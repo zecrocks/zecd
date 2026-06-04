@@ -50,7 +50,7 @@ pub fn open_read(network: ZNetwork, wallet_dir: &Path) -> anyhow::Result<ReadDb>
 
 /// Open the compact-block cache.
 pub fn open_fsblockdb(wallet_dir: &Path) -> anyhow::Result<FsBlockDb> {
-    Ok(FsBlockDb::for_path(wallet_dir).map_err(|e| anyhow::anyhow!("{e:?}"))?)
+    FsBlockDb::for_path(wallet_dir).map_err(|e| anyhow::anyhow!("{e:?}"))
 }
 
 /// Initialize both the wallet DB and the block-cache DB (idempotent migrations).

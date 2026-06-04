@@ -1,0 +1,42 @@
+name: Regtest E2E
+
+# Live tier: brings up zebra (Regtest) + lightwalletd via zingo-infra and drives the real zecd
+# binary over its JSON-RPC (see regtest-harness/). This needs a Linux host with network access
+# (zingo-infra downloads zebrad/lightwalletd) and cannot run in the offline CI tier.
+#
+# It is NON-GATING (continue-on-error) for now: the zingo-infra dependency tree currently fails
+# to resolve from a clean checkout because `zingolib` pins `orchard ^0.10`, all of whose
+# published versions are yanked (see regtest-harness/README.md for the status and the
+# patch-replication path to unblock it). Once it resolves, flip continue-on-error off.
+
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - "regtest-harness/**"
+      - "src/**"
+      - ".github/workflows/regtest.yml"
+
+jobs:
+  regtest:
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install protobuf compiler
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      # Release build: debug Orchard/Sapling proving is >20s; release keeps the harness snappy.
+      - name: Build zecd (release)
+        run: cargo build --release --bin zecd
+
+      - name: Run regtest end-to-end harness
+        env:
+          ZECD_BIN: ${{ github.workspace }}/target/release/zecd
+        # Single-threaded: the harness binds fixed ports (zecd RPC + lightwalletd).
+        run: cargo test --manifest-path regtest-harness/Cargo.toml -- --nocapture --test-threads=1

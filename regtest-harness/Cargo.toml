@@ -1,0 +1,30 @@
+[package]
+name = "zecd-regtest-harness"
+version = "0.0.0"
+edition = "2021"
+publish = false
+description = "End-to-end regtest integration harness for zecd (zebra + lightwalletd via zingo-infra)"
+
+# Standalone workspace on purpose: this crate pulls in zingo-infra's heavy, fast-moving
+# dependency tree (zebra-chain, etc.). Declaring its own [workspace] keeps that tree fully
+# isolated from zecd's hard-pinned librustzcash lockfile - `cargo build` in the parent never
+# sees these deps, and a resolver hiccup here can never destabilise the zecd binary.
+[workspace]
+
+[dependencies]
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "process", "time", "fs", "io-util"] }
+# Plaintext HTTP only (zecd RPC is local http://) - no TLS stack pulled in.
+reqwest = { version = "0.12", default-features = false, features = ["json"] }
+serde_json = "1"
+anyhow = "1"
+tempfile = "3"
+
+[dev-dependencies]
+# The ecosystem's local-net orchestrator (formerly "zcash_local_net"). It downloads and runs
+# zebrad + lightwalletd, and - crucially - mines regtest blocks via getblocktemplate/submitblock
+# (zebra has no `generate` RPC). Git-only.
+#
+# KNOWN BLOCKER (see README.md): this does not resolve from a clean checkout - `zingolib` pins
+# `orchard ^0.10`, all of whose published versions are yanked. Unblocking requires replicating
+# zingolib's `[patch.crates-io]` (forked orchard/librustzcash) here, or vendoring a Cargo.lock.
+zingo-infra-testutils = { git = "https://github.com/zingolabs/infrastructure", branch = "main" }

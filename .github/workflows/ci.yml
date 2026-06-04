@@ -1,0 +1,38 @@
+name: CI
+
+# Offline tier: builds zecd and runs the full `cargo test` suite (unit + HTTP integration +
+# the regtest network/lifecycle tests) plus clippy. No network or Docker required, so this is
+# the gating check that runs on every push/PR - including from automated runs.
+
+on:
+  push:
+    branches: [main, master, "feature/**"]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install protobuf compiler
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build
+        run: cargo build --bin zecd
+
+      - name: Test (offline - includes the regtest network + wallet-lifecycle tests)
+        run: cargo test
+
+      - name: Clippy
+        run: cargo clippy --all-targets -- -D warnings

@@ -13,7 +13,7 @@
 
 services:
   zebra:
-    image: zfnd/zebra:v5.0.0                # pin to a verified release
+    image: zfnd/zebra:5.0.0                 # pin to a verified release (zebra tags have no 'v' prefix)
     restart: unless-stopped
     command: ["zebrad", "-c", "/etc/zebra/zebrad.toml", "start"]
     volumes:

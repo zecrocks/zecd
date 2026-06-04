@@ -12,10 +12,11 @@ use zcash_client_backend::proto::service::compact_tx_streamer_client::CompactTxS
 use crate::network::ZNetwork;
 
 /// Which set of root certificates to trust for TLS connections.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum TlsRoots {
     /// OS trust store (honors `SSL_CERT_FILE`). Works behind TLS-intercepting proxies and with
     /// local/corporate CAs. Default.
+    #[default]
     Native,
     /// Embedded Mozilla root bundle (webpki-roots). Good for minimal containers, but won't
     /// trust private/proxy CAs.
@@ -29,12 +30,6 @@ impl TlsRoots {
             "webpki" | "mozilla" => Ok(TlsRoots::Webpki),
             other => Err(anyhow!("invalid tls_roots '{other}', expected 'native' or 'webpki'")),
         }
-    }
-}
-
-impl Default for TlsRoots {
-    fn default() -> Self {
-        TlsRoots::Native
     }
 }
 
