@@ -55,9 +55,20 @@ pub fn open_fsblockdb(wallet_dir: &Path) -> anyhow::Result<FsBlockDb> {
 /// Initialize both the wallet DB and the block-cache DB (idempotent migrations).
 pub fn init_dbs(network: Network, wallet_dir: &Path) -> anyhow::Result<WriteDb> {
     std::fs::create_dir_all(wallet_dir)?;
+    enable_wal(wallet_dir)?;
     let mut db_cache = open_fsblockdb(wallet_dir)?;
     let mut db_data = open_write(network, wallet_dir)?;
     init_blockmeta_db(&mut db_cache).map_err(|e| anyhow::anyhow!("{e:?}"))?;
     init_wallet_db(&mut db_data, None)?;
     Ok(db_data)
+}
+
+/// Put the wallet DB into WAL journal mode (a persistent, per-database setting) so RPC read
+/// connections get consistent snapshots without blocking on the sync writer.
+fn enable_wal(wallet_dir: &Path) -> anyhow::Result<()> {
+    let conn = rusqlite::Connection::open(data_db_path(wallet_dir))?;
+    conn.busy_timeout(std::time::Duration::from_secs(5))?;
+    // `PRAGMA journal_mode=WAL` returns the resulting mode as a row; ignore it.
+    conn.query_row("PRAGMA journal_mode=WAL;", [], |_| Ok(()))?;
+    Ok(())
 }

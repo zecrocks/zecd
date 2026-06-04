@@ -40,8 +40,9 @@ age = { version = "0.11", features = ["armor"] }
 bip0039 = { version = "0.12", features = ["std", "all-languages"] }
 secrecy = "0.8"
 
-# lightwalletd transport (match zcash-devtool)
-tonic = { version = "0.14", features = ["gzip", "tls-webpki-roots"] }
+# lightwalletd transport. `tls-ring` installs the rustls crypto provider (zcash-devtool gets
+# one transitively via its `tor` feature, which we don't enable).
+tonic = { version = "0.14", features = ["gzip", "tls-ring", "tls-webpki-roots"] }
 prost = "0.14"
 rusqlite = { version = "0.37", features = ["time"] }
 time = "0.3"

@@ -83,6 +83,7 @@ pub fn error(id: Value, err: &RpcError) -> Value {
 }
 
 /// The parsed top-level request body: a single call or a batch.
+#[derive(Debug)]
 pub enum Body {
     Single(Value),
     Batch(Vec<Value>),
@@ -108,5 +109,63 @@ pub fn parse_body(bytes: &[u8]) -> Result<Body, RpcError> {
             crate::error::codes::RPC_INVALID_REQUEST,
             "Top-level request must be an object or array",
         )),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::error::codes;
+
+    #[test]
+    fn parses_single_and_batch() {
+        assert!(matches!(
+            parse_body(br#"{"method":"getblockcount","id":1}"#),
+            Ok(Body::Single(_))
+        ));
+        assert!(matches!(
+            parse_body(br#"[{"method":"a","id":1},{"method":"b","id":2}]"#),
+            Ok(Body::Batch(v)) if v.len() == 2
+        ));
+    }
+
+    #[test]
+    fn parse_errors() {
+        // Invalid JSON -> parse error.
+        assert_eq!(parse_body(b"not json").unwrap_err().code, codes::RPC_PARSE_ERROR);
+        // Wrong top-level type.
+        assert_eq!(parse_body(b"5").unwrap_err().code, codes::RPC_INVALID_REQUEST);
+        // Empty batch.
+        assert_eq!(parse_body(b"[]").unwrap_err().code, codes::RPC_INVALID_REQUEST);
+    }
+
+    #[test]
+    fn request_from_value_ok_and_missing_method() {
+        let v: Value = serde_json::from_str(r#"{"method":"sendtoaddress","id":"x","params":["addr",1.5]}"#).unwrap();
+        let req = RpcRequest::from_value(v).unwrap();
+        assert_eq!(req.method, "sendtoaddress");
+        assert_eq!(req.id, Value::String("x".into()));
+        assert_eq!(req.params.len(), 2);
+        assert_eq!(req.param(0).unwrap().as_str(), Some("addr"));
+
+        // Missing method preserves the id in the error tuple.
+        let v: Value = serde_json::from_str(r#"{"id":7}"#).unwrap();
+        let (id, err) = RpcRequest::from_value(v).unwrap_err();
+        assert_eq!(id, serde_json::json!(7));
+        assert_eq!(err.code, codes::RPC_INVALID_REQUEST);
+    }
+
+    #[test]
+    fn envelopes_match_bitcoind_shape() {
+        let ok = success(serde_json::json!(1), serde_json::json!("done"));
+        assert_eq!(ok["result"], serde_json::json!("done"));
+        assert_eq!(ok["error"], Value::Null);
+        assert_eq!(ok["id"], serde_json::json!(1));
+
+        let err = error(serde_json::json!(2), &RpcError::method_not_found("foo"));
+        assert_eq!(err["result"], Value::Null);
+        assert_eq!(err["error"]["code"], serde_json::json!(codes::RPC_METHOD_NOT_FOUND));
+        assert!(err["error"]["message"].is_string());
+        assert_eq!(err["id"], serde_json::json!(2));
     }
 }
