@@ -1,11 +1,14 @@
 //! Control RPCs: stop, uptime, help, getrpcinfo.
 
+use std::sync::atomic::Ordering;
+
 use serde_json::{json, Value};
 
 use crate::error::RpcError;
 use crate::state::AppState;
 
 pub fn stop(state: &AppState) -> Result<Value, RpcError> {
+    state.shutting_down.store(true, Ordering::Relaxed);
     state.shutdown.notify_one();
     Ok(Value::String("zecd stopping".to_string()))
 }
@@ -24,6 +27,15 @@ pub fn help() -> Result<Value, RpcError> {
     ))
 }
 
-pub fn getrpcinfo() -> Result<Value, RpcError> {
-    Ok(json!({ "active_commands": [], "logpath": "" }))
+pub fn getrpcinfo(state: &AppState) -> Result<Value, RpcError> {
+    // active_commands: one entry per currently-executing command, with elapsed microseconds -
+    // the same shape as Bitcoin Core's getrpcinfo (gives visibility under load).
+    let active: Vec<Value> = state
+        .active
+        .snapshot()
+        .into_iter()
+        .map(|(method, micros)| json!({ "method": method, "duration": micros as u64 }))
+        .collect();
+    // We log to stderr/tracing rather than a debug.log file, so logpath is empty.
+    Ok(json!({ "active_commands": active, "logpath": "" }))
 }

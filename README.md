@@ -81,6 +81,7 @@ port = 18232                     # mainnet default 8232, testnet 18232
 user = "zec"
 password = "secret"
 # cookiefile = "./data/.cookie"  # used when user/password are unset
+work_queue = 100                 # max in-flight requests before HTTP 503 (= bitcoind -rpcworkqueue)
 
 [keys]
 age_identity = "./data/identity.txt"
@@ -137,6 +138,46 @@ zecd logs via `tracing`. The level comes from `[log] level` and is overridden by
 RPC call emits a structured event - `debug` on success (`method`, `wallet`, `elapsed_ms`), `info`
 on error (adds `code`, `message`) - and sync/connection lifecycle events log at `info`. Set
 `[log] format = "json"` for structured JSON lines suitable for Loki/CloudWatch/Elastic.
+
+## Concurrency & busy servers
+
+zecd is a daemon; each wallet is owned by a single-writer actor, so **sends serialize per
+wallet** - the same guarantee Bitcoin Core gets from `cs_wallet`. Concurrent
+`sendtoaddress`/`sendmany` calls are processed one at a time, so two sends never select the same
+note: there is **no double-spend**. When many sends go out at once they queue at the actor and each
+client's HTTP call blocks until its send completes. Because a freshly-created change note is
+unconfirmed (not yet spendable), rapid back-to-back sends exhaust spendable notes and then return
+`RPC_WALLET_INSUFFICIENT_FUNDS (-6)` until confirmations arrive - the same code bitcoind returns
+when funds are already spent/locked.
+
+Overload protection matches bitcoind's work queue: at most `[rpc] work_queue` requests
+(default 100, like `-rpcworkqueue`) are in flight; beyond that the server returns **HTTP 503
+`Work queue depth exceeded`**. During shutdown it returns **503 `Request rejected during server
+shutdown`**.
+
+HTTP status and error codes match Bitcoin Core exactly (`rpc/protocol.h`, `httprpc.cpp`):
+
+| Condition | RPC code | HTTP |
+|---|---|---|
+| success | - | 200 |
+| insufficient funds | `-6` | 500 |
+| wallet locked (needs `walletpassphrase`) | `-13` | 500 |
+| tx rejected by network | `-26` | 500 |
+| bad/unknown address or txid | `-5` | 500 |
+| invalid parameter | `-8` | 500 |
+| invalid request | `-32600` | 400 |
+| method not found | `-32601` | 404 |
+| parse error | `-32700` | 500 |
+| auth failure | - | 401 (+ `WWW-Authenticate`, 250 ms delay) |
+| over work-queue / shutting down | - | 503 |
+
+Batches always return HTTP 200 with per-item errors in the array.
+
+**Visibility under load:** `getrpcinfo` returns `active_commands` - one entry per
+currently-executing call with `method` and `duration` (µs) - so you can see exactly what is in
+flight. Combine with `getwalletinfo` (`txcount`, balances, `scanning`),
+`getbalance`/`getunconfirmedbalance`, `listtransactions`/`gettransaction` (per-tx
+`confirmations`), and the `/status` health endpoint.
 
 ## Health & readiness
 

@@ -32,7 +32,7 @@ pub async fn dispatch(
         "stop" => control::stop(state),
         "uptime" => control::uptime(state),
         "help" => control::help(),
-        "getrpcinfo" => control::getrpcinfo(),
+        "getrpcinfo" => control::getrpcinfo(state),
 
         // Network
         "getnetworkinfo" => network::getnetworkinfo(state),

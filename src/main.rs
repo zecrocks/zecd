@@ -99,18 +99,23 @@ async fn run_daemon(config: AppConfig) -> anyhow::Result<()> {
     }
 
     let shutdown = Arc::new(Notify::new());
+    let shutting_down = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let state = AppState {
         config: config.clone(),
         auth,
         registry: Arc::new(registry),
         started_at: Instant::now(),
         shutdown: shutdown.clone(),
+        shutting_down: shutting_down.clone(),
+        work_queue: Arc::new(tokio::sync::Semaphore::new(config.rpc.work_queue)),
+        active: crate::state::ActiveCommands::default(),
     };
 
-    // Translate Ctrl-C into a graceful shutdown.
+    // Translate Ctrl-C into a graceful shutdown (flag first, so in-flight new requests 503).
     tokio::spawn(async move {
         if tokio::signal::ctrl_c().await.is_ok() {
             info!("received Ctrl-C, shutting down");
+            shutting_down.store(true, std::sync::atomic::Ordering::Relaxed);
             shutdown.notify_one();
         }
     });

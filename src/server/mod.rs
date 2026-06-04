@@ -57,28 +57,39 @@ async fn handle(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
+    // Reject new work once shutdown has been requested (matches bitcoind).
+    if state.shutting_down.load(std::sync::atomic::Ordering::Relaxed) {
+        return plain_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Request rejected during server shutdown",
+        );
+    }
+
     let auth_header = headers
         .get(header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok());
     if !state.auth.check(auth_header) {
+        // Bitcoin Core inserts a small delay on auth failure to deter brute-forcing.
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
         return unauthorized();
     }
 
+    // Bound concurrent in-flight requests like bitcoind's work queue; excess → 503.
+    let _permit = match state.work_queue.clone().try_acquire_owned() {
+        Ok(p) => p,
+        Err(_) => {
+            return plain_response(StatusCode::SERVICE_UNAVAILABLE, "Work queue depth exceeded")
+        }
+    };
+
     match jsonrpc::parse_body(&body) {
-        Err(e) => json_response(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            &jsonrpc::error(Value::Null, &e),
-        ),
+        Err(e) => json_response(status_for(&e), &jsonrpc::error(Value::Null, &e)),
         Ok(Body::Single(v)) => {
-            let (resp, is_err) = process_single(&state, wallet.as_deref(), v).await;
-            let status = if is_err {
-                StatusCode::INTERNAL_SERVER_ERROR
-            } else {
-                StatusCode::OK
-            };
+            let (resp, status) = process_single(&state, wallet.as_deref(), v).await;
             json_response(status, &resp)
         }
         Ok(Body::Batch(items)) => {
+            // Batches always return HTTP 200; per-item errors live in the array.
             let mut out = Vec::with_capacity(items.len());
             for v in items {
                 let (resp, _) = process_single(&state, wallet.as_deref(), v).await;
@@ -89,26 +100,33 @@ async fn handle(
     }
 }
 
-/// Validate and dispatch one request, returning `(envelope, is_error)`. Emits one structured
-/// log line per call (debug on success, info on error) with method, wallet, and latency.
-async fn process_single(state: &AppState, wallet: Option<&str>, v: Value) -> (Value, bool) {
+/// HTTP status for an RPC error, matching Bitcoin Core's `JSONErrorReply`.
+fn status_for(err: &crate::error::RpcError) -> StatusCode {
+    StatusCode::from_u16(crate::error::http_status_for_code(err.code))
+        .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR)
+}
+
+/// Validate and dispatch one request, returning `(envelope, http_status)`. Registers the
+/// command as active (for `getrpcinfo`) and emits one structured log line per call.
+async fn process_single(state: &AppState, wallet: Option<&str>, v: Value) -> (Value, StatusCode) {
     match RpcRequest::from_value(v) {
         Err((id, err)) => {
             tracing::debug!(code = err.code, message = %err.message, "rpc request rejected");
-            (jsonrpc::error(id, &err), true)
+            (jsonrpc::error(id, &err), status_for(&err))
         }
         Ok(req) => {
+            let _active = state.active.begin(&req.method);
             let start = std::time::Instant::now();
             let result = rpc::dispatch(state, wallet, &req).await;
             let elapsed_ms = start.elapsed().as_millis() as u64;
             match result {
                 Ok(value) => {
                     tracing::debug!(method = %req.method, wallet = wallet.unwrap_or("default"), elapsed_ms, "rpc ok");
-                    (jsonrpc::success(req.id, value), false)
+                    (jsonrpc::success(req.id, value), StatusCode::OK)
                 }
                 Err(err) => {
                     tracing::info!(method = %req.method, wallet = wallet.unwrap_or("default"), elapsed_ms, code = err.code, message = %err.message, "rpc error");
-                    (jsonrpc::error(req.id, &err), true)
+                    (jsonrpc::error(req.id, &err), status_for(&err))
                 }
             }
         }
@@ -125,10 +143,15 @@ fn json_response(status: StatusCode, body: &Value) -> Response {
         .into_response()
 }
 
+/// A plain-text response (bitcoind uses these for 503/overload and shutdown messages).
+fn plain_response(status: StatusCode, msg: &'static str) -> Response {
+    (status, [(header::CONTENT_TYPE, "text/plain")], msg).into_response()
+}
+
 fn unauthorized() -> Response {
     (
         StatusCode::UNAUTHORIZED,
-        [(header::WWW_AUTHENTICATE, "Basic realm=\"zecd\"")],
+        [(header::WWW_AUTHENTICATE, "Basic realm=\"jsonrpc\"")],
         "",
     )
         .into_response()
@@ -161,6 +184,7 @@ mod tests {
             user: Some("u".into()),
             password: Some("p".into()),
             cookiefile: None,
+            work_queue: 16,
         };
         let config = AppConfig {
             network: zcash_protocol::consensus::Network::TestNetwork,
@@ -190,6 +214,9 @@ mod tests {
             registry: Arc::new(WalletRegistry::new("default".into())),
             started_at: Instant::now(),
             shutdown: Arc::new(Notify::new()),
+            shutting_down: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            work_queue: Arc::new(tokio::sync::Semaphore::new(16)),
+            active: crate::state::ActiveCommands::default(),
         }
     }
 
@@ -236,19 +263,32 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn unknown_method_is_500_with_error_code() {
+    async fn unknown_method_is_404_with_error_code() {
         let r = router(test_state())
             .oneshot(req(r#"{"method":"definitely_not_a_method","id":2}"#, Some(("u", "p"))))
             .await
             .unwrap();
-        // Bitcoin Core returns HTTP 500 with the error object in the body.
-        assert_eq!(r.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        // Bitcoin Core maps RPC_METHOD_NOT_FOUND to HTTP 404 (httprpc.cpp JSONErrorReply).
+        assert_eq!(r.status(), StatusCode::NOT_FOUND);
         let v = body_json(r).await;
         assert_eq!(v["result"], Value::Null);
         assert_eq!(
             v["error"]["code"],
             serde_json::json!(crate::error::codes::RPC_METHOD_NOT_FOUND)
         );
+    }
+
+    #[tokio::test]
+    async fn work_queue_exhaustion_returns_503() {
+        use std::sync::Arc;
+        let mut state = test_state();
+        // A zero-permit queue: every request is "over capacity".
+        state.work_queue = Arc::new(tokio::sync::Semaphore::new(0));
+        let r = router(state)
+            .oneshot(req(r#"{"method":"uptime","id":1}"#, Some(("u", "p"))))
+            .await
+            .unwrap();
+        assert_eq!(r.status(), StatusCode::SERVICE_UNAVAILABLE);
     }
 
     #[tokio::test]

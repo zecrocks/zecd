@@ -76,6 +76,9 @@ pub struct RpcConfig {
     pub password: Option<String>,
     /// Path to a bitcoind-style cookie file; generated at startup when no user/password set.
     pub cookiefile: Option<PathBuf>,
+    /// Max concurrent in-flight requests before returning HTTP 503 (Bitcoin Core's
+    /// `-rpcworkqueue`, default 100).
+    pub work_queue: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -166,6 +169,7 @@ struct RpcFile {
     user: Option<String>,
     password: Option<String>,
     cookiefile: Option<PathBuf>,
+    work_queue: Option<usize>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -350,6 +354,7 @@ impl AppConfig {
             user: None,
             password: None,
             cookiefile: None,
+            work_queue: None,
         });
         let bind: IpAddr = cli
             .rpc_bind
@@ -369,6 +374,7 @@ impl AppConfig {
             cookiefile: rpc_file
                 .cookiefile
                 .or_else(|| Some(datadir.join(".cookie"))),
+            work_queue: rpc_file.work_queue.unwrap_or(100).max(1),
         };
 
         let keys_file = file.keys.unwrap_or(KeysFile {
