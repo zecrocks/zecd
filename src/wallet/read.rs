@@ -1,0 +1,202 @@
+//! Read-only wallet queries served from short-lived connections, so they never block on the
+//! sync writer (SQLite WAL gives consistent snapshots).
+#![allow(dead_code)] // some TxRecord fields are surfaced selectively by RPC methods
+
+use std::path::Path;
+
+use rusqlite::{named_params, Connection};
+use uuid::Uuid;
+use zcash_client_backend::data_api::wallet::ConfirmationsPolicy;
+use zcash_client_backend::data_api::WalletRead;
+use zcash_protocol::consensus::Network;
+
+use crate::wallet::open::{data_db_path, open_read};
+
+/// Spendable / pending balances aggregated across the wallet's accounts (in zatoshis).
+#[derive(Debug, Default, Clone)]
+pub struct BalanceInfo {
+    pub orchard_spendable: u64,
+    pub sapling_spendable: u64,
+    pub total_spendable: u64,
+    /// Value received but not yet spendable (needs more confirmations).
+    pub pending: u64,
+    /// Change awaiting confirmation.
+    pub immature: u64,
+}
+
+/// Aggregate balances via `get_wallet_summary` (mirrors devtool's `balance.rs`).
+pub fn balance(network: Network, wallet_dir: &Path) -> anyhow::Result<BalanceInfo> {
+    let db = open_read(network, wallet_dir)?;
+    let mut info = BalanceInfo::default();
+    if let Some(summary) = db.get_wallet_summary(ConfirmationsPolicy::default())? {
+        for bal in summary.account_balances().values() {
+            info.orchard_spendable += bal.orchard_balance().spendable_value().into_u64();
+            info.sapling_spendable += bal.sapling_balance().spendable_value().into_u64();
+            info.pending += bal.orchard_balance().value_pending_spendability().into_u64()
+                + bal.sapling_balance().value_pending_spendability().into_u64();
+            info.immature += bal.orchard_balance().change_pending_confirmation().into_u64()
+                + bal.sapling_balance().change_pending_confirmation().into_u64();
+        }
+        info.total_spendable = info.orchard_spendable + info.sapling_spendable;
+    }
+    Ok(info)
+}
+
+/// Number of transactions in the wallet (for `getwalletinfo.txcount`).
+pub fn tx_count(wallet_dir: &Path) -> anyhow::Result<u64> {
+    let conn = open_conn(wallet_dir)?;
+    let n: i64 = conn.query_row("SELECT COUNT(*) FROM v_transactions", [], |r| r.get(0))?;
+    Ok(n as u64)
+}
+
+/// One output row from `v_tx_outputs`.
+#[derive(Debug, Clone)]
+pub struct TxOutputRecord {
+    pub pool: i64,
+    pub output_index: u32,
+    pub from_account: Option<Uuid>,
+    pub to_account: Option<Uuid>,
+    pub to_address: Option<String>,
+    pub value: i64,
+    pub is_change: bool,
+}
+
+/// One transaction row from `v_transactions`, plus its outputs.
+#[derive(Debug, Clone)]
+pub struct TxRecord {
+    pub mined_height: Option<u32>,
+    pub txid_hex: String,
+    pub expiry_height: Option<u32>,
+    pub account_balance_delta: i64,
+    pub fee_paid: Option<u64>,
+    pub sent_note_count: i64,
+    pub received_note_count: i64,
+    pub block_time: Option<i64>,
+    pub expired_unmined: bool,
+    pub outputs: Vec<TxOutputRecord>,
+}
+
+fn open_conn(wallet_dir: &Path) -> anyhow::Result<Connection> {
+    let conn = Connection::open(data_db_path(wallet_dir))?;
+    conn.busy_timeout(std::time::Duration::from_secs(5))?;
+    Ok(conn)
+}
+
+/// Convert internal txid bytes to conventional (reversed) display hex.
+fn txid_display(bytes: &[u8]) -> String {
+    let mut b = bytes.to_vec();
+    b.reverse();
+    hex::encode(b)
+}
+
+/// Convert a display-hex txid back to internal byte order for lookups.
+fn txid_internal(display_hex: &str) -> Option<Vec<u8>> {
+    let mut b = hex::decode(display_hex).ok()?;
+    if b.len() != 32 {
+        return None;
+    }
+    b.reverse();
+    Some(b)
+}
+
+fn load_outputs(conn: &Connection, txid: &[u8]) -> anyhow::Result<Vec<TxOutputRecord>> {
+    let mut stmt = conn.prepare(
+        "SELECT output_pool, output_index, from_account_uuid, to_account_uuid,
+                to_address, value, is_change
+         FROM v_tx_outputs
+         WHERE txid = :txid",
+    )?;
+    let rows = stmt.query_map(named_params! {":txid": txid}, |row| {
+        Ok(TxOutputRecord {
+            pool: row.get("output_pool")?,
+            output_index: row.get("output_index")?,
+            from_account: row.get::<_, Option<Uuid>>("from_account_uuid")?,
+            to_account: row.get::<_, Option<Uuid>>("to_account_uuid")?,
+            to_address: row.get("to_address")?,
+            value: row.get("value")?,
+            is_change: row.get("is_change")?,
+        })
+    })?;
+    let mut out = Vec::new();
+    for r in rows {
+        out.push(r?);
+    }
+    Ok(out)
+}
+
+/// All transactions, oldest first (callers apply skip/count). Mirrors `list_tx.rs`.
+pub fn list_transactions(wallet_dir: &Path) -> anyhow::Result<Vec<TxRecord>> {
+    let conn = open_conn(wallet_dir)?;
+    let mut stmt = conn.prepare(
+        "SELECT mined_height, txid, expiry_height, account_balance_delta, fee_paid,
+                sent_note_count, received_note_count, block_time, expired_unmined,
+                COALESCE(
+                    mined_height,
+                    CASE WHEN expiry_height == 0 THEN NULL ELSE expiry_height END
+                ) AS sort_height
+         FROM v_transactions
+         ORDER BY sort_height ASC NULLS LAST",
+    )?;
+    let mut records = Vec::new();
+    let rows = stmt.query_map([], |row| {
+        let txid: Vec<u8> = row.get("txid")?;
+        Ok((
+            txid.clone(),
+            TxRecord {
+                mined_height: row.get("mined_height")?,
+                txid_hex: txid_display(&txid),
+                expiry_height: row.get("expiry_height")?,
+                account_balance_delta: row.get("account_balance_delta")?,
+                fee_paid: row.get::<_, Option<i64>>("fee_paid")?.map(|v| v as u64),
+                sent_note_count: row.get("sent_note_count")?,
+                received_note_count: row.get("received_note_count")?,
+                block_time: row.get("block_time")?,
+                expired_unmined: row.get("expired_unmined")?,
+                outputs: Vec::new(),
+            },
+        ))
+    })?;
+    let mut pending: Vec<(Vec<u8>, TxRecord)> = Vec::new();
+    for r in rows {
+        pending.push(r?);
+    }
+    for (txid, mut rec) in pending {
+        rec.outputs = load_outputs(&conn, &txid)?;
+        records.push(rec);
+    }
+    Ok(records)
+}
+
+/// A single transaction by its display-hex txid.
+pub fn get_transaction(wallet_dir: &Path, txid_hex: &str) -> anyhow::Result<Option<TxRecord>> {
+    let Some(internal) = txid_internal(txid_hex) else {
+        return Ok(None);
+    };
+    let conn = open_conn(wallet_dir)?;
+    let mut stmt = conn.prepare(
+        "SELECT mined_height, txid, expiry_height, account_balance_delta, fee_paid,
+                sent_note_count, received_note_count, block_time, expired_unmined
+         FROM v_transactions
+         WHERE txid = :txid",
+    )?;
+    let mut rows = stmt.query(named_params! {":txid": internal})?;
+    let Some(row) = rows.next()? else {
+        return Ok(None);
+    };
+    let txid: Vec<u8> = row.get("txid")?;
+    let mut rec = TxRecord {
+        mined_height: row.get("mined_height")?,
+        txid_hex: txid_display(&txid),
+        expiry_height: row.get("expiry_height")?,
+        account_balance_delta: row.get("account_balance_delta")?,
+        fee_paid: row.get::<_, Option<i64>>("fee_paid")?.map(|v| v as u64),
+        sent_note_count: row.get("sent_note_count")?,
+        received_note_count: row.get("received_note_count")?,
+        block_time: row.get("block_time")?,
+        expired_unmined: row.get("expired_unmined")?,
+        outputs: Vec::new(),
+    };
+    drop(rows);
+    rec.outputs = load_outputs(&conn, &txid)?;
+    Ok(Some(rec))
+}

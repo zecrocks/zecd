@@ -1,0 +1,82 @@
+[package]
+name = "zecd"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.81"
+license = "MIT OR Apache-2.0"
+publish = false
+description = "A Bitcoin-Core-style JSON-RPC server for Orchard-only Zcash, built on librustzcash"
+
+[dependencies]
+# Async runtime + HTTP server
+tokio = { version = "1.21", features = ["rt-multi-thread", "macros", "fs", "signal", "sync", "time", "io-util"] }
+axum = { version = "0.7", features = ["json"] }
+tower = { version = "0.5", features = ["util"] }
+hyper = "1"
+futures-util = "0.3"
+
+# Serialization. `arbitrary_precision` is REQUIRED: bitcoind emits amounts as JSON numbers
+# with 8 decimals and clients parse them as Decimal; without this they round-trip through f64.
+serde = { version = "1.0", features = ["derive"] }
+serde_json = { version = "1.0", features = ["arbitrary_precision"] }
+rust_decimal = "1"
+
+# CLI / config / logging
+clap = { version = "4.5", features = ["derive", "string", "env"] }
+toml = "0.8"
+anyhow = "1"
+thiserror = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+
+# Auth
+base64 = "0.22"
+subtle = "2"
+rand = { version = "0.8", default-features = false, features = ["std", "std_rng"] }
+hex = "0.4"
+
+# Seed handling
+age = { version = "0.11", features = ["armor"] }
+bip0039 = { version = "0.12", features = ["std", "all-languages"] }
+secrecy = "0.8"
+
+# lightwalletd transport (match zcash-devtool)
+tonic = { version = "0.14", features = ["gzip", "tls-webpki-roots"] }
+prost = "0.14"
+rusqlite = { version = "0.37", features = ["time"] }
+time = "0.3"
+uuid = { version = "1", features = ["v4", "serde"] }
+rayon = "1.7"
+
+# Zcash - versions identical to zcash-devtool/Cargo.toml
+orchard = { version = "0.12", default-features = false }
+zcash_address = "0.10"
+zcash_client_backend = { version = "0.21", features = ["lightwalletd-tonic-tls-webpki-roots", "orchard"] }
+zcash_client_sqlite = { version = "0.19", features = ["unstable", "orchard", "serde"] }
+zcash_keys = { version = "0.12", features = ["unstable", "orchard"] }
+zcash_primitives = "0.26"
+zcash_proofs = { version = "0.26", features = ["bundled-prover"] }
+zcash_protocol = { version = "0.7", features = ["local-consensus"] }
+sapling = { package = "sapling-crypto", version = "0.6" }
+zip32 = "0.2"
+zip321 = "0.6"
+
+[dev-dependencies]
+tempfile = "3"
+
+# Mirror of zcash-devtool/Cargo.toml [patch.crates-io] (rev 77c422f1bd56400c9647f089c87f3776e16fd212).
+# Pins librustzcash to the exact upstream tree zcash-devtool was validated against.
+[patch.crates-io]
+equihash = { git = "https://github.com/zcash/librustzcash.git", rev = "77c422f1bd56400c9647f089c87f3776e16fd212" }
+f4jumble = { git = "https://github.com/zcash/librustzcash.git", rev = "77c422f1bd56400c9647f089c87f3776e16fd212" }
+pczt = { git = "https://github.com/zcash/librustzcash.git", rev = "77c422f1bd56400c9647f089c87f3776e16fd212" }
+transparent = { package = "zcash_transparent", git = "https://github.com/zcash/librustzcash.git", rev = "77c422f1bd56400c9647f089c87f3776e16fd212" }
+zcash_address = { git = "https://github.com/zcash/librustzcash.git", rev = "77c422f1bd56400c9647f089c87f3776e16fd212" }
+zcash_client_backend = { git = "https://github.com/zcash/librustzcash.git", rev = "77c422f1bd56400c9647f089c87f3776e16fd212" }
+zcash_client_sqlite = { git = "https://github.com/zcash/librustzcash.git", rev = "77c422f1bd56400c9647f089c87f3776e16fd212" }
+zcash_encoding = { git = "https://github.com/zcash/librustzcash.git", rev = "77c422f1bd56400c9647f089c87f3776e16fd212" }
+zcash_keys = { git = "https://github.com/zcash/librustzcash.git", rev = "77c422f1bd56400c9647f089c87f3776e16fd212" }
+zcash_primitives = { git = "https://github.com/zcash/librustzcash.git", rev = "77c422f1bd56400c9647f089c87f3776e16fd212" }
+zcash_proofs = { git = "https://github.com/zcash/librustzcash.git", rev = "77c422f1bd56400c9647f089c87f3776e16fd212" }
+zcash_protocol = { git = "https://github.com/zcash/librustzcash.git", rev = "77c422f1bd56400c9647f089c87f3776e16fd212" }
+zip321 = { git = "https://github.com/zcash/librustzcash.git", rev = "77c422f1bd56400c9647f089c87f3776e16fd212" }

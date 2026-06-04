@@ -1,0 +1,42 @@
+# Example zecd configuration. Copy to <datadir>/zecd.toml (or pass --conf) and edit.
+# CLI flags (e.g. --rpcuser, --rpcport, --testnet, --datadir, --server) override these.
+
+# Network: "main" or "test".
+network = "test"
+
+# Parent directory for per-wallet subdirectories, the cookie file, and (by default) the
+# age identity. Each wallet lives in its own subdirectory.
+datadir = "./data"
+
+# Wallet selected when a request hits "/" rather than "/wallet/<name>".
+default_wallet = "default"
+
+# One section per wallet. The directory holds data.sqlite, keys.toml, blocks/, labels.sqlite.
+[wallets.default]
+dir = "./data/default"
+
+[lightwalletd]
+# "ecc" | "ywallet" | "zecrocks" | a "host:port" (use your local lightwalletd in production,
+# e.g. "127.0.0.1:9067"). Defaults to the public zecrocks infrastructure.
+server = "zecrocks"
+# Only "direct" is supported (TLS for remote hosts, plaintext for localhost).
+connection = "direct"
+
+[rpc]
+bind = "127.0.0.1"
+# Mainnet default 8232, testnet default 18232.
+port = 18232
+# If user/password are omitted, a bitcoind-style cookie file is generated at <datadir>/.cookie.
+user = "zec"
+password = "change-me"
+# cookiefile = "./data/.cookie"
+
+[keys]
+# age identity file used to decrypt the wallet seed for unattended sending.
+age_identity = "./data/identity.txt"
+# Decrypt the seed at startup so sendtoaddress/sendmany work without walletpassphrase.
+auto_unlock = true
+
+[sync]
+# How often to poll lightwalletd for new blocks (seconds).
+interval_secs = 20

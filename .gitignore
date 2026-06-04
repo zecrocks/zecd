@@ -1,0 +1,15 @@
+/target
+**/*.rs.bk
+Cargo.lock.orig
+
+# Local runtime data / wallets (never commit secrets)
+/data
+*.sqlite
+*.sqlite-journal
+*.sqlite-wal
+*.sqlite-shm
+keys.toml
+*.cookie
+.cookie
+identity.txt
+zecd.toml
