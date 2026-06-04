@@ -4,6 +4,7 @@ mod address;
 mod amount;
 mod config;
 mod error;
+mod health;
 mod init;
 mod lightwalletd;
 mod rpc;
@@ -27,9 +28,9 @@ use crate::wallet::WalletRegistry;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    init_tracing();
     let cli = Cli::parse();
     let config = AppConfig::resolve(&cli)?;
+    init_tracing(&config.log);
 
     match &cli.command {
         Some(Command::Init(args)) => init::run(&config, args).await,
@@ -37,10 +38,17 @@ async fn main() -> anyhow::Result<()> {
     }
 }
 
-fn init_tracing() {
+/// Initialize tracing. The filter defaults to `[log] level` and is overridden by `RUST_LOG`;
+/// `[log] format = "json"` emits structured logs for cloud-native log aggregation.
+fn init_tracing(log: &config::LogConfig) {
     let filter = tracing_subscriber::EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
-    tracing_subscriber::fmt().with_env_filter(filter).init();
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(&log.level));
+    let builder = tracing_subscriber::fmt().with_env_filter(filter);
+    if log.format.eq_ignore_ascii_case("json") {
+        builder.json().init();
+    } else {
+        builder.init();
+    }
 }
 
 async fn run_daemon(config: AppConfig) -> anyhow::Result<()> {
@@ -63,6 +71,7 @@ async fn run_daemon(config: AppConfig) -> anyhow::Result<()> {
             &config.lightwalletd.server,
             config.network,
             config.lightwalletd.tls_roots,
+            config.lightwalletd.force_tls,
         )?;
         let actor_cfg = ActorConfig {
             name: name.clone(),
@@ -105,6 +114,9 @@ async fn run_daemon(config: AppConfig) -> anyhow::Result<()> {
             shutdown.notify_one();
         }
     });
+
+    // Liveness/readiness probes on a separate port (best-effort; non-fatal if it can't bind).
+    tokio::spawn(health::run(state.clone()));
 
     server::run(state).await
 }

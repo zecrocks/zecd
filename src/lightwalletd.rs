@@ -1,7 +1,7 @@
 //! lightwalletd connection management. Ported from `zcash-devtool/src/remote.rs`, keeping
-//! direct connections only (TLS for remote hosts, plaintext for localhost). The deployment
-//! model is either a local self-hosted lightwalletd or the public zecrocks infrastructure,
-//! both reached directly - no Tor/SOCKS.
+//! direct connections only. TLS is used for remote hosts and skipped for localhost, but can
+//! be forced on/off explicitly (e.g. a co-located plaintext lightwalletd reached by service
+//! name in docker-compose). No Tor/SOCKS.
 
 use std::borrow::Cow;
 
@@ -13,11 +13,11 @@ use zcash_protocol::consensus::Network;
 /// Which set of root certificates to trust for TLS connections.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TlsRoots {
-    /// The OS trust store (honors `SSL_CERT_FILE`). Works behind TLS-intercepting proxies and
-    /// with local/corporate CAs. Default.
+    /// OS trust store (honors `SSL_CERT_FILE`). Works behind TLS-intercepting proxies and with
+    /// local/corporate CAs. Default.
     Native,
-    /// The embedded Mozilla root bundle (webpki-roots). Good for minimal containers with no
-    /// system trust store, but won't trust private/proxy CAs.
+    /// Embedded Mozilla root bundle (webpki-roots). Good for minimal containers, but won't
+    /// trust private/proxy CAs.
     Webpki,
 }
 
@@ -37,22 +37,36 @@ impl Default for TlsRoots {
     }
 }
 
+/// Parse a `[lightwalletd] tls` setting into a force-TLS override: `auto` (None) uses the
+/// localhost heuristic; `yes`/`no` force it.
+pub fn parse_tls_mode(s: &str) -> anyhow::Result<Option<bool>> {
+    match s.trim().to_ascii_lowercase().as_str() {
+        "auto" => Ok(None),
+        "yes" | "true" | "on" | "tls" => Ok(Some(true)),
+        "no" | "false" | "off" | "plaintext" => Ok(Some(false)),
+        other => Err(anyhow!("invalid tls '{other}', expected 'auto', 'yes', or 'no'")),
+    }
+}
+
 /// A resolved lightwalletd endpoint.
 #[derive(Clone, Debug)]
 pub struct Server {
     host: Cow<'static, str>,
     port: u16,
-    tls: TlsRoots,
+    roots: TlsRoots,
+    /// `Some(true/false)` forces TLS on/off; `None` uses the localhost heuristic.
+    force_tls: Option<bool>,
 }
 
 impl Server {
-    fn new(host: Cow<'static, str>, port: u16, tls: TlsRoots) -> Self {
-        Server { host, port, tls }
+    fn new(host: Cow<'static, str>, port: u16, roots: TlsRoots, force_tls: Option<bool>) -> Self {
+        Server { host, port, roots, force_tls }
     }
 
-    /// localhost is plaintext; everything else uses TLS.
     fn use_tls(&self) -> bool {
-        !matches!(self.host.as_ref(), "localhost" | "127.0.0.1" | "::1")
+        self.force_tls.unwrap_or_else(|| {
+            !matches!(self.host.as_ref(), "localhost" | "127.0.0.1" | "::1")
+        })
     }
 
     fn endpoint(&self) -> String {
@@ -65,7 +79,7 @@ impl Server {
     }
 
     pub fn describe(&self) -> String {
-        format!("{}:{}", self.host, self.port)
+        format!("{}:{} (tls={})", self.host, self.port, self.use_tls())
     }
 
     /// Open a gRPC connection to this lightwalletd server.
@@ -75,7 +89,7 @@ impl Server {
             let tls = ClientTlsConfig::new()
                 .domain_name(self.host.to_string())
                 .assume_http2(true);
-            let tls = match self.tls {
+            let tls = match self.roots {
                 TlsRoots::Native => tls.with_native_roots(),
                 TlsRoots::Webpki => tls.with_webpki_roots(),
             };
@@ -87,7 +101,7 @@ impl Server {
     }
 }
 
-// Presets as (host, port). TLS roots are attached at resolve time.
+// Presets as (host, port). TLS roots / force-mode are attached at resolve time.
 const ECC_TESTNET: &[(&str, u16)] = &[("lightwalletd.testnet.electriccoin.co", 9067)];
 const YWALLET_MAINNET: &[(&str, u16)] =
     &[("lwd1.zcash-infra.com", 9067), ("lwd2.zcash-infra.com", 9067)];
@@ -96,7 +110,12 @@ const ZEC_ROCKS_TESTNET: &[(&str, u16)] = &[("testnet.zec.rocks", 443)];
 
 /// Resolve a server string (`ecc` | `ywallet` | `zecrocks` | `host:port[,host:port]`) for the
 /// given network into a concrete [`Server`].
-pub fn resolve(server: &str, network: Network, tls: TlsRoots) -> anyhow::Result<Server> {
+pub fn resolve(
+    server: &str,
+    network: Network,
+    roots: TlsRoots,
+    force_tls: Option<bool>,
+) -> anyhow::Result<Server> {
     let preset: Option<&[(&str, u16)]> = match (server, network) {
         ("ecc", Network::TestNetwork) => Some(ECC_TESTNET),
         ("ecc", Network::MainNetwork) => None,
@@ -104,18 +123,18 @@ pub fn resolve(server: &str, network: Network, tls: TlsRoots) -> anyhow::Result<
         ("ywallet", Network::TestNetwork) => None,
         ("zecrocks", Network::MainNetwork) => Some(ZEC_ROCKS_MAINNET),
         ("zecrocks", Network::TestNetwork) => Some(ZEC_ROCKS_TESTNET),
-        _ => return parse_host_list(server, tls),
+        _ => return parse_host_list(server, roots, force_tls),
     };
 
     match preset.and_then(|s| s.first()) {
-        Some(&(host, port)) => Ok(Server::new(Cow::Borrowed(host), port, tls)),
+        Some(&(host, port)) => Ok(Server::new(Cow::Borrowed(host), port, roots, force_tls)),
         None => Err(anyhow!(
             "lightwalletd preset '{server}' does not serve {network:?}"
         )),
     }
 }
 
-fn parse_host_list(s: &str, tls: TlsRoots) -> anyhow::Result<Server> {
+fn parse_host_list(s: &str, roots: TlsRoots, force_tls: Option<bool>) -> anyhow::Result<Server> {
     let first = s.split(',').next().unwrap_or(s);
     let (host, port_str) = first
         .rsplit_once(':')
@@ -123,7 +142,7 @@ fn parse_host_list(s: &str, tls: TlsRoots) -> anyhow::Result<Server> {
     let port: u16 = port_str
         .parse()
         .map_err(|_| anyhow!("invalid port in '{first}'"))?;
-    Ok(Server::new(Cow::Owned(host.to_string()), port, tls))
+    Ok(Server::new(Cow::Owned(host.to_string()), port, roots, force_tls))
 }
 
 #[cfg(test)]
@@ -132,25 +151,39 @@ mod tests {
 
     #[test]
     fn resolves_presets_and_custom() {
-        let s = resolve("zecrocks", Network::TestNetwork, TlsRoots::Native).unwrap();
-        assert_eq!(s.describe(), "testnet.zec.rocks:443");
-        let s = resolve("zecrocks", Network::MainNetwork, TlsRoots::Native).unwrap();
-        assert_eq!(s.describe(), "zec.rocks:443");
-        let s = resolve("127.0.0.1:9067", Network::TestNetwork, TlsRoots::Native).unwrap();
-        assert_eq!(s.describe(), "127.0.0.1:9067");
+        let s = resolve("zecrocks", Network::TestNetwork, TlsRoots::Native, None).unwrap();
+        assert_eq!(s.host.as_ref(), "testnet.zec.rocks");
+        assert!(s.use_tls());
+        let s = resolve("zecrocks", Network::MainNetwork, TlsRoots::Native, None).unwrap();
+        assert_eq!(s.host.as_ref(), "zec.rocks");
+        // localhost auto -> plaintext
+        let s = resolve("127.0.0.1:9067", Network::TestNetwork, TlsRoots::Native, None).unwrap();
         assert!(!s.use_tls());
-        assert!(resolve("ecc", Network::MainNetwork, TlsRoots::Native).is_err());
+        // forced plaintext for a co-located lightwalletd reached by service name
+        let s = resolve("lightwalletd:9067", Network::TestNetwork, TlsRoots::Native, Some(false)).unwrap();
+        assert!(!s.use_tls());
+        // forced TLS even for localhost
+        let s = resolve("127.0.0.1:443", Network::MainNetwork, TlsRoots::Native, Some(true)).unwrap();
+        assert!(s.use_tls());
+        assert!(resolve("ecc", Network::MainNetwork, TlsRoots::Native, None).is_err());
+    }
+
+    #[test]
+    fn tls_mode_parsing() {
+        assert_eq!(parse_tls_mode("auto").unwrap(), None);
+        assert_eq!(parse_tls_mode("no").unwrap(), Some(false));
+        assert_eq!(parse_tls_mode("yes").unwrap(), Some(true));
+        assert!(parse_tls_mode("maybe").is_err());
     }
 
     // --- Network integration tests (hit the public zecrocks/ECC testnet lightwalletd) ---
-    // Ignored by default so offline `cargo test` stays green; run with:
-    //   cargo test -- --include-ignored
+    // Run with: cargo test -- --include-ignored
 
     #[tokio::test]
     #[ignore = "hits testnet.zec.rocks over the network"]
     async fn testnet_zecrocks_get_latest_block() {
         use zcash_client_backend::proto::service;
-        let server = resolve("zecrocks", Network::TestNetwork, TlsRoots::Native).unwrap();
+        let server = resolve("zecrocks", Network::TestNetwork, TlsRoots::Native, None).unwrap();
         let mut client = server.connect().await.expect("connect to testnet.zec.rocks");
         let tip = client
             .get_latest_block(service::ChainSpec::default())
@@ -165,7 +198,7 @@ mod tests {
     #[ignore = "hits testnet.zec.rocks over the network"]
     async fn testnet_zecrocks_lightd_info_and_treestate() {
         use zcash_client_backend::proto::service;
-        let server = resolve("zecrocks", Network::TestNetwork, TlsRoots::Native).unwrap();
+        let server = resolve("zecrocks", Network::TestNetwork, TlsRoots::Native, None).unwrap();
         let mut client = server.connect().await.expect("connect");
 
         let info = client
@@ -175,14 +208,8 @@ mod tests {
             .into_inner();
         assert!(!info.vendor.is_empty());
         assert!(info.block_height > 2_000_000);
-        // Testnet consensus chain name.
-        assert!(
-            info.chain_name.contains("test"),
-            "unexpected chain_name {}",
-            info.chain_name
-        );
+        assert!(info.chain_name.contains("test"), "unexpected chain_name {}", info.chain_name);
 
-        // A tree state for a recent block must be retrievable and convertible.
         let h = info.block_height - 100;
         let ts = client
             .get_tree_state(service::BlockId { height: h, hash: vec![] })
@@ -197,7 +224,7 @@ mod tests {
     #[ignore = "hits zec.rocks (mainnet) over the network"]
     async fn mainnet_zecrocks_get_latest_block() {
         use zcash_client_backend::proto::service;
-        let server = resolve("zecrocks", Network::MainNetwork, TlsRoots::Native).unwrap();
+        let server = resolve("zecrocks", Network::MainNetwork, TlsRoots::Native, None).unwrap();
         let mut client = server.connect().await.expect("connect to zec.rocks");
         let tip = client
             .get_latest_block(service::ChainSpec::default())

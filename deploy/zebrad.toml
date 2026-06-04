@@ -1,0 +1,11 @@
+# Minimal Zebra config for serving lightwalletd. Testnet; for mainnet set network = "Mainnet"
+# and use RPC port 8232 (and update lightwalletd-zcash.conf + zecd.toml accordingly).
+[network]
+network = "Testnet"
+
+[rpc]
+# Expose JSON-RPC on the compose network for lightwalletd. Keep this off any public interface.
+listen_addr = "0.0.0.0:18232"
+
+[state]
+cache_dir = "/var/cache/zebra"

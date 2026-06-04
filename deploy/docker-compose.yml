@@ -1,0 +1,62 @@
+# Example self-hosted Zcash stack:  zebra (full node) -> lightwalletd -> zecd.
+#
+# Testnet by default (see comments for mainnet). The image tags are EXAMPLES - pin them to
+# releases you have verified; the zebra/lightwalletd flags can vary between versions.
+#
+# First run (zebra must sync enough for lightwalletd before zecd can init):
+#   docker compose up -d zebra lightwalletd        # let these sync
+#   docker compose run --rm zecd init --wallet default --account-name primary
+#   docker compose up -d                           # start zecd (and the rest)
+#
+# Probes:   curl localhost:9233/healthz ; curl localhost:9233/readyz
+# RPC:      curl --user zec:CHANGE-ME --data-binary '{"method":"getblockchaininfo","id":1}' localhost:18232/
+
+services:
+  zebra:
+    image: zfnd/zebra:v5.0.0                # pin to a verified release
+    restart: unless-stopped
+    command: ["zebrad", "-c", "/etc/zebra/zebrad.toml", "start"]
+    volumes:
+      - ./zebrad.toml:/etc/zebra/zebrad.toml:ro
+      - zebra-state:/var/cache/zebra
+    expose:
+      - "18232"   # JSON-RPC, reached by lightwalletd over the compose network
+
+  lightwalletd:
+    image: electriccoinco/lightwalletd:v0.4.19   # pin to a verified release
+    restart: unless-stopped
+    depends_on:
+      - zebra
+    command:
+      - "--grpc-bind-addr=0.0.0.0:9067"
+      - "--no-tls-very-insecure"               # plaintext gRPC on the internal network
+      - "--log-file=/dev/stdout"
+      - "--zcash-conf-path=/etc/lightwalletd/zcash.conf"
+      - "--data-dir=/var/lib/lightwalletd"
+    volumes:
+      - ./lightwalletd-zcash.conf:/etc/lightwalletd/zcash.conf:ro
+      - lwd-data:/var/lib/lightwalletd
+    expose:
+      - "9067"
+
+  zecd:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    depends_on:
+      - lightwalletd
+    command: ["--datadir=/var/lib/zecd", "--conf=/etc/zecd/zecd.toml"]
+    environment:
+      - RUST_LOG=info
+    volumes:
+      - ./zecd.toml:/etc/zecd/zecd.toml:ro
+      - zecd-data:/var/lib/zecd
+    ports:
+      - "18232:18232"   # Bitcoin-style JSON-RPC
+      - "9233:9233"     # health: /healthz /readyz /status
+
+volumes:
+  zebra-state:
+  lwd-data:
+  zecd-data:

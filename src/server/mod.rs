@@ -89,14 +89,29 @@ async fn handle(
     }
 }
 
-/// Validate and dispatch one request, returning `(envelope, is_error)`.
+/// Validate and dispatch one request, returning `(envelope, is_error)`. Emits one structured
+/// log line per call (debug on success, info on error) with method, wallet, and latency.
 async fn process_single(state: &AppState, wallet: Option<&str>, v: Value) -> (Value, bool) {
     match RpcRequest::from_value(v) {
-        Err((id, err)) => (jsonrpc::error(id, &err), true),
-        Ok(req) => match rpc::dispatch(state, wallet, &req).await {
-            Ok(result) => (jsonrpc::success(req.id, result), false),
-            Err(err) => (jsonrpc::error(req.id, &err), true),
-        },
+        Err((id, err)) => {
+            tracing::debug!(code = err.code, message = %err.message, "rpc request rejected");
+            (jsonrpc::error(id, &err), true)
+        }
+        Ok(req) => {
+            let start = std::time::Instant::now();
+            let result = rpc::dispatch(state, wallet, &req).await;
+            let elapsed_ms = start.elapsed().as_millis() as u64;
+            match result {
+                Ok(value) => {
+                    tracing::debug!(method = %req.method, wallet = wallet.unwrap_or("default"), elapsed_ms, "rpc ok");
+                    (jsonrpc::success(req.id, value), false)
+                }
+                Err(err) => {
+                    tracing::info!(method = %req.method, wallet = wallet.unwrap_or("default"), elapsed_ms, code = err.code, message = %err.message, "rpc error");
+                    (jsonrpc::error(req.id, &err), true)
+                }
+            }
+        }
     }
 }
 
@@ -156,10 +171,18 @@ mod tests {
                 server: "zecrocks".into(),
                 connection: "direct".into(),
                 tls_roots: crate::lightwalletd::TlsRoots::Native,
+                force_tls: None,
             },
             rpc: rpc.clone(),
             keys: KeysConfig { age_identity: None, auto_unlock: true },
             sync: SyncConfig { interval_secs: 20 },
+            health: crate::config::HealthConfig {
+                enabled: false,
+                bind: "127.0.0.1".parse().unwrap(),
+                port: 9233,
+                ready_progress: 0.999,
+            },
+            log: crate::config::LogConfig { level: "info".into(), format: "text".into() },
         };
         AppState {
             auth: Authenticator::from_config(&rpc).unwrap(),

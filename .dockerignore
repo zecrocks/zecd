@@ -1,0 +1,10 @@
+target
+.git
+**/*.sqlite
+**/*.sqlite-wal
+**/*.sqlite-shm
+**/blocks
+zecd-data
+data
+*.cookie
+identity.txt

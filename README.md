@@ -73,6 +73,7 @@ dir = "./data/default"
 server = "zecrocks"              # "ecc" | "ywallet" | "zecrocks" | "host:port"
 connection = "direct"
 tls_roots = "native"            # "native" (OS store, honors SSL_CERT_FILE) | "webpki"
+tls = "auto"                    # "auto" (TLS for remote, plaintext for localhost) | "yes" | "no"
 
 [rpc]
 bind = "127.0.0.1"
@@ -87,6 +88,16 @@ auto_unlock = true               # decrypt the seed at startup so sends need no 
 
 [sync]
 interval_secs = 20
+
+[log]
+level = "info"                   # tracing filter; RUST_LOG overrides
+format = "text"                  # "text" | "json" (structured, for log aggregation)
+
+[health]
+enabled = true
+bind = "127.0.0.1"               # set 0.0.0.0 for Kubernetes/LB probes
+port = 9233
+ready_progress = 0.999           # /readyz is 200 once scan progress reaches this
 ```
 
 ## Supported RPC methods
@@ -106,6 +117,72 @@ interval_secs = 20
 
 Multiwallet is addressed bitcoind-style via `POST /wallet/<name>`; the default wallet is used at
 `POST /`.
+
+## Addresses
+
+`getnewaddress` returns a fresh **Orchard-only Unified Address** (`u1…` / `utest1…`) on every
+call. These are **diversified addresses of a single account**, not new derivation paths: the
+wallet has one ZIP-32 account (`m/32'/coin_type'/account'`), and each address is a different
+*diversifier index* of that account's Orchard key (`UnifiedAddressRequest::ORCHARD` →
+`account.uivk().find_address(j, …)`). librustzcash advances to the next unused diversifier
+(starting from a timestamp-derived index, incrementing past any collision) and persists it in the
+wallet's `addresses` table, so each call yields a new, unused address - and all of them receive
+into the same account and are spendable by the same key (ZIP-316 unified addresses + ZIP-32
+diversification).
+
+## Logging
+
+zecd logs via `tracing`. The level comes from `[log] level` and is overridden by the standard
+`RUST_LOG` env var (e.g. `RUST_LOG=debug` or `RUST_LOG=zecd=debug,zcash_client_backend=info`). Each
+RPC call emits a structured event - `debug` on success (`method`, `wallet`, `elapsed_ms`), `info`
+on error (adds `code`, `message`) - and sync/connection lifecycle events log at `info`. Set
+`[log] format = "json"` for structured JSON lines suitable for Loki/CloudWatch/Elastic.
+
+## Health & readiness
+
+With `[health] enabled` (default), zecd serves unauthenticated probes on a separate port
+(`[health] port`, default 9233):
+
+- `GET /healthz` - liveness: `200 ok` while the process is running.
+- `GET /readyz` - readiness: `200` once every wallet is connected to lightwalletd and synced to
+  `[health] ready_progress`; otherwise `503`. Body is JSON with per-wallet detail.
+- `GET /status` - JSON snapshot of per-wallet sync state.
+
+Set `[health] bind = "0.0.0.0"` so a Kubernetes kubelet / load balancer can reach the probes. The
+health server starts after wallets load, so cover the brief prover-init at boot with a
+`startupProbe` / `initialDelaySeconds`.
+
+## Bitcoin Core conformance
+
+zecd matches Bitcoin Core's method names, response field names/types, the JSON-RPC 1.0 envelope
+(`{"result","error","id"}`), HTTP 500-with-error-body / 401 semantics, decimal (8-dp) amounts, and
+error codes (`protocol.h`: e.g. `-5`, `-6`, `-13`, `-32601`). This is verified two ways:
+
+- **`scripts/conformance.py`** drives a running daemon with the *same client logic
+  `python-bitcoinrpc` uses* (`AuthServiceProxy`): Basic auth, the 1.0 envelope, amounts decoded as
+  `decimal.Decimal` (asserting no float drift), `JSONRPCException` raised with the right code, and
+  batching. (Validated live against testnet: 49/49.) `scripts/rpc_smoke.py` is a stdlib-only variant.
+- **`cargo test`** covers the framing/auth/HTTP-status behavior with offline unit + HTTP
+  integration tests, and (with `--include-ignored`) live lightwalletd calls.
+
+Intentional divergences are listed under *Compatibility boundary* below.
+
+## Docker / self-hosted stack
+
+`deploy/docker-compose.yml` runs the full **zebra → lightwalletd → zecd** stack (testnet by
+default); `Dockerfile` builds the zecd image.
+
+```sh
+cd deploy
+docker compose up -d zebra lightwalletd     # let these sync first
+docker compose run --rm zecd init --wallet default --account-name primary
+docker compose up -d
+curl localhost:9233/readyz
+curl --user zec:CHANGE-ME --data-binary '{"method":"getblockchaininfo","id":1}' localhost:18232/
+```
+
+Image tags in the compose are examples - pin zebra/lightwalletd to releases you've verified. Edit
+`deploy/*.toml` / `*.conf` for mainnet (network, ports, and the `zecd.toml` RPC password).
 
 ## Compatibility boundary
 

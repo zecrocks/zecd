@@ -46,6 +46,7 @@ pub async fn run(config: &AppConfig, args: &InitArgs) -> anyhow::Result<()> {
         &config.lightwalletd.server,
         network,
         config.lightwalletd.tls_roots,
+        config.lightwalletd.force_tls,
     )?;
     let mut client = server
         .connect()

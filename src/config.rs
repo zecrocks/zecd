@@ -28,6 +28,26 @@ pub struct AppConfig {
     pub rpc: RpcConfig,
     pub keys: KeysConfig,
     pub sync: SyncConfig,
+    pub health: HealthConfig,
+    pub log: LogConfig,
+}
+
+#[derive(Debug, Clone)]
+pub struct HealthConfig {
+    /// Serve liveness/readiness probes on a separate, unauthenticated HTTP port.
+    pub enabled: bool,
+    pub bind: IpAddr,
+    pub port: u16,
+    /// Scan progress at/above which `/readyz` reports ready (0..=1).
+    pub ready_progress: f64,
+}
+
+#[derive(Debug, Clone)]
+pub struct LogConfig {
+    /// Default tracing filter (overridden by `RUST_LOG`).
+    pub level: String,
+    /// "text" (human) or "json" (structured, for log aggregation).
+    pub format: String,
 }
 
 #[derive(Debug, Clone)]
@@ -44,6 +64,8 @@ pub struct LightwalletdConfig {
     pub connection: String,
     /// TLS root certificates to trust (`native` or `webpki`).
     pub tls_roots: crate::lightwalletd::TlsRoots,
+    /// Force TLS on/off; `None` = auto (TLS for remote hosts, plaintext for localhost).
+    pub force_tls: Option<bool>,
 }
 
 #[derive(Debug, Clone)]
@@ -101,6 +123,24 @@ struct ConfigFile {
     rpc: Option<RpcFile>,
     keys: Option<KeysFile>,
     sync: Option<SyncFile>,
+    health: Option<HealthFile>,
+    log: Option<LogFile>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct HealthFile {
+    enabled: Option<bool>,
+    bind: Option<String>,
+    port: Option<u16>,
+    ready_progress: Option<f64>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LogFile {
+    level: Option<String>,
+    format: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -115,6 +155,7 @@ struct LightwalletdFile {
     server: Option<String>,
     connection: Option<String>,
     tls_roots: Option<String>,
+    tls: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -282,10 +323,15 @@ impl AppConfig {
             server: None,
             connection: None,
             tls_roots: None,
+            tls: None,
         });
         let tls_roots = match lwd_file.tls_roots {
             Some(s) => crate::lightwalletd::TlsRoots::parse(&s)?,
             None => crate::lightwalletd::TlsRoots::default(),
+        };
+        let force_tls = match lwd_file.tls {
+            Some(s) => crate::lightwalletd::parse_tls_mode(&s)?,
+            None => None,
         };
         let lightwalletd = LightwalletdConfig {
             server: cli
@@ -295,6 +341,7 @@ impl AppConfig {
                 .unwrap_or_else(|| DEFAULT_LIGHTWALLETD.to_string()),
             connection: lwd_file.connection.unwrap_or_else(|| "direct".to_string()),
             tls_roots,
+            force_tls,
         };
 
         let rpc_file = file.rpc.unwrap_or(RpcFile {
@@ -344,6 +391,29 @@ impl AppConfig {
             interval_secs: sync_file.interval_secs.unwrap_or(20),
         };
 
+        let health_file = file.health.unwrap_or(HealthFile {
+            enabled: None,
+            bind: None,
+            port: None,
+            ready_progress: None,
+        });
+        let health = HealthConfig {
+            enabled: health_file.enabled.unwrap_or(true),
+            bind: health_file
+                .bind
+                .unwrap_or_else(|| "127.0.0.1".to_string())
+                .parse()
+                .context("parsing health bind address")?,
+            port: health_file.port.unwrap_or(9233),
+            ready_progress: health_file.ready_progress.unwrap_or(0.999),
+        };
+
+        let log_file = file.log.unwrap_or(LogFile { level: None, format: None });
+        let log = LogConfig {
+            level: log_file.level.unwrap_or_else(|| "info".to_string()),
+            format: log_file.format.unwrap_or_else(|| "text".to_string()),
+        };
+
         Ok(AppConfig {
             network,
             datadir,
@@ -353,6 +423,8 @@ impl AppConfig {
             rpc,
             keys,
             sync,
+            health,
+            log,
         })
     }
 }
