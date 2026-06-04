@@ -145,7 +145,16 @@ cargo test -- --include-ignored
 # End-to-end RPC smoke test against a running, synced daemon (stdlib-only, validates the
 # bitcoind wire format, amounts, and error codes over HTTP):
 python3 scripts/rpc_smoke.py --url http://127.0.0.1:18232/ --user u --password p
+
+# Spending smoke test (manual; needs two wallets, the default one funded). Validates the
+# walletlock/walletpassphrase gate, sendtoaddress, and sendmany by broadcasting real txs:
+python3 scripts/rpc_send_smoke.py --send-timeout 180
 ```
+
+All wallet RPCs have been exercised against the live public testnet (zecrocks): balances,
+addresses/labels, history (`listtransactions`/`gettransaction` incl. `hex`), `listunspent`,
+the `walletlock`/`walletpassphrase` gate, and real Orchard `sendtoaddress`/`sendmany`
+broadcasts (receiving a note and spending it across two wallets).
 
 ## Security
 
