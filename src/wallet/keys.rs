@@ -9,9 +9,9 @@ use std::path::Path;
 
 use secrecy::{ExposeSecret, SecretVec};
 use zcash_keys::keys::UnifiedSpendingKey;
-use zcash_protocol::consensus::Network;
 
 use crate::error::RpcError;
+use crate::network::ZNetwork;
 use crate::wallet::store::WalletStore;
 
 /// Holds the decrypted seed (when unlocked). Sending requires this to be unlocked.
@@ -45,7 +45,7 @@ impl SeedKeeper {
     /// "unlock needed" error (-13) if the seed is not loaded.
     pub fn derive_usk(
         &self,
-        network: Network,
+        network: ZNetwork,
         account_index: zip32::AccountId,
     ) -> Result<UnifiedSpendingKey, RpcError> {
         let seed = self.seed.as_ref().ok_or_else(RpcError::unlock_needed)?;

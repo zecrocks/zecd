@@ -9,7 +9,9 @@ use anyhow::anyhow;
 use bip0039::{English, Mnemonic};
 use secrecy::{ExposeSecret, SecretVec, Zeroize};
 use serde::{Deserialize, Serialize};
-use zcash_protocol::consensus::{BlockHeight, Network, NetworkUpgrade, Parameters};
+use zcash_protocol::consensus::{BlockHeight, NetworkUpgrade, Parameters};
+
+use crate::network::ZNetwork;
 
 const KEYS_FILE: &str = "keys.toml";
 
@@ -19,7 +21,7 @@ pub fn keys_path(wallet_dir: &Path) -> PathBuf {
 
 /// Parsed `keys.toml`.
 pub struct WalletStore {
-    pub network: Network,
+    pub network: ZNetwork,
     pub birthday: BlockHeight,
     seed_ciphertext: Option<String>,
 }
@@ -29,21 +31,6 @@ struct StoreEncoding {
     mnemonic: Option<String>,
     network: Option<String>,
     birthday: Option<u32>,
-}
-
-fn network_name(n: Network) -> &'static str {
-    match n {
-        Network::MainNetwork => "main",
-        Network::TestNetwork => "test",
-    }
-}
-
-fn parse_network(s: &str) -> anyhow::Result<Network> {
-    match s.trim() {
-        "main" => Ok(Network::MainNetwork),
-        "test" => Ok(Network::TestNetwork),
-        other => Err(anyhow!("unsupported network in keys.toml: {other}")),
-    }
 }
 
 impl WalletStore {
@@ -58,7 +45,7 @@ impl WalletStore {
         recipients: impl Iterator<Item = &'a dyn age::Recipient>,
         mnemonic: &Mnemonic,
         birthday: BlockHeight,
-        network: Network,
+        network: ZNetwork,
     ) -> anyhow::Result<()> {
         std::fs::create_dir_all(wallet_dir)?;
         let path = keys_path(wallet_dir);
@@ -70,7 +57,7 @@ impl WalletStore {
 
         let encoding = StoreEncoding {
             mnemonic: Some(encrypt_mnemonic(recipients, mnemonic)?),
-            network: Some(network_name(network).to_string()),
+            network: Some(network.name().to_string()),
             birthday: Some(u32::from(birthday)),
         };
         let text = toml::to_string(&encoding).map_err(|_| anyhow!("serializing keys.toml"))?;
@@ -89,9 +76,9 @@ impl WalletStore {
         let network = encoding
             .network
             .as_deref()
-            .map(parse_network)
+            .map(ZNetwork::parse)
             .transpose()?
-            .unwrap_or(Network::TestNetwork);
+            .unwrap_or(ZNetwork::Test);
 
         let birthday = encoding.birthday.map(BlockHeight::from).unwrap_or_else(|| {
             network

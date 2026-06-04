@@ -12,11 +12,11 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 
 use tokio::sync::{mpsc, oneshot, watch};
-use zcash_protocol::consensus::Network;
 use zcash_protocol::TxId;
 use zip321::TransactionRequest;
 
 use crate::error::RpcError;
+use crate::network::ZNetwork;
 
 /// A snapshot of sync state, published by the actor and read by blockchain/wallet RPCs.
 #[derive(Clone, Debug, Default)]
@@ -73,7 +73,7 @@ pub enum WalletCommand {
 pub struct WalletHandle {
     pub name: String,
     pub dir: PathBuf,
-    pub network: Network,
+    pub network: ZNetwork,
     cmd_tx: mpsc::Sender<WalletCommand>,
     status_rx: watch::Receiver<SyncStatus>,
 }
@@ -158,7 +158,7 @@ impl WalletRegistry {
 pub(crate) fn make_handle(
     name: String,
     dir: PathBuf,
-    network: Network,
+    network: ZNetwork,
     cmd_tx: mpsc::Sender<WalletCommand>,
     status_rx: watch::Receiver<SyncStatus>,
 ) -> WalletHandle {

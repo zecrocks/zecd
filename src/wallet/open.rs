@@ -9,15 +9,16 @@ use zcash_client_sqlite::chain::BlockMeta;
 use zcash_client_sqlite::util::SystemClock;
 use zcash_client_sqlite::wallet::init::init_wallet_db;
 use zcash_client_sqlite::{FsBlockDb, WalletDb};
-use zcash_protocol::consensus::Network;
+
+use crate::network::ZNetwork;
 
 const DATA_DB: &str = "data.sqlite";
 const BLOCKS_FOLDER: &str = "blocks";
 
 /// A read/write wallet handle (uses a real clock + OS RNG, required for writes).
-pub type WriteDb = WalletDb<rusqlite::Connection, Network, SystemClock, OsRng>;
+pub type WriteDb = WalletDb<rusqlite::Connection, ZNetwork, SystemClock, OsRng>;
 /// A read-only wallet handle (no clock/RNG needed), as used by devtool's read paths.
-pub type ReadDb = WalletDb<rusqlite::Connection, Network, (), ()>;
+pub type ReadDb = WalletDb<rusqlite::Connection, ZNetwork, (), ()>;
 
 pub fn data_db_path(wallet_dir: &Path) -> PathBuf {
     wallet_dir.join(DATA_DB)
@@ -28,7 +29,7 @@ pub fn block_path(wallet_dir: &Path, meta: &BlockMeta) -> PathBuf {
 }
 
 /// Open the wallet DB for writing (sync, sends, address generation).
-pub fn open_write(network: Network, wallet_dir: &Path) -> anyhow::Result<WriteDb> {
+pub fn open_write(network: ZNetwork, wallet_dir: &Path) -> anyhow::Result<WriteDb> {
     Ok(WalletDb::for_path(
         data_db_path(wallet_dir),
         network,
@@ -38,7 +39,7 @@ pub fn open_write(network: Network, wallet_dir: &Path) -> anyhow::Result<WriteDb
 }
 
 /// Open the wallet DB read-only (balances, history); short-lived per request.
-pub fn open_read(network: Network, wallet_dir: &Path) -> anyhow::Result<ReadDb> {
+pub fn open_read(network: ZNetwork, wallet_dir: &Path) -> anyhow::Result<ReadDb> {
     Ok(WalletDb::for_path(
         data_db_path(wallet_dir),
         network,
@@ -53,7 +54,7 @@ pub fn open_fsblockdb(wallet_dir: &Path) -> anyhow::Result<FsBlockDb> {
 }
 
 /// Initialize both the wallet DB and the block-cache DB (idempotent migrations).
-pub fn init_dbs(network: Network, wallet_dir: &Path) -> anyhow::Result<WriteDb> {
+pub fn init_dbs(network: ZNetwork, wallet_dir: &Path) -> anyhow::Result<WriteDb> {
     std::fs::create_dir_all(wallet_dir)?;
     enable_wal(wallet_dir)?;
     let mut db_cache = open_fsblockdb(wallet_dir)?;

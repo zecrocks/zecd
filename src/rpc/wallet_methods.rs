@@ -325,7 +325,7 @@ pub fn listunspent(state: &AppState, wallet: Option<&str>, req: &RpcRequest) -> 
     Ok(Value::Array(arr))
 }
 
-fn build_payment(network: &zcash_protocol::consensus::Network, addr: &str, amount: &Value) -> Result<Payment, RpcError> {
+fn build_payment(network: &crate::network::ZNetwork, addr: &str, amount: &Value) -> Result<Payment, RpcError> {
     let zaddr = crate::address::parse_recipient_on_network(network, addr)?;
     let zats = value_to_zats(amount)?;
     Ok(Payment::without_memo(zaddr, zats))

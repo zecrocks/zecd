@@ -25,8 +25,9 @@ use zcash_client_backend::proto::service::{
 };
 use zcash_client_sqlite::{chain::BlockMeta, FsBlockDb, FsBlockDbError};
 use zcash_primitives::merkle_tree::HashSer;
-use zcash_protocol::consensus::{BlockHeight, Network};
+use zcash_protocol::consensus::BlockHeight;
 
+use crate::network::ZNetwork;
 use crate::wallet::open::{block_path, WriteDb};
 
 const BATCH_SIZE: u32 = 10_000;
@@ -157,7 +158,7 @@ fn delete_cached_blocks(wallet_dir: &Path, block_meta: Vec<BlockMeta>) {
 /// Scan a downloaded range; handle continuity (reorg) errors by rewinding. Returns whether
 /// the suggested scan ranges changed materially.
 fn scan_blocks(
-    params: &Network,
+    params: &ZNetwork,
     wallet_dir: &Path,
     db_cache: &mut FsBlockDb,
     db_data: &mut WriteDb,
@@ -216,7 +217,7 @@ fn scan_blocks(
 /// call again), `false` if there are no pending scan ranges (wallet is caught up).
 pub async fn sync_one_batch(
     client: &mut CompactTxStreamerClient<Channel>,
-    params: &Network,
+    params: &ZNetwork,
     wallet_dir: &Path,
     db_cache: &mut FsBlockDb,
     db_data: &mut WriteDb,
