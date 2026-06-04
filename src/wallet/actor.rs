@@ -403,58 +403,65 @@ impl WalletActor {
             .ok_or_else(|| RpcError::wallet("Cannot spend from a view-only account"))?;
         let usk = self.seed.derive_usk(self.network, account_index)?;
 
-        let change_strategy = MultiOutputChangeStrategy::new(
-            StandardFeeRule::Zip317,
-            None,
-            ShieldedProtocol::Orchard,
-            DustOutputPolicy::default(),
-            SplitPolicy::with_min_output_value(
-                NonZeroUsize::new(TARGET_NOTE_COUNT).expect("nonzero"),
-                Zatoshis::from_u64(MIN_SPLIT_OUTPUT_VALUE).expect("valid"),
-            ),
-        );
-        let input_selector = GreedyInputSelector::new();
+        // Proposal building + proving is CPU-heavy (Sapling/Orchard proofs take seconds).
+        // Run it under `block_in_place` so it doesn't stall the async runtime, and so the
+        // single send doesn't block the actor thread from being cooperatively yielded.
+        let net = self.network;
+        let account_id = self.account_id;
+        let prover = &self.prover;
+        let db = &mut self.db_data;
+        let (txid, raw): (TxId, service::RawTransaction) =
+            tokio::task::block_in_place(move || -> Result<_, RpcError> {
+                let change_strategy = MultiOutputChangeStrategy::new(
+                    StandardFeeRule::Zip317,
+                    None,
+                    ShieldedProtocol::Orchard,
+                    DustOutputPolicy::default(),
+                    SplitPolicy::with_min_output_value(
+                        NonZeroUsize::new(TARGET_NOTE_COUNT).expect("nonzero"),
+                        Zatoshis::from_u64(MIN_SPLIT_OUTPUT_VALUE).expect("valid"),
+                    ),
+                );
+                let input_selector = GreedyInputSelector::new();
 
-        let proposal = propose_transfer(
-            &mut self.db_data,
-            &self.network,
-            self.account_id,
-            &input_selector,
-            &change_strategy,
-            request,
-            ConfirmationsPolicy::default(),
-        )
-        .map_err(|e: crate::error::ProposalError| classify_err(e))?;
+                let proposal = propose_transfer(
+                    db,
+                    &net,
+                    account_id,
+                    &input_selector,
+                    &change_strategy,
+                    request,
+                    ConfirmationsPolicy::default(),
+                )
+                .map_err(|e: crate::error::ProposalError| classify_err(e))?;
 
-        let txids = create_proposed_transactions(
-            &mut self.db_data,
-            &self.network,
-            &self.prover,
-            &self.prover,
-            &SpendingKeys::from_unified_spending_key(usk),
-            OvkPolicy::Sender,
-            &proposal,
-        )
-        .map_err(|e: crate::error::ProposalError| classify_err(e))?;
+                let txids = create_proposed_transactions(
+                    db,
+                    &net,
+                    prover,
+                    prover,
+                    &SpendingKeys::from_unified_spending_key(usk),
+                    OvkPolicy::Sender,
+                    &proposal,
+                )
+                .map_err(|e: crate::error::ProposalError| classify_err(e))?;
 
-        if txids.len() > 1 {
-            return Err(RpcError::wallet(
-                "multi-transaction proposals are not supported",
-            ));
-        }
-        let txid = *txids.first();
+                if txids.len() > 1 {
+                    return Err(RpcError::wallet(
+                        "multi-transaction proposals are not supported",
+                    ));
+                }
+                let txid = *txids.first();
 
-        let raw = {
-            let tx = self
-                .db_data
-                .get_transaction(txid)
-                .map_err(|e| RpcError::database(e.to_string()))?
-                .ok_or_else(|| RpcError::wallet("created transaction not found in wallet"))?;
-            let mut raw_tx = service::RawTransaction::default();
-            tx.write(&mut raw_tx.data)
-                .map_err(|e| RpcError::misc(format!("failed to serialize transaction: {e}")))?;
-            raw_tx
-        };
+                let tx = db
+                    .get_transaction(txid)
+                    .map_err(|e| RpcError::database(e.to_string()))?
+                    .ok_or_else(|| RpcError::wallet("created transaction not found in wallet"))?;
+                let mut raw_tx = service::RawTransaction::default();
+                tx.write(&mut raw_tx.data)
+                    .map_err(|e| RpcError::misc(format!("failed to serialize transaction: {e}")))?;
+                Ok((txid, raw_tx))
+            })?;
 
         if self.client.is_none() {
             self.connect()
