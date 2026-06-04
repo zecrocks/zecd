@@ -2,13 +2,16 @@
 //! sync writer (SQLite WAL gives consistent snapshots).
 #![allow(dead_code)] // some TxRecord fields are surfaced selectively by RPC methods
 
+use std::collections::HashMap;
 use std::path::Path;
 
-use rusqlite::{named_params, Connection};
+use anyhow::anyhow;
+use rusqlite::{named_params, Connection, OptionalExtension};
 use uuid::Uuid;
 use zcash_client_backend::data_api::wallet::ConfirmationsPolicy;
-use zcash_client_backend::data_api::WalletRead;
+use zcash_client_backend::data_api::{InputSource, WalletRead};
 use zcash_protocol::consensus::Network;
+use zcash_protocol::ShieldedProtocol;
 
 use crate::wallet::open::{data_db_path, open_read};
 
@@ -74,6 +77,17 @@ pub struct TxRecord {
     pub block_time: Option<i64>,
     pub expired_unmined: bool,
     pub outputs: Vec<TxOutputRecord>,
+    /// Raw serialized transaction bytes, when available (populated by `get_transaction`).
+    pub raw: Option<Vec<u8>>,
+}
+
+/// An unspent Orchard note, for `listunspent`.
+#[derive(Debug, Clone)]
+pub struct UnspentNote {
+    pub txid: String,
+    pub vout: u32,
+    pub value: u64,
+    pub mined_height: Option<u32>,
 }
 
 fn open_conn(wallet_dir: &Path) -> anyhow::Result<Connection> {
@@ -153,6 +167,7 @@ pub fn list_transactions(wallet_dir: &Path) -> anyhow::Result<Vec<TxRecord>> {
                 block_time: row.get("block_time")?,
                 expired_unmined: row.get("expired_unmined")?,
                 outputs: Vec::new(),
+                raw: None,
             },
         ))
     })?;
@@ -195,8 +210,76 @@ pub fn get_transaction(wallet_dir: &Path, txid_hex: &str) -> anyhow::Result<Opti
         block_time: row.get("block_time")?,
         expired_unmined: row.get("expired_unmined")?,
         outputs: Vec::new(),
+        raw: None,
     };
     drop(rows);
     rec.outputs = load_outputs(&conn, &txid)?;
+    // Fetch the raw transaction bytes for `gettransaction.hex`, if stored.
+    rec.raw = conn
+        .query_row(
+            "SELECT raw FROM transactions WHERE txid = :txid",
+            named_params! {":txid": &internal},
+            |row| row.get::<_, Option<Vec<u8>>>(0),
+        )
+        .optional()?
+        .flatten();
     Ok(Some(rec))
+}
+
+/// List unspent Orchard notes for `listunspent` (with mined height for confirmations).
+pub fn list_unspent(network: Network, wallet_dir: &Path) -> anyhow::Result<Vec<UnspentNote>> {
+    let db = open_read(network, wallet_dir)?;
+    let Some(chain_height) = db.chain_height()? else {
+        return Ok(vec![]);
+    };
+    let target_height = (chain_height + 1).into();
+
+    // Map txid (display hex) -> mined height for computing confirmations.
+    let mut mined: HashMap<String, Option<u32>> = HashMap::new();
+    {
+        let conn = open_conn(wallet_dir)?;
+        let mut stmt = conn.prepare("SELECT txid, mined_height FROM v_transactions")?;
+        let rows = stmt.query_map([], |r| {
+            Ok((r.get::<_, Vec<u8>>(0)?, r.get::<_, Option<u32>>(1)?))
+        })?;
+        for row in rows {
+            let (txid, mh) = row?;
+            mined.insert(txid_display(&txid), mh);
+        }
+    }
+
+    let mut out = Vec::new();
+    for account in db.get_account_ids()? {
+        let notes = db.select_unspent_notes(account, &[ShieldedProtocol::Orchard], target_height, &[])?;
+        for note in notes.orchard() {
+            let txid = note.txid().to_string();
+            let value = note.note_value().map_err(|e| anyhow!("note value: {e:?}"))?.into_u64();
+            let mined_height = mined.get(&txid).copied().flatten();
+            out.push(UnspentNote {
+                vout: note.output_index() as u32,
+                txid,
+                value,
+                mined_height,
+            });
+        }
+    }
+    Ok(out)
+}
+
+/// Whether `addr` is one of the wallet's own generated addresses (for `getaddressinfo.ismine`).
+pub fn is_mine(network: Network, wallet_dir: &Path, addr: &str) -> bool {
+    let Ok(db) = open_read(network, wallet_dir) else {
+        return false;
+    };
+    let Ok(ids) = db.get_account_ids() else {
+        return false;
+    };
+    for account in ids {
+        if let Ok(list) = db.list_addresses(account) {
+            if list.iter().any(|info| info.address().encode(&network) == addr) {
+                return true;
+            }
+        }
+    }
+    false
 }

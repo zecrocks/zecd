@@ -42,6 +42,8 @@ pub struct LightwalletdConfig {
     pub server: String,
     /// `direct` | `tor` | `socks5://host:port`.
     pub connection: String,
+    /// TLS root certificates to trust (`native` or `webpki`).
+    pub tls_roots: crate::lightwalletd::TlsRoots,
 }
 
 #[derive(Debug, Clone)]
@@ -112,6 +114,7 @@ struct WalletFile {
 struct LightwalletdFile {
     server: Option<String>,
     connection: Option<String>,
+    tls_roots: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -278,7 +281,12 @@ impl AppConfig {
         let lwd_file = file.lightwalletd.unwrap_or(LightwalletdFile {
             server: None,
             connection: None,
+            tls_roots: None,
         });
+        let tls_roots = match lwd_file.tls_roots {
+            Some(s) => crate::lightwalletd::TlsRoots::parse(&s)?,
+            None => crate::lightwalletd::TlsRoots::default(),
+        };
         let lightwalletd = LightwalletdConfig {
             server: cli
                 .server
@@ -286,6 +294,7 @@ impl AppConfig {
                 .or(lwd_file.server)
                 .unwrap_or_else(|| DEFAULT_LIGHTWALLETD.to_string()),
             connection: lwd_file.connection.unwrap_or_else(|| "direct".to_string()),
+            tls_roots,
         };
 
         let rpc_file = file.rpc.unwrap_or(RpcFile {
@@ -320,7 +329,13 @@ impl AppConfig {
             auto_unlock: None,
         });
         let keys = KeysConfig {
-            age_identity: cli.age_identity.clone().or(keys_file.age_identity),
+            // Default to <datadir>/identity.txt, matching where `zecd init` writes the
+            // identity, so auto-unlock works out of the box.
+            age_identity: cli
+                .age_identity
+                .clone()
+                .or(keys_file.age_identity)
+                .or_else(|| Some(datadir.join("identity.txt"))),
             auto_unlock: keys_file.auto_unlock.unwrap_or(true),
         };
 

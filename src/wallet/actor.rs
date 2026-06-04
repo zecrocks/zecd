@@ -41,6 +41,24 @@ use crate::wallet::{labels, make_handle, store, SyncStatus, WalletCommand, Walle
 const TARGET_NOTE_COUNT: usize = 4;
 const MIN_SPLIT_OUTPUT_VALUE: u64 = 10_000_000; // 0.1 ZEC
 
+thread_local! {
+    /// Set while we deliberately `catch_unwind` librustzcash's progress estimator, so the
+    /// panic hook can stay quiet for that (expected, handled) panic only.
+    static SILENCE_PROGRESS_PANIC: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Install a panic hook that suppresses the (caught) librustzcash progress-estimator panic
+/// while leaving all other panics fully reported. Call once at startup.
+pub fn install_panic_hook() {
+    let default = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        if SILENCE_PROGRESS_PANIC.with(|f| f.get()) {
+            return;
+        }
+        default(info);
+    }));
+}
+
 /// Parameters needed to launch a wallet actor.
 pub struct ActorConfig {
     pub name: String,
@@ -244,7 +262,8 @@ impl WalletActor {
         self.client = Some(client);
         let client = self.client.as_mut().expect("just set");
         engine::update_subtree_roots(client, &mut self.db_data).await?;
-        self.update_status();
+        // NB: do not call `update_status()` here - `get_wallet_summary`'s progress estimator
+        // underflows if invoked before the chain tip is set (see `refresh_tip`).
         Ok(())
     }
 
@@ -295,21 +314,34 @@ impl WalletActor {
     }
 
     fn update_status(&self) {
-        let (fully_scanned, scan_progress, scanning) =
-            match self.db_data.get_wallet_summary(ConfirmationsPolicy::default()) {
-                Ok(Some(s)) => {
-                    let scanned = Some(u32::from(s.fully_scanned_height()));
-                    let scan = s.progress().scan();
-                    let denom = *scan.denominator();
-                    let ratio = if denom == 0 {
-                        1.0
-                    } else {
-                        *scan.numerator() as f64 / denom as f64
-                    };
-                    (scanned, ratio, ratio < 1.0)
-                }
-                _ => (None, 0.0, true),
-            };
+        // `get_wallet_summary`'s subtree progress estimator can underflow before the chain
+        // tip's tree size is known (it panics in debug, wraps in release at this librustzcash
+        // rev). Only call it once we have a tip, and isolate it with `catch_unwind` so a
+        // progress-estimation panic can never take down the actor.
+        let summary = if self.tip_height.is_some() {
+            SILENCE_PROGRESS_PANIC.with(|f| f.set(true));
+            let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                self.db_data.get_wallet_summary(ConfirmationsPolicy::default())
+            }));
+            SILENCE_PROGRESS_PANIC.with(|f| f.set(false));
+            r.ok().and_then(|r| r.ok()).flatten()
+        } else {
+            None
+        };
+        let (fully_scanned, scan_progress, scanning) = match summary {
+            Some(s) => {
+                let scanned = Some(u32::from(s.fully_scanned_height()));
+                let scan = s.progress().scan();
+                let denom = *scan.denominator();
+                let ratio = if denom == 0 {
+                    1.0
+                } else {
+                    (*scan.numerator() as f64 / denom as f64).clamp(0.0, 1.0)
+                };
+                (scanned, ratio, ratio < 1.0)
+            }
+            None => (None, 0.0, true),
+        };
 
         let status = SyncStatus {
             connected: self.client.is_some(),

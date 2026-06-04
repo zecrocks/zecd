@@ -82,11 +82,11 @@ pub fn getaddressinfo(
     let handle = state.registry.get(wallet)?;
     let v = crate::address::validate(&handle.network, addr);
     let label = labels::get_label(&handle.dir, addr).ok().flatten();
+    let ismine = v.is_valid && read::is_mine(handle.network, &handle.dir, addr);
     Ok(json!({
         "address": addr,
         "isvalid": v.is_valid,
-        // ismine detection for shielded UAs is not implemented in v1.
-        "ismine": false,
+        "ismine": ismine,
         "iswatchonly": false,
         "isscript": false,
         "labels": label.map(|l| vec![l]).unwrap_or_default(),
@@ -255,8 +255,7 @@ pub fn gettransaction(
         "timereceived": rec.block_time.unwrap_or(0),
         "bip125-replaceable": "no",
         "details": details,
-        // Raw hex is not surfaced by the read path in v1.
-        "hex": ""
+        "hex": rec.raw.as_ref().map(hex::encode).unwrap_or_default(),
     });
     if let Some(fee) = rec.fee_paid {
         obj["fee"] = signed_zats_to_value(-(fee as i64));
@@ -267,10 +266,35 @@ pub fn gettransaction(
     Ok(obj)
 }
 
-pub fn listunspent(_state: &AppState, _wallet: Option<&str>, _req: &RpcRequest) -> Result<Value, RpcError> {
-    // An Orchard-only shielded wallet has no transparent UTXOs, and shielded notes are not
-    // exposed as bitcoin-style outpoints. Returns an empty set; use getbalance instead.
-    Ok(Value::Array(vec![]))
+pub fn listunspent(state: &AppState, wallet: Option<&str>, req: &RpcRequest) -> Result<Value, RpcError> {
+    let minconf = req.param(0).and_then(|v| v.as_i64()).unwrap_or(1);
+    let maxconf = req.param(1).and_then(|v| v.as_i64()).unwrap_or(9_999_999);
+    let handle = state.registry.get(wallet)?;
+    let st = handle.status();
+    // Each unspent Orchard note is reported as one entry. The (txid, vout) refers to the
+    // shielded action that created the note; there is no transparent scriptPubKey.
+    let notes = read::list_unspent(handle.network, &handle.dir)?;
+    let arr: Vec<Value> = notes
+        .iter()
+        .map(|n| {
+            let conf = st.confirmations(n.mined_height);
+            (conf, n)
+        })
+        .filter(|(conf, _)| *conf >= minconf && *conf <= maxconf)
+        .map(|(conf, n)| {
+            json!({
+                "txid": n.txid,
+                "vout": n.vout,
+                "address": "",
+                "amount": zats_to_value(n.value),
+                "confirmations": conf,
+                "spendable": true,
+                "solvable": true,
+                "safe": true,
+            })
+        })
+        .collect();
+    Ok(Value::Array(arr))
 }
 
 fn build_payment(network: &zcash_protocol::consensus::Network, addr: &str, amount: &Value) -> Result<Payment, RpcError> {

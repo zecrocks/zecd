@@ -155,6 +155,7 @@ mod tests {
             lightwalletd: LightwalletdConfig {
                 server: "zecrocks".into(),
                 connection: "direct".into(),
+                tls_roots: crate::lightwalletd::TlsRoots::Native,
             },
             rpc: rpc.clone(),
             keys: KeysConfig { age_identity: None, auto_unlock: true },

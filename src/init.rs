@@ -42,7 +42,11 @@ pub async fn run(config: &AppConfig, args: &InitArgs) -> anyhow::Result<()> {
         .unwrap_or_else(|| config.datadir.join("identity.txt"));
     let recipients = ensure_identity(&identity_path).await?;
 
-    let server = lightwalletd::resolve(&config.lightwalletd.server, network)?;
+    let server = lightwalletd::resolve(
+        &config.lightwalletd.server,
+        network,
+        config.lightwalletd.tls_roots,
+    )?;
     let mut client = server
         .connect()
         .await

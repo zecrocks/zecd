@@ -72,6 +72,7 @@ dir = "./data/default"
 [lightwalletd]
 server = "zecrocks"              # "ecc" | "ywallet" | "zecrocks" | "host:port"
 connection = "direct"
+tls_roots = "native"            # "native" (OS store, honors SSL_CERT_FILE) | "webpki"
 
 [rpc]
 bind = "127.0.0.1"
@@ -124,11 +125,27 @@ Edges to be aware of (all consequences of being a shielded light wallet):
   they are spendable/visible.
 - **Fees:** `estimatesmartfee` returns a stable conventional rate; real fees are ZIP-317,
   computed at transaction-build time.
-- **Addresses are shielded UAs** (`u1...`): clients that parse the address string as a transparent
-  Bitcoin address will not understand them; clients that treat addresses as opaque strings are fine.
-- **`listunspent` returns `[]`:** there are no transparent UTXOs, and shielded notes are not
-  exposed as bitcoin-style outpoints. Use `getbalance`.
-- **`gettransaction.hex`** is empty and `getaddressinfo.ismine` is always `false` in this version.
+- **Addresses are shielded UAs** (`u1...`/`utest1...`): clients that parse the address string as a
+  transparent Bitcoin address will not understand them; clients that treat addresses as opaque
+  strings are fine.
+- **`listunspent`** lists each unspent Orchard *note* as one entry. Its `txid`/`vout` identify the
+  shielded action that created the note (there is no transparent `scriptPubKey`), and `address` is
+  empty.
+
+## Testing
+
+```sh
+# Unit + offline tests (amount conversion, auth, JSON-RPC framing, HTTP status codes):
+cargo test
+
+# Also run the network integration tests that hit the public zecrocks lightwalletd
+# (testnet.zec.rocks / zec.rocks) - get_latest_block, get_lightd_info, tree state:
+cargo test -- --include-ignored
+
+# End-to-end RPC smoke test against a running, synced daemon (stdlib-only, validates the
+# bitcoind wire format, amounts, and error codes over HTTP):
+python3 scripts/rpc_smoke.py --url http://127.0.0.1:18232/ --user u --password p
+```
 
 ## Security
 

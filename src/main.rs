@@ -44,6 +44,7 @@ fn init_tracing() {
 }
 
 async fn run_daemon(config: AppConfig) -> anyhow::Result<()> {
+    actor::install_panic_hook();
     let config = Arc::new(config);
     let auth = server::auth::Authenticator::from_config(&config.rpc)?;
 
@@ -58,7 +59,11 @@ async fn run_daemon(config: AppConfig) -> anyhow::Result<()> {
             );
             continue;
         }
-        let server = lightwalletd::resolve(&config.lightwalletd.server, config.network)?;
+        let server = lightwalletd::resolve(
+            &config.lightwalletd.server,
+            config.network,
+            config.lightwalletd.tls_roots,
+        )?;
         let actor_cfg = ActorConfig {
             name: name.clone(),
             network: config.network,
