@@ -51,6 +51,11 @@ pub enum WalletCommand {
         request: TransactionRequest,
         reply: oneshot::Sender<Result<TxId, RpcError>>,
     },
+    /// Fetch the raw bytes of a transaction (from the wallet, else lightwalletd).
+    GetRawTx {
+        txid: TxId,
+        reply: oneshot::Sender<Result<Option<Vec<u8>>, RpcError>>,
+    },
     /// Decrypt the seed into memory (compat for `walletpassphrase`).
     Unlock {
         reply: oneshot::Sender<Result<(), RpcError>>,
@@ -98,6 +103,10 @@ impl WalletHandle {
 
     pub async fn send(&self, request: TransactionRequest) -> Result<TxId, RpcError> {
         self.dispatch(|reply| WalletCommand::Send { request, reply }).await
+    }
+
+    pub async fn get_raw_tx(&self, txid: TxId) -> Result<Option<Vec<u8>>, RpcError> {
+        self.dispatch(|reply| WalletCommand::GetRawTx { txid, reply }).await
     }
 
     pub async fn unlock(&self) -> Result<(), RpcError> {

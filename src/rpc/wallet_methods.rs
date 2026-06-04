@@ -3,6 +3,7 @@
 use std::collections::BTreeSet;
 
 use serde_json::{json, Map, Value};
+use zcash_protocol::TxId;
 use zip321::{Payment, TransactionRequest};
 
 use crate::amount::{signed_zats_to_value, value_to_zats, zats_to_value};
@@ -13,6 +14,17 @@ use crate::wallet::{labels, read};
 
 fn opt_str(req: &RpcRequest, i: usize) -> Option<String> {
     req.param(i).and_then(|v| v.as_str()).map(|s| s.to_string())
+}
+
+/// Parse a display-hex txid (reversed) into a [`TxId`] (internal byte order).
+fn parse_txid(display_hex: &str) -> Option<TxId> {
+    let mut bytes = hex::decode(display_hex).ok()?;
+    if bytes.len() != 32 {
+        return None;
+    }
+    bytes.reverse();
+    let arr: [u8; 32] = bytes.try_into().ok()?;
+    Some(TxId::from_bytes(arr))
 }
 
 pub fn listwallets(state: &AppState) -> Result<Value, RpcError> {
@@ -206,7 +218,7 @@ pub fn listtransactions(
     Ok(Value::Array(entries[start..end].to_vec()))
 }
 
-pub fn gettransaction(
+pub async fn gettransaction(
     state: &AppState,
     wallet: Option<&str>,
     req: &RpcRequest,
@@ -215,7 +227,7 @@ pub fn gettransaction(
         .param(0)
         .and_then(|v| v.as_str())
         .ok_or_else(|| RpcError::invalid_params("gettransaction requires a txid"))?;
-    let handle = state.registry.get(wallet)?;
+    let handle = state.registry.get(wallet)?.clone();
     let st = handle.status();
     let rec = read::get_transaction(&handle.dir, txid)?
         .ok_or_else(|| RpcError::invalid_address_or_key("Invalid or non-wallet transaction id"))?;
@@ -247,6 +259,22 @@ pub fn gettransaction(
         details.push(d);
     }
 
+    // `hex`: stored raw for txs we created; otherwise fetch the full tx on demand (received
+    // txs are only seen as compact blocks until enhanced).
+    let hex_str = match &rec.raw {
+        Some(raw) => hex::encode(raw),
+        None => match parse_txid(&rec.txid_hex) {
+            Some(txid) => handle
+                .get_raw_tx(txid)
+                .await
+                .ok()
+                .flatten()
+                .map(hex::encode)
+                .unwrap_or_default(),
+            None => String::new(),
+        },
+    };
+
     let mut obj = json!({
         "amount": signed_zats_to_value(rec.account_balance_delta),
         "confirmations": st.confirmations(rec.mined_height),
@@ -255,7 +283,7 @@ pub fn gettransaction(
         "timereceived": rec.block_time.unwrap_or(0),
         "bip125-replaceable": "no",
         "details": details,
-        "hex": rec.raw.as_ref().map(hex::encode).unwrap_or_default(),
+        "hex": hex_str,
     });
     if let Some(fee) = rec.fee_paid {
         obj["fee"] = signed_zats_to_value(-(fee as i64));

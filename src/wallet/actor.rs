@@ -366,6 +366,10 @@ impl WalletActor {
                 let res = self.do_send(request).await;
                 let _ = reply.send(res);
             }
+            WalletCommand::GetRawTx { txid, reply } => {
+                let res = self.do_get_raw_tx(txid).await;
+                let _ = reply.send(res);
+            }
             WalletCommand::Unlock { reply } => {
                 let res = self.do_unlock();
                 let _ = reply.send(res);
@@ -478,6 +482,37 @@ impl WalletActor {
 
         self.update_status();
         Ok(txid)
+    }
+
+    /// Return raw transaction bytes: prefer the locally-stored copy (present for txs we
+    /// created or have enhanced), otherwise fetch the full tx from lightwalletd. The
+    /// `TxFilter` hash is the txid's internal bytes (per zcash-devtool's enhance).
+    async fn do_get_raw_tx(&mut self, txid: TxId) -> Result<Option<Vec<u8>>, RpcError> {
+        if let Ok(Some(tx)) = self.db_data.get_transaction(txid) {
+            let mut buf = Vec::new();
+            tx.write(&mut buf)
+                .map_err(|e| RpcError::misc(format!("failed to serialize transaction: {e}")))?;
+            return Ok(Some(buf));
+        }
+        if self.client.is_none() {
+            self.connect()
+                .await
+                .map_err(|e| RpcError::misc(format!("connect to lightwalletd: {e}")))?;
+        }
+        let client = self
+            .client
+            .as_mut()
+            .ok_or_else(|| RpcError::misc("not connected to lightwalletd"))?;
+        let filter = service::TxFilter {
+            hash: txid.as_ref().to_vec(),
+            ..Default::default()
+        };
+        let raw = client
+            .get_transaction(filter)
+            .await
+            .map_err(|e| RpcError::misc(format!("get_transaction RPC failed: {e}")))?
+            .into_inner();
+        Ok(if raw.data.is_empty() { None } else { Some(raw.data) })
     }
 
     fn do_unlock(&mut self) -> Result<(), RpcError> {
