@@ -118,3 +118,124 @@ fn unauthorized() -> Response {
     )
         .into_response()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::BTreeMap;
+    use std::sync::Arc;
+    use std::time::Instant;
+
+    use axum::body::Body as AxumBody;
+    use axum::http::Request;
+    use base64::Engine;
+    use serde_json::Value;
+    use tokio::sync::Notify;
+    use tower::ServiceExt;
+
+    use crate::config::{
+        AppConfig, KeysConfig, LightwalletdConfig, RpcConfig, SyncConfig,
+    };
+    use crate::server::auth::Authenticator;
+    use crate::wallet::WalletRegistry;
+
+    fn test_state() -> AppState {
+        let rpc = RpcConfig {
+            bind: "127.0.0.1".parse().unwrap(),
+            port: 1,
+            user: Some("u".into()),
+            password: Some("p".into()),
+            cookiefile: None,
+        };
+        let config = AppConfig {
+            network: zcash_protocol::consensus::Network::TestNetwork,
+            datadir: std::path::PathBuf::from("/tmp"),
+            default_wallet: "default".into(),
+            wallets: BTreeMap::new(),
+            lightwalletd: LightwalletdConfig {
+                server: "zecrocks".into(),
+                connection: "direct".into(),
+            },
+            rpc: rpc.clone(),
+            keys: KeysConfig { age_identity: None, auto_unlock: true },
+            sync: SyncConfig { interval_secs: 20 },
+        };
+        AppState {
+            auth: Authenticator::from_config(&rpc).unwrap(),
+            config: Arc::new(config),
+            registry: Arc::new(WalletRegistry::new("default".into())),
+            started_at: Instant::now(),
+            shutdown: Arc::new(Notify::new()),
+        }
+    }
+
+    fn req(body: &str, auth: Option<(&str, &str)>) -> Request<AxumBody> {
+        let mut b = Request::builder().method("POST").uri("/");
+        if let Some((u, p)) = auth {
+            let creds = base64::engine::general_purpose::STANDARD.encode(format!("{u}:{p}"));
+            b = b.header("authorization", format!("Basic {creds}"));
+        }
+        b.body(AxumBody::from(body.to_string())).unwrap()
+    }
+
+    async fn body_json(resp: Response) -> Value {
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        serde_json::from_slice(&bytes).unwrap()
+    }
+
+    #[tokio::test]
+    async fn missing_or_wrong_auth_is_401() {
+        let r = router(test_state())
+            .oneshot(req(r#"{"method":"getnetworkinfo","id":1}"#, None))
+            .await
+            .unwrap();
+        assert_eq!(r.status(), StatusCode::UNAUTHORIZED);
+
+        let r = router(test_state())
+            .oneshot(req(r#"{"method":"getnetworkinfo","id":1}"#, Some(("u", "wrong"))))
+            .await
+            .unwrap();
+        assert_eq!(r.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn getnetworkinfo_ok_200() {
+        let r = router(test_state())
+            .oneshot(req(r#"{"method":"getnetworkinfo","id":1,"params":[]}"#, Some(("u", "p"))))
+            .await
+            .unwrap();
+        assert_eq!(r.status(), StatusCode::OK);
+        let v = body_json(r).await;
+        assert_eq!(v["error"], Value::Null);
+        assert_eq!(v["id"], serde_json::json!(1));
+        assert!(v["result"]["subversion"].as_str().unwrap().contains("zecd"));
+    }
+
+    #[tokio::test]
+    async fn unknown_method_is_500_with_error_code() {
+        let r = router(test_state())
+            .oneshot(req(r#"{"method":"definitely_not_a_method","id":2}"#, Some(("u", "p"))))
+            .await
+            .unwrap();
+        // Bitcoin Core returns HTTP 500 with the error object in the body.
+        assert_eq!(r.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let v = body_json(r).await;
+        assert_eq!(v["result"], Value::Null);
+        assert_eq!(
+            v["error"]["code"],
+            serde_json::json!(crate::error::codes::RPC_METHOD_NOT_FOUND)
+        );
+    }
+
+    #[tokio::test]
+    async fn batch_returns_200_array() {
+        let body = r#"[{"method":"uptime","id":1},{"method":"nope","id":2}]"#;
+        let r = router(test_state()).oneshot(req(body, Some(("u", "p")))).await.unwrap();
+        assert_eq!(r.status(), StatusCode::OK);
+        let v = body_json(r).await;
+        let arr = v.as_array().unwrap();
+        assert_eq!(arr.len(), 2);
+        assert_eq!(arr[0]["error"], Value::Null);
+        assert!(arr[1]["error"]["code"].is_number());
+    }
+}
