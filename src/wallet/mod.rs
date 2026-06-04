@@ -8,6 +8,9 @@ pub mod open;
 pub mod read;
 pub mod store;
 
+#[cfg(test)]
+mod regtest_tests;
+
 use std::collections::HashMap;
 use std::path::PathBuf;
 
