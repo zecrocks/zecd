@@ -1,0 +1,6 @@
+# The vendored Cargo.lock pins the zingo-infra tree to a snapshot built with Rust 1.83 (matching
+# zingolib's own rust-toolchain). Newer rustc (e.g. 1.94) rejects some of those pinned transitive
+# crates - notably `metrics 0.24.1` (E0521, a soundness rule tightened in a later rustc). This file
+# is scoped to regtest-harness/ only, so zecd at the repo root still builds on stable.
+[toolchain]
+channel = "1.83"

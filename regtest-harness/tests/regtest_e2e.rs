@@ -24,8 +24,8 @@ use zecd_regtest_harness::{Zecd, ZecdConfig};
 // every upgrade (incl. NU5/Orchard) active at height 1 - matching zecd's `network::regtest()`.
 // The `Validator` trait brings `generate_blocks` into scope.
 use zingo_infra_testutils::services::{
-    indexer::LightwalletdConfig,
-    validator::{Validator, ZebradConfig},
+    indexer::{Lightwalletd, LightwalletdConfig},
+    validator::{Validator, Zebrad, ZebradConfig},
     LocalNet,
 };
 
@@ -38,7 +38,7 @@ async fn regtest_end_to_end() {
     //    zebra's RPC port automatically (and overwrites `zcashd_conf`). LightwalletdConfig has no
     //    Default - `listen_port: None` picks a free port; `lightwalletd_bin: None` uses the
     //    binary zingo-infra downloads.
-    let net = LocalNet::launch(
+    let net = LocalNet::<Lightwalletd, Zebrad>::launch(
         LightwalletdConfig {
             lightwalletd_bin: None,
             listen_port: None,
