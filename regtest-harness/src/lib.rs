@@ -37,7 +37,10 @@ pub fn pick_port() -> Result<u16> {
 /// Resolve a required external binary from `$<env_var>`, returning `None` if unset or missing so
 /// callers can skip the live test cleanly.
 pub fn resolve_bin(env_var: &str) -> Option<PathBuf> {
-    std::env::var(env_var).ok().map(PathBuf::from).filter(|p| p.is_file())
+    std::env::var(env_var)
+        .ok()
+        .map(PathBuf::from)
+        .filter(|p| p.is_file())
 }
 
 // =============================== zebrad (Regtest validator) ===============================
@@ -47,9 +50,18 @@ pub fn resolve_bin(env_var: &str) -> Option<PathBuf> {
 /// Used by [`proposal_block_from_template`] to pick the right block-commitment field.
 fn regtest_network() -> Network {
     Network::new_regtest(
-        ConfiguredActivationHeights { nu5: Some(1), nu6: Some(1), ..Default::default() }.into(),
+        ConfiguredActivationHeights {
+            nu5: Some(1),
+            nu6: Some(1),
+            ..Default::default()
+        }
+        .into(),
     )
 }
+
+/// A throwaway transparent address used as zebra's coinbase recipient when the caller doesn't need
+/// to control the coinbase (the unfunded e2e). Funded flows pass the funding wallet's own address.
+const DEFAULT_MINER_ADDRESS: &str = "t27eWDgjFYJGVXmzrXeVjnb5J3uXDM9xH9v";
 
 /// A running `zebrad` Regtest node.
 pub struct Zebrad {
@@ -61,13 +73,21 @@ pub struct Zebrad {
 }
 
 impl Zebrad {
-    /// Launch `zebrad` in Regtest mode and wait until its JSON-RPC answers.
+    /// Launch `zebrad` in Regtest mode (mining to a throwaway address) and wait until its
+    /// JSON-RPC answers.
     pub async fn start(bin: &Path) -> Result<Zebrad> {
+        Self::start_with_miner(bin, DEFAULT_MINER_ADDRESS).await
+    }
+
+    /// Launch `zebrad` mining its coinbase to `miner_address`, so a wallet that controls that
+    /// address can spend the matured coinbase (used to fund the Orchard wallet under test).
+    pub async fn start_with_miner(bin: &Path, miner_address: &str) -> Result<Zebrad> {
         let dir = tempfile::tempdir().context("create zebrad dir")?;
         let rpc_port = pick_port()?;
         let net_port = pick_port()?;
         let config_path = dir.path().join("zebrad.toml");
-        std::fs::write(&config_path, zebrad_toml(net_port, rpc_port)).context("write zebrad.toml")?;
+        std::fs::write(&config_path, zebrad_toml(net_port, rpc_port, miner_address))
+            .context("write zebrad.toml")?;
 
         let child = Command::new(bin)
             .args(["--config", config_path.to_str().unwrap(), "start"])
@@ -76,7 +96,12 @@ impl Zebrad {
             .spawn()
             .with_context(|| format!("spawn zebrad ({})", bin.display()))?;
 
-        let zebrad = Zebrad { child, rpc_port, net: regtest_network(), _dir: dir };
+        let zebrad = Zebrad {
+            child,
+            rpc_port,
+            net: regtest_network(),
+            _dir: dir,
+        };
         zebrad.wait_until_rpc_up().await?;
         Ok(zebrad)
     }
@@ -88,7 +113,10 @@ impl Zebrad {
     async fn wait_until_rpc_up(&self) -> Result<()> {
         let deadline = Instant::now() + Duration::from_secs(90);
         loop {
-            if zebra_rpc_call(&self.rpc_url(), "getblockchaininfo", json!([])).await.is_ok() {
+            if zebra_rpc_call(&self.rpc_url(), "getblockchaininfo", json!([]))
+                .await
+                .is_ok()
+            {
                 return Ok(());
             }
             if Instant::now() >= deadline {
@@ -109,9 +137,12 @@ impl Zebrad {
                 .context("getblocktemplate")?;
             let template: BlockTemplateResponse =
                 serde_json::from_value(template_value).context("decode block template")?;
-            let block =
-                proposal_block_from_template(&template, BlockTemplateTimeSource::default(), &self.net)
-                    .map_err(|e| anyhow!("assemble block from template: {e}"))?;
+            let block = proposal_block_from_template(
+                &template,
+                BlockTemplateTimeSource::default(),
+                &self.net,
+            )
+            .map_err(|e| anyhow!("assemble block from template: {e}"))?;
             let block_hex = hex::encode(block.zcash_serialize_to_vec().context("serialize block")?);
             zebra_rpc_call(&url, "submitblock", json!([block_hex]))
                 .await
@@ -131,7 +162,7 @@ impl Drop for Zebrad {
 /// zebrad Regtest config for zebra 5.x. Note: no `[mining] debug_like_zcashd` (removed after
 /// 2.x), `disable_pow = true` so submitted blocks need no PoW, and `enable_cookie_auth = false`
 /// so lightwalletd can use the rpcuser/rpcpassword from its `zcash.conf`.
-fn zebrad_toml(net_port: u16, rpc_port: u16) -> String {
+fn zebrad_toml(net_port: u16, rpc_port: u16, miner_address: &str) -> String {
     format!(
         r#"[network]
 network = "Regtest"
@@ -145,7 +176,7 @@ NU5 = 1
 NU6 = 1
 
 [mining]
-miner_address = "t27eWDgjFYJGVXmzrXeVjnb5J3uXDM9xH9v"
+miner_address = "{miner_address}"
 
 [state]
 ephemeral = true
@@ -204,7 +235,11 @@ impl Lightwalletd {
             .spawn()
             .with_context(|| format!("spawn lightwalletd ({})", bin.display()))?;
 
-        let lwd = Lightwalletd { child, grpc_port, _dir: dir };
+        let lwd = Lightwalletd {
+            child,
+            grpc_port,
+            _dir: dir,
+        };
         lwd.wait_until_ready(&log_file).await?;
         Ok(lwd)
     }
@@ -219,7 +254,10 @@ impl Lightwalletd {
             }
             if Instant::now() >= deadline {
                 let log = std::fs::read_to_string(log_file).unwrap_or_default();
-                bail!("lightwalletd did not become ready within 90s; log tail:\n{}", tail(&log, 20));
+                bail!(
+                    "lightwalletd did not become ready within 90s; log tail:\n{}",
+                    tail(&log, 20)
+                );
             }
             tokio::time::sleep(Duration::from_millis(500)).await;
         }
@@ -230,6 +268,140 @@ impl Drop for Lightwalletd {
     fn drop(&mut self) {
         let _ = self.child.kill();
         let _ = self.child.wait();
+    }
+}
+
+// =============================== funder (zcash-devtool) ===============================
+
+/// A valid 24-word BIP-39 test mnemonic (the canonical all-zero-entropy vector). Regtest only - it
+/// controls throwaway coinbase funds, never anything of value.
+const FUNDER_MNEMONIC: &str = "abandon abandon abandon abandon abandon abandon abandon abandon \
+abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon \
+abandon abandon abandon art";
+
+/// Drives the `zcash-devtool` binary as a funding wallet. It controls zebra's coinbase (which is
+/// mined to its address), shields the matured transparent coinbase into Orchard, and sends Orchard
+/// funds to the `zecd` wallet under test. Resolve the binary via `$DEVTOOL_BIN`.
+///
+/// Regtest can't mine a coinbase straight into an Orchard note that `zecd` (Orchard-only) would
+/// see, so this is how we get funds into `zecd`: mine transparent coinbase → mature (101 blocks) →
+/// shield to Orchard → send to `zecd`'s unified address.
+pub struct Funder {
+    bin: PathBuf,
+    dir: tempfile::TempDir,
+}
+
+impl Funder {
+    /// Initialise the funding wallet against a lightwalletd. Non-interactive via `--mnemonic`;
+    /// `--birthday 0` so it scans the whole (short) regtest chain.
+    pub fn init(bin: &Path, lwd_port: u16) -> Result<Funder> {
+        let dir = tempfile::tempdir().context("create funder dir")?;
+        let funder = Funder {
+            bin: bin.to_path_buf(),
+            dir,
+        };
+        let identity = funder.identity();
+        funder.run(
+            "init",
+            &[
+                "--name",
+                "funder",
+                "--network",
+                "regtest",
+                "--identity",
+                &identity,
+                "--mnemonic",
+                FUNDER_MNEMONIC,
+                "--birthday",
+                "0",
+            ],
+            Some(lwd_port),
+        )?;
+        Ok(funder)
+    }
+
+    fn identity(&self) -> String {
+        self.dir
+            .path()
+            .join("identity.txt")
+            .to_string_lossy()
+            .into_owned()
+    }
+
+    fn wallet_dir(&self) -> String {
+        self.dir.path().to_string_lossy().into_owned()
+    }
+
+    /// The funder's unified address (parsed from `list-addresses`), used as zebra's miner address.
+    pub fn unified_address(&self) -> Result<String> {
+        let out = self.run("list-addresses", &[], None)?;
+        out.lines()
+            .find_map(|line| line.split("Default Address:").nth(1))
+            .map(|addr| addr.trim().to_string())
+            .ok_or_else(|| anyhow!("no Default Address in devtool list-addresses output:\n{out}"))
+    }
+
+    /// Scan the chain via lightwalletd to pick up new transactions / UTXOs.
+    pub fn sync(&self, lwd_port: u16) -> Result<()> {
+        self.run("sync", &[], Some(lwd_port)).map(|_| ())
+    }
+
+    /// Shield all spendable transparent funds (the matured coinbase) into Orchard.
+    pub fn shield(&self, lwd_port: u16) -> Result<()> {
+        let identity = self.identity();
+        self.run("shield", &["--identity", &identity], Some(lwd_port))
+            .map(|_| ())
+    }
+
+    /// Send `zatoshis` to `to_address` (an Orchard/unified address).
+    pub fn send(&self, lwd_port: u16, to_address: &str, zatoshis: u64) -> Result<()> {
+        let identity = self.identity();
+        let value = zatoshis.to_string();
+        self.run(
+            "send",
+            &[
+                "--identity",
+                &identity,
+                "--address",
+                to_address,
+                "--value",
+                &value,
+            ],
+            Some(lwd_port),
+        )
+        .map(|_| ())
+    }
+
+    /// Run `zcash-devtool wallet -w <dir> <subcommand> <extra...> [--server .. --connection direct]`.
+    fn run(&self, subcommand: &str, extra: &[&str], lwd_port: Option<u16>) -> Result<String> {
+        let mut args: Vec<String> = vec![
+            "wallet".into(),
+            "-w".into(),
+            self.wallet_dir(),
+            subcommand.into(),
+        ];
+        args.extend(extra.iter().map(|s| s.to_string()));
+        if let Some(port) = lwd_port {
+            args.extend([
+                "--server".into(),
+                format!("127.0.0.1:{port}"),
+                "--connection".into(),
+                "direct".into(),
+            ]);
+        }
+        let output = Command::new(&self.bin)
+            .args(&args)
+            .output()
+            .with_context(|| format!("spawn devtool {subcommand}"))?;
+        if !output.status.success() {
+            bail!(
+                "devtool {subcommand} failed ({}):\nstdout: {}\nstderr: {}",
+                output.status,
+                String::from_utf8_lossy(&output.stdout),
+                tail(&String::from_utf8_lossy(&output.stderr), 30),
+            );
+        }
+        Ok(String::from_utf8_lossy(&output.stdout).into_owned())
     }
 }
 
@@ -288,7 +460,12 @@ impl Zecd {
         let deadline = Instant::now() + Duration::from_secs(90);
         loop {
             let init = Command::new(&bin)
-                .args(["--datadir", datadir.path().to_str().unwrap(), "--regtest", "init"])
+                .args([
+                    "--datadir",
+                    datadir.path().to_str().unwrap(),
+                    "--regtest",
+                    "init",
+                ])
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped())
                 .output()
@@ -308,7 +485,12 @@ impl Zecd {
         }
 
         let child = Command::new(&bin)
-            .args(["--datadir", datadir.path().to_str().unwrap(), "--regtest", "run"])
+            .args([
+                "--datadir",
+                datadir.path().to_str().unwrap(),
+                "--regtest",
+                "run",
+            ])
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .spawn()
@@ -345,7 +527,11 @@ impl Zecd {
             .map_err(|e| RpcError::transport(format!("decoding response: {e}")))?;
         if let Some(err) = envelope.get("error").filter(|e| !e.is_null()) {
             let code = err.get("code").and_then(|c| c.as_i64()).unwrap_or(0);
-            let message = err.get("message").and_then(|m| m.as_str()).unwrap_or("").to_string();
+            let message = err
+                .get("message")
+                .and_then(|m| m.as_str())
+                .unwrap_or("")
+                .to_string();
             return Err(RpcError::Rpc { code, message });
         }
         Ok(envelope.get("result").cloned().unwrap_or(Value::Null))

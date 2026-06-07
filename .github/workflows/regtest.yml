@@ -1,9 +1,11 @@
 name: Regtest E2E
 
 # Live tier: brings up the Zcash-Foundation regtest stack - zebra (Regtest) + lightwalletd - and
-# drives the real zecd binary over its JSON-RPC (see regtest-harness/). No zingo-infra: the harness
-# mines via zebra's own getblocktemplate/submitblock. zebrad + lightwalletd binaries are extracted
-# from their official Docker images; the harness builds on stable Rust against current zebra crates.
+# drives the real zecd binary over its JSON-RPC (see regtest-harness/). It also builds
+# zcash-devtool (regtest-enabled) as a funding wallet, used to shield a mined transparent coinbase
+# into Orchard and fund zecd (the funded e2e). No zingo-infra: the harness mines via zebra's own
+# getblocktemplate/submitblock. zebrad + lightwalletd are extracted from their official Docker
+# images; everything builds on stable Rust against current zebra crates.
 
 on:
   workflow_dispatch:
@@ -29,10 +31,29 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
 
       - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            .
+            regtest-harness
+            zcash-devtool
 
       # Release build: debug Orchard/Sapling proving is >20s; release keeps the harness snappy.
       - name: Build zecd (release)
         run: cargo build --release --bin zecd
+
+      # The funding wallet: zcash-devtool with regtest support (PR zecrocks/zcash-devtool#1).
+      # It shields a mined transparent coinbase into Orchard and sends it to zecd, since regtest
+      # can't mine an Orchard coinbase zecd would scan.
+      # TODO: switch `ref` to `main` once zcash-devtool#1 merges.
+      - name: Checkout zcash-devtool (funder)
+        uses: actions/checkout@v4
+        with:
+          repository: zecrocks/zcash-devtool
+          ref: sleepy-faraday-T6HUy
+          path: zcash-devtool
+
+      - name: Build zcash-devtool (funder)
+        run: cargo build --release --manifest-path zcash-devtool/Cargo.toml --bin zcash-devtool
 
       # Extract zebrad + lightwalletd from their official Docker images. zebra MUST match the
       # zebra-rpc/zebra-chain tag the harness builds against (regtest-harness/Cargo.toml: v5.0.0)
@@ -61,6 +82,7 @@ jobs:
       - name: Run regtest end-to-end harness
         env:
           ZECD_BIN: ${{ github.workspace }}/target/release/zecd
+          DEVTOOL_BIN: ${{ github.workspace }}/zcash-devtool/target/release/zcash-devtool
           # ZEBRAD_BIN / LIGHTWALLETD_BIN are exported by the provisioning step above.
         # --locked: build against the committed lock. Single-threaded: the harness binds fixed ports.
         run: cargo test --locked --manifest-path regtest-harness/Cargo.toml -- --nocapture --test-threads=1
