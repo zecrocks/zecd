@@ -1,0 +1,47 @@
+# zecd configuration for the docker-compose stack (mounted at /etc/zecd/zecd.toml).
+# Matches the stack's network - testnet by default; see docker-compose.yml / zebrad.toml.
+
+network = "test"
+datadir = "/var/lib/zecd"
+default_wallet = "default"
+
+[wallets.default]
+dir = "/var/lib/zecd/default"
+
+[lightwalletd]
+# Failover, tried in order, always preferring the first (the daemon snaps back to it when it
+# recovers). Here: the co-located lightwalletd first, then the public testnet endpoint if the
+# local node is down. The scheme prefix sets TLS per endpoint - http:// for the plaintext local
+# node (it runs with --no-tls-very-insecure), https:// for the public TLS endpoint.
+servers = ["http://lightwalletd:9067", "https://testnet.zec.rocks:443"]
+# For a MAINNET deployment, set network = "main" above and use the public zecrocks failover pair:
+# servers = ["http://lightwalletd:9067", "https://zec.rocks:443", "https://eu.zec.rocks:443"]
+connect_timeout_secs = 10
+reconnect_base_secs = 1
+reconnect_max_secs = 60
+primary_recheck_secs = 60
+
+[rpc]
+# Bind to all interfaces so the published container port is reachable; protect with auth and a
+# network policy / reverse proxy. Do not expose this port to untrusted networks.
+bind = "0.0.0.0"
+port = 18232
+user = "zec"
+password = "CHANGE-ME"
+
+[keys]
+# age identity written by `zecd init`; used to decrypt the seed for unattended sending.
+age_identity = "/var/lib/zecd/identity.txt"
+auto_unlock = true
+
+[sync]
+interval_secs = 20
+
+[health]
+# Bind probes to all interfaces so the compose-published port (9233) is reachable.
+bind = "0.0.0.0"
+port = 9233
+
+[log]
+level = "info"
+format = "json"
