@@ -32,19 +32,50 @@ use zingo_infra_testutils::services::{
 const INITIAL_BLOCKS: u32 = 10;
 const SYNC_TIMEOUT: Duration = Duration::from_secs(90);
 
+/// Resolve a required external binary: `$<env_var>` if set, otherwise zingo-infra's default
+/// location (`fetched_resources/test_binaries/<name>/<name>` under this crate). Returns `None`
+/// if neither exists, so the test can skip cleanly instead of panicking deep inside
+/// zingo-infra's `launch` (which `unwrap()`s a NotFound when the binary is missing).
+fn resolve_bin(env_var: &str, name: &str) -> Option<PathBuf> {
+    if let Ok(p) = std::env::var(env_var) {
+        let pb = PathBuf::from(p);
+        return pb.is_file().then_some(pb);
+    }
+    let pb = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("fetched_resources/test_binaries")
+        .join(name)
+        .join(name);
+    pb.is_file().then_some(pb)
+}
+
 #[tokio::test]
 async fn regtest_end_to_end() {
+    // The live tier needs zingo-blessed `zebrad` + `lightwalletd` binaries (zingo-infra fetches
+    // them from a private host - see README). When they aren't provisioned (plain `cargo test`, or
+    // a CI box without them), skip cleanly: this still validates that the harness compiles and
+    // links against zingo-infra. To run the full end-to-end, set ZEBRAD_BIN and LIGHTWALLETD_BIN
+    // (or populate fetched_resources/test_binaries/).
+    let (Some(zebrad_bin), Some(lightwalletd_bin)) = (
+        resolve_bin("ZEBRAD_BIN", "zebrad"),
+        resolve_bin("LIGHTWALLETD_BIN", "lightwalletd"),
+    ) else {
+        eprintln!(
+            "SKIP regtest_end_to_end: zebrad/lightwalletd not found. Set ZEBRAD_BIN and \
+             LIGHTWALLETD_BIN (or populate fetched_resources/test_binaries/). See README.md."
+        );
+        return;
+    };
+
     // 1. Launch zebra (Regtest) + lightwalletd; `launch` wires lightwalletd's validator port to
-    //    zebra's RPC port automatically (and overwrites `zcashd_conf`). LightwalletdConfig has no
-    //    Default - `listen_port: None` picks a free port; `lightwalletd_bin: None` uses the
-    //    binary zingo-infra downloads.
+    //    zebra's RPC port automatically (and overwrites `zcashd_conf`). `listen_port: None` picks
+    //    a free port.
     let net = LocalNet::<Lightwalletd, Zebrad>::launch(
         LightwalletdConfig {
-            lightwalletd_bin: None,
+            lightwalletd_bin: Some(lightwalletd_bin),
             listen_port: None,
             zcashd_conf: PathBuf::new(),
         },
-        ZebradConfig::default(),
+        ZebradConfig { zebrad_bin: Some(zebrad_bin), ..ZebradConfig::default() },
     )
     .await;
 

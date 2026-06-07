@@ -37,6 +37,11 @@ jobs:
       - name: Run regtest end-to-end harness
         env:
           ZECD_BIN: ${{ github.workspace }}/target/release/zecd
+          # To run the FULL live e2e, point these at zingo-blessed binaries provisioned in an
+          # earlier step (see regtest-harness/README.md). Unset, the test compiles + links and
+          # then skips the live assertions - so this job validates the harness build either way.
+          # ZEBRAD_BIN: ...
+          # LIGHTWALLETD_BIN: ...
         # Run from inside regtest-harness/ so its rust-toolchain.toml (Rust 1.83, matching the
         # vendored lock) drives the build; newer rustc rejects some pinned transitive crates.
         # --locked: don't wander off the vendored lock (yanked-but-locked orchard + pinned zebra).
