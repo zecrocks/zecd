@@ -1,13 +1,9 @@
 name: Regtest E2E
 
-# Live tier: brings up zebra (Regtest) + lightwalletd via zingo-infra and drives the real zecd
-# binary over its JSON-RPC (see regtest-harness/). This needs a Linux host with network access
-# (zingo-infra downloads zebrad/lightwalletd) and cannot run in the offline CI tier.
-#
-# It is NON-GATING (continue-on-error) for now: the zingo-infra dependency tree currently fails
-# to resolve from a clean checkout because `zingolib` pins `orchard ^0.10`, all of whose
-# published versions are yanked (see regtest-harness/README.md for the status and the
-# patch-replication path to unblock it). Once it resolves, flip continue-on-error off.
+# Live tier: brings up the Zcash-Foundation regtest stack - zebra (Regtest) + lightwalletd - and
+# drives the real zecd binary over its JSON-RPC (see regtest-harness/). No zingo-infra: the harness
+# mines via zebra's own getblocktemplate/submitblock. zebrad + lightwalletd binaries are extracted
+# from their official Docker images; the harness builds on stable Rust against current zebra crates.
 
 on:
   workflow_dispatch:
@@ -17,10 +13,13 @@ on:
       - "src/**"
       - ".github/workflows/regtest.yml"
 
+concurrency:
+  group: regtest-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   regtest:
     runs-on: ubuntu-latest
-    continue-on-error: true
     steps:
       - uses: actions/checkout@v4
 
@@ -35,8 +34,33 @@ jobs:
       - name: Build zecd (release)
         run: cargo build --release --bin zecd
 
+      # Extract zebrad + lightwalletd from their official Docker images. zebra MUST match the
+      # zebra-rpc/zebra-chain tag the harness builds against (regtest-harness/Cargo.toml: v5.0.0)
+      # so the block we assemble from getblocktemplate matches what this zebrad's submitblock
+      # accepts. Keep these two in lockstep. The harness reads ZEBRAD_BIN/LIGHTWALLETD_BIN.
+      - name: Provision zebrad + lightwalletd from images
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/bin"
+          extract() {
+            img="$1"; name="$2"; out="$RUNNER_TEMP/bin/$name"
+            docker pull -q "$img"
+            cid=$(docker create "$img")
+            rel=$(docker export "$cid" | tar -tf - | grep -m1 -E "(^|/)${name}\$" || true)
+            if [ -z "$rel" ]; then echo "::error::could not locate $name in $img"; docker rm "$cid" >/dev/null; exit 1; fi
+            docker cp "$cid:/$rel" "$out"
+            docker rm "$cid" >/dev/null
+            chmod +x "$out"
+            echo "$name -> $out"; file -b "$out" || true
+          }
+          extract zfnd/zebra:5.0.0 zebrad
+          extract electriccoinco/lightwalletd:v0.4.19 lightwalletd
+          echo "ZEBRAD_BIN=$RUNNER_TEMP/bin/zebrad" >> "$GITHUB_ENV"
+          echo "LIGHTWALLETD_BIN=$RUNNER_TEMP/bin/lightwalletd" >> "$GITHUB_ENV"
+
       - name: Run regtest end-to-end harness
         env:
           ZECD_BIN: ${{ github.workspace }}/target/release/zecd
-        # Single-threaded: the harness binds fixed ports (zecd RPC + lightwalletd).
-        run: cargo test --manifest-path regtest-harness/Cargo.toml -- --nocapture --test-threads=1
+          # ZEBRAD_BIN / LIGHTWALLETD_BIN are exported by the provisioning step above.
+        # --locked: build against the committed lock. Single-threaded: the harness binds fixed ports.
+        run: cargo test --locked --manifest-path regtest-harness/Cargo.toml -- --nocapture --test-threads=1
