@@ -328,6 +328,31 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "hits testnet.zec.rocks over the network"]
+    async fn failover_skips_dead_first_endpoint() {
+        use zcash_client_backend::proto::service;
+        // A closed local port as the primary, with the live testnet endpoint as fallback.
+        let servers =
+            resolve("127.0.0.1:1,testnet.zec.rocks:443", ZNetwork::Test, TlsRoots::Native, None)
+                .unwrap();
+        assert_eq!(servers.len(), 2);
+        let timeout = Duration::from_secs(10);
+        // The primary must fail (and fail fast), so the actor would move on.
+        assert!(servers[0].connect_timeout(timeout).await.is_err());
+        // The fallback must connect - this is the endpoint failover lands on.
+        let mut client = servers[1]
+            .connect_timeout(timeout)
+            .await
+            .expect("failover endpoint connects");
+        let tip = client
+            .get_latest_block(service::ChainSpec::default())
+            .await
+            .expect("get_latest_block")
+            .into_inner();
+        assert!(tip.height > 2_000_000, "unexpected testnet height {}", tip.height);
+    }
+
+    #[tokio::test]
     #[ignore = "hits zec.rocks (mainnet) over the network"]
     async fn mainnet_zecrocks_get_latest_block() {
         use zcash_client_backend::proto::service;

@@ -19,8 +19,19 @@ dir = "./data/default"
 # "ecc" | "ywallet" | "zecrocks" | a "host:port" (use your local lightwalletd in production,
 # e.g. "127.0.0.1:9067"). Defaults to the public zecrocks infrastructure.
 server = "zecrocks"
+# Or list multiple endpoints for failover, tried in order and always preferring the first
+# (e.g. a local lightwalletd with a public fallback). `servers` takes precedence over `server`;
+# the daemon snaps back to the primary as soon as it recovers.
+# servers = ["127.0.0.1:9067", "zec.rocks:443"]
 # Only "direct" is supported (TLS for remote hosts, plaintext for localhost).
 connection = "direct"
+# Per-attempt dial timeout (seconds) so a hung/black-holed endpoint can't stall sync.
+connect_timeout_secs = 10
+# Reconnect backoff (seconds): start at base, double up to max, with full jitter.
+reconnect_base_secs = 1
+reconnect_max_secs = 60
+# While running on a fallback, how often (seconds) to re-probe higher-priority servers.
+primary_recheck_secs = 60
 
 [rpc]
 bind = "127.0.0.1"
