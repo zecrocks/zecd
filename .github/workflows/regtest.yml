@@ -34,14 +34,35 @@ jobs:
       - name: Build zecd (release)
         run: cargo build --release --bin zecd
 
+      # Provision zebrad + lightwalletd from public images (zingo-infra's own binary host is
+      # zingolabs-internal and unreachable). These are CURRENT releases; zingo-infra's mining is
+      # pinned to an older zebra, so getblocktemplate/submitblock may not line up - this is the
+      # "try public binaries" path and may need iteration. The harness reads ZEBRAD_BIN/
+      # LIGHTWALLETD_BIN and skips the live assertions if either is missing.
+      - name: Provision zebrad + lightwalletd from images
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/bin"
+          extract() {
+            img="$1"; name="$2"; out="$RUNNER_TEMP/bin/$name"
+            docker pull -q "$img"
+            cid=$(docker create "$img")
+            rel=$(docker export "$cid" | tar -tf - | grep -m1 -E "(^|/)${name}\$" || true)
+            if [ -z "$rel" ]; then echo "::error::could not locate $name in $img"; docker rm "$cid" >/dev/null; exit 1; fi
+            docker cp "$cid:/$rel" "$out"
+            docker rm "$cid" >/dev/null
+            chmod +x "$out"
+            echo "$name -> $out"; file -b "$out" || true
+          }
+          extract zfnd/zebra:5.0.0 zebrad
+          extract electriccoinco/lightwalletd:v0.4.19 lightwalletd
+          echo "ZEBRAD_BIN=$RUNNER_TEMP/bin/zebrad" >> "$GITHUB_ENV"
+          echo "LIGHTWALLETD_BIN=$RUNNER_TEMP/bin/lightwalletd" >> "$GITHUB_ENV"
+
       - name: Run regtest end-to-end harness
         env:
           ZECD_BIN: ${{ github.workspace }}/target/release/zecd
-          # To run the FULL live e2e, point these at zingo-blessed binaries provisioned in an
-          # earlier step (see regtest-harness/README.md). Unset, the test compiles + links and
-          # then skips the live assertions - so this job validates the harness build either way.
-          # ZEBRAD_BIN: ...
-          # LIGHTWALLETD_BIN: ...
+          # ZEBRAD_BIN / LIGHTWALLETD_BIN are exported by the provisioning step above.
         # Run from inside regtest-harness/ so its rust-toolchain.toml (Rust 1.83, matching the
         # vendored lock) drives the build; newer rustc rejects some pinned transitive crates.
         # --locked: don't wander off the vendored lock (yanked-but-locked orchard + pinned zebra).
