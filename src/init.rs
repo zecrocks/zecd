@@ -77,10 +77,13 @@ pub async fn run(config: &AppConfig, args: &InitArgs) -> anyhow::Result<()> {
     let birthday_height = BlockHeight::from(args.birthday.unwrap_or(chain_tip.saturating_sub(100)));
     let birthday = {
         // Fetch the tree state for the block before the birthday (leaks birthday to server).
-        let request = service::BlockId {
-            height: u64::from(birthday_height).saturating_sub(1),
-            ..Default::default()
-        };
+        // Never request below height 1: lightwalletd treats a BlockId height of 0 as
+        // "unspecified" and rejects it ("must specify a block height or ID"), and there is no
+        // pre-genesis tree state. This happens on short chains (e.g. a fresh regtest network
+        // where `chain_tip - 100` underflows to 0). `AccountBirthday::from_treestate` then
+        // derives the actual birthday from the returned tree state's height.
+        let prior_height = u64::from(birthday_height).saturating_sub(1).max(1);
+        let request = service::BlockId { height: prior_height, ..Default::default() };
         let treestate = client.get_tree_state(request).await?.into_inner();
         AccountBirthday::from_treestate(treestate, recover_until)
             .map_err(|_| anyhow!("failed to derive account birthday from tree state"))?
