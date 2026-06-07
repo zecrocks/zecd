@@ -35,10 +35,11 @@ jobs:
         run: cargo build --release --bin zecd
 
       # Provision zebrad + lightwalletd from public images (zingo-infra's own binary host is
-      # zingolabs-internal and unreachable). These are CURRENT releases; zingo-infra's mining is
-      # pinned to an older zebra, so getblocktemplate/submitblock may not line up - this is the
-      # "try public binaries" path and may need iteration. The harness reads ZEBRAD_BIN/
-      # LIGHTWALLETD_BIN and skips the live assertions if either is missing.
+      # zingolabs-internal and unreachable). zingo-infra pins zebra rev 0dcc4205 = zebrad 2.1.1, so
+      # we use zfnd/zebra:2.1.0 (closest published tag; 2.1.1 isn't published) - a version match so
+      # its [mining] config fields and getblocktemplate output line up with zingo-infra's mining.
+      # (zebra 5.0.0 fails: it removed the `debug_like_zcashd` mining config field zingo-infra
+      # writes.) The harness reads ZEBRAD_BIN/LIGHTWALLETD_BIN and skips if either is missing.
       - name: Provision zebrad + lightwalletd from images
         run: |
           set -euo pipefail
@@ -54,7 +55,7 @@ jobs:
             chmod +x "$out"
             echo "$name -> $out"; file -b "$out" || true
           }
-          extract zfnd/zebra:5.0.0 zebrad
+          extract zfnd/zebra:2.1.0 zebrad
           extract electriccoinco/lightwalletd:v0.4.19 lightwalletd
           echo "ZEBRAD_BIN=$RUNNER_TEMP/bin/zebrad" >> "$GITHUB_ENV"
           echo "LIGHTWALLETD_BIN=$RUNNER_TEMP/bin/lightwalletd" >> "$GITHUB_ENV"
