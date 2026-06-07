@@ -2,12 +2,8 @@ name: Regtest E2E
 
 # Live tier: brings up zebra (Regtest) + lightwalletd via zingo-infra and drives the real zecd
 # binary over its JSON-RPC (see regtest-harness/). This needs a Linux host with network access
-# (zingo-infra downloads zebrad/lightwalletd) and cannot run in the offline CI tier.
-#
-# It is NON-GATING (continue-on-error) for now: the zingo-infra dependency tree currently fails
-# to resolve from a clean checkout because `zingolib` pins `orchard ^0.10`, all of whose
-# published versions are yanked (see regtest-harness/README.md for the status and the
-# patch-replication path to unblock it). Once it resolves, flip continue-on-error off.
+# (zingo-infra downloads zebrad/lightwalletd) and cannot run in the offline CI tier. The harness
+# now resolves + compiles (vendored Cargo.lock + Rust 1.83); this run validates it end to end.
 
 on:
   workflow_dispatch:
@@ -17,10 +13,13 @@ on:
       - "src/**"
       - ".github/workflows/regtest.yml"
 
+concurrency:
+  group: regtest-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   regtest:
     runs-on: ubuntu-latest
-    continue-on-error: true
     steps:
       - uses: actions/checkout@v4
 
