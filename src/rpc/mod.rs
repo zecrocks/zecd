@@ -34,7 +34,7 @@ pub async fn dispatch(
         // Network
         "getnetworkinfo" => network::getnetworkinfo(state),
         "getconnectioncount" => network::getconnectioncount(state),
-        "getpeerinfo" => network::getpeerinfo(),
+        "getpeerinfo" => network::getpeerinfo(state),
         "ping" => network::ping(),
 
         // Blockchain

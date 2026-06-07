@@ -70,10 +70,17 @@ default_wallet = "default"
 dir = "./data/default"
 
 [lightwalletd]
-server = "zecrocks"              # "ecc" | "ywallet" | "zecrocks" | "host:port"
+server = "zecrocks"              # "ecc" | "ywallet" | "zecrocks" | "host:port" (or "h:p,h:p")
+# Or list multiple endpoints for failover (tried in order, always preferring the first);
+# `servers` takes precedence over `server`. The daemon snaps back to the primary when it recovers.
+# servers = ["127.0.0.1:9067", "zec.rocks:443"]
 connection = "direct"
 tls_roots = "native"            # "native" (OS store, honors SSL_CERT_FILE) | "webpki"
 tls = "auto"                    # "auto" (TLS for remote, plaintext for localhost) | "yes" | "no"
+connect_timeout_secs = 10       # per-attempt dial timeout (so a hung endpoint can't stall sync)
+reconnect_base_secs = 1         # reconnect backoff: base delay (doubles, full jitter)
+reconnect_max_secs = 60         # reconnect backoff: ceiling
+primary_recheck_secs = 60       # while on a fallback, how often to re-probe higher-priority servers
 
 [rpc]
 bind = "127.0.0.1"
@@ -186,8 +193,11 @@ With `[health] enabled` (default), zecd serves unauthenticated probes on a separ
 
 - `GET /healthz` - liveness: `200 ok` while the process is running.
 - `GET /readyz` - readiness: `200` once every wallet is connected to lightwalletd and synced to
-  `[health] ready_progress`; otherwise `503`. Body is JSON with per-wallet detail.
-- `GET /status` - JSON snapshot of per-wallet sync state.
+  `[health] ready_progress`; otherwise `503`. Body is JSON with per-wallet detail; when not ready it
+  also carries a `reason` (`"upstream_down"` vs `"syncing"`) so alerting can tell an unreachable
+  lightwalletd apart from a normal catch-up.
+- `GET /status` - JSON snapshot of per-wallet sync state, including the active `server` endpoint and
+  `conn_state` (`down` | `syncing` | `ready`). `getpeerinfo` reflects the same active upstream.
 
 Set `[health] bind = "0.0.0.0"` so a Kubernetes kubelet / load balancer can reach the probes. The
 health server starts after wallets load, so cover the brief prover-init at boot with a

@@ -2,6 +2,7 @@
 
 mod address;
 mod amount;
+mod backoff;
 mod config;
 mod error;
 mod health;
@@ -68,8 +69,8 @@ async fn run_daemon(config: AppConfig) -> anyhow::Result<()> {
             );
             continue;
         }
-        let server = lightwalletd::resolve(
-            &config.lightwalletd.server,
+        let servers = lightwalletd::resolve_all(
+            &config.lightwalletd.servers,
             config.network,
             config.lightwalletd.tls_roots,
             config.lightwalletd.force_tls,
@@ -78,8 +79,12 @@ async fn run_daemon(config: AppConfig) -> anyhow::Result<()> {
             name: name.clone(),
             network: config.network,
             wallet_dir: entry.dir.clone(),
-            server,
+            servers,
             sync_interval: Duration::from_secs(config.sync.interval_secs),
+            connect_timeout: Duration::from_secs(config.lightwalletd.connect_timeout_secs),
+            reconnect_base: Duration::from_secs(config.lightwalletd.reconnect_base_secs),
+            reconnect_max: Duration::from_secs(config.lightwalletd.reconnect_max_secs),
+            primary_recheck: Duration::from_secs(config.lightwalletd.primary_recheck_secs),
             age_identity: config.keys.age_identity.clone(),
             auto_unlock: config.keys.auto_unlock,
         };

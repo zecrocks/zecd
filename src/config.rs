@@ -19,6 +19,24 @@ use crate::network::ZNetwork;
 /// deployments override `[lightwalletd] server` with their local node.
 pub const DEFAULT_LIGHTWALLETD: &str = "zecrocks";
 
+/// Resolve the ordered list of lightwalletd server tokens by precedence:
+/// CLI `--server` > file `servers` array > file `server` string > built-in default.
+fn select_server_tokens(
+    cli_server: Option<String>,
+    file_servers: Option<Vec<String>>,
+    file_server: Option<String>,
+) -> Vec<String> {
+    if let Some(s) = cli_server {
+        vec![s]
+    } else if let Some(list) = file_servers.filter(|l| !l.is_empty()) {
+        list
+    } else if let Some(s) = file_server {
+        vec![s]
+    } else {
+        vec![DEFAULT_LIGHTWALLETD.to_string()]
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct AppConfig {
     pub network: ZNetwork,
@@ -59,14 +77,23 @@ pub struct WalletEntry {
 
 #[derive(Debug, Clone)]
 pub struct LightwalletdConfig {
-    /// `ecc` | `ywallet` | `zecrocks` | a comma-separated `host:port` list.
-    pub server: String,
+    /// Ordered list of server tokens; each is `ecc` | `ywallet` | `zecrocks` or a `host:port`
+    /// (or a comma-separated `host:port` list). Tried in order, always preferring the first.
+    pub servers: Vec<String>,
     /// `direct` | `tor` | `socks5://host:port`.
     pub connection: String,
     /// TLS root certificates to trust (`native` or `webpki`).
     pub tls_roots: crate::lightwalletd::TlsRoots,
     /// Force TLS on/off; `None` = auto (TLS for remote hosts, plaintext for localhost).
     pub force_tls: Option<bool>,
+    /// Per-attempt dial timeout (seconds) for connecting to a lightwalletd endpoint.
+    pub connect_timeout_secs: u64,
+    /// Reconnect backoff base delay (seconds).
+    pub reconnect_base_secs: u64,
+    /// Reconnect backoff maximum delay (seconds).
+    pub reconnect_max_secs: u64,
+    /// While running on a fallback, how often (seconds) to re-probe higher-priority servers.
+    pub primary_recheck_secs: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -157,9 +184,14 @@ struct WalletFile {
 #[serde(deny_unknown_fields)]
 struct LightwalletdFile {
     server: Option<String>,
+    servers: Option<Vec<String>>,
     connection: Option<String>,
     tls_roots: Option<String>,
     tls: Option<String>,
+    connect_timeout_secs: Option<u64>,
+    reconnect_base_secs: Option<u64>,
+    reconnect_max_secs: Option<u64>,
+    primary_recheck_secs: Option<u64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -324,9 +356,14 @@ impl AppConfig {
 
         let lwd_file = file.lightwalletd.unwrap_or(LightwalletdFile {
             server: None,
+            servers: None,
             connection: None,
             tls_roots: None,
             tls: None,
+            connect_timeout_secs: None,
+            reconnect_base_secs: None,
+            reconnect_max_secs: None,
+            primary_recheck_secs: None,
         });
         let tls_roots = match lwd_file.tls_roots {
             Some(s) => crate::lightwalletd::TlsRoots::parse(&s)?,
@@ -336,15 +373,17 @@ impl AppConfig {
             Some(s) => crate::lightwalletd::parse_tls_mode(&s)?,
             None => None,
         };
+        let servers = select_server_tokens(cli.server.clone(), lwd_file.servers, lwd_file.server);
+        let reconnect_base_secs = lwd_file.reconnect_base_secs.unwrap_or(1).max(1);
         let lightwalletd = LightwalletdConfig {
-            server: cli
-                .server
-                .clone()
-                .or(lwd_file.server)
-                .unwrap_or_else(|| DEFAULT_LIGHTWALLETD.to_string()),
+            servers,
             connection: lwd_file.connection.unwrap_or_else(|| "direct".to_string()),
             tls_roots,
             force_tls,
+            connect_timeout_secs: lwd_file.connect_timeout_secs.unwrap_or(10).max(1),
+            reconnect_base_secs,
+            reconnect_max_secs: lwd_file.reconnect_max_secs.unwrap_or(60).max(reconnect_base_secs),
+            primary_recheck_secs: lwd_file.primary_recheck_secs.unwrap_or(60).max(1),
         };
 
         let rpc_file = file.rpc.unwrap_or(RpcFile {
@@ -431,5 +470,67 @@ impl AppConfig {
             health,
             log,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn server_token_precedence() {
+        // CLI wins over everything.
+        assert_eq!(
+            select_server_tokens(
+                Some("cli:1".into()),
+                Some(vec!["arr:1".into()]),
+                Some("str:1".into())
+            ),
+            vec!["cli:1".to_string()]
+        );
+        // The `servers` array beats the legacy `server` string.
+        assert_eq!(
+            select_server_tokens(
+                None,
+                Some(vec!["a:1".into(), "b:2".into()]),
+                Some("str:1".into())
+            ),
+            vec!["a:1".to_string(), "b:2".to_string()]
+        );
+        // An empty array falls through to the string.
+        assert_eq!(
+            select_server_tokens(None, Some(vec![]), Some("str:1".into())),
+            vec!["str:1".to_string()]
+        );
+        // Nothing configured -> built-in default.
+        assert_eq!(
+            select_server_tokens(None, None, None),
+            vec![DEFAULT_LIGHTWALLETD.to_string()]
+        );
+    }
+
+    #[test]
+    fn lightwalletd_file_parses_array_and_backoff() {
+        let f: LightwalletdFile = toml::from_str(
+            r#"
+            servers = ["127.0.0.1:9067", "zec.rocks:443"]
+            connect_timeout_secs = 5
+            reconnect_base_secs = 2
+            reconnect_max_secs = 30
+            primary_recheck_secs = 90
+            "#,
+        )
+        .unwrap();
+        assert_eq!(f.servers.unwrap().len(), 2);
+        assert_eq!(f.connect_timeout_secs, Some(5));
+        assert_eq!(f.reconnect_base_secs, Some(2));
+        assert_eq!(f.reconnect_max_secs, Some(30));
+        assert_eq!(f.primary_recheck_secs, Some(90));
+    }
+
+    #[test]
+    fn lightwalletd_file_rejects_unknown_field() {
+        // `deny_unknown_fields` must still reject typos/unsupported keys.
+        assert!(toml::from_str::<LightwalletdFile>("bogus_key = 1").is_err());
     }
 }
