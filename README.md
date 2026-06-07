@@ -71,9 +71,12 @@ dir = "./data/default"
 
 [lightwalletd]
 server = "zecrocks"              # "ecc" | "ywallet" | "zecrocks" | "host:port" (or "h:p,h:p")
-# Or list multiple endpoints for failover (tried in order, always preferring the first);
-# `servers` takes precedence over `server`. The daemon snaps back to the primary when it recovers.
-# servers = ["127.0.0.1:9067", "zec.rocks:443"]
+# Or list multiple endpoints for failover, tried in order and always preferring the first; the
+# daemon snaps back to the primary when it recovers. `servers` takes precedence over `server`.
+# A scheme prefix sets TLS per endpoint (http:// plaintext, https:// TLS), so a plaintext local
+# node and TLS public fallbacks can share one list:
+#   mainnet:  servers = ["http://127.0.0.1:9067", "https://zec.rocks:443", "https://eu.zec.rocks:443"]
+#   testnet:  servers = ["http://127.0.0.1:9067", "https://testnet.zec.rocks:443"]
 connection = "direct"
 tls_roots = "native"            # "native" (OS store, honors SSL_CERT_FILE) | "webpki"
 tls = "auto"                    # "auto" (TLS for remote, plaintext for localhost) | "yes" | "no"

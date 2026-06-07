@@ -121,7 +121,9 @@ const ZEC_ROCKS_TESTNET: &[(&str, u16)] = &[("testnet.zec.rocks", 443)];
 
 /// Resolve a single server token (`ecc` | `ywallet` | `zecrocks` | `host:port[,host:port]`) for
 /// the given network into an ordered, non-empty list of [`Server`]s. Multi-endpoint presets and
-/// comma-separated host lists expand to all of their endpoints (the first is the primary).
+/// comma-separated host lists expand to all of their endpoints (the first is the primary). A
+/// `host:port` may carry an `http://`/`https://` scheme to force that endpoint's TLS mode,
+/// overriding the global `tls` setting (e.g. a plaintext local node + TLS public fallbacks).
 pub fn resolve(
     server: &str,
     network: ZNetwork,
@@ -179,13 +181,22 @@ fn parse_host_list(s: &str, roots: TlsRoots, force_tls: Option<bool>) -> anyhow:
         if entry.is_empty() {
             continue;
         }
-        let (host, port_str) = entry
+        // An optional `http://`/`https://` scheme sets TLS per endpoint, overriding the global
+        // `tls` setting - so a plaintext local node and TLS public fallbacks can share one list.
+        let (force, rest) = if let Some(r) = entry.strip_prefix("https://") {
+            (Some(true), r)
+        } else if let Some(r) = entry.strip_prefix("http://") {
+            (Some(false), r)
+        } else {
+            (force_tls, entry)
+        };
+        let (host, port_str) = rest
             .rsplit_once(':')
             .ok_or_else(|| anyhow!("invalid lightwalletd address '{entry}', expected host:port"))?;
         let port: u16 = port_str
             .parse()
             .map_err(|_| anyhow!("invalid port in '{entry}'"))?;
-        servers.push(Server::new(Cow::Owned(host.to_string()), port, roots, force_tls));
+        servers.push(Server::new(Cow::Owned(host.to_string()), port, roots, force));
     }
     if servers.is_empty() {
         return Err(anyhow!("no lightwalletd hosts in '{s}'"));
@@ -255,6 +266,37 @@ mod tests {
     fn empty_host_list_errors() {
         assert!(resolve(" , ", ZNetwork::Test, TlsRoots::Native, None).is_err());
         assert!(resolve(",", ZNetwork::Test, TlsRoots::Native, None).is_err());
+    }
+
+    #[test]
+    fn scheme_prefix_sets_tls_per_server() {
+        // Global tls=auto (None); scheme prefixes pick TLS per endpoint.
+        let s = resolve(
+            "http://lightwalletd:9067,https://zec.rocks:443",
+            ZNetwork::Main,
+            TlsRoots::Native,
+            None,
+        )
+        .unwrap();
+        assert_eq!(s.len(), 2);
+        assert_eq!(s[0].host.as_ref(), "lightwalletd");
+        assert!(!s[0].use_tls()); // http:// => plaintext even though it's a remote-looking host
+        assert_eq!(s[1].host.as_ref(), "zec.rocks");
+        assert!(s[1].use_tls()); // https:// => TLS
+    }
+
+    #[test]
+    fn scheme_prefix_overrides_global_tls() {
+        // Even with a global force (tls="no"), an explicit https:// forces TLS for that endpoint.
+        let s = resolve(
+            "lightwalletd:9067,https://zec.rocks:443",
+            ZNetwork::Main,
+            TlsRoots::Native,
+            Some(false),
+        )
+        .unwrap();
+        assert!(!s[0].use_tls()); // no scheme -> global force (plaintext)
+        assert!(s[1].use_tls()); // scheme overrides to TLS
     }
 
     #[test]

@@ -533,4 +533,12 @@ mod tests {
         // `deny_unknown_fields` must still reject typos/unsupported keys.
         assert!(toml::from_str::<LightwalletdFile>("bogus_key = 1").is_err());
     }
+
+    #[test]
+    fn shipped_configs_parse() {
+        // The example and docker configs must deserialize (deny_unknown_fields catches typos and
+        // drift as the schema evolves).
+        toml::from_str::<ConfigFile>(include_str!("../zecd.example.toml")).expect("zecd.example.toml");
+        toml::from_str::<ConfigFile>(include_str!("../deploy/zecd.toml")).expect("deploy/zecd.toml");
+    }
 }

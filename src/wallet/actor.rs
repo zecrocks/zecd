@@ -43,6 +43,11 @@ use crate::wallet::{labels, make_handle, store, ConnState, SyncStatus, WalletCom
 const TARGET_NOTE_COUNT: usize = 4;
 const MIN_SPLIT_OUTPUT_VALUE: u64 = 10_000_000; // 0.1 ZEC
 
+/// Upper bound on the per-attempt dial timeout used when re-probing higher-priority servers,
+/// so a black-holed primary can't stall the command loop for the full `connect_timeout` on
+/// each `primary_recheck`. A recovered primary connects near-instantly; a dead one fails fast.
+const REPROBE_CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
+
 thread_local! {
     /// Set while we deliberately `catch_unwind` librustzcash's progress estimator, so the
     /// panic hook can stay quiet for that (expected, handled) panic only.
@@ -353,10 +358,11 @@ impl WalletActor {
             return;
         }
         self.last_primary_probe = Instant::now();
+        // Cap the probe dial so a black-holed primary can't stall command processing.
+        let probe_timeout = self.connect_timeout.min(REPROBE_CONNECT_TIMEOUT);
         for idx in 0..self.active {
             let describe = self.servers[idx].describe();
-            let Ok(mut client) = self.servers[idx].connect_timeout(self.connect_timeout).await
-            else {
+            let Ok(mut client) = self.servers[idx].connect_timeout(probe_timeout).await else {
                 continue;
             };
             if let Err(e) = engine::update_subtree_roots(&mut client, &mut self.db_data).await {
