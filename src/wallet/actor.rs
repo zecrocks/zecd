@@ -25,13 +25,14 @@ use zcash_client_backend::wallet::OvkPolicy;
 use zcash_client_sqlite::{AccountUuid, FsBlockDb};
 use zcash_keys::keys::UnifiedAddressRequest;
 use zcash_proofs::prover::LocalTxProver;
-use zcash_protocol::consensus::{BlockHeight, Network};
+use zcash_protocol::consensus::BlockHeight;
 use zcash_protocol::value::Zatoshis;
 use zcash_protocol::{ShieldedProtocol, TxId};
 use zip321::TransactionRequest;
 
 use crate::error::{codes, RpcError};
 use crate::lightwalletd::Server;
+use crate::network::ZNetwork;
 use crate::sync::engine;
 use crate::wallet::keys::{self, SeedKeeper};
 use crate::wallet::open::{self, WriteDb};
@@ -62,7 +63,7 @@ pub fn install_panic_hook() {
 /// Parameters needed to launch a wallet actor.
 pub struct ActorConfig {
     pub name: String,
-    pub network: Network,
+    pub network: ZNetwork,
     pub wallet_dir: PathBuf,
     pub server: Server,
     pub sync_interval: Duration,
@@ -72,7 +73,7 @@ pub struct ActorConfig {
 
 struct WalletActor {
     name: String,
-    network: Network,
+    network: ZNetwork,
     wallet_dir: PathBuf,
     server: Server,
     sync_interval: Duration,

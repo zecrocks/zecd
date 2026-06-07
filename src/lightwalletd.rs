@@ -8,13 +8,15 @@ use std::borrow::Cow;
 use anyhow::anyhow;
 use tonic::transport::{Channel, ClientTlsConfig};
 use zcash_client_backend::proto::service::compact_tx_streamer_client::CompactTxStreamerClient;
-use zcash_protocol::consensus::Network;
+
+use crate::network::ZNetwork;
 
 /// Which set of root certificates to trust for TLS connections.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum TlsRoots {
     /// OS trust store (honors `SSL_CERT_FILE`). Works behind TLS-intercepting proxies and with
     /// local/corporate CAs. Default.
+    #[default]
     Native,
     /// Embedded Mozilla root bundle (webpki-roots). Good for minimal containers, but won't
     /// trust private/proxy CAs.
@@ -28,12 +30,6 @@ impl TlsRoots {
             "webpki" | "mozilla" => Ok(TlsRoots::Webpki),
             other => Err(anyhow!("invalid tls_roots '{other}', expected 'native' or 'webpki'")),
         }
-    }
-}
-
-impl Default for TlsRoots {
-    fn default() -> Self {
-        TlsRoots::Native
     }
 }
 
@@ -112,24 +108,28 @@ const ZEC_ROCKS_TESTNET: &[(&str, u16)] = &[("testnet.zec.rocks", 443)];
 /// given network into a concrete [`Server`].
 pub fn resolve(
     server: &str,
-    network: Network,
+    network: ZNetwork,
     roots: TlsRoots,
     force_tls: Option<bool>,
 ) -> anyhow::Result<Server> {
+    // The named presets are public mainnet/testnet infrastructure; regtest has none, so a
+    // regtest deployment must give an explicit `host:port` (handled by `parse_host_list`).
     let preset: Option<&[(&str, u16)]> = match (server, network) {
-        ("ecc", Network::TestNetwork) => Some(ECC_TESTNET),
-        ("ecc", Network::MainNetwork) => None,
-        ("ywallet", Network::MainNetwork) => Some(YWALLET_MAINNET),
-        ("ywallet", Network::TestNetwork) => None,
-        ("zecrocks", Network::MainNetwork) => Some(ZEC_ROCKS_MAINNET),
-        ("zecrocks", Network::TestNetwork) => Some(ZEC_ROCKS_TESTNET),
+        ("ecc", ZNetwork::Test) => Some(ECC_TESTNET),
+        ("ecc", _) => None,
+        ("ywallet", ZNetwork::Main) => Some(YWALLET_MAINNET),
+        ("ywallet", _) => None,
+        ("zecrocks", ZNetwork::Main) => Some(ZEC_ROCKS_MAINNET),
+        ("zecrocks", ZNetwork::Test) => Some(ZEC_ROCKS_TESTNET),
+        ("zecrocks", _) => None,
         _ => return parse_host_list(server, roots, force_tls),
     };
 
     match preset.and_then(|s| s.first()) {
         Some(&(host, port)) => Ok(Server::new(Cow::Borrowed(host), port, roots, force_tls)),
         None => Err(anyhow!(
-            "lightwalletd preset '{server}' does not serve {network:?}"
+            "lightwalletd preset '{server}' does not serve {}",
+            network.name()
         )),
     }
 }
@@ -151,21 +151,21 @@ mod tests {
 
     #[test]
     fn resolves_presets_and_custom() {
-        let s = resolve("zecrocks", Network::TestNetwork, TlsRoots::Native, None).unwrap();
+        let s = resolve("zecrocks", ZNetwork::Test, TlsRoots::Native, None).unwrap();
         assert_eq!(s.host.as_ref(), "testnet.zec.rocks");
         assert!(s.use_tls());
-        let s = resolve("zecrocks", Network::MainNetwork, TlsRoots::Native, None).unwrap();
+        let s = resolve("zecrocks", ZNetwork::Main, TlsRoots::Native, None).unwrap();
         assert_eq!(s.host.as_ref(), "zec.rocks");
         // localhost auto -> plaintext
-        let s = resolve("127.0.0.1:9067", Network::TestNetwork, TlsRoots::Native, None).unwrap();
+        let s = resolve("127.0.0.1:9067", ZNetwork::Test, TlsRoots::Native, None).unwrap();
         assert!(!s.use_tls());
         // forced plaintext for a co-located lightwalletd reached by service name
-        let s = resolve("lightwalletd:9067", Network::TestNetwork, TlsRoots::Native, Some(false)).unwrap();
+        let s = resolve("lightwalletd:9067", ZNetwork::Test, TlsRoots::Native, Some(false)).unwrap();
         assert!(!s.use_tls());
         // forced TLS even for localhost
-        let s = resolve("127.0.0.1:443", Network::MainNetwork, TlsRoots::Native, Some(true)).unwrap();
+        let s = resolve("127.0.0.1:443", ZNetwork::Main, TlsRoots::Native, Some(true)).unwrap();
         assert!(s.use_tls());
-        assert!(resolve("ecc", Network::MainNetwork, TlsRoots::Native, None).is_err());
+        assert!(resolve("ecc", ZNetwork::Main, TlsRoots::Native, None).is_err());
     }
 
     #[test]
@@ -183,7 +183,7 @@ mod tests {
     #[ignore = "hits testnet.zec.rocks over the network"]
     async fn testnet_zecrocks_get_latest_block() {
         use zcash_client_backend::proto::service;
-        let server = resolve("zecrocks", Network::TestNetwork, TlsRoots::Native, None).unwrap();
+        let server = resolve("zecrocks", ZNetwork::Test, TlsRoots::Native, None).unwrap();
         let mut client = server.connect().await.expect("connect to testnet.zec.rocks");
         let tip = client
             .get_latest_block(service::ChainSpec::default())
@@ -198,7 +198,7 @@ mod tests {
     #[ignore = "hits testnet.zec.rocks over the network"]
     async fn testnet_zecrocks_lightd_info_and_treestate() {
         use zcash_client_backend::proto::service;
-        let server = resolve("zecrocks", Network::TestNetwork, TlsRoots::Native, None).unwrap();
+        let server = resolve("zecrocks", ZNetwork::Test, TlsRoots::Native, None).unwrap();
         let mut client = server.connect().await.expect("connect");
 
         let info = client
@@ -224,7 +224,7 @@ mod tests {
     #[ignore = "hits zec.rocks (mainnet) over the network"]
     async fn mainnet_zecrocks_get_latest_block() {
         use zcash_client_backend::proto::service;
-        let server = resolve("zecrocks", Network::MainNetwork, TlsRoots::Native, None).unwrap();
+        let server = resolve("zecrocks", ZNetwork::Main, TlsRoots::Native, None).unwrap();
         let mut client = server.connect().await.expect("connect to zec.rocks");
         let tip = client
             .get_latest_block(service::ChainSpec::default())

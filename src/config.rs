@@ -8,10 +8,11 @@ use std::collections::BTreeMap;
 use std::net::IpAddr;
 use std::path::PathBuf;
 
-use anyhow::{anyhow, Context};
+use anyhow::Context;
 use clap::Parser;
 use serde::Deserialize;
-use zcash_protocol::consensus::Network;
+
+use crate::network::ZNetwork;
 
 /// Default lightwalletd endpoint: the public zecrocks infrastructure
 /// (`zec.rocks:443` on mainnet, `testnet.zec.rocks:443` on testnet). Self-hosted
@@ -20,7 +21,7 @@ pub const DEFAULT_LIGHTWALLETD: &str = "zecrocks";
 
 #[derive(Debug, Clone)]
 pub struct AppConfig {
-    pub network: Network,
+    pub network: ZNetwork,
     pub datadir: PathBuf,
     pub default_wallet: String,
     pub wallets: BTreeMap<String, WalletEntry>,
@@ -102,10 +103,10 @@ impl AppConfig {
     }
 
     /// Default RPC port for a network when none is configured (zcashd convention).
-    pub fn default_rpc_port(network: Network) -> u16 {
+    pub fn default_rpc_port(network: ZNetwork) -> u16 {
         match network {
-            Network::MainNetwork => 8232,
-            Network::TestNetwork => 18232,
+            ZNetwork::Main => 8232,
+            ZNetwork::Test | ZNetwork::Regtest(_) => 18232,
         }
     }
 }
@@ -205,7 +206,11 @@ pub struct Cli {
     #[arg(long)]
     pub testnet: bool,
 
-    /// Network: "main" or "test".
+    /// Use regtest - a local zebra+lightwalletd chain (overrides config `network`).
+    #[arg(long)]
+    pub regtest: bool,
+
+    /// Network: "main", "test", or "regtest".
     #[arg(long, value_name = "NET")]
     pub network: Option<String>,
 
@@ -265,14 +270,6 @@ pub struct InitArgs {
     pub birthday: Option<u32>,
 }
 
-fn parse_network(s: &str) -> anyhow::Result<Network> {
-    match s.trim() {
-        "main" | "mainnet" => Ok(Network::MainNetwork),
-        "test" | "testnet" => Ok(Network::TestNetwork),
-        other => Err(anyhow!("unsupported network: {other}")),
-    }
-}
-
 impl AppConfig {
     /// Resolve the effective configuration from CLI flags and the TOML file.
     pub fn resolve(cli: &Cli) -> anyhow::Result<AppConfig> {
@@ -296,15 +293,17 @@ impl AppConfig {
             ConfigFile::default()
         };
 
-        // Network: CLI --testnet/--network override the file.
-        let network = if cli.testnet {
-            Network::TestNetwork
+        // Network: CLI --regtest/--testnet/--network override the file.
+        let network = if cli.regtest {
+            crate::network::regtest()
+        } else if cli.testnet {
+            ZNetwork::Test
         } else if let Some(n) = &cli.network {
-            parse_network(n)?
+            ZNetwork::parse(n)?
         } else if let Some(n) = &file.network {
-            parse_network(n)?
+            ZNetwork::parse(n)?
         } else {
-            Network::TestNetwork
+            ZNetwork::Test
         };
 
         let default_wallet = file

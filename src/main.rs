@@ -7,6 +7,7 @@ mod error;
 mod health;
 mod init;
 mod lightwalletd;
+mod network;
 mod rpc;
 mod server;
 mod state;

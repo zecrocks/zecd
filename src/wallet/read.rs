@@ -10,9 +10,9 @@ use rusqlite::{named_params, Connection, OptionalExtension};
 use uuid::Uuid;
 use zcash_client_backend::data_api::wallet::ConfirmationsPolicy;
 use zcash_client_backend::data_api::{InputSource, WalletRead};
-use zcash_protocol::consensus::Network;
 use zcash_protocol::ShieldedProtocol;
 
+use crate::network::ZNetwork;
 use crate::wallet::open::{data_db_path, open_read};
 
 /// Spendable / pending balances aggregated across the wallet's accounts (in zatoshis).
@@ -28,7 +28,7 @@ pub struct BalanceInfo {
 }
 
 /// Aggregate balances via `get_wallet_summary` (mirrors devtool's `balance.rs`).
-pub fn balance(network: Network, wallet_dir: &Path) -> anyhow::Result<BalanceInfo> {
+pub fn balance(network: ZNetwork, wallet_dir: &Path) -> anyhow::Result<BalanceInfo> {
     let db = open_read(network, wallet_dir)?;
     let mut info = BalanceInfo::default();
     if let Some(summary) = db.get_wallet_summary(ConfirmationsPolicy::default())? {
@@ -227,7 +227,7 @@ pub fn get_transaction(wallet_dir: &Path, txid_hex: &str) -> anyhow::Result<Opti
 }
 
 /// List unspent Orchard notes for `listunspent` (with mined height for confirmations).
-pub fn list_unspent(network: Network, wallet_dir: &Path) -> anyhow::Result<Vec<UnspentNote>> {
+pub fn list_unspent(network: ZNetwork, wallet_dir: &Path) -> anyhow::Result<Vec<UnspentNote>> {
     let db = open_read(network, wallet_dir)?;
     let Some(chain_height) = db.chain_height()? else {
         return Ok(vec![]);
@@ -267,7 +267,7 @@ pub fn list_unspent(network: Network, wallet_dir: &Path) -> anyhow::Result<Vec<U
 }
 
 /// Whether `addr` is one of the wallet's own generated addresses (for `getaddressinfo.ismine`).
-pub fn is_mine(network: Network, wallet_dir: &Path, addr: &str) -> bool {
+pub fn is_mine(network: ZNetwork, wallet_dir: &Path, addr: &str) -> bool {
     let Ok(db) = open_read(network, wallet_dir) else {
         return false;
     };

@@ -7,17 +7,14 @@ pub mod util;
 pub mod wallet_methods;
 
 use serde_json::Value;
-use zcash_protocol::consensus::Network;
 
 use crate::error::RpcError;
+use crate::network::ZNetwork;
 use crate::server::jsonrpc::RpcRequest;
 use crate::state::AppState;
 
-pub(crate) fn net_name(network: Network) -> &'static str {
-    match network {
-        Network::MainNetwork => "main",
-        Network::TestNetwork => "test",
-    }
+pub(crate) fn net_name(network: ZNetwork) -> &'static str {
+    network.name()
 }
 
 /// Route a parsed request to its handler. `wallet` is the wallet name from a `/wallet/<name>`

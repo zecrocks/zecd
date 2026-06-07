@@ -187,7 +187,7 @@ mod tests {
             work_queue: 16,
         };
         let config = AppConfig {
-            network: zcash_protocol::consensus::Network::TestNetwork,
+            network: crate::network::ZNetwork::Test,
             datadir: std::path::PathBuf::from("/tmp"),
             default_wallet: "default".into(),
             wallets: BTreeMap::new(),
