@@ -38,5 +38,6 @@ jobs:
       - name: Run regtest end-to-end harness
         env:
           ZECD_BIN: ${{ github.workspace }}/target/release/zecd
+        # --locked: build against the vendored lock (yanked-but-locked orchard + pinned zebra rev).
         # Single-threaded: the harness binds fixed ports (zecd RPC + lightwalletd).
-        run: cargo test --manifest-path regtest-harness/Cargo.toml -- --nocapture --test-threads=1
+        run: cargo test --locked --manifest-path regtest-harness/Cargo.toml -- --nocapture --test-threads=1

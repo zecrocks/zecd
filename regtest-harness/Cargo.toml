@@ -24,7 +24,10 @@ tempfile = "3"
 # zebrad + lightwalletd, and - crucially - mines regtest blocks via getblocktemplate/submitblock
 # (zebra has no `generate` RPC). Git-only.
 #
-# KNOWN BLOCKER (see README.md): this does not resolve from a clean checkout - `zingolib` pins
-# `orchard ^0.10`, all of whose published versions are yanked. Unblocking requires replicating
-# zingolib's `[patch.crates-io]` (forked orchard/librustzcash) here, or vendoring a Cargo.lock.
-zingo-infra-testutils = { git = "https://github.com/zingolabs/infrastructure", branch = "main" }
+# Pinned to the exact infrastructure rev whose committed Cargo.lock we vendor (this crate's
+# Cargo.lock). That lock pins the whole tree to a mutually-consistent snapshot - notably zebra-rpc
+# to a rev that still has the `getblocktemplate-rpcs` feature, and the yanked-but-locked
+# `orchard 0.10.1` that cargo accepts only because it is recorded in the lock. Pinning to a moving
+# `branch = "main"` drifts off the lock and re-breaks (newer zebra dropped that feature; all
+# published `orchard 0.10.x` are yanked). Always build this crate with `--locked`. See README.md.
+zingo-infra-testutils = { git = "https://github.com/zingolabs/infrastructure", rev = "18cce79116589ce88b24310a18ad88e3e3023d7c" }

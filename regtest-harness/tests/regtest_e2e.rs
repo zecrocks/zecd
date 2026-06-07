@@ -14,16 +14,19 @@
 //! covers sync, addresses, the RPC surface and insufficient-funds - not a funded spend. Funded
 //! semantics are covered by zecd's offline lifecycle test and the live testnet flow.
 
+use std::path::PathBuf;
 use std::time::Duration;
 
 use serde_json::json;
 use zecd_regtest_harness::{Zecd, ZecdConfig};
 
-// zingo-infra's local-net orchestrator. `ZebradConfig::default()` already selects
-// Network::Regtest with regtest activation heights and a default miner address, so we lean on
-// the defaults and only read back the ports we need.
+// zingo-infra's local-net orchestrator. `ZebradConfig::default()` selects Network::Regtest with
+// every upgrade (incl. NU5/Orchard) active at height 1 - matching zecd's `network::regtest()`.
+// The `Validator` trait brings `generate_blocks` into scope.
 use zingo_infra_testutils::services::{
-    indexer::LightwalletdConfig, validator::ZebradConfig, LocalNet,
+    indexer::LightwalletdConfig,
+    validator::{Validator, ZebradConfig},
+    LocalNet,
 };
 
 const INITIAL_BLOCKS: u32 = 10;
@@ -31,9 +34,19 @@ const SYNC_TIMEOUT: Duration = Duration::from_secs(90);
 
 #[tokio::test]
 async fn regtest_end_to_end() {
-    // 1. Launch zebra (Regtest) + lightwalletd; lightwalletd's validator port is wired to
-    //    zebra's RPC port automatically by `launch`.
-    let net = LocalNet::launch(LightwalletdConfig::default(), ZebradConfig::default()).await;
+    // 1. Launch zebra (Regtest) + lightwalletd; `launch` wires lightwalletd's validator port to
+    //    zebra's RPC port automatically (and overwrites `zcashd_conf`). LightwalletdConfig has no
+    //    Default - `listen_port: None` picks a free port; `lightwalletd_bin: None` uses the
+    //    binary zingo-infra downloads.
+    let net = LocalNet::launch(
+        LightwalletdConfig {
+            lightwalletd_bin: None,
+            listen_port: None,
+            zcashd_conf: PathBuf::new(),
+        },
+        ZebradConfig::default(),
+    )
+    .await;
 
     // 2. Mine an initial chain so zecd has a tip above the wallet birthday (regtest genesis).
     net.validator()
