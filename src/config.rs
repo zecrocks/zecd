@@ -540,5 +540,7 @@ mod tests {
         // drift as the schema evolves).
         toml::from_str::<ConfigFile>(include_str!("../zecd.example.toml")).expect("zecd.example.toml");
         toml::from_str::<ConfigFile>(include_str!("../deploy/zecd.toml")).expect("deploy/zecd.toml");
+        toml::from_str::<ConfigFile>(include_str!("../deploy/zecd.mainnet.toml"))
+            .expect("deploy/zecd.mainnet.toml");
     }
 }

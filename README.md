@@ -235,8 +235,18 @@ curl localhost:9233/readyz
 curl --user zec:CHANGE-ME --data-binary '{"method":"getblockchaininfo","id":1}' localhost:18232/
 ```
 
-Image tags in the compose are examples - pin zebra/lightwalletd to releases you've verified. Edit
-`deploy/*.toml` / `*.conf` for mainnet (network, ports, and the `zecd.toml` RPC password).
+**Mainnet:** a ready-made override is included. Add `-f docker-compose.mainnet.yml` to every command
+to swap each service onto its mainnet config (`zebrad.mainnet.toml`, `lightwalletd-zcash.mainnet.conf`,
+`zecd.mainnet.toml` - local node primary with `zec.rocks:443` / `eu.zec.rocks:443` failover):
+
+```sh
+docker compose -f docker-compose.yml -f docker-compose.mainnet.yml up -d zebra lightwalletd
+docker compose -f docker-compose.yml -f docker-compose.mainnet.yml run --rm zecd init --wallet default --account-name primary
+docker compose -f docker-compose.yml -f docker-compose.mainnet.yml up -d
+```
+
+Image tags in the compose are examples - pin zebra/lightwalletd to releases you've verified. Set a
+real RPC password in `zecd.toml` / `zecd.mainnet.toml` before exposing the port.
 
 ## Compatibility boundary
 

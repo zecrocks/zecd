@@ -1,0 +1,43 @@
+# zecd configuration for the docker-compose stack - MAINNET variant.
+# Use with: docker compose -f docker-compose.yml -f docker-compose.mainnet.yml up -d
+# The default stack is testnet (zecd.toml); this file switches zecd to mainnet.
+
+network = "main"
+datadir = "/var/lib/zecd"
+default_wallet = "default"
+
+[wallets.default]
+dir = "/var/lib/zecd/default"
+
+[lightwalletd]
+# Failover, tried in order, always preferring the first: the co-located lightwalletd, then the
+# public zecrocks mainnet endpoints if the local node is down. The scheme prefix sets TLS per
+# endpoint - http:// for the plaintext local node, https:// for the public TLS endpoints.
+servers = ["http://lightwalletd:9067", "https://zec.rocks:443", "https://eu.zec.rocks:443"]
+connect_timeout_secs = 10
+reconnect_base_secs = 1
+reconnect_max_secs = 60
+primary_recheck_secs = 60
+
+[rpc]
+# Kept on 18232 (matching the testnet stack's published port) rather than the mainnet default 8232,
+# so the compose port mapping is identical across networks. Protect with auth + a network policy.
+bind = "0.0.0.0"
+port = 18232
+user = "zec"
+password = "CHANGE-ME"
+
+[keys]
+age_identity = "/var/lib/zecd/identity.txt"
+auto_unlock = true
+
+[sync]
+interval_secs = 20
+
+[health]
+bind = "0.0.0.0"
+port = 9233
+
+[log]
+level = "info"
+format = "json"
