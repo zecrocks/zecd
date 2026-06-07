@@ -3,31 +3,26 @@ name = "zecd-regtest-harness"
 version = "0.0.0"
 edition = "2021"
 publish = false
-description = "End-to-end regtest integration harness for zecd (zebra + lightwalletd via zingo-infra)"
+description = "End-to-end regtest integration harness for zecd (zebra + lightwalletd, Zcash-Foundation-standard)"
 
-# Standalone workspace on purpose: this crate pulls in zingo-infra's heavy, fast-moving
-# dependency tree (zebra-chain, etc.). Declaring its own [workspace] keeps that tree fully
-# isolated from zecd's hard-pinned librustzcash lockfile - `cargo build` in the parent never
-# sees these deps, and a resolver hiccup here can never destabilise the zecd binary.
+# Standalone workspace on purpose: this crate pulls in zebra's crates (zebra-rpc/zebra-chain and
+# their tree). Declaring its own [workspace] keeps that fully isolated from zecd's hard-pinned
+# librustzcash lockfile - `cargo build` in the parent never sees these deps.
 [workspace]
 
 [dependencies]
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "process", "time", "fs", "io-util"] }
-# Plaintext HTTP only (zecd RPC is local http://) - no TLS stack pulled in.
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "process", "time", "fs", "io-util", "net"] }
+# Plaintext HTTP only (zecd + zebra RPC are local http://) - no TLS stack pulled in.
 reqwest = { version = "0.12", default-features = false, features = ["json"] }
 serde_json = "1"
 anyhow = "1"
 tempfile = "3"
+hex = "0.4"
 
-[dev-dependencies]
-# The ecosystem's local-net orchestrator (formerly "zcash_local_net"). It downloads and runs
-# zebrad + lightwalletd, and - crucially - mines regtest blocks via getblocktemplate/submitblock
-# (zebra has no `generate` RPC). Git-only.
-#
-# Pinned to the exact infrastructure rev whose committed Cargo.lock we vendor (this crate's
-# Cargo.lock). That lock pins the whole tree to a mutually-consistent snapshot - notably zebra-rpc
-# to a rev that still has the `getblocktemplate-rpcs` feature, and the yanked-but-locked
-# `orchard 0.10.1` that cargo accepts only because it is recorded in the lock. Pinning to a moving
-# `branch = "main"` drifts off the lock and re-breaks (newer zebra dropped that feature; all
-# published `orchard 0.10.x` are yanked). Always build this crate with `--locked`. See README.md.
-zingo-infra-testutils = { git = "https://github.com/zingolabs/infrastructure", rev = "18cce79116589ce88b24310a18ad88e3e3023d7c" }
+# Zcash-Foundation regtest stack. We mine the way zebra's own regtest tests do - `getblocktemplate`
+# → `proposal_block_from_template` → `submitblock` (no PoW on Regtest) - instead of depending on
+# zingo-infra/zcash_local_net. Pinned to the tag matching the zebrad binary CI runs (zfnd/zebra
+# image); keep these in lockstep with the image tag in .github/workflows/regtest.yml. A committed
+# Cargo.lock pins the rest of the tree; build with --locked.
+zebra-chain = { git = "https://github.com/ZcashFoundation/zebra", tag = "v5.0.0" }
+zebra-rpc = { git = "https://github.com/ZcashFoundation/zebra", tag = "v5.0.0" }

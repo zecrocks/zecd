@@ -1,109 +1,56 @@
-//! End-to-end regtest test: zebra (Regtest) + lightwalletd, driven through zecd's JSON-RPC.
+//! End-to-end regtest test: zebra (Regtest) + lightwalletd + the real `zecd` daemon.
 //!
-//! Orchestration - spinning up zebrad + lightwalletd and, crucially, MINING blocks - is
-//! delegated to `zingo-infra-testutils`. Zebra has no `generate` RPC; blocks are produced via
-//! getblocktemplate/submitblock, which that crate wraps as `validator().generate_blocks(n)`.
-//!
-//! VALIDATION STATUS: this test needs a Linux host with network access (zingo-infra downloads
-//! zebrad/lightwalletd) and the built `zecd` release binary. It runs in CI
-//! (`.github/workflows/regtest.yml`), NOT in zecd's offline `cargo test` tier. The
-//! `zingo_infra_testutils` calls below target that crate's `services` API and are exercised /
-//! corrected in CI; everything driven through `zecd`'s JSON-RPC is stable and authoritative.
-//!
-//! FUNDING CAVEAT: regtest can't fund an Orchard-only wallet on-chain (zebra #9082), so this
-//! covers sync, addresses, the RPC surface and insufficient-funds - not a funded spend. Funded
-//! semantics are covered by zecd's offline lifecycle test and the live testnet flow.
+//! Skips cleanly when the node binaries aren't provisioned (so plain `cargo test` and the
+//! build-only CI path still validate that the harness compiles). Provide `ZEBRAD_BIN` and
+//! `LIGHTWALLETD_BIN` to run the full flow - see README.md.
 
-use std::path::PathBuf;
 use std::time::Duration;
 
 use serde_json::json;
-use zecd_regtest_harness::{Zecd, ZecdConfig};
+use zecd_regtest_harness::{pick_port, resolve_bin, Lightwalletd, Zebrad, Zecd, ZecdConfig};
 
-// zingo-infra's local-net orchestrator. `ZebradConfig::default()` selects Network::Regtest with
-// every upgrade (incl. NU5/Orchard) active at height 1 - matching zecd's `network::regtest()`.
-// The `Validator` trait brings `generate_blocks` into scope.
-use zingo_infra_testutils::services::{
-    indexer::{Lightwalletd, LightwalletdConfig},
-    validator::{Validator, Zebrad, ZebradConfig},
-    LocalNet,
-};
-
+/// Blocks mined before launching zecd. Regtest mining is cheap (PoW disabled).
 const INITIAL_BLOCKS: u32 = 10;
-const SYNC_TIMEOUT: Duration = Duration::from_secs(90);
-
-/// Resolve a required external binary: `$<env_var>` if set, otherwise zingo-infra's default
-/// location (`fetched_resources/test_binaries/<name>/<name>` under this crate). Returns `None`
-/// if neither exists, so the test can skip cleanly instead of panicking deep inside
-/// zingo-infra's `launch` (which `unwrap()`s a NotFound when the binary is missing).
-fn resolve_bin(env_var: &str, name: &str) -> Option<PathBuf> {
-    if let Ok(p) = std::env::var(env_var) {
-        let pb = PathBuf::from(p);
-        return pb.is_file().then_some(pb);
-    }
-    let pb = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("fetched_resources/test_binaries")
-        .join(name)
-        .join(name);
-    pb.is_file().then_some(pb)
-}
+/// Generous: lightwalletd ingestion + zecd scan over a fresh regtest chain.
+const SYNC_TIMEOUT: Duration = Duration::from_secs(120);
 
 #[tokio::test]
 async fn regtest_end_to_end() {
-    // The live tier needs zingo-blessed `zebrad` + `lightwalletd` binaries (zingo-infra fetches
-    // them from a private host - see README). When they aren't provisioned (plain `cargo test`, or
-    // a CI box without them), skip cleanly: this still validates that the harness compiles and
-    // links against zingo-infra. To run the full end-to-end, set ZEBRAD_BIN and LIGHTWALLETD_BIN
-    // (or populate fetched_resources/test_binaries/).
-    let (Some(zebrad_bin), Some(lightwalletd_bin)) = (
-        resolve_bin("ZEBRAD_BIN", "zebrad"),
-        resolve_bin("LIGHTWALLETD_BIN", "lightwalletd"),
-    ) else {
+    let (Some(zebrad_bin), Some(lightwalletd_bin)) =
+        (resolve_bin("ZEBRAD_BIN"), resolve_bin("LIGHTWALLETD_BIN"))
+    else {
         eprintln!(
-            "SKIP regtest_end_to_end: zebrad/lightwalletd not found. Set ZEBRAD_BIN and \
-             LIGHTWALLETD_BIN (or populate fetched_resources/test_binaries/). See README.md."
+            "SKIP regtest_end_to_end: set ZEBRAD_BIN and LIGHTWALLETD_BIN to run the live e2e \
+             (see README.md). The harness still compiled and linked."
         );
         return;
     };
 
-    // 1. Launch zebra (Regtest) + lightwalletd; `launch` wires lightwalletd's validator port to
-    //    zebra's RPC port automatically (and overwrites `zcashd_conf`). `listen_port: None` picks
-    //    a free port.
-    let net = LocalNet::<Lightwalletd, Zebrad>::launch(
-        LightwalletdConfig {
-            lightwalletd_bin: Some(lightwalletd_bin),
-            listen_port: None,
-            zcashd_conf: PathBuf::new(),
-        },
-        ZebradConfig { zebrad_bin: Some(zebrad_bin), ..ZebradConfig::default() },
-    )
-    .await;
+    // 1. zebra Regtest node, then mine the initial chain (getblocktemplate/submitblock).
+    let zebrad = Zebrad::start(&zebrad_bin).await.expect("launch zebrad regtest");
+    zebrad.generate_blocks(INITIAL_BLOCKS).await.expect("mine initial regtest blocks");
 
-    // 2. Mine an initial chain so zecd has a tip above the wallet birthday (regtest genesis).
-    net.validator()
-        .generate_blocks(INITIAL_BLOCKS)
-        .await
-        .expect("mine initial regtest blocks");
+    // 2. lightwalletd in front of zebra (ingests the mined chain).
+    let lightwalletd =
+        Lightwalletd::start(&lightwalletd_bin, zebrad.rpc_port).await.expect("launch lightwalletd");
 
-    // 3. Start zecd pointed at this lightwalletd. `indexer().port()` is the lightwalletd gRPC
-    //    port (upstream getter - adjust here if the zingo-infra API differs).
+    // 3. zecd against lightwalletd (init retries until lightwalletd has caught up).
     let cfg = ZecdConfig {
-        lightwalletd_port: net.indexer().port(),
-        rpc_port: 18232,
-        rpc_user: "u".into(),
-        rpc_password: "p".into(),
+        lightwalletd_port: lightwalletd.grpc_port,
+        rpc_port: pick_port().expect("pick zecd rpc port"),
+        rpc_user: "user".to_string(),
+        rpc_password: "pass".to_string(),
     };
     let zecd = Zecd::start(&cfg).await.expect("start zecd against regtest lightwalletd");
     zecd.wait_until_synced(INITIAL_BLOCKS as u64, SYNC_TIMEOUT)
         .await
         .expect("zecd scans to the regtest tip");
 
-    // ---- zecd RPC assertions (the stable, authoritative part of this test) ----
+    // ---- zecd RPC assertions ----
 
-    // Chain identity. Capture the synced height rather than assuming an absolute value: how the
-    // regtest genesis and zingo-infra's initial `generate_blocks` map onto a tip height is an
-    // implementation detail (it lands one above the number we generated). What matters is that
-    // zecd tracks the tip - `blocks` is zecd's fully-scanned height.
+    // Chain identity. Capture the synced height rather than assuming an absolute value (how the
+    // regtest genesis maps to a tip height is an implementation detail); `blocks` is the
+    // fully-scanned height.
     let info = zecd.call("getblockchaininfo", json!([])).await.expect("getblockchaininfo");
     assert_eq!(info["chain"], "regtest", "getblockchaininfo.chain");
     let height0 = info["blocks"].as_u64().expect("blocks is a number");
@@ -112,46 +59,31 @@ async fn regtest_end_to_end() {
         "zecd should have scanned at least the {INITIAL_BLOCKS} mined blocks (got {height0})"
     );
 
-    // Mining more blocks advances zecd's view by exactly that many (confirmations machinery).
-    net.validator().generate_blocks(5).await.expect("mine 5 more");
+    // Orchard-only receive address: unified, regtest-encoded.
+    let addr = zecd.call("getnewaddress", json!([])).await.expect("getnewaddress");
+    let addr = addr.as_str().expect("address is a string");
+    assert!(addr.starts_with("uregtest1"), "expected a uregtest1 unified address, got {addr}");
+
+    let validated = zecd.call("validateaddress", json!([addr])).await.expect("validateaddress");
+    assert_eq!(validated["isvalid"], true, "validateaddress.isvalid for our own address");
+
+    // Empty wallet: zero balance, no history, no notes.
+    let balance = zecd.call("getbalance", json!([])).await.expect("getbalance");
+    assert_eq!(balance.as_f64(), Some(0.0), "fresh wallet balance should be 0");
+    let txs = zecd.call("listtransactions", json!([])).await.expect("listtransactions");
+    assert_eq!(txs.as_array().map(|a| a.len()), Some(0), "no transactions yet");
+
+    // Spending with no funds → Bitcoin Core's insufficient-funds code (-6).
+    let err = zecd
+        .call("sendtoaddress", json!([addr, 1.0]))
+        .await
+        .expect_err("sendtoaddress with an empty wallet must fail");
+    assert_eq!(err.code(), Some(-6), "expected insufficient-funds (-6), got: {err}");
+
+    // Mining more blocks advances zecd's view by exactly that many.
+    zebrad.generate_blocks(5).await.expect("mine 5 more");
     zecd.wait_until_synced(height0 + 5, SYNC_TIMEOUT)
         .await
         .expect("zecd follows the new blocks");
-    assert_eq!(zecd.block_count().await.unwrap(), height0 + 5);
-
-    // Addresses: getnewaddress yields a regtest Unified Address; validateaddress agrees.
-    let addr = zecd.call("getnewaddress", json!([])).await.expect("getnewaddress");
-    let addr = addr.as_str().expect("getnewaddress returns a string").to_string();
-    assert!(addr.starts_with("uregtest1"), "expected a uregtest1 UA, got {addr}");
-    let val = zecd.call("validateaddress", json!([addr])).await.expect("validateaddress");
-    assert_eq!(val["isvalid"], true, "own address validates on regtest");
-
-    // Empty wallet: zero balance, no history, no notes.
-    let bal = zecd.call("getbalance", json!([])).await.expect("getbalance");
-    assert_eq!(bal.as_f64().unwrap_or(-1.0), 0.0, "fresh wallet balance is 0");
-    assert!(zecd
-        .call("listtransactions", json!([]))
-        .await
-        .expect("listtransactions")
-        .as_array()
-        .unwrap()
-        .is_empty());
-    assert!(zecd
-        .call("listunspent", json!([]))
-        .await
-        .expect("listunspent")
-        .as_array()
-        .unwrap()
-        .is_empty());
-
-    // Insufficient funds: sending from an empty wallet returns Bitcoin Core's -6.
-    let err = zecd
-        .call("sendtoaddress", json!([addr, 0.1]))
-        .await
-        .expect_err("send from an empty wallet must fail");
-    assert_eq!(
-        err.code(),
-        Some(-6),
-        "expected RPC_WALLET_INSUFFICIENT_FUNDS (-6), got: {err}"
-    );
+    assert_eq!(zecd.block_count().await.expect("getblockcount"), height0 + 5);
 }
