@@ -292,8 +292,40 @@ pub struct Funder {
 }
 
 impl Funder {
+    /// Derive the funder's default transparent address offline (no chain, no wallet) from its
+    /// fixed mnemonic, so zebra can be told to mine its coinbase here *before* any chain exists.
+    /// Mining straight to the funder keeps everything on one chain, so the wallet's birthday anchor
+    /// stays valid (a throwaway chain would hand the wallet a wrong note-commitment anchor).
+    pub fn derive_transparent_address(bin: &Path) -> Result<String> {
+        let output = Command::new(bin)
+            .args([
+                "wallet",
+                "derive-address",
+                "--network",
+                "regtest",
+                "--mnemonic",
+                FUNDER_MNEMONIC,
+            ])
+            .output()
+            .context("spawn devtool derive-address")?;
+        if !output.status.success() {
+            bail!(
+                "devtool derive-address failed ({}): {}",
+                output.status,
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        let out = String::from_utf8_lossy(&output.stdout);
+        out.lines()
+            .find_map(|line| line.split("Transparent Address:").nth(1))
+            .map(|addr| addr.trim().to_string())
+            .ok_or_else(|| anyhow!("no Transparent Address in derive-address output:\n{out}"))
+    }
+
     /// Initialise the funding wallet against a lightwalletd. Non-interactive via `--mnemonic`;
-    /// `--birthday 0` so it scans the whole (short) regtest chain.
+    /// `--birthday 2` is the lowest height with a tree state (init fetches `GetTreeState(birthday-1)`,
+    /// which needs a real block - `birthday 0/1` requests genesis and is rejected). The funder's
+    /// transparent coinbase is detected regardless of birthday.
     pub fn init(bin: &Path, lwd_port: u16) -> Result<Funder> {
         let dir = tempfile::tempdir().context("create funder dir")?;
         let funder = Funder {
@@ -313,7 +345,7 @@ impl Funder {
                 "--mnemonic",
                 FUNDER_MNEMONIC,
                 "--birthday",
-                "0",
+                "2",
             ],
             Some(lwd_port),
         )?;

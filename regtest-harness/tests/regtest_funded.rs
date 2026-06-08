@@ -5,9 +5,13 @@
 //! funding wallet (`zcash-devtool`), let it mature (100 blocks), **shield** it into Orchard, then
 //! **send** Orchard funds to `zecd`'s unified address.
 //!
+//! Everything runs on a **single chain**: we derive the funder's transparent address *offline*
+//! (`devtool wallet derive-address`) and mine straight to it, so the funder's wallet birthday
+//! anchor is taken from the same chain it spends on (a throwaway "discover the address" chain would
+//! hand the wallet a wrong note-commitment anchor and the shield/send proofs would be invalid).
+//!
 //! Skips cleanly unless `ZEBRAD_BIN`, `LIGHTWALLETD_BIN` and `DEVTOOL_BIN` are all set (see
-//! README.md). This is the Phase 1 deliverable: prove funded receive works end to end. Phase 2
-//! builds the full RPC coverage on top of a funded wallet.
+//! README.md). Phase 1 deliverable: prove funded receive works end to end.
 
 use std::time::{Duration, Instant};
 
@@ -16,8 +20,9 @@ use zecd_regtest_harness::{
     pick_port, resolve_bin, Funder, Lightwalletd, Zebrad, Zecd, ZecdConfig,
 };
 
-/// Coinbase maturity is 100 blocks; mine one past that so the height-1 coinbase is spendable.
-const MATURITY_BLOCKS: u32 = 101;
+/// Blocks mined up front. Coinbase maturity is 100, so with the tip here the early coinbases
+/// (heights ~1..10) are spendable, giving the funder plenty to shield.
+const INITIAL_MINE: u32 = 110;
 /// 1 ZEC, in zatoshis.
 const FUND_ZATOSHIS: u64 = 100_000_000;
 /// Generous: lightwalletd ingestion + zecd scan + Orchard proving.
@@ -37,32 +42,28 @@ async fn regtest_funded_orchard_receive() {
         return;
     };
 
-    // 1. Bring up a throwaway node just long enough to initialise the funding wallet and learn the
-    //    address its coinbase must be mined to (chicken-and-egg: the wallet is created against a
-    //    running chain, but zebra needs the address at launch).
-    let funder = {
-        let zebrad_tmp = Zebrad::start(&zebrad_bin).await.expect("start temp zebrad");
-        let lwd_tmp = Lightwalletd::start(&lwd_bin, zebrad_tmp.rpc_port)
-            .await
-            .expect("start temp lightwalletd");
-        Funder::init(&devtool_bin, lwd_tmp.grpc_port).expect("initialise funding wallet")
-        // temp nodes are dropped (killed) here; the funder wallet on disk persists.
-    };
-    let funder_ua = funder.unified_address().expect("funder unified address");
+    // 1. Learn the funder's transparent address offline (no chain yet) so zebra can mine its
+    //    coinbase straight to it - keeping the whole flow on one chain.
+    let funder_taddr = Funder::derive_transparent_address(&devtool_bin)
+        .expect("derive funder transparent address");
 
-    // 2. Real node mining the coinbase to the funder, behind a fresh lightwalletd.
-    let zebrad = Zebrad::start_with_miner(&zebrad_bin, &funder_ua)
+    // 2. Single chain: zebra mines the coinbase to the funder, behind lightwalletd.
+    let zebrad = Zebrad::start_with_miner(&zebrad_bin, &funder_taddr)
         .await
         .expect("start zebrad mining to the funder");
     let lwd = Lightwalletd::start(&lwd_bin, zebrad.rpc_port)
         .await
         .expect("start lightwalletd");
 
-    // 3. Mine past coinbase maturity, then shield the transparent coinbase into Orchard.
+    // 3. Mine past coinbase maturity.
     zebrad
-        .generate_blocks(MATURITY_BLOCKS)
+        .generate_blocks(INITIAL_MINE)
         .await
-        .expect("mine to coinbase maturity");
+        .expect("mine the initial chain");
+
+    // 4. Initialise the funder against THIS chain, then shield its matured transparent coinbase
+    //    into Orchard.
+    let funder = Funder::init(&devtool_bin, lwd.grpc_port).expect("initialise funding wallet");
     funder.sync(lwd.grpc_port).expect("funder sync (coinbase)");
     funder
         .shield(lwd.grpc_port)
@@ -70,7 +71,7 @@ async fn regtest_funded_orchard_receive() {
     zebrad.generate_blocks(2).await.expect("confirm shield");
     funder.sync(lwd.grpc_port).expect("funder sync (shielded)");
 
-    // 4. zecd against the same lightwalletd; get its Orchard unified address.
+    // 5. zecd against the same lightwalletd; get its Orchard unified address.
     let cfg = ZecdConfig {
         lightwalletd_port: lwd.grpc_port,
         rpc_port: pick_port().expect("pick zecd rpc port"),
@@ -90,7 +91,7 @@ async fn regtest_funded_orchard_receive() {
         "expected a uregtest1 address, got {zecd_ua}"
     );
 
-    // 5. Fund zecd: send Orchard funds from the funder to zecd's UA, then confirm.
+    // 6. Fund zecd: send Orchard funds from the funder to zecd's UA, then confirm.
     funder
         .send(lwd.grpc_port, &zecd_ua, FUND_ZATOSHIS)
         .expect("send Orchard funds to zecd");
@@ -99,7 +100,7 @@ async fn regtest_funded_orchard_receive() {
         .await
         .expect("confirm funding send");
 
-    // 6. zecd scans the note and reports the balance.
+    // 7. zecd scans the note and reports the balance.
     let deadline = Instant::now() + FUND_TIMEOUT;
     let balance = loop {
         let bal = zecd
@@ -117,7 +118,6 @@ async fn regtest_funded_orchard_receive() {
         tokio::time::sleep(Duration::from_millis(500)).await;
     };
 
-    // ~1 ZEC received (the funder paid the fee), give or take change semantics.
     assert!(
         balance > 0.0,
         "zecd should have a positive Orchard balance, got {balance}"
