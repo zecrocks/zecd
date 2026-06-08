@@ -21,10 +21,36 @@ use zip321::TransactionRequest;
 use crate::error::RpcError;
 use crate::network::ZNetwork;
 
+/// Connection state to lightwalletd, surfaced for monitoring (e.g. to distinguish "all
+/// upstreams down" from "still syncing" on `/readyz`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ConnState {
+    /// No usable client: every configured upstream is currently unreachable.
+    #[default]
+    Down,
+    /// Connected and scanning toward the chain tip.
+    Syncing,
+    /// Connected and fully caught up.
+    Ready,
+}
+
+impl ConnState {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ConnState::Down => "down",
+            ConnState::Syncing => "syncing",
+            ConnState::Ready => "ready",
+        }
+    }
+}
+
 /// A snapshot of sync state, published by the actor and read by blockchain/wallet RPCs.
 #[derive(Clone, Debug, Default)]
 pub struct SyncStatus {
     pub connected: bool,
+    /// Active lightwalletd endpoint, e.g. `"zec.rocks:443 (tls=true)"`.
+    pub server: Option<String>,
+    pub conn_state: ConnState,
     pub chain_tip: Option<u32>,
     pub fully_scanned: Option<u32>,
     pub best_block_hash: Option<String>,

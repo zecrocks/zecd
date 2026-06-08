@@ -17,10 +17,23 @@ dir = "./data/default"
 
 [lightwalletd]
 # "ecc" | "ywallet" | "zecrocks" | a "host:port" (use your local lightwalletd in production,
-# e.g. "127.0.0.1:9067"). Defaults to the public zecrocks infrastructure.
+# e.g. "127.0.0.1:9067"). Defaults to the public zecrocks infrastructure (testnet.zec.rocks here).
 server = "zecrocks"
+# Or list multiple endpoints for failover, tried in order and always preferring the first (the
+# daemon snaps back to the primary when it recovers). `servers` takes precedence over `server`.
+# A scheme prefix sets TLS per endpoint (http:// = plaintext, https:// = TLS); without a prefix
+# TLS is auto (on for remote hosts, off for localhost).
+#   testnet:  servers = ["http://127.0.0.1:9067", "https://testnet.zec.rocks:443"]
+#   mainnet:  servers = ["http://127.0.0.1:9067", "https://zec.rocks:443", "https://eu.zec.rocks:443"]
 # Only "direct" is supported (TLS for remote hosts, plaintext for localhost).
 connection = "direct"
+# Per-attempt dial timeout (seconds) so a hung/black-holed endpoint can't stall sync.
+connect_timeout_secs = 10
+# Reconnect backoff (seconds): start at base, double up to max, with full jitter.
+reconnect_base_secs = 1
+reconnect_max_secs = 60
+# While running on a fallback, how often (seconds) to re-probe higher-priority servers.
+primary_recheck_secs = 60
 
 [rpc]
 bind = "127.0.0.1"

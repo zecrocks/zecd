@@ -2,6 +2,7 @@
 //! `zcash-devtool/src/commands/wallet/init.rs`.
 
 use std::path::Path;
+use std::time::Duration;
 
 use age::secrecy::ExposeSecret as _;
 use anyhow::{anyhow, Context};
@@ -42,14 +43,19 @@ pub async fn run(config: &AppConfig, args: &InitArgs) -> anyhow::Result<()> {
         .unwrap_or_else(|| config.datadir.join("identity.txt"));
     let recipients = ensure_identity(&identity_path).await?;
 
-    let server = lightwalletd::resolve(
-        &config.lightwalletd.server,
+    // init is a one-shot interactive command; it uses only the first configured endpoint (no
+    // failover) - the daemon's actor does the multi-server failover at runtime.
+    let server = lightwalletd::resolve_all(
+        &config.lightwalletd.servers,
         network,
         config.lightwalletd.tls_roots,
         config.lightwalletd.force_tls,
-    )?;
+    )?
+    .into_iter()
+    .next()
+    .ok_or_else(|| anyhow!("no lightwalletd servers configured"))?;
     let mut client = server
-        .connect()
+        .connect_timeout(Duration::from_secs(config.lightwalletd.connect_timeout_secs))
         .await
         .with_context(|| format!("connecting to lightwalletd {}", server.describe()))?;
 

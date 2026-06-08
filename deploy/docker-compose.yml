@@ -1,7 +1,8 @@
 # Example self-hosted Zcash stack:  zebra (full node) -> lightwalletd -> zecd.
 #
-# Testnet by default (see comments for mainnet). The image tags are EXAMPLES - pin them to
-# releases you have verified; the zebra/lightwalletd flags can vary between versions.
+# Testnet by default. For mainnet, add `-f docker-compose.mainnet.yml` to each command below (it
+# swaps in the *.mainnet.* config files). The image tags are EXAMPLES - pin them to releases you
+# have verified; the zebra/lightwalletd flags can vary between versions.
 #
 # First run (zebra must sync enough for lightwalletd before zecd can init):
 #   docker compose up -d zebra lightwalletd        # let these sync

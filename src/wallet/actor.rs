@@ -3,7 +3,7 @@
 
 use std::num::NonZeroUsize;
 use std::path::PathBuf;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::anyhow;
 use tokio::sync::{mpsc, watch};
@@ -30,17 +30,23 @@ use zcash_protocol::value::Zatoshis;
 use zcash_protocol::{ShieldedProtocol, TxId};
 use zip321::TransactionRequest;
 
+use crate::backoff::Backoff;
 use crate::error::{codes, RpcError};
 use crate::lightwalletd::Server;
 use crate::network::ZNetwork;
 use crate::sync::engine;
 use crate::wallet::keys::{self, SeedKeeper};
 use crate::wallet::open::{self, WriteDb};
-use crate::wallet::{labels, make_handle, store, SyncStatus, WalletCommand, WalletHandle};
+use crate::wallet::{labels, make_handle, store, ConnState, SyncStatus, WalletCommand, WalletHandle};
 
 /// Note-management defaults for change splitting (match zcash-devtool's send defaults).
 const TARGET_NOTE_COUNT: usize = 4;
 const MIN_SPLIT_OUTPUT_VALUE: u64 = 10_000_000; // 0.1 ZEC
+
+/// Upper bound on the per-attempt dial timeout used when re-probing higher-priority servers,
+/// so a black-holed primary can't stall the command loop for the full `connect_timeout` on
+/// each `primary_recheck`. A recovered primary connects near-instantly; a dead one fails fast.
+const REPROBE_CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
 
 thread_local! {
     /// Set while we deliberately `catch_unwind` librustzcash's progress estimator, so the
@@ -65,8 +71,16 @@ pub struct ActorConfig {
     pub name: String,
     pub network: ZNetwork,
     pub wallet_dir: PathBuf,
-    pub server: Server,
+    /// Ordered lightwalletd endpoints (non-empty); tried in order, preferring the first.
+    pub servers: Vec<Server>,
     pub sync_interval: Duration,
+    /// Per-attempt dial timeout.
+    pub connect_timeout: Duration,
+    /// Reconnect backoff base/max delays.
+    pub reconnect_base: Duration,
+    pub reconnect_max: Duration,
+    /// While on a fallback, how often to re-probe higher-priority servers.
+    pub primary_recheck: Duration,
     pub age_identity: Option<PathBuf>,
     pub auto_unlock: bool,
 }
@@ -75,7 +89,16 @@ struct WalletActor {
     name: String,
     network: ZNetwork,
     wallet_dir: PathBuf,
-    server: Server,
+    /// Ordered lightwalletd endpoints (non-empty); `active` indexes the connected one.
+    servers: Vec<Server>,
+    active: usize,
+    connect_timeout: Duration,
+    backoff: Backoff,
+    /// When the next reconnect attempt is allowed (a backoff deadline, not a fixed tick), so
+    /// commands interrupting the idle wait don't advance the backoff.
+    reconnect_at: Instant,
+    primary_recheck: Duration,
+    last_primary_probe: Instant,
     sync_interval: Duration,
     age_identity: Option<PathBuf>,
     account_id: AccountUuid,
@@ -95,6 +118,12 @@ struct WalletActor {
 /// Open the wallet, derive its account info, optionally unlock the seed, build the prover,
 /// and spawn the actor task. Returns a clonable handle.
 pub async fn spawn(cfg: ActorConfig) -> anyhow::Result<WalletHandle> {
+    if cfg.servers.is_empty() {
+        return Err(anyhow!(
+            "no lightwalletd servers configured for wallet '{}'",
+            cfg.name
+        ));
+    }
     if !store::WalletStore::exists(&cfg.wallet_dir) {
         return Err(anyhow!(
             "wallet '{}' is not initialized ({} missing); run `zecd init --wallet {}`",
@@ -143,7 +172,13 @@ pub async fn spawn(cfg: ActorConfig) -> anyhow::Result<WalletHandle> {
         name: cfg.name.clone(),
         network: cfg.network,
         wallet_dir: cfg.wallet_dir.clone(),
-        server: cfg.server,
+        servers: cfg.servers,
+        active: 0,
+        connect_timeout: cfg.connect_timeout,
+        backoff: Backoff::new(cfg.reconnect_base, cfg.reconnect_max),
+        reconnect_at: Instant::now(),
+        primary_recheck: cfg.primary_recheck,
+        last_primary_probe: Instant::now(),
         sync_interval: cfg.sync_interval,
         age_identity: cfg.age_identity,
         account_id,
@@ -196,9 +231,6 @@ impl WalletActor {
         }
         self.update_status();
 
-        let mut interval = tokio::time::interval(self.sync_interval);
-        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-
         let mut more_work = true;
         loop {
             if more_work {
@@ -224,6 +256,15 @@ impl WalletActor {
                     }
                 }
             } else {
+                // Idle: poll at `sync_interval` while connected; when disconnected, wait until the
+                // backoff deadline (`reconnect_at`) instead of hammering a dead upstream on a fixed
+                // tick. Using a deadline (not `next_delay()` per loop) means commands interrupting
+                // the wait don't inflate the backoff - it advances only on an actual failed connect.
+                let wait = if self.client.is_some() {
+                    self.sync_interval
+                } else {
+                    self.reconnect_at.saturating_duration_since(Instant::now())
+                };
                 tokio::select! {
                     maybe_cmd = self.cmd_rx.recv() => {
                         match maybe_cmd {
@@ -231,11 +272,18 @@ impl WalletActor {
                             None => return,
                         }
                     }
-                    _ = interval.tick() => {
+                    _ = tokio::time::sleep(wait) => {
                         if self.client.is_none() {
                             if let Err(e) = self.connect().await {
-                                warn!("[{}] reconnect failed: {e}", self.name);
+                                // Schedule the next attempt with exponential backoff + jitter.
+                                let delay = self.backoff.next_delay();
+                                self.reconnect_at = Instant::now() + delay;
+                                warn!("[{}] reconnect failed: {e}; retrying in {delay:?}", self.name);
+                                self.update_status();
                             }
+                        } else {
+                            // Connected, possibly to a fallback - try to move back to the primary.
+                            self.reprobe_primary().await;
                         }
                         if self.client.is_some() {
                             match self.refresh_tip().await {
@@ -253,19 +301,86 @@ impl WalletActor {
         }
     }
 
+    /// Connect to lightwalletd, always preferring the primary: try the configured endpoints in
+    /// order from the top and use the first that connects (and passes the subtree-root sync). On
+    /// success, store the client, record the active server, and reset the reconnect backoff. On
+    /// total failure, leave `self.client` as `None` and return the last error.
     async fn connect(&mut self) -> anyhow::Result<()> {
-        info!(
-            "[{}] connecting to lightwalletd {}",
-            self.name,
-            self.server.describe()
-        );
-        let client = self.server.connect().await?;
-        self.client = Some(client);
-        let client = self.client.as_mut().expect("just set");
-        engine::update_subtree_roots(client, &mut self.db_data).await?;
-        // NB: do not call `update_status()` here - `get_wallet_summary`'s progress estimator
-        // underflows if invoked before the chain tip is set (see `refresh_tip`).
-        Ok(())
+        let n = self.servers.len();
+        let mut last_err = None;
+        for idx in 0..n {
+            let describe = self.servers[idx].describe();
+            info!("[{}] connecting to lightwalletd {}", self.name, describe);
+            match self.servers[idx].connect_timeout(self.connect_timeout).await {
+                Ok(client) => {
+                    self.client = Some(client);
+                    let client = self.client.as_mut().expect("just set");
+                    // A reachable-but-unhealthy upstream can still fail here; treat that as this
+                    // server failing and fall through to the next candidate.
+                    if let Err(e) = engine::update_subtree_roots(client, &mut self.db_data).await {
+                        warn!("[{}] subtree-root sync failed on {}: {e}", self.name, describe);
+                        self.client = None;
+                        last_err = Some(e);
+                        continue;
+                    }
+                    if idx != self.active {
+                        warn!(
+                            "[{}] lightwalletd now using {} (was {})",
+                            self.name,
+                            describe,
+                            self.servers[self.active].describe()
+                        );
+                        self.active = idx;
+                    }
+                    self.backoff.reset();
+                    self.last_primary_probe = Instant::now();
+                    // NB: do not call `update_status()` here - `get_wallet_summary`'s progress
+                    // estimator underflows if invoked before the chain tip is set (see `refresh_tip`).
+                    return Ok(());
+                }
+                Err(e) => {
+                    warn!("[{}] connect to {} failed: {e}", self.name, describe);
+                    last_err = Some(e);
+                }
+            }
+        }
+        Err(last_err.unwrap_or_else(|| anyhow!("no lightwalletd servers available")))
+    }
+
+    /// While connected to a fallback, periodically try to move back to a higher-priority server
+    /// (prefer-primary). No-op when already on the primary, disconnected, or probed too recently.
+    /// On success, swaps in the better client and resets backoff.
+    async fn reprobe_primary(&mut self) {
+        if self.active == 0
+            || self.client.is_none()
+            || self.last_primary_probe.elapsed() < self.primary_recheck
+        {
+            return;
+        }
+        self.last_primary_probe = Instant::now();
+        // Cap the probe dial so a black-holed primary can't stall command processing.
+        let probe_timeout = self.connect_timeout.min(REPROBE_CONNECT_TIMEOUT);
+        for idx in 0..self.active {
+            let describe = self.servers[idx].describe();
+            let Ok(mut client) = self.servers[idx].connect_timeout(probe_timeout).await else {
+                continue;
+            };
+            if let Err(e) = engine::update_subtree_roots(&mut client, &mut self.db_data).await {
+                warn!("[{}] primary re-probe {} failed during subtree sync: {e}", self.name, describe);
+                continue;
+            }
+            info!(
+                "[{}] preferred lightwalletd {} recovered; switching back from {}",
+                self.name,
+                describe,
+                self.servers[self.active].describe()
+            );
+            self.client = Some(client);
+            self.active = idx;
+            self.backoff.reset();
+            self.update_status();
+            return;
+        }
     }
 
     async fn refresh_tip(&mut self) -> anyhow::Result<()> {
@@ -344,8 +459,17 @@ impl WalletActor {
             None => (None, 0.0, true),
         };
 
+        let conn_state = if self.client.is_none() {
+            ConnState::Down
+        } else if scanning {
+            ConnState::Syncing
+        } else {
+            ConnState::Ready
+        };
         let status = SyncStatus {
             connected: self.client.is_some(),
+            server: Some(self.servers[self.active].describe()),
+            conn_state,
             chain_tip: self.tip_height,
             fully_scanned,
             best_block_hash: self.tip_hash.clone(),
@@ -469,15 +593,23 @@ impl WalletActor {
                 .await
                 .map_err(|e| RpcError::misc(format!("connect to lightwalletd: {e}")))?;
         }
-        let client = self
-            .client
-            .as_mut()
-            .ok_or_else(|| RpcError::misc("not connected to lightwalletd"))?;
-        let response = client
-            .send_transaction(raw)
-            .await
-            .map_err(|e| RpcError::misc(format!("send_transaction RPC failed: {e}")))?
-            .into_inner();
+        let response = {
+            let client = self
+                .client
+                .as_mut()
+                .ok_or_else(|| RpcError::misc("not connected to lightwalletd"))?;
+            client.send_transaction(raw).await
+        };
+        let response = match response {
+            Ok(r) => r.into_inner(),
+            Err(e) => {
+                // Transport failure: drop the dead client so the next op reconnects/fails over.
+                // Don't auto-retry the broadcast - re-broadcasting is the caller's decision.
+                self.client = None;
+                self.update_status();
+                return Err(RpcError::misc(format!("send_transaction RPC failed: {e}")));
+            }
+        };
         if response.error_code != 0 {
             return Err(RpcError::new(
                 codes::RPC_VERIFY_REJECTED,
@@ -507,19 +639,26 @@ impl WalletActor {
                 .await
                 .map_err(|e| RpcError::misc(format!("connect to lightwalletd: {e}")))?;
         }
-        let client = self
-            .client
-            .as_mut()
-            .ok_or_else(|| RpcError::misc("not connected to lightwalletd"))?;
         let filter = service::TxFilter {
             hash: txid.as_ref().to_vec(),
             ..Default::default()
         };
-        let raw = client
-            .get_transaction(filter)
-            .await
-            .map_err(|e| RpcError::misc(format!("get_transaction RPC failed: {e}")))?
-            .into_inner();
+        let raw = {
+            let client = self
+                .client
+                .as_mut()
+                .ok_or_else(|| RpcError::misc("not connected to lightwalletd"))?;
+            client.get_transaction(filter).await
+        };
+        let raw = match raw {
+            Ok(r) => r.into_inner(),
+            Err(e) => {
+                // Transport failure: drop the dead client so the next op reconnects/fails over.
+                self.client = None;
+                self.update_status();
+                return Err(RpcError::misc(format!("get_transaction RPC failed: {e}")));
+            }
+        };
         Ok(if raw.data.is_empty() { None } else { Some(raw.data) })
     }
 

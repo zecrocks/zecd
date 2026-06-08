@@ -94,6 +94,13 @@ def main() -> int:
         ck(f"has {f}", f in ni)
     ck("relayfee is Decimal", isinstance(ni["relayfee"], decimal.Decimal), repr(ni["relayfee"]))
 
+    print("== getpeerinfo shape ==")
+    pi = rpc.call("getpeerinfo")
+    ck("getpeerinfo is list", isinstance(pi, list))
+    # Reflects the active lightwalletd upstream; on a synced daemon there should be one "peer".
+    if pi:
+        ck("peer has addr", isinstance(pi[0].get("addr"), str) and bool(pi[0]["addr"]))
+
     print("== getwalletinfo fields ==")
     wi = rpc.call("getwalletinfo")
     for f in ("walletname", "balance", "unconfirmed_balance", "immature_balance", "txcount", "paytxfee"):

@@ -51,20 +51,26 @@ async fn healthz() -> &'static str {
     "ok"
 }
 
-/// Compute overall readiness and a per-wallet status map.
-fn snapshot(state: &AppState) -> (bool, Value) {
+/// Compute overall readiness, whether any wallet's upstream is down, and a per-wallet status map.
+fn snapshot(state: &AppState) -> (bool, bool, Value) {
     let names = state.registry.names();
     let mut ready = !names.is_empty();
+    let mut any_down = false;
     let mut wallets = Map::new();
     for name in names {
         if let Ok(h) = state.registry.get(Some(&name)) {
             let st = h.status();
             let w_ready = st.connected && st.scan_progress >= state.config.health.ready_progress;
             ready = ready && w_ready;
+            if matches!(st.conn_state, crate::wallet::ConnState::Down) {
+                any_down = true;
+            }
             wallets.insert(
                 name,
                 json!({
                     "connected": st.connected,
+                    "server": st.server,
+                    "conn_state": st.conn_state.as_str(),
                     "chain_tip": st.chain_tip,
                     "fully_scanned": st.fully_scanned,
                     "scan_progress": st.scan_progress,
@@ -74,21 +80,26 @@ fn snapshot(state: &AppState) -> (bool, Value) {
             );
         }
     }
-    (ready, Value::Object(wallets))
+    (ready, any_down, Value::Object(wallets))
 }
 
 async fn readyz(State(state): State<AppState>) -> Response {
-    let (ready, wallets) = snapshot(&state);
+    let (ready, any_down, wallets) = snapshot(&state);
     let code = if ready {
         StatusCode::OK
     } else {
         StatusCode::SERVICE_UNAVAILABLE
     };
-    (code, Json(json!({ "ready": ready, "wallets": wallets }))).into_response()
+    let mut body = json!({ "ready": ready, "wallets": wallets });
+    if !ready {
+        // Distinguish "all upstreams down" from "still syncing" so probes/alerts can tell them apart.
+        body["reason"] = json!(if any_down { "upstream_down" } else { "syncing" });
+    }
+    (code, Json(body)).into_response()
 }
 
 async fn status(State(state): State<AppState>) -> Response {
-    let (ready, wallets) = snapshot(&state);
+    let (ready, _any_down, wallets) = snapshot(&state);
     Json(json!({
         "ready": ready,
         "network": crate::rpc::net_name(state.config.network),

@@ -1,5 +1,5 @@
-# Minimal Zebra config for serving lightwalletd. Testnet; for mainnet set network = "Mainnet"
-# and use RPC port 8232 (and update lightwalletd-zcash.conf + zecd.toml accordingly).
+# Minimal Zebra config for serving lightwalletd. Testnet default; the mainnet variant is
+# zebrad.mainnet.toml (used via docker-compose.mainnet.yml).
 [network]
 network = "Testnet"
 
