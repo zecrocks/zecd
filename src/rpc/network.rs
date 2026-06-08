@@ -40,8 +40,23 @@ pub fn getconnectioncount(state: &AppState) -> Result<Value, RpcError> {
     Ok(json!(if connected(state) { 1 } else { 0 }))
 }
 
-pub fn getpeerinfo() -> Result<Value, RpcError> {
-    Ok(Value::Array(vec![]))
+pub fn getpeerinfo(state: &AppState) -> Result<Value, RpcError> {
+    // zecd's single "peer" is the active lightwalletd upstream. Report it (with its connection
+    // state) when connected; otherwise an empty peer list, as bitcoind does with no peers.
+    let Ok(w) = state.registry.get(None) else {
+        return Ok(Value::Array(vec![]));
+    };
+    let st = w.status();
+    if !st.connected {
+        return Ok(Value::Array(vec![]));
+    }
+    Ok(json!([{
+        "id": 0,
+        "addr": st.server.clone().unwrap_or_default(),
+        "inbound": false,
+        "conn_state": st.conn_state.as_str(),
+        "syncing": st.scanning,
+    }]))
 }
 
 pub fn ping() -> Result<Value, RpcError> {

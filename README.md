@@ -70,10 +70,20 @@ default_wallet = "default"
 dir = "./data/default"
 
 [lightwalletd]
-server = "zecrocks"              # "ecc" | "ywallet" | "zecrocks" | "host:port"
+server = "zecrocks"              # "ecc" | "ywallet" | "zecrocks" | "host:port" (or "h:p,h:p")
+# Or list multiple endpoints for failover, tried in order and always preferring the first; the
+# daemon snaps back to the primary when it recovers. `servers` takes precedence over `server`.
+# A scheme prefix sets TLS per endpoint (http:// plaintext, https:// TLS), so a plaintext local
+# node and TLS public fallbacks can share one list:
+#   mainnet:  servers = ["http://127.0.0.1:9067", "https://zec.rocks:443", "https://eu.zec.rocks:443"]
+#   testnet:  servers = ["http://127.0.0.1:9067", "https://testnet.zec.rocks:443"]
 connection = "direct"
 tls_roots = "native"            # "native" (OS store, honors SSL_CERT_FILE) | "webpki"
 tls = "auto"                    # "auto" (TLS for remote, plaintext for localhost) | "yes" | "no"
+connect_timeout_secs = 10       # per-attempt dial timeout (so a hung endpoint can't stall sync)
+reconnect_base_secs = 1         # reconnect backoff: base delay (doubles, full jitter)
+reconnect_max_secs = 60         # reconnect backoff: ceiling
+primary_recheck_secs = 60       # while on a fallback, how often to re-probe higher-priority servers
 
 [rpc]
 bind = "127.0.0.1"
@@ -186,8 +196,11 @@ With `[health] enabled` (default), zecd serves unauthenticated probes on a separ
 
 - `GET /healthz` - liveness: `200 ok` while the process is running.
 - `GET /readyz` - readiness: `200` once every wallet is connected to lightwalletd and synced to
-  `[health] ready_progress`; otherwise `503`. Body is JSON with per-wallet detail.
-- `GET /status` - JSON snapshot of per-wallet sync state.
+  `[health] ready_progress`; otherwise `503`. Body is JSON with per-wallet detail; when not ready it
+  also carries a `reason` (`"upstream_down"` vs `"syncing"`) so alerting can tell an unreachable
+  lightwalletd apart from a normal catch-up.
+- `GET /status` - JSON snapshot of per-wallet sync state, including the active `server` endpoint and
+  `conn_state` (`down` | `syncing` | `ready`). `getpeerinfo` reflects the same active upstream.
 
 Set `[health] bind = "0.0.0.0"` so a Kubernetes kubelet / load balancer can reach the probes. The
 health server starts after wallets load, so cover the brief prover-init at boot with a
@@ -222,8 +235,18 @@ curl localhost:9233/readyz
 curl --user zec:CHANGE-ME --data-binary '{"method":"getblockchaininfo","id":1}' localhost:18232/
 ```
 
-Image tags in the compose are examples - pin zebra/lightwalletd to releases you've verified. Edit
-`deploy/*.toml` / `*.conf` for mainnet (network, ports, and the `zecd.toml` RPC password).
+**Mainnet:** a ready-made override is included. Add `-f docker-compose.mainnet.yml` to every command
+to swap each service onto its mainnet config (`zebrad.mainnet.toml`, `lightwalletd-zcash.mainnet.conf`,
+`zecd.mainnet.toml` - local node primary with `zec.rocks:443` / `eu.zec.rocks:443` failover):
+
+```sh
+docker compose -f docker-compose.yml -f docker-compose.mainnet.yml up -d zebra lightwalletd
+docker compose -f docker-compose.yml -f docker-compose.mainnet.yml run --rm zecd init --wallet default --account-name primary
+docker compose -f docker-compose.yml -f docker-compose.mainnet.yml up -d
+```
+
+Image tags in the compose are examples - pin zebra/lightwalletd to releases you've verified. Set a
+real RPC password in `zecd.toml` / `zecd.mainnet.toml` before exposing the port.
 
 ## Compatibility boundary
 

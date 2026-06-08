@@ -1,0 +1,12 @@
+# Minimal Zebra config for serving lightwalletd - MAINNET variant.
+# Used by docker-compose.mainnet.yml; the default stack uses the testnet zebrad.toml.
+[network]
+network = "Mainnet"
+
+[rpc]
+# Internal JSON-RPC for lightwalletd on the compose network (kept on 18232 for both networks so
+# the stack's wiring/ports don't change). Keep this off any public interface.
+listen_addr = "0.0.0.0:18232"
+
+[state]
+cache_dir = "/var/cache/zebra"

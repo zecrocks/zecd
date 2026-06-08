@@ -14,3 +14,5 @@ keys.toml
 .cookie
 identity.txt
 zecd.toml
+# ...but the docker-stack template is intentional (a checked-in example, no real secrets).
+!/deploy/zecd.toml
