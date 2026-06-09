@@ -12,7 +12,7 @@ use tokio::io::AsyncWriteExt as _;
 
 use zcash_client_backend::data_api::{AccountBirthday, WalletWrite};
 use zcash_client_backend::proto::service;
-use zcash_protocol::consensus::BlockHeight;
+use zcash_protocol::consensus::{BlockHeight, NetworkUpgrade, Parameters};
 
 use crate::config::{AppConfig, InitArgs, WalletEntry};
 use crate::lightwalletd;
@@ -80,7 +80,28 @@ pub async fn run(config: &AppConfig, args: &InitArgs) -> anyhow::Result<()> {
         (Mnemonic::generate(Count::Words24), None)
     };
 
-    let birthday_height = BlockHeight::from(args.birthday.unwrap_or(chain_tip.saturating_sub(100)));
+    // A freshly-generated wallet can have no history, so its birthday defaults to just below
+    // the tip. A *restored* wallet may hold notes from any point in its past; defaulting
+    // anywhere near the tip would silently skip them (the funds exist on chain but are never
+    // scanned), so without --birthday we scan from Sapling activation - the start of the
+    // shielded-note era - trading sync time for never missing funds.
+    let birthday_height = BlockHeight::from(args.birthday.unwrap_or_else(|| {
+        if args.restore {
+            let sapling = u32::from(
+                network
+                    .activation_height(NetworkUpgrade::Sapling)
+                    .expect("Sapling activation height is known"),
+            );
+            eprintln!(
+                "No --birthday given; scanning the restored wallet from Sapling activation \
+                 (height {sapling}) so no notes are missed. Pass --birthday <height> (at or \
+                 before the wallet's first transaction) to make the initial sync much faster."
+            );
+            sapling
+        } else {
+            chain_tip.saturating_sub(100)
+        }
+    }));
     let birthday = {
         // Fetch the tree state for the block before the birthday (leaks birthday to server).
         // Never request below height 1: lightwalletd treats a BlockId height of 0 as

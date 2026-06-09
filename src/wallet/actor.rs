@@ -37,6 +37,7 @@ use crate::network::ZNetwork;
 use crate::sync::engine;
 use crate::wallet::keys::{self, SeedKeeper};
 use crate::wallet::open::{self, WriteDb};
+use crate::wallet::read;
 use crate::wallet::{labels, make_handle, store, ConnState, SyncStatus, WalletCommand, WalletHandle};
 
 /// Note-management defaults for change splitting (match zcash-devtool's send defaults).
@@ -47,6 +48,13 @@ const MIN_SPLIT_OUTPUT_VALUE: u64 = 10_000_000; // 0.1 ZEC
 /// so a black-holed primary can't stall the command loop for the full `connect_timeout` on
 /// each `primary_recheck`. A recovered primary connects near-instantly; a dead one fails fast.
 const REPROBE_CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// How often (at most) to re-broadcast wallet transactions that are still unmined and
+/// unexpired. Covers sends whose original broadcast failed (their notes are already locked
+/// in the DB until expiry) and mempool drops across upstream restarts; bitcoind keeps
+/// retransmitting unconfirmed wallet txs the same way. A node that already has the tx
+/// rejects the duplicate, which is harmless.
+const REBROADCAST_INTERVAL: Duration = Duration::from_secs(60);
 
 thread_local! {
     /// Set while we deliberately `catch_unwind` librustzcash's progress estimator, so the
@@ -112,7 +120,8 @@ struct WalletActor {
     cmd_rx: mpsc::Receiver<WalletCommand>,
     tip_height: Option<u32>,
     tip_hash: Option<String>,
-    tip_time: Option<i64>,
+    /// Last time the unmined-tx rebroadcast pass ran (`None` = not yet).
+    last_rebroadcast: Option<Instant>,
 }
 
 /// Open the wallet, derive its account info, optionally unlock the seed, build the prover,
@@ -192,7 +201,7 @@ pub async fn spawn(cfg: ActorConfig) -> anyhow::Result<WalletHandle> {
         cmd_rx,
         tip_height: None,
         tip_hash: None,
-        tip_time: None,
+        last_rebroadcast: None,
     };
 
     tokio::spawn(actor.run());
@@ -247,7 +256,13 @@ impl WalletActor {
                     }
                 }
                 match self.sync_step().await {
-                    Ok(worked) => more_work = worked,
+                    Ok(worked) => {
+                        more_work = worked;
+                        if !worked {
+                            // Caught up: give any unmined wallet txs another shot at the mempool.
+                            self.maybe_rebroadcast().await;
+                        }
+                    }
                     Err(e) => {
                         warn!("[{}] sync error: {e}", self.name);
                         self.client = None;
@@ -475,9 +490,57 @@ impl WalletActor {
             best_block_hash: self.tip_hash.clone(),
             scan_progress,
             scanning,
-            tip_time: self.tip_time,
         };
         let _ = self.status_tx.send(status);
+    }
+
+    /// Re-broadcast wallet transactions that are still unmined and unexpired, at most once
+    /// per [`REBROADCAST_INTERVAL`]. Run only when caught up, so a tx that was mined but not
+    /// yet scanned isn't pointlessly re-sent. Rejections from a node that already knows the
+    /// tx are expected and logged at debug; transport failures drop the client so the next
+    /// loop iteration reconnects/fails over.
+    async fn maybe_rebroadcast(&mut self) {
+        let Some(tip) = self.tip_height else { return };
+        if self.client.is_none()
+            || self
+                .last_rebroadcast
+                .is_some_and(|t| t.elapsed() < REBROADCAST_INTERVAL)
+        {
+            return;
+        }
+        self.last_rebroadcast = Some(Instant::now());
+        let txs = match read::unmined_raw_txs(&self.wallet_dir, tip) {
+            Ok(txs) => txs,
+            Err(e) => {
+                warn!("[{}] querying unmined txs for rebroadcast: {e}", self.name);
+                return;
+            }
+        };
+        for (txid, data) in txs {
+            let Some(client) = self.client.as_mut() else { return };
+            let raw = service::RawTransaction { data, ..Default::default() };
+            match client.send_transaction(raw).await {
+                Ok(r) => {
+                    let r = r.into_inner();
+                    if r.error_code == 0 {
+                        info!("[{}] re-broadcast unmined tx {txid}", self.name);
+                    } else {
+                        tracing::debug!(
+                            "[{}] rebroadcast of {txid} rejected (code {}): {}",
+                            self.name,
+                            r.error_code,
+                            r.error_message
+                        );
+                    }
+                }
+                Err(e) => {
+                    warn!("[{}] rebroadcast transport error: {e}", self.name);
+                    self.client = None;
+                    self.update_status();
+                    return;
+                }
+            }
+        }
     }
 
     /// Returns `true` if the actor should stop.
@@ -558,7 +621,7 @@ impl WalletActor {
                     request,
                     ConfirmationsPolicy::default(),
                 )
-                .map_err(|e: crate::error::ProposalError| classify_err(e))?;
+                .map_err(classify_err)?;
 
                 let txids = create_proposed_transactions(
                     db,
@@ -569,7 +632,7 @@ impl WalletActor {
                     OvkPolicy::Sender,
                     &proposal,
                 )
-                .map_err(|e: crate::error::ProposalError| classify_err(e))?;
+                .map_err(classify_err)?;
 
                 if txids.len() > 1 {
                     return Err(RpcError::wallet(
@@ -681,12 +744,27 @@ impl WalletActor {
 }
 
 /// Classify a librustzcash spend/proposal error into a Bitcoin-Core RPC code. Insufficient
-/// funds maps to -6; everything else to the generic wallet error -4.
-fn classify_err<E: std::fmt::Debug>(e: E) -> RpcError {
-    let s = format!("{e:?}");
-    if s.to_lowercase().contains("insufficient") {
-        RpcError::insufficient_funds(s)
-    } else {
-        RpcError::wallet(s)
+/// funds maps to -6; everything else to the generic wallet error -4. Client-facing messages
+/// use `Display` (not `Debug`) so internal note/proposal structure isn't leaked.
+fn classify_err(e: crate::error::ProposalError) -> RpcError {
+    use zcash_client_backend::data_api::error::Error;
+    match &e {
+        Error::InsufficientFunds { available, required } => {
+            RpcError::insufficient_funds(format!(
+                "Insufficient funds: {} zatoshis spendable, {} required (including fee)",
+                u64::from(*available),
+                u64::from(*required),
+            ))
+        }
+        // Insufficient-balance conditions can also surface from the change strategy
+        // (e.g. `ChangeError::InsufficientFunds`); catch those by message.
+        _ => {
+            let s = e.to_string();
+            if s.to_lowercase().contains("insufficient") {
+                RpcError::insufficient_funds(s)
+            } else {
+                RpcError::wallet(s)
+            }
+        }
     }
 }

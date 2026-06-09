@@ -226,6 +226,66 @@ pub fn get_transaction(wallet_dir: &Path, txid_hex: &str) -> anyhow::Result<Opti
     Ok(Some(rec))
 }
 
+/// Wallet transactions that are still unmined and unexpired at `tip` - candidates for
+/// rebroadcast. Returns `(display_txid, raw_bytes)`; `raw` is only present for txs the
+/// wallet created or has enhanced. An expiry height of 0 means "never expires".
+pub fn unmined_raw_txs(wallet_dir: &Path, tip: u32) -> anyhow::Result<Vec<(String, Vec<u8>)>> {
+    let conn = open_conn(wallet_dir)?;
+    let mut stmt = conn.prepare(
+        "SELECT txid, raw, expiry_height FROM transactions
+         WHERE mined_height IS NULL AND raw IS NOT NULL",
+    )?;
+    let rows = stmt.query_map([], |row| {
+        Ok((
+            row.get::<_, Vec<u8>>(0)?,
+            row.get::<_, Vec<u8>>(1)?,
+            row.get::<_, Option<u32>>(2)?,
+        ))
+    })?;
+    let mut out = Vec::new();
+    for r in rows {
+        let (txid, raw, expiry) = r?;
+        let unexpired = match expiry {
+            None | Some(0) => true,
+            Some(e) => e > tip,
+        };
+        if unexpired {
+            out.push((txid_display(&txid), raw));
+        }
+    }
+    Ok(out)
+}
+
+/// The `(display-hex hash, unix time)` of a block the wallet has scanned, from the wallet's
+/// `blocks` table. Hashes are stored in internal byte order and displayed reversed, like txids.
+pub fn block_info_at(wallet_dir: &Path, height: u32) -> anyhow::Result<Option<(String, i64)>> {
+    let conn = open_conn(wallet_dir)?;
+    let row = conn
+        .query_row(
+            "SELECT hash, time FROM blocks WHERE height = :height",
+            named_params! {":height": height},
+            |r| Ok((r.get::<_, Vec<u8>>(0)?, r.get::<_, i64>(1)?)),
+        )
+        .optional()?;
+    Ok(row.map(|(hash, time)| (txid_display(&hash), time)))
+}
+
+/// The median-time-past at `height`: the median of the (up to) 11 scanned block times ending
+/// at `height` inclusive - the consensus MTP rule, for `getblockchaininfo.mediantime`.
+pub fn median_time_past(wallet_dir: &Path, height: u32) -> anyhow::Result<Option<i64>> {
+    let conn = open_conn(wallet_dir)?;
+    let mut stmt = conn.prepare(
+        "SELECT time FROM blocks WHERE height <= :height ORDER BY height DESC LIMIT 11",
+    )?;
+    let rows = stmt.query_map(named_params! {":height": height}, |r| r.get::<_, i64>(0))?;
+    let mut times: Vec<i64> = rows.collect::<Result<_, _>>()?;
+    if times.is_empty() {
+        return Ok(None);
+    }
+    times.sort_unstable();
+    Ok(Some(times[times.len() / 2]))
+}
+
 /// List unspent Orchard notes for `listunspent` (with mined height for confirmations).
 pub fn list_unspent(network: ZNetwork, wallet_dir: &Path) -> anyhow::Result<Vec<UnspentNote>> {
     let db = open_read(network, wallet_dir)?;
