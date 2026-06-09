@@ -52,7 +52,21 @@ jobs:
           ref: sleepy-faraday-T6HUy
           path: zcash-devtool
 
+      # Cache the funder binary keyed on its commit, so devtool is built once per devtool change
+      # and skipped entirely on every other run (it rarely changes between zecd runs). On a miss,
+      # rust-cache (above) still has its dependency tree, so the rebuild is just devtool's own crate.
+      - name: Resolve devtool commit
+        run: echo "DEVTOOL_SHA=$(git -C zcash-devtool rev-parse HEAD)" >> "$GITHUB_ENV"
+
+      - name: Cache the funder binary
+        id: devtool-bin
+        uses: actions/cache@v4
+        with:
+          path: zcash-devtool/target/release/zcash-devtool
+          key: devtool-bin-${{ runner.os }}-${{ env.DEVTOOL_SHA }}
+
       - name: Build zcash-devtool (funder)
+        if: steps.devtool-bin.outputs.cache-hit != 'true'
         run: cargo build --release --manifest-path zcash-devtool/Cargo.toml --bin zcash-devtool
 
       # Extract zebrad + lightwalletd from their official Docker images. zebra MUST match the
