@@ -53,6 +53,7 @@ fn regtest_network() -> Network {
         ConfiguredActivationHeights {
             nu5: Some(1),
             nu6: Some(1),
+            nu6_1: Some(1),
             ..Default::default()
         }
         .into(),
@@ -174,6 +175,7 @@ disable_pow = true
 [network.testnet_parameters.activation_heights]
 NU5 = 1
 NU6 = 1
+"NU6.1" = 1
 
 [mining]
 miner_address = "{miner_address}"
