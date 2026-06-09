@@ -53,6 +53,8 @@ fn regtest_network() -> Network {
         ConfiguredActivationHeights {
             nu5: Some(1),
             nu6: Some(1),
+            nu6_1: Some(1),
+            nu6_2: Some(1),
             ..Default::default()
         }
         .into(),
@@ -171,13 +173,13 @@ listen_addr = "127.0.0.1:{net_port}"
 [network.testnet_parameters]
 disable_pow = true
 
-# NU6 is the regtest ceiling: lightwalletd v0.4.19 + the pinned librustzcash handle NU6, but
-# activating NU6.1 made zebra's z_gettreestate report "block not in the main chain" at zecd init.
-# devtool's and zecd's regtest networks must match (no NU6.1). Real NU6.1/NU6.2 needs the
-# librustzcash bump (see the NU6.2 TODO).
+# Activate the full NU6.x line from genesis. devtool's and zecd's regtest networks must match
+# this (see network::regtest / data::regtest_local).
 [network.testnet_parameters.activation_heights]
 NU5 = 1
 NU6 = 1
+"NU6.1" = 1
+"NU6.2" = 1
 
 [mining]
 miner_address = "{miner_address}"

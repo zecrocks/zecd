@@ -620,6 +620,7 @@ impl WalletActor {
                     &change_strategy,
                     request,
                     ConfirmationsPolicy::default(),
+                    None,
                 )
                 .map_err(classify_err)?;
 
@@ -631,6 +632,7 @@ impl WalletActor {
                     &SpendingKeys::from_unified_spending_key(usk),
                     OvkPolicy::Sender,
                     &proposal,
+                    None,
                 )
                 .map_err(classify_err)?;
 
