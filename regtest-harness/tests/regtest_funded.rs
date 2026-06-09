@@ -23,6 +23,11 @@ use zecd_regtest_harness::{
 /// Blocks mined up front. Coinbase maturity is 100, so with the tip here the early coinbases
 /// (heights ~1..10) are spendable, giving the funder plenty to shield.
 const INITIAL_MINE: u32 = 110;
+/// After the funder syncs, advance the chain this many more blocks (without re-syncing it) before
+/// shielding. devtool's coinbase-maturity view runs ~1 block ahead of zebra's, so it can pick a
+/// coinbase that's 1 block short when zebra validates the broadcast; landing the shield a few
+/// blocks later makes the selected coinbase comfortably mature.
+const MATURITY_BUFFER: u32 = 10;
 /// 1 ZEC, in zatoshis.
 const FUND_ZATOSHIS: u64 = 100_000_000;
 /// Generous: lightwalletd ingestion + zecd scan + Orchard proving.
@@ -65,6 +70,13 @@ async fn regtest_funded_orchard_receive() {
     //    into Orchard.
     let funder = Funder::init(&devtool_bin, lwd.grpc_port).expect("initialise funding wallet");
     funder.sync(lwd.grpc_port).expect("funder sync (coinbase)");
+    // Advance the chain a few blocks WITHOUT re-syncing the funder, so the coinbase the shield
+    // selects (against the funder's slightly-stale tip) is comfortably mature at the height the
+    // shield actually lands - avoids "immature transparent coinbase spend".
+    zebrad
+        .generate_blocks(MATURITY_BUFFER)
+        .await
+        .expect("mine maturity buffer");
     funder
         .shield(lwd.grpc_port)
         .expect("shield transparent coinbase into Orchard");
