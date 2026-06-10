@@ -49,12 +49,11 @@ const MIN_SPLIT_OUTPUT_VALUE: u64 = 10_000_000; // 0.1 ZEC
 /// each `primary_recheck`. A recovered primary connects near-instantly; a dead one fails fast.
 const REPROBE_CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
 
-/// How often (at most) to re-broadcast wallet transactions that are still unmined and
-/// unexpired. Covers sends whose original broadcast failed (their notes are already locked
-/// in the DB until expiry) and mempool drops across upstream restarts; bitcoind keeps
-/// retransmitting unconfirmed wallet txs the same way. A node that already has the tx
-/// rejects the duplicate, which is harmless.
-const REBROADCAST_INTERVAL: Duration = Duration::from_secs(60);
+// NB: the unmined-tx rebroadcast interval is configurable (`[sync] rebroadcast_secs`,
+// default 60) and arrives via `ActorConfig::rebroadcast_interval`. It covers sends whose
+// original broadcast failed (their notes are already locked in the DB until expiry) and
+// mempool drops across upstream restarts; bitcoind keeps retransmitting unconfirmed wallet
+// txs the same way. A node that already has the tx rejects the duplicate, which is harmless.
 
 thread_local! {
     /// Set while we deliberately `catch_unwind` librustzcash's progress estimator, so the
@@ -82,6 +81,8 @@ pub struct ActorConfig {
     /// Ordered lightwalletd endpoints (non-empty); tried in order, preferring the first.
     pub servers: Vec<Server>,
     pub sync_interval: Duration,
+    /// Minimum spacing between unmined-tx rebroadcast passes.
+    pub rebroadcast_interval: Duration,
     /// Per-attempt dial timeout.
     pub connect_timeout: Duration,
     /// Reconnect backoff base/max delays.
@@ -108,6 +109,7 @@ struct WalletActor {
     primary_recheck: Duration,
     last_primary_probe: Instant,
     sync_interval: Duration,
+    rebroadcast_interval: Duration,
     age_identity: Option<PathBuf>,
     account_id: AccountUuid,
     account_index: Option<zip32::AccountId>,
@@ -189,6 +191,7 @@ pub async fn spawn(cfg: ActorConfig) -> anyhow::Result<WalletHandle> {
         primary_recheck: cfg.primary_recheck,
         last_primary_probe: Instant::now(),
         sync_interval: cfg.sync_interval,
+        rebroadcast_interval: cfg.rebroadcast_interval,
         age_identity: cfg.age_identity,
         account_id,
         account_index,
@@ -495,7 +498,7 @@ impl WalletActor {
     }
 
     /// Re-broadcast wallet transactions that are still unmined and unexpired, at most once
-    /// per [`REBROADCAST_INTERVAL`]. Run only when caught up, so a tx that was mined but not
+    /// per `rebroadcast_interval`. Run only when caught up, so a tx that was mined but not
     /// yet scanned isn't pointlessly re-sent. Rejections from a node that already knows the
     /// tx are expected and logged at debug; transport failures drop the client so the next
     /// loop iteration reconnects/fails over.
@@ -504,7 +507,7 @@ impl WalletActor {
         if self.client.is_none()
             || self
                 .last_rebroadcast
-                .is_some_and(|t| t.elapsed() < REBROADCAST_INTERVAL)
+                .is_some_and(|t| t.elapsed() < self.rebroadcast_interval)
         {
             return;
         }

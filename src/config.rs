@@ -123,6 +123,8 @@ pub struct KeysConfig {
 #[derive(Debug, Clone)]
 pub struct SyncConfig {
     pub interval_secs: u64,
+    /// How often (at most) to re-broadcast wallet txs that are unmined and unexpired.
+    pub rebroadcast_secs: u64,
 }
 
 impl AppConfig {
@@ -220,6 +222,7 @@ struct KeysFile {
 #[serde(deny_unknown_fields)]
 struct SyncFile {
     interval_secs: Option<u64>,
+    rebroadcast_secs: Option<u64>,
 }
 
 // ---------------------------------------------------------------------------
@@ -447,9 +450,13 @@ impl AppConfig {
             auto_unlock: keys_file.auto_unlock.unwrap_or(true),
         };
 
-        let sync_file = file.sync.unwrap_or(SyncFile { interval_secs: None });
+        let sync_file = file.sync.unwrap_or(SyncFile {
+            interval_secs: None,
+            rebroadcast_secs: None,
+        });
         let sync = SyncConfig {
             interval_secs: sync_file.interval_secs.unwrap_or(20),
+            rebroadcast_secs: sync_file.rebroadcast_secs.unwrap_or(60).max(1),
         };
 
         let health_file = file.health.unwrap_or(HealthFile {

@@ -56,3 +56,6 @@ auto_unlock = true
 [sync]
 # How often to poll lightwalletd for new blocks (seconds).
 interval_secs = 20
+# How often (at most) to re-broadcast wallet txs that are unmined and unexpired (seconds).
+# Covers sends whose initial broadcast failed and mempool drops across upstream restarts.
+rebroadcast_secs = 60

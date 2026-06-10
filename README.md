@@ -99,6 +99,7 @@ auto_unlock = true               # decrypt the seed at startup so sends need no 
 
 [sync]
 interval_secs = 20
+rebroadcast_secs = 60            # max spacing of unmined-tx re-broadcast passes
 
 [log]
 level = "info"                   # tracing filter; RUST_LOG overrides
