@@ -291,23 +291,151 @@ async fn regtest_funded_orchard_receive() {
         "nothing confirmed is re-reported past the fresh cursor: {lsb2}"
     );
 
+    // ---- Phase 3: send during an upstream outage (the committed-send contract) ----
+
+    // The change from the Phase-2 send is trusted and has 3 confirmations, so it is
+    // spendable. Kill lightwalletd, then send: the wallet must commit and return the txid
+    // even though the broadcast can't reach anyone - recovery is the rebroadcast loop's job.
+    let lwd_port = lwd.grpc_port;
+    lwd.stop();
+    let txid_outage = zecd
+        .call("sendtoaddress", json!([funder_ua, 0.1]))
+        .await
+        .expect("a committed send returns its txid even when broadcast fails");
+    let txid_outage = txid_outage.as_str().expect("txid is a string").to_string();
+    let gt = zecd
+        .call("gettransaction", json!([txid_outage]))
+        .await
+        .expect("gettransaction during the outage");
+    assert_eq!(gt["confirmations"].as_i64(), Some(0), "committed, unmined: {gt}");
+
+    // The daemon reports the outage once the actor notices the dead connection.
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let peers = zecd.call("getpeerinfo", json!([])).await.expect("getpeerinfo");
+        if peers.as_array().is_some_and(|a| a.is_empty()) {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "getpeerinfo never emptied during the outage: {peers}"
+        );
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+
+    // Upstream recovers on the same address: zecd reconnects (1-2s backoff), the
+    // rebroadcast pass (2s interval) re-submits the tx, and mining confirms it.
+    let lwd = Lightwalletd::start_on(&lwd_bin, zebrad.rpc_port, lwd_port)
+        .await
+        .expect("restart lightwalletd on the same port");
+    mine_until_confirmed(&zebrad, &zecd, &txid_outage, "outage send after recovery").await;
+
+    // ---- Phase 4: a send that can never broadcast expires, and the funds come back ----
+
+    // Let Phase 3's change reach trusted spendability, and take the balance baseline.
+    let tip = zecd.block_count().await.expect("getblockcount");
+    zebrad.generate_blocks(3).await.expect("mature the change");
+    zecd.wait_until_synced(tip + 3, FUND_TIMEOUT)
+        .await
+        .expect("zecd scans the maturity blocks");
+    let balance_before = zecd
+        .call("getbalance", json!([]))
+        .await
+        .expect("getbalance")
+        .as_f64()
+        .expect("balance is a number");
+
+    // Send into a dead upstream again - but this time mine past the tx's 40-block expiry
+    // while nothing can relay it. When the upstream returns, zecd catches up *past* expiry
+    // before its rebroadcast pass runs (the pass only fires once caught up), and consensus
+    // forbids mining the tx beyond its expiry height regardless - so it expires for good.
+    let lwd_port = lwd.grpc_port;
+    lwd.stop();
+    let txid_expired = zecd
+        .call("sendtoaddress", json!([funder_ua, 0.1]))
+        .await
+        .expect("committed send during the outage")
+        .as_str()
+        .expect("txid is a string")
+        .to_string();
+    let tip = zecd.block_count().await.expect("getblockcount");
+    zebrad
+        .generate_blocks(45)
+        .await
+        .expect("mine past the 40-block expiry");
+    let _lwd = Lightwalletd::start_on(&lwd_bin, zebrad.rpc_port, lwd_port)
+        .await
+        .expect("restart lightwalletd");
+    zecd.wait_until_synced(tip + 45, FUND_TIMEOUT)
+        .await
+        .expect("zecd scans past the expiry height");
+
+    // The poller sees the death signal...
+    let gt = zecd
+        .call("gettransaction", json!([txid_expired]))
+        .await
+        .expect("gettransaction on the expired send");
+    assert_eq!(
+        gt["confirmations"].as_i64(),
+        Some(-1),
+        "an expired unmined send reports conflicted: {gt}"
+    );
+    assert!(
+        gt["details"]
+            .as_array()
+            .expect("details")
+            .iter()
+            .any(|d| d["abandoned"] == json!(true)),
+        "the send detail is abandoned: {gt}"
+    );
+
+    // ...the locked inputs are released (balance returns to the pre-send baseline)...
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let bal = zecd
+            .call("getbalance", json!([]))
+            .await
+            .expect("getbalance")
+            .as_f64()
+            .unwrap_or(0.0);
+        if (bal - balance_before).abs() < 1e-8 {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "funds were not released after expiry: {bal} != {balance_before}"
+        );
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+
+    // ...and the payment can simply be re-sent and confirmed normally.
+    let txid_retry = zecd
+        .call("sendtoaddress", json!([funder_ua, 0.1]))
+        .await
+        .expect("re-send after expiry succeeds")
+        .as_str()
+        .expect("txid is a string")
+        .to_string();
+    mine_until_confirmed(&zebrad, &zecd, &txid_retry, "re-send after expiry").await;
+
     // ---- concurrent-send burst: the no-double-spend invariant under contention ----
     //
-    // The wallet holds ~0.6 ZEC (1.0 received − 0.4 sent − fee). Fire four concurrent
-    // sendtoaddress of 0.5: two successes would need 1.0+, more than the wallet holds, so
-    // *exactly one* can succeed no matter how change was split into notes - the rest must
-    // serialize behind it in the wallet actor and fail with -6 (insufficient funds), never by
-    // double-spending the same note. This is the CI version of the manual "busy-server demo".
+    // After Phases 2-4 the wallet holds ~0.4 ZEC (1.0 received − 0.4 − 0.1 − 0.1 − fees).
+    // Fire four concurrent sendtoaddress of 0.25: two successes would need 0.5, more than the
+    // wallet holds, so *exactly one* can succeed no matter how change was split into notes -
+    // the rest must serialize behind it in the wallet actor and fail with -6 (insufficient
+    // funds), never by double-spending the same note. This is the CI version of the manual
+    // "busy-server demo".
     //
-    // First let the 0.4-send's change confirm past the trusted-note depth (3) so the burst has
-    // a spendable note to fight over.
+    // First let the Phase-4 retry's change age past the trusted-note depth (3, plus one for
+    // the block the retry itself may have landed in) so the burst has spendable notes.
     let tip = zecd.block_count().await.expect("getblockcount");
-    zebrad.generate_blocks(3).await.expect("age the change");
-    zecd.wait_until_synced(tip + 3, FUND_TIMEOUT)
+    zebrad.generate_blocks(4).await.expect("age the change");
+    zecd.wait_until_synced(tip + 4, FUND_TIMEOUT)
         .await
         .expect("zecd scans the change-aging blocks");
 
-    let burst = json!([funder_ua, 0.5]);
+    let burst = json!([funder_ua, 0.25]);
     let (a, b, c, d) = tokio::join!(
         zecd.call("sendtoaddress", burst.clone()),
         zecd.call("sendtoaddress", burst.clone()),
@@ -353,6 +481,23 @@ async fn regtest_funded_orchard_receive() {
 
     // ---- conformance.py against the live, funded daemon ----
     run_conformance(cfg.rpc_port, &cfg.rpc_user, &cfg.rpc_password);
+}
+
+/// Mine one block at a time (giving the rebroadcast/scan loop time between blocks) until
+/// zecd reports the tx confirmed. Panics after ~30 rounds.
+async fn mine_until_confirmed(zebrad: &Zebrad, zecd: &Zecd, txid: &str, what: &str) {
+    for _ in 0..30 {
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        zebrad.generate_blocks(1).await.expect("mine a block");
+        let gt = zecd
+            .call("gettransaction", json!([txid]))
+            .await
+            .expect("gettransaction while polling for confirmation");
+        if gt["confirmations"].as_i64().unwrap_or(0) >= 1 {
+            return;
+        }
+    }
+    panic!("{what}: tx {txid} did not confirm within the mining budget");
 }
 
 /// Run `scripts/conformance.py` (the python-bitcoinrpc-equivalent wire-format suite) against
