@@ -295,6 +295,84 @@ mod tests {
         assert_eq!(r.status(), StatusCode::SERVICE_UNAVAILABLE);
     }
 
+    /// One-shot a single RPC call and return the error code from the envelope (None = success).
+    async fn call_err_code(body: &str) -> Option<i64> {
+        let r = router(test_state())
+            .oneshot(req(body, Some(("u", "p"))))
+            .await
+            .unwrap();
+        let v = body_json(r).await;
+        v["error"]["code"].as_i64()
+    }
+
+    /// The unsupported fee-shifting params must be rejected with -8 *before* any wallet
+    /// access (these run against a registry with no wallets at all), so the guard can never
+    /// be bypassed by wallet state.
+    #[tokio::test]
+    async fn money_semantics_params_are_rejected_before_wallet_access() {
+        use crate::error::codes::RPC_INVALID_PARAMETER;
+        // sendtoaddress param 4 = subtractfeefromamount.
+        let code = call_err_code(
+            r#"{"method":"sendtoaddress","id":1,"params":["uaddr","1.0","","",true]}"#,
+        )
+        .await;
+        assert_eq!(code, Some(RPC_INVALID_PARAMETER as i64));
+        // sendmany param 4 = subtractfeefrom (non-empty array engages it).
+        let code = call_err_code(
+            r#"{"method":"sendmany","id":1,"params":["",{"uaddr":1.0},1,"",["uaddr"]]}"#,
+        )
+        .await;
+        assert_eq!(code, Some(RPC_INVALID_PARAMETER as i64));
+        // ...but a false/empty value must NOT trip the guard (it fails later, on the
+        // missing wallet, -18), so well-behaved clients passing defaults still work.
+        use crate::error::codes::RPC_WALLET_NOT_FOUND;
+        let code = call_err_code(
+            r#"{"method":"sendtoaddress","id":1,"params":["uaddr","1.0","","",false]}"#,
+        )
+        .await;
+        assert_eq!(code, Some(RPC_WALLET_NOT_FOUND as i64));
+    }
+
+    #[tokio::test]
+    async fn parameter_validation_codes() {
+        use crate::error::codes::{RPC_INVALID_ADDRESS_OR_KEY, RPC_INVALID_PARAMETER};
+        // listtransactions: negative count / from -> -8 (before wallet access).
+        let code =
+            call_err_code(r#"{"method":"listtransactions","id":1,"params":["*",-1]}"#).await;
+        assert_eq!(code, Some(RPC_INVALID_PARAMETER as i64));
+        let code =
+            call_err_code(r#"{"method":"listtransactions","id":1,"params":["*",10,-5]}"#).await;
+        assert_eq!(code, Some(RPC_INVALID_PARAMETER as i64));
+        // getnewaddress: unknown address_type -> -5; orchard/unified accepted (fails later
+        // on the missing wallet instead).
+        let code =
+            call_err_code(r#"{"method":"getnewaddress","id":1,"params":["","bech32"]}"#).await;
+        assert_eq!(code, Some(RPC_INVALID_ADDRESS_OR_KEY as i64));
+        let code =
+            call_err_code(r#"{"method":"getnewaddress","id":1,"params":["","orchard"]}"#).await;
+        assert_ne!(code, Some(RPC_INVALID_ADDRESS_OR_KEY as i64));
+    }
+
+    /// The newer wallet methods are wired into dispatch: they must fail on the missing
+    /// wallet / missing params - never with -32601 (method not found).
+    #[tokio::test]
+    async fn new_wallet_methods_are_dispatched() {
+        use crate::error::codes::RPC_METHOD_NOT_FOUND;
+        for body in [
+            r#"{"method":"listsinceblock","id":1,"params":[]}"#,
+            r#"{"method":"getreceivedbyaddress","id":1,"params":["uaddr"]}"#,
+            r#"{"method":"listreceivedbyaddress","id":1,"params":[]}"#,
+        ] {
+            let code = call_err_code(body).await;
+            assert!(code.is_some(), "walletless state must yield an error: {body}");
+            assert_ne!(
+                code,
+                Some(RPC_METHOD_NOT_FOUND as i64),
+                "method must be dispatched: {body}"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn batch_returns_200_array() {
         let body = r#"[{"method":"uptime","id":1},{"method":"nope","id":2}]"#;
