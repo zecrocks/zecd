@@ -329,9 +329,11 @@ until `walletlock` or shutdown). Anyone with RPC access can therefore unlock the
 
 **RPC surface.**
 
-- Exactly one RPC credential is supported: `rpcuser`/`rpcpassword`, or the generated cookie file
-  (`<datadir>/.cookie`, mode 0600) when they are unset. There is no `rpcauth`-style multi-user
-  list or per-method whitelist.
+- RPC credentials follow bitcoind: `rpcuser`/`rpcpassword`, bitcoind-style `rpcauth` entries
+  (`[rpc] auth = ["<user>:<salt>$<hmac-sha256>"]` in the config or repeated `--rpcauth` flags,
+  generated with bitcoin's `share/rpcauth/rpcauth.py`), and a generated cookie file
+  (`<datadir>/.cookie`, mode 0600) when no user/password pair is set. There is no per-method
+  whitelist.
 - Do not expose the RPC port to untrusted networks. Bind to `127.0.0.1` and/or front it with TLS
   or a reverse proxy. On mainnet, zecd refuses to start while the password is the example
   placeholder (`CHANGE-ME`).

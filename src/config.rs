@@ -102,6 +102,9 @@ pub struct RpcConfig {
     pub port: u16,
     pub user: Option<String>,
     pub password: Option<String>,
+    /// Bitcoin-Core-style `rpcauth` entries (`<user>:<salt>$<hmac-sha256 hex>`), each an
+    /// additional accepted credential; generate them with bitcoind's `rpcauth.py`.
+    pub auth: Vec<String>,
     /// Path to a bitcoind-style cookie file; generated at startup when no user/password set.
     pub cookiefile: Option<PathBuf>,
     /// Max concurrent in-flight requests before returning HTTP 503 (Bitcoin Core's
@@ -201,6 +204,7 @@ struct RpcFile {
     port: Option<u16>,
     user: Option<String>,
     password: Option<String>,
+    auth: Option<Vec<String>>,
     cookiefile: Option<PathBuf>,
     work_queue: Option<usize>,
 }
@@ -261,6 +265,10 @@ pub struct Cli {
     /// RPC password (HTTP Basic auth).
     #[arg(long = "rpcpassword", value_name = "PASS")]
     pub rpc_password: Option<String>,
+
+    /// rpcauth credential (`<user>:<salt>$<hmac-sha256 hex>`); may be repeated.
+    #[arg(long = "rpcauth", value_name = "USER:SALT$HASH")]
+    pub rpc_auth: Vec<String>,
 
     /// lightwalletd server: ecc | ywallet | zecrocks | host:port[,host:port].
     #[arg(long, value_name = "SERVER")]
@@ -391,6 +399,7 @@ impl AppConfig {
             port: None,
             user: None,
             password: None,
+            auth: None,
             cookiefile: None,
             work_queue: None,
         });
@@ -409,6 +418,14 @@ impl AppConfig {
                 .unwrap_or_else(|| AppConfig::default_rpc_port(network)),
             user: cli.rpc_user.clone().or(rpc_file.user),
             password: cli.rpc_password.clone().or(rpc_file.password),
+            // rpcauth entries accumulate across CLI and file, matching bitcoind where
+            // every -rpcauth/conf line is an accepted credential.
+            auth: cli
+                .rpc_auth
+                .iter()
+                .cloned()
+                .chain(rpc_file.auth.unwrap_or_default())
+                .collect(),
             cookiefile: rpc_file
                 .cookiefile
                 .or_else(|| Some(datadir.join(".cookie"))),

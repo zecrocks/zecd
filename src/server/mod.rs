@@ -183,6 +183,7 @@ mod tests {
             port: 1,
             user: Some("u".into()),
             password: Some("p".into()),
+            auth: vec![],
             cookiefile: None,
             work_queue: 16,
         };
