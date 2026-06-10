@@ -16,9 +16,10 @@
 //! Phase 1: funded receive (funder → zecd, balance + history). Phase 2: zecd *spends* - the
 //! walletlock/-13/walletpassphrase gate, a real `sendtoaddress` back to the funder with
 //! `gettransaction` shape checks through confirmation, and the payment-poller methods
-//! (`listsinceblock` cursor loop, `getreceivedbyaddress`/`listreceivedbyaddress`). Finally
-//! `scripts/conformance.py` runs against the live funded daemon, putting its full
-//! Bitcoin-Core wire-format suite under CI.
+//! (`listsinceblock` cursor loop, `getreceivedbyaddress`/`listreceivedbyaddress`), then a
+//! concurrent-send burst proving the no-double-spend invariant (exactly one winner, losers
+//! get -6). Finally `scripts/conformance.py` runs against the live funded daemon, putting its
+//! full Bitcoin-Core wire-format suite under CI.
 
 use std::time::{Duration, Instant};
 
@@ -293,6 +294,66 @@ async fn regtest_funded_orchard_receive() {
             .iter()
             .all(|t| t["confirmations"].as_i64().unwrap_or(0) < 1),
         "nothing confirmed is re-reported past the fresh cursor: {lsb2}"
+    );
+
+    // ---- concurrent-send burst: the no-double-spend invariant under contention ----
+    //
+    // The wallet holds ~0.6 ZEC (1.0 received − 0.4 sent − fee). Fire four concurrent
+    // sendtoaddress of 0.5: two successes would need 1.0+, more than the wallet holds, so
+    // *exactly one* can succeed no matter how change was split into notes - the rest must
+    // serialize behind it in the wallet actor and fail with -6 (insufficient funds), never by
+    // double-spending the same note. This is the CI version of the manual "busy-server demo".
+    //
+    // First let the 0.4-send's change confirm past the trusted-note depth (3) so the burst has
+    // a spendable note to fight over.
+    let tip = zecd.block_count().await.expect("getblockcount");
+    zebrad.generate_blocks(3).await.expect("age the change");
+    zecd.wait_until_synced(tip + 3, FUND_TIMEOUT)
+        .await
+        .expect("zecd scans the change-aging blocks");
+
+    let burst = json!([funder_ua, 0.5]);
+    let (a, b, c, d) = tokio::join!(
+        zecd.call("sendtoaddress", burst.clone()),
+        zecd.call("sendtoaddress", burst.clone()),
+        zecd.call("sendtoaddress", burst.clone()),
+        zecd.call("sendtoaddress", burst.clone()),
+    );
+    let results = [a, b, c, d];
+    let winners: Vec<&str> = results
+        .iter()
+        .filter_map(|r| r.as_ref().ok().and_then(|v| v.as_str()))
+        .collect();
+    assert_eq!(
+        winners.len(),
+        1,
+        "exactly one concurrent send can be funded: {results:?}"
+    );
+    let winner_txid = winners[0].to_string();
+    assert_eq!(winner_txid.len(), 64, "winning txid is display hex");
+    for r in &results {
+        if let Err(e) = r {
+            assert_eq!(
+                e.code(),
+                Some(-6),
+                "every losing concurrent send fails with insufficient-funds (-6): {e}"
+            );
+        }
+    }
+
+    // The winner is a real transaction: it mines and confirms like any other send.
+    let tip = zecd.block_count().await.expect("getblockcount");
+    zebrad.generate_blocks(3).await.expect("confirm the winner");
+    zecd.wait_until_synced(tip + 3, FUND_TIMEOUT)
+        .await
+        .expect("zecd scans the winner's confirmations");
+    let gt = zecd
+        .call("gettransaction", json!([winner_txid]))
+        .await
+        .expect("gettransaction on the burst winner");
+    assert!(
+        gt["confirmations"].as_i64().is_some_and(|c| c >= 1),
+        "the burst winner confirmed on-chain: {gt}"
     );
 
     // ---- conformance.py against the live, funded daemon ----
