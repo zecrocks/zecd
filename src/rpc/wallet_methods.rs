@@ -1,6 +1,6 @@
 //! Wallet RPCs mapped onto Orchard shielded operations.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 
 use serde_json::{json, Map, Value};
 use zcash_protocol::TxId;
@@ -10,7 +10,7 @@ use crate::amount::{signed_zats_to_value, value_to_zats, zats_to_value};
 use crate::error::RpcError;
 use crate::server::jsonrpc::RpcRequest;
 use crate::state::AppState;
-use crate::wallet::{labels, read};
+use crate::wallet::{labels, read, SyncStatus};
 
 fn opt_str(req: &RpcRequest, i: usize) -> Option<String> {
     req.param(i).and_then(|v| v.as_str()).map(|s| s.to_string())
@@ -156,6 +156,83 @@ fn output_category(from_account: bool, to_account: bool) -> Option<&'static str>
     }
 }
 
+/// Per-transaction confirmation count: -1 for an expired unmined tx (it can never confirm;
+/// Bitcoin Core's "conflicted" signal, so pollers terminate), else anchored to the wallet's
+/// fully-scanned height.
+fn tx_confirmations(st: &SyncStatus, tx: &read::TxRecord) -> i64 {
+    if tx.expired_unmined {
+        -1
+    } else {
+        st.confirmations(tx.mined_height)
+    }
+}
+
+/// Build the `listtransactions`-shaped entries for one wallet transaction: one entry per
+/// non-change, non-internal output, sends negative (Bitcoin Core's sign convention).
+/// `label_filter` of `Some(l)` keeps only entries labelled exactly `l`. Shared by
+/// `listtransactions` and `listsinceblock`.
+fn tx_entries(
+    tx: &read::TxRecord,
+    label_map: &HashMap<String, String>,
+    confirmations: i64,
+    label_filter: Option<&str>,
+) -> Vec<Value> {
+    let mut entries = Vec::new();
+    for out in &tx.outputs {
+        if out.is_change {
+            continue;
+        }
+        let Some(category) =
+            output_category(out.from_account.is_some(), out.to_account.is_some())
+        else {
+            continue;
+        };
+        let amount = if category == "send" { -out.value } else { out.value };
+        let address = out.to_address.clone().unwrap_or_default();
+        let label = out
+            .to_address
+            .as_ref()
+            .and_then(|a| label_map.get(a).cloned())
+            .unwrap_or_default();
+        if label_filter.is_some_and(|f| f != label) {
+            continue;
+        }
+        let mut entry = json!({
+            "address": address,
+            "category": category,
+            "amount": signed_zats_to_value(amount),
+            "label": label,
+            "vout": out.output_index,
+            "confirmations": confirmations,
+            "txid": tx.txid_hex,
+            "time": tx.block_time.unwrap_or(0),
+            "timereceived": tx.block_time.unwrap_or(0),
+            "bip125-replaceable": "no",
+            "trusted": tx.mined_height.is_some(),
+        });
+        if category == "send" {
+            // Bitcoin Core carries `abandoned` on send entries only.
+            entry["abandoned"] = json!(tx.expired_unmined);
+            if let Some(fee) = tx.fee_paid {
+                entry["fee"] = signed_zats_to_value(-(fee as i64));
+            }
+        }
+        if let Some(h) = tx.mined_height {
+            entry["blockheight"] = json!(h);
+        }
+        entries.push(entry);
+    }
+    entries
+}
+
+/// Bitcoin Core's `gettransaction.amount` excludes the fee (reported separately in `fee`):
+/// for a wallet-funded tx the balance delta is -(payments + fee), so add the fee back.
+/// `fee_paid` is only known when the wallet funded the tx; for pure receives it is None and
+/// the delta is already the received amount. A self-transfer nets to 0.
+fn gettransaction_amount(account_balance_delta: i64, fee_paid: Option<u64>) -> i64 {
+    account_balance_delta + fee_paid.unwrap_or(0) as i64
+}
+
 pub fn listtransactions(
     state: &AppState,
     wallet: Option<&str>,
@@ -177,57 +254,8 @@ pub fn listtransactions(
 
     let mut entries: Vec<Value> = Vec::new();
     for tx in &txs {
-        // An expired unmined tx can never confirm; report it as conflicted (confirmations
-        // -1, like Bitcoin Core) so pollers terminate instead of waiting forever.
-        let confirmations = if tx.expired_unmined {
-            -1
-        } else {
-            st.confirmations(tx.mined_height)
-        };
-        for out in &tx.outputs {
-            if out.is_change {
-                continue;
-            }
-            let Some(category) =
-                output_category(out.from_account.is_some(), out.to_account.is_some())
-            else {
-                continue;
-            };
-            let amount = if category == "send" { -out.value } else { out.value };
-            let address = out.to_address.clone().unwrap_or_default();
-            let label = out
-                .to_address
-                .as_ref()
-                .and_then(|a| label_map.get(a).cloned())
-                .unwrap_or_default();
-            if label_filter.as_deref().is_some_and(|f| f != label) {
-                continue;
-            }
-            let mut entry = json!({
-                "address": address,
-                "category": category,
-                "amount": signed_zats_to_value(amount),
-                "label": label,
-                "vout": out.output_index,
-                "confirmations": confirmations,
-                "txid": tx.txid_hex,
-                "time": tx.block_time.unwrap_or(0),
-                "timereceived": tx.block_time.unwrap_or(0),
-                "bip125-replaceable": "no",
-                "trusted": tx.mined_height.is_some(),
-            });
-            if category == "send" {
-                // Bitcoin Core carries `abandoned` on send entries only.
-                entry["abandoned"] = json!(tx.expired_unmined);
-                if let Some(fee) = tx.fee_paid {
-                    entry["fee"] = signed_zats_to_value(-(fee as i64));
-                }
-            }
-            if let Some(h) = tx.mined_height {
-                entry["blockheight"] = json!(h);
-            }
-            entries.push(entry);
-        }
+        let confirmations = tx_confirmations(&st, tx);
+        entries.extend(tx_entries(tx, &label_map, confirmations, label_filter.as_deref()));
     }
 
     // `entries` is oldest-first; return the most recent `count` after skipping `skip`.
@@ -295,17 +323,8 @@ pub async fn gettransaction(
         },
     };
 
-    // Bitcoin Core's `amount` excludes the fee (reported separately in `fee`): for a
-    // wallet-funded tx the balance delta is -(payments + fee), so add the fee back.
-    // `fee_paid` is only known when the wallet funded the tx; for pure receives it is
-    // None and the delta is already the received amount. A self-transfer nets to 0.
-    let amount = rec.account_balance_delta + rec.fee_paid.unwrap_or(0) as i64;
-    // Expired unmined txs can never confirm: report -1 (conflicted) so pollers terminate.
-    let confirmations = if rec.expired_unmined {
-        -1
-    } else {
-        st.confirmations(rec.mined_height)
-    };
+    let amount = gettransaction_amount(rec.account_balance_delta, rec.fee_paid);
+    let confirmations = tx_confirmations(&st, &rec);
     let mut obj = json!({
         "amount": signed_zats_to_value(amount),
         "confirmations": confirmations,
@@ -450,4 +469,145 @@ pub async fn walletlock(state: &AppState, wallet: Option<&str>) -> Result<Value,
     let handle = state.registry.get(wallet)?.clone();
     handle.lock().await?;
     Ok(Value::Null)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::wallet::read::{TxOutputRecord, TxRecord};
+
+    fn status(fully_scanned: u32) -> SyncStatus {
+        SyncStatus {
+            fully_scanned: Some(fully_scanned),
+            chain_tip: Some(fully_scanned + 5),
+            ..Default::default()
+        }
+    }
+
+    fn out(
+        from: bool,
+        to: bool,
+        value: i64,
+        addr: Option<&str>,
+        is_change: bool,
+    ) -> TxOutputRecord {
+        TxOutputRecord {
+            pool: 3,
+            output_index: 0,
+            from_account: from.then(uuid::Uuid::new_v4),
+            to_account: to.then(uuid::Uuid::new_v4),
+            to_address: addr.map(str::to_string),
+            value,
+            is_change,
+        }
+    }
+
+    fn tx(
+        mined: Option<u32>,
+        expired: bool,
+        fee: Option<u64>,
+        outputs: Vec<TxOutputRecord>,
+    ) -> TxRecord {
+        TxRecord {
+            mined_height: mined,
+            txid_hex: "ab".repeat(32),
+            expiry_height: None,
+            account_balance_delta: 0,
+            fee_paid: fee,
+            sent_note_count: 0,
+            received_note_count: 0,
+            block_time: Some(1_700_000_000),
+            expired_unmined: expired,
+            outputs,
+            raw: None,
+        }
+    }
+
+    #[test]
+    fn receive_entry_shape() {
+        let t = tx(Some(100), false, None, vec![out(false, true, 150_000_000, Some("ua"), false)]);
+        let st = status(102);
+        let e = tx_entries(&t, &HashMap::new(), tx_confirmations(&st, &t), None);
+        assert_eq!(e.len(), 1);
+        assert_eq!(e[0]["category"], "receive");
+        assert_eq!(e[0]["amount"].to_string(), "1.50000000");
+        assert_eq!(e[0]["confirmations"], json!(3));
+        assert_eq!(e[0]["blockheight"], json!(100));
+        assert_eq!(e[0]["trusted"], json!(true));
+        // `abandoned`/`fee` ride on send entries only.
+        assert!(e[0].get("abandoned").is_none());
+        assert!(e[0].get("fee").is_none());
+    }
+
+    #[test]
+    fn send_entry_is_negative_with_fee() {
+        let t = tx(
+            Some(50),
+            false,
+            Some(10_000),
+            vec![out(true, false, 150_000_000, Some("dest"), false)],
+        );
+        let e = tx_entries(&t, &HashMap::new(), 1, None);
+        assert_eq!(e[0]["category"], "send");
+        assert_eq!(e[0]["amount"].to_string(), "-1.50000000");
+        assert_eq!(e[0]["fee"].to_string(), "-0.00010000");
+        assert_eq!(e[0]["abandoned"], json!(false));
+    }
+
+    #[test]
+    fn change_and_internal_outputs_are_skipped() {
+        let t = tx(
+            Some(50),
+            false,
+            None,
+            vec![
+                out(true, true, 1, Some("self"), true),  // change
+                out(true, true, 2, Some("self"), false), // internal transfer
+            ],
+        );
+        assert!(tx_entries(&t, &HashMap::new(), 1, None).is_empty());
+    }
+
+    #[test]
+    fn expired_tx_is_conflicted_and_abandoned() {
+        let t = tx(None, true, Some(10_000), vec![out(true, false, 5, Some("dest"), false)]);
+        let st = status(100);
+        let conf = tx_confirmations(&st, &t);
+        assert_eq!(conf, -1);
+        let e = tx_entries(&t, &HashMap::new(), conf, None);
+        assert_eq!(e[0]["confirmations"], json!(-1));
+        assert_eq!(e[0]["abandoned"], json!(true));
+        assert_eq!(e[0]["trusted"], json!(false));
+    }
+
+    #[test]
+    fn label_filter_keeps_only_matches() {
+        let mut labels = HashMap::new();
+        labels.insert("dest".to_string(), "alice".to_string());
+        let t = tx(Some(50), false, None, vec![out(false, true, 5, Some("dest"), false)]);
+        assert_eq!(tx_entries(&t, &labels, 1, Some("alice")).len(), 1);
+        assert!(tx_entries(&t, &labels, 1, Some("bob")).is_empty());
+        assert_eq!(tx_entries(&t, &labels, 1, None).len(), 1);
+    }
+
+    #[test]
+    fn gettransaction_amount_adds_fee_back() {
+        // Wallet-funded: delta = -(payment + fee); `amount` must be -payment.
+        assert_eq!(gettransaction_amount(-150_010_000, Some(10_000)), -150_000_000);
+        // Pure receive: no fee known, delta already the received value.
+        assert_eq!(gettransaction_amount(250_000_000, None), 250_000_000);
+        // Self-transfer: delta is just -fee; nets to 0.
+        assert_eq!(gettransaction_amount(-10_000, Some(10_000)), 0);
+    }
+
+    #[test]
+    fn confirmations_anchor_to_fully_scanned() {
+        let st = status(100); // fully_scanned 100, chain_tip 105
+        assert_eq!(st.confirmations(Some(100)), 1);
+        assert_eq!(st.confirmations(Some(98)), 3);
+        // Mined above the fully-scanned height (scanned-ahead range): not yet counted,
+        // matching what getblockcount-based client math would compute.
+        assert_eq!(st.confirmations(Some(101)), 0);
+        assert_eq!(st.confirmations(None), 0);
+    }
 }
