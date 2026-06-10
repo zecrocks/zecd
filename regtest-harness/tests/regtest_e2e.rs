@@ -41,12 +41,10 @@ async fn regtest_end_to_end() {
         .expect("launch lightwalletd");
 
     // 3. zecd against lightwalletd (init retries until lightwalletd has caught up).
-    let cfg = ZecdConfig {
-        lightwalletd_port: lightwalletd.grpc_port,
-        rpc_port: pick_port().expect("pick zecd rpc port"),
-        rpc_user: "user".to_string(),
-        rpc_password: "pass".to_string(),
-    };
+    let cfg = ZecdConfig::new(
+        lightwalletd.grpc_port,
+        pick_port().expect("pick zecd rpc port"),
+    );
     let zecd = Zecd::start(&cfg)
         .await
         .expect("start zecd against regtest lightwalletd");

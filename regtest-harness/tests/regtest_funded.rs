@@ -105,12 +105,7 @@ async fn regtest_funded_orchard_receive() {
     funder.sync(lwd.grpc_port).expect("funder sync (shielded)");
 
     // 5. zecd against the same lightwalletd; get its Orchard unified address.
-    let cfg = ZecdConfig {
-        lightwalletd_port: lwd.grpc_port,
-        rpc_port: pick_port().expect("pick zecd rpc port"),
-        rpc_user: "user".to_string(),
-        rpc_password: "pass".to_string(),
-    };
+    let cfg = ZecdConfig::new(lwd.grpc_port, pick_port().expect("pick zecd rpc port"));
     let zecd = Zecd::start(&cfg)
         .await
         .expect("start zecd against regtest lightwalletd");

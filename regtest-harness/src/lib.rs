@@ -304,8 +304,15 @@ pub struct Lightwalletd {
 impl Lightwalletd {
     /// Launch `lightwalletd` against the given zebrad RPC port and wait until its gRPC server is up.
     pub async fn start(bin: &Path, zebrad_rpc_port: u16) -> Result<Lightwalletd> {
-        let dir = tempfile::tempdir().context("create lightwalletd dir")?;
         let grpc_port = pick_port()?;
+        Self::start_on(bin, zebrad_rpc_port, grpc_port).await
+    }
+
+    /// Launch on a *fixed* gRPC port. Used by the fault tests to bring lightwalletd back on
+    /// the same address a running zecd is configured for (a fresh data dir re-ingests the
+    /// chain from zebra, which takes seconds on a regtest chain).
+    pub async fn start_on(bin: &Path, zebrad_rpc_port: u16, grpc_port: u16) -> Result<Lightwalletd> {
+        let dir = tempfile::tempdir().context("create lightwalletd dir")?;
         let http_port = pick_port()?;
         let data_dir = dir.path().join("data");
         std::fs::create_dir_all(&data_dir)?;
@@ -345,6 +352,12 @@ impl Lightwalletd {
         };
         lwd.wait_until_ready(&log_file).await?;
         Ok(lwd)
+    }
+
+    /// Kill the process, simulating an upstream outage. The gRPC port is freed (new
+    /// connections are refused) and can be reused by a later [`Lightwalletd::start_on`].
+    pub fn stop(self) {
+        // Drop runs kill + wait.
     }
 
     async fn wait_until_ready(&self, log_file: &Path) -> Result<()> {
@@ -566,10 +579,33 @@ pub struct Zecd {
 
 /// How `zecd` should reach the regtest lightwalletd, and what RPC port/creds to expose.
 pub struct ZecdConfig {
+    /// Primary lightwalletd gRPC port.
     pub lightwalletd_port: u16,
+    /// Optional fallback lightwalletd (for the failover tests); listed after the primary.
+    pub fallback_lightwalletd_port: Option<u16>,
     pub rpc_port: u16,
     pub rpc_user: String,
     pub rpc_password: String,
+    /// `[sync] rebroadcast_secs` - tight by default so outage tests don't idle a minute.
+    pub rebroadcast_secs: u64,
+    /// `[lightwalletd] primary_recheck_secs` - how fast a recovered primary is re-adopted.
+    pub primary_recheck_secs: u64,
+}
+
+impl ZecdConfig {
+    /// Test-friendly defaults: `user`/`pass` credentials, no fallback, 2s rebroadcast,
+    /// 3s primary re-check, fast reconnect backoff (written by [`write_zecd_toml`]).
+    pub fn new(lightwalletd_port: u16, rpc_port: u16) -> ZecdConfig {
+        ZecdConfig {
+            lightwalletd_port,
+            fallback_lightwalletd_port: None,
+            rpc_port,
+            rpc_user: "user".to_string(),
+            rpc_password: "pass".to_string(),
+            rebroadcast_secs: 2,
+            primary_recheck_secs: 3,
+        }
+    }
 }
 
 impl Zecd {
@@ -784,6 +820,11 @@ fn reset_datadir(datadir: &Path, cfg: &ZecdConfig) -> Result<()> {
 }
 
 fn write_zecd_toml(datadir: &Path, cfg: &ZecdConfig) -> Result<()> {
+    let mut servers = format!(r#""127.0.0.1:{}""#, cfg.lightwalletd_port);
+    if let Some(fb) = cfg.fallback_lightwalletd_port {
+        servers.push_str(&format!(r#", "127.0.0.1:{fb}""#));
+    }
+    // Fast reconnect backoff (1..2s) so outage-recovery tests converge quickly.
     let toml = format!(
         r#"network = "regtest"
 datadir = "{datadir}"
@@ -793,9 +834,13 @@ default_wallet = "default"
 dir = "{datadir}/default"
 
 [lightwalletd]
-server = "127.0.0.1:{lwd}"
+servers = [{servers}]
 connection = "direct"
 tls = "no"
+connect_timeout_secs = 5
+reconnect_base_secs = 1
+reconnect_max_secs = 2
+primary_recheck_secs = {primary_recheck}
 
 [rpc]
 bind = "127.0.0.1"
@@ -808,6 +853,7 @@ auto_unlock = true
 
 [sync]
 interval_secs = 2
+rebroadcast_secs = {rebroadcast}
 
 [health]
 enabled = true
@@ -815,10 +861,11 @@ bind = "127.0.0.1"
 port = {health_port}
 "#,
         datadir = datadir.display(),
-        lwd = cfg.lightwalletd_port,
+        primary_recheck = cfg.primary_recheck_secs,
         rpc_port = cfg.rpc_port,
         user = cfg.rpc_user,
         password = cfg.rpc_password,
+        rebroadcast = cfg.rebroadcast_secs,
         health_port = cfg.rpc_port + 1,
     );
     std::fs::write(datadir.join("zecd.toml"), toml)?;
