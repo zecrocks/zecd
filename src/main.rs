@@ -54,6 +54,16 @@ fn init_tracing(log: &config::LogConfig) {
 }
 
 async fn run_daemon(config: AppConfig) -> anyhow::Result<()> {
+    // The example/deploy configs ship with a placeholder RPC password; on mainnet that is
+    // spend authority, so refuse to start until it has been changed.
+    if matches!(config.network, crate::network::ZNetwork::Main)
+        && config.rpc.password.as_deref() == Some("CHANGE-ME")
+    {
+        anyhow::bail!(
+            "[rpc] password is still the example placeholder \"CHANGE-ME\"; \
+             set a real password before running on mainnet"
+        );
+    }
     actor::install_panic_hook();
     let config = Arc::new(config);
     let auth = server::auth::Authenticator::from_config(&config.rpc)?;
