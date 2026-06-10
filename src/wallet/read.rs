@@ -343,6 +343,24 @@ pub fn list_unspent(network: ZNetwork, wallet_dir: &Path) -> anyhow::Result<Vec<
     Ok(out)
 }
 
+/// Every address the wallet has generated, encoded for the network (for
+/// `listreceivedbyaddress` with `include_empty`).
+pub fn all_addresses(network: ZNetwork, wallet_dir: &Path) -> Vec<String> {
+    let Ok(db) = open_read(network, wallet_dir) else {
+        return Vec::new();
+    };
+    let Ok(ids) = db.get_account_ids() else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for account in ids {
+        if let Ok(list) = db.list_addresses(account) {
+            out.extend(list.iter().map(|info| info.address().encode(&network)));
+        }
+    }
+    out
+}
+
 /// Whether `addr` is one of the wallet's own generated addresses (for `getaddressinfo.ismine`).
 pub fn is_mine(network: ZNetwork, wallet_dir: &Path, addr: &str) -> bool {
     let Ok(db) = open_read(network, wallet_dir) else {

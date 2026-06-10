@@ -115,8 +115,9 @@ ready_progress = 0.999           # /readyz is 200 once scan progress reaches thi
 
 **Wallet:** `getnewaddress` (→ Orchard UA), `getbalance`, `getunconfirmedbalance`,
 `getwalletinfo`, `getaddressinfo`, `setlabel`, `getaddressesbylabel`, `listlabels`,
-`listtransactions`, `listsinceblock`, `gettransaction`, `listunspent`, `sendtoaddress`,
-`sendmany`, `walletpassphrase`, `walletlock`, `listwallets`.
+`listtransactions`, `listsinceblock`, `gettransaction`, `listunspent`, `getreceivedbyaddress`,
+`listreceivedbyaddress`, `sendtoaddress`, `sendmany`, `walletpassphrase`, `walletlock`,
+`listwallets`.
 
 **Blockchain:** `getblockchaininfo`, `getblockcount`, `getbestblockhash`, `getblockhash`.
 

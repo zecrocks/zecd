@@ -265,6 +265,107 @@ pub fn listtransactions(
     Ok(Value::Array(entries[start..end].to_vec()))
 }
 
+/// Aggregate wallet-received outputs (non-change, paying one of our accounts) per address,
+/// counting only transactions with at least `minconf` confirmations. Returns
+/// `(amount_zats, confirmations_of_most_recent_counted_tx, txids)` keyed by address.
+/// Conflicted txs report -1 confirmations and so never meet `minconf >= 0`.
+fn received_by_address(
+    txs: &[read::TxRecord],
+    st: &SyncStatus,
+    minconf: i64,
+) -> HashMap<String, (u64, i64, Vec<String>)> {
+    let mut map: HashMap<String, (u64, i64, Vec<String>)> = HashMap::new();
+    for tx in txs {
+        let conf = tx_confirmations(st, tx);
+        if conf < minconf {
+            continue;
+        }
+        for out in &tx.outputs {
+            if out.is_change || out.to_account.is_none() {
+                continue;
+            }
+            let Some(addr) = &out.to_address else { continue };
+            let e = map.entry(addr.clone()).or_insert((0, i64::MAX, Vec::new()));
+            e.0 += out.value.max(0) as u64;
+            e.1 = e.1.min(conf);
+            e.2.push(tx.txid_hex.clone());
+        }
+    }
+    map
+}
+
+/// `getreceivedbyaddress <address> [minconf]` - total received by one of the wallet's own
+/// addresses, in transactions with at least `minconf` confirmations.
+pub fn getreceivedbyaddress(
+    state: &AppState,
+    wallet: Option<&str>,
+    req: &RpcRequest,
+) -> Result<Value, RpcError> {
+    let addr = req
+        .param(0)
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| RpcError::invalid_params("getreceivedbyaddress requires an address"))?;
+    let minconf = req.param(1).and_then(|v| v.as_i64()).unwrap_or(1);
+    let handle = state.registry.get(wallet)?;
+    if !crate::address::validate(&handle.network, addr).is_valid {
+        return Err(RpcError::invalid_address_or_key(format!(
+            "Invalid Zcash address: {addr}"
+        )));
+    }
+    if !read::is_mine(handle.network, &handle.dir, addr) {
+        return Err(RpcError::wallet("Address not found in wallet"));
+    }
+    let st = handle.status();
+    let txs = read::list_transactions(&handle.dir)?;
+    let total = received_by_address(&txs, &st, minconf)
+        .remove(addr)
+        .map(|(amt, _, _)| amt)
+        .unwrap_or(0);
+    Ok(zats_to_value(total))
+}
+
+/// `listreceivedbyaddress [minconf] [include_empty] [include_watchonly] [address_filter]` -
+/// per-address received totals with the txids that paid them. There is no watch-only
+/// support, so `include_watchonly` is accepted and ignored.
+pub fn listreceivedbyaddress(
+    state: &AppState,
+    wallet: Option<&str>,
+    req: &RpcRequest,
+) -> Result<Value, RpcError> {
+    let minconf = req.param(0).and_then(|v| v.as_i64()).unwrap_or(1);
+    let include_empty = req.param(1).and_then(|v| v.as_bool()).unwrap_or(false);
+    let address_filter = req.param(3).and_then(|v| v.as_str()).map(str::to_string);
+    let handle = state.registry.get(wallet)?;
+    let st = handle.status();
+    let txs = read::list_transactions(&handle.dir)?;
+    let label_map = labels::all(&handle.dir).unwrap_or_default();
+    let mut received = received_by_address(&txs, &st, minconf);
+
+    // The address universe: everything that received, plus (with include_empty) every
+    // address the wallet has ever generated.
+    let mut addrs: BTreeSet<String> = received.keys().cloned().collect();
+    if include_empty {
+        addrs.extend(read::all_addresses(handle.network, &handle.dir));
+    }
+
+    let mut out = Vec::new();
+    for addr in addrs {
+        if address_filter.as_deref().is_some_and(|f| f != addr) {
+            continue;
+        }
+        let (amount, conf, txids) = received.remove(&addr).unwrap_or((0, 0, Vec::new()));
+        let conf = if txids.is_empty() { 0 } else { conf };
+        out.push(json!({
+            "address": addr,
+            "amount": zats_to_value(amount),
+            "confirmations": conf,
+            "label": label_map.get(&addr).cloned().unwrap_or_default(),
+            "txids": txids,
+        }));
+    }
+    Ok(Value::Array(out))
+}
+
 /// `listsinceblock [blockhash] [target_confirmations]` - the canonical restart-safe payment
 /// poller: returns every wallet tx in blocks after `blockhash` (plus all unmined txs), and a
 /// `lastblock` hash to feed back into the next call. Reorged-away transactions are rescanned
@@ -651,6 +752,25 @@ mod tests {
         assert_eq!(tx_entries(&t, &labels, 1, Some("alice")).len(), 1);
         assert!(tx_entries(&t, &labels, 1, Some("bob")).is_empty());
         assert_eq!(tx_entries(&t, &labels, 1, None).len(), 1);
+    }
+
+    #[test]
+    fn received_by_address_groups_and_respects_minconf() {
+        let st = status(100);
+        let txs = vec![
+            tx(Some(100), false, None, vec![out(false, true, 100, Some("a"), false)]), // 1 conf
+            tx(Some(91), false, None, vec![out(false, true, 50, Some("a"), false)]),   // 10 conf
+            tx(None, false, None, vec![out(false, true, 7, Some("a"), false)]),        // 0 conf
+            tx(None, true, None, vec![out(false, true, 9, Some("a"), false)]),         // expired: -1 conf
+            tx(Some(100), false, None, vec![out(true, true, 11, Some("a"), true)]),    // change: skipped
+        ];
+        let m = received_by_address(&txs, &st, 1);
+        let (amt, conf, txids) = m.get("a").cloned().unwrap();
+        assert_eq!(amt, 150);
+        assert_eq!(conf, 1); // confirmations of the most recent counted tx
+        assert_eq!(txids.len(), 2);
+        // minconf 0 picks up the unmined receive but still never the expired/change outputs.
+        assert_eq!(received_by_address(&txs, &st, 0).get("a").unwrap().0, 157);
     }
 
     #[test]

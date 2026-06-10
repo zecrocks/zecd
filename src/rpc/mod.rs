@@ -60,6 +60,8 @@ pub async fn dispatch(
         "listsinceblock" => wallet_methods::listsinceblock(state, wallet, req),
         "gettransaction" => wallet_methods::gettransaction(state, wallet, req).await,
         "listunspent" => wallet_methods::listunspent(state, wallet, req),
+        "getreceivedbyaddress" => wallet_methods::getreceivedbyaddress(state, wallet, req),
+        "listreceivedbyaddress" => wallet_methods::listreceivedbyaddress(state, wallet, req),
         "listwallets" => wallet_methods::listwallets(state),
         "setlabel" => wallet_methods::setlabel(state, wallet, req),
 

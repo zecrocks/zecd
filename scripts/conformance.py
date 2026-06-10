@@ -130,6 +130,19 @@ def main() -> int:
     ai = rpc.call("getaddressinfo", addr)
     ck("getaddressinfo.ismine", ai["ismine"] is True)
 
+    print("== received-by-address ==")
+    recv = rpc.call("getreceivedbyaddress", addr)
+    ck("getreceivedbyaddress is Decimal", isinstance(recv, decimal.Decimal), repr(recv))
+    ck("fresh address received 0", recv == 0)
+    lra = rpc.call("listreceivedbyaddress", 1, True)
+    ck("listreceivedbyaddress is list", isinstance(lra, list))
+    ck("fresh address listed with include_empty", any(e.get("address") == addr for e in lra))
+    try:
+        rpc.call("getreceivedbyaddress", "not-an-address")
+        ck("invalid address raises", False)
+    except JSONRPCException as e:
+        ck("invalid address -> code -5", e.code == -5, e.code)
+
     print("== history ==")
     txs = rpc.call("listtransactions", "*", 20)
     ck("listtransactions is list", isinstance(txs, list))
