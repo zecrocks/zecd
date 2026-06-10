@@ -50,6 +50,20 @@ const MIN_SPLIT_OUTPUT_VALUE: u64 = 10_000_000; // 0.1 ZEC
 /// each `primary_recheck`. A recovered primary connects near-instantly; a dead one fails fast.
 const REPROBE_CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
 
+/// Deadlines for RPCs issued on an already-connected channel. The dial timeout covers only
+/// the TCP/TLS connect, so a peer that hangs *after* accepting would otherwise stall the
+/// actor's command loop indefinitely (HTTP/2 keepalive on the channel is the systemic
+/// backstop; these make the critical paths deterministic and snappier).
+///
+/// The post-connect health check may include the one-time subtree-root stream (hundreds of
+/// roots on mainnet), so it gets a generous budget...
+const PREPARE_TIMEOUT: Duration = Duration::from_secs(60);
+/// ...while a primary re-probe runs from the idle loop with a healthy fallback active, so it
+/// must stay tight (roots are already synced by then; this is a cheap liveness ping).
+const REPROBE_PREPARE_TIMEOUT: Duration = Duration::from_secs(10);
+/// Unary calls (broadcast, tip refresh, tx fetch) on the live channel.
+const UNARY_RPC_TIMEOUT: Duration = Duration::from_secs(30);
+
 // NB: the unmined-tx rebroadcast interval is configurable (`[sync] rebroadcast_secs`,
 // default 60) and arrives via `ActorConfig::rebroadcast_interval`. It covers sends whose
 // original broadcast failed (their notes are already locked in the DB until expiry) and
@@ -365,9 +379,13 @@ impl WalletActor {
                     let client = self.client.as_mut().expect("just set");
                     // A reachable-but-unhealthy upstream can still fail here; treat that as this
                     // server failing and fall through to the next candidate.
-                    if let Err(e) =
-                        prepare_client(client, &mut self.db_data, &mut self.subtree_roots_synced)
-                            .await
+                    if let Err(e) = prepare_client(
+                        client,
+                        &mut self.db_data,
+                        &mut self.subtree_roots_synced,
+                        PREPARE_TIMEOUT,
+                    )
+                    .await
                     {
                         warn!("[{}] health check failed on {}: {e}", self.name, describe);
                         self.client = None;
@@ -419,8 +437,13 @@ impl WalletActor {
             // Health check: full subtree-root sync only if not yet done this process, else a
             // cheap `get_latest_block` - so a recovered primary isn't re-streamed all its roots
             // on every recheck (default 60s while on a fallback).
-            if let Err(e) =
-                prepare_client(&mut client, &mut self.db_data, &mut self.subtree_roots_synced).await
+            if let Err(e) = prepare_client(
+                &mut client,
+                &mut self.db_data,
+                &mut self.subtree_roots_synced,
+                REPROBE_PREPARE_TIMEOUT,
+            )
+            .await
             {
                 warn!("[{}] primary re-probe {} not healthy: {e}", self.name, describe);
                 continue;
@@ -445,10 +468,13 @@ impl WalletActor {
                 .client
                 .as_mut()
                 .ok_or_else(|| anyhow!("not connected"))?;
-            client
-                .get_latest_block(service::ChainSpec::default())
-                .await?
-                .into_inner()
+            tokio::time::timeout(
+                UNARY_RPC_TIMEOUT,
+                client.get_latest_block(service::ChainSpec::default()),
+            )
+            .await
+            .map_err(|_| anyhow!("get_latest_block timed out after {UNARY_RPC_TIMEOUT:?}"))??
+            .into_inner()
         };
         let tip = BlockHeight::try_from(block_id.height)
             .map_err(|_| anyhow!("chain tip height out of range"))?;
@@ -568,7 +594,15 @@ impl WalletActor {
         for (txid, data) in txs {
             let Some(client) = self.client.as_mut() else { return };
             let raw = service::RawTransaction { data, ..Default::default() };
-            match client.send_transaction(raw).await {
+            let sent = tokio::time::timeout(UNARY_RPC_TIMEOUT, client.send_transaction(raw))
+                .await
+                .map_err(|_| {
+                    tonic::Status::deadline_exceeded(format!(
+                        "rebroadcast timed out after {UNARY_RPC_TIMEOUT:?}"
+                    ))
+                })
+                .and_then(|r| r);
+            match sent {
                 Ok(r) => {
                     let r = r.into_inner();
                     if r.error_code == 0 {
@@ -744,7 +778,16 @@ impl WalletActor {
         }
         let response = {
             let client = self.client.as_mut().expect("connected above");
-            client.send_transaction(raw).await
+            // Bounded: a peer that hangs mid-broadcast is treated like any other transport
+            // failure - the committed tx rides on the rebroadcast loop either way.
+            tokio::time::timeout(UNARY_RPC_TIMEOUT, client.send_transaction(raw))
+                .await
+                .map_err(|_| {
+                    tonic::Status::deadline_exceeded(format!(
+                        "broadcast timed out after {UNARY_RPC_TIMEOUT:?}"
+                    ))
+                })
+                .and_then(|r| r)
         };
         let response = match response {
             Ok(r) => r.into_inner(),
@@ -802,7 +845,14 @@ impl WalletActor {
                 .client
                 .as_mut()
                 .ok_or_else(|| RpcError::misc("not connected to lightwalletd"))?;
-            client.get_transaction(filter).await
+            tokio::time::timeout(UNARY_RPC_TIMEOUT, client.get_transaction(filter))
+                .await
+                .map_err(|_| {
+                    tonic::Status::deadline_exceeded(format!(
+                        "get_transaction timed out after {UNARY_RPC_TIMEOUT:?}"
+                    ))
+                })
+                .and_then(|r| r)
         };
         let raw = match raw {
             Ok(r) => r.into_inner(),
@@ -938,18 +988,26 @@ impl WalletActor {
 /// (also a health check) and sets `roots_synced`; subsequent calls only do a cheap
 /// `get_latest_block` liveness probe, since the roots already persist in the wallet DB. This
 /// avoids re-streaming every subtree root on each reconnect / primary re-probe.
+///
+/// The whole check is bounded by `budget`: a peer that accepts connections but never answers
+/// (the dial timeout can't see this) must not stall the actor's command loop.
 async fn prepare_client(
     client: &mut CompactTxStreamerClient<Channel>,
     db_data: &mut WriteDb,
     roots_synced: &mut bool,
+    budget: Duration,
 ) -> anyhow::Result<()> {
-    if *roots_synced {
-        client.get_latest_block(service::ChainSpec::default()).await?;
-    } else {
-        engine::update_subtree_roots(client, db_data).await?;
-        *roots_synced = true;
-    }
-    Ok(())
+    tokio::time::timeout(budget, async {
+        if *roots_synced {
+            client.get_latest_block(service::ChainSpec::default()).await?;
+        } else {
+            engine::update_subtree_roots(client, db_data).await?;
+            *roots_synced = true;
+        }
+        Ok::<(), anyhow::Error>(())
+    })
+    .await
+    .map_err(|_| anyhow!("upstream health check timed out after {budget:?}"))?
 }
 
 /// Sleep until the unlock deadline, or forever when there is none. Used as a `select!` arm so an
