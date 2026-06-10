@@ -128,6 +128,14 @@ def main() -> int:
        isinstance(addr, str) and addr.startswith(("u1", "utest1", "uregtest1")))
     va = rpc.call("validateaddress", addr)
     ck("validateaddress.isvalid", va["isvalid"] is True)
+    ck("validateaddress echoes address", va.get("address") == addr)
+    # Bitcoin Core returns only the verdict + error details for invalid input.
+    bad = rpc.call("validateaddress", "not-an-address")
+    ck("invalid validateaddress.isvalid False", bad["isvalid"] is False)
+    ck("invalid validateaddress has no address echo",
+       "address" not in bad and "scriptPubKey" not in bad and "isscript" not in bad)
+    ck("invalid validateaddress has error fields",
+       "error" in bad and "error_locations" in bad)
     ai = rpc.call("getaddressinfo", addr)
     ck("getaddressinfo.ismine", ai["ismine"] is True)
 

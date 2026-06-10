@@ -13,11 +13,22 @@ pub fn validateaddress(state: &AppState, req: &RpcRequest) -> Result<Value, RpcE
         .and_then(|v| v.as_str())
         .ok_or_else(|| RpcError::invalid_params("validateaddress requires an address"))?;
     let v = crate::address::validate(&state.config.network, addr);
+    // Bitcoin Core returns only the verdict plus error details for invalid input; the
+    // address echo and script fields appear only when the address is valid.
+    if !v.is_valid {
+        return Ok(json!({
+            "isvalid": false,
+            "error_locations": [],
+            "error": "Invalid or unsupported address format",
+        }));
+    }
     Ok(json!({
-        "isvalid": v.is_valid,
+        "isvalid": true,
         "address": addr,
-        "scriptPubKey": "",
-        "isscript": false,
+        // Real scriptPubKey for transparent addresses; shielded addresses have no
+        // script form, so the field stays empty.
+        "scriptPubKey": v.script_pub_key.unwrap_or_default(),
+        "isscript": v.is_script,
         "iswitness": false,
         // Extension field: whether this address can receive Orchard funds.
         "isvalid_orchard": v.is_orchard,
