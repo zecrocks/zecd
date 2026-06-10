@@ -310,9 +310,21 @@ async fn regtest_funded_orchard_receive() {
 
     // ---- Phase 3: send during an upstream outage (the committed-send contract) ----
 
-    // The change from the Phase-2 send is trusted and has 3 confirmations, so it is
-    // spendable. Kill lightwalletd, then send: the wallet must commit and return the txid
-    // even though the broadcast can't reach anyone - recovery is the rebroadcast loop's job.
+    // Give the Phase-2 change a comfortable confirmation margin first: trusted change needs
+    // 3 confirmations and the Phase-2 send may have landed in *any* of the 3 just-mined
+    // blocks (mempool/template timing), so without this buffer Phase 3's spendable balance
+    // is a race.
+    let tip = zecd.block_count().await.expect("getblockcount");
+    zebrad
+        .generate_blocks(4)
+        .await
+        .expect("mature the Phase-2 change");
+    zecd.wait_until_synced(tip + 4, FUND_TIMEOUT)
+        .await
+        .expect("scan the change-maturity blocks");
+
+    // Kill lightwalletd, then send: the wallet must commit and return the txid even though
+    // the broadcast can't reach anyone - recovery is the rebroadcast loop's job.
     let lwd_port = lwd.grpc_port;
     lwd.stop();
     let txid_outage = zecd
