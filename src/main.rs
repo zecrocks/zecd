@@ -54,6 +54,16 @@ fn init_tracing(log: &config::LogConfig) {
 }
 
 async fn run_daemon(config: AppConfig) -> anyhow::Result<()> {
+    // The example/deploy configs ship with a placeholder RPC password; on mainnet that is
+    // spend authority, so refuse to start until it has been changed.
+    if matches!(config.network, crate::network::ZNetwork::Main)
+        && config.rpc.password.as_deref() == Some("CHANGE-ME")
+    {
+        anyhow::bail!(
+            "[rpc] password is still the example placeholder \"CHANGE-ME\"; \
+             set a real password before running on mainnet"
+        );
+    }
     actor::install_panic_hook();
     let config = Arc::new(config);
     let auth = server::auth::Authenticator::from_config(&config.rpc)?;
@@ -129,5 +139,18 @@ async fn run_daemon(config: AppConfig) -> anyhow::Result<()> {
     // Liveness/readiness probes on a separate port (best-effort; non-fatal if it can't bind).
     tokio::spawn(health::run(state.clone()));
 
-    server::run(state).await
+    let result = server::run(state).await;
+
+    // bitcoind removes its generated .cookie on clean shutdown so a stale credential can't
+    // linger; do the same. Only applies when cookie auth was in use (no user/password set).
+    if config.rpc.user.is_none() || config.rpc.password.is_none() {
+        if let Some(cookie) = &config.rpc.cookiefile {
+            match std::fs::remove_file(cookie) {
+                Ok(()) => info!("removed cookie file {}", cookie.display()),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => warn!("could not remove cookie file {}: {e}", cookie.display()),
+            }
+        }
+    }
+    result
 }

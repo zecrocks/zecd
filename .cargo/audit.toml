@@ -1,0 +1,9 @@
+# cargo-audit configuration (used by the CI `audit` job).
+
+[advisories]
+# RUSTSEC-2026-0009: `time` <0.3.47 DoS via stack exhaustion when *parsing* untrusted
+# datetime strings. We cannot upgrade: zcash_client_backend 0.23.0 pins `time-core = "=0.1.2"`,
+# which forces time 0.3.37 (0.3.47 needs time-core 0.1.8). Our dependency path uses `time`
+# for timestamp arithmetic only - no parsing of untrusted input - so exposure is nil.
+# Drop this ignore when the librustzcash line is next upgraded.
+ignore = ["RUSTSEC-2026-0009"]

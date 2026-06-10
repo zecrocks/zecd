@@ -36,3 +36,20 @@ jobs:
 
       - name: Clippy
         run: cargo clippy --all-targets -- -D warnings
+
+  # Dependency vulnerability scan against the RustSec advisory DB. Warnings (unmaintained
+  # crates) don't fail the job; vulnerabilities do.
+  audit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install cargo-audit
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-audit
+
+      # Ignored advisories (with rationale) live in .cargo/audit.toml so local runs of
+      # `cargo audit` apply the same documented exceptions.
+      - name: Audit dependencies
+        run: cargo audit

@@ -121,6 +121,32 @@ async fn regtest_end_to_end() {
         "expected insufficient-funds (-6), got: {err}"
     );
 
+    // The walletpassphrase gate. A locked wallet refuses to send with -13 - the seed check
+    // runs before input selection, so this needs no funds. Unlocking (the passphrase string
+    // is not the credential; the daemon decrypts with its age identity) restores the -6.
+    zecd.call("walletlock", json!([])).await.expect("walletlock");
+    let err = zecd
+        .call("sendtoaddress", json!([addr, 1.0]))
+        .await
+        .expect_err("a locked wallet must refuse to send");
+    assert_eq!(
+        err.code(),
+        Some(-13),
+        "expected unlock-needed (-13), got: {err}"
+    );
+    zecd.call("walletpassphrase", json!(["any", 60]))
+        .await
+        .expect("walletpassphrase re-unlocks from the age identity");
+    let err = zecd
+        .call("sendtoaddress", json!([addr, 1.0]))
+        .await
+        .expect_err("still no funds after unlocking");
+    assert_eq!(
+        err.code(),
+        Some(-6),
+        "after unlock the send fails on funds again (-6), got: {err}"
+    );
+
     // Mining more blocks advances zecd's view by exactly that many.
     zebrad.generate_blocks(5).await.expect("mine 5 more");
     zecd.wait_until_synced(height0 + 5, SYNC_TIMEOUT)

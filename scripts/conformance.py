@@ -84,7 +84,7 @@ def main() -> int:
     for f in ("chain", "blocks", "headers", "bestblockhash", "verificationprogress",
               "initialblockdownload", "pruned", "difficulty", "warnings"):
         ck(f"has {f}", f in bci, type(bci.get(f)).__name__)
-    ck("chain is main/test", bci["chain"] in ("main", "test"))
+    ck("chain is main/test/regtest", bci["chain"] in ("main", "test", "regtest"))
     ck("blocks is int", isinstance(bci["blocks"], int))
     ck("bestblockhash 64-hex", isinstance(bci["bestblockhash"], str) and len(bci["bestblockhash"]) == 64)
 
@@ -124,11 +124,25 @@ def main() -> int:
 
     print("== addresses ==")
     addr = rpc.call("getnewaddress", "conformance")
-    ck("getnewaddress unified", isinstance(addr, str) and addr.startswith(("u1", "utest1")))
+    ck("getnewaddress unified",
+       isinstance(addr, str) and addr.startswith(("u1", "utest1", "uregtest1")))
     va = rpc.call("validateaddress", addr)
     ck("validateaddress.isvalid", va["isvalid"] is True)
     ai = rpc.call("getaddressinfo", addr)
     ck("getaddressinfo.ismine", ai["ismine"] is True)
+
+    print("== received-by-address ==")
+    recv = rpc.call("getreceivedbyaddress", addr)
+    ck("getreceivedbyaddress is Decimal", isinstance(recv, decimal.Decimal), repr(recv))
+    ck("fresh address received 0", recv == 0)
+    lra = rpc.call("listreceivedbyaddress", 1, True)
+    ck("listreceivedbyaddress is list", isinstance(lra, list))
+    ck("fresh address listed with include_empty", any(e.get("address") == addr for e in lra))
+    try:
+        rpc.call("getreceivedbyaddress", "not-an-address")
+        ck("invalid address raises", False)
+    except JSONRPCException as e:
+        ck("invalid address -> code -5", e.code == -5, e.code)
 
     print("== history ==")
     txs = rpc.call("listtransactions", "*", 20)
@@ -144,6 +158,21 @@ def main() -> int:
         ck("gettransaction has details list", isinstance(gt.get("details"), list))
         ck("gettransaction hex hex-string", isinstance(gt.get("hex"), str) and len(gt["hex"]) % 2 == 0)
 
+    print("== listsinceblock (restart-safe poller) ==")
+    lsb = rpc.call("listsinceblock")
+    ck("has transactions list", isinstance(lsb.get("transactions"), list))
+    ck("has removed list", isinstance(lsb.get("removed"), list))
+    ck("lastblock 64-hex", isinstance(lsb.get("lastblock"), str) and len(lsb["lastblock"]) == 64)
+    ck("lastblock == getbestblockhash", lsb["lastblock"] == best)
+    again = rpc.call("listsinceblock", lsb["lastblock"])
+    ck("since lastblock reports only unconfirmed",
+       all(t["confirmations"] < 1 for t in again["transactions"]))
+    try:
+        rpc.call("listsinceblock", "00" * 32)
+        ck("unknown block raises", False)
+    except JSONRPCException as e:
+        ck("unknown block -> code -5", e.code == -5, e.code)
+
     print("== error handling (JSONRPCException with Bitcoin Core codes) ==")
     try:
         rpc.call("gettransaction", "00" * 32)
@@ -155,6 +184,32 @@ def main() -> int:
         ck("unknown method raises", False)
     except JSONRPCException as e:
         ck("unknown method -> code -32601", e.code == -32601, e.code)
+    try:
+        rpc.call("setlabel", "not-an-address", "x")
+        ck("setlabel invalid address raises", False)
+    except JSONRPCException as e:
+        ck("setlabel invalid address -> code -5", e.code == -5, e.code)
+    try:
+        rpc.call("getaddressesbylabel", "no-such-label-xyz")
+        ck("unknown label raises", False)
+    except JSONRPCException as e:
+        ck("unknown label -> code -11", e.code == -11, e.code)
+    try:
+        rpc.call("listtransactions", "*", -1)
+        ck("negative count raises", False)
+    except JSONRPCException as e:
+        ck("negative count -> code -8", e.code == -8, e.code)
+    try:
+        rpc.call("getnewaddress", "", "bech32")
+        ck("unknown address type raises", False)
+    except JSONRPCException as e:
+        ck("unknown address type -> code -5", e.code == -5, e.code)
+    try:
+        # Amount as a string (zecd accepts both); the reject fires before any send logic.
+        rpc.call("sendtoaddress", addr, "0.1", "", "", True)
+        ck("subtractfeefromamount raises", False)
+    except JSONRPCException as e:
+        ck("subtractfeefromamount -> code -8", e.code == -8, e.code)
     try:
         AuthServiceProxy(args.url, args.user, "wrong-password").call("getblockcount")
         ck("bad auth raises", False)

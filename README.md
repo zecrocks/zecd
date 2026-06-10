@@ -115,8 +115,9 @@ ready_progress = 0.999           # /readyz is 200 once scan progress reaches thi
 
 **Wallet:** `getnewaddress` (→ Orchard UA), `getbalance`, `getunconfirmedbalance`,
 `getwalletinfo`, `getaddressinfo`, `setlabel`, `getaddressesbylabel`, `listlabels`,
-`listtransactions`, `gettransaction`, `listunspent`, `sendtoaddress`, `sendmany`,
-`walletpassphrase`, `walletlock`, `listwallets`.
+`listtransactions`, `listsinceblock`, `gettransaction`, `listunspent`, `getreceivedbyaddress`,
+`listreceivedbyaddress`, `sendtoaddress`, `sendmany`, `walletpassphrase`, `walletlock`,
+`listwallets`.
 
 **Blockchain:** `getblockchaininfo`, `getblockcount`, `getbestblockhash`, `getblockhash`.
 
@@ -297,11 +298,45 @@ addresses/labels, history (`listtransactions`/`gettransaction` incl. `hex`), `li
 the `walletlock`/`walletpassphrase` gate, and real Orchard `sendtoaddress`/`sendmany`
 broadcasts (receiving a note and spending it across two wallets).
 
+## Operations
+
+`docs/OPERATIONS.md` is the production runbook: what to back up (mnemonic, `keys.toml`,
+age identity, birthday height), restore procedures, monitoring/alerting, send semantics
+under failure, upgrades, and the mainnet checklist.
+
 ## Security
 
-- The wallet seed is stored as an `age`-encrypted mnemonic in `<wallet>/keys.toml` and decrypted
-  into memory only when needed (held as a zeroizing secret). Keep your age identity file safe.
-- Do not expose the RPC port to untrusted networks. Bind to `127.0.0.1` and/or front it with TLS.
+**Key custody / threat model.** The wallet seed is stored as an `age`-encrypted mnemonic in
+`<wallet>/keys.toml`; the decryption key is the age identity file (`[keys] age_identity`,
+default `<datadir>/identity.txt`). With the default `auto_unlock = true` the seed is decrypted
+into memory at startup (held as a zeroizing secret) so sends need no `walletpassphrase`. Be
+clear about what this protects:
+
+- With `identity.txt` in the same datadir as `keys.toml` (the default layout), the encryption
+  protects against leakage of `keys.toml` *alone* - e.g. a copy or backup of just the wallet
+  subdirectory. It does **not** protect against compromise of the host: anyone who can read
+  the datadir has both files and therefore the seed.
+- For mainnet, store the identity outside the datadir (secrets manager, separate mount, or the
+  `ZECD_AGE_IDENTITY` env var) and consider `auto_unlock = false`, so the seed is only
+  decrypted after an explicit `walletpassphrase`.
+
+**`walletpassphrase` differs from Bitcoin Core.** The passphrase argument is **not verified** -
+the credential is the age identity file on the server, not the passphrase string.
+`walletpassphrase <anything> <timeout>` succeeds whenever the daemon can decrypt the seed with
+the configured identity, and the timeout is accepted but not enforced (the seed stays in memory
+until `walletlock` or shutdown). Anyone with RPC access can therefore unlock the wallet:
+**treat RPC credentials as spend authority.**
+
+**RPC surface.**
+
+- Exactly one RPC credential is supported: `rpcuser`/`rpcpassword`, or the generated cookie file
+  (`<datadir>/.cookie`, mode 0600) when they are unset. There is no `rpcauth`-style multi-user
+  list or per-method whitelist.
+- Do not expose the RPC port to untrusted networks. Bind to `127.0.0.1` and/or front it with TLS
+  or a reverse proxy. On mainnet, zecd refuses to start while the password is the example
+  placeholder (`CHANGE-ME`).
+- The health port (`[health]`) is unauthenticated by design and exposes sync status only; keep it
+  off the public internet anyway.
 
 ## License
 

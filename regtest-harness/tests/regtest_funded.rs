@@ -11,7 +11,14 @@
 //! hand the wallet a wrong note-commitment anchor and the shield/send proofs would be invalid).
 //!
 //! Skips cleanly unless `ZEBRAD_BIN`, `LIGHTWALLETD_BIN` and `DEVTOOL_BIN` are all set (see
-//! README.md). Phase 1 deliverable: prove funded receive works end to end.
+//! README.md).
+//!
+//! Phase 1: funded receive (funder → zecd, balance + history). Phase 2: zecd *spends* - the
+//! walletlock/-13/walletpassphrase gate, a real `sendtoaddress` back to the funder with
+//! `gettransaction` shape checks through confirmation, and the payment-poller methods
+//! (`listsinceblock` cursor loop, `getreceivedbyaddress`/`listreceivedbyaddress`). Finally
+//! `scripts/conformance.py` runs against the live funded daemon, putting its full
+//! Bitcoin-Core wire-format suite under CI.
 
 use std::time::{Duration, Instant};
 
@@ -166,4 +173,160 @@ async fn regtest_funded_orchard_receive() {
             .any(|t| t.get("category").and_then(|c| c.as_str()) == Some("receive")),
         "expected a receive in zecd history: {txs:?}"
     );
+
+    // ---- Phase 2: zecd spends ----
+
+    // The poller methods credit the funded receive. getreceivedbyaddress: exactly the 1 ZEC
+    // sent to our UA; listreceivedbyaddress lists the UA with the contributing txid.
+    let recv = zecd
+        .call("getreceivedbyaddress", json!([zecd_ua]))
+        .await
+        .expect("getreceivedbyaddress");
+    assert_eq!(
+        recv.as_f64(),
+        Some(1.0),
+        "the 1-ZEC funding receive is credited to the UA, got {recv}"
+    );
+    let lra = zecd
+        .call("listreceivedbyaddress", json!([1, false]))
+        .await
+        .expect("listreceivedbyaddress");
+    assert!(
+        lra.as_array().expect("array").iter().any(|e| {
+            e["address"] == json!(zecd_ua.as_str())
+                && e["txids"].as_array().is_some_and(|t| !t.is_empty())
+        }),
+        "listreceivedbyaddress lists the funded UA with its txid: {lra}"
+    );
+
+    // Capture the listsinceblock cursor before the send, exactly as a payment poller would.
+    let lsb = zecd
+        .call("listsinceblock", json!([]))
+        .await
+        .expect("listsinceblock");
+    let cursor = lsb["lastblock"].as_str().expect("lastblock hash").to_string();
+    assert_eq!(cursor.len(), 64, "lastblock is a block hash: {lsb}");
+
+    // The walletpassphrase gate around a real spend: locked → -13, unlocked → it goes through.
+    let funder_ua = funder.unified_address().expect("funder unified address");
+    zecd.call("walletlock", json!([])).await.expect("walletlock");
+    let err = zecd
+        .call("sendtoaddress", json!([funder_ua, 0.4]))
+        .await
+        .expect_err("a locked wallet must refuse to send");
+    assert_eq!(err.code(), Some(-13), "expected unlock-needed (-13): {err}");
+    zecd.call("walletpassphrase", json!(["any", 600]))
+        .await
+        .expect("walletpassphrase re-unlocks from the age identity");
+
+    // The send-success path: a real Orchard spend back to the funder.
+    let txid = zecd
+        .call("sendtoaddress", json!([funder_ua, 0.4]))
+        .await
+        .expect("sendtoaddress succeeds with spendable funds");
+    let txid = txid.as_str().expect("txid is a string").to_string();
+    assert_eq!(txid.len(), 64, "txid is display hex");
+
+    // gettransaction immediately: unconfirmed send shape (amount excludes the fee).
+    let gt = zecd
+        .call("gettransaction", json!([txid]))
+        .await
+        .expect("gettransaction on our own send");
+    assert_eq!(
+        gt["amount"].as_f64(),
+        Some(-0.4),
+        "gettransaction.amount is the negated payment, fee excluded: {gt}"
+    );
+    assert!(
+        gt["fee"].as_f64().is_some_and(|f| f < 0.0),
+        "fee is present and negative: {gt}"
+    );
+    assert_eq!(gt["confirmations"].as_i64(), Some(0), "not yet mined: {gt}");
+    assert!(
+        gt["hex"].as_str().is_some_and(|h| !h.is_empty()),
+        "raw hex is stored for our own send: {gt}"
+    );
+    assert!(
+        gt["details"].as_array().expect("details").iter().any(|d| {
+            d["category"] == "send" && d["address"] == json!(funder_ua.as_str())
+        }),
+        "details carry the send to the funder: {gt}"
+    );
+
+    // Mine it in and let zecd scan; the send confirms.
+    let tip = zecd.block_count().await.expect("getblockcount");
+    zebrad.generate_blocks(3).await.expect("confirm the send");
+    zecd.wait_until_synced(tip + 3, FUND_TIMEOUT)
+        .await
+        .expect("zecd scans the confirming blocks");
+    let gt = zecd
+        .call("gettransaction", json!([txid]))
+        .await
+        .expect("gettransaction after mining");
+    assert!(
+        gt["confirmations"].as_i64().is_some_and(|c| c >= 1),
+        "the send is confirmed: {gt}"
+    );
+    assert!(gt["blockheight"].is_u64(), "mined height is reported: {gt}");
+
+    // The poller loop closes: since the pre-send cursor, the send appears; since the fresh
+    // cursor, nothing confirmed is left to report.
+    let lsb = zecd
+        .call("listsinceblock", json!([cursor]))
+        .await
+        .expect("listsinceblock since the pre-send cursor");
+    assert!(
+        lsb["transactions"].as_array().expect("transactions").iter().any(|t| {
+            t["txid"] == json!(txid.as_str()) && t["category"] == "send"
+        }),
+        "the send is reported since the pre-send cursor: {lsb}"
+    );
+    let cursor2 = lsb["lastblock"].as_str().expect("new lastblock").to_string();
+    let lsb2 = zecd
+        .call("listsinceblock", json!([cursor2]))
+        .await
+        .expect("listsinceblock since the fresh cursor");
+    assert!(
+        lsb2["transactions"]
+            .as_array()
+            .expect("transactions")
+            .iter()
+            .all(|t| t["confirmations"].as_i64().unwrap_or(0) < 1),
+        "nothing confirmed is re-reported past the fresh cursor: {lsb2}"
+    );
+
+    // ---- conformance.py against the live, funded daemon ----
+    run_conformance(cfg.rpc_port, &cfg.rpc_user, &cfg.rpc_password);
+}
+
+/// Run `scripts/conformance.py` (the python-bitcoinrpc-equivalent wire-format suite) against
+/// the regtest daemon. Skips with a notice if `python3` isn't available so local runs without
+/// it don't fail confusingly; CI always has it.
+fn run_conformance(rpc_port: u16, user: &str, password: &str) {
+    let script = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("harness lives inside the zecd repo")
+        .join("scripts/conformance.py");
+    let out = std::process::Command::new("python3")
+        .arg(&script)
+        .args([
+            "--url",
+            &format!("http://127.0.0.1:{rpc_port}/"),
+            "--user",
+            user,
+            "--password",
+            password,
+        ])
+        .output();
+    match out {
+        Err(e) => eprintln!("SKIP conformance.py: python3 unavailable ({e})"),
+        Ok(out) => {
+            println!("{}", String::from_utf8_lossy(&out.stdout));
+            assert!(
+                out.status.success(),
+                "conformance.py reported failures:\n{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
+    }
 }

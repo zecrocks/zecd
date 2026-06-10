@@ -270,6 +270,23 @@ pub fn block_info_at(wallet_dir: &Path, height: u32) -> anyhow::Result<Option<(S
     Ok(row.map(|(hash, time)| (txid_display(&hash), time)))
 }
 
+/// The height of a wallet-scanned block, looked up by its display-hex hash (for
+/// `listsinceblock`). Hashes are stored in internal byte order, displayed reversed.
+pub fn block_height_by_hash(wallet_dir: &Path, display_hash: &str) -> anyhow::Result<Option<u32>> {
+    let Some(internal) = txid_internal(display_hash) else {
+        return Ok(None);
+    };
+    let conn = open_conn(wallet_dir)?;
+    let h = conn
+        .query_row(
+            "SELECT height FROM blocks WHERE hash = :hash",
+            named_params! {":hash": internal},
+            |r| r.get::<_, u32>(0),
+        )
+        .optional()?;
+    Ok(h)
+}
+
 /// The median-time-past at `height`: the median of the (up to) 11 scanned block times ending
 /// at `height` inclusive - the consensus MTP rule, for `getblockchaininfo.mediantime`.
 pub fn median_time_past(wallet_dir: &Path, height: u32) -> anyhow::Result<Option<i64>> {
@@ -324,6 +341,24 @@ pub fn list_unspent(network: ZNetwork, wallet_dir: &Path) -> anyhow::Result<Vec<
         }
     }
     Ok(out)
+}
+
+/// Every address the wallet has generated, encoded for the network (for
+/// `listreceivedbyaddress` with `include_empty`).
+pub fn all_addresses(network: ZNetwork, wallet_dir: &Path) -> Vec<String> {
+    let Ok(db) = open_read(network, wallet_dir) else {
+        return Vec::new();
+    };
+    let Ok(ids) = db.get_account_ids() else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for account in ids {
+        if let Ok(list) = db.list_addresses(account) {
+            out.extend(list.iter().map(|info| info.address().encode(&network)));
+        }
+    }
+    out
 }
 
 /// Whether `addr` is one of the wallet's own generated addresses (for `getaddressinfo.ismine`).
