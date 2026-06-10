@@ -170,6 +170,13 @@ pub fn listtransactions(
 
     let mut entries: Vec<Value> = Vec::new();
     for tx in &txs {
+        // An expired unmined tx can never confirm; report it as conflicted (confirmations
+        // -1, like Bitcoin Core) so pollers terminate instead of waiting forever.
+        let confirmations = if tx.expired_unmined {
+            -1
+        } else {
+            st.confirmations(tx.mined_height)
+        };
         for out in &tx.outputs {
             if out.is_change {
                 continue;
@@ -192,7 +199,7 @@ pub fn listtransactions(
                 "amount": signed_zats_to_value(amount),
                 "label": label,
                 "vout": out.output_index,
-                "confirmations": st.confirmations(tx.mined_height),
+                "confirmations": confirmations,
                 "txid": tx.txid_hex,
                 "time": tx.block_time.unwrap_or(0),
                 "timereceived": tx.block_time.unwrap_or(0),
@@ -200,6 +207,8 @@ pub fn listtransactions(
                 "trusted": tx.mined_height.is_some(),
             });
             if category == "send" {
+                // Bitcoin Core carries `abandoned` on send entries only.
+                entry["abandoned"] = json!(tx.expired_unmined);
                 if let Some(fee) = tx.fee_paid {
                     entry["fee"] = signed_zats_to_value(-(fee as i64));
                 }
@@ -252,6 +261,7 @@ pub async fn gettransaction(
             "label": out.to_address.as_ref().and_then(|a| label_map.get(a).cloned()).unwrap_or_default(),
         });
         if category == "send" {
+            d["abandoned"] = json!(rec.expired_unmined);
             if let Some(fee) = rec.fee_paid {
                 d["fee"] = signed_zats_to_value(-(fee as i64));
             }
@@ -280,9 +290,15 @@ pub async fn gettransaction(
     // `fee_paid` is only known when the wallet funded the tx; for pure receives it is
     // None and the delta is already the received amount. A self-transfer nets to 0.
     let amount = rec.account_balance_delta + rec.fee_paid.unwrap_or(0) as i64;
+    // Expired unmined txs can never confirm: report -1 (conflicted) so pollers terminate.
+    let confirmations = if rec.expired_unmined {
+        -1
+    } else {
+        st.confirmations(rec.mined_height)
+    };
     let mut obj = json!({
         "amount": signed_zats_to_value(amount),
-        "confirmations": st.confirmations(rec.mined_height),
+        "confirmations": confirmations,
         "txid": rec.txid_hex,
         "time": rec.block_time.unwrap_or(0),
         "timereceived": rec.block_time.unwrap_or(0),
