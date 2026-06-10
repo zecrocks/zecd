@@ -37,6 +37,16 @@ pub async fn getnewaddress(
     req: &RpcRequest,
 ) -> Result<Value, RpcError> {
     let label = opt_str(req, 0).filter(|s| !s.is_empty());
+    // Param 1 (address_type): every zecd address is an Orchard unified address. Accept the
+    // matching names but reject Bitcoin types, so a caller asking for e.g. "bech32" isn't
+    // silently handed a different kind of address than it asked for.
+    if let Some(t) = opt_str(req, 1).filter(|s| !s.is_empty()) {
+        if !t.eq_ignore_ascii_case("orchard") && !t.eq_ignore_ascii_case("unified") {
+            return Err(RpcError::invalid_address_or_key(format!(
+                "Unknown address type '{t}'"
+            )));
+        }
+    }
     let handle = state.registry.get(wallet)?.clone();
     let addr = handle.get_new_address(label).await?;
     Ok(Value::String(addr))
@@ -116,6 +126,11 @@ pub fn setlabel(
         .ok_or_else(|| RpcError::invalid_params("setlabel requires an address"))?;
     let label = opt_str(req, 1).unwrap_or_default();
     let handle = state.registry.get(wallet)?;
+    if !crate::address::validate(&handle.network, addr).is_valid {
+        return Err(RpcError::invalid_address_or_key(format!(
+            "Invalid Zcash address: {addr}"
+        )));
+    }
     labels::set_label(&handle.dir, addr, &label)
         .map_err(|e| RpcError::database(e.to_string()))?;
     Ok(Value::Null)
@@ -133,6 +148,13 @@ pub fn getaddressesbylabel(
     let handle = state.registry.get(wallet)?;
     let addrs =
         labels::addresses_for_label(&handle.dir, label).map_err(|e| RpcError::database(e.to_string()))?;
+    if addrs.is_empty() {
+        // Bitcoin Core: -11 RPC_WALLET_INVALID_LABEL_NAME for a label with no addresses.
+        return Err(RpcError::new(
+            crate::error::codes::RPC_WALLET_INVALID_LABEL_NAME,
+            format!("No addresses with label {label}"),
+        ));
+    }
     let mut map = Map::new();
     for a in addrs {
         map.insert(a, json!({ "purpose": "receive" }));
@@ -245,8 +267,22 @@ pub fn listtransactions(
         .and_then(|v| v.as_str())
         .filter(|s| *s != "*")
         .map(str::to_string);
-    let count = req.param(1).and_then(|v| v.as_u64()).unwrap_or(10) as usize;
-    let skip = req.param(2).and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+    let count = match req.param(1).filter(|v| !v.is_null()) {
+        None => 10,
+        Some(v) => match v.as_i64() {
+            Some(n) if n >= 0 => n as usize,
+            Some(_) => return Err(RpcError::invalid_parameter("Negative count")),
+            None => return Err(RpcError::type_error("count must be a number")),
+        },
+    };
+    let skip = match req.param(2).filter(|v| !v.is_null()) {
+        None => 0,
+        Some(v) => match v.as_i64() {
+            Some(n) if n >= 0 => n as usize,
+            Some(_) => return Err(RpcError::invalid_parameter("Negative from")),
+            None => return Err(RpcError::type_error("from must be a number")),
+        },
+    };
     let handle = state.registry.get(wallet)?;
     let st = handle.status();
     let txs = read::list_transactions(&handle.dir)?;

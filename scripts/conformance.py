@@ -184,6 +184,32 @@ def main() -> int:
     except JSONRPCException as e:
         ck("unknown method -> code -32601", e.code == -32601, e.code)
     try:
+        rpc.call("setlabel", "not-an-address", "x")
+        ck("setlabel invalid address raises", False)
+    except JSONRPCException as e:
+        ck("setlabel invalid address -> code -5", e.code == -5, e.code)
+    try:
+        rpc.call("getaddressesbylabel", "no-such-label-xyz")
+        ck("unknown label raises", False)
+    except JSONRPCException as e:
+        ck("unknown label -> code -11", e.code == -11, e.code)
+    try:
+        rpc.call("listtransactions", "*", -1)
+        ck("negative count raises", False)
+    except JSONRPCException as e:
+        ck("negative count -> code -8", e.code == -8, e.code)
+    try:
+        rpc.call("getnewaddress", "", "bech32")
+        ck("unknown address type raises", False)
+    except JSONRPCException as e:
+        ck("unknown address type -> code -5", e.code == -5, e.code)
+    try:
+        # Amount as a string (zecd accepts both); the reject fires before any send logic.
+        rpc.call("sendtoaddress", addr, "0.1", "", "", True)
+        ck("subtractfeefromamount raises", False)
+    except JSONRPCException as e:
+        ck("subtractfeefromamount -> code -8", e.code == -8, e.code)
+    try:
         AuthServiceProxy(args.url, args.user, "wrong-password").call("getblockcount")
         ck("bad auth raises", False)
     except JSONRPCException as e:
