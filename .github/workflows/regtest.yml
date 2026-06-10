@@ -3,20 +3,44 @@ name: Regtest E2E
 # Live tier: brings up the Zcash-Foundation regtest stack - zebra (Regtest) + lightwalletd - and
 # drives the real zecd binary over its JSON-RPC (see regtest-harness/). It also builds
 # zcash-devtool (regtest-enabled) as a funding wallet, used to shield a mined transparent coinbase
-# into Orchard and fund zecd (the funded e2e). No zingo-infra: the harness mines via zebra's own
-# getblocktemplate/submitblock. zebrad + lightwalletd are extracted from their official Docker
-# images; everything builds on stable Rust against current zebra crates.
+# into Orchard and fund zecd (the funded e2e). No zingo-infra: the harness mines via zebrad's
+# Regtest-only `generate` RPC, so it has no zebra crate dependency and works against any zebrad
+# release. zebrad + lightwalletd are extracted from their official Docker images.
+#
+# Runs on PRs and pushes to main against the pinned zebra image, and weekly (or on dispatch with
+# an image tag of your choice) against zfnd/zebra:latest as an early-warning canary for upstream
+# zebra changes.
 
 on:
   workflow_dispatch:
+    inputs:
+      zebra-image:
+        description: "zfnd/zebra image tag to test against (e.g. 5.0.0, latest)"
+        required: false
+        default: ""
+  schedule:
+    # Weekly canary against zfnd/zebra:latest (Mondays 06:17 UTC; an off-peak odd minute).
+    - cron: "17 6 * * 1"
+  push:
+    branches: [main, master]
+    paths:
+      - "regtest-harness/**"
+      - "src/**"
+      - ".github/workflows/regtest.yml"
   pull_request:
     paths:
       - "regtest-harness/**"
       - "src/**"
       - ".github/workflows/regtest.yml"
 
+# The pinned zebra image used by PR/push runs; the schedule runs `latest` instead, and a manual
+# dispatch can name any tag. Bumping zebra = changing this one value (the harness drives zebrad
+# purely over JSON-RPC, so nothing else needs to move in lockstep).
+env:
+  ZEBRA_IMAGE_PINNED: "5.0.0"
+
 concurrency:
-  group: regtest-${{ github.ref }}
+  group: regtest-${{ github.event_name }}-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
@@ -70,10 +94,21 @@ jobs:
         if: steps.devtool-bin.outputs.cache-hit != 'true'
         run: cargo build --release --manifest-path zcash-devtool/Cargo.toml --bin zcash-devtool
 
-      # Extract zebrad + lightwalletd from their official Docker images. zebra MUST match the
-      # zebra-rpc/zebra-chain tag the harness builds against (regtest-harness/Cargo.toml: v5.0.0)
-      # so the block we assemble from getblocktemplate matches what this zebrad's submitblock
-      # accepts. Keep these two in lockstep. The harness reads ZEBRAD_BIN/LIGHTWALLETD_BIN.
+      # Pick the zebra image: the pinned tag for PR/push runs, `latest` for the weekly canary,
+      # or whatever a manual dispatch asked for.
+      - name: Select zebra image tag
+        run: |
+          case "${{ github.event_name }}" in
+            schedule) tag="latest" ;;
+            workflow_dispatch) tag="${{ inputs.zebra-image }}"; tag="${tag:-$ZEBRA_IMAGE_PINNED}" ;;
+            *) tag="$ZEBRA_IMAGE_PINNED" ;;
+          esac
+          echo "Testing against zfnd/zebra:$tag"
+          echo "ZEBRA_TAG=$tag" >> "$GITHUB_ENV"
+
+      # Extract zebrad + lightwalletd from their official Docker images. The harness drives
+      # zebrad over JSON-RPC only (mining via the Regtest-only `generate` RPC), so any zebrad
+      # release works. The harness reads ZEBRAD_BIN/LIGHTWALLETD_BIN.
       - name: Provision zebrad + lightwalletd from images
         run: |
           set -euo pipefail
@@ -89,7 +124,7 @@ jobs:
             chmod +x "$out"
             echo "$name -> $out"; file -b "$out" || true
           }
-          extract zfnd/zebra:5.0.0 zebrad
+          extract "zfnd/zebra:$ZEBRA_TAG" zebrad
           extract electriccoinco/lightwalletd:v0.4.19 lightwalletd
           echo "ZEBRAD_BIN=$RUNNER_TEMP/bin/zebrad" >> "$GITHUB_ENV"
           echo "LIGHTWALLETD_BIN=$RUNNER_TEMP/bin/lightwalletd" >> "$GITHUB_ENV"
@@ -101,5 +136,6 @@ jobs:
           ZECD_BIN: ${{ github.workspace }}/target/release/zecd
           DEVTOOL_BIN: ${{ github.workspace }}/zcash-devtool/target/release/zcash-devtool
           # ZEBRAD_BIN / LIGHTWALLETD_BIN are exported by the provisioning step above.
-        # --locked: build against the committed lock. Single-threaded: the harness binds fixed ports.
+        # --locked: build against the committed lock. Single-threaded: two zebrad+lightwalletd
+        # stacks plus Orchard proving would contend badly on a 2-core runner.
         run: cargo test --locked --manifest-path regtest-harness/Cargo.toml -- --nocapture --test-threads=1
