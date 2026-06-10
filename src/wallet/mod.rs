@@ -60,10 +60,13 @@ pub struct SyncStatus {
 }
 
 impl SyncStatus {
-    /// Confirmations for a transaction mined at `mined_height` given the current tip.
+    /// Confirmations for a transaction mined at `mined_height`, anchored to the wallet's
+    /// fully-scanned height - the same height `getblockcount` reports - so the classic
+    /// client computation `getblockcount() - tx.blockheight + 1` agrees with this field.
+    /// (Anchoring to `chain_tip` instead made the two disagree whenever scanning lagged.)
     pub fn confirmations(&self, mined_height: Option<u32>) -> i64 {
-        match (self.chain_tip, mined_height) {
-            (Some(tip), Some(h)) if tip >= h => (tip - h + 1) as i64,
+        match (self.fully_scanned, mined_height) {
+            (Some(scanned), Some(h)) if scanned >= h => (scanned - h + 1) as i64,
             _ => 0,
         }
     }
