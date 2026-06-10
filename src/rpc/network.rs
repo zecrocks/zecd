@@ -14,11 +14,23 @@ fn connected(state: &AppState) -> bool {
         .unwrap_or(false)
 }
 
+/// zecd's own version in Bitcoin Core's numeric encoding (major*10000 + minor*100 + patch),
+/// derived from Cargo.toml so it can't drift from the crate version.
+fn version_number() -> u64 {
+    let mut parts = env!("CARGO_PKG_VERSION")
+        .split('.')
+        .map(|p| p.parse::<u64>().unwrap_or(0));
+    let major = parts.next().unwrap_or(0);
+    let minor = parts.next().unwrap_or(0);
+    let patch = parts.next().unwrap_or(0);
+    major * 10000 + minor * 100 + patch
+}
+
 pub fn getnetworkinfo(state: &AppState) -> Result<Value, RpcError> {
     let up = connected(state);
     Ok(json!({
-        "version": 240000,
-        "subversion": "/zecd:0.1.0/",
+        "version": version_number(),
+        "subversion": format!("/zecd:{}/", env!("CARGO_PKG_VERSION")),
         "protocolversion": 170100,
         "localservices": "0000000000000000",
         "localservicesnames": [],
@@ -61,4 +73,15 @@ pub fn getpeerinfo(state: &AppState) -> Result<Value, RpcError> {
 
 pub fn ping() -> Result<Value, RpcError> {
     Ok(Value::Null)
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn version_number_encodes_cargo_version() {
+        let v = super::version_number();
+        assert!(v > 0, "version must encode to a nonzero number");
+        // 0.1.0 -> 100, 1.2.3 -> 10203; sanity-check the arithmetic shape.
+        assert_eq!(v % 100, env!("CARGO_PKG_VERSION").split('.').nth(2).unwrap().parse::<u64>().unwrap());
+    }
 }
