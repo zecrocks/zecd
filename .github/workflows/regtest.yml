@@ -135,7 +135,17 @@ jobs:
         env:
           ZECD_BIN: ${{ github.workspace }}/target/release/zecd
           DEVTOOL_BIN: ${{ github.workspace }}/zcash-devtool/target/release/zcash-devtool
+          # Capture zebrad's logs so a startup failure is diagnosable from the CI run.
+          ZEBRAD_STDERR: ${{ runner.temp }}/zebrad.log
           # ZEBRAD_BIN / LIGHTWALLETD_BIN are exported by the provisioning step above.
         # --locked: build against the committed lock. Single-threaded: two zebrad+lightwalletd
         # stacks plus Orchard proving would contend badly on a 2-core runner.
         run: cargo test --locked --manifest-path regtest-harness/Cargo.toml -- --nocapture --test-threads=1
+
+      - name: Dump diagnostics on failure
+        if: failure()
+        run: |
+          echo "== disk =="
+          df -h / "$RUNNER_TEMP" || true
+          echo "== zebrad log (last 200 lines) =="
+          tail -n 200 "$RUNNER_TEMP/zebrad.log" 2>/dev/null || echo "(no zebrad log was written)"

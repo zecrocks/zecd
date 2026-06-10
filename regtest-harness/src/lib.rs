@@ -109,7 +109,7 @@ impl Zebrad {
         )
         .context("write zebrad.toml")?;
         let child = spawn_zebrad(bin, &config_path)?;
-        let zebrad = Zebrad {
+        let mut zebrad = Zebrad {
             child,
             rpc_port,
             net_port,
@@ -163,22 +163,29 @@ impl Zebrad {
         format!("http://127.0.0.1:{}/", self.rpc_port)
     }
 
-    async fn wait_until_rpc_up(&self) -> Result<()> {
+    async fn wait_until_rpc_up(&mut self) -> Result<()> {
         let deadline = Instant::now() + Duration::from_secs(120);
+        let mut last_err = anyhow!("no getblocktemplate attempt completed");
         loop {
+            // A dead zebrad can never become mineable - fail immediately with the exit status
+            // instead of burning the whole timeout on connection-refused.
+            if let Ok(Some(status)) = self.child.try_wait() {
+                bail!(
+                    "zebrad exited during startup ({status}); \
+                     set ZEBRAD_STDERR=<file> to capture its logs"
+                );
+            }
             // `getblocktemplate` succeeds only once zebra's RPC is up *and* it considers itself
             // synced to the chain tip (mempool active) - which is exactly the precondition for
             // `generate_blocks`. On a fresh node, and especially under the load of several test
             // nodes running at once, this readiness lags RPC availability by a moment, so we poll
             // the template endpoint itself rather than just `getblockchaininfo`.
-            if zebra_rpc_call(&self.rpc_url(), "getblocktemplate", json!([]))
-                .await
-                .is_ok()
-            {
-                return Ok(());
+            match zebra_rpc_call(&self.rpc_url(), "getblocktemplate", json!([])).await {
+                Ok(_) => return Ok(()),
+                Err(e) => last_err = e,
             }
             if Instant::now() >= deadline {
-                bail!("zebrad did not become mineable within 120s");
+                bail!("zebrad did not become mineable within 120s; last error: {last_err:#}");
             }
             tokio::time::sleep(Duration::from_millis(500)).await;
         }
