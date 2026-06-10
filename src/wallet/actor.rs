@@ -39,7 +39,9 @@ use crate::sync::engine;
 use crate::wallet::keys::{self, SeedKeeper};
 use crate::wallet::open::{self, WriteDb};
 use crate::wallet::read;
-use crate::wallet::{labels, make_handle, store, ConnState, SyncStatus, WalletCommand, WalletHandle};
+use crate::wallet::{
+    labels, make_handle, store, ConnState, RawTx, SyncStatus, WalletCommand, WalletHandle,
+};
 
 /// Note-management defaults for change splitting (match zcash-devtool's send defaults).
 const TARGET_NOTE_COUNT: usize = 4;
@@ -641,6 +643,10 @@ impl WalletActor {
                 let res = self.do_get_raw_tx(txid).await;
                 let _ = reply.send(res);
             }
+            WalletCommand::Broadcast { data, reply } => {
+                let res = self.do_broadcast(data).await;
+                let _ = reply.send(res);
+            }
             WalletCommand::Unlock { passphrase, timeout_secs, reply } => {
                 let res = self.do_unlock(passphrase, timeout_secs);
                 let _ = reply.send(res);
@@ -824,12 +830,12 @@ impl WalletActor {
     /// Return raw transaction bytes: prefer the locally-stored copy (present for txs we
     /// created or have enhanced), otherwise fetch the full tx from lightwalletd. The
     /// `TxFilter` hash is the txid's internal bytes (per zcash-devtool's enhance).
-    async fn do_get_raw_tx(&mut self, txid: TxId) -> Result<Option<Vec<u8>>, RpcError> {
+    async fn do_get_raw_tx(&mut self, txid: TxId) -> Result<Option<RawTx>, RpcError> {
         if let Ok(Some(tx)) = self.db_data.get_transaction(txid) {
             let mut buf = Vec::new();
             tx.write(&mut buf)
                 .map_err(|e| RpcError::misc(format!("failed to serialize transaction: {e}")))?;
-            return Ok(Some(buf));
+            return Ok(Some(RawTx { data: buf, mined_height: None }));
         }
         if self.client.is_none() {
             self.connect()
@@ -863,7 +869,60 @@ impl WalletActor {
                 return Err(RpcError::misc(format!("get_transaction RPC failed: {e}")));
             }
         };
-        Ok(if raw.data.is_empty() { None } else { Some(raw.data) })
+        Ok(if raw.data.is_empty() {
+            None
+        } else {
+            // lightwalletd reports the mined height in `height`; mempool transactions carry
+            // 0 or -1 (encoded as u64), neither of which is a real mined height here.
+            let mined_height = u32::try_from(raw.height).ok().filter(|h| *h > 0);
+            Some(RawTx { data: raw.data, mined_height })
+        })
+    }
+
+    /// Broadcast caller-supplied raw transaction bytes (`sendrawtransaction`). Unlike
+    /// `do_send`, the transaction is not in our wallet DB, so there is no rebroadcast loop
+    /// backing it - every failure (transport or rejection) surfaces as an error so the
+    /// caller knows the network never accepted the tx.
+    async fn do_broadcast(&mut self, data: Vec<u8>) -> Result<(), RpcError> {
+        if self.client.is_none() {
+            self.connect()
+                .await
+                .map_err(|e| RpcError::misc(format!("connect to lightwalletd: {e}")))?;
+        }
+        let raw = service::RawTransaction { data, ..Default::default() };
+        let response = {
+            let client = self
+                .client
+                .as_mut()
+                .ok_or_else(|| RpcError::misc("not connected to lightwalletd"))?;
+            tokio::time::timeout(UNARY_RPC_TIMEOUT, client.send_transaction(raw))
+                .await
+                .map_err(|_| {
+                    tonic::Status::deadline_exceeded(format!(
+                        "broadcast timed out after {UNARY_RPC_TIMEOUT:?}"
+                    ))
+                })
+                .and_then(|r| r)
+        };
+        let response = match response {
+            Ok(r) => r.into_inner(),
+            Err(e) => {
+                // Transport/deadline failure: drop the client so the next op reconnects/fails over.
+                self.client = None;
+                self.update_status();
+                return Err(RpcError::misc(format!("send_transaction RPC failed: {e}")));
+            }
+        };
+        if response.error_code != 0 {
+            return Err(RpcError::new(
+                codes::RPC_VERIFY_REJECTED,
+                format!(
+                    "transaction rejected (code {}): {}",
+                    response.error_code, response.error_message
+                ),
+            ));
+        }
+        Ok(())
     }
 
     /// `walletpassphrase`: decrypt the seed with `passphrase` and hold it unlocked until

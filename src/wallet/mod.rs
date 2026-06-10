@@ -79,6 +79,15 @@ impl SyncStatus {
     }
 }
 
+/// Raw transaction bytes plus the mined height reported by lightwalletd (when the tx was
+/// fetched remotely; `None` for unmined txs and for locally-stored copies, whose height the
+/// caller already knows from the wallet DB).
+#[derive(Clone, Debug)]
+pub struct RawTx {
+    pub data: Vec<u8>,
+    pub mined_height: Option<u32>,
+}
+
 /// Commands sent from RPC handlers to the per-wallet actor (the sole DB writer).
 pub enum WalletCommand {
     GetNewAddress {
@@ -92,7 +101,12 @@ pub enum WalletCommand {
     /// Fetch the raw bytes of a transaction (from the wallet, else lightwalletd).
     GetRawTx {
         txid: TxId,
-        reply: oneshot::Sender<Result<Option<Vec<u8>>, RpcError>>,
+        reply: oneshot::Sender<Result<Option<RawTx>, RpcError>>,
+    },
+    /// Broadcast caller-supplied raw transaction bytes (for `sendrawtransaction`).
+    Broadcast {
+        data: Vec<u8>,
+        reply: oneshot::Sender<Result<(), RpcError>>,
     },
     /// Unlock an encrypted wallet for `timeout_secs` (Bitcoin Core's `walletpassphrase`):
     /// decrypt the seed with `passphrase`, hold it, and auto-relock after the timeout.
@@ -158,8 +172,12 @@ impl WalletHandle {
         self.dispatch(|reply| WalletCommand::Send { request, reply }).await
     }
 
-    pub async fn get_raw_tx(&self, txid: TxId) -> Result<Option<Vec<u8>>, RpcError> {
+    pub async fn get_raw_tx(&self, txid: TxId) -> Result<Option<RawTx>, RpcError> {
         self.dispatch(|reply| WalletCommand::GetRawTx { txid, reply }).await
+    }
+
+    pub async fn broadcast(&self, data: Vec<u8>) -> Result<(), RpcError> {
+        self.dispatch(|reply| WalletCommand::Broadcast { data, reply }).await
     }
 
     pub async fn unlock(&self, passphrase: Passphrase, timeout_secs: i64) -> Result<(), RpcError> {

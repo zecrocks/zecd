@@ -65,6 +65,29 @@ pub fn getunconfirmedbalance(state: &AppState, wallet: Option<&str>) -> Result<V
     Ok(zats_to_value(info.pending))
 }
 
+/// `getbalances` - the modern (Bitcoin Core 0.19+) balance triple. There is no watch-only
+/// support, so the `watchonly` object is omitted (as Bitcoin Core does for wallets without
+/// watch-only funds).
+pub fn getbalances(state: &AppState, wallet: Option<&str>) -> Result<Value, RpcError> {
+    let handle = state.registry.get(wallet)?;
+    let info = read::balance(handle.network, &handle.dir)?;
+    let mut obj = json!({
+        "mine": {
+            "trusted": zats_to_value(info.total_spendable),
+            "untrusted_pending": zats_to_value(info.pending),
+            "immature": zats_to_value(info.immature),
+        },
+    });
+    // `lastprocessedblock` (Bitcoin Core 26+): the block the balances are anchored to -
+    // for zecd that is the fully-scanned height, the same anchor as `getblockcount`.
+    if let Some(h) = handle.status().fully_scanned {
+        if let Ok(Some((hash, _))) = read::block_info_at(&handle.dir, h) {
+            obj["lastprocessedblock"] = json!({ "hash": hash, "height": h });
+        }
+    }
+    Ok(obj)
+}
+
 pub fn getwalletinfo(state: &AppState, wallet: Option<&str>) -> Result<Value, RpcError> {
     let handle = state.registry.get(wallet)?;
     let info = read::balance(handle.network, &handle.dir)?;
@@ -409,6 +432,94 @@ pub fn listreceivedbyaddress(
     Ok(Value::Array(out))
 }
 
+/// Fold per-address received totals into per-label totals (addresses without an explicit
+/// label fall under the default label `""`, like Bitcoin Core's address book). The
+/// confirmation count for a label is the minimum across its addresses - Bitcoin Core's
+/// `ListReceived` aggregation.
+fn received_by_label(
+    received: &HashMap<String, (u64, i64, Vec<String>)>,
+    label_map: &HashMap<String, String>,
+) -> std::collections::BTreeMap<String, (u64, i64)> {
+    let mut by_label: std::collections::BTreeMap<String, (u64, i64)> = Default::default();
+    for (addr, (amount, conf, _)) in received {
+        let label = label_map.get(addr).cloned().unwrap_or_default();
+        let e = by_label.entry(label).or_insert((0, i64::MAX));
+        e.0 += amount;
+        e.1 = e.1.min(*conf);
+    }
+    by_label
+}
+
+/// `getreceivedbylabel <label> [minconf]` - total received across the addresses carrying
+/// `label`. An unknown label is `-4` like Bitcoin Core's `GetReceived`.
+pub fn getreceivedbylabel(
+    state: &AppState,
+    wallet: Option<&str>,
+    req: &RpcRequest,
+) -> Result<Value, RpcError> {
+    let label = req
+        .param(0)
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| RpcError::invalid_params("getreceivedbylabel requires a label"))?;
+    let minconf = req.param(1).and_then(|v| v.as_i64()).unwrap_or(1);
+    let handle = state.registry.get(wallet)?;
+    let addrs = labels::addresses_for_label(&handle.dir, label)
+        .map_err(|e| RpcError::database(e.to_string()))?;
+    if addrs.is_empty() {
+        return Err(RpcError::wallet("Label not found in wallet"));
+    }
+    let st = handle.status();
+    let txs = read::list_transactions(&handle.dir)?;
+    let received = received_by_address(&txs, &st, minconf);
+    let total: u64 = addrs
+        .iter()
+        .filter_map(|a| received.get(a).map(|(amt, _, _)| *amt))
+        .sum();
+    Ok(zats_to_value(total))
+}
+
+/// `listreceivedbylabel [minconf] [include_empty] [include_watchonly]` - `listreceivedbyaddress`
+/// aggregated per label. `include_watchonly` is accepted and ignored (no watch-only support).
+pub fn listreceivedbylabel(
+    state: &AppState,
+    wallet: Option<&str>,
+    req: &RpcRequest,
+) -> Result<Value, RpcError> {
+    let minconf = req.param(0).and_then(|v| v.as_i64()).unwrap_or(1);
+    let include_empty = req.param(1).and_then(|v| v.as_bool()).unwrap_or(false);
+    let handle = state.registry.get(wallet)?;
+    let st = handle.status();
+    let txs = read::list_transactions(&handle.dir)?;
+    let label_map = labels::all(&handle.dir).unwrap_or_default();
+    let received = received_by_address(&txs, &st, minconf);
+    let mut by_label = received_by_label(&received, &label_map);
+
+    if include_empty {
+        // Every known label, plus the default label "" if any wallet address is unlabelled.
+        for label in label_map.values() {
+            by_label.entry(label.clone()).or_insert((0, i64::MAX));
+        }
+        if read::all_addresses(handle.network, &handle.dir)
+            .iter()
+            .any(|a| !label_map.contains_key(a))
+        {
+            by_label.entry(String::new()).or_insert((0, i64::MAX));
+        }
+    }
+
+    let out: Vec<Value> = by_label
+        .into_iter()
+        .map(|(label, (amount, conf))| {
+            json!({
+                "amount": zats_to_value(amount),
+                "confirmations": if conf == i64::MAX { 0 } else { conf },
+                "label": label,
+            })
+        })
+        .collect();
+    Ok(Value::Array(out))
+}
+
 /// `listsinceblock [blockhash] [target_confirmations]` - the canonical restart-safe payment
 /// poller: returns every wallet tx in blocks after `blockhash` (plus all unmined txs), and a
 /// `lastblock` hash to feed back into the next call. Reorged-away transactions are rescanned
@@ -524,7 +635,7 @@ pub async fn gettransaction(
                 .await
                 .ok()
                 .flatten()
-                .map(hex::encode)
+                .map(|raw| hex::encode(raw.data))
                 .unwrap_or_default(),
             None => String::new(),
         },
@@ -878,6 +989,25 @@ mod tests {
         assert_eq!(txids.len(), 2);
         // minconf 0 picks up the unmined receive but still never the expired/change outputs.
         assert_eq!(received_by_address(&txs, &st, 0).get("a").unwrap().0, 157);
+    }
+
+    #[test]
+    fn received_by_label_groups_and_defaults_to_empty_label() {
+        let st = status(100);
+        let txs = vec![
+            tx(Some(91), false, None, vec![out(false, true, 100, Some("a1"), false)]),
+            tx(Some(95), false, None, vec![out(false, true, 50, Some("a2"), false)]),
+            tx(Some(100), false, None, vec![out(false, true, 7, Some("b"), false)]),
+        ];
+        let mut labels = HashMap::new();
+        labels.insert("a1".to_string(), "alice".to_string());
+        labels.insert("a2".to_string(), "alice".to_string());
+        // "b" is unlabelled -> default label "".
+        let received = received_by_address(&txs, &st, 1);
+        let by_label = received_by_label(&received, &labels);
+        // Amounts sum per label; confirmations are the minimum across the label's addresses.
+        assert_eq!(by_label.get("alice"), Some(&(150, 6)));
+        assert_eq!(by_label.get(""), Some(&(7, 1)));
     }
 
     #[test]

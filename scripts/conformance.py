@@ -122,6 +122,13 @@ def main() -> int:
     # 8-dp string form, no float drift
     ck("getbalance 8-dp serialisable", str(bal) == format(bal, "f") or bal == bal)
 
+    print("== getbalances ==")
+    gb = rpc.call("getbalances")
+    mine = gb.get("mine", {})
+    for f in ("trusted", "untrusted_pending", "immature"):
+        ck(f"mine.{f} is Decimal", isinstance(mine.get(f), decimal.Decimal), repr(mine.get(f)))
+    ck("mine.trusted == getbalance", mine.get("trusted") == bal)
+
     print("== addresses ==")
     addr = rpc.call("getnewaddress", "conformance")
     ck("getnewaddress unified",
@@ -152,6 +159,22 @@ def main() -> int:
     except JSONRPCException as e:
         ck("invalid address -> code -5", e.code == -5, e.code)
 
+    print("== received-by-label ==")
+    # `getnewaddress "conformance"` above created the label.
+    rbl = rpc.call("getreceivedbylabel", "conformance")
+    ck("getreceivedbylabel is Decimal", isinstance(rbl, decimal.Decimal), repr(rbl))
+    lrl = rpc.call("listreceivedbylabel", 1, True)
+    ck("listreceivedbylabel is list", isinstance(lrl, list))
+    ck("label listed with include_empty", any(e.get("label") == "conformance" for e in lrl))
+    if lrl:
+        for f in ("amount", "confirmations", "label"):
+            ck(f"label entry has {f}", f in lrl[0])
+    try:
+        rpc.call("getreceivedbylabel", "no-such-label-xyz")
+        ck("getreceivedbylabel unknown raises", False)
+    except JSONRPCException as e:
+        ck("getreceivedbylabel unknown -> code -4", e.code == -4, e.code)
+
     print("== history ==")
     txs = rpc.call("listtransactions", "*", 20)
     ck("listtransactions is list", isinstance(txs, list))
@@ -165,6 +188,19 @@ def main() -> int:
         ck("gettransaction amount Decimal", isinstance(gt["amount"], decimal.Decimal))
         ck("gettransaction has details list", isinstance(gt.get("details"), list))
         ck("gettransaction hex hex-string", isinstance(gt.get("hex"), str) and len(gt["hex"]) % 2 == 0)
+
+        print("== getrawtransaction ==")
+        raw = rpc.call("getrawtransaction", t["txid"])
+        ck("getrawtransaction returns hex", isinstance(raw, str) and len(raw) % 2 == 0 and raw)
+        if gt.get("hex"):
+            ck("getrawtransaction matches gettransaction.hex", raw == gt["hex"])
+        v = rpc.call("getrawtransaction", t["txid"], 1)
+        ck("verbose is object", isinstance(v, dict))
+        for f in ("hex", "txid", "size", "version", "locktime", "vin", "vout"):
+            ck(f"verbose has {f}", f in v)
+        ck("verbose txid echoes", v.get("txid") == t["txid"])
+        ck("verbose hex matches", v.get("hex") == raw)
+        ck("verbose vin/vout are lists", isinstance(v.get("vin"), list) and isinstance(v.get("vout"), list))
 
     print("== listsinceblock (restart-safe poller) ==")
     lsb = rpc.call("listsinceblock")
@@ -218,6 +254,21 @@ def main() -> int:
         ck("subtractfeefromamount raises", False)
     except JSONRPCException as e:
         ck("subtractfeefromamount -> code -8", e.code == -8, e.code)
+    try:
+        rpc.call("getrawtransaction", "00" * 32)
+        ck("getrawtransaction unknown raises", False)
+    except JSONRPCException as e:
+        ck("getrawtransaction unknown -> code -5", e.code == -5, e.code)
+    try:
+        rpc.call("getrawtransaction", "not-a-txid")
+        ck("getrawtransaction bad txid raises", False)
+    except JSONRPCException as e:
+        ck("getrawtransaction bad txid -> code -8", e.code == -8, e.code)
+    try:
+        rpc.call("sendrawtransaction", "00ff")
+        ck("sendrawtransaction undecodable raises", False)
+    except JSONRPCException as e:
+        ck("sendrawtransaction undecodable -> code -22", e.code == -22, e.code)
     try:
         AuthServiceProxy(args.url, args.user, "wrong-password").call("getblockcount")
         ck("bad auth raises", False)
