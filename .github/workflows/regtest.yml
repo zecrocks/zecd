@@ -94,6 +94,8 @@ jobs:
           echo "ZEBRAD_BIN=$RUNNER_TEMP/bin/zebrad" >> "$GITHUB_ENV"
           echo "LIGHTWALLETD_BIN=$RUNNER_TEMP/bin/lightwalletd" >> "$GITHUB_ENV"
 
+      # The funded test also runs scripts/conformance.py (python3, stdlib-only) against the
+      # live daemon, so the full Bitcoin-Core wire-format suite is exercised here in CI.
       - name: Run regtest end-to-end harness
         env:
           ZECD_BIN: ${{ github.workspace }}/target/release/zecd

@@ -84,7 +84,7 @@ def main() -> int:
     for f in ("chain", "blocks", "headers", "bestblockhash", "verificationprogress",
               "initialblockdownload", "pruned", "difficulty", "warnings"):
         ck(f"has {f}", f in bci, type(bci.get(f)).__name__)
-    ck("chain is main/test", bci["chain"] in ("main", "test"))
+    ck("chain is main/test/regtest", bci["chain"] in ("main", "test", "regtest"))
     ck("blocks is int", isinstance(bci["blocks"], int))
     ck("bestblockhash 64-hex", isinstance(bci["bestblockhash"], str) and len(bci["bestblockhash"]) == 64)
 
@@ -124,7 +124,8 @@ def main() -> int:
 
     print("== addresses ==")
     addr = rpc.call("getnewaddress", "conformance")
-    ck("getnewaddress unified", isinstance(addr, str) and addr.startswith(("u1", "utest1")))
+    ck("getnewaddress unified",
+       isinstance(addr, str) and addr.startswith(("u1", "utest1", "uregtest1")))
     va = rpc.call("validateaddress", addr)
     ck("validateaddress.isvalid", va["isvalid"] is True)
     ai = rpc.call("getaddressinfo", addr)
