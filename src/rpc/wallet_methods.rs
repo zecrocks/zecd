@@ -161,6 +161,13 @@ pub fn listtransactions(
     wallet: Option<&str>,
     req: &RpcRequest,
 ) -> Result<Value, RpcError> {
+    // Param 0 is the label filter: "*" (or omitted/null) means all transactions; any other
+    // string returns only entries carrying exactly that label (Bitcoin Core semantics).
+    let label_filter = req
+        .param(0)
+        .and_then(|v| v.as_str())
+        .filter(|s| *s != "*")
+        .map(str::to_string);
     let count = req.param(1).and_then(|v| v.as_u64()).unwrap_or(10) as usize;
     let skip = req.param(2).and_then(|v| v.as_u64()).unwrap_or(0) as usize;
     let handle = state.registry.get(wallet)?;
@@ -193,6 +200,9 @@ pub fn listtransactions(
                 .as_ref()
                 .and_then(|a| label_map.get(a).cloned())
                 .unwrap_or_default();
+            if label_filter.as_deref().is_some_and(|f| f != label) {
+                continue;
+            }
             let mut entry = json!({
                 "address": address,
                 "category": category,
