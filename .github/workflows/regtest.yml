@@ -36,8 +36,12 @@ on:
 # The pinned zebra image used by PR/push runs; the schedule runs `latest` instead, and a manual
 # dispatch can name any tag. Bumping zebra = changing this one value (the harness drives zebrad
 # purely over JSON-RPC, so nothing else needs to move in lockstep).
+#
+# IMPORTANT: no workflow env var may start with `ZEBRA_` - zebrad parses ZEBRA_*-prefixed
+# environment variables as config overrides and exits with "unknown field" on ones it doesn't
+# recognise. (The harness also scrubs ZEBRA_* before spawning zebrad, as a second line of defence.)
 env:
-  ZEBRA_IMAGE_PINNED: "5.0.0"
+  ZEBRAD_IMAGE_PINNED: "5.0.0"
 
 concurrency:
   group: regtest-${{ github.event_name }}-${{ github.ref }}
@@ -100,11 +104,11 @@ jobs:
         run: |
           case "${{ github.event_name }}" in
             schedule) tag="latest" ;;
-            workflow_dispatch) tag="${{ inputs.zebra-image }}"; tag="${tag:-$ZEBRA_IMAGE_PINNED}" ;;
-            *) tag="$ZEBRA_IMAGE_PINNED" ;;
+            workflow_dispatch) tag="${{ inputs.zebra-image }}"; tag="${tag:-$ZEBRAD_IMAGE_PINNED}" ;;
+            *) tag="$ZEBRAD_IMAGE_PINNED" ;;
           esac
           echo "Testing against zfnd/zebra:$tag"
-          echo "ZEBRA_TAG=$tag" >> "$GITHUB_ENV"
+          echo "ZEBRAD_IMAGE_TAG=$tag" >> "$GITHUB_ENV"
 
       # Extract zebrad + lightwalletd from their official Docker images. The harness drives
       # zebrad over JSON-RPC only (mining via the Regtest-only `generate` RPC), so any zebrad
@@ -124,7 +128,7 @@ jobs:
             chmod +x "$out"
             echo "$name -> $out"; file -b "$out" || true
           }
-          extract "zfnd/zebra:$ZEBRA_TAG" zebrad
+          extract "zfnd/zebra:$ZEBRAD_IMAGE_TAG" zebrad
           extract electriccoinco/lightwalletd:v0.4.19 lightwalletd
           echo "ZEBRAD_BIN=$RUNNER_TEMP/bin/zebrad" >> "$GITHUB_ENV"
           echo "LIGHTWALLETD_BIN=$RUNNER_TEMP/bin/lightwalletd" >> "$GITHUB_ENV"

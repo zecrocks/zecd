@@ -75,8 +75,17 @@ fn spawn_zebrad(bin: &Path, config_path: &Path) -> Result<Child> {
         }
         None => (Stdio::null(), Stdio::null()),
     };
-    Command::new(bin)
-        .args(["--config", config_path.to_str().unwrap(), "start"])
+    let mut cmd = Command::new(bin);
+    // zebrad reads `ZEBRA_*` environment variables as config overrides (config-rs), and an
+    // unrelated variable like `ZEBRA_TAG` in a CI job makes it exit at startup with
+    // "Configuration error: unknown field". Scrub the prefix so the harness only ever
+    // configures zebrad through the config file it writes.
+    for (key, _) in std::env::vars_os() {
+        if key.to_string_lossy().starts_with("ZEBRA_") {
+            cmd.env_remove(key);
+        }
+    }
+    cmd.args(["--config", config_path.to_str().unwrap(), "start"])
         .stdout(out)
         .stderr(err)
         .spawn()
