@@ -49,9 +49,7 @@ jobs:
         with:
           tool: cargo-audit
 
-      # RUSTSEC-2026-0009 (`time` 0.3.37, DoS via stack exhaustion when parsing untrusted
-      # time strings - zecd never parses external time input): the fix (time >=0.3.47)
-      # requires time-core 0.1.8, but zcash_client_backend 0.23.0 pins time-core =0.1.2.
-      # Drop the ignore once librustzcash ships a release that unpins it.
+      # Ignored advisories (with rationale) live in .cargo/audit.toml so local runs of
+      # `cargo audit` apply the same documented exceptions.
       - name: Audit dependencies
-        run: cargo audit --ignore RUSTSEC-2026-0009
+        run: cargo audit
