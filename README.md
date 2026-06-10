@@ -274,6 +274,12 @@ Edges to be aware of (all consequences of being a shielded light wallet):
 - **`listunspent`** lists each unspent Orchard *note* as one entry. Its `txid`/`vout` identify the
   shielded action that created the note (there is no transparent `scriptPubKey`), and `address` is
   empty.
+- **Reorgs invalidate `listsinceblock` cursors.** zecd keeps only the current chain's scanned
+  block hashes (a light wallet has no stale-header index), so if the block your cursor points at
+  is reorged away - or is below the wallet birthday - `listsinceblock <hash>` returns
+  `-5 Block not found` instead of bitcoind's walk back to the fork point. Treat `-5` as "cursor
+  invalid": re-baseline with a parameterless `listsinceblock` and rely on txid-based dedupe
+  (idempotent payment processing is required for reorg safety anyway).
 
 ## Testing
 
