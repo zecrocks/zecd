@@ -66,3 +66,5 @@ zip321 = "0.8"
 
 [dev-dependencies]
 tempfile = "3"
+# Frontier bookkeeping for the fabricated-chain reorg test (matches librustzcash's version).
+incrementalmerkletree = "0.8"
