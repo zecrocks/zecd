@@ -2,10 +2,11 @@
 //!
 //! Orchestrates the **Zcash Foundation** regtest stack directly - `zebrad` (Regtest, PoW
 //! disabled) + `lightwalletd` - and drives the real `zecd` daemon over its Bitcoin-Core-style
-//! JSON-RPC. There is intentionally **no `zingo-infra`/`zcash_local_net` dependency**: we mine the
-//! way zebra's own tests do (`getblocktemplate` → [`proposal_block_from_template`] → `submitblock`,
-//! which needs no proof-of-work on Regtest), so the harness tracks *current* zebra and builds on
-//! stable Rust.
+//! JSON-RPC. There is intentionally **no `zingo-infra`/`zcash_local_net` dependency**, and no
+//! compile-time zebra dependency either: blocks are mined with zebrad's own Regtest-only
+//! `generate` RPC (zebra ≥ 2.0.0), which runs the template→assemble→submit flow server-side
+//! against the node's own network parameters. The harness is a pure black-box JSON-RPC driver,
+//! so it works unmodified against any zebrad release.
 //!
 //! Binaries are supplied by the caller via `$ZEBRAD_BIN` / `$LIGHTWALLETD_BIN` (see
 //! [`resolve_bin`]); in CI they're extracted from the official `zfnd/zebra` and
@@ -18,14 +19,6 @@ use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, bail, Context, Result};
 use serde_json::{json, Value};
-use zebra_chain::{
-    parameters::{testnet::ConfiguredActivationHeights, Network},
-    serialization::ZcashSerialize,
-};
-use zebra_rpc::{
-    client::{BlockTemplateResponse, BlockTemplateTimeSource},
-    proposal_block_from_template,
-};
 
 /// Pick an unused loopback TCP port (bind `:0`, read the port, release it). Racy by nature, but
 /// fine for a single-threaded test run.
@@ -48,29 +41,12 @@ pub fn resolve_bin(env_var: &str) -> Option<PathBuf> {
 /// Height at which NU6.1 and NU6.2 activate on our regtest chain. NU5/NU6 are active from genesis;
 /// NU6.1's activation block requires ZIP-271 lockbox disbursements out of the deferred pool, which
 /// only accrues once NU6 is live - so NU6.1/NU6.2 activate a few blocks in, after a pool exists.
-/// Must match `zecd`'s `network::regtest` and the funding-stream/disbursement config in
-/// [`zebrad_toml`].
+/// Must match `zecd`'s `network::regtest`.
 const NU6_2_ACTIVATION_HEIGHT: u32 = 4;
 /// ZIP-271 one-time lockbox disbursement paid in the NU6.1 activation block's coinbase. A P2SH
 /// regtest address and a token amount (<= the pool accrued by [`NU6_2_ACTIVATION_HEIGHT`]).
 const LOCKBOX_DISBURSEMENT_ADDR: &str = "t27eWDgjFYJGVXmzrXeVjnb5J3uXDM9xH9v";
 const LOCKBOX_DISBURSEMENT_ZATS: u64 = 1;
-
-/// The `zebra-chain` Regtest network matching the zebrad config we write below. NU5/NU6 active from
-/// height 1 (Orchard included), NU6.1/NU6.2 at [`NU6_2_ACTIVATION_HEIGHT`].
-/// Used by [`proposal_block_from_template`] to pick the right block-commitment field.
-fn regtest_network() -> Network {
-    Network::new_regtest(
-        ConfiguredActivationHeights {
-            nu5: Some(1),
-            nu6: Some(1),
-            nu6_1: Some(NU6_2_ACTIVATION_HEIGHT),
-            nu6_2: Some(NU6_2_ACTIVATION_HEIGHT),
-            ..Default::default()
-        }
-        .into(),
-    )
-}
 
 /// A throwaway transparent address used as zebra's coinbase recipient when the caller doesn't need
 /// to control the coinbase (the unfunded e2e). Funded flows pass the funding wallet's own address.
@@ -84,7 +60,6 @@ pub struct Zebrad {
     net_port: u16,
     bin: PathBuf,
     config_path: PathBuf,
-    net: Network,
     _dir: tempfile::TempDir,
 }
 
@@ -140,7 +115,6 @@ impl Zebrad {
             net_port,
             bin: bin.to_path_buf(),
             config_path,
-            net: regtest_network(),
             _dir: dir,
         };
         zebrad.wait_until_rpc_up().await?;
@@ -215,33 +189,20 @@ impl Zebrad {
         zebra_rpc_call(&self.rpc_url(), method, params).await
     }
 
-    /// Mine `n` blocks the way zebra's own regtest test does: fetch a template, assemble the block
-    /// with [`proposal_block_from_template`], and submit it. Regtest disables PoW, so there is no
+    /// Mine `n` blocks via zebrad's Regtest-only `generate` RPC (zebra ≥ 2.0.0). Server-side it
+    /// runs the same `getblocktemplate` → assemble → `submitblock` flow zebra's own regtest tests
+    /// use, against the node's own network parameters - so the harness needs no zebra crates and
+    /// can't drift from the running node's consensus rules. Regtest disables PoW, so there is no
     /// solving step.
     pub async fn generate_blocks(&self, n: u32) -> Result<()> {
-        for _ in 0..n {
-            let url = self.rpc_url();
-            let template_value = zebra_rpc_call(&url, "getblocktemplate", json!([]))
-                .await
-                .context("getblocktemplate")?;
-            let template: BlockTemplateResponse =
-                serde_json::from_value(template_value).context("decode block template")?;
-            let block = proposal_block_from_template(
-                &template,
-                BlockTemplateTimeSource::default(),
-                &self.net,
-            )
-            .map_err(|e| anyhow!("assemble block from template: {e}"))?;
-            let block_hex = hex::encode(block.zcash_serialize_to_vec().context("serialize block")?);
-            // `submitblock` reports a *consensus* rejection as a non-null result string (e.g.
-            // "rejected"), not a JSON-RPC error - so a bad block would otherwise be swallowed and
-            // the chain would silently never advance. Treat any non-null result as a failure.
-            let submit = zebra_rpc_call(&url, "submitblock", json!([block_hex]))
-                .await
-                .context("submitblock")?;
-            if !submit.is_null() {
-                anyhow::bail!("submitblock rejected the assembled block: {submit}");
-            }
+        let hashes = zebra_rpc_call(&self.rpc_url(), "generate", json!([n]))
+            .await
+            .context("generate")?;
+        // `generate` returns the array of mined block hashes; a short array means some block
+        // was rejected - fail loudly so the chain can't silently stop advancing.
+        let mined = hashes.as_array().map(|a| a.len()).unwrap_or(0);
+        if mined != n as usize {
+            bail!("generate mined {mined} of {n} requested blocks: {hashes}");
         }
         Ok(())
     }
