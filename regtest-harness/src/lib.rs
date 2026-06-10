@@ -45,16 +45,27 @@ pub fn resolve_bin(env_var: &str) -> Option<PathBuf> {
 
 // =============================== zebrad (Regtest validator) ===============================
 
-/// The `zebra-chain` Regtest network matching the zebrad config we write below: every upgrade
-/// active from height 1 (NU5/Orchard included), the same convention as `zecd`'s `network::regtest`.
+/// Height at which NU6.1 and NU6.2 activate on our regtest chain. NU5/NU6 are active from genesis;
+/// NU6.1's activation block requires ZIP-271 lockbox disbursements out of the deferred pool, which
+/// only accrues once NU6 is live - so NU6.1/NU6.2 activate a few blocks in, after a pool exists.
+/// Must match `zecd`'s `network::regtest` and the funding-stream/disbursement config in
+/// [`zebrad_toml`].
+const NU6_2_ACTIVATION_HEIGHT: u32 = 4;
+/// ZIP-271 one-time lockbox disbursement paid in the NU6.1 activation block's coinbase. A P2SH
+/// regtest address and a token amount (<= the pool accrued by [`NU6_2_ACTIVATION_HEIGHT`]).
+const LOCKBOX_DISBURSEMENT_ADDR: &str = "t27eWDgjFYJGVXmzrXeVjnb5J3uXDM9xH9v";
+const LOCKBOX_DISBURSEMENT_ZATS: u64 = 1;
+
+/// The `zebra-chain` Regtest network matching the zebrad config we write below. NU5/NU6 active from
+/// height 1 (Orchard included), NU6.1/NU6.2 at [`NU6_2_ACTIVATION_HEIGHT`].
 /// Used by [`proposal_block_from_template`] to pick the right block-commitment field.
 fn regtest_network() -> Network {
     Network::new_regtest(
         ConfiguredActivationHeights {
             nu5: Some(1),
             nu6: Some(1),
-            nu6_1: Some(1),
-            nu6_2: Some(1),
+            nu6_1: Some(NU6_2_ACTIVATION_HEIGHT),
+            nu6_2: Some(NU6_2_ACTIVATION_HEIGHT),
             ..Default::default()
         }
         .into(),
@@ -70,8 +81,31 @@ pub struct Zebrad {
     child: Child,
     /// JSON-RPC port (cookie auth disabled so lightwalletd can connect).
     pub rpc_port: u16,
+    net_port: u16,
+    bin: PathBuf,
+    config_path: PathBuf,
     net: Network,
     _dir: tempfile::TempDir,
+}
+
+/// Spawn `zebrad --config <config_path> start`. Set ZEBRAD_STDERR to a file path to capture its
+/// logs (zebra logs to stdout, so route both there); otherwise discard them to keep test output
+/// clean.
+fn spawn_zebrad(bin: &Path, config_path: &Path) -> Result<Child> {
+    let (out, err) = match std::env::var_os("ZEBRAD_STDERR") {
+        Some(p) => {
+            let f = std::fs::File::create(&p).context("create ZEBRAD_STDERR file")?;
+            let f2 = f.try_clone().context("clone ZEBRAD_STDERR file")?;
+            (Stdio::from(f), Stdio::from(f2))
+        }
+        None => (Stdio::null(), Stdio::null()),
+    };
+    Command::new(bin)
+        .args(["--config", config_path.to_str().unwrap(), "start"])
+        .stdout(out)
+        .stderr(err)
+        .spawn()
+        .with_context(|| format!("spawn zebrad ({})", bin.display()))
 }
 
 impl Zebrad {
@@ -88,19 +122,24 @@ impl Zebrad {
         let rpc_port = pick_port()?;
         let net_port = pick_port()?;
         let config_path = dir.path().join("zebrad.toml");
-        std::fs::write(&config_path, zebrad_toml(net_port, rpc_port, miner_address))
-            .context("write zebrad.toml")?;
-
-        let child = Command::new(bin)
-            .args(["--config", config_path.to_str().unwrap(), "start"])
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .with_context(|| format!("spawn zebrad ({})", bin.display()))?;
-
+        let cache_dir = dir.path().join("state");
+        std::fs::write(
+            &config_path,
+            zebrad_toml(
+                net_port,
+                rpc_port,
+                miner_address,
+                &cache_dir.to_string_lossy(),
+            ),
+        )
+        .context("write zebrad.toml")?;
+        let child = spawn_zebrad(bin, &config_path)?;
         let zebrad = Zebrad {
             child,
             rpc_port,
+            net_port,
+            bin: bin.to_path_buf(),
+            config_path,
             net: regtest_network(),
             _dir: dir,
         };
@@ -108,24 +147,72 @@ impl Zebrad {
         Ok(zebrad)
     }
 
+    /// Restart `zebrad` mining to a different address, preserving the chain (persistent state).
+    /// Used by the funded e2e to stop minting coinbases to the funder so its existing coinbases
+    /// can age past maturity while a throwaway address mines the tail.
+    pub async fn restart_with_miner(&mut self, miner_address: &str) -> Result<()> {
+        // Clean shutdown via the regtest `stop` RPC (raises SIGINT) so zebra backs up its
+        // non-finalized state. A SIGKILL would drop the recent, not-yet-finalized blocks and reset
+        // the chain to genesis - losing the funder's coinbases.
+        let _ = self.rpc("stop", json!([])).await;
+        let deadline = Instant::now() + Duration::from_secs(60);
+        loop {
+            match self.child.try_wait() {
+                Ok(Some(_)) => break,
+                Ok(None) if Instant::now() < deadline => {
+                    tokio::time::sleep(Duration::from_millis(200)).await;
+                }
+                _ => {
+                    let _ = self.child.kill();
+                    let _ = self.child.wait();
+                    break;
+                }
+            }
+        }
+        let cache_dir = self._dir.path().join("state");
+        std::fs::write(
+            &self.config_path,
+            zebrad_toml(
+                self.net_port,
+                self.rpc_port,
+                miner_address,
+                &cache_dir.to_string_lossy(),
+            ),
+        )
+        .context("rewrite zebrad.toml for restart")?;
+        self.child = spawn_zebrad(&self.bin, &self.config_path)?;
+        self.wait_until_rpc_up().await?;
+        Ok(())
+    }
+
     fn rpc_url(&self) -> String {
         format!("http://127.0.0.1:{}/", self.rpc_port)
     }
 
     async fn wait_until_rpc_up(&self) -> Result<()> {
-        let deadline = Instant::now() + Duration::from_secs(90);
+        let deadline = Instant::now() + Duration::from_secs(120);
         loop {
-            if zebra_rpc_call(&self.rpc_url(), "getblockchaininfo", json!([]))
+            // `getblocktemplate` succeeds only once zebra's RPC is up *and* it considers itself
+            // synced to the chain tip (mempool active) - which is exactly the precondition for
+            // `generate_blocks`. On a fresh node, and especially under the load of several test
+            // nodes running at once, this readiness lags RPC availability by a moment, so we poll
+            // the template endpoint itself rather than just `getblockchaininfo`.
+            if zebra_rpc_call(&self.rpc_url(), "getblocktemplate", json!([]))
                 .await
                 .is_ok()
             {
                 return Ok(());
             }
             if Instant::now() >= deadline {
-                bail!("zebrad RPC did not come up within 90s");
+                bail!("zebrad did not become mineable within 120s");
             }
             tokio::time::sleep(Duration::from_millis(500)).await;
         }
+    }
+
+    /// Issue a raw JSON-RPC call to this zebrad (test/diagnostic helper).
+    pub async fn rpc(&self, method: &str, params: Value) -> Result<Value> {
+        zebra_rpc_call(&self.rpc_url(), method, params).await
     }
 
     /// Mine `n` blocks the way zebra's own regtest test does: fetch a template, assemble the block
@@ -146,9 +233,15 @@ impl Zebrad {
             )
             .map_err(|e| anyhow!("assemble block from template: {e}"))?;
             let block_hex = hex::encode(block.zcash_serialize_to_vec().context("serialize block")?);
-            zebra_rpc_call(&url, "submitblock", json!([block_hex]))
+            // `submitblock` reports a *consensus* rejection as a non-null result string (e.g.
+            // "rejected"), not a JSON-RPC error - so a bad block would otherwise be swallowed and
+            // the chain would silently never advance. Treat any non-null result as a failure.
+            let submit = zebra_rpc_call(&url, "submitblock", json!([block_hex]))
                 .await
                 .context("submitblock")?;
+            if !submit.is_null() {
+                anyhow::bail!("submitblock rejected the assembled block: {submit}");
+            }
         }
         Ok(())
     }
@@ -164,7 +257,10 @@ impl Drop for Zebrad {
 /// zebrad Regtest config for zebra 5.x. Note: no `[mining] debug_like_zcashd` (removed after
 /// 2.x), `disable_pow = true` so submitted blocks need no PoW, and `enable_cookie_auth = false`
 /// so lightwalletd can use the rpcuser/rpcpassword from its `zcash.conf`.
-fn zebrad_toml(net_port: u16, rpc_port: u16, miner_address: &str) -> String {
+fn zebrad_toml(net_port: u16, rpc_port: u16, miner_address: &str, cache_dir: &str) -> String {
+    let nu6_2 = NU6_2_ACTIVATION_HEIGHT;
+    let lockbox_addr = LOCKBOX_DISBURSEMENT_ADDR;
+    let lockbox_amount = LOCKBOX_DISBURSEMENT_ZATS;
     format!(
         r#"[network]
 network = "Regtest"
@@ -173,19 +269,43 @@ listen_addr = "127.0.0.1:{net_port}"
 [network.testnet_parameters]
 disable_pow = true
 
-# Activate the full NU6.x line from genesis. devtool's and zecd's regtest networks must match
-# this (see network::regtest / data::regtest_local).
+# NU5/NU6 from genesis, then NU6.1+NU6.2 at NU6_2_ACTIVATION_HEIGHT. NU6.1 can't activate at
+# height 1: its activation block must carry ZIP-271 one-time lockbox disbursements, and the
+# deferred (lockbox) pool only accrues once NU6 is active - so we let NU6 run for a few blocks to
+# build a pool, then disburse a token amount at the NU6.1/NU6.2 activation block. zebra's
+# getblocktemplate emits the disbursement output automatically from the config below.
+# devtool's and zecd's regtest networks must match these heights (network::regtest / regtest_local).
 [network.testnet_parameters.activation_heights]
 NU5 = 1
 NU6 = 1
-"NU6.1" = 1
-"NU6.2" = 1
+"NU6.1" = {nu6_2}
+"NU6.2" = {nu6_2}
+
+# A deferred (lockbox) funding stream so the pool has something to disburse at NU6.1.
+[[network.testnet_parameters.funding_streams]]
+[network.testnet_parameters.funding_streams.height_range]
+start = 1
+end = 1_000_000
+[[network.testnet_parameters.funding_streams.recipients]]
+receiver = "Deferred"
+numerator = 12
+addresses = []
+
+# The ZIP-271 one-time disbursement paid at the NU6.1 activation block. The amount need only be
+# <= the pool accrued by then; the residual stays in the lockbox.
+[[network.testnet_parameters.lockbox_disbursements]]
+address = "{lockbox_addr}"
+amount = {lockbox_amount}
 
 [mining]
 miner_address = "{miner_address}"
 
 [state]
-ephemeral = true
+# Persistent (not ephemeral) so the chain survives a restart with a different miner address - the
+# funded e2e mines the funder's coinbases, then restarts mining to a throwaway address to age them
+# past coinbase maturity (see Zebrad::restart_with_miner).
+ephemeral = false
+cache_dir = "{cache_dir}"
 
 [rpc]
 listen_addr = "127.0.0.1:{rpc_port}"

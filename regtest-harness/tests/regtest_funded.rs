@@ -20,9 +20,21 @@ use zecd_regtest_harness::{
     pick_port, resolve_bin, Funder, Lightwalletd, Zebrad, Zecd, ZecdConfig,
 };
 
-/// Blocks mined up front. Coinbase maturity is 100, so with the tip here the early coinbases
-/// (heights ~1..10) are spendable, giving the funder plenty to shield.
-const INITIAL_MINE: u32 = 110;
+/// Coinbase blocks mined to the funder up front. zebra finalizes blocks deeper than
+/// `MAX_BLOCK_REORG_HEIGHT` (= coinbase maturity − 1 = 99) below the tip; only finalized blocks are
+/// persisted to disk and survive the miner-swap restart below. So mining 120 finalizes the
+/// funder's coinbases at heights ~1..21 (the rest are non-finalized and dropped on restart). This
+/// matters because the light-client coinbase-maturity filter can't recognise coinbase-ness for
+/// outputs discovered via lightwalletd's GetAddressUtxos (no tx_index), so the funder must simply
+/// never hold an immature coinbase - the restart drops the immature (non-finalized) tail.
+const FUNDER_COINBASES: u32 = 120;
+/// After restarting mining to a throwaway address, mine this many blocks. The restart resets the
+/// tip to the finalized height (~21); this tail re-grows the chain so the surviving funder
+/// coinbases (~1..21) are well past the 100-block maturity, and gives the funder a recent tip to
+/// build its shield against. Comfortably exceeds coinbase maturity (100).
+const MATURITY_TAIL: u32 = 130;
+/// A throwaway P2SH address that mines the maturity tail (the funder does not control it).
+const TAIL_MINER_ADDRESS: &str = "t27eWDgjFYJGVXmzrXeVjnb5J3uXDM9xH9v";
 /// 1 ZEC, in zatoshis.
 const FUND_ZATOSHIS: u64 = 100_000_000;
 /// Generous: lightwalletd ingestion + zecd scan + Orchard proving.
@@ -47,30 +59,41 @@ async fn regtest_funded_orchard_receive() {
     let funder_taddr = Funder::derive_transparent_address(&devtool_bin)
         .expect("derive funder transparent address");
 
-    // 2. Single chain: zebra mines the coinbase to the funder, behind lightwalletd.
-    let zebrad = Zebrad::start_with_miner(&zebrad_bin, &funder_taddr)
+    // 2. Single chain: zebra first mines a few coinbases straight to the funder, then restarts
+    //    mining to a throwaway address. This keeps everything on one chain while letting the
+    //    funder's coinbases age past maturity without it accruing new, immature ones.
+    let mut zebrad = Zebrad::start_with_miner(&zebrad_bin, &funder_taddr)
         .await
         .expect("start zebrad mining to the funder");
+    zebrad
+        .generate_blocks(FUNDER_COINBASES)
+        .await
+        .expect("mine the funder's coinbases");
+    zebrad
+        .restart_with_miner(TAIL_MINER_ADDRESS)
+        .await
+        .expect("restart zebrad mining to the throwaway address");
+    zebrad
+        .generate_blocks(MATURITY_TAIL)
+        .await
+        .expect("mine the maturity tail");
+
+    // 3. lightwalletd in front of zebra (ingests the whole chain).
     let lwd = Lightwalletd::start(&lwd_bin, zebrad.rpc_port)
         .await
         .expect("start lightwalletd");
 
-    // 3. Mine past coinbase maturity.
-    zebrad
-        .generate_blocks(INITIAL_MINE)
-        .await
-        .expect("mine the initial chain");
-
-    // 4. Initialise the funder against THIS chain, then shield its matured transparent coinbase
-    //    into Orchard.
+    // 4. Initialise the funder against THIS chain, then shield its now-mature transparent coinbases
+    //    into Orchard. Every coinbase the funder holds is older than the maturity tail, so the
+    //    broadcast is accepted.
     let funder = Funder::init(&devtool_bin, lwd.grpc_port).expect("initialise funding wallet");
     funder.sync(lwd.grpc_port).expect("funder sync (coinbase)");
-    // shield only selects mature coinbases (zcash_client_sqlite's coinbase-maturity filter), so the
-    // broadcast is accepted without any extra maturity buffer.
     funder
         .shield(lwd.grpc_port)
         .expect("shield transparent coinbase into Orchard");
-    zebrad.generate_blocks(2).await.expect("confirm shield");
+    // The shielded note must reach the default confirmation depth (3 for trusted/self-shielded
+    // notes) before the funder can spend it; a few extra blocks cover the tip skew.
+    zebrad.generate_blocks(6).await.expect("confirm shield");
     funder.sync(lwd.grpc_port).expect("funder sync (shielded)");
 
     // 5. zecd against the same lightwalletd; get its Orchard unified address.
@@ -93,12 +116,15 @@ async fn regtest_funded_orchard_receive() {
         "expected a uregtest1 address, got {zecd_ua}"
     );
 
-    // 6. Fund zecd: send Orchard funds from the funder to zecd's UA, then confirm.
+    // 6. Fund zecd: send Orchard funds from the funder to zecd's UA, then confirm. zecd's
+    //    getbalance uses the default confirmations policy, under which an externally-received
+    //    (untrusted) note needs 10 confirmations before it counts; mine a couple extra for the
+    //    tip skew.
     funder
         .send(lwd.grpc_port, &zecd_ua, FUND_ZATOSHIS)
         .expect("send Orchard funds to zecd");
     zebrad
-        .generate_blocks(2)
+        .generate_blocks(12)
         .await
         .expect("confirm funding send");
 
