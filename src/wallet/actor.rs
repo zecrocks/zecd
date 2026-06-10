@@ -653,29 +653,46 @@ impl WalletActor {
                 Ok((txid, raw_tx))
             })?;
 
+        // The transaction is now committed to the wallet DB (its input notes are locked until
+        // expiry) and `maybe_rebroadcast` keeps re-submitting it while it is unmined and
+        // unexpired. From here on, a transport-level broadcast failure must NOT surface as an
+        // RPC error: bitcoind's contract is that once the wallet has committed the tx,
+        // `sendtoaddress` returns the txid even if initial relay fails - returning an error
+        // here would invite the caller to retry the payment while the original can still be
+        // re-broadcast and confirm (an application-level double-pay).
         if self.client.is_none() {
-            self.connect()
-                .await
-                .map_err(|e| RpcError::misc(format!("connect to lightwalletd: {e}")))?;
+            if let Err(e) = self.connect().await {
+                warn!(
+                    "[{}] created {txid} but no lightwalletd is reachable ({e}); it will be \
+                     re-broadcast once a connection recovers",
+                    self.name
+                );
+                return Ok(txid);
+            }
         }
         let response = {
-            let client = self
-                .client
-                .as_mut()
-                .ok_or_else(|| RpcError::misc("not connected to lightwalletd"))?;
+            let client = self.client.as_mut().expect("connected above");
             client.send_transaction(raw).await
         };
         let response = match response {
             Ok(r) => r.into_inner(),
             Err(e) => {
                 // Transport failure: drop the dead client so the next op reconnects/fails over.
-                // Don't auto-retry the broadcast - re-broadcasting is the caller's decision.
+                // The committed tx rides on the rebroadcast loop.
                 self.client = None;
                 self.update_status();
-                return Err(RpcError::misc(format!("send_transaction RPC failed: {e}")));
+                warn!(
+                    "[{}] broadcast of {txid} failed in transport ({e}); it will be re-broadcast",
+                    self.name
+                );
+                return Ok(txid);
             }
         };
         if response.error_code != 0 {
+            // An explicit upstream rejection (the node examined the tx and refused it) is a
+            // different case from a transport failure: surface it as -26. The tx's notes stay
+            // locked in the wallet until its expiry height, after which they become spendable
+            // again - an immediate retry fails with -6 rather than double-paying.
             return Err(RpcError::new(
                 codes::RPC_VERIFY_REJECTED,
                 format!(
