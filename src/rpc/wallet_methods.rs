@@ -346,6 +346,18 @@ pub fn listunspent(state: &AppState, wallet: Option<&str>, req: &RpcRequest) -> 
     Ok(Value::Array(arr))
 }
 
+/// Whether a positional param was supplied with a value that "turns it on" (anything but
+/// null/false/empty array). Used to reject unsupported options that would change money
+/// semantics if silently ignored.
+fn param_engaged(v: &Value) -> bool {
+    match v {
+        Value::Null => false,
+        Value::Bool(b) => *b,
+        Value::Array(a) => !a.is_empty(),
+        _ => true,
+    }
+}
+
 fn build_payment(network: &crate::network::ZNetwork, addr: &str, amount: &Value) -> Result<Payment, RpcError> {
     let zaddr = crate::address::parse_recipient_on_network(network, addr)?;
     let zats = value_to_zats(amount)?;
@@ -364,6 +376,14 @@ pub async fn sendtoaddress(
     let amount = req
         .param(1)
         .ok_or_else(|| RpcError::invalid_params("sendtoaddress requires an amount"))?;
+    // Params 2/3 (comment, comment_to) are metadata and safe to ignore, but
+    // subtractfeefromamount changes who pays the fee: silently ignoring it would debit the
+    // sender more than the caller intended. Reject it until it is implemented.
+    if req.param(4).is_some_and(param_engaged) {
+        return Err(RpcError::invalid_parameter(
+            "subtractfeefromamount is not supported (fees are ZIP-317, paid by the sender)",
+        ));
+    }
     let handle = state.registry.get(wallet)?.clone();
     let payment = build_payment(&handle.network, addr, amount)?;
     let request = TransactionRequest::new(vec![payment])
@@ -377,11 +397,19 @@ pub async fn sendmany(
     wallet: Option<&str>,
     req: &RpcRequest,
 ) -> Result<Value, RpcError> {
-    // params: [dummy, { "addr": amount, ... }, ...]; the first arg is ignored (legacy).
+    // params: [dummy, { "addr": amount, ... }, minconf, comment, subtractfeefrom, ...].
+    // The dummy is ignored (legacy) and minconf is an "ignored dummy value" in Bitcoin Core
+    // too, but subtractfeefrom changes who pays the fee - reject it rather than silently
+    // sending different amounts than the caller intended.
     let recipients = req
         .param(1)
         .and_then(|v| v.as_object())
         .ok_or_else(|| RpcError::invalid_params("sendmany requires an address->amount object"))?;
+    if req.param(4).is_some_and(param_engaged) {
+        return Err(RpcError::invalid_parameter(
+            "subtractfeefrom is not supported (fees are ZIP-317, paid by the sender)",
+        ));
+    }
     let handle = state.registry.get(wallet)?.clone();
     let mut payments = Vec::new();
     for (addr, amount) in recipients {
