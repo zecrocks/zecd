@@ -298,6 +298,12 @@ addresses/labels, history (`listtransactions`/`gettransaction` incl. `hex`), `li
 the `walletlock`/`walletpassphrase` gate, and real Orchard `sendtoaddress`/`sendmany`
 broadcasts (receiving a note and spending it across two wallets).
 
+## Operations
+
+`docs/OPERATIONS.md` is the production runbook: what to back up (mnemonic, `keys.toml`,
+age identity, birthday height), restore procedures, monitoring/alerting, send semantics
+under failure, upgrades, and the mainnet checklist.
+
 ## Security
 
 **Key custody / threat model.** The wallet seed is stored as an `age`-encrypted mnemonic in
