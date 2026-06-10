@@ -117,8 +117,8 @@ ready_progress = 0.999           # /readyz is 200 once scan progress reaches thi
 **Wallet:** `getnewaddress` (→ Orchard UA), `getbalance`, `getunconfirmedbalance`,
 `getwalletinfo`, `getaddressinfo`, `setlabel`, `getaddressesbylabel`, `listlabels`,
 `listtransactions`, `listsinceblock`, `gettransaction`, `listunspent`, `getreceivedbyaddress`,
-`listreceivedbyaddress`, `sendtoaddress`, `sendmany`, `walletpassphrase`, `walletlock`,
-`listwallets`.
+`listreceivedbyaddress`, `sendtoaddress`, `sendmany`, `encryptwallet`, `walletpassphrase`,
+`walletpassphrasechange`, `walletlock`, `listwallets`.
 
 **Blockchain:** `getblockchaininfo`, `getblockcount`, `getbestblockhash`, `getblockhash`.
 
@@ -307,26 +307,27 @@ under failure, upgrades, and the mainnet checklist.
 
 ## Security
 
-**Key custody / threat model.** The wallet seed is stored as an `age`-encrypted mnemonic in
-`<wallet>/keys.toml`; the decryption key is the age identity file (`[keys] age_identity`,
-default `<datadir>/identity.txt`). With the default `auto_unlock = true` the seed is decrypted
-into memory at startup (held as a zeroizing secret) so sends need no `walletpassphrase`. Be
-clear about what this protects:
+**Two key-custody models**, mirroring bitcoind's unencrypted/encrypted wallet states:
 
-- With `identity.txt` in the same datadir as `keys.toml` (the default layout), the encryption
-  protects against leakage of `keys.toml` *alone* - e.g. a copy or backup of just the wallet
-  subdirectory. It does **not** protect against compromise of the host: anyone who can read
-  the datadir has both files and therefore the seed.
-- For mainnet, store the identity outside the datadir (secrets manager, separate mount, or the
-  `ZECD_AGE_IDENTITY` env var) and consider `auto_unlock = false`, so the seed is only
-  decrypted after an explicit `walletpassphrase`.
+- **Unencrypted (default):** the mnemonic in `<wallet>/keys.toml` is wrapped to the age
+  identity file (`[keys] age_identity`, default `<datadir>/identity.txt`); with the default
+  `auto_unlock = true` the seed is decrypted into memory at startup (held as a zeroizing
+  secret) so sends are unattended. The passphrase RPCs (`walletpassphrase`, `walletlock`,
+  `walletpassphrasechange`) return `-15`, exactly like bitcoind with an unencrypted wallet.
+  What the at-rest encryption protects: with `identity.txt` co-located in the datadir, only
+  leakage of `keys.toml` *alone* (e.g. a copy of just the wallet subdirectory) - anyone who
+  can read the whole datadir has the seed. For unattended mainnet wallets, store the identity
+  outside the datadir (secrets manager, separate mount, or `ZECD_AGE_IDENTITY`).
+- **Encrypted (`zecd init --encrypt`, or `encryptwallet` on a running wallet):** the mnemonic
+  is wrapped with a passphrase (age scrypt) instead; no identity file can decrypt it. The
+  wallet starts locked (sends return `-13`); `walletpassphrase "<pass>" <timeout>` verifies
+  the passphrase (`-14` if wrong) and auto-relocks when the timeout elapses;
+  `walletpassphrasechange` rotates it; `getwalletinfo.unlocked_until` reports the relock
+  time. Unlike Bitcoin Core, `encryptwallet` does not regenerate the seed - the mnemonic is
+  unchanged, only its at-rest wrapping - so existing backups stay valid.
 
-**`walletpassphrase` differs from Bitcoin Core.** The passphrase argument is **not verified** -
-the credential is the age identity file on the server, not the passphrase string.
-`walletpassphrase <anything> <timeout>` succeeds whenever the daemon can decrypt the seed with
-the configured identity, and the timeout is accepted but not enforced (the seed stays in memory
-until `walletlock` or shutdown). Anyone with RPC access can therefore unlock the wallet:
-**treat RPC credentials as spend authority.**
+In both models, anyone with RPC access to an unlocked wallet can spend: **treat RPC
+credentials as spend authority.**
 
 **RPC surface.**
 

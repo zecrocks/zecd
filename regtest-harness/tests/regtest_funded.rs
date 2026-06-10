@@ -203,17 +203,34 @@ async fn regtest_funded_orchard_receive() {
     let cursor = lsb["lastblock"].as_str().expect("lastblock hash").to_string();
     assert_eq!(cursor.len(), 64, "lastblock is a block hash: {lsb}");
 
-    // The walletpassphrase gate around a real spend: locked → -13, unlocked → it goes through.
+    // Encrypt the wallet (Bitcoin-Core style) and exercise the gate around a real spend:
+    // encryptwallet locks it (-13 on send), a wrong passphrase is rejected (-14), and the
+    // real one unlocks with a timeout long enough to cover the remaining phases.
     let funder_ua = funder.unified_address().expect("funder unified address");
-    zecd.call("walletlock", json!([])).await.expect("walletlock");
+    zecd.call("encryptwallet", json!(["regtest-pass"]))
+        .await
+        .expect("encryptwallet on the funded wallet");
     let err = zecd
         .call("sendtoaddress", json!([funder_ua, 0.4]))
         .await
         .expect_err("a locked wallet must refuse to send");
     assert_eq!(err.code(), Some(-13), "expected unlock-needed (-13): {err}");
-    zecd.call("walletpassphrase", json!(["any", 600]))
+    let err = zecd
+        .call("walletpassphrase", json!(["wrong-pass", 600]))
         .await
-        .expect("walletpassphrase re-unlocks from the age identity");
+        .expect_err("a wrong passphrase must be rejected");
+    assert_eq!(err.code(), Some(-14), "expected passphrase-incorrect (-14): {err}");
+    zecd.call("walletpassphrase", json!(["regtest-pass", 3600]))
+        .await
+        .expect("the real passphrase unlocks");
+    let wi = zecd
+        .call("getwalletinfo", json!([]))
+        .await
+        .expect("getwalletinfo");
+    assert!(
+        wi["unlocked_until"].as_i64().unwrap_or(0) > 0,
+        "unlocked_until reports the relock time while unlocked: {wi}"
+    );
 
     // The send-success path: a real Orchard spend back to the funder.
     let txid = zecd

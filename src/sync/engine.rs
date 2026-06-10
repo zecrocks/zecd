@@ -239,13 +239,28 @@ pub async fn sync_one_batch(
     };
 
     let block_meta = download_blocks(client, wallet_dir, db_cache, &scan_range).await?;
-    let chain_state = download_chain_state(client, scan_range.block_range().start - 1).await?;
 
-    // `scan_cached_blocks` is CPU-bound; keep the async runtime healthy.
-    let _ranges_updated = tokio::task::block_in_place(|| {
-        scan_blocks(params, wallet_dir, db_cache, db_data, &chain_state, &scan_range)
-    })?;
+    // Fetch the prior block's chain state and scan. Anything that fails here must still clean up
+    // the just-downloaded cache files, so the result is captured and the delete runs regardless.
+    let result = async {
+        // Never request the tree state below height 1: lightwalletd treats BlockId height 0 as
+        // "unspecified" and rejects it, and there's no pre-genesis tree state. On a genesis-
+        // adjacent range (fresh regtest) `start - 1` would be 0; clamp to 1 (mirrors init.rs).
+        let start = u32::from(scan_range.block_range().start);
+        let prior_height = BlockHeight::from(start.saturating_sub(1).max(1));
+        let chain_state = download_chain_state(client, prior_height).await?;
 
+        // `scan_cached_blocks` is CPU-bound; keep the async runtime healthy.
+        tokio::task::block_in_place(|| {
+            scan_blocks(params, wallet_dir, db_cache, db_data, &chain_state, &scan_range)
+        })?;
+        Ok::<(), anyhow::Error>(())
+    }
+    .await;
+
+    // Remove the downloaded compact blocks whether the scan succeeded or failed, so a transient
+    // error (or a reorg-shifted range) can't strand cache files on disk.
     delete_cached_blocks(wallet_dir, block_meta);
+    result?;
     Ok(true)
 }

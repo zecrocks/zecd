@@ -308,6 +308,12 @@ pub struct InitArgs {
     #[arg(long)]
     pub restore: bool,
 
+    /// Passphrase-encrypt the wallet (Bitcoin-Core style): the mnemonic is wrapped with a
+    /// passphrase instead of the age identity, and the wallet starts locked - sending requires
+    /// `walletpassphrase`. The passphrase is read from `ZECD_WALLET_PASSPHRASE` or stdin.
+    #[arg(long)]
+    pub encrypt: bool,
+
     /// Optional birthday height; defaults to the current chain tip for new wallets.
     #[arg(long)]
     pub birthday: Option<u32>,

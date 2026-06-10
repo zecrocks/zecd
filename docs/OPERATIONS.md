@@ -81,8 +81,10 @@ need a rollback path (stop the daemon before copying).
 - [ ] RPC bound to `127.0.0.1` or a private network; TLS/reverse proxy in front if it
       must cross a network boundary. **RPC credentials are spend authority** (see
       README → Security).
-- [ ] age identity stored outside the datadir (secrets manager / separate mount /
-      `ZECD_AGE_IDENTITY`); consider `auto_unlock = false`.
+- [ ] Key custody chosen deliberately: for unattended sending, the age identity stored
+      outside the datadir (secrets manager / separate mount / `ZECD_AGE_IDENTITY`); for
+      human-operated wallets, `zecd init --encrypt` (or `encryptwallet`) so spending
+      requires a verified `walletpassphrase` with an enforced timeout.
 - [ ] Mnemonic + birthday recorded offline; restore procedure tested on testnet.
 - [ ] Own `lightwalletd` as primary, public endpoints as fallback (`[lightwalletd]
       servers`); Docker images pinned to verified releases.
