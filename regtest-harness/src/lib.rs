@@ -360,6 +360,20 @@ impl Lightwalletd {
         // Drop runs kill + wait.
     }
 
+    /// Pause the process with SIGSTOP, simulating a *hung* upstream: the kernel keeps its
+    /// sockets alive - TCP connects succeed and segments are ACKed - but no request is ever
+    /// answered. This is the failure mode a kill can't reproduce (a dead process refuses
+    /// connections immediately) and the one only HTTP/2 keepalive / per-RPC deadlines can
+    /// detect. Resume with [`Lightwalletd::resume`].
+    pub fn pause(&self) -> Result<()> {
+        signal_process(self.child.id(), "STOP")
+    }
+
+    /// Resume a [`Lightwalletd::pause`]d process (SIGCONT); it picks up where it stopped.
+    pub fn resume(&self) -> Result<()> {
+        signal_process(self.child.id(), "CONT")
+    }
+
     async fn wait_until_ready(&self, log_file: &Path) -> Result<()> {
         let deadline = Instant::now() + Duration::from_secs(90);
         loop {
@@ -805,6 +819,18 @@ async fn zebra_rpc_call(url: &str, method: &str, params: Value) -> Result<Value>
 fn tail(s: &str, lines: usize) -> String {
     let all: Vec<&str> = s.lines().collect();
     all[all.len().saturating_sub(lines)..].join("\n")
+}
+
+/// Send a named signal (e.g. `STOP`, `CONT`) to a process via the portable `kill` binary
+/// (avoids a libc dependency for the harness's two niche uses).
+fn signal_process(pid: u32, sig: &str) -> Result<()> {
+    let status = Command::new("kill")
+        .arg(format!("-{sig}"))
+        .arg(pid.to_string())
+        .status()
+        .with_context(|| format!("spawn kill -{sig} {pid}"))?;
+    anyhow::ensure!(status.success(), "kill -{sig} {pid} exited with {status}");
+    Ok(())
 }
 
 fn reset_datadir(datadir: &Path, cfg: &ZecdConfig) -> Result<()> {
