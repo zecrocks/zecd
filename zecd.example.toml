@@ -42,6 +42,9 @@ port = 18232
 # If user/password are omitted, a bitcoind-style cookie file is generated at <datadir>/.cookie.
 user = "zec"
 password = "change-me"
+# Additional bitcoind-style rpcauth credentials (salted - no plaintext in the config).
+# Generate entries with bitcoin's share/rpcauth/rpcauth.py: `rpcauth.py <user> [password]`.
+# auth = ["alice:<salt>$<hmac-sha256 hex>"]
 # cookiefile = "./data/.cookie"
 
 [keys]

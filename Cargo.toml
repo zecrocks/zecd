@@ -19,7 +19,6 @@ futures-util = "0.3"
 # with 8 decimals and clients parse them as Decimal; without this they round-trip through f64.
 serde = { version = "1.0", features = ["derive"] }
 serde_json = { version = "1.0", features = ["arbitrary_precision"] }
-rust_decimal = "1"
 
 # CLI / config / logging
 clap = { version = "4.5", features = ["derive", "string", "env"] }
@@ -29,9 +28,11 @@ thiserror = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json"] }
 
-# Auth
+# Auth. hmac+sha2 implement Bitcoin Core's salted `rpcauth` scheme (HMAC-SHA256).
 base64 = "0.22"
 subtle = "2"
+hmac = "0.12"
+sha2 = "0.10"
 rand = { version = "0.8", default-features = false, features = ["std", "std_rng"] }
 hex = "0.4"
 
@@ -58,6 +59,7 @@ zcash_keys = { version = "0.14", features = ["unstable", "orchard"] }
 zcash_primitives = "0.28"
 zcash_proofs = { version = "0.28", features = ["bundled-prover"] }
 zcash_protocol = { version = "0.9", features = ["local-consensus"] }
+zcash_transparent = "0.8"
 sapling = { package = "sapling-crypto", version = "0.7" }
 zip32 = "0.2"
 zip321 = "0.8"

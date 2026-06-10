@@ -183,6 +183,7 @@ mod tests {
             port: 1,
             user: Some("u".into()),
             password: Some("p".into()),
+            auth: vec![],
             cookiefile: None,
             work_queue: 16,
         };
@@ -383,5 +384,40 @@ mod tests {
         assert_eq!(arr.len(), 2);
         assert_eq!(arr[0]["error"], Value::Null);
         assert!(arr[1]["error"]["code"].is_number());
+    }
+
+    /// Bitcoin Core's validateaddress returns only the verdict (plus error details) for
+    /// invalid input; address/scriptPubKey/isscript appear only when valid. Transparent
+    /// addresses carry their real scriptPubKey (vectors shared with zallet, from zcashd
+    /// qa/rpc-tests/disablewallet.py).
+    #[tokio::test]
+    async fn validateaddress_matches_bitcoind_shape() {
+        async fn result_for(addr: &str) -> Value {
+            let body = format!(r#"{{"method":"validateaddress","id":1,"params":["{addr}"]}}"#);
+            let r = router(test_state()).oneshot(req(&body, Some(("u", "p")))).await.unwrap();
+            assert_eq!(r.status(), StatusCode::OK);
+            body_json(r).await["result"].clone()
+        }
+
+        // Invalid (garbage, and a mainnet address on this testnet state): no address echo.
+        for addr in ["notanaddress", "t1VydNnkjBzfL1iAMyUbwGKJAF7PgvuCfMY"] {
+            let v = result_for(addr).await;
+            assert_eq!(v["isvalid"], serde_json::json!(false));
+            let obj = v.as_object().unwrap();
+            assert!(!obj.contains_key("address"), "invalid result must not echo address");
+            assert!(!obj.contains_key("scriptPubKey"));
+            assert!(!obj.contains_key("isscript"));
+            assert!(obj.contains_key("error"));
+            assert!(obj.contains_key("error_locations"));
+        }
+
+        // Valid testnet P2PKH: real scriptPubKey, isscript false.
+        let v = result_for("tmGqwWtL7RsbxikDSN26gsbicxVr2xJNe86").await;
+        assert_eq!(v["isvalid"], serde_json::json!(true));
+        assert_eq!(v["address"], serde_json::json!("tmGqwWtL7RsbxikDSN26gsbicxVr2xJNe86"));
+        let spk = v["scriptPubKey"].as_str().unwrap();
+        assert!(spk.starts_with("76a914") && spk.ends_with("88ac"), "got {spk}");
+        assert_eq!(v["isscript"], serde_json::json!(false));
+        assert_eq!(v["iswitness"], serde_json::json!(false));
     }
 }
