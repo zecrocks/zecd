@@ -144,6 +144,21 @@ def main() -> int:
         ck("gettransaction has details list", isinstance(gt.get("details"), list))
         ck("gettransaction hex hex-string", isinstance(gt.get("hex"), str) and len(gt["hex"]) % 2 == 0)
 
+    print("== listsinceblock (restart-safe poller) ==")
+    lsb = rpc.call("listsinceblock")
+    ck("has transactions list", isinstance(lsb.get("transactions"), list))
+    ck("has removed list", isinstance(lsb.get("removed"), list))
+    ck("lastblock 64-hex", isinstance(lsb.get("lastblock"), str) and len(lsb["lastblock"]) == 64)
+    ck("lastblock == getbestblockhash", lsb["lastblock"] == best)
+    again = rpc.call("listsinceblock", lsb["lastblock"])
+    ck("since lastblock reports only unconfirmed",
+       all(t["confirmations"] < 1 for t in again["transactions"]))
+    try:
+        rpc.call("listsinceblock", "00" * 32)
+        ck("unknown block raises", False)
+    except JSONRPCException as e:
+        ck("unknown block -> code -5", e.code == -5, e.code)
+
     print("== error handling (JSONRPCException with Bitcoin Core codes) ==")
     try:
         rpc.call("gettransaction", "00" * 32)

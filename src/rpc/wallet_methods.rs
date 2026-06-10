@@ -265,6 +265,69 @@ pub fn listtransactions(
     Ok(Value::Array(entries[start..end].to_vec()))
 }
 
+/// `listsinceblock [blockhash] [target_confirmations]` - the canonical restart-safe payment
+/// poller: returns every wallet tx in blocks after `blockhash` (plus all unmined txs), and a
+/// `lastblock` hash to feed back into the next call. Reorged-away transactions are rescanned
+/// and re-reported by the sync engine rather than tracked separately, so `removed` is always
+/// empty.
+pub fn listsinceblock(
+    state: &AppState,
+    wallet: Option<&str>,
+    req: &RpcRequest,
+) -> Result<Value, RpcError> {
+    let handle = state.registry.get(wallet)?;
+    let st = handle.status();
+
+    // Param 0: list activity *since* this block (exclusive). Omitted/empty means everything.
+    let since_height = match req.param(0).and_then(|v| v.as_str()).filter(|s| !s.is_empty()) {
+        Some(hash) => Some(
+            read::block_height_by_hash(&handle.dir, hash)?
+                .ok_or_else(|| RpcError::invalid_address_or_key("Block not found"))?,
+        ),
+        None => None,
+    };
+    // Param 1: which depth's block hash to return as `lastblock` (>= 1, like Bitcoin Core).
+    let target_conf = match req.param(1) {
+        None | Some(Value::Null) => 1u32,
+        Some(v) => match v.as_i64() {
+            Some(n) if n >= 1 => n as u32,
+            _ => return Err(RpcError::invalid_parameter("Invalid target_confirmations")),
+        },
+    };
+
+    let txs = read::list_transactions(&handle.dir)?;
+    let label_map = labels::all(&handle.dir).unwrap_or_default();
+    let mut transactions: Vec<Value> = Vec::new();
+    for tx in &txs {
+        let include = match (tx.mined_height, since_height) {
+            (Some(h), Some(since)) => h > since,
+            // Unmined txs (and everything, when no reference block was given).
+            _ => true,
+        };
+        if !include {
+            continue;
+        }
+        let confirmations = tx_confirmations(&st, tx);
+        transactions.extend(tx_entries(tx, &label_map, confirmations, None));
+    }
+
+    // `lastblock` is the hash of the block that currently has `target_confirmations`
+    // confirmations: pass it back as the next call's blockhash and any tx with fewer
+    // confirmations at this point is reported again rather than missed.
+    let lastblock = st
+        .fully_scanned
+        .and_then(|scanned| scanned.checked_sub(target_conf - 1))
+        .and_then(|h| read::block_info_at(&handle.dir, h).ok().flatten())
+        .map(|(hash, _)| hash)
+        .unwrap_or_default();
+
+    Ok(json!({
+        "transactions": transactions,
+        "removed": [],
+        "lastblock": lastblock,
+    }))
+}
+
 pub async fn gettransaction(
     state: &AppState,
     wallet: Option<&str>,
