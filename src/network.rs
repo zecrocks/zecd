@@ -65,14 +65,19 @@ impl Parameters for ZNetwork {
     }
 }
 
-/// A regtest network with every network upgrade active from height 1 - the `zebra`/`zcashd`
-/// regtest convention (and what `deploy/regtest` configures zebra to use). Orchard (NU5) is
-/// therefore active for the entire chain.
+/// A regtest network matching the chain the regtest harness runs: NU5 (Orchard) and NU6 active
+/// from height 1, then NU6.1/NU6.2 a few blocks in (their activation block needs ZIP-271 lockbox
+/// disbursements, so they can't start at genesis). Orchard is active for the entire chain.
 // `zcash_unstable` is a librustzcash RUSTFLAGS cfg (nu7/zfuture). We don't set it, but the
 // gated fields are kept so this literal stays valid if someone builds with those NUs enabled.
 #[allow(unexpected_cfgs)]
 pub fn regtest() -> ZNetwork {
     let h = Some(BlockHeight::from_u32(1));
+    // NU6.1/NU6.2 activate a few blocks in, not at genesis: NU6.1's activation block must carry
+    // ZIP-271 lockbox disbursements, which require a deferred pool that only accrues once NU6 is
+    // live. This must match the regtest chain the harness/zebra run (regtest-harness's
+    // NU6_2_ACTIVATION_HEIGHT) so zecd commits transactions to the right consensus branch id.
+    let nu62 = Some(BlockHeight::from_u32(4));
     ZNetwork::Regtest(LocalNetwork {
         overwinter: h,
         sapling: h,
@@ -81,11 +86,12 @@ pub fn regtest() -> ZNetwork {
         canopy: h,
         nu5: h,
         nu6: h,
-        nu6_1: h,
+        nu6_1: nu62,
+        nu6_2: nu62,
         #[cfg(zcash_unstable = "nu7")]
-        nu7: h,
+        nu7: nu62,
         #[cfg(zcash_unstable = "zfuture")]
-        z_future: h,
+        z_future: nu62,
     })
 }
 

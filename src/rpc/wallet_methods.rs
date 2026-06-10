@@ -275,8 +275,13 @@ pub async fn gettransaction(
         },
     };
 
+    // Bitcoin Core's `amount` excludes the fee (reported separately in `fee`): for a
+    // wallet-funded tx the balance delta is -(payments + fee), so add the fee back.
+    // `fee_paid` is only known when the wallet funded the tx; for pure receives it is
+    // None and the delta is already the received amount. A self-transfer nets to 0.
+    let amount = rec.account_balance_delta + rec.fee_paid.unwrap_or(0) as i64;
     let mut obj = json!({
-        "amount": signed_zats_to_value(rec.account_balance_delta),
+        "amount": signed_zats_to_value(amount),
         "confirmations": st.confirmations(rec.mined_height),
         "txid": rec.txid_hex,
         "time": rec.block_time.unwrap_or(0),

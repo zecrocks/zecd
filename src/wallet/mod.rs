@@ -57,7 +57,6 @@ pub struct SyncStatus {
     /// Scan progress in `[0, 1]`.
     pub scan_progress: f64,
     pub scanning: bool,
-    pub tip_time: Option<i64>,
 }
 
 impl SyncStatus {

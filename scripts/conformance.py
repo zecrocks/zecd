@@ -88,6 +88,15 @@ def main() -> int:
     ck("blocks is int", isinstance(bci["blocks"], int))
     ck("bestblockhash 64-hex", isinstance(bci["bestblockhash"], str) and len(bci["bestblockhash"]) == 64)
 
+    print("== blocks/hash consistency ==")
+    # The classic poller pattern must hold: getblockhash(getblockcount()) succeeds and
+    # agrees with getbestblockhash (all three describe the fully-scanned block).
+    count = rpc.call("getblockcount")
+    ck("getblockcount is int", isinstance(count, int))
+    best = rpc.call("getbestblockhash")
+    at_count = rpc.call("getblockhash", count)
+    ck("getblockhash(getblockcount()) == getbestblockhash", best == at_count, f"{best} != {at_count}")
+
     print("== getnetworkinfo fields ==")
     ni = rpc.call("getnetworkinfo")
     for f in ("version", "subversion", "protocolversion", "connections", "relayfee", "networks", "warnings"):
