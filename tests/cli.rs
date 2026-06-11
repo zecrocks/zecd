@@ -134,34 +134,42 @@ fn unknown_config_field_is_rejected() {
     );
 }
 
-/// On mainnet the RPC password is spend authority, so the daemon must refuse to start
-/// while it is still the shipped placeholder.
+/// On mainnet the RPC password is spend authority, so the daemon must refuse to start while it is
+/// still the shipped placeholder - in any case, since the deploy templates use `CHANGE-ME` and the
+/// example config uses lowercase `change-me`.
 #[test]
 fn mainnet_placeholder_password_refuses_to_start() {
-    let dir = tempfile::tempdir().unwrap();
-    let out = run_with_timeout(
-        {
-            let mut c = zecd();
-            c.args([
-                "--datadir",
-                dir.path().to_str().unwrap(),
-                "--network",
-                "main",
-                "--rpcuser",
-                "u",
-                "--rpcpassword",
-                "CHANGE-ME",
-            ]);
-            c
-        },
-        Duration::from_secs(10),
-    );
-    assert_eq!(out.status.code(), Some(1));
-    assert!(
-        stderr_of(&out).contains("CHANGE-ME"),
-        "stderr: {}",
-        stderr_of(&out)
-    );
+    for placeholder in ["CHANGE-ME", "change-me", " Change-Me "] {
+        let dir = tempfile::tempdir().unwrap();
+        let out = run_with_timeout(
+            {
+                let mut c = zecd();
+                c.args([
+                    "--datadir",
+                    dir.path().to_str().unwrap(),
+                    "--network",
+                    "main",
+                    "--rpcuser",
+                    "u",
+                    "--rpcpassword",
+                    placeholder,
+                ]);
+                c
+            },
+            Duration::from_secs(10),
+        );
+        assert_eq!(
+            out.status.code(),
+            Some(1),
+            "placeholder {placeholder:?} should refuse to start; stderr: {}",
+            stderr_of(&out)
+        );
+        assert!(
+            stderr_of(&out).contains("CHANGE-ME"),
+            "placeholder {placeholder:?} stderr: {}",
+            stderr_of(&out)
+        );
+    }
 }
 
 #[test]

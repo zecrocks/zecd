@@ -746,7 +746,7 @@ pub async fn sendtoaddress(
     let handle = state.registry.get(wallet)?.clone();
     let payment = build_payment(&handle.network, addr, amount)?;
     let request = TransactionRequest::new(vec![payment])
-        .map_err(|e| RpcError::wallet(format!("invalid payment request: {e:?}")))?;
+        .map_err(|e| RpcError::wallet(format!("invalid payment request: {e}")))?;
     let txid = handle.send(request).await?;
     Ok(Value::String(txid.to_string()))
 }
@@ -785,7 +785,7 @@ pub async fn sendmany(
         return Err(RpcError::invalid_params("sendmany requires at least one recipient"));
     }
     let request = TransactionRequest::new(payments)
-        .map_err(|e| RpcError::wallet(format!("invalid payment request: {e:?}")))?;
+        .map_err(|e| RpcError::wallet(format!("invalid payment request: {e}")))?;
     let txid = handle.send(request).await?;
     Ok(Value::String(txid.to_string()))
 }

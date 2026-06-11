@@ -31,10 +31,17 @@ pub async fn run(state: AppState) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Maximum accepted HTTP request-body size. JSON-RPC requests - even large batches - are small,
+/// so this bounds memory from a hostile or buggy client while staying generous. It makes axum's
+/// otherwise-implicit limit explicit and tunable; oversize requests are rejected with HTTP 413 by
+/// the body-limit layer, before auth or dispatch.
+const MAX_BODY_BYTES: usize = 2 * 1024 * 1024;
+
 fn router(state: AppState) -> Router {
     Router::new()
         .route("/", post(handle_root))
         .route("/wallet/:name", post(handle_wallet))
+        .layer(axum::extract::DefaultBodyLimit::max(MAX_BODY_BYTES))
         .with_state(state)
 }
 
@@ -251,6 +258,17 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(r.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn oversize_body_is_413() {
+        // A body past MAX_BODY_BYTES is rejected by the body-limit layer before auth/dispatch.
+        let big = "a".repeat(MAX_BODY_BYTES + 1);
+        let r = router(test_state())
+            .oneshot(req(&big, Some(("u", "p"))))
+            .await
+            .unwrap();
+        assert_eq!(r.status(), StatusCode::PAYLOAD_TOO_LARGE);
     }
 
     #[tokio::test]

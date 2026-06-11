@@ -56,7 +56,11 @@ async fn run_daemon(config: AppConfig) -> anyhow::Result<()> {
     // The example/deploy configs ship with a placeholder RPC password; on mainnet that is
     // spend authority, so refuse to start until it has been changed.
     if matches!(config.network, crate::network::ZNetwork::Main)
-        && config.rpc.password.as_deref() == Some("CHANGE-ME")
+        && config
+            .rpc
+            .password
+            .as_deref()
+            .is_some_and(|p| p.trim().eq_ignore_ascii_case("change-me"))
     {
         anyhow::bail!(
             "[rpc] password is still the example placeholder \"CHANGE-ME\"; \

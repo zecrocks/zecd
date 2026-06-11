@@ -218,18 +218,43 @@ async fn ensure_identity(path: &Path) -> anyhow::Result<Vec<Box<dyn age::Recipie
     if let Some(parent) = path.parent() {
         tokio::fs::create_dir_all(parent).await?;
     }
-    let mut f = tokio::fs::File::create_new(path).await?;
+    // Create the identity file with mode 0600 set atomically at open time, rather than
+    // creating under the umask and chmod-ing afterwards: the age secret key must never be
+    // briefly world-readable between create and set_permissions. `create_new` preserves the
+    // refusal to clobber an existing identity. Mirrors the cookie writer in `server::auth`.
+    let mut opts = tokio::fs::OpenOptions::new();
+    opts.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        // tokio's OpenOptions exposes `mode` as an inherent method (no trait import needed).
+        opts.mode(0o600);
+    }
+    let mut f = opts.open(path).await?;
     f.write_all(b"# zecd age identity (KEEP SECRET)\n").await?;
     f.write_all(format!("# public key: {recipient}\n").as_bytes())
         .await?;
     f.write_all(format!("{}\n", identity.to_string().expose_secret()).as_bytes())
         .await?;
     f.flush().await?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
-    }
 
     Ok(vec![Box::new(recipient)])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The age identity holds the secret key that decrypts the mnemonic, so it must be created
+    /// private. Asserts the end-state mode; atomicity (never world-readable mid-write) comes from
+    /// creating with the mode set at open time rather than chmod-ing afterwards.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn identity_file_is_created_private() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("identity.txt");
+        ensure_identity(&path).await.expect("create identity");
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600, "age identity must be private (0600)");
+    }
 }

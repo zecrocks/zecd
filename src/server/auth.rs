@@ -10,7 +10,7 @@ use base64::Engine;
 use hmac::{Hmac, Mac};
 use rand::RngCore;
 use sha2::Sha256;
-use subtle::ConstantTimeEq;
+use subtle::{Choice, ConstantTimeEq};
 
 use crate::config::RpcConfig;
 
@@ -40,8 +40,15 @@ impl PasswordHash {
         PasswordHash { salt, hash }
     }
 
+    /// Constant-time password check returning a `subtle::Choice` so callers can combine it
+    /// without short-circuiting. The HMAC is always computed, regardless of the result.
+    fn check_ct(&self, password: &str) -> Choice {
+        Self::compute(password, &self.salt).ct_eq(&self.hash)
+    }
+
+    #[cfg(test)]
     fn check(&self, password: &str) -> bool {
-        Self::compute(password, &self.salt).ct_eq(&self.hash).into()
+        self.check_ct(password).into()
     }
 }
 
@@ -118,9 +125,17 @@ impl Authenticator {
         let Ok(creds) = std::str::from_utf8(&decoded) else { return false };
         let Some((user, password)) = creds.split_once(':') else { return false };
 
-        self.users
-            .iter()
-            .any(|(u, hash)| u == user && hash.check(password))
+        // Check every configured credential without short-circuiting: always run the password
+        // HMAC (via `check_ct`) and combine with bitwise `Choice` ops, so response timing does
+        // not reveal whether a username exists. (Username *length* can still differ; usernames
+        // are not secret in bitcoind's model - the cookie user is the fixed `__cookie__`.)
+        let mut found = Choice::from(0u8);
+        for (u, hash) in &self.users {
+            let user_ok = u.as_bytes().ct_eq(user.as_bytes());
+            let pass_ok = hash.check_ct(password);
+            found |= user_ok & pass_ok;
+        }
+        found.into()
     }
 }
 
