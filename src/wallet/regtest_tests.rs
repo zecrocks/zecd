@@ -126,7 +126,8 @@ fn offline_actor_cfg(
         name: name.to_string(),
         network: net,
         wallet_dir,
-        servers: lightwalletd::resolve("127.0.0.1:1", net, TlsRoots::Native, Some(false)).unwrap(),
+        servers: lightwalletd::resolve("127.0.0.1:1", net, TlsRoots::Native, Some(false), None)
+            .unwrap(),
         sync_interval: Duration::from_secs(60),
         rebroadcast_interval: Duration::from_secs(60),
         connect_timeout: Duration::from_millis(150),

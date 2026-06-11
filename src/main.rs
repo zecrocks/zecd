@@ -11,6 +11,7 @@ mod lightwalletd;
 mod network;
 mod rpc;
 mod server;
+mod socks;
 mod state;
 mod sync;
 mod wallet;
@@ -92,6 +93,7 @@ async fn run_daemon(config: AppConfig) -> anyhow::Result<()> {
             config.network,
             config.lightwalletd.tls_roots,
             config.lightwalletd.force_tls,
+            config.lightwalletd.proxy,
         )?;
         let actor_cfg = ActorConfig {
             name: name.clone(),

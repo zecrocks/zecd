@@ -25,7 +25,14 @@ server = "zecrocks"
 # TLS is auto (on for remote hosts, off for localhost).
 #   testnet:  servers = ["http://127.0.0.1:9067", "https://testnet.zec.rocks:443"]
 #   mainnet:  servers = ["http://127.0.0.1:9067", "https://zec.rocks:443", "https://eu.zec.rocks:443"]
-# Only "direct" is supported (TLS for remote hosts, plaintext for localhost).
+# How to reach lightwalletd:
+#   "direct" - connect directly (TLS for remote hosts, plaintext for localhost).
+#   "tor" - route all traffic through Tor's default SOCKS port (127.0.0.1:9050);
+#                            run a tor daemon alongside zecd. Use ".onion" endpoints for full
+#                            privacy (they skip TLS - Tor encrypts the hop).
+#   "socks5://host:port" - route through any SOCKS5 proxy (Tor on a custom port, Nym, etc.).
+# The proxy applies to every configured endpoint; TLS is still layered on top for remote hosts so
+# the proxy only ever sees ciphertext.
 connection = "direct"
 # Per-attempt dial timeout (seconds) so a hung/black-holed endpoint can't stall sync.
 connect_timeout_secs = 10

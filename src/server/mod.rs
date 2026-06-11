@@ -200,7 +200,7 @@ mod tests {
             wallets: BTreeMap::new(),
             lightwalletd: LightwalletdConfig {
                 servers: vec!["zecrocks".into()],
-                connection: "direct".into(),
+                proxy: None,
                 tls_roots: crate::lightwalletd::TlsRoots::Native,
                 force_tls: None,
                 connect_timeout_secs: 10,

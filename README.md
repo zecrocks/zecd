@@ -85,7 +85,9 @@ server = "zecrocks"              # "ecc" | "ywallet" | "zecrocks" | "host:port" 
 # node and TLS public fallbacks can share one list:
 #   mainnet:  servers = ["http://127.0.0.1:9067", "https://zec.rocks:443", "https://eu.zec.rocks:443"]
 #   testnet:  servers = ["http://127.0.0.1:9067", "https://testnet.zec.rocks:443"]
-connection = "direct"
+connection = "direct"           # "direct" | "tor" | "socks5://host:port" - route all lightwalletd
+                                #   traffic through a SOCKS5 proxy ("tor" = 127.0.0.1:9050). TLS is
+                                #   still layered on top, so the proxy only sees ciphertext.
 tls_roots = "native"            # "native" (OS store, honors SSL_CERT_FILE) | "webpki"
 tls = "auto"                    # "auto" (TLS for remote, plaintext for localhost) | "yes" | "no"
 connect_timeout_secs = 10       # per-attempt dial timeout (so a hung endpoint can't stall sync)

@@ -5,7 +5,7 @@
 #![allow(dead_code)] // some config fields/helpers are part of the model but not yet read
 
 use std::collections::BTreeMap;
-use std::net::IpAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
 
 use anyhow::Context;
@@ -80,8 +80,9 @@ pub struct LightwalletdConfig {
     /// Ordered list of server tokens; each is `ecc` | `ywallet` | `zecrocks` or a `host:port`
     /// (or a comma-separated `host:port` list). Tried in order, always preferring the first.
     pub servers: Vec<String>,
-    /// `direct` | `tor` | `socks5://host:port`.
-    pub connection: String,
+    /// Optional SOCKS5 proxy to route every lightwalletd connection through, parsed from the
+    /// `connection` setting (`direct` | `tor` | `socks5://host:port`). `None` = direct.
+    pub proxy: Option<SocketAddr>,
     /// TLS root certificates to trust (`native` or `webpki`).
     pub tls_roots: crate::lightwalletd::TlsRoots,
     /// Force TLS on/off; `None` = auto (TLS for remote hosts, plaintext for localhost).
@@ -277,6 +278,11 @@ pub struct Cli {
     #[arg(long, value_name = "SERVER")]
     pub server: Option<String>,
 
+    /// How to reach lightwalletd: direct | tor | socks5://host:port (routes all traffic through
+    /// the SOCKS5 proxy).
+    #[arg(long, value_name = "MODE")]
+    pub connection: Option<String>,
+
     /// age identity file used to decrypt the wallet seed for sending.
     #[arg(long, value_name = "FILE", env = "ZECD_AGE_IDENTITY")]
     pub age_identity: Option<PathBuf>,
@@ -391,10 +397,18 @@ impl AppConfig {
             None => None,
         };
         let servers = select_server_tokens(cli.server.clone(), lwd_file.servers, lwd_file.server);
+        // CLI `--connection` wins over the file `connection`; both parse to an optional SOCKS5
+        // proxy. Validated here so a typo fails at startup, before any wallet/network I/O.
+        let connection = cli
+            .connection
+            .clone()
+            .or(lwd_file.connection)
+            .unwrap_or_else(|| "direct".to_string());
+        let proxy = crate::lightwalletd::parse_connection_mode(&connection)?;
         let reconnect_base_secs = lwd_file.reconnect_base_secs.unwrap_or(1).max(1);
         let lightwalletd = LightwalletdConfig {
             servers,
-            connection: lwd_file.connection.unwrap_or_else(|| "direct".to_string()),
+            proxy,
             tls_roots,
             force_tls,
             connect_timeout_secs: lwd_file.connect_timeout_secs.unwrap_or(10).max(1),

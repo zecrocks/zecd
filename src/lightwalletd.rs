@@ -1,9 +1,14 @@
-//! lightwalletd connection management. Ported from `zcash-devtool/src/remote.rs`, keeping
-//! direct connections only. TLS is used for remote hosts and skipped for localhost, but can
-//! be forced on/off explicitly (e.g. a co-located plaintext lightwalletd reached by service
-//! name in docker-compose). No Tor/SOCKS.
+//! lightwalletd connection management. Ported from `zcash-devtool/src/remote.rs`. TLS is used
+//! for remote hosts and skipped for localhost (and `.onion`), but can be forced on/off explicitly
+//! (e.g. a co-located plaintext lightwalletd reached by service name in docker-compose).
+//!
+//! Connections can optionally be routed through a SOCKS5 proxy (`[lightwalletd] connection`),
+//! which covers Tor, Nym, and any other SOCKS5 proxy - see [`parse_connection_mode`]. The proxy,
+//! like the TLS settings, is attached to every resolved [`Server`] so no connection can silently
+//! bypass it.
 
 use std::borrow::Cow;
+use std::net::SocketAddr;
 use std::time::Duration;
 
 use anyhow::anyhow;
@@ -11,6 +16,7 @@ use tonic::transport::{Channel, ClientTlsConfig};
 use zcash_client_backend::proto::service::compact_tx_streamer_client::CompactTxStreamerClient;
 
 use crate::network::ZNetwork;
+use crate::socks::SocksConnector;
 
 /// Which set of root certificates to trust for TLS connections.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
@@ -45,6 +51,39 @@ pub fn parse_tls_mode(s: &str) -> anyhow::Result<Option<bool>> {
     }
 }
 
+/// Tor's conventional local SOCKS5 listener, used as the proxy when `connection = "tor"`.
+const TOR_SOCKS_DEFAULT: &str = "127.0.0.1:9050";
+
+/// Parse a `[lightwalletd] connection` setting into an optional SOCKS5 proxy address that every
+/// lightwalletd connection should be dialed through. Recognised forms:
+///
+/// - `direct` - no proxy; dial endpoints directly (the default).
+/// - `tor` - route through Tor's default local SOCKS port (`127.0.0.1:9050`). zecd has no
+///   built-in Tor client (unlike zcash-devtool), so this is just a convenience alias for the
+///   standard Tor proxy; run a `tor` daemon alongside zecd.
+/// - `socks5://<host>:<port>` - route through an explicit SOCKS5 proxy (Tor on a non-default
+///   port, Nym, etc.).
+pub fn parse_connection_mode(s: &str) -> anyhow::Result<Option<SocketAddr>> {
+    let s = s.trim();
+    match s.to_ascii_lowercase().as_str() {
+        "direct" | "" => Ok(None),
+        "tor" => Ok(Some(parse_socks_addr(TOR_SOCKS_DEFAULT)?)),
+        lower if lower.starts_with("socks5://") => {
+            // Slice the original (not the lowercased copy) so the address keeps its case.
+            Ok(Some(parse_socks_addr(&s["socks5://".len()..])?))
+        }
+        _ => Err(anyhow!(
+            "invalid connection '{s}', expected 'direct', 'tor', or 'socks5://<host>:<port>'"
+        )),
+    }
+}
+
+fn parse_socks_addr(addr: &str) -> anyhow::Result<SocketAddr> {
+    addr.trim()
+        .parse()
+        .map_err(|_| anyhow!("invalid SOCKS5 proxy address '{addr}', expected <ip>:<port>"))
+}
+
 /// A resolved lightwalletd endpoint.
 #[derive(Clone, Debug)]
 pub struct Server {
@@ -53,16 +92,27 @@ pub struct Server {
     roots: TlsRoots,
     /// `Some(true/false)` forces TLS on/off; `None` uses the localhost heuristic.
     force_tls: Option<bool>,
+    /// When set, every connection to this endpoint is dialed through this SOCKS5 proxy.
+    proxy: Option<SocketAddr>,
 }
 
 impl Server {
-    fn new(host: Cow<'static, str>, port: u16, roots: TlsRoots, force_tls: Option<bool>) -> Self {
-        Server { host, port, roots, force_tls }
+    fn new(
+        host: Cow<'static, str>,
+        port: u16,
+        roots: TlsRoots,
+        force_tls: Option<bool>,
+        proxy: Option<SocketAddr>,
+    ) -> Self {
+        Server { host, port, roots, force_tls, proxy }
     }
 
     fn use_tls(&self) -> bool {
         self.force_tls.unwrap_or_else(|| {
+            // localhost never has a cert; `.onion` is encrypted by Tor itself. Everything else
+            // is treated as a remote host that needs TLS.
             !matches!(self.host.as_ref(), "localhost" | "127.0.0.1" | "::1")
+                && !self.host.ends_with(".onion")
         })
     }
 
@@ -76,7 +126,12 @@ impl Server {
     }
 
     pub fn describe(&self) -> String {
-        format!("{}:{} (tls={})", self.host, self.port, self.use_tls())
+        match self.proxy {
+            Some(proxy) => {
+                format!("{}:{} (tls={}, socks={proxy})", self.host, self.port, self.use_tls())
+            }
+            None => format!("{}:{} (tls={})", self.host, self.port, self.use_tls()),
+        }
     }
 
     /// Open a gRPC connection to this lightwalletd server, bounding the whole dial (including
@@ -93,12 +148,12 @@ impl Server {
         // critical unary calls. TCP keepalive complements it below the HTTP/2 layer: it
         // detects a dead L4 path (host suspend, NAT rebind, silently dropped conntrack
         // entries) and keeps idle NAT/firewall mappings alive between syncs.
-        let channel = Channel::from_shared(self.endpoint())?
+        let endpoint = Channel::from_shared(self.endpoint())?
             .tcp_keepalive(Some(Duration::from_secs(15)))
             .http2_keep_alive_interval(Duration::from_secs(15))
             .keep_alive_timeout(Duration::from_secs(5))
             .keep_alive_while_idle(true);
-        let channel = if self.use_tls() {
+        let endpoint = if self.use_tls() {
             let tls = ClientTlsConfig::new()
                 .domain_name(self.host.to_string())
                 .assume_http2(true);
@@ -106,11 +161,20 @@ impl Server {
                 TlsRoots::Native => tls.with_native_roots(),
                 TlsRoots::Webpki => tls.with_webpki_roots(),
             };
-            channel.tls_config(tls)?
+            endpoint.tls_config(tls)?
         } else {
-            channel
+            endpoint
         };
-        let connected = tokio::time::timeout(timeout, channel.connect())
+        // Routing through a SOCKS5 proxy supplies tonic a custom connector; tonic still layers
+        // the `tls_config` above over the proxied stream, so remote endpoints stay TLS-encrypted
+        // end to end (the proxy only sees ciphertext). Without a proxy we dial directly.
+        let connect = async {
+            match self.proxy {
+                Some(proxy) => endpoint.connect_with_connector(SocksConnector::new(proxy)).await,
+                None => endpoint.connect().await,
+            }
+        };
+        let connected = tokio::time::timeout(timeout, connect)
             .await
             .map_err(|_| anyhow!("connect to {} timed out after {timeout:?}", self.describe()))??;
         Ok(CompactTxStreamerClient::new(connected))
@@ -141,6 +205,7 @@ pub fn resolve(
     network: ZNetwork,
     roots: TlsRoots,
     force_tls: Option<bool>,
+    proxy: Option<SocketAddr>,
 ) -> anyhow::Result<Vec<Server>> {
     // The named presets are public mainnet/testnet infrastructure; regtest has none, so a
     // regtest deployment must give an explicit `host:port` (handled by `parse_host_list`).
@@ -152,14 +217,14 @@ pub fn resolve(
         ("zecrocks", ZNetwork::Main) => Some(ZEC_ROCKS_MAINNET),
         ("zecrocks", ZNetwork::Test) => Some(ZEC_ROCKS_TESTNET),
         ("zecrocks", _) => None,
-        _ => return parse_host_list(server, roots, force_tls),
+        _ => return parse_host_list(server, roots, force_tls, proxy),
     };
 
     match preset {
         // Preset consts are non-empty by construction, so the result is non-empty.
         Some(entries) => Ok(entries
             .iter()
-            .map(|&(host, port)| Server::new(Cow::Borrowed(host), port, roots, force_tls))
+            .map(|&(host, port)| Server::new(Cow::Borrowed(host), port, roots, force_tls, proxy))
             .collect()),
         None => Err(anyhow!(
             "lightwalletd preset '{server}' does not serve {}",
@@ -175,10 +240,11 @@ pub fn resolve_all(
     network: ZNetwork,
     roots: TlsRoots,
     force_tls: Option<bool>,
+    proxy: Option<SocketAddr>,
 ) -> anyhow::Result<Vec<Server>> {
     let mut out = Vec::new();
     for token in servers {
-        out.extend(resolve(token, network, roots, force_tls)?);
+        out.extend(resolve(token, network, roots, force_tls, proxy)?);
     }
     if out.is_empty() {
         return Err(anyhow!("no lightwalletd servers configured"));
@@ -186,7 +252,12 @@ pub fn resolve_all(
     Ok(out)
 }
 
-fn parse_host_list(s: &str, roots: TlsRoots, force_tls: Option<bool>) -> anyhow::Result<Vec<Server>> {
+fn parse_host_list(
+    s: &str,
+    roots: TlsRoots,
+    force_tls: Option<bool>,
+    proxy: Option<SocketAddr>,
+) -> anyhow::Result<Vec<Server>> {
     let mut servers = Vec::new();
     for entry in s.split(',') {
         let entry = entry.trim();
@@ -208,7 +279,7 @@ fn parse_host_list(s: &str, roots: TlsRoots, force_tls: Option<bool>) -> anyhow:
         let port: u16 = port_str
             .parse()
             .map_err(|_| anyhow!("invalid port in '{entry}'"))?;
-        servers.push(Server::new(Cow::Owned(host.to_string()), port, roots, force));
+        servers.push(Server::new(Cow::Owned(host.to_string()), port, roots, force, proxy));
     }
     if servers.is_empty() {
         return Err(anyhow!("no lightwalletd hosts in '{s}'"));
@@ -222,33 +293,33 @@ mod tests {
 
     #[test]
     fn resolves_presets_and_custom() {
-        let s = resolve("zecrocks", ZNetwork::Test, TlsRoots::Native, None).unwrap();
+        let s = resolve("zecrocks", ZNetwork::Test, TlsRoots::Native, None, None).unwrap();
         assert_eq!(s[0].host.as_ref(), "testnet.zec.rocks");
         assert!(s[0].use_tls());
-        let s = resolve("zecrocks", ZNetwork::Main, TlsRoots::Native, None).unwrap();
+        let s = resolve("zecrocks", ZNetwork::Main, TlsRoots::Native, None, None).unwrap();
         assert_eq!(s[0].host.as_ref(), "zec.rocks");
         // localhost auto -> plaintext
-        let s = resolve("127.0.0.1:9067", ZNetwork::Test, TlsRoots::Native, None).unwrap();
+        let s = resolve("127.0.0.1:9067", ZNetwork::Test, TlsRoots::Native, None, None).unwrap();
         assert!(!s[0].use_tls());
         // forced plaintext for a co-located lightwalletd reached by service name
-        let s = resolve("lightwalletd:9067", ZNetwork::Test, TlsRoots::Native, Some(false)).unwrap();
+        let s = resolve("lightwalletd:9067", ZNetwork::Test, TlsRoots::Native, Some(false), None).unwrap();
         assert!(!s[0].use_tls());
         // forced TLS even for localhost
-        let s = resolve("127.0.0.1:443", ZNetwork::Main, TlsRoots::Native, Some(true)).unwrap();
+        let s = resolve("127.0.0.1:443", ZNetwork::Main, TlsRoots::Native, Some(true), None).unwrap();
         assert!(s[0].use_tls());
-        assert!(resolve("ecc", ZNetwork::Main, TlsRoots::Native, None).is_err());
+        assert!(resolve("ecc", ZNetwork::Main, TlsRoots::Native, None, None).is_err());
     }
 
     #[test]
     fn single_host_unchanged() {
-        let s = resolve("127.0.0.1:9067", ZNetwork::Test, TlsRoots::Native, None).unwrap();
+        let s = resolve("127.0.0.1:9067", ZNetwork::Test, TlsRoots::Native, None, None).unwrap();
         assert_eq!(s.len(), 1);
         assert!(!s[0].use_tls());
     }
 
     #[test]
     fn resolves_multi_host() {
-        let s = resolve("a.example:9067,b.example:443", ZNetwork::Test, TlsRoots::Native, None)
+        let s = resolve("a.example:9067,b.example:443", ZNetwork::Test, TlsRoots::Native, None, None)
             .unwrap();
         assert_eq!(s.len(), 2);
         assert_eq!(s[0].host.as_ref(), "a.example");
@@ -260,7 +331,7 @@ mod tests {
     #[test]
     fn resolves_preset_returns_all_endpoints() {
         // ywallet mainnet has two endpoints; both must be returned (old resolve dropped the 2nd).
-        let s = resolve("ywallet", ZNetwork::Main, TlsRoots::Native, None).unwrap();
+        let s = resolve("ywallet", ZNetwork::Main, TlsRoots::Native, None, None).unwrap();
         assert_eq!(s.len(), 2);
         assert_eq!(s[0].host.as_ref(), "lwd1.zcash-infra.com");
         assert_eq!(s[1].host.as_ref(), "lwd2.zcash-infra.com");
@@ -268,7 +339,7 @@ mod tests {
 
     #[test]
     fn multi_host_tolerates_whitespace_and_trailing_comma() {
-        let s = resolve("a:1 , b:2 ,", ZNetwork::Test, TlsRoots::Native, None).unwrap();
+        let s = resolve("a:1 , b:2 ,", ZNetwork::Test, TlsRoots::Native, None, None).unwrap();
         assert_eq!(s.len(), 2);
         assert_eq!(s[0].host.as_ref(), "a");
         assert_eq!(s[1].host.as_ref(), "b");
@@ -276,8 +347,8 @@ mod tests {
 
     #[test]
     fn empty_host_list_errors() {
-        assert!(resolve(" , ", ZNetwork::Test, TlsRoots::Native, None).is_err());
-        assert!(resolve(",", ZNetwork::Test, TlsRoots::Native, None).is_err());
+        assert!(resolve(" , ", ZNetwork::Test, TlsRoots::Native, None, None).is_err());
+        assert!(resolve(",", ZNetwork::Test, TlsRoots::Native, None, None).is_err());
     }
 
     #[test]
@@ -287,6 +358,7 @@ mod tests {
             "http://lightwalletd:9067,https://zec.rocks:443",
             ZNetwork::Main,
             TlsRoots::Native,
+            None,
             None,
         )
         .unwrap();
@@ -305,6 +377,7 @@ mod tests {
             ZNetwork::Main,
             TlsRoots::Native,
             Some(false),
+            None,
         )
         .unwrap();
         assert!(!s[0].use_tls()); // no scheme -> global force (plaintext)
@@ -314,11 +387,11 @@ mod tests {
     #[test]
     fn resolve_all_flattens() {
         let tokens = vec!["127.0.0.1:9067".to_string(), "zecrocks".to_string()];
-        let s = resolve_all(&tokens, ZNetwork::Main, TlsRoots::Native, None).unwrap();
+        let s = resolve_all(&tokens, ZNetwork::Main, TlsRoots::Native, None, None).unwrap();
         assert_eq!(s.len(), 2); // 127.0.0.1:9067 + zec.rocks
         assert_eq!(s[0].host.as_ref(), "127.0.0.1");
         assert_eq!(s[1].host.as_ref(), "zec.rocks");
-        assert!(resolve_all(&[], ZNetwork::Main, TlsRoots::Native, None).is_err());
+        assert!(resolve_all(&[], ZNetwork::Main, TlsRoots::Native, None, None).is_err());
     }
 
     #[test]
@@ -329,6 +402,74 @@ mod tests {
         assert!(parse_tls_mode("maybe").is_err());
     }
 
+    #[test]
+    fn connection_mode_parsing() {
+        // `direct` (and the empty string) means no proxy.
+        assert_eq!(parse_connection_mode("direct").unwrap(), None);
+        assert_eq!(parse_connection_mode("  ").unwrap(), None);
+        // `tor` aliases Tor's default local SOCKS port.
+        assert_eq!(
+            parse_connection_mode("tor").unwrap(),
+            Some("127.0.0.1:9050".parse().unwrap())
+        );
+        // Explicit SOCKS5 proxies are parsed verbatim, case-insensitively on the scheme.
+        assert_eq!(
+            parse_connection_mode("socks5://127.0.0.1:9150").unwrap(),
+            Some("127.0.0.1:9150".parse().unwrap())
+        );
+        assert_eq!(
+            parse_connection_mode("SOCKS5://192.168.1.5:1080").unwrap(),
+            Some("192.168.1.5:1080".parse().unwrap())
+        );
+        // Garbage and unparseable proxy addresses are rejected.
+        assert!(parse_connection_mode("proxy").is_err());
+        assert!(parse_connection_mode("socks5://not-an-addr").is_err());
+        assert!(parse_connection_mode("socks5://example.com:9050").is_err());
+    }
+
+    #[test]
+    fn proxy_threads_through_resolve() {
+        let proxy: SocketAddr = "127.0.0.1:9050".parse().unwrap();
+        let s = resolve("zecrocks", ZNetwork::Main, TlsRoots::Native, None, Some(proxy)).unwrap();
+        assert_eq!(s[0].proxy, Some(proxy));
+        // describe() surfaces the proxy so logs make the routing obvious.
+        assert!(s[0].describe().contains("socks=127.0.0.1:9050"));
+        // host:port lists carry the proxy onto every endpoint too.
+        let s = resolve(
+            "a.example:9067,b.example:443",
+            ZNetwork::Main,
+            TlsRoots::Native,
+            None,
+            Some(proxy),
+        )
+        .unwrap();
+        assert!(s.iter().all(|srv| srv.proxy == Some(proxy)));
+    }
+
+    #[test]
+    fn onion_host_skips_tls_by_default() {
+        // `.onion` endpoints are encrypted by Tor; default heuristic must not require TLS.
+        let s = resolve(
+            "abcd1234.onion:9067",
+            ZNetwork::Main,
+            TlsRoots::Native,
+            None,
+            Some("127.0.0.1:9050".parse().unwrap()),
+        )
+        .unwrap();
+        assert!(!s[0].use_tls());
+        // …but an explicit `https://` still forces TLS over the onion route.
+        let s = resolve(
+            "https://abcd1234.onion:443",
+            ZNetwork::Main,
+            TlsRoots::Native,
+            None,
+            None,
+        )
+        .unwrap();
+        assert!(s[0].use_tls());
+    }
+
     // --- Network integration tests (hit the public zecrocks/ECC testnet lightwalletd) ---
     // Run with: cargo test -- --include-ignored
 
@@ -336,7 +477,7 @@ mod tests {
     #[ignore = "hits testnet.zec.rocks over the network"]
     async fn testnet_zecrocks_get_latest_block() {
         use zcash_client_backend::proto::service;
-        let server = resolve("zecrocks", ZNetwork::Test, TlsRoots::Native, None)
+        let server = resolve("zecrocks", ZNetwork::Test, TlsRoots::Native, None, None)
             .unwrap()
             .into_iter()
             .next()
@@ -355,7 +496,7 @@ mod tests {
     #[ignore = "hits testnet.zec.rocks over the network"]
     async fn testnet_zecrocks_lightd_info_and_treestate() {
         use zcash_client_backend::proto::service;
-        let server = resolve("zecrocks", ZNetwork::Test, TlsRoots::Native, None)
+        let server = resolve("zecrocks", ZNetwork::Test, TlsRoots::Native, None, None)
             .unwrap()
             .into_iter()
             .next()
@@ -387,7 +528,7 @@ mod tests {
         use zcash_client_backend::proto::service;
         // A closed local port as the primary, with the live testnet endpoint as fallback.
         let servers =
-            resolve("127.0.0.1:1,testnet.zec.rocks:443", ZNetwork::Test, TlsRoots::Native, None)
+            resolve("127.0.0.1:1,testnet.zec.rocks:443", ZNetwork::Test, TlsRoots::Native, None, None)
                 .unwrap();
         assert_eq!(servers.len(), 2);
         let timeout = Duration::from_secs(10);
@@ -410,7 +551,7 @@ mod tests {
     #[ignore = "hits zec.rocks (mainnet) over the network"]
     async fn mainnet_zecrocks_get_latest_block() {
         use zcash_client_backend::proto::service;
-        let server = resolve("zecrocks", ZNetwork::Main, TlsRoots::Native, None)
+        let server = resolve("zecrocks", ZNetwork::Main, TlsRoots::Native, None, None)
             .unwrap()
             .into_iter()
             .next()

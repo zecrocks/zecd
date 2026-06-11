@@ -91,6 +91,7 @@ pub async fn run(config: &AppConfig, args: &InitArgs) -> anyhow::Result<()> {
         network,
         config.lightwalletd.tls_roots,
         config.lightwalletd.force_tls,
+        config.lightwalletd.proxy,
     )?
     .into_iter()
     .next()

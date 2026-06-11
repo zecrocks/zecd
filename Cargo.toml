@@ -48,6 +48,10 @@ secrecy = "0.8"
 # lets us trust the OS store (and SSL_CERT_FILE), which `tls-webpki-roots` alone does not.
 tonic = { version = "0.14", features = ["gzip", "tls-ring", "tls-native-roots", "tls-webpki-roots"] }
 prost = "0.14"
+# SOCKS5 proxy support for routing lightwalletd connections through Tor/Nym/any SOCKS5 proxy.
+# `hyper-util`'s `TokioIo` adapts the proxied TCP stream to tonic's connector interface.
+tokio-socks = "0.5"
+hyper-util = { version = "0.1", features = ["tokio"] }
 rusqlite = { version = "0.37", features = ["time"] }
 time = "0.3"
 uuid = { version = "1", features = ["v4", "serde"] }
