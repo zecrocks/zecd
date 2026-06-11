@@ -114,11 +114,15 @@ ready_progress = 0.999           # /readyz is 200 once scan progress reaches thi
 
 ## Supported RPC methods
 
-**Wallet:** `getnewaddress` (→ Orchard UA), `getbalance`, `getunconfirmedbalance`,
+**Wallet:** `getnewaddress` (→ Orchard UA), `getbalance`, `getbalances`, `getunconfirmedbalance`,
 `getwalletinfo`, `getaddressinfo`, `setlabel`, `getaddressesbylabel`, `listlabels`,
 `listtransactions`, `listsinceblock`, `gettransaction`, `listunspent`, `getreceivedbyaddress`,
-`listreceivedbyaddress`, `sendtoaddress`, `sendmany`, `encryptwallet`, `walletpassphrase`,
-`walletpassphrasechange`, `walletlock`, `listwallets`.
+`listreceivedbyaddress`, `getreceivedbylabel`, `listreceivedbylabel`, `sendtoaddress`, `sendmany`,
+`encryptwallet`, `walletpassphrase`, `walletpassphrasechange`, `walletlock`, `listwallets`.
+
+**Raw transactions:** `getrawtransaction` (verbose form is zcashd's `TxToJSON` shape, matching
+Zallet, with the shielded bundles included), `sendrawtransaction` (broadcasts caller-built raw
+bytes through lightwalletd).
 
 **Blockchain:** `getblockchaininfo`, `getblockcount`, `getbestblockhash`, `getblockhash`.
 

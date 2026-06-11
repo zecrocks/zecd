@@ -33,6 +33,9 @@ base64 = "0.22"
 subtle = "2"
 hmac = "0.12"
 sha2 = "0.10"
+# hash160 (= ripemd160(sha256)) for transparent-script address extraction in
+# `getrawtransaction`; already in the tree via the zcash crates.
+ripemd = "0.1"
 rand = { version = "0.8", default-features = false, features = ["std", "std_rng"] }
 hex = "0.4"
 
@@ -60,6 +63,9 @@ zcash_primitives = "0.28"
 zcash_proofs = { version = "0.28", features = ["bundled-prover"] }
 zcash_protocol = { version = "0.9", features = ["local-consensus"] }
 zcash_transparent = "0.8"
+# Script asm rendering + standard-script solver for `getrawtransaction` (already in the
+# tree via zcash_transparent; same crate Zallet uses for this).
+zcash_script = "0.4.5"
 sapling = { package = "sapling-crypto", version = "0.7" }
 zip32 = "0.2"
 zip321 = "0.8"

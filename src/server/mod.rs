@@ -363,6 +363,12 @@ mod tests {
             r#"{"method":"listsinceblock","id":1,"params":[]}"#,
             r#"{"method":"getreceivedbyaddress","id":1,"params":["uaddr"]}"#,
             r#"{"method":"listreceivedbyaddress","id":1,"params":[]}"#,
+            r#"{"method":"getbalances","id":1,"params":[]}"#,
+            r#"{"method":"getreceivedbylabel","id":1,"params":["l"]}"#,
+            r#"{"method":"listreceivedbylabel","id":1,"params":[]}"#,
+            r#"{"method":"walletpassphrasechange","id":1,"params":["a","b"]}"#,
+            r#"{"method":"getrawtransaction","id":1,"params":["00"]}"#,
+            r#"{"method":"sendrawtransaction","id":1,"params":["00"]}"#,
         ] {
             let code = call_err_code(body).await;
             assert!(code.is_some(), "walletless state must yield an error: {body}");

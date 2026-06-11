@@ -3,6 +3,7 @@
 pub mod blockchain;
 pub mod control;
 pub mod network;
+pub mod rawtx;
 pub mod util;
 pub mod wallet_methods;
 
@@ -49,8 +50,13 @@ pub async fn dispatch(
         "estimatefee" => util::estimatefee(req),
         "getmempoolinfo" => util::getmempoolinfo(),
 
+        // Raw transactions (served via the wallet's lightwalletd connection)
+        "getrawtransaction" => rawtx::getrawtransaction(state, wallet, req).await,
+        "sendrawtransaction" => rawtx::sendrawtransaction(state, wallet, req).await,
+
         // Wallet - reads
         "getbalance" => wallet_methods::getbalance(state, wallet),
+        "getbalances" => wallet_methods::getbalances(state, wallet),
         "getunconfirmedbalance" => wallet_methods::getunconfirmedbalance(state, wallet),
         "getwalletinfo" => wallet_methods::getwalletinfo(state, wallet),
         "getaddressinfo" => wallet_methods::getaddressinfo(state, wallet, req),
@@ -62,6 +68,8 @@ pub async fn dispatch(
         "listunspent" => wallet_methods::listunspent(state, wallet, req),
         "getreceivedbyaddress" => wallet_methods::getreceivedbyaddress(state, wallet, req),
         "listreceivedbyaddress" => wallet_methods::listreceivedbyaddress(state, wallet, req),
+        "getreceivedbylabel" => wallet_methods::getreceivedbylabel(state, wallet, req),
+        "listreceivedbylabel" => wallet_methods::listreceivedbylabel(state, wallet, req),
         "listwallets" => wallet_methods::listwallets(state),
         "setlabel" => wallet_methods::setlabel(state, wallet, req),
 
@@ -69,10 +77,10 @@ pub async fn dispatch(
         "getnewaddress" => wallet_methods::getnewaddress(state, wallet, req).await,
         "sendtoaddress" => wallet_methods::sendtoaddress(state, wallet, req).await,
         "sendmany" => wallet_methods::sendmany(state, wallet, req).await,
-        "walletpassphrase" => wallet_methods::walletpassphrase(state, wallet, req).await,
-        "walletlock" => wallet_methods::walletlock(state, wallet).await,
         "encryptwallet" => wallet_methods::encryptwallet(state, wallet, req).await,
+        "walletpassphrase" => wallet_methods::walletpassphrase(state, wallet, req).await,
         "walletpassphrasechange" => wallet_methods::walletpassphrasechange(state, wallet, req).await,
+        "walletlock" => wallet_methods::walletlock(state, wallet).await,
 
         other => Err(RpcError::method_not_found(other)),
     }
