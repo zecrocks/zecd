@@ -862,6 +862,9 @@ impl WalletActor {
         };
         let raw = match raw {
             Ok(r) => r.into_inner(),
+            // The upstream looked up the txid and doesn't know it: an application-level
+            // miss, not a failure - keep the (healthy) client and report "no such tx".
+            Err(status) if is_tx_not_found(&status) => return Ok(None),
             Err(e) => {
                 // Transport failure: drop the dead client so the next op reconnects/fails over.
                 self.client = None;
@@ -1109,5 +1112,44 @@ fn classify_err(e: crate::error::ProposalError) -> RpcError {
                 RpcError::wallet(s)
             }
         }
+    }
+}
+
+/// True when a `GetTransaction` error status means the node simply does not know the txid -
+/// an application-level miss the RPC layer reports as -5, not a transport failure worth
+/// dropping the connection over. lightwalletd proxies the backing node's message through:
+/// zcashd says "No such mempool transaction" / "No such mempool or blockchain transaction"
+/// (with -txindex) or, historically, "No information available about transaction"; zebrad
+/// says "No such mempool or main chain transaction".
+fn is_tx_not_found(status: &tonic::Status) -> bool {
+    if status.code() == tonic::Code::NotFound {
+        return true;
+    }
+    let msg = status.message().to_lowercase();
+    msg.contains("no such mempool") || msg.contains("no information available about transaction")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_tx_not_found;
+
+    #[test]
+    fn tx_not_found_statuses_are_misses_not_failures() {
+        for msg in [
+            "No such mempool transaction. Use -txindex to enable blockchain transaction queries.",
+            "No such mempool or blockchain transaction",
+            "No such mempool or main chain transaction",
+            "-5: No such mempool or main chain transaction",
+            "No information available about transaction",
+        ] {
+            assert!(
+                is_tx_not_found(&tonic::Status::unknown(msg)),
+                "{msg:?} must classify as not-found"
+            );
+        }
+        assert!(is_tx_not_found(&tonic::Status::not_found("anything")));
+        // Transport-class failures must still drop the client.
+        assert!(!is_tx_not_found(&tonic::Status::unavailable("connection refused")));
+        assert!(!is_tx_not_found(&tonic::Status::deadline_exceeded("timed out")));
     }
 }
