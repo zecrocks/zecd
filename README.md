@@ -15,9 +15,12 @@ It is not recommended to ever share seed phrases between apps. However by design
 goes badly wrong with zecd, its seed phrases can be entered into any other librustzcash wallet
 to access funds.
 
-zecd is a light client for quick scalability. It syncs compact blocks in the background and
+zecd is a light client, for quick scalability. It syncs compact blocks in the background and
 never speaks P2P or indexes the chain itself. Production deployments should connect to a full
 self-hosted Zcash node (Zebra + Lightwalletd, or Zaino).
+
+All zecd funds are recoverable by a seed phrase. Importing private keys per-address is not
+supported, all addresses are dervied from wallet seeds.
 
 ## Deployment model
 
