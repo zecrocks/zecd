@@ -1,18 +1,16 @@
 # zecd
 
-A **Bitcoin-Core-style JSON-RPC server for Zcash**, backed entirely by
-[librustzcash](https://github.com/zcash/librustzcash), operating an **Orchard-shielded-only**
-wallet.
+A Bitcoin-Core-style JSON-RPC server for Zcash, backed by
+[librustzcash](https://github.com/zcash/librustzcash), operating an Orchard-shielded-only wallet.
 
-`zecd` speaks Bitcoin Core's JSON-RPC dialect - the same method names, response shapes,
-HTTP Basic/cookie auth, JSON-RPC 1.0 envelope, and batching - so existing Bitcoin RPC client
-libraries (Python `python-bitcoinrpc`, Rust `bitcoincore-rpc`, Go `rpcclient`, Ruby) and
-Bitcoin-RPC-style integrations can talk to it with little or no massaging. It is **not** modeled
-on `zcashd`'s `z_*` RPC: it reuses Bitcoin names (`getbalance`, `getnewaddress`, `sendtoaddress`,
-`listtransactions`, `gettransaction`, …) and maps them onto Orchard shielded operations.
+zecd speaks Bitcoin Core's RPC dialect - same method names, response shapes, HTTP Basic/cookie
+auth, JSON-RPC 1.0 envelope, and batching - so existing Bitcoin RPC clients (`python-bitcoinrpc`,
+`bitcoincore-rpc`, Go `rpcclient`, etc.) work with little or no changes. It is not modeled on
+`zcashd`'s `z_*` RPC: it reuses Bitcoin names (`getbalance`, `getnewaddress`, `sendtoaddress`,
+`listtransactions`, ...) and maps them onto Orchard shielded operations.
 
-It is a **lightwalletd-backed light client**: it syncs compact blocks in the background and never
-speaks a peer-to-peer protocol, streams full blocks, or indexes the chain itself.
+It is a lightwalletd-backed light client: it syncs compact blocks in the background and never
+speaks P2P, streams full blocks, or indexes the chain itself.
 
 ## Deployment model
 
@@ -20,11 +18,9 @@ speaks a peer-to-peer protocol, streams full blocks, or indexes the chain itself
 zebra (full node)  →  lightwalletd  →  zecd  →  your app / Bitcoin RPC client
 ```
 
-- **Self-hosted production:** point `zecd` at your own local `lightwalletd` (which talks to
-  `zebra`). Set `[lightwalletd] server = "127.0.0.1:9067"`.
-- **Testing / out-of-the-box:** `zecd` defaults to the public **zecrocks** infrastructure
-  (`zec.rocks:443` on mainnet, `testnet.zec.rocks:443` on testnet), so it runs immediately with
-  no node to stand up.
+Self-hosted: point zecd at your own lightwalletd with `[lightwalletd] server = "127.0.0.1:9067"`.
+By default it uses the public zecrocks infrastructure (`zec.rocks:443` mainnet,
+`testnet.zec.rocks:443` testnet), so it runs out of the box with no node to stand up.
 
 ## Quick start
 
@@ -54,7 +50,7 @@ print(rpc.getbalance())
 print(rpc.listtransactions("*", 20))
 ```
 
-If you do not set `--rpcuser`/`--rpcpassword`, `zecd` writes a bitcoind-style cookie file to
+Without `--rpcuser`/`--rpcpassword`, zecd writes a bitcoind-style cookie file to
 `<datadir>/.cookie` and authenticates against that.
 
 ## Configuration
@@ -114,65 +110,60 @@ ready_progress = 0.999           # /readyz is 200 once scan progress reaches thi
 
 ## Supported RPC methods
 
-**Wallet:** `getnewaddress` (→ Orchard UA), `getbalance`, `getbalances`, `getunconfirmedbalance`,
+Wallet: `getnewaddress` (→ Orchard UA), `getbalance`, `getbalances`, `getunconfirmedbalance`,
 `getwalletinfo`, `getaddressinfo`, `setlabel`, `getaddressesbylabel`, `listlabels`,
 `listtransactions`, `listsinceblock`, `gettransaction`, `listunspent`, `getreceivedbyaddress`,
 `listreceivedbyaddress`, `getreceivedbylabel`, `listreceivedbylabel`, `sendtoaddress`, `sendmany`,
 `encryptwallet`, `walletpassphrase`, `walletpassphrasechange`, `walletlock`, `listwallets`.
 
-**Raw transactions:** `getrawtransaction` (verbose form is zcashd's `TxToJSON` shape, matching
-Zallet, with the shielded bundles included), `sendrawtransaction` (broadcasts caller-built raw
-bytes through lightwalletd).
+Raw transactions: `getrawtransaction` (verbose form is zcashd's `TxToJSON` shape, matching Zallet,
+shielded bundles included), `sendrawtransaction` (broadcasts caller-built raw bytes through
+lightwalletd).
 
-**Blockchain:** `getblockchaininfo`, `getblockcount`, `getbestblockhash`, `getblockhash`.
+Blockchain: `getblockchaininfo`, `getblockcount`, `getbestblockhash`, `getblockhash`.
 
-**Network:** `getnetworkinfo`, `getconnectioncount`, `getpeerinfo`, `ping`.
+Network: `getnetworkinfo`, `getconnectioncount`, `getpeerinfo`, `ping`.
 
-**Utility:** `validateaddress`, `estimatesmartfee`, `estimatefee`, `getmempoolinfo`.
+Utility: `validateaddress`, `estimatesmartfee`, `estimatefee`, `getmempoolinfo`.
 
-**Control:** `stop`, `uptime`, `help`, `getrpcinfo`.
+Control: `stop`, `uptime`, `help`, `getrpcinfo`.
 
 Multiwallet is addressed bitcoind-style via `POST /wallet/<name>`; the default wallet is used at
 `POST /`.
 
 ## Addresses
 
-`getnewaddress` returns a fresh **Orchard-only Unified Address** (`u1…` / `utest1…`) on every
-call. These are **diversified addresses of a single account**, not new derivation paths: the
-wallet has one ZIP-32 account (`m/32'/coin_type'/account'`), and each address is a different
-*diversifier index* of that account's Orchard key (`UnifiedAddressRequest::ORCHARD` →
-`account.uivk().find_address(j, …)`). librustzcash advances to the next unused diversifier
-(starting from a timestamp-derived index, incrementing past any collision) and persists it in the
-wallet's `addresses` table, so each call yields a new, unused address - and all of them receive
-into the same account and are spendable by the same key (ZIP-316 unified addresses + ZIP-32
-diversification).
+`getnewaddress` returns a fresh Orchard-only Unified Address (`u1…` / `utest1…`) on every call.
+These are diversified addresses of a single account, not new derivation paths: the wallet has one
+ZIP-32 account (`m/32'/coin_type'/account'`), and each address is a different diversifier index of
+that account's Orchard key. librustzcash advances to the next unused diversifier and persists it,
+so each call yields a new, unused address - all receive into the same account and are spendable by
+the same key (ZIP-316 + ZIP-32 diversification).
 
 ## Logging
 
-zecd logs via `tracing`. The level comes from `[log] level` and is overridden by the standard
-`RUST_LOG` env var (e.g. `RUST_LOG=debug` or `RUST_LOG=zecd=debug,zcash_client_backend=info`). Each
-RPC call emits a structured event - `debug` on success (`method`, `wallet`, `elapsed_ms`), `info`
-on error (adds `code`, `message`) - and sync/connection lifecycle events log at `info`. Set
-`[log] format = "json"` for structured JSON lines suitable for Loki/CloudWatch/Elastic.
+zecd logs via `tracing`. The level comes from `[log] level`, overridden by `RUST_LOG` (e.g.
+`RUST_LOG=zecd=debug,zcash_client_backend=info`). Each RPC call emits a structured event - `debug`
+on success (`method`, `wallet`, `elapsed_ms`), `info` on error (adds `code`, `message`) - and
+sync/connection lifecycle events log at `info`. `[log] format = "json"` emits JSON lines for
+Loki/CloudWatch/Elastic.
 
 ## Concurrency & busy servers
 
-zecd is a daemon; each wallet is owned by a single-writer actor, so **sends serialize per
-wallet** - the same guarantee Bitcoin Core gets from `cs_wallet`. Concurrent
-`sendtoaddress`/`sendmany` calls are processed one at a time, so two sends never select the same
-note: there is **no double-spend**. When many sends go out at once they queue at the actor and each
-client's HTTP call blocks until its send completes. Because a freshly-created change note is
-unconfirmed (not yet spendable), rapid back-to-back sends exhaust spendable notes and then return
-`RPC_WALLET_INSUFFICIENT_FUNDS (-6)` until confirmations arrive - the same code bitcoind returns
-when funds are already spent/locked. The `-6` message reports any balance awaiting confirmations,
-so a client can tell "retry after the next block" apart from "the wallet needs funding".
+Each wallet is owned by a single-writer actor, so sends serialize per wallet - the same guarantee
+Bitcoin Core gets from `cs_wallet`. Concurrent `sendtoaddress`/`sendmany` calls are processed one
+at a time and never select the same note, so there is no double-spend; queued sends block their
+HTTP call until complete. Because freshly-created change is unconfirmed (not yet spendable), rapid
+back-to-back sends exhaust spendable notes and return `RPC_WALLET_INSUFFICIENT_FUNDS (-6)` until
+confirmations arrive - the same code bitcoind returns for spent/locked funds. The `-6` message
+reports any balance awaiting confirmations, so a client can tell "retry after the next block" from
+"the wallet needs funding".
 
-Overload protection matches bitcoind's work queue: at most `[rpc] work_queue` requests
-(default 100, like `-rpcworkqueue`) are in flight; beyond that the server returns **HTTP 503
-`Work queue depth exceeded`**. During shutdown it returns **503 `Request rejected during server
-shutdown`**.
+Overload protection matches bitcoind's work queue: at most `[rpc] work_queue` requests (default
+100, like `-rpcworkqueue`) are in flight; beyond that the server returns HTTP 503 `Work queue
+depth exceeded`. During shutdown it returns 503 `Request rejected during server shutdown`.
 
-HTTP status and error codes match Bitcoin Core exactly (`rpc/protocol.h`, `httprpc.cpp`):
+HTTP status and error codes match Bitcoin Core (`rpc/protocol.h`, `httprpc.cpp`):
 
 | Condition | RPC code | HTTP |
 |---|---|---|
@@ -190,48 +181,45 @@ HTTP status and error codes match Bitcoin Core exactly (`rpc/protocol.h`, `httpr
 
 Batches always return HTTP 200 with per-item errors in the array.
 
-**Visibility under load:** `getrpcinfo` returns `active_commands` - one entry per
-currently-executing call with `method` and `duration` (µs) - so you can see exactly what is in
-flight. Combine with `getwalletinfo` (`txcount`, balances, `scanning`),
-`getbalance`/`getunconfirmedbalance`, `listtransactions`/`gettransaction` (per-tx
-`confirmations`), and the `/status` health endpoint.
+For visibility under load, `getrpcinfo` returns `active_commands` - one entry per executing call
+with `method` and `duration` (µs). Combine with `getwalletinfo` (`txcount`, balances, `scanning`),
+`listtransactions`/`gettransaction` (per-tx `confirmations`), and the `/status` health endpoint.
 
 ## Health & readiness
 
 With `[health] enabled` (default), zecd serves unauthenticated probes on a separate port
-(`[health] port`, default 9233):
+(default 9233):
 
 - `GET /healthz` - liveness: `200 ok` while the process is running.
 - `GET /readyz` - readiness: `200` once every wallet is connected to lightwalletd and synced to
-  `[health] ready_progress`; otherwise `503`. Body is JSON with per-wallet detail; when not ready it
-  also carries a `reason` (`"upstream_down"` vs `"syncing"`) so alerting can tell an unreachable
-  lightwalletd apart from a normal catch-up.
-- `GET /status` - JSON snapshot of per-wallet sync state, including the active `server` endpoint and
-  `conn_state` (`down` | `syncing` | `ready`). `getpeerinfo` reflects the same active upstream.
+  `[health] ready_progress`; otherwise `503`. Body is JSON with per-wallet detail; when not ready
+  it carries a `reason` (`"upstream_down"` vs `"syncing"`) so alerting can tell an unreachable
+  lightwalletd apart from normal catch-up.
+- `GET /status` - JSON snapshot of per-wallet sync state, including the active `server` endpoint
+  and `conn_state` (`down` | `syncing` | `ready`). `getpeerinfo` reflects the same active upstream.
 
-Set `[health] bind = "0.0.0.0"` so a Kubernetes kubelet / load balancer can reach the probes. The
-health server starts after wallets load, so cover the brief prover-init at boot with a
-`startupProbe` / `initialDelaySeconds`.
+Set `[health] bind = "0.0.0.0"` for Kubernetes/LB probes. The health server starts after wallets
+load, so cover the brief prover-init at boot with a `startupProbe` / `initialDelaySeconds`.
 
 ## Bitcoin Core conformance
 
 zecd matches Bitcoin Core's method names, response field names/types, the JSON-RPC 1.0 envelope
 (`{"result","error","id"}`), HTTP 500-with-error-body / 401 semantics, decimal (8-dp) amounts, and
-error codes (`protocol.h`: e.g. `-5`, `-6`, `-13`, `-32601`). This is verified two ways:
+error codes. Verified two ways:
 
-- **`scripts/conformance.py`** drives a running daemon with the *same client logic
-  `python-bitcoinrpc` uses* (`AuthServiceProxy`): Basic auth, the 1.0 envelope, amounts decoded as
-  `decimal.Decimal` (asserting no float drift), `JSONRPCException` raised with the right code, and
-  batching. (Validated live against testnet: 49/49.) `scripts/rpc_smoke.py` is a stdlib-only variant.
-- **`cargo test`** covers the framing/auth/HTTP-status behavior with offline unit + HTTP
-  integration tests, and (with `--include-ignored`) live lightwalletd calls.
+- `scripts/conformance.py` drives a running daemon with the same client logic `python-bitcoinrpc`
+  uses (`AuthServiceProxy`): Basic auth, the 1.0 envelope, amounts decoded as `decimal.Decimal`
+  (asserting no float drift), `JSONRPCException` with the right code, and batching. Validated live
+  against testnet: 49/49. `scripts/rpc_smoke.py` is a stdlib-only variant.
+- `cargo test` covers framing/auth/HTTP-status behavior offline, and (with `--include-ignored`)
+  live lightwalletd calls.
 
 Intentional divergences are listed under *Compatibility boundary* below.
 
 ## Docker / self-hosted stack
 
-`deploy/docker-compose.yml` runs the full **zebra → lightwalletd → zecd** stack (testnet by
-default); `Dockerfile` builds the zecd image.
+`deploy/docker-compose.yml` runs the full zebra → lightwalletd → zecd stack (testnet by default);
+`Dockerfile` builds the zecd image.
 
 ```sh
 cd deploy
@@ -242,9 +230,9 @@ curl localhost:9233/readyz
 curl --user zec:CHANGE-ME --data-binary '{"method":"getblockchaininfo","id":1}' localhost:18232/
 ```
 
-**Mainnet:** a ready-made override is included. Add `-f docker-compose.mainnet.yml` to every command
-to swap each service onto its mainnet config (`zebrad.mainnet.toml`, `lightwalletd-zcash.mainnet.conf`,
-`zecd.mainnet.toml` - local node primary with `zec.rocks:443` / `eu.zec.rocks:443` failover):
+Mainnet: add `-f docker-compose.mainnet.yml` to every command to swap each service onto its
+mainnet config (`zebrad.mainnet.toml`, `lightwalletd-zcash.mainnet.conf`, `zecd.mainnet.toml` -
+local node primary with `zec.rocks:443` / `eu.zec.rocks:443` failover):
 
 ```sh
 docker compose -f docker-compose.yml -f docker-compose.mainnet.yml up -d zebra lightwalletd
@@ -257,42 +245,40 @@ real RPC password in `zecd.toml` / `zecd.mainnet.toml` before exposing the port.
 
 ## Compatibility boundary
 
-`zecd` targets **generic Bitcoin-RPC compatibility**: any integration that drives a coin purely
-through Bitcoin-Core RPC (request an address with `getnewaddress`, then poll
-`listtransactions` / `gettransaction` / `getbalance` to detect payment and confirmations) works.
+zecd targets generic Bitcoin-RPC compatibility: any integration that drives a coin purely through
+Bitcoin-Core RPC (request an address with `getnewaddress`, poll
+`listtransactions`/`gettransaction`/`getbalance` for payment and confirmations) works.
 
-What is **out of scope by design**:
+Out of scope by design:
 
-- **BTCPayServer via NBXplorer.** NBXplorer indexes the chain over Bitcoin P2P / full blocks and
-  tracks xpub derivation schemes over transparent UTXOs. The `zebra → lightwalletd → zecd` stack
-  exposes no P2P surface and the wallet is shielded-only, so this path is not pursued.
+- BTCPayServer via NBXplorer. NBXplorer indexes the chain over Bitcoin P2P / full blocks and
+  tracks xpub derivation schemes over transparent UTXOs. The zebra → lightwalletd → zecd stack
+  exposes no P2P surface and the wallet is shielded-only.
 
-Edges to be aware of (all consequences of being a shielded light wallet):
+Edges to be aware of (consequences of being a shielded light wallet):
 
-- **Spending needs confirmations:** while an incoming mempool payment is *visible* immediately
+- Spending needs confirmations: an incoming mempool payment is visible immediately
   (`getunconfirmedbalance` / `listtransactions` at 0 conf, via lightwalletd's mempool stream),
-  received notes must mine and reach the confirmation minimum before they are spendable.
-- **Fees are never client-settable.** Real fees are ZIP-317 - a deterministic formula
-  (5,000 zatoshis × max(2, logical actions); a typical send is 0.0001 ZEC) computed by the
-  wallet at transaction-build time, with no fee market to outbid. Explicit fee instructions
-  are therefore rejected with `-8` rather than silently ignored: `subtractfeefromamount`/
-  `subtractfeefrom` and `fee_rate` on `sendtoaddress`/`sendmany` (`settxfee` does not exist;
-  `conf_target`/`estimate_mode` are estimation hints and are safely ignored - the
-  conventional fee already buys next-block inclusion). `estimatesmartfee`/`estimatefee`
-  remain as inert probe-compat stubs returning a stable conventional rate; the exact fee
-  paid is reported after the fact in `gettransaction.fee`.
-- **Addresses are shielded UAs** (`u1...`/`utest1...`): clients that parse the address string as a
+  but received notes must mine and reach the confirmation minimum before they are spendable.
+- Fees are never client-settable. Fees are ZIP-317 - a deterministic formula (5,000 zatoshis ×
+  max(2, logical actions); a typical send is 0.0001 ZEC) computed at transaction-build time, with
+  no fee market to outbid. Explicit fee instructions are rejected with `-8` rather than silently
+  ignored: `subtractfeefromamount`/`subtractfeefrom` and `fee_rate` on `sendtoaddress`/`sendmany`
+  (`settxfee` does not exist; `conf_target`/`estimate_mode` are estimation hints and are safely
+  ignored). `estimatesmartfee`/`estimatefee` remain as inert probe-compat stubs returning a stable
+  conventional rate; the exact fee paid is reported after the fact in `gettransaction.fee`.
+- Addresses are shielded UAs (`u1...`/`utest1...`): clients that parse the address string as a
   transparent Bitcoin address will not understand them; clients that treat addresses as opaque
   strings are fine.
-- **`listunspent`** lists each unspent Orchard *note* as one entry. Its `txid`/`vout` identify the
-  shielded action that created the note (there is no transparent `scriptPubKey`), and `address` is
-  empty.
-- **Reorgs invalidate `listsinceblock` cursors.** zecd keeps only the current chain's scanned
-  block hashes (a light wallet has no stale-header index), so if the block your cursor points at
-  is reorged away - or is below the wallet birthday - `listsinceblock <hash>` returns
-  `-5 Block not found` instead of bitcoind's walk back to the fork point. Treat `-5` as "cursor
-  invalid": re-baseline with a parameterless `listsinceblock` and rely on txid-based dedupe
-  (idempotent payment processing is required for reorg safety anyway).
+- `listunspent` lists each unspent Orchard note as one entry. Its `txid`/`vout` identify the
+  shielded action that created the note (there is no transparent `scriptPubKey`), and `address`
+  is empty.
+- Reorgs invalidate `listsinceblock` cursors. zecd keeps only the current chain's scanned block
+  hashes (a light wallet has no stale-header index), so if the cursor block is reorged away - or
+  is below the wallet birthday - `listsinceblock <hash>` returns `-5 Block not found` instead of
+  bitcoind's walk back to the fork point. Treat `-5` as "cursor invalid": re-baseline with a
+  parameterless `listsinceblock` and rely on txid-based dedupe (idempotent payment processing is
+  required for reorg safety anyway).
 
 ## Testing
 
@@ -314,52 +300,49 @@ python3 scripts/rpc_send_smoke.py --send-timeout 180
 ```
 
 All wallet RPCs have been exercised against the live public testnet (zecrocks): balances,
-addresses/labels, history (`listtransactions`/`gettransaction` incl. `hex`), `listunspent`,
-the `walletlock`/`walletpassphrase` gate, and real Orchard `sendtoaddress`/`sendmany`
-broadcasts (receiving a note and spending it across two wallets).
+addresses/labels, history (`listtransactions`/`gettransaction` incl. `hex`), `listunspent`, the
+`walletlock`/`walletpassphrase` gate, and real Orchard `sendtoaddress`/`sendmany` broadcasts.
 
 ## Operations
 
-`docs/OPERATIONS.md` is the production runbook: what to back up (mnemonic, `keys.toml`,
-age identity, birthday height), restore procedures, monitoring/alerting, send semantics
-under failure, upgrades, and the mainnet checklist.
+`docs/OPERATIONS.md` is the production runbook: what to back up (mnemonic, `keys.toml`, age
+identity, birthday height), restore procedures, monitoring/alerting, send semantics under failure,
+upgrades, and the mainnet checklist.
 
 ## Security
 
-**Two key-custody models**, mirroring bitcoind's unencrypted/encrypted wallet states:
+Two key-custody models, mirroring bitcoind's unencrypted/encrypted wallet states:
 
-- **Unencrypted (default):** the mnemonic in `<wallet>/keys.toml` is wrapped to the age
-  identity file (`[keys] age_identity`, default `<datadir>/identity.txt`); with the default
-  `auto_unlock = true` the seed is decrypted into memory at startup (held as a zeroizing
-  secret) so sends are unattended. The passphrase RPCs (`walletpassphrase`, `walletlock`,
-  `walletpassphrasechange`) return `-15`, exactly like bitcoind with an unencrypted wallet.
-  What the at-rest encryption protects: with `identity.txt` co-located in the datadir, only
-  leakage of `keys.toml` *alone* (e.g. a copy of just the wallet subdirectory) - anyone who
-  can read the whole datadir has the seed. For unattended mainnet wallets, store the identity
-  outside the datadir (secrets manager, separate mount, or `ZECD_AGE_IDENTITY`).
-- **Encrypted (`zecd init --encrypt`, or `encryptwallet` on a running wallet):** the mnemonic
-  is wrapped with a passphrase (age scrypt) instead; no identity file can decrypt it. The
-  wallet starts locked (sends return `-13`); `walletpassphrase "<pass>" <timeout>` verifies
-  the passphrase (`-14` if wrong) and auto-relocks when the timeout elapses;
-  `walletpassphrasechange` rotates it; `getwalletinfo.unlocked_until` reports the relock
-  time. Unlike Bitcoin Core, `encryptwallet` does not regenerate the seed - the mnemonic is
-  unchanged, only its at-rest wrapping - so existing backups stay valid.
+- Unencrypted (default): the mnemonic in `<wallet>/keys.toml` is wrapped to the age identity file
+  (`[keys] age_identity`, default `<datadir>/identity.txt`); with the default `auto_unlock = true`
+  the seed is decrypted into memory at startup (held as a zeroizing secret) so sends are
+  unattended. The passphrase RPCs return `-15`, like bitcoind with an unencrypted wallet. With
+  `identity.txt` co-located in the datadir, the at-rest encryption only protects against leakage
+  of `keys.toml` alone - anyone who can read the whole datadir has the seed. For unattended
+  mainnet wallets, store the identity outside the datadir (secrets manager, separate mount, or
+  `ZECD_AGE_IDENTITY`).
+- Encrypted (`zecd init --encrypt`, or `encryptwallet` on a running wallet): the mnemonic is
+  wrapped with a passphrase (age scrypt) instead; no identity file can decrypt it. The wallet
+  starts locked (sends return `-13`); `walletpassphrase "<pass>" <timeout>` unlocks (`-14` if
+  wrong) and auto-relocks at the timeout; `walletpassphrasechange` rotates it;
+  `getwalletinfo.unlocked_until` reports the relock time. Unlike Bitcoin Core, `encryptwallet`
+  does not regenerate the seed - only its at-rest wrapping changes - so existing backups stay
+  valid.
 
-In both models, anyone with RPC access to an unlocked wallet can spend: **treat RPC
-credentials as spend authority.**
+In both models, anyone with RPC access to an unlocked wallet can spend: treat RPC credentials as
+spend authority.
 
-**RPC surface.**
+RPC surface:
 
-- RPC credentials follow bitcoind: `rpcuser`/`rpcpassword`, bitcoind-style `rpcauth` entries
-  (`[rpc] auth = ["<user>:<salt>$<hmac-sha256>"]` in the config or repeated `--rpcauth` flags,
-  generated with bitcoin's `share/rpcauth/rpcauth.py`), and a generated cookie file
-  (`<datadir>/.cookie`, mode 0600) when no user/password pair is set. There is no per-method
-  whitelist.
+- Credentials follow bitcoind: `rpcuser`/`rpcpassword`, bitcoind-style `rpcauth` entries
+  (`[rpc] auth = ["<user>:<salt>$<hmac-sha256>"]` or repeated `--rpcauth` flags, generated with
+  bitcoin's `share/rpcauth/rpcauth.py`), and a generated cookie file (`<datadir>/.cookie`, mode
+  0600) when no user/password pair is set. There is no per-method whitelist.
 - Do not expose the RPC port to untrusted networks. Bind to `127.0.0.1` and/or front it with TLS
   or a reverse proxy. On mainnet, zecd refuses to start while the password is the example
   placeholder (`CHANGE-ME`).
-- The health port (`[health]`) is unauthenticated by design and exposes sync status only; keep it
-  off the public internet anyway.
+- The health port is unauthenticated by design and exposes sync status only; keep it off the
+  public internet anyway.
 
 ## License
 
