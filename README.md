@@ -1,9 +1,9 @@
 # zecd
 
-A Bitcoin-Core-style JSON-RPC server for Zcash: a shielded-only wallet server built on
-[librustzcash](https://github.com/zcash/librustzcash), exposed through bitcoind's RPC dialect.
-It uses the same method names, response shapes, auth, JSON-RPC 1.0 envelope, and error codes
-as Bitcoin Core, so that existing Bitcoin RPC clients can use Zcash with little or no changes.
+A shielded-only wallet server built on [librustzcash](https://github.com/zcash/librustzcash),
+exposed through bitcoind's RPC dialect for developer ease of use. It uses the same method names,
+response shapes, auth, JSON-RPC 1.0 envelope, and error codes as Bitcoin Core, so that existing
+Bitcoin RPC clients can use Zcash with little or no changes.
 
 This project is intentionally not backwards-compatible with `zcashd`. Instead is compatible with
 other librustzcash-powered wallets, notablly Zodl ([iOS](https://github.com/zodl-inc/zodl-ios),
