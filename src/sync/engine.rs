@@ -1,6 +1,25 @@
 //! lightwalletd-backed block sync, ported from `zcash-devtool/src/commands/wallet/sync.rs`
 //! and refactored to process one batch per call so the owning actor can interleave RPC
 //! commands between batches. TUI and transparent-input handling are removed (Orchard-only).
+//!
+//! # Reorg handling: why it lives here and not in librustzcash
+//!
+//! Reorg *detection* is librustzcash's job: `scan_cached_blocks` checks `prev_hash`
+//! continuity and returns a `ChainError::Scan` with `is_continuity_error() == true` when the
+//! served chain contradicts stored history. Only the *recovery* lives here, and that is by
+//! upstream design, not accident: the `zcash_client_backend::data_api::chain` module docs
+//! prescribe exactly this caller-side protocol - catch the continuity error, pick a rewind
+//! height (`at_height - 10` is upstream's own example heuristic), `truncate_to_height`, drop
+//! the cached blocks - because rewind depth and cache management are application policy.
+//!
+//! librustzcash does ship a turnkey driver (`zcash_client_backend::sync::run`, behind the
+//! `sync` feature) whose reorg branch matches `scan_blocks` below, but it is unusable here
+//! for two reasons: it is a blocking run-until-caught-up loop (this actor needs one batch
+//! per call so RPC commands interleave), and it propagates `RequestedRewindInvalid`
+//! unhandled - a young wallet hit by a reorg near its birthday would re-fail the same scan
+//! range forever. `perform_rewind`'s shallow retry exists to close that second gap; see
+//! its docs. Do not "simplify" this module down to what `sync::run` does: that version
+//! wedges.
 
 use std::path::Path;
 
@@ -29,7 +48,7 @@ use zcash_primitives::merkle_tree::HashSer;
 use zcash_protocol::consensus::BlockHeight;
 
 use crate::network::ZNetwork;
-use crate::wallet::open::{block_path, data_db_path, WriteDb};
+use crate::wallet::open::{block_path, WriteDb};
 
 const BATCH_SIZE: u32 = 10_000;
 
@@ -156,75 +175,61 @@ fn delete_cached_blocks(wallet_dir: &Path, block_meta: Vec<BlockMeta>) {
     }
 }
 
-/// Find the highest height that is both in the `blocks` table AND has sapling + orchard
-/// note-commitment-tree checkpoints, bounded by `max_height`. Used as a shallow-rewind
-/// fallback when the requested rewind has no valid checkpoint at or below it (a young wallet
-/// whose only lower checkpoint - the birthday anchor - has no corresponding `blocks` row).
-fn find_shallow_rewind_target(
-    wallet_dir: &Path,
-    max_height: BlockHeight,
-) -> anyhow::Result<Option<BlockHeight>> {
-    use rusqlite::OptionalExtension;
-    let conn = rusqlite::Connection::open_with_flags(
-        data_db_path(wallet_dir),
-        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
-    )?;
-    let h: Option<u32> = conn
-        .query_row(
-            "SELECT MAX(blocks.height) FROM blocks
-             JOIN sapling_tree_checkpoints sc ON sc.checkpoint_id = blocks.height
-             JOIN orchard_tree_checkpoints oc ON oc.checkpoint_id = blocks.height
-             WHERE blocks.height <= :max",
-            rusqlite::named_params! {":max": u32::from(max_height)},
-            |row| row.get(0),
-        )
-        .optional()?
-        .flatten();
-    Ok(h.map(BlockHeight::from))
-}
-
 /// Rewind the wallet to `requested` (chosen below the continuity break at `at_height`),
-/// falling back when no note-commitment-tree checkpoint exists at or below it: first to the
-/// `safe_rewind_height` the wallet itself reports, then to a shallower checkpointed block.
-/// Returns the height actually rewound to (`truncate_to_height` may rewind deeper than
-/// requested, to the nearest checkpoint). Without the fallbacks a young wallet can wedge:
-/// `truncate_to_height` errors with `RequestedRewindInvalid` and the same scan range fails
-/// identically on every retry.
+/// retrying at the shallow bound `at_height - 2` when no valid truncation target exists at
+/// or below `requested`. Returns the height actually rewound to.
+///
+/// The retry leans on the documented `WalletWrite::truncate_to_height` contract:
+/// implementations rewind to the nearest valid target *at or below* the requested height
+/// and return it (`zcash_client_sqlite` picks the highest scanned block carrying both
+/// sapling and orchard note-commitment-tree checkpoints), so one shallower call is the
+/// entire "find a recoverable height" search. The stored block at `at_height - 1`
+/// contradicts the new chain, so any useful rewind must remove it - hence the strict
+/// `at_height - 2` bound, which also guarantees progress: each pass strictly shrinks the
+/// scanned chain instead of re-truncating to the same stale block forever. Without the
+/// retry a young wallet wedges: the deep rewind target can land below every checkpointed
+/// block (the birthday anchor has no `blocks` row), `truncate_to_height` errors with
+/// `RequestedRewindInvalid`, and the same scan range fails identically on every attempt -
+/// the bug upstream's `sync::run` still has (see the module docs).
+///
+/// The error's `safe_rewind_height` is deliberately ignored: upstream computes it as the
+/// minimum checkpoint height *without* requiring a scanned block there, so it may name the
+/// blocks-row-less birthday anchor (itself an invalid target), and any height below the
+/// already-failed `requested` fails a fortiori.
+///
+/// Lineage: mirrored in zkv's `internal/sync.rs` - port fixes both ways.
+///
+/// TODO(upstream): the one remaining storage-backend coupling here is matching the
+/// concrete `SqliteClientError::RequestedRewindInvalid` - `zcash_client_backend`'s
+/// `WalletWrite` has no trait-level "rewind invalid" error contract, so reorg recovery is
+/// structurally tied to the sqlite backend. With non-SQLite `WalletDb` backends planned
+/// (PostgreSQL), propose upstream a trait-level error (or a `truncate_to_height` variant
+/// that reports "no valid target at or below" portably) and switch this match to it.
 fn perform_rewind(
     db_data: &mut WriteDb,
-    wallet_dir: &Path,
     at_height: BlockHeight,
     requested: BlockHeight,
 ) -> anyhow::Result<BlockHeight> {
     match db_data.truncate_to_height(requested) {
         Ok(h) => Ok(h),
-        Err(SqliteClientError::RequestedRewindInvalid { safe_rewind_height, .. }) => {
-            // Defensive: honor the wallet-reported safe height if it gives a deeper rewind.
-            if let Some(safe) = safe_rewind_height.filter(|&s| s < requested) {
-                info!("No checkpoint at or below {requested}; trying safe rewind to {safe}");
-                if let Ok(h) = db_data.truncate_to_height(safe) {
-                    return Ok(h);
-                }
-            }
-            // Shallow fallback: rewind less deep than the 10-block safety margin asked for.
-            // The stored block at `at_height - 1` contradicts the new chain, so any useful
-            // rewind must remove it - hence the strict `at_height - 2` bound. It also
-            // guarantees progress: each fallback strictly shrinks the scanned chain, so a
-            // deep reorg degrades into successively deeper rewinds instead of a silent loop
-            // re-truncating to the same stale block forever.
+        Err(SqliteClientError::RequestedRewindInvalid { .. }) => {
             let bound = BlockHeight::from(u32::from(at_height).saturating_sub(2));
-            if let Some(target) = find_shallow_rewind_target(wallet_dir, bound)? {
-                info!("Shallow rewind to {target} (no valid target at or below {requested})");
-                return Ok(db_data.truncate_to_height(target)?);
+            match db_data.truncate_to_height(bound) {
+                Ok(h) => {
+                    info!("Shallow rewind to {h} (no valid target at or below {requested})");
+                    Ok(h)
+                }
+                // No scanned block below the conflict can be rewound to: the reorg is
+                // deeper than the wallet's rewindable history. Recovering needs a
+                // from-birthday resync.
+                Err(SqliteClientError::RequestedRewindInvalid { .. }) => Err(anyhow!(
+                    "unrecoverable reorg at {at_height}: no note-commitment-tree checkpoint \
+                     with a scanned block exists below the conflict (requested rewind to \
+                     {requested}); restore the wallet from its mnemonic into a fresh \
+                     directory (`zecd init --restore`) to resync from the wallet birthday"
+                )),
+                Err(e) => Err(e.into()),
             }
-            // No scanned block below the conflict can be rewound to: the reorg is deeper
-            // than the wallet's rewindable history. Recovering needs a from-birthday resync.
-            Err(anyhow!(
-                "unrecoverable reorg at {at_height}: no note-commitment-tree checkpoint with \
-                 a scanned block exists below the conflict (requested rewind to {requested}); \
-                 restore the wallet from its mnemonic into a fresh directory (`zecd init \
-                 --restore`) to resync from the wallet birthday"
-            ))
         }
         Err(e) => Err(e.into()),
     }
@@ -263,7 +268,7 @@ fn scan_blocks(
             // (virtually all real blocks). `perform_rewind` falls back to the nearest
             // valid checkpoint when the requested height has none; the cache is then
             // truncated to the height actually rewound to.
-            let rewind_height = perform_rewind(db_data, wallet_dir, err.at_height(), requested)?;
+            let rewind_height = perform_rewind(db_data, err.at_height(), requested)?;
             db_cache
                 .with_blocks(Some(rewind_height + 1), None, |block| {
                     let meta = BlockMeta {
@@ -568,7 +573,7 @@ mod tests {
     }
 
     /// Scan a short chain so the standard 10-block rewind margin lands below the wallet's
-    /// first scanned block, then exercise `perform_rewind`'s recovery ladder directly.
+    /// first scanned block, then exercise `perform_rewind`'s shallow retry directly.
     fn short_chain_wallet(wd: &Path, blocks: u32) -> WriteDb {
         let net = crate::network::regtest();
         let mut db_data = crate::wallet::open::init_dbs(net, wd).expect("init dbs");
@@ -606,11 +611,11 @@ mod tests {
     }
 
     /// A reorg within 10 blocks of the wallet's entire scanned history: the requested rewind
-    /// (`at_height - 10`, floored at 0) has no checkpoint at or below it, so the old code
-    /// failed with `RequestedRewindInvalid` on every retry. The shallow fallback must rewind
-    /// to the highest checkpointed block *strictly below* the known-stale block at
-    /// `at_height - 1` - here 4, not 5 - so the conflicting block is removed and retries
-    /// make progress.
+    /// (`at_height - 10`, floored at 0) has no checkpoint at or below it, so a bare
+    /// `truncate_to_height` fails with `RequestedRewindInvalid` on every retry. The shallow
+    /// retry (truncate at `at_height - 2`) must rewind to the highest checkpointed block
+    /// *strictly below* the known-stale block at `at_height - 1` - here 4, not 5 - so the
+    /// conflicting block is removed and retries make progress.
     #[test]
     fn rewind_falls_back_to_shallow_checkpoint() {
         let dir = tempfile::tempdir().unwrap();
@@ -619,7 +624,6 @@ mod tests {
 
         let rewound = perform_rewind(
             &mut db_data,
-            wd,
             BlockHeight::from_u32(6),
             BlockHeight::from_u32(0),
         )
@@ -639,7 +643,6 @@ mod tests {
 
         let err = perform_rewind(
             &mut db_data,
-            wd,
             BlockHeight::from_u32(2),
             BlockHeight::from_u32(0),
         )
