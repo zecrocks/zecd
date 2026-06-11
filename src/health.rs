@@ -24,7 +24,7 @@ pub async fn run(state: AppState) {
         return;
     }
     let addr = SocketAddr::new(state.config.health.bind, state.config.health.port);
-    let shutdown = state.shutdown.clone();
+    let shutdown = state.shutdown_signal();
     let app = Router::new()
         .route("/healthz", get(healthz))
         .route("/readyz", get(readyz))
@@ -35,7 +35,7 @@ pub async fn run(state: AppState) {
         Ok(listener) => {
             info!("health server listening on http://{addr} (/healthz /readyz /status)");
             if let Err(e) = axum::serve(listener, app)
-                .with_graceful_shutdown(async move { shutdown.notified().await })
+                .with_graceful_shutdown(shutdown)
                 .await
             {
                 warn!("health server error: {e}");

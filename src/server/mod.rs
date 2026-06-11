@@ -21,12 +21,12 @@ use crate::state::AppState;
 /// Bind and serve until graceful shutdown is signalled.
 pub async fn run(state: AppState) -> anyhow::Result<()> {
     let addr = SocketAddr::new(state.config.rpc.bind, state.config.rpc.port);
-    let shutdown = state.shutdown.clone();
+    let shutdown = state.shutdown_signal();
     let app = router(state);
     let listener = tokio::net::TcpListener::bind(addr).await?;
     info!("RPC server listening on http://{addr}");
     axum::serve(listener, app)
-        .with_graceful_shutdown(async move { shutdown.notified().await })
+        .with_graceful_shutdown(shutdown)
         .await?;
     Ok(())
 }
@@ -168,7 +168,6 @@ mod tests {
     use axum::http::Request;
     use base64::Engine;
     use serde_json::Value;
-    use tokio::sync::Notify;
     use tower::ServiceExt;
 
     use crate::config::{
@@ -218,7 +217,7 @@ mod tests {
             config: Arc::new(config),
             registry: Arc::new(WalletRegistry::new("default".into())),
             started_at: Instant::now(),
-            shutdown: Arc::new(Notify::new()),
+            shutdown_tx: tokio::sync::watch::channel(false).0,
             shutting_down: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             work_queue: Arc::new(tokio::sync::Semaphore::new(16)),
             active: crate::state::ActiveCommands::default(),

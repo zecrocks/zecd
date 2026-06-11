@@ -1,15 +1,12 @@
 //! Control RPCs: stop, uptime, help, getrpcinfo.
 
-use std::sync::atomic::Ordering;
-
 use serde_json::{json, Value};
 
 use crate::error::RpcError;
 use crate::state::AppState;
 
 pub fn stop(state: &AppState) -> Result<Value, RpcError> {
-    state.shutting_down.store(true, Ordering::Relaxed);
-    state.shutdown.notify_one();
+    state.trigger_shutdown();
     Ok(Value::String("zecd stopping".to_string()))
 }
 

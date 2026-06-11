@@ -114,9 +114,15 @@ use crate::wallet::actor::{self, ActorConfig};
 use crate::wallet::store::{Passphrase, WalletStore};
 
 /// An ActorConfig pointed at a dead local endpoint (connect fails fast; the actor still runs).
-fn offline_actor_cfg(name: &str, wallet_dir: std::path::PathBuf) -> ActorConfig {
+/// The returned shutdown sender must be kept alive for the actor's lifetime (dropping it is
+/// itself a shutdown signal).
+fn offline_actor_cfg(
+    name: &str,
+    wallet_dir: std::path::PathBuf,
+) -> (ActorConfig, tokio::sync::watch::Sender<bool>) {
+    let (shutdown_tx, shutdown) = tokio::sync::watch::channel(false);
     let net = network::regtest();
-    ActorConfig {
+    let cfg = ActorConfig {
         name: name.to_string(),
         network: net,
         wallet_dir,
@@ -129,7 +135,9 @@ fn offline_actor_cfg(name: &str, wallet_dir: std::path::PathBuf) -> ActorConfig 
         primary_recheck: Duration::from_secs(60),
         age_identity: None,
         auto_unlock: true,
-    }
+        shutdown,
+    };
+    (cfg, shutdown_tx)
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -154,7 +162,8 @@ async fn encrypted_wallet_unlock_lock_cycle() {
         .unwrap();
     drop(db);
 
-    let handle = actor::spawn(offline_actor_cfg("enc", wd)).await.unwrap();
+    let (cfg, _shutdown_tx) = offline_actor_cfg("enc", wd);
+    let (handle, _task) = actor::spawn(cfg).await.unwrap();
 
     // Wrong passphrase -> -14.
     let e = handle
@@ -209,7 +218,8 @@ async fn unencrypted_wallet_rejects_passphrase_rpcs() {
         .unwrap();
     drop(db);
 
-    let handle = actor::spawn(offline_actor_cfg("plain", wd)).await.unwrap();
+    let (cfg, _shutdown_tx) = offline_actor_cfg("plain", wd);
+    let (handle, _task) = actor::spawn(cfg).await.unwrap();
 
     // walletpassphrase / walletlock on an unencrypted wallet -> -15 (matches bitcoind).
     let e = handle

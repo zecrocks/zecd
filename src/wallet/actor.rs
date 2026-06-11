@@ -109,6 +109,9 @@ pub struct ActorConfig {
     pub primary_recheck: Duration,
     pub age_identity: Option<PathBuf>,
     pub auto_unlock: bool,
+    /// Flips to `true` on Ctrl-C/`stop`; the actor exits its loop (between sync batches)
+    /// so the `WalletDb` is dropped cleanly before the process ends.
+    pub shutdown: watch::Receiver<bool>,
 }
 
 struct WalletActor {
@@ -151,11 +154,14 @@ struct WalletActor {
     /// For an encrypted wallet that's currently unlocked: when the seed auto-relocks. Re-running
     /// `walletpassphrase` overwrites it (resetting the timer); `walletlock` clears it.
     unlock_until: Option<Instant>,
+    /// Graceful-shutdown signal (see [`ActorConfig::shutdown`]).
+    shutdown: watch::Receiver<bool>,
 }
 
 /// Open the wallet, derive its account info, optionally unlock the seed, build the prover,
-/// and spawn the actor task. Returns a clonable handle.
-pub async fn spawn(cfg: ActorConfig) -> anyhow::Result<WalletHandle> {
+/// and spawn the actor task. Returns a clonable handle plus the task's join handle (awaited
+/// at shutdown so the wallet DB closes cleanly before the runtime is torn down).
+pub async fn spawn(cfg: ActorConfig) -> anyhow::Result<(WalletHandle, tokio::task::JoinHandle<()>)> {
     if cfg.servers.is_empty() {
         return Err(anyhow!(
             "no lightwalletd servers configured for wallet '{}'",
@@ -244,16 +250,14 @@ pub async fn spawn(cfg: ActorConfig) -> anyhow::Result<WalletHandle> {
         subtree_roots_synced: false,
         encrypted,
         unlock_until: None,
+        shutdown: cfg.shutdown,
     };
 
-    tokio::spawn(actor.run());
+    let task = tokio::spawn(actor.run());
 
-    Ok(make_handle(
-        cfg.name,
-        cfg.wallet_dir,
-        cfg.network,
-        cmd_tx,
-        status_rx,
+    Ok((
+        make_handle(cfg.name, cfg.wallet_dir, cfg.network, cmd_tx, status_rx),
+        task,
     ))
 }
 
@@ -284,6 +288,12 @@ impl WalletActor {
 
         let mut more_work = true;
         loop {
+            // Exit between sync batches once shutdown is signalled, so Ctrl-C/`stop` doesn't
+            // wait out a long catch-up scan and the DB connection is dropped cleanly.
+            if *self.shutdown.borrow() {
+                info!("[{}] wallet actor shutting down", self.name);
+                return;
+            }
             // Relock an encrypted wallet whose passphrase timeout has elapsed. Checked every
             // iteration (between sync batches) so the seed doesn't linger long past expiry; the
             // `select!` branch below handles the idle case, and `do_send` has a hard backstop.
@@ -327,6 +337,15 @@ impl WalletActor {
                     self.reconnect_at.saturating_duration_since(Instant::now())
                 };
                 tokio::select! {
+                    // Wakes the idle wait promptly on Ctrl-C/`stop`; the loop-top check exits.
+                    // An Err (sender dropped) only happens at teardown - stop right here, since
+                    // `changed()` would otherwise resolve Err on every iteration (a busy loop).
+                    res = self.shutdown.changed() => {
+                        if res.is_err() {
+                            info!("[{}] wallet actor shutting down", self.name);
+                            return;
+                        }
+                    }
                     maybe_cmd = self.cmd_rx.recv() => {
                         match maybe_cmd {
                             Some(cmd) => if self.handle_command(cmd).await { return; },

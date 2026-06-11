@@ -19,7 +19,6 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use clap::Parser;
-use tokio::sync::Notify;
 use tracing::{error, info, warn};
 
 use crate::config::{AppConfig, Cli, Command};
@@ -68,7 +67,12 @@ async fn run_daemon(config: AppConfig) -> anyhow::Result<()> {
     let config = Arc::new(config);
     let auth = server::auth::Authenticator::from_config(&config.rpc)?;
 
+    // Shutdown broadcast: `true` is sent on Ctrl-C / `stop`. Created before the actors so
+    // each one carries a receiver and can stop its sync loop between batches.
+    let (shutdown_tx, _) = tokio::sync::watch::channel(false);
+
     let mut registry = WalletRegistry::new(config.default_wallet.clone());
+    let mut actor_tasks = Vec::new();
     for (name, entry) in &config.wallets {
         if !WalletStore::exists(&entry.dir) {
             warn!(
@@ -98,11 +102,13 @@ async fn run_daemon(config: AppConfig) -> anyhow::Result<()> {
             primary_recheck: Duration::from_secs(config.lightwalletd.primary_recheck_secs),
             age_identity: config.keys.age_identity.clone(),
             auto_unlock: config.keys.auto_unlock,
+            shutdown: shutdown_tx.subscribe(),
         };
         match actor::spawn(actor_cfg).await {
-            Ok(handle) => {
+            Ok((handle, task)) => {
                 info!("loaded wallet '{}'", name);
                 registry.insert(handle);
+                actor_tasks.push((name.clone(), task));
             }
             Err(e) => error!("failed to start wallet '{}': {e}", name),
         }
@@ -115,25 +121,23 @@ async fn run_daemon(config: AppConfig) -> anyhow::Result<()> {
         );
     }
 
-    let shutdown = Arc::new(Notify::new());
-    let shutting_down = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let state = AppState {
         config: config.clone(),
         auth,
         registry: Arc::new(registry),
         started_at: Instant::now(),
-        shutdown: shutdown.clone(),
-        shutting_down: shutting_down.clone(),
+        shutdown_tx: shutdown_tx.clone(),
+        shutting_down: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         work_queue: Arc::new(tokio::sync::Semaphore::new(config.rpc.work_queue)),
         active: crate::state::ActiveCommands::default(),
     };
 
     // Translate Ctrl-C into a graceful shutdown (flag first, so in-flight new requests 503).
+    let ctrl_c_state = state.clone();
     tokio::spawn(async move {
         if tokio::signal::ctrl_c().await.is_ok() {
             info!("received Ctrl-C, shutting down");
-            shutting_down.store(true, std::sync::atomic::Ordering::Relaxed);
-            shutdown.notify_one();
+            ctrl_c_state.trigger_shutdown();
         }
     });
 
@@ -141,6 +145,20 @@ async fn run_daemon(config: AppConfig) -> anyhow::Result<()> {
     tokio::spawn(health::run(state.clone()));
 
     let result = server::run(state).await;
+
+    // Stop the wallet actors and wait for them so the WalletDb is dropped cleanly rather than
+    // the task being killed mid-write at runtime teardown. The send also covers the case where
+    // `server::run` returned on its own (e.g. a bind error) without a shutdown trigger.
+    shutdown_tx.send_replace(true);
+    let actor_stop_deadline = Duration::from_secs(30);
+    for (name, task) in actor_tasks {
+        match tokio::time::timeout(actor_stop_deadline, task).await {
+            Ok(_) => info!("wallet '{name}' stopped"),
+            Err(_) => warn!(
+                "wallet '{name}' did not stop within {actor_stop_deadline:?}; exiting anyway"
+            ),
+        }
+    }
 
     // bitcoind removes its generated .cookie on clean shutdown so a stale credential can't
     // linger; do the same. Only applies when cookie auth was in use (no user/password set).

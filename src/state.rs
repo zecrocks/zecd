@@ -5,7 +5,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
-use tokio::sync::{Notify, Semaphore};
+use tokio::sync::{watch, Semaphore};
 
 use crate::config::AppConfig;
 use crate::server::auth::Authenticator;
@@ -17,14 +17,34 @@ pub struct AppState {
     pub auth: Authenticator,
     pub registry: Arc<WalletRegistry>,
     pub started_at: Instant,
-    /// Notified by `stop`/Ctrl-C to trigger graceful shutdown.
-    pub shutdown: Arc<Notify>,
+    /// Broadcasts `stop`/Ctrl-C to every shutdown waiter (RPC server, health server, wallet
+    /// actors). A `watch` channel - not `Notify` - so all waiters wake and a trigger that
+    /// races a late subscriber is never lost (`wait_for` checks the current value first).
+    pub shutdown_tx: watch::Sender<bool>,
     /// Set once shutdown has been requested; new requests are then rejected with 503.
     pub shutting_down: Arc<AtomicBool>,
     /// Bounds concurrent in-flight requests (Bitcoin Core's `-rpcworkqueue`); excess → 503.
     pub work_queue: Arc<Semaphore>,
     /// Currently-executing commands, for `getrpcinfo.active_commands`.
     pub active: ActiveCommands,
+}
+
+impl AppState {
+    /// Request graceful shutdown: flag first (so in-flight new requests get 503), then wake
+    /// every waiter.
+    pub fn trigger_shutdown(&self) {
+        self.shutting_down.store(true, Ordering::Relaxed);
+        self.shutdown_tx.send_replace(true);
+    }
+
+    /// A future that resolves once shutdown has been requested. Race-free: it also resolves
+    /// immediately when shutdown was triggered before the call (or the sender is gone).
+    pub fn shutdown_signal(&self) -> impl std::future::Future<Output = ()> + Send + 'static {
+        let mut rx = self.shutdown_tx.subscribe();
+        async move {
+            let _ = rx.wait_for(|stop| *stop).await;
+        }
+    }
 }
 
 /// RAII tracker of in-flight RPC commands (mirrors Bitcoin Core's `RPCCommandExecution`).
