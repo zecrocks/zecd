@@ -2,10 +2,10 @@
 
 A shielded-only wallet server built on [librustzcash](https://github.com/zcash/librustzcash),
 exposed through bitcoind's RPC dialect for developer ease of use. It uses the same method names,
-response shapes, auth, JSON-RPC 1.0 envelope, and error codes as Bitcoin Core, so that existing
-Bitcoin RPC clients can use Zcash with little or no changes.
+response shapes, auth, and error codes as Bitcoin Core, so that many existing Bitcoin RPC clients
+can use Zcash with little or no changes.
 
-This project is intentionally not backwards-compatible with `zcashd`. Instead is compatible with
+This project is intentionally not backwards-compatible with `zcashd`. Instead it is compatible with
 other librustzcash-powered wallets, notablly Zodl ([iOS](https://github.com/zodl-inc/zodl-ios),
 [Android](https://github.com/zodl-inc/zodl-android)), which is built by much of the Zcash Core
 team. To migrate funds from zcashd to zecd, the only supported path is to send everything on-chain
