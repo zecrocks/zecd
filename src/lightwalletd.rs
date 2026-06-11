@@ -90,8 +90,11 @@ impl Server {
         // interval+timeout, instead of stalling them forever - TCP alone can't detect this
         // (the kernel keeps ACKing for a stopped process). This is the systemic backstop for
         // the long-lived channel; the actor additionally puts explicit deadlines on its
-        // critical unary calls.
+        // critical unary calls. TCP keepalive complements it below the HTTP/2 layer: it
+        // detects a dead L4 path (host suspend, NAT rebind, silently dropped conntrack
+        // entries) and keeps idle NAT/firewall mappings alive between syncs.
         let channel = Channel::from_shared(self.endpoint())?
+            .tcp_keepalive(Some(Duration::from_secs(15)))
             .http2_keep_alive_interval(Duration::from_secs(15))
             .keep_alive_timeout(Duration::from_secs(5))
             .keep_alive_while_idle(true);

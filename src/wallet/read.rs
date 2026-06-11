@@ -88,6 +88,10 @@ pub struct UnspentNote {
     pub vout: u32,
     pub value: u64,
     pub mined_height: Option<u32>,
+    /// Whether this wallet authored the transaction that created the note (it spent from the
+    /// account). Bitcoin Core's `listunspent.safe` analog: an *own* unconfirmed note (change)
+    /// is trusted, a foreign unconfirmed note is not.
+    pub trusted: bool,
 }
 
 fn open_conn(wallet_dir: &Path) -> anyhow::Result<Connection> {
@@ -229,11 +233,20 @@ pub fn get_transaction(wallet_dir: &Path, txid_hex: &str) -> anyhow::Result<Opti
 /// Wallet transactions that are still unmined and unexpired at `tip` - candidates for
 /// rebroadcast. Returns `(display_txid, raw_bytes)`; `raw` is only present for txs the
 /// wallet created or has enhanced. An expiry height of 0 means "never expires".
+///
+/// Only transactions that spend this wallet's notes qualify (nobody else can spend them, so
+/// such a tx was necessarily authored here). The actor's mempool stream also stores *foreign*
+/// incoming txs as unmined rows with raw bytes, and those are the sender's to retransmit,
+/// not ours.
 pub fn unmined_raw_txs(wallet_dir: &Path, tip: u32) -> anyhow::Result<Vec<(String, Vec<u8>)>> {
     let conn = open_conn(wallet_dir)?;
     let mut stmt = conn.prepare(
-        "SELECT txid, raw, expiry_height FROM transactions
-         WHERE mined_height IS NULL AND raw IS NOT NULL",
+        "SELECT txid, raw, expiry_height FROM transactions t
+         WHERE mined_height IS NULL AND raw IS NOT NULL
+         AND (EXISTS (SELECT 1 FROM orchard_received_note_spends s
+                      WHERE s.transaction_id = t.id_tx)
+              OR EXISTS (SELECT 1 FROM sapling_received_note_spends s
+                         WHERE s.transaction_id = t.id_tx))",
     )?;
     let rows = stmt.query_map([], |row| {
         Ok((
@@ -311,17 +324,23 @@ pub fn list_unspent(network: ZNetwork, wallet_dir: &Path) -> anyhow::Result<Vec<
     };
     let target_height = (chain_height + 1).into();
 
-    // Map txid (display hex) -> mined height for computing confirmations.
-    let mut mined: HashMap<String, Option<u32>> = HashMap::new();
+    // Map txid (display hex) -> (mined height, authored-by-us) for confirmations and trust.
+    // A negative balance delta means the wallet spent notes in the tx, i.e. it authored it.
+    let mut tx_meta: HashMap<String, (Option<u32>, bool)> = HashMap::new();
     {
         let conn = open_conn(wallet_dir)?;
-        let mut stmt = conn.prepare("SELECT txid, mined_height FROM v_transactions")?;
+        let mut stmt = conn
+            .prepare("SELECT txid, mined_height, account_balance_delta FROM v_transactions")?;
         let rows = stmt.query_map([], |r| {
-            Ok((r.get::<_, Vec<u8>>(0)?, r.get::<_, Option<u32>>(1)?))
+            Ok((
+                r.get::<_, Vec<u8>>(0)?,
+                r.get::<_, Option<u32>>(1)?,
+                r.get::<_, i64>(2)?,
+            ))
         })?;
         for row in rows {
-            let (txid, mh) = row?;
-            mined.insert(txid_display(&txid), mh);
+            let (txid, mh, delta) = row?;
+            tx_meta.insert(txid_display(&txid), (mh, delta < 0));
         }
     }
 
@@ -331,12 +350,13 @@ pub fn list_unspent(network: ZNetwork, wallet_dir: &Path) -> anyhow::Result<Vec<
         for note in notes.orchard() {
             let txid = note.txid().to_string();
             let value = note.note_value().map_err(|e| anyhow!("note value: {e:?}"))?.into_u64();
-            let mined_height = mined.get(&txid).copied().flatten();
+            let (mined_height, trusted) = tx_meta.get(&txid).copied().unwrap_or((None, false));
             out.push(UnspentNote {
                 vout: note.output_index() as u32,
                 txid,
                 value,
                 mined_height,
+                trusted,
             });
         }
     }

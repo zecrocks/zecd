@@ -686,7 +686,10 @@ pub fn listunspent(state: &AppState, wallet: Option<&str>, req: &RpcRequest) -> 
                 "confirmations": conf,
                 "spendable": true,
                 "solvable": true,
-                "safe": true,
+                // Bitcoin Core: confirmed notes and the wallet's *own* unconfirmed change
+                // are safe to spend; a foreign note surfaced at 0-conf (minconf=0, fed by
+                // the mempool stream) is not.
+                "safe": conf > 0 || n.trusted,
             })
         })
         .collect();

@@ -1,4 +1,5 @@
-# cargo-audit configuration (used by the CI `audit` job).
+# cargo-audit configuration (for local `cargo audit` runs; CI uses `cargo deny`,
+# whose deny.toml documents the same advisory exceptions).
 
 [advisories]
 # RUSTSEC-2026-0009: `time` <0.3.47 DoS via stack exhaustion when *parsing* untrusted

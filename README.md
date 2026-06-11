@@ -164,7 +164,8 @@ note: there is **no double-spend**. When many sends go out at once they queue at
 client's HTTP call blocks until its send completes. Because a freshly-created change note is
 unconfirmed (not yet spendable), rapid back-to-back sends exhaust spendable notes and then return
 `RPC_WALLET_INSUFFICIENT_FUNDS (-6)` until confirmations arrive - the same code bitcoind returns
-when funds are already spent/locked.
+when funds are already spent/locked. The `-6` message reports any balance awaiting confirmations,
+so a client can tell "retry after the next block" apart from "the wallet needs funding".
 
 Overload protection matches bitcoind's work queue: at most `[rpc] work_queue` requests
 (default 100, like `-rpcworkqueue`) are in flight; beyond that the server returns **HTTP 503
@@ -268,8 +269,9 @@ What is **out of scope by design**:
 
 Edges to be aware of (all consequences of being a shielded light wallet):
 
-- **No instant 0-conf:** received notes must be scanned and reach the confirmation minimum before
-  they are spendable/visible.
+- **Spending needs confirmations:** while an incoming mempool payment is *visible* immediately
+  (`getunconfirmedbalance` / `listtransactions` at 0 conf, via lightwalletd's mempool stream),
+  received notes must mine and reach the confirmation minimum before they are spendable.
 - **Fees are never client-settable.** Real fees are ZIP-317 - a deterministic formula
   (5,000 zatoshis × max(2, logical actions); a typical send is 0.0001 ZEC) computed by the
   wallet at transaction-build time, with no fee market to outbid. Explicit fee instructions

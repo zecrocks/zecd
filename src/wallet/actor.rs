@@ -12,8 +12,8 @@ use tonic::transport::Channel;
 use tracing::{info, warn};
 
 use zcash_client_backend::data_api::wallet::{
-    create_proposed_transactions, input_selection::GreedyInputSelector, propose_transfer,
-    ConfirmationsPolicy, SpendingKeys,
+    create_proposed_transactions, decrypt_and_store_transaction,
+    input_selection::GreedyInputSelector, propose_transfer, ConfirmationsPolicy, SpendingKeys,
 };
 use zcash_client_backend::data_api::{Account, WalletRead, WalletWrite};
 use zcash_client_backend::fees::{
@@ -25,8 +25,9 @@ use zcash_client_backend::proto::service::{
 use zcash_client_backend::wallet::OvkPolicy;
 use zcash_client_sqlite::{AccountUuid, FsBlockDb};
 use zcash_keys::keys::UnifiedAddressRequest;
+use zcash_primitives::transaction::Transaction;
 use zcash_proofs::prover::LocalTxProver;
-use zcash_protocol::consensus::BlockHeight;
+use zcash_protocol::consensus::{BlockHeight, BranchId};
 use zcash_protocol::value::Zatoshis;
 use zcash_protocol::{ShieldedProtocol, TxId};
 use zip321::TransactionRequest;
@@ -136,6 +137,13 @@ struct WalletActor {
     db_data: WriteDb,
     db_cache: FsBlockDb,
     client: Option<CompactTxStreamerClient<Channel>>,
+    /// Live mempool subscription (`GetMempoolStream`), open only while caught up to the tip.
+    /// lightwalletd streams current + newly-arriving mempool txs and closes the stream when a
+    /// new block is mined; each tx is trial-decrypted and stored unmined if it pays this
+    /// wallet, which is what lets `getunconfirmedbalance`/`listtransactions` reflect an
+    /// incoming payment before its first confirmation (bitcoind parity). Best-effort: any
+    /// stream error just drops it and the next caught-up pass reopens.
+    mempool: Option<tonic::Streaming<service::RawTransaction>>,
     prover: LocalTxProver,
     seed: SeedKeeper,
     status_tx: watch::Sender<SyncStatus>,
@@ -257,6 +265,7 @@ pub async fn spawn(cfg: ActorConfig) -> anyhow::Result<(WalletHandle, tokio::tas
         cmd_rx,
         tip_height: None,
         tip_hash: None,
+        mempool: None,
         last_rebroadcast: None,
         subtree_roots_synced: false,
         encrypted,
@@ -326,8 +335,10 @@ impl WalletActor {
                     Ok(worked) => {
                         more_work = worked;
                         if !worked {
-                            // Caught up: give any unmined wallet txs another shot at the mempool.
+                            // Caught up: give any unmined wallet txs another shot at the mempool,
+                            // and (re)subscribe to incoming mempool txs for 0-conf visibility.
                             self.maybe_rebroadcast().await;
+                            self.ensure_mempool_stream().await;
                         }
                     }
                     Err(e) => {
@@ -347,26 +358,46 @@ impl WalletActor {
                 } else {
                     self.reconnect_at.saturating_duration_since(Instant::now())
                 };
-                tokio::select! {
+                // The mempool stream is moved out for the duration of the `select!` so its
+                // arm's borrow can't conflict with the `&mut self` the handlers need; the
+                // handlers run after the event is chosen (and the stream put back).
+                enum IdleEvent {
+                    Shutdown(Result<(), watch::error::RecvError>),
+                    Cmd(Option<WalletCommand>),
+                    Relock,
+                    Tick,
+                    Mempool(Result<Option<service::RawTransaction>, tonic::Status>),
+                }
+                let event = {
+                    let mut mempool = self.mempool.take();
+                    let event = tokio::select! {
+                        res = self.shutdown.changed() => IdleEvent::Shutdown(res),
+                        maybe_cmd = self.cmd_rx.recv() => IdleEvent::Cmd(maybe_cmd),
+                        _ = relock_sleep(self.unlock_until) => IdleEvent::Relock,
+                        _ = tokio::time::sleep(wait) => IdleEvent::Tick,
+                        res = mempool_next(&mut mempool) => IdleEvent::Mempool(res),
+                    };
+                    self.mempool = mempool;
+                    event
+                };
+                match event {
                     // Wakes the idle wait promptly on Ctrl-C/`stop`; the loop-top check exits.
                     // An Err (sender dropped) only happens at teardown - stop right here, since
                     // `changed()` would otherwise resolve Err on every iteration (a busy loop).
-                    res = self.shutdown.changed() => {
+                    IdleEvent::Shutdown(res) => {
                         if res.is_err() {
                             info!("[{}] wallet actor shutting down", self.name);
                             return;
                         }
                     }
-                    maybe_cmd = self.cmd_rx.recv() => {
-                        match maybe_cmd {
-                            Some(cmd) => if self.handle_command(cmd).await { return; },
-                            None => return,
+                    IdleEvent::Cmd(Some(cmd)) => {
+                        if self.handle_command(cmd).await {
+                            return;
                         }
                     }
-                    _ = relock_sleep(self.unlock_until) => {
-                        self.relock_if_expired();
-                    }
-                    _ = tokio::time::sleep(wait) => {
+                    IdleEvent::Cmd(None) => return,
+                    IdleEvent::Relock => self.relock_if_expired(),
+                    IdleEvent::Tick => {
                         if self.client.is_none() {
                             if let Err(e) = self.connect().await {
                                 // Schedule the next attempt with exponential backoff + jitter.
@@ -390,6 +421,27 @@ impl WalletActor {
                             }
                         }
                     }
+                    IdleEvent::Mempool(Ok(Some(raw))) => self.store_mempool_tx(raw),
+                    IdleEvent::Mempool(Ok(None)) => {
+                        // lightwalletd closes the stream when a new block is mined: sync it
+                        // now instead of waiting out the rest of the poll interval. The next
+                        // caught-up pass reopens the stream.
+                        self.mempool = None;
+                        match self.refresh_tip().await {
+                            Ok(()) => more_work = true,
+                            Err(e) => {
+                                warn!("[{}] tip refresh failed: {e}", self.name);
+                                self.client = None;
+                                self.update_status();
+                            }
+                        }
+                    }
+                    IdleEvent::Mempool(Err(e)) => {
+                        // Best-effort subscription: drop it and let the regular liveness
+                        // checks decide whether the connection itself is unhealthy.
+                        tracing::debug!("[{}] mempool stream error: {e}", self.name);
+                        self.mempool = None;
+                    }
                 }
             }
         }
@@ -400,6 +452,9 @@ impl WalletActor {
     /// success, store the client, record the active server, and reset the reconnect backoff. On
     /// total failure, leave `self.client` as `None` and return the last error.
     async fn connect(&mut self) -> anyhow::Result<()> {
+        // Any open mempool stream belongs to the channel being replaced; drop it so it can't
+        // pin the old connection alive. It is reopened on the next caught-up sync pass.
+        self.mempool = None;
         let n = self.servers.len();
         let mut last_err = None;
         for idx in 0..n {
@@ -414,6 +469,7 @@ impl WalletActor {
                     if let Err(e) = prepare_client(
                         client,
                         &mut self.db_data,
+                        self.network,
                         &mut self.subtree_roots_synced,
                         PREPARE_TIMEOUT,
                     )
@@ -472,6 +528,7 @@ impl WalletActor {
             if let Err(e) = prepare_client(
                 &mut client,
                 &mut self.db_data,
+                self.network,
                 &mut self.subtree_roots_synced,
                 REPROBE_PREPARE_TIMEOUT,
             )
@@ -487,10 +544,74 @@ impl WalletActor {
                 self.servers[self.active].describe()
             );
             self.client = Some(client);
+            self.mempool = None; // belonged to the fallback's channel; reopened on next pass
             self.active = idx;
             self.backoff.reset();
             self.update_status();
             return;
+        }
+    }
+
+    /// Subscribe to lightwalletd's mempool stream if not already subscribed. Called only when
+    /// caught up to the chain tip (mempool txs are meaningless to a wallet that's still
+    /// scanning history). Failures are logged at debug and retried on the next caught-up
+    /// pass - older or unusual upstreams may not serve `GetMempoolStream`, and 0-conf
+    /// visibility is a best-effort improvement, not a correctness requirement.
+    async fn ensure_mempool_stream(&mut self) {
+        if self.mempool.is_some() || self.tip_height.is_none() {
+            return;
+        }
+        let Some(client) = self.client.as_mut() else { return };
+        // Bounded like other unary calls: only the response headers are awaited here; the
+        // stream body is consumed incrementally from the idle loop.
+        match tokio::time::timeout(
+            UNARY_RPC_TIMEOUT,
+            client.get_mempool_stream(service::Empty::default()),
+        )
+        .await
+        {
+            Ok(Ok(stream)) => {
+                tracing::debug!("[{}] subscribed to the mempool stream", self.name);
+                self.mempool = Some(stream.into_inner());
+            }
+            Ok(Err(e)) => {
+                tracing::debug!("[{}] mempool stream unavailable: {e}", self.name);
+            }
+            Err(_) => {
+                tracing::debug!(
+                    "[{}] mempool stream subscription timed out after {UNARY_RPC_TIMEOUT:?}",
+                    self.name
+                );
+            }
+        }
+    }
+
+    /// Trial-decrypt one mempool transaction against the wallet's keys and store it (as an
+    /// unmined row) if any output is ours. `decrypt_and_store_transaction` no-ops for
+    /// unrelated txs, so no pre-filtering is needed. Best-effort: a tx that fails to parse
+    /// or store is logged and skipped.
+    fn store_mempool_tx(&mut self, raw: service::RawTransaction) {
+        let Some(tip) = self.tip_height else { return };
+        // lightwalletd reports height 0 for mempool txs; a positive height means it was
+        // already mined by the time it was streamed.
+        let mined_height = (raw.height > 0 && raw.height <= u64::from(u32::MAX))
+            .then(|| BlockHeight::from_u32(raw.height as u32));
+        // A mempool tx targets the next block.
+        let branch_height = mined_height.unwrap_or_else(|| BlockHeight::from_u32(tip) + 1);
+        let tx = match Transaction::read(
+            &raw.data[..],
+            BranchId::for_height(&self.network, branch_height),
+        ) {
+            Ok(tx) => tx,
+            Err(e) => {
+                tracing::debug!("[{}] skipping unparseable mempool tx: {e}", self.name);
+                return;
+            }
+        };
+        let txid = tx.txid();
+        match decrypt_and_store_transaction(&self.network, &mut self.db_data, &tx, mined_height) {
+            Ok(()) => tracing::debug!("[{}] processed mempool tx {txid}", self.name),
+            Err(e) => warn!("[{}] failed to store mempool tx {txid}: {e}", self.name),
         }
     }
 
@@ -764,7 +885,7 @@ impl WalletActor {
                     ConfirmationsPolicy::default(),
                     None,
                 )
-                .map_err(classify_err)?;
+                .map_err(|e| enrich_insufficient_funds(db, classify_err(e)))?;
 
                 let txids = create_proposed_transactions(
                     db,
@@ -776,7 +897,7 @@ impl WalletActor {
                     &proposal,
                     None,
                 )
-                .map_err(classify_err)?;
+                .map_err(|e| enrich_insufficient_funds(db, classify_err(e)))?;
 
                 if txids.len() > 1 {
                     return Err(RpcError::wallet(
@@ -1081,24 +1202,26 @@ impl WalletActor {
     }
 }
 
-/// Ensure a freshly-connected lightwalletd `client` is healthy and the wallet has its
-/// note-commitment subtree roots. The first successful call this process downloads the roots
-/// (also a health check) and sets `roots_synced`; subsequent calls only do a cheap
-/// `get_latest_block` liveness probe, since the roots already persist in the wallet DB. This
-/// avoids re-streaming every subtree root on each reconnect / primary re-probe.
+/// Ensure a freshly-connected lightwalletd `client` is healthy, serves the chain this wallet
+/// is configured for, and the wallet has its note-commitment subtree roots. The
+/// `get_lightd_info` call doubles as the liveness probe and the wrong-chain guard (a mainnet
+/// zecd pointed at a testnet lightwalletd would otherwise happily scan the wrong chain). The
+/// first successful call this process additionally downloads the subtree roots and sets
+/// `roots_synced`; the roots persist in the wallet DB, so they aren't re-streamed on each
+/// reconnect / primary re-probe.
 ///
 /// The whole check is bounded by `budget`: a peer that accepts connections but never answers
 /// (the dial timeout can't see this) must not stall the actor's command loop.
 async fn prepare_client(
     client: &mut CompactTxStreamerClient<Channel>,
     db_data: &mut WriteDb,
+    network: ZNetwork,
     roots_synced: &mut bool,
     budget: Duration,
 ) -> anyhow::Result<()> {
     tokio::time::timeout(budget, async {
-        if *roots_synced {
-            client.get_latest_block(service::ChainSpec::default()).await?;
-        } else {
+        verify_server_network(client, network).await?;
+        if !*roots_synced {
             engine::update_subtree_roots(client, db_data).await?;
             *roots_synced = true;
         }
@@ -1106,6 +1229,58 @@ async fn prepare_client(
     })
     .await
     .map_err(|_| anyhow!("upstream health check timed out after {budget:?}"))?
+}
+
+/// Refuse a lightwalletd whose `chain_name` contradicts the configured network. Only the
+/// mainnet/non-mainnet boundary is enforced: zebra reports `"test"` for regtest too (its
+/// `bip70_network_name` only distinguishes mainnet), so test vs regtest cannot be told
+/// apart from here - and the guard's job is ensuring a mainnet wallet never scans a test
+/// chain (or vice versa). A definitive cross is a hard error so the caller fails over to
+/// the next candidate; an unrecognized name is only a warning, since not every server
+/// reports one.
+async fn verify_server_network(
+    client: &mut CompactTxStreamerClient<Channel>,
+    network: ZNetwork,
+) -> anyhow::Result<()> {
+    let info = client.get_lightd_info(service::Empty {}).await?.into_inner();
+    match chain_name_is_main(&info.chain_name) {
+        Some(server_is_main) => {
+            let wallet_is_main = matches!(network, ZNetwork::Main);
+            if server_is_main != wallet_is_main {
+                return Err(anyhow!(
+                    "lightwalletd serves chain '{}' but this wallet is configured for '{}'",
+                    info.chain_name,
+                    network.name()
+                ));
+            }
+        }
+        None => warn!(
+            "lightwalletd reported unrecognized chain_name {:?}; skipping network check",
+            info.chain_name
+        ),
+    }
+    Ok(())
+}
+
+/// Classify a lightwalletd `chain_name` as mainnet (`Some(true)`), a test chain
+/// (`Some(false)`), or unrecognized (`None`).
+fn chain_name_is_main(chain_name: &str) -> Option<bool> {
+    match chain_name {
+        "main" => Some(true),
+        "test" | "regtest" => Some(false),
+        _ => None,
+    }
+}
+
+/// Await the next message on an open mempool stream, or pend forever when none is open, so
+/// the actor's idle `select!` arm simply never fires without a subscription.
+async fn mempool_next(
+    stream: &mut Option<tonic::Streaming<service::RawTransaction>>,
+) -> Result<Option<service::RawTransaction>, tonic::Status> {
+    match stream {
+        Some(s) => s.message().await,
+        None => std::future::pending().await,
+    }
 }
 
 /// Sleep until the unlock deadline, or forever when there is none. Used as a `select!` arm so an
@@ -1151,6 +1326,37 @@ fn classify_err(e: crate::error::ProposalError) -> RpcError {
     }
 }
 
+/// Append the wallet's pending balance to an insufficient-funds (`-6`) error, so the common
+/// rapid-send case (spendable notes exhausted while shielded change awaits confirmations) is
+/// self-diagnosing: the caller can tell "retry once confirmations arrive" apart from "fund
+/// the wallet". Any other error passes through untouched. Looking up the summary here is
+/// safe: a `-6` means a proposal actually ran, which implies the chain tip is set (the
+/// `get_wallet_summary` progress-estimator underflow guarded against in `update_status`
+/// can't fire), and a failed lookup just leaves the message unenriched.
+fn enrich_insufficient_funds(db: &WriteDb, err: RpcError) -> RpcError {
+    if err.code != codes::RPC_WALLET_INSUFFICIENT_FUNDS {
+        return err;
+    }
+    let Ok(Some(summary)) = db.get_wallet_summary(ConfirmationsPolicy::default()) else {
+        return err;
+    };
+    let (mut incoming, mut change) = (0u64, 0u64);
+    for bal in summary.account_balances().values() {
+        incoming += bal.orchard_balance().value_pending_spendability().into_u64()
+            + bal.sapling_balance().value_pending_spendability().into_u64();
+        change += bal.orchard_balance().change_pending_confirmation().into_u64()
+            + bal.sapling_balance().change_pending_confirmation().into_u64();
+    }
+    if incoming == 0 && change == 0 {
+        return err;
+    }
+    RpcError::insufficient_funds(format!(
+        "{}; awaiting confirmations: {incoming} zatoshis incoming, {change} zatoshis change \
+ - these become spendable as blocks arrive",
+        err.message
+    ))
+}
+
 /// True when a `GetTransaction` error status means the node simply does not know the txid -
 /// an application-level miss the RPC layer reports as -5, not a transport failure worth
 /// dropping the connection over. lightwalletd proxies the backing node's message through:
@@ -1187,5 +1393,62 @@ mod tests {
         // Transport-class failures must still drop the client.
         assert!(!is_tx_not_found(&tonic::Status::unavailable("connection refused")));
         assert!(!is_tx_not_found(&tonic::Status::deadline_exceeded("timed out")));
+    }
+
+    /// The wrong-chain guard enforces only the mainnet/non-mainnet boundary. The regtest
+    /// case is the load-bearing one: zebra-backed lightwalletd reports `"test"` on regtest
+    /// (zebra's `bip70_network_name` only distinguishes mainnet), and treating that as a
+    /// mismatch bricked the regtest e2e - the actor rejected its only server on every
+    /// connect and never synced.
+    #[test]
+    fn chain_name_guard_checks_only_the_mainnet_boundary() {
+        use super::chain_name_is_main;
+
+        assert_eq!(chain_name_is_main("main"), Some(true));
+        assert_eq!(chain_name_is_main("test"), Some(false));
+        assert_eq!(chain_name_is_main("regtest"), Some(false));
+        // Unrecognized names skip the check (warn only).
+        assert_eq!(chain_name_is_main(""), None);
+        assert_eq!(chain_name_is_main("Main"), None);
+
+        // What verify_server_network derives from these classifications:
+        let is_main = |net: super::ZNetwork| matches!(net, super::ZNetwork::Main);
+        // zebra regtest reports "test"; a regtest wallet must accept it.
+        assert_eq!(chain_name_is_main("test"), Some(is_main(crate::network::regtest())));
+        // The boundary that matters: a mainnet wallet rejects test chains and vice versa.
+        assert_ne!(chain_name_is_main("test"), Some(is_main(super::ZNetwork::Main)));
+        assert_ne!(chain_name_is_main("main"), Some(is_main(super::ZNetwork::Test)));
+    }
+
+    /// `enrich_insufficient_funds` must touch *only* a -6 whose wallet actually has value
+    /// awaiting confirmations: other codes and a no-pending -6 pass through byte-identical
+    /// (clients match on these messages; never churn them gratuitously).
+    #[test]
+    fn insufficient_funds_enrichment_leaves_other_errors_alone() {
+        use super::{codes, BlockHeight, RpcError};
+        use zcash_client_backend::data_api::chain::ChainState;
+        use zcash_client_backend::data_api::{AccountBirthday, WalletWrite};
+        use zcash_primitives::block::BlockHash;
+
+        let net = crate::network::regtest();
+        let dir = tempfile::tempdir().unwrap();
+        let mut db = crate::wallet::open::init_dbs(net, dir.path()).expect("init dbs");
+        let birthday = AccountBirthday::from_parts(
+            ChainState::empty(BlockHeight::from_u32(0), BlockHash([0u8; 32])),
+            None,
+        );
+        db.create_account("t", &secrecy::SecretVec::new(vec![1u8; 64]), &birthday, None)
+            .expect("create account");
+        // The tip must be set before `get_wallet_summary` (progress-estimator underflow
+        // gotcha); the production call site inherits this from the completed proposal.
+        db.update_chain_tip(BlockHeight::from_u32(5)).expect("set tip");
+
+        let other = RpcError::wallet("some other failure");
+        assert_eq!(super::enrich_insufficient_funds(&db, other.clone()).message, other.message);
+
+        let bare = RpcError::insufficient_funds("Insufficient funds: 0 zatoshis spendable");
+        let out = super::enrich_insufficient_funds(&db, bare.clone());
+        assert_eq!(out.code, codes::RPC_WALLET_INSUFFICIENT_FUNDS);
+        assert_eq!(out.message, bare.message, "no pending balance, so no enrichment");
     }
 }

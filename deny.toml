@@ -1,0 +1,53 @@
+[graph]
+all-features = true
+
+[advisories]
+version = 2
+yanked = "deny"
+ignore = [
+    # `time` <0.3.47 DoS via stack exhaustion when *parsing* untrusted datetime
+    # strings. We cannot upgrade: zcash_client_backend 0.23.0 pins
+    # `time-core = "=0.1.2"`, which forces time 0.3.37 (0.3.47 needs time-core
+    # 0.1.8). Our dependency path uses `time` for timestamp arithmetic only -
+    # no parsing of untrusted input - so exposure is nil. Drop this ignore when
+    # the librustzcash line is next upgraded. (Same exception as
+    # .cargo/audit.toml, for local `cargo audit` runs.)
+    "RUSTSEC-2026-0009",
+    # proc-macro-error2 is unmaintained. It is a build-time proc-macro
+    # dependency only (no runtime code path), pulled in transitively by
+    # orchard (via getset) and age (via i18n-embed-fl); there is no
+    # first-party use and "no safe upgrade is available" per the advisory.
+    # "Unmaintained" is informational, not a vulnerability. Revisit once the
+    # upstream Zcash/age crates migrate off it.
+    "RUSTSEC-2026-0173",
+]
+
+[licenses]
+version = 2
+# zecd is MIT OR Apache-2.0; permit the usual permissive set for
+# transitive deps. Tighten as needed if `cargo deny` complains.
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "BSL-1.0",
+    "CC0-1.0",
+    "ISC",
+    "Unicode-3.0",
+    "Unlicense",
+    "Zlib",
+    # webpki-roots: Mozilla CA root certificate bundle.
+    "CDLA-Permissive-2.0",
+]
+confidence-threshold = 0.93
+
+[bans]
+multiple-versions = "allow"
+wildcards = "deny"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-git = []
