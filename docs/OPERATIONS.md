@@ -64,6 +64,22 @@ Suggested alerts: `/readyz` 503 with `reason=upstream_down` for >5 min; `/status
   failed and safe to re-send.
 - Rapid back-to-back sends can exhaust spendable notes (`-6`) until change confirms.
 
+## Reorgs
+
+zecd follows chain reorgs automatically: the scanner detects the fork via a block-hash
+continuity error, rewinds the wallet ~10 blocks below it, and rescans the replacement
+chain. Transactions in reorged-away blocks revert to unconfirmed (`confirmations: 0`)
+until re-mined - confirmation thresholds keep doing their job. Operator-visible
+consequences:
+
+- **A `listsinceblock` cursor pointing at a reorged-away block returns `-5 Block not
+  found`** (zecd keeps no stale-header history to walk back through, unlike bitcoind).
+  Treat `-5` as "cursor invalid": re-baseline with a parameterless `listsinceblock`,
+  process the result idempotently (dedupe by txid), and store the fresh `lastblock`.
+  Poller logic should assume any tx below your confirmation threshold can be re-reported.
+- Balances and `getblockcount` can dip while the rewound range rescans; `/status` shows
+  `scanning` during the catch-up.
+
 ## Upgrades
 
 1. `zecd stop` (or SIGINT) - graceful: in-flight requests finish, new ones get 503.
@@ -81,8 +97,10 @@ need a rollback path (stop the daemon before copying).
 - [ ] RPC bound to `127.0.0.1` or a private network; TLS/reverse proxy in front if it
       must cross a network boundary. **RPC credentials are spend authority** (see
       README → Security).
-- [ ] age identity stored outside the datadir (secrets manager / separate mount /
-      `ZECD_AGE_IDENTITY`); consider `auto_unlock = false`.
+- [ ] Key custody chosen deliberately: for unattended sending, the age identity stored
+      outside the datadir (secrets manager / separate mount / `ZECD_AGE_IDENTITY`); for
+      human-operated wallets, `zecd init --encrypt` (or `encryptwallet`) so spending
+      requires a verified `walletpassphrase` with an enforced timeout.
 - [ ] Mnemonic + birthday recorded offline; restore procedure tested on testnet.
 - [ ] Own `lightwalletd` as primary, public endpoints as fallback (`[lightwalletd]
       servers`); Docker images pinned to verified releases.

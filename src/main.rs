@@ -91,6 +91,7 @@ async fn run_daemon(config: AppConfig) -> anyhow::Result<()> {
             wallet_dir: entry.dir.clone(),
             servers,
             sync_interval: Duration::from_secs(config.sync.interval_secs),
+            rebroadcast_interval: Duration::from_secs(config.sync.rebroadcast_secs),
             connect_timeout: Duration::from_secs(config.lightwalletd.connect_timeout_secs),
             reconnect_base: Duration::from_secs(config.lightwalletd.reconnect_base_secs),
             reconnect_max: Duration::from_secs(config.lightwalletd.reconnect_max_secs),

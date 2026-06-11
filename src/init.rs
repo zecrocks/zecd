@@ -5,7 +5,7 @@ use std::path::Path;
 use std::time::Duration;
 
 use age::secrecy::ExposeSecret as _;
-use anyhow::{anyhow, Context};
+use anyhow::{anyhow, bail, Context};
 use bip0039::{Count, English, Mnemonic};
 use secrecy::{SecretVec, Zeroize};
 use tokio::io::AsyncWriteExt as _;
@@ -17,7 +17,36 @@ use zcash_protocol::consensus::{BlockHeight, NetworkUpgrade, Parameters};
 use crate::config::{AppConfig, InitArgs, WalletEntry};
 use crate::lightwalletd;
 use crate::wallet::open;
-use crate::wallet::store::WalletStore;
+use crate::wallet::store::{Passphrase, WalletStore};
+
+/// Read the encryption passphrase for `init --encrypt`. Prefers the `ZECD_WALLET_PASSPHRASE`
+/// environment variable (for non-interactive/automated init); otherwise prompts on stderr and
+/// reads it twice from stdin to confirm. Only the trailing newline is stripped, so a passphrase
+/// may contain surrounding spaces.
+fn read_encryption_passphrase() -> anyhow::Result<Passphrase> {
+    if let Some(p) = std::env::var_os("ZECD_WALLET_PASSPHRASE") {
+        let s = p.to_string_lossy().into_owned();
+        if s.is_empty() {
+            bail!("ZECD_WALLET_PASSPHRASE is set but empty");
+        }
+        return Ok(Passphrase::from(s));
+    }
+    let read_line = |prompt: &str| -> anyhow::Result<String> {
+        eprintln!("{prompt}");
+        let mut line = String::new();
+        std::io::stdin().read_line(&mut line)?;
+        Ok(line.trim_end_matches(['\n', '\r']).to_string())
+    };
+    let p1 = read_line("Enter a passphrase to encrypt the wallet:")?;
+    let p2 = read_line("Confirm passphrase:")?;
+    if p1 != p2 {
+        bail!("passphrases do not match");
+    }
+    if p1.is_empty() {
+        bail!("passphrase cannot be empty");
+    }
+    Ok(Passphrase::from(p1))
+}
 
 pub async fn run(config: &AppConfig, args: &InitArgs) -> anyhow::Result<()> {
     let entry: WalletEntry = config.wallets.get(&args.wallet).cloned().unwrap_or(WalletEntry {
@@ -41,7 +70,19 @@ pub async fn run(config: &AppConfig, args: &InitArgs) -> anyhow::Result<()> {
         .age_identity
         .clone()
         .unwrap_or_else(|| config.datadir.join("identity.txt"));
-    let recipients = ensure_identity(&identity_path).await?;
+    // An encrypted wallet wraps its mnemonic with a passphrase (age scrypt) and needs no
+    // identity file; an unencrypted wallet wraps it to the age identity for unattended unlock.
+    let recipients = if args.encrypt {
+        None
+    } else {
+        Some(ensure_identity(&identity_path).await?)
+    };
+    // Read the passphrase early (before any network I/O) so we fail fast on mismatch/empty.
+    let passphrase = if args.encrypt {
+        Some(read_encryption_passphrase()?)
+    } else {
+        None
+    };
 
     // init is a one-shot interactive command; it uses only the first configured endpoint (no
     // failover) - the daemon's actor does the multi-server failover at runtime.
@@ -116,13 +157,23 @@ pub async fn run(config: &AppConfig, args: &InitArgs) -> anyhow::Result<()> {
             .map_err(|_| anyhow!("failed to derive account birthday from tree state"))?
     };
 
-    WalletStore::init_with_mnemonic(
-        &wallet_dir,
-        recipients.iter().map(|r| r.as_ref() as _),
-        &mnemonic,
-        birthday.height(),
-        network,
-    )?;
+    match (passphrase, &recipients) {
+        (Some(passphrase), _) => WalletStore::init_with_passphrase(
+            &wallet_dir,
+            passphrase,
+            &mnemonic,
+            birthday.height(),
+            network,
+        )?,
+        (None, Some(recipients)) => WalletStore::init_with_mnemonic(
+            &wallet_dir,
+            recipients.iter().map(|r| r.as_ref() as _),
+            &mnemonic,
+            birthday.height(),
+            network,
+        )?,
+        (None, None) => unreachable!("non-encrypted init always builds identity recipients"),
+    }
 
     let seed = {
         let mut s = mnemonic.to_seed("");
@@ -135,7 +186,13 @@ pub async fn run(config: &AppConfig, args: &InitArgs) -> anyhow::Result<()> {
     db.create_account(&args.account_name, &seed, &birthday, None)?;
 
     eprintln!("Wallet '{}' initialized at {}", args.wallet, wallet_dir.display());
-    eprintln!("age identity: {}", identity_path.display());
+    if args.encrypt {
+        eprintln!(
+            "Wallet is passphrase-encrypted; it starts locked. Call walletpassphrase \"<pass>\" <timeout> to unlock for sending."
+        );
+    } else {
+        eprintln!("age identity: {}", identity_path.display());
+    }
     if !args.restore {
         eprintln!("\nIMPORTANT - record this mnemonic seed phrase and keep it safe:\n");
         println!("{}", mnemonic.phrase());

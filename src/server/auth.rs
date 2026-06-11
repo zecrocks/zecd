@@ -131,16 +131,23 @@ fn random_hex(bytes: usize) -> String {
 }
 
 fn write_cookie(path: &Path, user: &str, password: &str) -> std::io::Result<()> {
+    use std::io::Write;
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
     let contents = format!("{user}:{password}");
-    std::fs::write(path, contents.as_bytes())?;
+
+    // Create the file with mode 0600 atomically (via OpenOptions) rather than writing then
+    // chmod-ing, so the cookie is never briefly world-readable between create and set_permissions.
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create(true).truncate(true);
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
     }
+    let mut file = opts.open(path)?;
+    file.write_all(contents.as_bytes())?;
     Ok(())
 }
 

@@ -41,12 +41,10 @@ async fn regtest_end_to_end() {
         .expect("launch lightwalletd");
 
     // 3. zecd against lightwalletd (init retries until lightwalletd has caught up).
-    let cfg = ZecdConfig {
-        lightwalletd_port: lightwalletd.grpc_port,
-        rpc_port: pick_port().expect("pick zecd rpc port"),
-        rpc_user: "user".to_string(),
-        rpc_password: "pass".to_string(),
-    };
+    let cfg = ZecdConfig::new(
+        lightwalletd.grpc_port,
+        pick_port().expect("pick zecd rpc port"),
+    );
     let zecd = Zecd::start(&cfg)
         .await
         .expect("start zecd against regtest lightwalletd");
@@ -121,10 +119,25 @@ async fn regtest_end_to_end() {
         "expected insufficient-funds (-6), got: {err}"
     );
 
-    // The walletpassphrase gate. A locked wallet refuses to send with -13 - the seed check
-    // runs before input selection, so this needs no funds. Unlocking (the passphrase string
-    // is not the credential; the daemon decrypts with its age identity) restores the -6.
-    zecd.call("walletlock", json!([])).await.expect("walletlock");
+    // The wallet is unencrypted (age-identity model): the passphrase RPCs reject with -15,
+    // exactly like bitcoind running with an unencrypted wallet.
+    let err = zecd
+        .call("walletlock", json!([]))
+        .await
+        .expect_err("walletlock on an unencrypted wallet must fail");
+    assert_eq!(err.code(), Some(-15), "expected -15, got: {err}");
+    let err = zecd
+        .call("walletpassphrase", json!(["x", 60]))
+        .await
+        .expect_err("walletpassphrase on an unencrypted wallet must fail");
+    assert_eq!(err.code(), Some(-15), "expected -15, got: {err}");
+
+    // encryptwallet flips it to the Bitcoin-Core encrypted state: the wallet locks (send ->
+    // -13; the seed check precedes input selection so no funds are needed), a wrong
+    // passphrase is rejected (-14), and the real one unlocks - back to failing on funds (-6).
+    zecd.call("encryptwallet", json!(["regtest-pass"]))
+        .await
+        .expect("encryptwallet");
     let err = zecd
         .call("sendtoaddress", json!([addr, 1.0]))
         .await
@@ -134,9 +147,18 @@ async fn regtest_end_to_end() {
         Some(-13),
         "expected unlock-needed (-13), got: {err}"
     );
-    zecd.call("walletpassphrase", json!(["any", 60]))
+    let err = zecd
+        .call("walletpassphrase", json!(["wrong-pass", 60]))
         .await
-        .expect("walletpassphrase re-unlocks from the age identity");
+        .expect_err("a wrong passphrase must be rejected");
+    assert_eq!(
+        err.code(),
+        Some(-14),
+        "expected passphrase-incorrect (-14), got: {err}"
+    );
+    zecd.call("walletpassphrase", json!(["regtest-pass", 60]))
+        .await
+        .expect("the real passphrase unlocks");
     let err = zecd
         .call("sendtoaddress", json!([addr, 1.0]))
         .await

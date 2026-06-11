@@ -71,6 +71,8 @@ pub async fn dispatch(
         "sendmany" => wallet_methods::sendmany(state, wallet, req).await,
         "walletpassphrase" => wallet_methods::walletpassphrase(state, wallet, req).await,
         "walletlock" => wallet_methods::walletlock(state, wallet).await,
+        "encryptwallet" => wallet_methods::encryptwallet(state, wallet, req).await,
+        "walletpassphrasechange" => wallet_methods::walletpassphrasechange(state, wallet, req).await,
 
         other => Err(RpcError::method_not_found(other)),
     }

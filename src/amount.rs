@@ -408,4 +408,27 @@ mod tests {
         let n: Value = serde_json::from_str("21000001").unwrap(); // > 21M ZEC
         assert!(value_to_zats(&n).is_err());
     }
+
+    #[test]
+    fn accepts_scientific_notation() {
+        // Bitcoin Core's ParseFixedPoint accepts exponent form; these exercise
+        // parse_fixed_point's exponent handling end to end.
+        let n: Value = serde_json::from_str("1e-5").unwrap(); // 0.00001 ZEC = 1000 zats
+        assert_eq!(value_to_zats(&n).unwrap().into_u64(), 1_000);
+        let n: Value = serde_json::from_str("1E-8").unwrap(); // 1 zatoshi
+        assert_eq!(value_to_zats(&n).unwrap().into_u64(), 1);
+        let n: Value = serde_json::from_str("1.5e2").unwrap(); // 150 ZEC
+        assert_eq!(value_to_zats(&n).unwrap().into_u64(), 150 * COIN);
+        // As a string, too.
+        let s = Value::String("2e-3".to_string()); // 0.002 ZEC = 200_000 zats
+        assert_eq!(value_to_zats(&s).unwrap().into_u64(), 200_000);
+    }
+
+    #[test]
+    fn scientific_still_enforces_8dp_and_range() {
+        let n: Value = serde_json::from_str("1e-9").unwrap(); // 9 dp -> too fine
+        assert!(value_to_zats(&n).is_err());
+        let n: Value = serde_json::from_str("1e9").unwrap(); // 1e9 ZEC > 21M cap
+        assert!(value_to_zats(&n).is_err());
+    }
 }

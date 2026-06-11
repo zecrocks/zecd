@@ -3,9 +3,10 @@
 
 use std::num::NonZeroUsize;
 use std::path::PathBuf;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::anyhow;
+use secrecy::ExposeSecret;
 use tokio::sync::{mpsc, watch};
 use tonic::transport::Channel;
 use tracing::{info, warn};
@@ -49,12 +50,25 @@ const MIN_SPLIT_OUTPUT_VALUE: u64 = 10_000_000; // 0.1 ZEC
 /// each `primary_recheck`. A recovered primary connects near-instantly; a dead one fails fast.
 const REPROBE_CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
 
-/// How often (at most) to re-broadcast wallet transactions that are still unmined and
-/// unexpired. Covers sends whose original broadcast failed (their notes are already locked
-/// in the DB until expiry) and mempool drops across upstream restarts; bitcoind keeps
-/// retransmitting unconfirmed wallet txs the same way. A node that already has the tx
-/// rejects the duplicate, which is harmless.
-const REBROADCAST_INTERVAL: Duration = Duration::from_secs(60);
+/// Deadlines for RPCs issued on an already-connected channel. The dial timeout covers only
+/// the TCP/TLS connect, so a peer that hangs *after* accepting would otherwise stall the
+/// actor's command loop indefinitely (HTTP/2 keepalive on the channel is the systemic
+/// backstop; these make the critical paths deterministic and snappier).
+///
+/// The post-connect health check may include the one-time subtree-root stream (hundreds of
+/// roots on mainnet), so it gets a generous budget...
+const PREPARE_TIMEOUT: Duration = Duration::from_secs(60);
+/// ...while a primary re-probe runs from the idle loop with a healthy fallback active, so it
+/// must stay tight (roots are already synced by then; this is a cheap liveness ping).
+const REPROBE_PREPARE_TIMEOUT: Duration = Duration::from_secs(10);
+/// Unary calls (broadcast, tip refresh, tx fetch) on the live channel.
+const UNARY_RPC_TIMEOUT: Duration = Duration::from_secs(30);
+
+// NB: the unmined-tx rebroadcast interval is configurable (`[sync] rebroadcast_secs`,
+// default 60) and arrives via `ActorConfig::rebroadcast_interval`. It covers sends whose
+// original broadcast failed (their notes are already locked in the DB until expiry) and
+// mempool drops across upstream restarts; bitcoind keeps retransmitting unconfirmed wallet
+// txs the same way. A node that already has the tx rejects the duplicate, which is harmless.
 
 thread_local! {
     /// Set while we deliberately `catch_unwind` librustzcash's progress estimator, so the
@@ -82,6 +96,8 @@ pub struct ActorConfig {
     /// Ordered lightwalletd endpoints (non-empty); tried in order, preferring the first.
     pub servers: Vec<Server>,
     pub sync_interval: Duration,
+    /// Minimum spacing between unmined-tx rebroadcast passes.
+    pub rebroadcast_interval: Duration,
     /// Per-attempt dial timeout.
     pub connect_timeout: Duration,
     /// Reconnect backoff base/max delays.
@@ -108,6 +124,7 @@ struct WalletActor {
     primary_recheck: Duration,
     last_primary_probe: Instant,
     sync_interval: Duration,
+    rebroadcast_interval: Duration,
     age_identity: Option<PathBuf>,
     account_id: AccountUuid,
     account_index: Option<zip32::AccountId>,
@@ -122,6 +139,16 @@ struct WalletActor {
     tip_hash: Option<String>,
     /// Last time the unmined-tx rebroadcast pass ran (`None` = not yet).
     last_rebroadcast: Option<Instant>,
+    /// Whether the note-commitment subtree roots have been downloaded at least once this
+    /// process. After the first fetch they persist in the wallet DB, so later (re)connects do a
+    /// cheap liveness probe instead of re-streaming every root.
+    subtree_roots_synced: bool,
+    /// Whether the wallet is passphrase-encrypted (read from `keys.toml` at spawn). Gates the
+    /// Bitcoin-Core-style `walletpassphrase`/`walletlock`/`encryptwallet` behavior.
+    encrypted: bool,
+    /// For an encrypted wallet that's currently unlocked: when the seed auto-relocks. Re-running
+    /// `walletpassphrase` overwrites it (resetting the timer); `walletlock` clears it.
+    unlock_until: Option<Instant>,
 }
 
 /// Open the wallet, derive its account info, optionally unlock the seed, build the prover,
@@ -146,11 +173,20 @@ pub async fn spawn(cfg: ActorConfig) -> anyhow::Result<WalletHandle> {
     let db_cache = open::open_fsblockdb(&cfg.wallet_dir)?;
     let (account_id, account_index) = select_account(&db_data)?;
 
-    // Optionally decrypt the seed up-front for unattended sending.
+    // Determine the wallet's encryption mode, and for unencrypted wallets optionally decrypt
+    // the seed up-front for unattended sending. An encrypted wallet has no passphrase at rest,
+    // so it cannot auto-unlock - it starts locked and requires `walletpassphrase` (matching
+    // Bitcoin Core's encrypted-wallet behavior).
+    let st = store::WalletStore::read(&cfg.wallet_dir)?;
+    let encrypted = st.is_encrypted();
     let mut seed = SeedKeeper::locked();
-    if cfg.auto_unlock {
+    if encrypted {
+        info!(
+            "[{}] wallet is passphrase-encrypted; it starts locked - call walletpassphrase to unlock for sending",
+            cfg.name
+        );
+    } else if cfg.auto_unlock {
         if let Some(identity) = &cfg.age_identity {
-            let st = store::WalletStore::read(&cfg.wallet_dir)?;
             if st.has_seed() {
                 match keys::decrypt_seed_with_identity(&st, identity) {
                     Ok(Some(s)) => {
@@ -189,6 +225,7 @@ pub async fn spawn(cfg: ActorConfig) -> anyhow::Result<WalletHandle> {
         primary_recheck: cfg.primary_recheck,
         last_primary_probe: Instant::now(),
         sync_interval: cfg.sync_interval,
+        rebroadcast_interval: cfg.rebroadcast_interval,
         age_identity: cfg.age_identity,
         account_id,
         account_index,
@@ -202,6 +239,9 @@ pub async fn spawn(cfg: ActorConfig) -> anyhow::Result<WalletHandle> {
         tip_height: None,
         tip_hash: None,
         last_rebroadcast: None,
+        subtree_roots_synced: false,
+        encrypted,
+        unlock_until: None,
     };
 
     tokio::spawn(actor.run());
@@ -242,6 +282,10 @@ impl WalletActor {
 
         let mut more_work = true;
         loop {
+            // Relock an encrypted wallet whose passphrase timeout has elapsed. Checked every
+            // iteration (between sync batches) so the seed doesn't linger long past expiry; the
+            // `select!` branch below handles the idle case, and `do_send` has a hard backstop.
+            self.relock_if_expired();
             if more_work {
                 // Service any queued commands first so writers aren't starved by sync.
                 loop {
@@ -286,6 +330,9 @@ impl WalletActor {
                             Some(cmd) => if self.handle_command(cmd).await { return; },
                             None => return,
                         }
+                    }
+                    _ = relock_sleep(self.unlock_until) => {
+                        self.relock_if_expired();
                     }
                     _ = tokio::time::sleep(wait) => {
                         if self.client.is_none() {
@@ -332,8 +379,15 @@ impl WalletActor {
                     let client = self.client.as_mut().expect("just set");
                     // A reachable-but-unhealthy upstream can still fail here; treat that as this
                     // server failing and fall through to the next candidate.
-                    if let Err(e) = engine::update_subtree_roots(client, &mut self.db_data).await {
-                        warn!("[{}] subtree-root sync failed on {}: {e}", self.name, describe);
+                    if let Err(e) = prepare_client(
+                        client,
+                        &mut self.db_data,
+                        &mut self.subtree_roots_synced,
+                        PREPARE_TIMEOUT,
+                    )
+                    .await
+                    {
+                        warn!("[{}] health check failed on {}: {e}", self.name, describe);
                         self.client = None;
                         last_err = Some(e);
                         continue;
@@ -380,8 +434,18 @@ impl WalletActor {
             let Ok(mut client) = self.servers[idx].connect_timeout(probe_timeout).await else {
                 continue;
             };
-            if let Err(e) = engine::update_subtree_roots(&mut client, &mut self.db_data).await {
-                warn!("[{}] primary re-probe {} failed during subtree sync: {e}", self.name, describe);
+            // Health check: full subtree-root sync only if not yet done this process, else a
+            // cheap `get_latest_block` - so a recovered primary isn't re-streamed all its roots
+            // on every recheck (default 60s while on a fallback).
+            if let Err(e) = prepare_client(
+                &mut client,
+                &mut self.db_data,
+                &mut self.subtree_roots_synced,
+                REPROBE_PREPARE_TIMEOUT,
+            )
+            .await
+            {
+                warn!("[{}] primary re-probe {} not healthy: {e}", self.name, describe);
                 continue;
             }
             info!(
@@ -404,10 +468,13 @@ impl WalletActor {
                 .client
                 .as_mut()
                 .ok_or_else(|| anyhow!("not connected"))?;
-            client
-                .get_latest_block(service::ChainSpec::default())
-                .await?
-                .into_inner()
+            tokio::time::timeout(
+                UNARY_RPC_TIMEOUT,
+                client.get_latest_block(service::ChainSpec::default()),
+            )
+            .await
+            .map_err(|_| anyhow!("get_latest_block timed out after {UNARY_RPC_TIMEOUT:?}"))??
+            .into_inner()
         };
         let tip = BlockHeight::try_from(block_id.height)
             .map_err(|_| anyhow!("chain tip height out of range"))?;
@@ -481,6 +548,12 @@ impl WalletActor {
         } else {
             ConnState::Ready
         };
+        // For an encrypted wallet, report the absolute relock time (0 = locked), matching
+        // Bitcoin Core's `getwalletinfo.unlocked_until`. Unencrypted wallets report `None`.
+        let unlocked_until = self.encrypted.then(|| match self.unlock_until {
+            Some(t) => now_unix() + t.saturating_duration_since(Instant::now()).as_secs() as i64,
+            None => 0,
+        });
         let status = SyncStatus {
             connected: self.client.is_some(),
             server: Some(self.servers[self.active].describe()),
@@ -490,12 +563,14 @@ impl WalletActor {
             best_block_hash: self.tip_hash.clone(),
             scan_progress,
             scanning,
+            encrypted: self.encrypted,
+            unlocked_until,
         };
         let _ = self.status_tx.send(status);
     }
 
     /// Re-broadcast wallet transactions that are still unmined and unexpired, at most once
-    /// per [`REBROADCAST_INTERVAL`]. Run only when caught up, so a tx that was mined but not
+    /// per `rebroadcast_interval`. Run only when caught up, so a tx that was mined but not
     /// yet scanned isn't pointlessly re-sent. Rejections from a node that already knows the
     /// tx are expected and logged at debug; transport failures drop the client so the next
     /// loop iteration reconnects/fails over.
@@ -504,7 +579,7 @@ impl WalletActor {
         if self.client.is_none()
             || self
                 .last_rebroadcast
-                .is_some_and(|t| t.elapsed() < REBROADCAST_INTERVAL)
+                .is_some_and(|t| t.elapsed() < self.rebroadcast_interval)
         {
             return;
         }
@@ -519,7 +594,15 @@ impl WalletActor {
         for (txid, data) in txs {
             let Some(client) = self.client.as_mut() else { return };
             let raw = service::RawTransaction { data, ..Default::default() };
-            match client.send_transaction(raw).await {
+            let sent = tokio::time::timeout(UNARY_RPC_TIMEOUT, client.send_transaction(raw))
+                .await
+                .map_err(|_| {
+                    tonic::Status::deadline_exceeded(format!(
+                        "rebroadcast timed out after {UNARY_RPC_TIMEOUT:?}"
+                    ))
+                })
+                .and_then(|r| r);
+            match sent {
                 Ok(r) => {
                     let r = r.into_inner();
                     if r.error_code == 0 {
@@ -558,16 +641,35 @@ impl WalletActor {
                 let res = self.do_get_raw_tx(txid).await;
                 let _ = reply.send(res);
             }
-            WalletCommand::Unlock { reply } => {
-                let res = self.do_unlock();
+            WalletCommand::Unlock { passphrase, timeout_secs, reply } => {
+                let res = self.do_unlock(passphrase, timeout_secs);
                 let _ = reply.send(res);
             }
             WalletCommand::Lock { reply } => {
-                self.seed.lock();
-                let _ = reply.send(Ok(()));
+                let res = self.do_lock();
+                let _ = reply.send(res);
+            }
+            WalletCommand::EncryptWallet { passphrase, reply } => {
+                let res = self.do_encrypt_wallet(passphrase);
+                let _ = reply.send(res);
+            }
+            WalletCommand::ChangePassphrase { old, new, reply } => {
+                let res = self.do_change_passphrase(old, new);
+                let _ = reply.send(res);
             }
         }
         false
+    }
+
+    /// Relock an encrypted wallet whose `walletpassphrase` timeout has elapsed: zeroize the
+    /// in-memory seed and clear the deadline. Cheap and idempotent.
+    fn relock_if_expired(&mut self) {
+        if self.unlock_until.is_some_and(|t| Instant::now() >= t) {
+            self.seed.lock();
+            self.unlock_until = None;
+            info!("[{}] wallet auto-locked (walletpassphrase timeout elapsed)", self.name);
+            self.update_status();
+        }
     }
 
     fn get_new_address(&mut self, label: Option<String>) -> Result<String, RpcError> {
@@ -586,6 +688,10 @@ impl WalletActor {
     }
 
     async fn do_send(&mut self, request: TransactionRequest) -> Result<TxId, RpcError> {
+        // Hard backstop: if an encrypted wallet's unlock has expired but proactive relock
+        // hasn't fired yet (e.g. a long sync batch was in progress), lock now so the spend
+        // can't slip through past its timeout. `derive_usk` then returns -13 as expected.
+        self.relock_if_expired();
         let account_index = self
             .account_index
             .ok_or_else(|| RpcError::wallet("Cannot spend from a view-only account"))?;
@@ -672,7 +778,16 @@ impl WalletActor {
         }
         let response = {
             let client = self.client.as_mut().expect("connected above");
-            client.send_transaction(raw).await
+            // Bounded: a peer that hangs mid-broadcast is treated like any other transport
+            // failure - the committed tx rides on the rebroadcast loop either way.
+            tokio::time::timeout(UNARY_RPC_TIMEOUT, client.send_transaction(raw))
+                .await
+                .map_err(|_| {
+                    tonic::Status::deadline_exceeded(format!(
+                        "broadcast timed out after {UNARY_RPC_TIMEOUT:?}"
+                    ))
+                })
+                .and_then(|r| r)
         };
         let response = match response {
             Ok(r) => r.into_inner(),
@@ -730,7 +845,14 @@ impl WalletActor {
                 .client
                 .as_mut()
                 .ok_or_else(|| RpcError::misc("not connected to lightwalletd"))?;
-            client.get_transaction(filter).await
+            tokio::time::timeout(UNARY_RPC_TIMEOUT, client.get_transaction(filter))
+                .await
+                .map_err(|_| {
+                    tonic::Status::deadline_exceeded(format!(
+                        "get_transaction timed out after {UNARY_RPC_TIMEOUT:?}"
+                    ))
+                })
+                .and_then(|r| r)
         };
         let raw = match raw {
             Ok(r) => r.into_inner(),
@@ -744,22 +866,165 @@ impl WalletActor {
         Ok(if raw.data.is_empty() { None } else { Some(raw.data) })
     }
 
-    fn do_unlock(&mut self) -> Result<(), RpcError> {
-        if self.seed.is_unlocked() {
-            return Ok(());
+    /// `walletpassphrase`: decrypt the seed with `passphrase` and hold it unlocked until
+    /// `timeout_secs` from now (argument validation/clamping happens in the RPC layer). Only
+    /// valid for an encrypted wallet; an unencrypted one returns -15 like Bitcoin Core.
+    fn do_unlock(&mut self, passphrase: store::Passphrase, timeout_secs: i64) -> Result<(), RpcError> {
+        if !self.encrypted {
+            return Err(RpcError::new(
+                codes::RPC_WALLET_WRONG_ENC_STATE,
+                "Error: running with an unencrypted wallet, but walletpassphrase was called.",
+            ));
         }
-        let identity = self
-            .age_identity
-            .as_ref()
-            .ok_or_else(|| RpcError::wallet("no age identity configured; cannot unlock wallet"))?;
         let st = store::WalletStore::read(&self.wallet_dir)
             .map_err(|e| RpcError::wallet(format!("reading keys.toml: {e}")))?;
-        let seed = keys::decrypt_seed_with_identity(&st, identity)
-            .map_err(|e| RpcError::wallet(format!("decrypting seed: {e}")))?
+        let seed = st
+            .decrypt_seed_with_passphrase(passphrase)
+            // Any decryption failure on the passphrase path means the passphrase was wrong.
+            .map_err(|_| {
+                RpcError::new(
+                    codes::RPC_WALLET_PASSPHRASE_INCORRECT,
+                    "Error: The wallet passphrase entered was incorrect.",
+                )
+            })?
             .ok_or_else(|| RpcError::wallet("wallet has no stored seed"))?;
         self.seed.set(seed);
+        // Re-running walletpassphrase overwrites the deadline (resets the timer). A timeout of 0
+        // relocks ~immediately, which `relock_if_expired` then enforces.
+        self.unlock_until = Some(Instant::now() + Duration::from_secs(timeout_secs.max(0) as u64));
+        self.relock_if_expired();
+        self.update_status();
         Ok(())
     }
+
+    /// `walletlock`: zeroize the seed and cancel the pending relock. -15 if unencrypted.
+    fn do_lock(&mut self) -> Result<(), RpcError> {
+        if !self.encrypted {
+            return Err(RpcError::new(
+                codes::RPC_WALLET_WRONG_ENC_STATE,
+                "Error: running with an unencrypted wallet, but walletlock was called.",
+            ));
+        }
+        self.seed.lock();
+        self.unlock_until = None;
+        self.update_status();
+        Ok(())
+    }
+
+    /// `encryptwallet`: re-wrap the (currently identity-encrypted) mnemonic under `passphrase`
+    /// and leave the wallet locked. -15 if already encrypted. Unlike Bitcoin Core, the seed is
+    /// NOT regenerated - the same mnemonic is preserved, only its at-rest wrapping changes.
+    fn do_encrypt_wallet(&mut self, passphrase: store::Passphrase) -> Result<(), RpcError> {
+        if self.encrypted {
+            return Err(RpcError::new(
+                codes::RPC_WALLET_WRONG_ENC_STATE,
+                "Error: running with an encrypted wallet, but encryptwallet was called.",
+            ));
+        }
+        let identity = self.age_identity.as_ref().ok_or_else(|| {
+            RpcError::wallet("no age identity configured; cannot read the mnemonic to encrypt")
+        })?;
+        let st = store::WalletStore::read(&self.wallet_dir)
+            .map_err(|e| RpcError::wallet(format!("reading keys.toml: {e}")))?;
+        let mnemonic = keys::decrypt_mnemonic_with_identity(&st, identity)
+            .map_err(|e| RpcError::wallet(format!("decrypting mnemonic: {e}")))?
+            .ok_or_else(|| RpcError::wallet("wallet has no stored mnemonic"))?;
+        let phrase = std::str::from_utf8(mnemonic.expose_secret().as_slice())
+            .map_err(|_| RpcError::wallet("stored mnemonic is not valid UTF-8"))?;
+        st.rewrite_with_passphrase(&self.wallet_dir, passphrase, phrase)
+            .map_err(|e| {
+                RpcError::new(
+                    codes::RPC_WALLET_ENCRYPTION_FAILED,
+                    format!("failed to encrypt wallet: {e}"),
+                )
+            })?;
+        // Now Bitcoin-Core "encrypted": lock and require walletpassphrase from here on.
+        self.encrypted = true;
+        self.seed.lock();
+        self.unlock_until = None;
+        self.update_status();
+        Ok(())
+    }
+
+    /// `walletpassphrasechange`: re-wrap the mnemonic from `old` to `new`. -15 if unencrypted,
+    /// -14 if `old` is wrong. Does not change the current lock state.
+    fn do_change_passphrase(
+        &mut self,
+        old: store::Passphrase,
+        new: store::Passphrase,
+    ) -> Result<(), RpcError> {
+        if !self.encrypted {
+            return Err(RpcError::new(
+                codes::RPC_WALLET_WRONG_ENC_STATE,
+                "Error: running with an unencrypted wallet, but walletpassphrasechange was called.",
+            ));
+        }
+        let st = store::WalletStore::read(&self.wallet_dir)
+            .map_err(|e| RpcError::wallet(format!("reading keys.toml: {e}")))?;
+        let mnemonic = st
+            .decrypt_mnemonic_with_passphrase(old)
+            .map_err(|_| {
+                RpcError::new(
+                    codes::RPC_WALLET_PASSPHRASE_INCORRECT,
+                    "Error: The wallet passphrase entered was incorrect.",
+                )
+            })?
+            .ok_or_else(|| RpcError::wallet("wallet has no stored mnemonic"))?;
+        let phrase = std::str::from_utf8(mnemonic.expose_secret().as_slice())
+            .map_err(|_| RpcError::wallet("stored mnemonic is not valid UTF-8"))?;
+        st.rewrite_with_passphrase(&self.wallet_dir, new, phrase)
+            .map_err(|e| {
+                RpcError::new(
+                    codes::RPC_WALLET_ENCRYPTION_FAILED,
+                    format!("failed to change passphrase: {e}"),
+                )
+            })?;
+        Ok(())
+    }
+}
+
+/// Ensure a freshly-connected lightwalletd `client` is healthy and the wallet has its
+/// note-commitment subtree roots. The first successful call this process downloads the roots
+/// (also a health check) and sets `roots_synced`; subsequent calls only do a cheap
+/// `get_latest_block` liveness probe, since the roots already persist in the wallet DB. This
+/// avoids re-streaming every subtree root on each reconnect / primary re-probe.
+///
+/// The whole check is bounded by `budget`: a peer that accepts connections but never answers
+/// (the dial timeout can't see this) must not stall the actor's command loop.
+async fn prepare_client(
+    client: &mut CompactTxStreamerClient<Channel>,
+    db_data: &mut WriteDb,
+    roots_synced: &mut bool,
+    budget: Duration,
+) -> anyhow::Result<()> {
+    tokio::time::timeout(budget, async {
+        if *roots_synced {
+            client.get_latest_block(service::ChainSpec::default()).await?;
+        } else {
+            engine::update_subtree_roots(client, db_data).await?;
+            *roots_synced = true;
+        }
+        Ok::<(), anyhow::Error>(())
+    })
+    .await
+    .map_err(|_| anyhow!("upstream health check timed out after {budget:?}"))?
+}
+
+/// Sleep until the unlock deadline, or forever when there is none. Used as a `select!` arm so an
+/// encrypted wallet's seed is zeroized promptly once its `walletpassphrase` timeout elapses.
+async fn relock_sleep(until: Option<Instant>) {
+    match until {
+        Some(t) => tokio::time::sleep_until(tokio::time::Instant::from_std(t)).await,
+        None => std::future::pending::<()>().await,
+    }
+}
+
+/// Current unix time in seconds (for reporting `unlocked_until`).
+fn now_unix() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64
 }
 
 /// Classify a librustzcash spend/proposal error into a Bitcoin-Core RPC code. Insufficient

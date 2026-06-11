@@ -224,6 +224,37 @@ def main() -> int:
     except JSONRPCException as e:
         ck("bad auth -> 401", e.code == 401, e.code)
 
+    print("== wallet encryption state ==")
+    # Adapts to the wallet under test: an encrypted wallet reports unlocked_until and verifies
+    # passphrases (-14 on a wrong one); an unencrypted wallet rejects the passphrase RPCs with
+    # -15, exactly like running bitcoind with an unencrypted wallet.
+    if "unlocked_until" in wi:
+        ck("unlocked_until is an int when encrypted", isinstance(wi["unlocked_until"], int))
+        try:
+            rpc.call("walletpassphrase", "definitely-not-the-passphrase", 60)
+            ck("wrong passphrase raises", False)
+        except JSONRPCException as e:
+            ck("wrong passphrase -> -14", e.code == -14, e.code)
+    else:
+        ck("getwalletinfo omits unlocked_until when unencrypted", "unlocked_until" not in wi)
+        try:
+            rpc.call("walletpassphrase", "anything", 60)
+            ck("walletpassphrase on unencrypted raises", False)
+        except JSONRPCException as e:
+            ck("walletpassphrase unencrypted -> -15", e.code == -15, e.code)
+        try:
+            rpc.call("walletlock")
+            ck("walletlock on unencrypted raises", False)
+        except JSONRPCException as e:
+            ck("walletlock unencrypted -> -15", e.code == -15, e.code)
+    # Argument validation happens before the encryption-state check: a negative timeout is -8
+    # in both wallet states.
+    try:
+        rpc.call("walletpassphrase", "anything", -1)
+        ck("negative timeout raises", False)
+    except JSONRPCException as e:
+        ck("walletpassphrase negative timeout -> -8", e.code == -8, e.code)
+
     print("== batch ==")
     out = rpc.batch([("getblockcount", []), ("no_such", [])])
     ck("batch returns array", isinstance(out, list) and len(out) == 2)

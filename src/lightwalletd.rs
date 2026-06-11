@@ -85,7 +85,16 @@ impl Server {
         &self,
         timeout: Duration,
     ) -> anyhow::Result<CompactTxStreamerClient<Channel>> {
-        let channel = Channel::from_shared(self.endpoint())?;
+        // HTTP/2 keepalive: a peer that accepted the connection but stopped responding (hung
+        // process, black-holed path) fails every in-flight RPC and stream within
+        // interval+timeout, instead of stalling them forever - TCP alone can't detect this
+        // (the kernel keeps ACKing for a stopped process). This is the systemic backstop for
+        // the long-lived channel; the actor additionally puts explicit deadlines on its
+        // critical unary calls.
+        let channel = Channel::from_shared(self.endpoint())?
+            .http2_keep_alive_interval(Duration::from_secs(15))
+            .keep_alive_timeout(Duration::from_secs(5))
+            .keep_alive_while_idle(true);
         let channel = if self.use_tls() {
             let tls = ClientTlsConfig::new()
                 .domain_name(self.host.to_string())

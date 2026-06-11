@@ -20,6 +20,7 @@ use zip321::TransactionRequest;
 
 use crate::error::RpcError;
 use crate::network::ZNetwork;
+use crate::wallet::store::Passphrase;
 
 /// Connection state to lightwalletd, surfaced for monitoring (e.g. to distinguish "all
 /// upstreams down" from "still syncing" on `/readyz`).
@@ -57,6 +58,12 @@ pub struct SyncStatus {
     /// Scan progress in `[0, 1]`.
     pub scan_progress: f64,
     pub scanning: bool,
+    /// True when the wallet is passphrase-encrypted (Bitcoin Core's `HasEncryptionKeys()`).
+    /// Drives whether `getwalletinfo` reports `unlocked_until` and how the passphrase RPCs behave.
+    pub encrypted: bool,
+    /// For an encrypted wallet: the unix time the seed auto-relocks (0 = locked now), matching
+    /// Bitcoin Core's `getwalletinfo.unlocked_until`. `None` for unencrypted wallets.
+    pub unlocked_until: Option<i64>,
 }
 
 impl SyncStatus {
@@ -87,12 +94,27 @@ pub enum WalletCommand {
         txid: TxId,
         reply: oneshot::Sender<Result<Option<Vec<u8>>, RpcError>>,
     },
-    /// Decrypt the seed into memory (compat for `walletpassphrase`).
+    /// Unlock an encrypted wallet for `timeout_secs` (Bitcoin Core's `walletpassphrase`):
+    /// decrypt the seed with `passphrase`, hold it, and auto-relock after the timeout.
     Unlock {
+        passphrase: Passphrase,
+        timeout_secs: i64,
         reply: oneshot::Sender<Result<(), RpcError>>,
     },
-    /// Zeroize the in-memory seed (compat for `walletlock`).
+    /// Zeroize the in-memory seed and cancel any pending relock (`walletlock`).
     Lock {
+        reply: oneshot::Sender<Result<(), RpcError>>,
+    },
+    /// Encrypt a previously-unencrypted wallet with `passphrase` (`encryptwallet`): re-wrap the
+    /// mnemonic under scrypt and leave the wallet locked.
+    EncryptWallet {
+        passphrase: Passphrase,
+        reply: oneshot::Sender<Result<(), RpcError>>,
+    },
+    /// Change an encrypted wallet's passphrase (`walletpassphrasechange`).
+    ChangePassphrase {
+        old: Passphrase,
+        new: Passphrase,
         reply: oneshot::Sender<Result<(), RpcError>>,
     },
 }
@@ -140,12 +162,27 @@ impl WalletHandle {
         self.dispatch(|reply| WalletCommand::GetRawTx { txid, reply }).await
     }
 
-    pub async fn unlock(&self) -> Result<(), RpcError> {
-        self.dispatch(|reply| WalletCommand::Unlock { reply }).await
+    pub async fn unlock(&self, passphrase: Passphrase, timeout_secs: i64) -> Result<(), RpcError> {
+        self.dispatch(|reply| WalletCommand::Unlock { passphrase, timeout_secs, reply })
+            .await
     }
 
     pub async fn lock(&self) -> Result<(), RpcError> {
         self.dispatch(|reply| WalletCommand::Lock { reply }).await
+    }
+
+    pub async fn encrypt_wallet(&self, passphrase: Passphrase) -> Result<(), RpcError> {
+        self.dispatch(|reply| WalletCommand::EncryptWallet { passphrase, reply })
+            .await
+    }
+
+    pub async fn change_passphrase(
+        &self,
+        old: Passphrase,
+        new: Passphrase,
+    ) -> Result<(), RpcError> {
+        self.dispatch(|reply| WalletCommand::ChangePassphrase { old, new, reply })
+            .await
     }
 }
 

@@ -10,6 +10,7 @@ use crate::amount::{signed_zats_to_value, value_to_zats, zats_to_value};
 use crate::error::RpcError;
 use crate::server::jsonrpc::RpcRequest;
 use crate::state::AppState;
+use crate::wallet::store::Passphrase;
 use crate::wallet::{labels, read, SyncStatus};
 
 fn opt_str(req: &RpcRequest, i: usize) -> Option<String> {
@@ -74,7 +75,7 @@ pub fn getwalletinfo(state: &AppState, wallet: Option<&str>) -> Result<Value, Rp
     } else {
         Value::Bool(false)
     };
-    Ok(json!({
+    let mut obj = json!({
         "walletname": handle.name,
         "walletversion": 169900,
         "format": "sqlite",
@@ -89,7 +90,13 @@ pub fn getwalletinfo(state: &AppState, wallet: Option<&str>) -> Result<Value, Rp
         "avoid_reuse": false,
         "scanning": scanning,
         "descriptors": false
-    }))
+    });
+    // Only present for passphrase-encrypted wallets (matches Bitcoin Core): the unix time the
+    // wallet auto-relocks, or 0 if currently locked.
+    if st.encrypted {
+        obj["unlocked_until"] = json!(st.unlocked_until.unwrap_or(0));
+    }
+    Ok(obj)
 }
 
 pub fn getaddressinfo(
@@ -653,21 +660,85 @@ pub async fn sendmany(
     Ok(Value::String(txid.to_string()))
 }
 
+/// Bitcoin Core clamps the unlock timeout to this many seconds (~3.17 years); larger values
+/// are silently reduced rather than rejected.
+const MAX_UNLOCK_TIMEOUT_SECS: i64 = 100_000_000;
+
 pub async fn walletpassphrase(
     state: &AppState,
     wallet: Option<&str>,
-    _req: &RpcRequest,
+    req: &RpcRequest,
 ) -> Result<Value, RpcError> {
-    // Compat: unlock the seed from the configured age identity. The timeout argument is
-    // accepted but not enforced in v1 (the seed remains until walletlock or shutdown).
+    let passphrase = req
+        .param(0)
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| RpcError::invalid_params("walletpassphrase requires a passphrase"))?;
+    // Timeout (seconds) is required and must be a non-negative integer; huge values are clamped.
+    let timeout = req
+        .param(1)
+        .and_then(|v| v.as_i64())
+        .ok_or_else(|| RpcError::invalid_parameter("walletpassphrase requires an integer timeout (seconds)"))?;
+    if timeout < 0 {
+        return Err(RpcError::invalid_parameter("Timeout cannot be negative."));
+    }
+    if passphrase.is_empty() {
+        return Err(RpcError::invalid_parameter("passphrase cannot be empty"));
+    }
+    let timeout = timeout.min(MAX_UNLOCK_TIMEOUT_SECS);
     let handle = state.registry.get(wallet)?.clone();
-    handle.unlock().await?;
+    handle.unlock(Passphrase::from(passphrase.to_owned()), timeout).await?;
     Ok(Value::Null)
 }
 
 pub async fn walletlock(state: &AppState, wallet: Option<&str>) -> Result<Value, RpcError> {
     let handle = state.registry.get(wallet)?.clone();
     handle.lock().await?;
+    Ok(Value::Null)
+}
+
+pub async fn encryptwallet(
+    state: &AppState,
+    wallet: Option<&str>,
+    req: &RpcRequest,
+) -> Result<Value, RpcError> {
+    let passphrase = req
+        .param(0)
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| RpcError::invalid_params("encryptwallet requires a passphrase"))?;
+    if passphrase.is_empty() {
+        return Err(RpcError::invalid_parameter("passphrase cannot be empty"));
+    }
+    let handle = state.registry.get(wallet)?.clone();
+    handle.encrypt_wallet(Passphrase::from(passphrase.to_owned())).await?;
+    // Unlike Bitcoin Core, the mnemonic/seed is unchanged (no new backup needed) - only the
+    // at-rest wrapping changed, so the wallet is now locked and needs walletpassphrase.
+    Ok(Value::String(
+        "wallet encrypted; the mnemonic is now passphrase-protected. \
+         Call walletpassphrase to unlock before sending."
+            .to_string(),
+    ))
+}
+
+pub async fn walletpassphrasechange(
+    state: &AppState,
+    wallet: Option<&str>,
+    req: &RpcRequest,
+) -> Result<Value, RpcError> {
+    let old = req
+        .param(0)
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| RpcError::invalid_params("walletpassphrasechange requires the old passphrase"))?;
+    let new = req
+        .param(1)
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| RpcError::invalid_params("walletpassphrasechange requires the new passphrase"))?;
+    if new.is_empty() {
+        return Err(RpcError::invalid_parameter("passphrase cannot be empty"));
+    }
+    let handle = state.registry.get(wallet)?.clone();
+    handle
+        .change_passphrase(Passphrase::from(old.to_owned()), Passphrase::from(new.to_owned()))
+        .await?;
     Ok(Value::Null)
 }
 

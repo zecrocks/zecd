@@ -100,3 +100,126 @@ fn regtest_wallet_lifecycle() {
         .derive_usk(net, account_index)
         .expect("derive USK on regtest");
 }
+
+// --- Actor-level encryption plumbing (offline, but `#[ignore]`d because `actor::spawn` loads the
+// bundled Sapling prover, which is slow). Run with `cargo test -- --include-ignored`. The actor
+// serves walletpassphrase/walletlock commands even while its lightwalletd connection is failing,
+// so a dead server endpoint is fine here. ---
+
+use std::time::Duration;
+
+use crate::error::codes;
+use crate::lightwalletd::{self, TlsRoots};
+use crate::wallet::actor::{self, ActorConfig};
+use crate::wallet::store::{Passphrase, WalletStore};
+
+/// An ActorConfig pointed at a dead local endpoint (connect fails fast; the actor still runs).
+fn offline_actor_cfg(name: &str, wallet_dir: std::path::PathBuf) -> ActorConfig {
+    let net = network::regtest();
+    ActorConfig {
+        name: name.to_string(),
+        network: net,
+        wallet_dir,
+        servers: lightwalletd::resolve("127.0.0.1:1", net, TlsRoots::Native, Some(false)).unwrap(),
+        sync_interval: Duration::from_secs(60),
+        rebroadcast_interval: Duration::from_secs(60),
+        connect_timeout: Duration::from_millis(150),
+        reconnect_base: Duration::from_secs(30),
+        reconnect_max: Duration::from_secs(60),
+        primary_recheck: Duration::from_secs(60),
+        age_identity: None,
+        auto_unlock: true,
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "spawns an actor that loads the bundled prover (slow); offline otherwise"]
+async fn encrypted_wallet_unlock_lock_cycle() {
+    let net = network::regtest();
+    let dir = tempfile::tempdir().unwrap();
+    let wd = dir.path().to_path_buf();
+
+    // Build a passphrase-encrypted, account-initialized regtest wallet offline.
+    let mnemonic = <Mnemonic<English>>::from_phrase(TEST_PHRASE).unwrap();
+    WalletStore::init_with_passphrase(
+        &wd,
+        Passphrase::from("pw".to_string()),
+        &mnemonic,
+        BlockHeight::from_u32(1),
+        net,
+    )
+    .unwrap();
+    let mut db = open::init_dbs(net, &wd).unwrap();
+    db.create_account("primary", &test_seed(), &genesis_birthday(), None)
+        .unwrap();
+    drop(db);
+
+    let handle = actor::spawn(offline_actor_cfg("enc", wd)).await.unwrap();
+
+    // Wrong passphrase -> -14.
+    let e = handle
+        .unlock(Passphrase::from("wrong".to_string()), 60)
+        .await
+        .unwrap_err();
+    assert_eq!(e.code, codes::RPC_WALLET_PASSPHRASE_INCORRECT, "{e}");
+
+    // Correct passphrase unlocks; status reports a future relock time.
+    handle
+        .unlock(Passphrase::from("pw".to_string()), 60)
+        .await
+        .unwrap();
+    assert!(
+        handle.status().unlocked_until.unwrap_or(0) > 0,
+        "unlocked_until should be set after unlock"
+    );
+
+    // walletlock relocks; unlocked_until drops to 0.
+    handle.lock().await.unwrap();
+    assert_eq!(handle.status().unlocked_until, Some(0));
+
+    // A zero timeout relocks immediately (Bitcoin allows timeout == 0).
+    handle
+        .unlock(Passphrase::from("pw".to_string()), 0)
+        .await
+        .unwrap();
+    assert_eq!(handle.status().unlocked_until, Some(0));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "spawns an actor that loads the bundled prover (slow); offline otherwise"]
+async fn unencrypted_wallet_rejects_passphrase_rpcs() {
+    let net = network::regtest();
+    let dir = tempfile::tempdir().unwrap();
+    let wd = dir.path().to_path_buf();
+
+    // An identity-encrypted (unencrypted, in Bitcoin terms) wallet.
+    let identity = age::x25519::Identity::generate();
+    let recipient = identity.to_public();
+    let mnemonic = <Mnemonic<English>>::from_phrase(TEST_PHRASE).unwrap();
+    WalletStore::init_with_mnemonic(
+        &wd,
+        std::iter::once(&recipient as &dyn age::Recipient),
+        &mnemonic,
+        BlockHeight::from_u32(1),
+        net,
+    )
+    .unwrap();
+    let mut db = open::init_dbs(net, &wd).unwrap();
+    db.create_account("primary", &test_seed(), &genesis_birthday(), None)
+        .unwrap();
+    drop(db);
+
+    let handle = actor::spawn(offline_actor_cfg("plain", wd)).await.unwrap();
+
+    // walletpassphrase / walletlock on an unencrypted wallet -> -15 (matches bitcoind).
+    let e = handle
+        .unlock(Passphrase::from("pw".to_string()), 60)
+        .await
+        .unwrap_err();
+    assert_eq!(e.code, codes::RPC_WALLET_WRONG_ENC_STATE, "{e}");
+    let e = handle.lock().await.unwrap_err();
+    assert_eq!(e.code, codes::RPC_WALLET_WRONG_ENC_STATE, "{e}");
+
+    // ...and it reports no unlock deadline at all.
+    assert_eq!(handle.status().unlocked_until, None);
+}
