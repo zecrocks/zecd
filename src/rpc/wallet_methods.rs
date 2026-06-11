@@ -731,6 +731,15 @@ pub async fn sendtoaddress(
             "subtractfeefromamount is not supported (fees are ZIP-317, paid by the sender)",
         ));
     }
+    // Param 9 (fee_rate) is an explicit fee instruction. Fees are ZIP-317 - computed by the
+    // wallet, never settable - so reject it rather than silently charging a different fee
+    // than the caller specified. (conf_target/estimate_mode are estimation *hints* and safe
+    // to ignore: the conventional fee already buys next-block inclusion.)
+    if req.param(9).is_some_and(param_engaged) {
+        return Err(RpcError::invalid_parameter(
+            "fee_rate is not supported (fees are ZIP-317, computed by the wallet)",
+        ));
+    }
     let handle = state.registry.get(wallet)?.clone();
     let payment = build_payment(&handle.network, addr, amount)?;
     let request = TransactionRequest::new(vec![payment])
@@ -755,6 +764,13 @@ pub async fn sendmany(
     if req.param(4).is_some_and(param_engaged) {
         return Err(RpcError::invalid_parameter(
             "subtractfeefrom is not supported (fees are ZIP-317, paid by the sender)",
+        ));
+    }
+    // Param 8 (fee_rate): an explicit fee instruction - rejected for the same reason as
+    // sendtoaddress's (the wallet computes the ZIP-317 fee; it is never settable).
+    if req.param(8).is_some_and(param_engaged) {
+        return Err(RpcError::invalid_parameter(
+            "fee_rate is not supported (fees are ZIP-317, computed by the wallet)",
         ));
     }
     let handle = state.registry.get(wallet)?.clone();

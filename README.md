@@ -270,8 +270,15 @@ Edges to be aware of (all consequences of being a shielded light wallet):
 
 - **No instant 0-conf:** received notes must be scanned and reach the confirmation minimum before
   they are spendable/visible.
-- **Fees:** `estimatesmartfee` returns a stable conventional rate; real fees are ZIP-317,
-  computed at transaction-build time.
+- **Fees are never client-settable.** Real fees are ZIP-317 - a deterministic formula
+  (5,000 zatoshis × max(2, logical actions); a typical send is 0.0001 ZEC) computed by the
+  wallet at transaction-build time, with no fee market to outbid. Explicit fee instructions
+  are therefore rejected with `-8` rather than silently ignored: `subtractfeefromamount`/
+  `subtractfeefrom` and `fee_rate` on `sendtoaddress`/`sendmany` (`settxfee` does not exist;
+  `conf_target`/`estimate_mode` are estimation hints and are safely ignored - the
+  conventional fee already buys next-block inclusion). `estimatesmartfee`/`estimatefee`
+  remain as inert probe-compat stubs returning a stable conventional rate; the exact fee
+  paid is reported after the fact in `gettransaction.fee`.
 - **Addresses are shielded UAs** (`u1...`/`utest1...`): clients that parse the address string as a
   transparent Bitcoin address will not understand them; clients that treat addresses as opaque
   strings are fine.

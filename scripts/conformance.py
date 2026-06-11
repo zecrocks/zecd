@@ -255,6 +255,17 @@ def main() -> int:
     except JSONRPCException as e:
         ck("subtractfeefromamount -> code -8", e.code == -8, e.code)
     try:
+        # fee_rate (param 9): an explicit fee instruction; fees are ZIP-317 and never settable.
+        rpc.call("sendtoaddress", addr, "0.1", "", "", False, False, None, "", False, 25)
+        ck("sendtoaddress fee_rate raises", False)
+    except JSONRPCException as e:
+        ck("sendtoaddress fee_rate -> code -8", e.code == -8, e.code)
+    try:
+        rpc.call("sendmany", "", {addr: "0.1"}, 1, "", [], False, None, "", 25)
+        ck("sendmany fee_rate raises", False)
+    except JSONRPCException as e:
+        ck("sendmany fee_rate -> code -8", e.code == -8, e.code)
+    try:
         rpc.call("getrawtransaction", "00" * 32)
         ck("getrawtransaction unknown raises", False)
     except JSONRPCException as e:

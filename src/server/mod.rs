@@ -323,6 +323,18 @@ mod tests {
         )
         .await;
         assert_eq!(code, Some(RPC_INVALID_PARAMETER as i64));
+        // sendtoaddress param 9 / sendmany param 8 = fee_rate: an explicit fee instruction,
+        // rejected (fees are ZIP-317 and never settable).
+        let code = call_err_code(
+            r#"{"method":"sendtoaddress","id":1,"params":["uaddr","1.0","","",false,false,null,"",false,25]}"#,
+        )
+        .await;
+        assert_eq!(code, Some(RPC_INVALID_PARAMETER as i64));
+        let code = call_err_code(
+            r#"{"method":"sendmany","id":1,"params":["",{"uaddr":1.0},1,"",[],false,null,"",25]}"#,
+        )
+        .await;
+        assert_eq!(code, Some(RPC_INVALID_PARAMETER as i64));
         // ...but a false/empty value must NOT trip the guard (it fails later, on the
         // missing wallet, -18), so well-behaved clients passing defaults still work.
         use crate::error::codes::RPC_WALLET_NOT_FOUND;

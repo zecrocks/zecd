@@ -211,6 +211,17 @@ pub async fn spawn(cfg: ActorConfig) -> anyhow::Result<(WalletHandle, tokio::tas
                 cfg.name
             );
         }
+    } else {
+        // An identity-encrypted wallet with auto_unlock=false is a dead end for sending:
+        // it starts locked, and walletpassphrase on a non-passphrase wallet is -15 (like
+        // bitcoind's unencrypted wallets) - there is no RPC that can unlock it. Reads still
+        // work, so don't refuse to start; warn loudly instead.
+        warn!(
+            "[{}] auto_unlock=false on an identity-encrypted wallet: sends will fail (-13) and \
+             walletpassphrase cannot unlock it (-15). Enable auto_unlock, or set a real \
+             passphrase with encryptwallet (then restart unlocks via walletpassphrase).",
+            cfg.name
+        );
     }
 
     // The local prover bundles Sapling parameters; build it once (off the async threads).
@@ -959,8 +970,9 @@ impl WalletActor {
         }
         let st = store::WalletStore::read(&self.wallet_dir)
             .map_err(|e| RpcError::wallet(format!("reading keys.toml: {e}")))?;
-        let seed = st
-            .decrypt_seed_with_passphrase(passphrase)
+        // scrypt is deliberately slow (~1s at the default work factor); run it under
+        // `block_in_place` so it doesn't stall the async runtime (the proving pattern).
+        let seed = tokio::task::block_in_place(|| st.decrypt_seed_with_passphrase(passphrase))
             // Any decryption failure on the passphrase path means the passphrase was wrong.
             .map_err(|_| {
                 RpcError::new(
@@ -1012,13 +1024,17 @@ impl WalletActor {
             .ok_or_else(|| RpcError::wallet("wallet has no stored mnemonic"))?;
         let phrase = std::str::from_utf8(mnemonic.expose_secret().as_slice())
             .map_err(|_| RpcError::wallet("stored mnemonic is not valid UTF-8"))?;
-        st.rewrite_with_passphrase(&self.wallet_dir, passphrase, phrase)
-            .map_err(|e| {
-                RpcError::new(
-                    codes::RPC_WALLET_ENCRYPTION_FAILED,
-                    format!("failed to encrypt wallet: {e}"),
-                )
-            })?;
+        // scrypt key derivation for the new wrapping is deliberately slow; keep it off the
+        // async runtime (the proving pattern).
+        tokio::task::block_in_place(|| {
+            st.rewrite_with_passphrase(&self.wallet_dir, passphrase, phrase)
+        })
+        .map_err(|e| {
+            RpcError::new(
+                codes::RPC_WALLET_ENCRYPTION_FAILED,
+                format!("failed to encrypt wallet: {e}"),
+            )
+        })?;
         // Now Bitcoin-Core "encrypted": lock and require walletpassphrase from here on.
         self.encrypted = true;
         self.seed.lock();
@@ -1042,8 +1058,9 @@ impl WalletActor {
         }
         let st = store::WalletStore::read(&self.wallet_dir)
             .map_err(|e| RpcError::wallet(format!("reading keys.toml: {e}")))?;
-        let mnemonic = st
-            .decrypt_mnemonic_with_passphrase(old)
+        // Both the old-passphrase verification and the new wrapping run scrypt (deliberately
+        // slow); keep them off the async runtime (the proving pattern).
+        let mnemonic = tokio::task::block_in_place(|| st.decrypt_mnemonic_with_passphrase(old))
             .map_err(|_| {
                 RpcError::new(
                     codes::RPC_WALLET_PASSPHRASE_INCORRECT,
@@ -1053,7 +1070,7 @@ impl WalletActor {
             .ok_or_else(|| RpcError::wallet("wallet has no stored mnemonic"))?;
         let phrase = std::str::from_utf8(mnemonic.expose_secret().as_slice())
             .map_err(|_| RpcError::wallet("stored mnemonic is not valid UTF-8"))?;
-        st.rewrite_with_passphrase(&self.wallet_dir, new, phrase)
+        tokio::task::block_in_place(|| st.rewrite_with_passphrase(&self.wallet_dir, new, phrase))
             .map_err(|e| {
                 RpcError::new(
                     codes::RPC_WALLET_ENCRYPTION_FAILED,
