@@ -53,9 +53,13 @@ services:
     volumes:
       - ./zecd.toml:/etc/zecd/zecd.toml:ro
       - zecd-data:/var/lib/zecd
+    # Published on loopback only: RPC credentials are spend authority and travel as plaintext
+    # HTTP Basic auth, so the port must not be reachable from untrusted networks. To serve other
+    # hosts, front it with TLS/a reverse proxy - or, understanding the exposure, change the
+    # mapping to "18232:18232".
     ports:
-      - "18232:18232"   # Bitcoin-style JSON-RPC
-      - "9233:9233"     # health: /healthz /readyz /status
+      - "127.0.0.1:18232:18232"   # Bitcoin-style JSON-RPC
+      - "127.0.0.1:9233:9233"     # health: /healthz /readyz /status
 
 volumes:
   zebra-state:

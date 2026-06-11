@@ -908,7 +908,7 @@ impl WalletActor {
 
                 let tx = db
                     .get_transaction(txid)
-                    .map_err(|e| RpcError::database(e.to_string()))?
+                    .map_err(RpcError::database_internal)?
                     .ok_or_else(|| RpcError::wallet("created transaction not found in wallet"))?;
                 let mut raw_tx = service::RawTransaction::default();
                 tx.write(&mut raw_tx.data)
@@ -965,12 +965,11 @@ impl WalletActor {
             // different case from a transport failure: surface it as -26. The tx's notes stay
             // locked in the wallet until its expiry height, after which they become spendable
             // again - an immediate retry fails with -6 rather than double-paying.
+            let reason = sanitize_upstream_msg(&response.error_message);
+            warn!("[{}] upstream rejected {txid} (code {}): {reason}", self.name, response.error_code);
             return Err(RpcError::new(
                 codes::RPC_VERIFY_REJECTED,
-                format!(
-                    "transaction rejected (code {}): {}",
-                    response.error_code, response.error_message
-                ),
+                format!("transaction rejected (code {}): {reason}", response.error_code),
             ));
         }
 
@@ -1068,12 +1067,11 @@ impl WalletActor {
             }
         };
         if response.error_code != 0 {
+            let reason = sanitize_upstream_msg(&response.error_message);
+            warn!("[{}] upstream rejected tx (code {}): {reason}", self.name, response.error_code);
             return Err(RpcError::new(
                 codes::RPC_VERIFY_REJECTED,
-                format!(
-                    "transaction rejected (code {}): {}",
-                    response.error_code, response.error_message
-                ),
+                format!("transaction rejected (code {}): {reason}", response.error_code),
             ));
         }
         Ok(())
@@ -1272,6 +1270,19 @@ fn chain_name_is_main(chain_name: &str) -> Option<bool> {
     }
 }
 
+/// Bound an upstream-supplied string before echoing it into an RPC error. lightwalletd's
+/// reject reasons are genuinely useful to clients (Bitcoin Core relays its own), but the
+/// upstream is only operator-trusted, so strip control characters and cap the length rather
+/// than relay arbitrary bytes (the same bounded text is what call sites log).
+fn sanitize_upstream_msg(msg: &str) -> String {
+    const MAX: usize = 200;
+    let mut out: String = msg.chars().filter(|c| !c.is_control()).take(MAX).collect();
+    if msg.chars().filter(|c| !c.is_control()).nth(MAX).is_some() {
+        out.push('…');
+    }
+    out
+}
+
 /// Await the next message on an open mempool stream, or pend forever when none is open, so
 /// the actor's idle `select!` arm simply never fires without a subscription.
 async fn mempool_next(
@@ -1373,7 +1384,26 @@ fn is_tx_not_found(status: &tonic::Status) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::is_tx_not_found;
+    use super::{is_tx_not_found, sanitize_upstream_msg};
+
+    /// Upstream reject reasons are relayed to RPC clients, but bounded: control characters
+    /// stripped, length capped (the upstream is operator-configured, not trusted-honest).
+    #[test]
+    fn upstream_messages_are_bounded_before_echoing() {
+        // Ordinary reject reasons pass through unchanged.
+        let real = "tx unpaid action limit exceeded";
+        assert_eq!(sanitize_upstream_msg(real), real);
+        // Control characters (log/terminal injection) are stripped.
+        assert_eq!(sanitize_upstream_msg("a\r\nb\x1b[31mc"), "ab[31mc");
+        // Oversized messages are truncated with an ellipsis marker.
+        let long = "x".repeat(500);
+        let bounded = sanitize_upstream_msg(&long);
+        assert_eq!(bounded.chars().count(), 201);
+        assert!(bounded.ends_with('…'));
+        // Exactly at the cap: no marker.
+        let exact = "y".repeat(200);
+        assert_eq!(sanitize_upstream_msg(&exact), exact);
+    }
 
     #[test]
     fn tx_not_found_statuses_are_misses_not_failures() {

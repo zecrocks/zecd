@@ -2,7 +2,6 @@
 //!
 //! CLI flags use Bitcoin-Core-style names (`-rpcuser`, `-rpcport`, `-datadir`, `-testnet`)
 //! where it helps operators, but the canonical source is the TOML config.
-#![allow(dead_code)] // some config fields/helpers are part of the model but not yet read
 
 use std::collections::BTreeMap;
 use std::net::{IpAddr, SocketAddr};
@@ -71,7 +70,6 @@ pub struct LogConfig {
 
 #[derive(Debug, Clone)]
 pub struct WalletEntry {
-    pub name: String,
     pub dir: PathBuf,
 }
 
@@ -129,12 +127,6 @@ pub struct SyncConfig {
 }
 
 impl AppConfig {
-    /// Look up a wallet by name, or the default wallet when `name` is `None`.
-    pub fn wallet(&self, name: Option<&str>) -> Option<&WalletEntry> {
-        let name = name.unwrap_or(&self.default_wallet);
-        self.wallets.get(name)
-    }
-
     /// Default RPC port for a network when none is configured (zcashd convention).
     pub fn default_rpc_port(network: ZNetwork) -> u16 {
         match network {
@@ -328,16 +320,20 @@ pub struct InitArgs {
 impl AppConfig {
     /// Resolve the effective configuration from CLI flags and the TOML file.
     pub fn resolve(cli: &Cli) -> anyhow::Result<AppConfig> {
-        let datadir = cli
+        // Datadir precedence: CLI > ZECD_DATADIR > config file > default. The config file is
+        // located *before* its own `datadir` can apply (like bitcoind: `-conf` resolution never
+        // depends on a datadir set inside the file), so the file lookup uses only CLI/env.
+        let cli_datadir = cli
             .datadir
             .clone()
-            .or_else(|| std::env::var_os("ZECD_DATADIR").map(PathBuf::from))
-            .unwrap_or_else(|| PathBuf::from("./zecd-data"));
+            .or_else(|| std::env::var_os("ZECD_DATADIR").map(PathBuf::from));
 
-        let conf_path = cli
-            .conf
-            .clone()
-            .unwrap_or_else(|| datadir.join("zecd.toml"));
+        let conf_path = cli.conf.clone().unwrap_or_else(|| {
+            cli_datadir
+                .clone()
+                .unwrap_or_else(|| PathBuf::from("./zecd-data"))
+                .join("zecd.toml")
+        });
 
         let file: ConfigFile = if conf_path.exists() {
             let text = std::fs::read_to_string(&conf_path)
@@ -347,6 +343,10 @@ impl AppConfig {
         } else {
             ConfigFile::default()
         };
+
+        let datadir = cli_datadir
+            .or_else(|| file.datadir.clone())
+            .unwrap_or_else(|| PathBuf::from("./zecd-data"));
 
         // Network: CLI --regtest/--testnet/--network override the file.
         let network = if cli.regtest {
@@ -370,10 +370,9 @@ impl AppConfig {
         let mut wallets = BTreeMap::new();
         for (name, w) in &file.wallets {
             let dir = w.dir.clone().unwrap_or_else(|| datadir.join(name));
-            wallets.insert(name.clone(), WalletEntry { name: name.clone(), dir });
+            wallets.insert(name.clone(), WalletEntry { dir });
         }
         wallets.entry(default_wallet.clone()).or_insert_with(|| WalletEntry {
-            name: default_wallet.clone(),
             dir: datadir.join(&default_wallet),
         });
 
@@ -576,6 +575,53 @@ mod tests {
     fn lightwalletd_file_rejects_unknown_field() {
         // `deny_unknown_fields` must still reject typos/unsupported keys.
         assert!(toml::from_str::<LightwalletdFile>("bogus_key = 1").is_err());
+    }
+
+    #[test]
+    fn file_datadir_is_honored_and_cli_wins() {
+        use clap::Parser as _;
+        let dir = tempfile::tempdir().unwrap();
+        let conf = dir.path().join("zecd.toml");
+        std::fs::write(&conf, "datadir = \"/tmp/zecd-from-file\"\n").unwrap();
+
+        // A `datadir` set in the config file governs data placement...
+        let cli = Cli::parse_from(["zecd", "--conf", conf.to_str().unwrap()]);
+        let cfg = AppConfig::resolve(&cli).unwrap();
+        assert_eq!(cfg.datadir, PathBuf::from("/tmp/zecd-from-file"));
+
+        // ...but --datadir on the CLI still wins over the file.
+        let cli = Cli::parse_from([
+            "zecd", "--conf", conf.to_str().unwrap(), "--datadir", "/tmp/zecd-from-cli",
+        ]);
+        let cfg = AppConfig::resolve(&cli).unwrap();
+        assert_eq!(cfg.datadir, PathBuf::from("/tmp/zecd-from-cli"));
+    }
+
+    #[test]
+    fn connection_mode_resolves_to_proxy_and_rejects_garbage() {
+        use clap::Parser as _;
+        let dir = tempfile::tempdir().unwrap();
+        let conf = dir.path().join("zecd.toml");
+
+        // An unrecognized connection mode must fail at startup, never silently fall back to
+        // direct connections (that would defeat the privacy property the operator configured).
+        std::fs::write(&conf, "[lightwalletd]\nconnection = \"torr\"\n").unwrap();
+        let cli = Cli::parse_from(["zecd", "--conf", conf.to_str().unwrap()]);
+        let err = AppConfig::resolve(&cli).unwrap_err().to_string();
+        assert!(err.contains("invalid connection"), "got: {err}");
+
+        // "tor" resolves to Tor's conventional local SOCKS port…
+        std::fs::write(&conf, "[lightwalletd]\nconnection = \"tor\"\n").unwrap();
+        let cli = Cli::parse_from(["zecd", "--conf", conf.to_str().unwrap()]);
+        let cfg = AppConfig::resolve(&cli).unwrap();
+        assert_eq!(cfg.lightwalletd.proxy, Some("127.0.0.1:9050".parse().unwrap()));
+
+        // …"direct" to no proxy, and the CLI --connection flag wins over the file.
+        let cli = Cli::parse_from([
+            "zecd", "--conf", conf.to_str().unwrap(), "--connection", "direct",
+        ]);
+        let cfg = AppConfig::resolve(&cli).unwrap();
+        assert_eq!(cfg.lightwalletd.proxy, None);
     }
 
     #[test]

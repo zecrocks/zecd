@@ -4,7 +4,6 @@
 //! and `error` keys (one of them null), the `id` is echoed verbatim, and a single request
 //! that errors is returned with HTTP status 500 (the body still holds the error object).
 //! Batches are JSON arrays and always return HTTP 200.
-#![allow(dead_code)] // params_raw is retained for object-style param support
 
 use serde_json::{json, Value};
 
@@ -20,6 +19,7 @@ pub struct RpcRequest {
     /// methods we implement.
     pub params: Vec<Value>,
     /// Raw params, preserved for the rare object-style call.
+    #[allow(dead_code)] // retained for object-style param support
     pub params_raw: Value,
 }
 

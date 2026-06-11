@@ -50,7 +50,6 @@ fn read_encryption_passphrase() -> anyhow::Result<Passphrase> {
 
 pub async fn run(config: &AppConfig, args: &InitArgs) -> anyhow::Result<()> {
     let entry: WalletEntry = config.wallets.get(&args.wallet).cloned().unwrap_or(WalletEntry {
-        name: args.wallet.clone(),
         dir: config.datadir.join(&args.wallet),
     });
     let wallet_dir = entry.dir;

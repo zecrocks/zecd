@@ -3,7 +3,6 @@
 //! The seed is held as a zeroizing secret and never persisted in the clear. The Unified
 //! Spending Key is derived fresh per send (mirrors `zcash-devtool/src/commands/wallet/send.rs`)
 //! and never cached.
-#![allow(dead_code)] // `unlocked` constructor kept for completeness
 
 use std::path::Path;
 
@@ -25,12 +24,9 @@ impl SeedKeeper {
         SeedKeeper { seed: None }
     }
 
+    #[allow(dead_code)] // used by the regtest lifecycle tests
     pub fn unlocked(seed: SecretVec<u8>) -> Self {
         SeedKeeper { seed: Some(seed) }
-    }
-
-    pub fn is_unlocked(&self) -> bool {
-        self.seed.is_some()
     }
 
     pub fn lock(&mut self) {

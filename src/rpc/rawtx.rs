@@ -41,7 +41,12 @@ fn parse_txid_param(s: &str) -> Result<TxId, RpcError> {
         RpcError::invalid_parameter(format!("parameter 1 must be hexadecimal string (not '{s}')"))
     })?;
     bytes.reverse();
-    Ok(TxId::from_bytes(bytes.try_into().expect("32 bytes")))
+    // 64 hex chars always decode to 32 bytes, but keep this an error (not an expect) so a
+    // future change to the length check above can't turn it into a panic path.
+    let bytes: [u8; 32] = bytes
+        .try_into()
+        .map_err(|_| RpcError::invalid_parameter(format!("parameter 1 must be of length 64 (not '{s}')")))?;
+    Ok(TxId::from_bytes(bytes))
 }
 
 /// `getrawtransaction <txid> [verbose] [blockhash]` - fetch any transaction by txid:

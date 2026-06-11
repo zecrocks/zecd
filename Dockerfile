@@ -2,8 +2,8 @@
 #
 #   docker build -t zecd .
 #
-# The build fetches the pinned librustzcash revision from GitHub (see Cargo.toml
-# [patch.crates-io]), so the build needs network access.
+# Dependencies are released librustzcash crates from crates.io (versions pinned by the
+# committed Cargo.lock), so the build needs network access to fetch them.
 
 FROM rust:1-bookworm AS build
 RUN apt-get update \

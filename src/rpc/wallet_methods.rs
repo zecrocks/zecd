@@ -162,7 +162,7 @@ pub fn setlabel(
         )));
     }
     labels::set_label(&handle.dir, addr, &label)
-        .map_err(|e| RpcError::database(e.to_string()))?;
+        .map_err(RpcError::database_internal)?;
     Ok(Value::Null)
 }
 
@@ -177,7 +177,7 @@ pub fn getaddressesbylabel(
         .ok_or_else(|| RpcError::invalid_params("getaddressesbylabel requires a label"))?;
     let handle = state.registry.get(wallet)?;
     let addrs =
-        labels::addresses_for_label(&handle.dir, label).map_err(|e| RpcError::database(e.to_string()))?;
+        labels::addresses_for_label(&handle.dir, label).map_err(RpcError::database_internal)?;
     if addrs.is_empty() {
         // Bitcoin Core: -11 RPC_WALLET_INVALID_LABEL_NAME for a label with no addresses.
         return Err(RpcError::new(
@@ -464,7 +464,7 @@ pub fn getreceivedbylabel(
     let minconf = req.param(1).and_then(|v| v.as_i64()).unwrap_or(1);
     let handle = state.registry.get(wallet)?;
     let addrs = labels::addresses_for_label(&handle.dir, label)
-        .map_err(|e| RpcError::database(e.to_string()))?;
+        .map_err(RpcError::database_internal)?;
     if addrs.is_empty() {
         return Err(RpcError::wallet("Label not found in wallet"));
     }
@@ -545,7 +545,7 @@ pub fn listsinceblock(
     let target_conf = match req.param(1) {
         None | Some(Value::Null) => 1u32,
         Some(v) => match v.as_i64() {
-            Some(n) if n >= 1 => n as u32,
+            Some(n) if (1..=i64::from(u32::MAX)).contains(&n) => n as u32,
             _ => return Err(RpcError::invalid_parameter("Invalid target_confirmations")),
         },
     };

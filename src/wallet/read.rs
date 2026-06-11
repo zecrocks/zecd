@@ -1,6 +1,5 @@
 //! Read-only wallet queries served from short-lived connections, so they never block on the
 //! sync writer (SQLite WAL gives consistent snapshots).
-#![allow(dead_code)] // some TxRecord fields are surfaced selectively by RPC methods
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -55,6 +54,7 @@ pub fn tx_count(wallet_dir: &Path) -> anyhow::Result<u64> {
 /// One output row from `v_tx_outputs`.
 #[derive(Debug, Clone)]
 pub struct TxOutputRecord {
+    #[allow(dead_code)] // part of the row shape; not yet surfaced by an RPC
     pub pool: i64,
     pub output_index: u32,
     pub from_account: Option<Uuid>,
@@ -69,10 +69,13 @@ pub struct TxOutputRecord {
 pub struct TxRecord {
     pub mined_height: Option<u32>,
     pub txid_hex: String,
+    #[allow(dead_code)] // part of the row shape; not yet surfaced by an RPC
     pub expiry_height: Option<u32>,
     pub account_balance_delta: i64,
     pub fee_paid: Option<u64>,
+    #[allow(dead_code)] // part of the row shape; not yet surfaced by an RPC
     pub sent_note_count: i64,
+    #[allow(dead_code)] // part of the row shape; not yet surfaced by an RPC
     pub received_note_count: i64,
     pub block_time: Option<i64>,
     pub expired_unmined: bool,

@@ -249,6 +249,20 @@ pub fn resolve_all(
     if out.is_empty() {
         return Err(anyhow!("no lightwalletd servers configured"));
     }
+    // RFC 7686: `.onion` names must never reach the DNS. Dialing one without a SOCKS proxy
+    // would leak the hidden-service name to the local resolver (announcing which service the
+    // operator intends to contact) and then fail anyway, so refuse at startup instead of
+    // silently degrading the privacy property the operator configured the .onion for.
+    if proxy.is_none() {
+        if let Some(s) = out.iter().find(|s| s.host.ends_with(".onion")) {
+            return Err(anyhow!(
+                "lightwalletd endpoint {}:{} is a .onion address but connection = \"direct\"; \
+                 set [lightwalletd] connection = \"tor\" (or \"socks5://<host>:<port>\")",
+                s.host,
+                s.port
+            ));
+        }
+    }
     Ok(out)
 }
 
@@ -468,6 +482,44 @@ mod tests {
         )
         .unwrap();
         assert!(s[0].use_tls());
+    }
+
+    /// A `.onion` endpoint without a SOCKS proxy must be refused at resolve time: the direct
+    /// dial would leak the hidden-service name to the local DNS resolver (RFC 7686) and could
+    /// never succeed anyway.
+    #[test]
+    fn onion_without_proxy_is_refused() {
+        let err = resolve_all(
+            &["abcd1234.onion:9067".to_string()],
+            ZNetwork::Main,
+            TlsRoots::Native,
+            None,
+            None,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains(".onion"), "got: {err}");
+        assert!(err.contains("connection"), "got: {err}");
+
+        // The same endpoint with a proxy resolves fine.
+        assert!(resolve_all(
+            &["abcd1234.onion:9067".to_string()],
+            ZNetwork::Main,
+            TlsRoots::Native,
+            None,
+            Some("127.0.0.1:9050".parse().unwrap()),
+        )
+        .is_ok());
+
+        // A .onion fallback hiding behind a clearnet primary is caught too.
+        assert!(resolve_all(
+            &["zec.rocks:443".to_string(), "abcd1234.onion:9067".to_string()],
+            ZNetwork::Main,
+            TlsRoots::Native,
+            None,
+            None,
+        )
+        .is_err());
     }
 
     // --- Network integration tests (hit the public zecrocks/ECC testnet lightwalletd) ---

@@ -132,6 +132,14 @@ impl RpcError {
         Self::new(codes::RPC_DATABASE_ERROR, message)
     }
 
+    /// Wallet-database failure from an internal error. The detail is logged server-side only:
+    /// rusqlite/`zcash_client_sqlite` messages can embed filesystem paths, which RPC clients
+    /// have no business seeing.
+    pub fn database_internal(e: impl fmt::Display) -> Self {
+        tracing::warn!("wallet database error: {e}");
+        Self::database("Database error")
+    }
+
     pub fn wallet_not_found(message: impl Into<String>) -> Self {
         Self::new(codes::RPC_WALLET_NOT_FOUND, message)
     }
@@ -163,6 +171,6 @@ impl From<anyhow::Error> for RpcError {
 
 impl From<rusqlite::Error> for RpcError {
     fn from(e: rusqlite::Error) -> Self {
-        RpcError::database(e.to_string())
+        RpcError::database_internal(e)
     }
 }

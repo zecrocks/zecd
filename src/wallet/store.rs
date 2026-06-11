@@ -1,6 +1,5 @@
 //! Per-wallet on-disk metadata (`keys.toml`): network, birthday height, and the
 //! age-encrypted BIP-39 mnemonic. Ported from `zcash-devtool/src/config.rs`.
-#![allow(dead_code)] // network/birthday are read during init/open paths
 
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};

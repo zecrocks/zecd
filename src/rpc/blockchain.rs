@@ -66,6 +66,7 @@ pub fn getblockhash(state: &AppState, req: &RpcRequest) -> Result<Value, RpcErro
     let height = req
         .param(0)
         .and_then(|v| v.as_u64())
+        .filter(|h| *h <= u64::from(u32::MAX))
         .ok_or_else(|| RpcError::invalid_params("getblockhash requires a height"))?
         as u32;
     let w = state.registry.get(None)?;
