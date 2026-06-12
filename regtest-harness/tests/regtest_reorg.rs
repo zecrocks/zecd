@@ -143,7 +143,10 @@ async fn regtest_reorg_rewinds_and_follows() {
     }
 
     // The wallet survived the rewind: balances and address derivation still answer.
-    let bal = zecd.call("getbalance", json!([])).await.expect("getbalance");
+    let bal = zecd
+        .call("getbalance", json!([]))
+        .await
+        .expect("getbalance");
     assert_eq!(bal.as_f64(), Some(0.0), "the empty wallet is still empty");
     let addr = zecd
         .call("getnewaddress", json!([]))

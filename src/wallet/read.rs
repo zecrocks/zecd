@@ -42,10 +42,22 @@ pub fn balance(
         for bal in summary.account_balances().values() {
             info.orchard_spendable += bal.orchard_balance().spendable_value().into_u64();
             info.sapling_spendable += bal.sapling_balance().spendable_value().into_u64();
-            info.pending += bal.orchard_balance().value_pending_spendability().into_u64()
-                + bal.sapling_balance().value_pending_spendability().into_u64();
-            info.immature += bal.orchard_balance().change_pending_confirmation().into_u64()
-                + bal.sapling_balance().change_pending_confirmation().into_u64();
+            info.pending += bal
+                .orchard_balance()
+                .value_pending_spendability()
+                .into_u64()
+                + bal
+                    .sapling_balance()
+                    .value_pending_spendability()
+                    .into_u64();
+            info.immature += bal
+                .orchard_balance()
+                .change_pending_confirmation()
+                .into_u64()
+                + bal
+                    .sapling_balance()
+                    .change_pending_confirmation()
+                    .into_u64();
         }
         info.total_spendable = info.orchard_spendable + info.sapling_spendable;
     }
@@ -405,9 +417,8 @@ pub fn block_height_by_hash(wallet_dir: &Path, display_hash: &str) -> anyhow::Re
 /// at `height` inclusive - the consensus MTP rule, for `getblockchaininfo.mediantime`.
 pub fn median_time_past(wallet_dir: &Path, height: u32) -> anyhow::Result<Option<i64>> {
     let conn = open_conn(wallet_dir)?;
-    let mut stmt = conn.prepare(
-        "SELECT time FROM blocks WHERE height <= :height ORDER BY height DESC LIMIT 11",
-    )?;
+    let mut stmt = conn
+        .prepare("SELECT time FROM blocks WHERE height <= :height ORDER BY height DESC LIMIT 11")?;
     let rows = stmt.query_map(named_params! {":height": height}, |r| r.get::<_, i64>(0))?;
     let mut times: Vec<i64> = rows.collect::<Result<_, _>>()?;
     if times.is_empty() {
@@ -433,8 +444,8 @@ pub fn list_unspent(network: ZNetwork, wallet_dir: &Path) -> anyhow::Result<Vec<
     let mut out_addr: HashMap<(String, u32), String> = HashMap::new();
     {
         let conn = open_conn(wallet_dir)?;
-        let mut stmt = conn
-            .prepare("SELECT txid, mined_height, account_balance_delta FROM v_transactions")?;
+        let mut stmt =
+            conn.prepare("SELECT txid, mined_height, account_balance_delta FROM v_transactions")?;
         let rows = stmt.query_map([], |r| {
             Ok((
                 r.get::<_, Vec<u8>>(0)?,
@@ -465,11 +476,15 @@ pub fn list_unspent(network: ZNetwork, wallet_dir: &Path) -> anyhow::Result<Vec<
 
     let mut out = Vec::new();
     for account in db.get_account_ids()? {
-        let notes = db.select_unspent_notes(account, &[ShieldedProtocol::Orchard], target_height, &[])?;
+        let notes =
+            db.select_unspent_notes(account, &[ShieldedProtocol::Orchard], target_height, &[])?;
         for note in notes.orchard() {
             let txid = note.txid().to_string();
             let vout = note.output_index() as u32;
-            let value = note.note_value().map_err(|e| anyhow!("note value: {e:?}"))?.into_u64();
+            let value = note
+                .note_value()
+                .map_err(|e| anyhow!("note value: {e:?}"))?
+                .into_u64();
             let (mined_height, trusted) = tx_meta.get(&txid).copied().unwrap_or((None, false));
             let address = out_addr.get(&(txid.clone(), vout)).cloned();
             out.push(UnspentNote {
@@ -594,7 +609,10 @@ pub fn is_mine(network: ZNetwork, wallet_dir: &Path, addr: &str) -> bool {
     };
     for account in ids {
         if let Ok(list) = db.list_addresses(account) {
-            if list.iter().any(|info| info.address().encode(&network) == addr) {
+            if list
+                .iter()
+                .any(|info| info.address().encode(&network) == addr)
+            {
                 return true;
             }
         }
@@ -701,9 +719,15 @@ mod tests {
             )
             .unwrap()
         };
-        assert_eq!(parse(Some("2026-06-11 09:31:53.1234567+00:00")), Some(1_781_170_313));
+        assert_eq!(
+            parse(Some("2026-06-11 09:31:53.1234567+00:00")),
+            Some(1_781_170_313)
+        );
         // A non-UTC offset is normalized to the same UTC epoch.
-        assert_eq!(parse(Some("2026-06-11 09:31:53.1234567+02:00")), Some(1_781_163_113));
+        assert_eq!(
+            parse(Some("2026-06-11 09:31:53.1234567+02:00")),
+            Some(1_781_163_113)
+        );
         assert_eq!(parse(None), None);
     }
 }

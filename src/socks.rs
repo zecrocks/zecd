@@ -113,7 +113,11 @@ mod tests {
                 sock.read_exact(&mut domain).await?;
                 let mut port = [0u8; 2];
                 sock.read_exact(&mut port).await?;
-                format!("{}:{}", String::from_utf8_lossy(&domain), u16::from_be_bytes(port))
+                format!(
+                    "{}:{}",
+                    String::from_utf8_lossy(&domain),
+                    u16::from_be_bytes(port)
+                )
             }
             // IPv4 (ATYP=1), handled for completeness.
             0x01 => {
@@ -134,7 +138,8 @@ mod tests {
         };
 
         // Reply success with a dummy bound address (VER, REP=0, RSV, ATYP=IPv4, 0.0.0.0:0).
-        sock.write_all(&[0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0]).await?;
+        sock.write_all(&[0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0])
+            .await?;
         Ok(target)
     }
 
@@ -149,9 +154,16 @@ mod tests {
 
         let mut connector = SocksConnector::new(proxy_addr);
         let conn = connector.call(uri.parse().unwrap()).await;
-        assert!(conn.is_ok(), "SOCKS5 negotiation should succeed: {:?}", conn.err());
+        assert!(
+            conn.is_ok(),
+            "SOCKS5 negotiation should succeed: {:?}",
+            conn.err()
+        );
 
-        server.await.unwrap().expect("fake SOCKS5 server ran cleanly")
+        server
+            .await
+            .unwrap()
+            .expect("fake SOCKS5 server ran cleanly")
     }
 
     #[tokio::test]

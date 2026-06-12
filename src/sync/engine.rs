@@ -33,8 +33,7 @@ use tokio::io::AsyncWriteExt;
 use tracing::{info, warn};
 use zcash_client_backend::data_api::{
     chain::{
-        error::Error as ChainError, scan_cached_blocks, BlockSource, ChainState,
-        CommitmentTreeRoot,
+        error::Error as ChainError, scan_cached_blocks, BlockSource, ChainState, CommitmentTreeRoot,
     },
     scanning::{ScanPriority, ScanRange},
     WalletCommitmentTrees, WalletRead, WalletWrite,
@@ -308,7 +307,14 @@ pub async fn sync_one_batch<C: ChainSource>(
 
         // `scan_cached_blocks` is CPU-bound; keep the async runtime healthy.
         tokio::task::block_in_place(|| {
-            scan_blocks(params, wallet_dir, db_cache, db_data, &chain_state, &scan_range)
+            scan_blocks(
+                params,
+                wallet_dir,
+                db_cache,
+                db_data,
+                &chain_state,
+                &scan_range,
+            )
         })?;
         Ok::<(), anyhow::Error>(())
     }
@@ -466,8 +472,15 @@ mod tests {
             let hash = fake_hash(0xA1, h);
             let cmx = cmx_bytes(0x0A, h);
             metas_a.push(write_block(wd, &mut db_cache, h, hash, prev, cmx, h));
-            scan_blocks(&net, wd, &mut db_cache, &mut db_data, &from, &range(h, h + 1))
-                .expect("scan chain A block");
+            scan_blocks(
+                &net,
+                wd,
+                &mut db_cache,
+                &mut db_data,
+                &from,
+                &range(h, h + 1),
+            )
+            .expect("scan chain A block");
             assert!(frontier.append(MerkleHashOrchard::from_cmx(
                 &ExtractedNoteCommitment::from_bytes(&cmx).unwrap()
             )));
@@ -504,7 +517,11 @@ mod tests {
         assert!(worked, "a rewind reports that the scan ranges changed");
 
         // The rewind: continuity broke at 11, so the wallet rewound to 11 - 10 = 1...
-        assert_eq!(max_scanned(&db_data), Some(1), "wallet truncated to the rewind height");
+        assert_eq!(
+            max_scanned(&db_data),
+            Some(1),
+            "wallet truncated to the rewind height"
+        );
         // ...the block cache is truncated to match...
         assert_eq!(
             db_cache.get_max_cached_height().expect("max cached height"),
@@ -512,7 +529,10 @@ mod tests {
             "cache truncated to the rewind height"
         );
         // ...and the now-stale cached block files above it are deleted from disk.
-        assert!(block_path(wd, &metas_a[0]).exists(), "block 1\'s file survives");
+        assert!(
+            block_path(wd, &metas_a[0]).exists(),
+            "block 1\'s file survives"
+        );
         for m in &metas_a[1..] {
             assert!(
                 !block_path(wd, m).exists(),
@@ -540,7 +560,11 @@ mod tests {
             &range(2, 13),
         )
         .expect("scan the replacement chain");
-        assert_eq!(max_scanned(&db_data), Some(12), "recovered past the old tip");
+        assert_eq!(
+            max_scanned(&db_data),
+            Some(12),
+            "recovered past the old tip"
+        );
     }
 
     /// Scan a short chain so the standard 10-block rewind margin lands below the wallet's
@@ -570,8 +594,15 @@ mod tests {
             let hash = fake_hash(0xA1, h);
             let cmx = cmx_bytes(0x0A, h);
             write_block(wd, &mut db_cache, h, hash, prev, cmx, h);
-            scan_blocks(&net, wd, &mut db_cache, &mut db_data, &from, &range(h, h + 1))
-                .expect("scan block");
+            scan_blocks(
+                &net,
+                wd,
+                &mut db_cache,
+                &mut db_data,
+                &from,
+                &range(h, h + 1),
+            )
+            .expect("scan block");
             assert!(frontier.append(MerkleHashOrchard::from_cmx(
                 &ExtractedNoteCommitment::from_bytes(&cmx).unwrap()
             )));
@@ -599,8 +630,16 @@ mod tests {
             BlockHeight::from_u32(0),
         )
         .expect("shallow fallback rewinds");
-        assert_eq!(u32::from(rewound), 4, "rewound below the stale block at at_height - 1");
-        assert_eq!(max_scanned(&db_data), Some(4), "wallet truncated to the fallback target");
+        assert_eq!(
+            u32::from(rewound),
+            4,
+            "rewound below the stale block at at_height - 1"
+        );
+        assert_eq!(
+            max_scanned(&db_data),
+            Some(4),
+            "wallet truncated to the fallback target"
+        );
     }
 
     /// A reorg deeper than the wallet's rewindable history (only block 1 is scanned and the

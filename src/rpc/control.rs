@@ -5,16 +5,20 @@ use serde_json::{json, Value};
 use crate::error::RpcError;
 use crate::state::AppState;
 
-pub fn stop(state: &AppState) -> Result<Value, RpcError> {
+/// `stop` - request graceful shutdown (in-flight requests finish; new ones get 503).
+pub(crate) fn stop(state: &AppState) -> Result<Value, RpcError> {
     state.trigger_shutdown();
     Ok(Value::String("zecd stopping".to_string()))
 }
 
-pub fn uptime(state: &AppState) -> Result<Value, RpcError> {
+/// `uptime` - seconds since the daemon started.
+pub(crate) fn uptime(state: &AppState) -> Result<Value, RpcError> {
     Ok(json!(state.started_at.elapsed().as_secs()))
 }
 
-pub fn help() -> Result<Value, RpcError> {
+/// `help` - a short orientation string (zecd has no per-method help pages; the README's
+/// method table is the reference).
+pub(crate) fn help() -> Result<Value, RpcError> {
     Ok(Value::String(
         "zecd: a Bitcoin-Core-style JSON-RPC server for Orchard-only Zcash. \
          Supported methods include getblockchaininfo, getnetworkinfo, getwalletinfo, \
@@ -24,7 +28,8 @@ pub fn help() -> Result<Value, RpcError> {
     ))
 }
 
-pub fn getrpcinfo(state: &AppState) -> Result<Value, RpcError> {
+/// `getrpcinfo` - the currently-executing commands, Bitcoin Core's load-visibility RPC.
+pub(crate) fn getrpcinfo(state: &AppState) -> Result<Value, RpcError> {
     // active_commands: one entry per currently-executing command, with elapsed microseconds -
     // the same shape as Bitcoin Core's getrpcinfo (gives visibility under load).
     let active: Vec<Value> = state

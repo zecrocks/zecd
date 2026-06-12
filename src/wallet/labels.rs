@@ -50,7 +50,9 @@ pub fn get_label(wallet_dir: &Path, address: &str) -> rusqlite::Result<Option<St
 pub fn all(wallet_dir: &Path) -> rusqlite::Result<HashMap<String, String>> {
     let conn = open(wallet_dir)?;
     let mut stmt = conn.prepare("SELECT address, label FROM address_labels")?;
-    let rows = stmt.query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))?;
+    let rows = stmt.query_map([], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+    })?;
     let mut map = HashMap::new();
     for r in rows {
         let (a, l) = r?;
@@ -94,7 +96,9 @@ pub fn first_seen(wallet_dir: &Path, txid: &str) -> rusqlite::Result<Option<i64>
 pub fn first_seen_all(wallet_dir: &Path) -> rusqlite::Result<HashMap<String, i64>> {
     let conn = open(wallet_dir)?;
     let mut stmt = conn.prepare("SELECT txid, time FROM tx_first_seen")?;
-    let rows = stmt.query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)))?;
+    let rows = stmt.query_map([], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+    })?;
     let mut map = HashMap::new();
     for r in rows {
         let (t, time) = r?;

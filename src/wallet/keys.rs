@@ -24,7 +24,7 @@ impl SeedKeeper {
         SeedKeeper { seed: None }
     }
 
-    #[allow(dead_code)] // used by the regtest lifecycle tests
+    #[cfg(test)] // only the regtest lifecycle tests construct an already-unlocked keeper
     pub fn unlocked(seed: SecretVec<u8>) -> Self {
         SeedKeeper { seed: Some(seed) }
     }

@@ -24,7 +24,10 @@ async fn wait_for_peer(zecd: &Zecd, port: u16, what: &str) {
     let needle = format!(":{port} ");
     let deadline = Instant::now() + TRANSITION_TIMEOUT;
     loop {
-        let peers = zecd.call("getpeerinfo", json!([])).await.unwrap_or(json!([]));
+        let peers = zecd
+            .call("getpeerinfo", json!([]))
+            .await
+            .unwrap_or(json!([]));
         let addr = peers
             .as_array()
             .and_then(|a| a.first())
@@ -95,7 +98,10 @@ async fn regtest_failover_prefers_primary() {
     wait_for_peer(&zecd, primary_port, "snap-back to primary").await;
 
     // Still live end-to-end on the re-adopted primary.
-    zebrad.generate_blocks(2).await.expect("mine after recovery");
+    zebrad
+        .generate_blocks(2)
+        .await
+        .expect("mine after recovery");
     zecd.wait_until_synced(INITIAL_BLOCKS as u64 + 5, SYNC_TIMEOUT)
         .await
         .expect("zecd follows the chain on the recovered primary");

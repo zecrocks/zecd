@@ -17,7 +17,7 @@ use crate::wallet::read;
 /// tparty's method table. Methods zecd serves but tparty deliberately does not (e.g.
 /// `sendtoaddress`/`sendmany` - tparty is a deposit funnel, not a spending wallet) fall
 /// through to -32601 here.
-pub async fn dispatch(
+pub(crate) async fn dispatch(
     state: &AppState,
     wallet: Option<&str>,
     req: &RpcRequest,
@@ -120,7 +120,11 @@ async fn getnewaddress(
         .and_then(|v| v.as_str())
         .map(str::to_string)
         .filter(|s| !s.is_empty());
-    if let Some(t) = req.param(1).and_then(|v| v.as_str()).filter(|s| !s.is_empty()) {
+    if let Some(t) = req
+        .param(1)
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+    {
         if !t.eq_ignore_ascii_case("legacy") {
             return Err(RpcError::invalid_address_or_key(format!(
                 "Unknown address type '{t}'"
@@ -187,6 +191,8 @@ fn getbalances(state: &AppState, wallet: Option<&str>) -> Result<Value, RpcError
     Ok(obj)
 }
 
+/// `getwalletinfo` - bitcoind's shape with the standard balance fields reporting
+/// *unshielded* funds; the destination pool rides on `shielded_*` extension fields.
 fn getwalletinfo(state: &AppState, wallet: Option<&str>) -> Result<Value, RpcError> {
     let handle = state.registry.get(wallet)?;
     let (spendable, pending) = read::transparent_balance(handle.network, &handle.dir, 1)?;

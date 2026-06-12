@@ -83,7 +83,8 @@ pub fn init_dbs_with(
     enable_wal(wallet_dir)?;
     let mut db_cache = open_fsblockdb(wallet_dir)?;
     let mut db_data = open_write_with(network, wallet_dir, external_gap_limit)?;
-    init_blockmeta_db(&mut db_cache).map_err(|e| anyhow::anyhow!("initializing block-cache db: {e}"))?;
+    init_blockmeta_db(&mut db_cache)
+        .map_err(|e| anyhow::anyhow!("initializing block-cache db: {e}"))?;
     init_wallet_db(&mut db_data, None)?;
     Ok(db_data)
 }

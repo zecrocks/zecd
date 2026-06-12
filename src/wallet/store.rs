@@ -81,7 +81,10 @@ impl WalletStore {
         network: ZNetwork,
     ) -> anyhow::Result<()> {
         let encoding = StoreEncoding {
-            mnemonic: Some(encrypt_phrase_with_passphrase(passphrase, mnemonic.phrase())?),
+            mnemonic: Some(encrypt_phrase_with_passphrase(
+                passphrase,
+                mnemonic.phrase(),
+            )?),
             network: Some(network.name().to_string()),
             birthday: Some(u32::from(birthday)),
             encryption: Some(ENC_PASSPHRASE.to_string()),
@@ -240,8 +243,7 @@ fn write_keys_atomic(
             file.write_all(text.as_bytes())?;
             file.sync_all()?;
         }
-        std::fs::rename(&tmp, &path)
-            .map_err(|e| anyhow!("replacing {}: {e}", path.display()))?;
+        std::fs::rename(&tmp, &path).map_err(|e| anyhow!("replacing {}: {e}", path.display()))?;
     }
     Ok(())
 }
@@ -325,7 +327,10 @@ mod tests {
         .unwrap();
 
         let st = WalletStore::read(dir.path()).unwrap();
-        assert!(st.is_encrypted(), "a passphrase wallet must report as encrypted");
+        assert!(
+            st.is_encrypted(),
+            "a passphrase wallet must report as encrypted"
+        );
         assert!(st.has_seed());
 
         // The correct passphrase recovers the BIP-39 seed.
@@ -333,7 +338,9 @@ mod tests {
             .decrypt_seed_with_passphrase(Passphrase::from("correct horse battery".to_string()))
             .unwrap()
             .unwrap();
-        let expected = <Mnemonic<English>>::from_phrase(PHRASE).unwrap().to_seed("");
+        let expected = <Mnemonic<English>>::from_phrase(PHRASE)
+            .unwrap()
+            .to_seed("");
         assert_eq!(seed.expose_secret().as_slice(), &expected[..]);
 
         // A wrong passphrase fails (the actor maps this to RPC -14).

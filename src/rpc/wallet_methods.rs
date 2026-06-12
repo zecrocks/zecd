@@ -10,8 +10,8 @@ use zcash_protocol::TxId;
 use zip321::{Payment, TransactionRequest};
 
 use crate::amount::{signed_zats_to_value, value_to_zats, zats_to_value};
-use crate::error::RpcError;
 use crate::config::SendPrivacy;
+use crate::error::RpcError;
 use crate::server::jsonrpc::RpcRequest;
 use crate::state::AppState;
 use crate::wallet::store::Passphrase;
@@ -32,11 +32,14 @@ fn parse_txid(display_hex: &str) -> Option<TxId> {
     Some(TxId::from_bytes(arr))
 }
 
-pub fn listwallets(state: &AppState) -> Result<Value, RpcError> {
+/// `listwallets` - the names of all loaded wallets (every `[wallets.<name>]` in the config).
+pub(crate) fn listwallets(state: &AppState) -> Result<Value, RpcError> {
     Ok(json!(state.registry.names()))
 }
 
-pub async fn getnewaddress(
+/// `getnewaddress [label] [address_type]` - a fresh diversified Orchard unified address for
+/// the wallet's account (new diversifier, not a new derivation path).
+pub(crate) async fn getnewaddress(
     state: &AppState,
     wallet: Option<&str>,
     req: &RpcRequest,
@@ -101,7 +104,9 @@ pub(crate) fn check_balance_dummy(v: Option<&Value>) -> Result<(), RpcError> {
     }
 }
 
-pub fn getbalance(
+/// `getbalance ["*"] [minconf]` - the spendable balance under the wallet's confirmations
+/// policy (or an explicit `minconf` override; see [`minconf_policy`]).
+pub(crate) fn getbalance(
     state: &AppState,
     wallet: Option<&str>,
     req: &RpcRequest,
@@ -113,7 +118,12 @@ pub fn getbalance(
     Ok(zats_to_value(info.total_spendable))
 }
 
-pub fn getunconfirmedbalance(state: &AppState, wallet: Option<&str>) -> Result<Value, RpcError> {
+/// `getunconfirmedbalance` - value received but not yet spendable under the wallet's
+/// confirmations policy (incoming 0-conf payments surface here via the mempool stream).
+pub(crate) fn getunconfirmedbalance(
+    state: &AppState,
+    wallet: Option<&str>,
+) -> Result<Value, RpcError> {
     let handle = state.registry.get(wallet)?;
     let info = read::balance(handle.network, &handle.dir, handle.confirmations)?;
     Ok(zats_to_value(info.pending))
@@ -122,7 +132,7 @@ pub fn getunconfirmedbalance(state: &AppState, wallet: Option<&str>) -> Result<V
 /// `getbalances` - the modern (Bitcoin Core 0.19+) balance triple. There is no watch-only
 /// support, so the `watchonly` object is omitted (as Bitcoin Core does for wallets without
 /// watch-only funds).
-pub fn getbalances(state: &AppState, wallet: Option<&str>) -> Result<Value, RpcError> {
+pub(crate) fn getbalances(state: &AppState, wallet: Option<&str>) -> Result<Value, RpcError> {
     let handle = state.registry.get(wallet)?;
     let info = read::balance(handle.network, &handle.dir, handle.confirmations)?;
     let mut obj = json!({
@@ -142,7 +152,9 @@ pub fn getbalances(state: &AppState, wallet: Option<&str>) -> Result<Value, RpcE
     Ok(obj)
 }
 
-pub fn getwalletinfo(state: &AppState, wallet: Option<&str>) -> Result<Value, RpcError> {
+/// `getwalletinfo` - wallet metadata and balances; `scanning` reports sync progress and
+/// `unlocked_until` appears only for passphrase-encrypted wallets, like Bitcoin Core.
+pub(crate) fn getwalletinfo(state: &AppState, wallet: Option<&str>) -> Result<Value, RpcError> {
     let handle = state.registry.get(wallet)?;
     let info = read::balance(handle.network, &handle.dir, handle.confirmations)?;
     let txcount = read::tx_count(&handle.dir).unwrap_or(0);
@@ -176,7 +188,9 @@ pub fn getwalletinfo(state: &AppState, wallet: Option<&str>) -> Result<Value, Rp
     Ok(obj)
 }
 
-pub fn getaddressinfo(
+/// `getaddressinfo <address>` - ownership/validity details for an address; see
+/// [`addressinfo_json`] for the response contract.
+pub(crate) fn getaddressinfo(
     state: &AppState,
     wallet: Option<&str>,
     req: &RpcRequest,
@@ -218,7 +232,10 @@ fn addressinfo_json(
     }))
 }
 
-pub fn setlabel(
+/// `setlabel <address> <label>` - label any valid address (foreign addresses too, as
+/// Bitcoin Core's send-side address book allows). Labels live in the `labels.sqlite`
+/// side-table, not the wallet DB.
+pub(crate) fn setlabel(
     state: &AppState,
     wallet: Option<&str>,
     req: &RpcRequest,
@@ -234,12 +251,13 @@ pub fn setlabel(
             "Invalid Zcash address: {addr}"
         )));
     }
-    labels::set_label(&handle.dir, addr, &label)
-        .map_err(RpcError::database_internal)?;
+    labels::set_label(&handle.dir, addr, &label).map_err(RpcError::database_internal)?;
     Ok(Value::Null)
 }
 
-pub fn getaddressesbylabel(
+/// `getaddressesbylabel <label>` - every address carrying `label`, each with its `purpose`
+/// (`receive` for the wallet's own addresses, `send` for labelled foreign ones).
+pub(crate) fn getaddressesbylabel(
     state: &AppState,
     wallet: Option<&str>,
     req: &RpcRequest,
@@ -272,7 +290,8 @@ pub fn getaddressesbylabel(
     Ok(Value::Object(map))
 }
 
-pub fn listlabels(state: &AppState, wallet: Option<&str>) -> Result<Value, RpcError> {
+/// `listlabels` - the sorted, de-duplicated set of labels in use.
+pub(crate) fn listlabels(state: &AppState, wallet: Option<&str>) -> Result<Value, RpcError> {
     let handle = state.registry.get(wallet)?;
     let all = labels::all(&handle.dir).unwrap_or_default();
     let set: BTreeSet<String> = all.into_values().collect();
@@ -394,7 +413,11 @@ fn tx_entries(
             continue;
         }
         for category in categories {
-            let amount = if *category == "send" { -out.value } else { out.value };
+            let amount = if *category == "send" {
+                -out.value
+            } else {
+                out.value
+            };
             let mut entry = json!({
                 "address": address,
                 "category": category,
@@ -428,7 +451,9 @@ fn gettransaction_amount(account_balance_delta: i64, fee_paid: Option<u64>) -> i
     account_balance_delta + fee_paid.unwrap_or(0) as i64
 }
 
-pub fn listtransactions(
+/// `listtransactions [label] [count] [from]` - the most recent wallet history entries, one
+/// per non-change output (see [`tx_entries`] for the entry shape and sign conventions).
+pub(crate) fn listtransactions(
     state: &AppState,
     wallet: Option<&str>,
     req: &RpcRequest,
@@ -466,7 +491,13 @@ pub fn listtransactions(
     for tx in &txs {
         let confirmations = tx_confirmations(&st, tx);
         let time = tx_time(tx, first_seen.get(&tx.txid_hex).copied());
-        entries.extend(tx_entries(tx, &label_map, confirmations, time, label_filter.as_deref()));
+        entries.extend(tx_entries(
+            tx,
+            &label_map,
+            confirmations,
+            time,
+            label_filter.as_deref(),
+        ));
     }
 
     // `entries` is oldest-first; return the most recent `count` after skipping `skip`.
@@ -495,7 +526,9 @@ fn received_by_address(
             if out.is_change || out.to_account.is_none() {
                 continue;
             }
-            let Some(addr) = &out.to_address else { continue };
+            let Some(addr) = &out.to_address else {
+                continue;
+            };
             let e = map.entry(addr.clone()).or_insert((0, i64::MAX, Vec::new()));
             e.0 += out.value.max(0) as u64;
             e.1 = e.1.min(conf);
@@ -507,7 +540,7 @@ fn received_by_address(
 
 /// `getreceivedbyaddress <address> [minconf]` - total received by one of the wallet's own
 /// addresses, in transactions with at least `minconf` confirmations.
-pub fn getreceivedbyaddress(
+pub(crate) fn getreceivedbyaddress(
     state: &AppState,
     wallet: Option<&str>,
     req: &RpcRequest,
@@ -538,7 +571,7 @@ pub fn getreceivedbyaddress(
 /// `listreceivedbyaddress [minconf] [include_empty] [include_watchonly] [address_filter]` -
 /// per-address received totals with the txids that paid them. There is no watch-only
 /// support, so `include_watchonly` is accepted and ignored.
-pub fn listreceivedbyaddress(
+pub(crate) fn listreceivedbyaddress(
     state: &AppState,
     wallet: Option<&str>,
     req: &RpcRequest,
@@ -597,7 +630,7 @@ fn received_by_label(
 
 /// `getreceivedbylabel <label> [minconf]` - total received across the addresses carrying
 /// `label`. An unknown label is `-4` like Bitcoin Core's `GetReceived`.
-pub fn getreceivedbylabel(
+pub(crate) fn getreceivedbylabel(
     state: &AppState,
     wallet: Option<&str>,
     req: &RpcRequest,
@@ -608,8 +641,8 @@ pub fn getreceivedbylabel(
         .ok_or_else(|| RpcError::invalid_params("getreceivedbylabel requires a label"))?;
     let minconf = depth_param(req.param(1), "minconf", 1)?;
     let handle = state.registry.get(wallet)?;
-    let addrs = labels::addresses_for_label(&handle.dir, label)
-        .map_err(RpcError::database_internal)?;
+    let addrs =
+        labels::addresses_for_label(&handle.dir, label).map_err(RpcError::database_internal)?;
     if addrs.is_empty() {
         return Err(RpcError::wallet("Label not found in wallet"));
     }
@@ -625,7 +658,7 @@ pub fn getreceivedbylabel(
 
 /// `listreceivedbylabel [minconf] [include_empty] [include_watchonly]` - `listreceivedbyaddress`
 /// aggregated per label. `include_watchonly` is accepted and ignored (no watch-only support).
-pub fn listreceivedbylabel(
+pub(crate) fn listreceivedbylabel(
     state: &AppState,
     wallet: Option<&str>,
     req: &RpcRequest,
@@ -670,7 +703,7 @@ pub fn listreceivedbylabel(
 /// `lastblock` hash to feed back into the next call. Reorged-away transactions are rescanned
 /// and re-reported by the sync engine rather than tracked separately, so `removed` is always
 /// empty.
-pub fn listsinceblock(
+pub(crate) fn listsinceblock(
     state: &AppState,
     wallet: Option<&str>,
     req: &RpcRequest,
@@ -679,7 +712,11 @@ pub fn listsinceblock(
     let st = handle.status();
 
     // Param 0: list activity *since* this block (exclusive). Omitted/empty means everything.
-    let since_height = match req.param(0).and_then(|v| v.as_str()).filter(|s| !s.is_empty()) {
+    let since_height = match req
+        .param(0)
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+    {
         Some(hash) => Some(
             read::block_height_by_hash(&handle.dir, hash)?
                 .ok_or_else(|| RpcError::invalid_address_or_key("Block not found"))?,
@@ -739,7 +776,10 @@ pub fn listsinceblock(
     }))
 }
 
-pub async fn gettransaction(
+/// `gettransaction <txid>` - detailed info on one wallet transaction: net `amount`
+/// (fee-exclusive, see [`gettransaction_amount`]), per-output `details`, and the raw `hex`
+/// (fetched from lightwalletd on demand for received txs only seen as compact outputs).
+pub(crate) async fn gettransaction(
     state: &AppState,
     wallet: Option<&str>,
     req: &RpcRequest,
@@ -754,47 +794,8 @@ pub async fn gettransaction(
         .ok_or_else(|| RpcError::invalid_address_or_key("Invalid or non-wallet transaction id"))?;
     let label_map = labels::all(&handle.dir).unwrap_or_default();
 
-    let mut details = Vec::new();
-    for out in &rec.outputs {
-        if out.is_change {
-            continue;
-        }
-        let categories = output_categories(out.from_account.is_some(), out.to_account.is_some());
-        for category in categories {
-            let amount = if *category == "send" { -out.value } else { out.value };
-            let mut d = json!({
-                "address": out.to_address.clone().unwrap_or_default(),
-                "category": category,
-                "amount": signed_zats_to_value(amount),
-                "vout": out.output_index,
-                "label": out.to_address.as_ref().and_then(|a| label_map.get(a).cloned()).unwrap_or_default(),
-            });
-            if *category == "send" {
-                d["abandoned"] = json!(rec.expired_unmined);
-                if let Some(fee) = rec.fee_paid {
-                    d["fee"] = signed_zats_to_value(-(fee as i64));
-                }
-            }
-            push_memo_fields(&mut d, out.memo.as_deref());
-            details.push(d);
-        }
-    }
-
-    // `hex`: stored raw for txs we created; otherwise fetch the full tx on demand (received
-    // txs are only seen as compact blocks until enhanced).
-    let hex_str = match &rec.raw {
-        Some(raw) => hex::encode(raw),
-        None => match parse_txid(&rec.txid_hex) {
-            Some(txid) => handle
-                .get_raw_tx(txid)
-                .await
-                .ok()
-                .flatten()
-                .map(|raw| hex::encode(raw.data))
-                .unwrap_or_default(),
-            None => String::new(),
-        },
-    };
+    let details = gettransaction_details(&rec, &label_map);
+    let hex_str = gettransaction_hex(&handle, &rec).await;
 
     let amount = gettransaction_amount(rec.account_balance_delta, rec.fee_paid);
     let confirmations = tx_confirmations(&st, &rec);
@@ -812,6 +813,66 @@ pub async fn gettransaction(
     }
     push_wallet_tx_fields(&mut obj, &rec, time);
     Ok(obj)
+}
+
+/// Build `gettransaction.details`: one entry per non-change output and category, sends
+/// negative - [`tx_entries`]'s conventions minus the per-tx fields (`confirmations`, `txid`,
+/// times), which `gettransaction` carries at the top level instead.
+fn gettransaction_details(rec: &read::TxRecord, label_map: &HashMap<String, String>) -> Vec<Value> {
+    let mut details = Vec::new();
+    for out in &rec.outputs {
+        if out.is_change {
+            continue;
+        }
+        let categories = output_categories(out.from_account.is_some(), out.to_account.is_some());
+        for category in categories {
+            let amount = if *category == "send" {
+                -out.value
+            } else {
+                out.value
+            };
+            let label = out
+                .to_address
+                .as_ref()
+                .and_then(|a| label_map.get(a).cloned())
+                .unwrap_or_default();
+            let mut d = json!({
+                "address": out.to_address.clone().unwrap_or_default(),
+                "category": category,
+                "amount": signed_zats_to_value(amount),
+                "vout": out.output_index,
+                "label": label,
+            });
+            if *category == "send" {
+                d["abandoned"] = json!(rec.expired_unmined);
+                if let Some(fee) = rec.fee_paid {
+                    d["fee"] = signed_zats_to_value(-(fee as i64));
+                }
+            }
+            push_memo_fields(&mut d, out.memo.as_deref());
+            details.push(d);
+        }
+    }
+    details
+}
+
+/// `gettransaction.hex`: stored raw bytes for txs we created; otherwise fetch the full tx on
+/// demand (received txs are only seen as compact blocks until enhanced). Best-effort - an
+/// unreachable upstream yields an empty string, not an error.
+async fn gettransaction_hex(handle: &crate::wallet::WalletHandle, rec: &read::TxRecord) -> String {
+    match &rec.raw {
+        Some(raw) => hex::encode(raw),
+        None => match parse_txid(&rec.txid_hex) {
+            Some(txid) => handle
+                .get_raw_tx(txid)
+                .await
+                .ok()
+                .flatten()
+                .map(|raw| hex::encode(raw.data))
+                .unwrap_or_default(),
+            None => String::new(),
+        },
+    }
 }
 
 /// Parse one of `listunspent`'s integer depth params with Bitcoin Core's typed-argument
@@ -897,7 +958,14 @@ fn unspent_json(
         .collect()
 }
 
-pub fn listunspent(state: &AppState, wallet: Option<&str>, req: &RpcRequest) -> Result<Value, RpcError> {
+/// `listunspent [minconf] [maxconf] [addresses] [include_unsafe]` - the wallet's unspent
+/// Orchard notes in Bitcoin Core's UTXO shape; see [`unspent_json`] for the synthesized
+/// `(txid, vout)` convention.
+pub(crate) fn listunspent(
+    state: &AppState,
+    wallet: Option<&str>,
+    req: &RpcRequest,
+) -> Result<Value, RpcError> {
     let minconf = depth_param(req.param(0), "minconf", 1)?;
     let maxconf = depth_param(req.param(1), "maxconf", 9_999_999)?;
     let handle = state.registry.get(wallet)?;
@@ -1002,7 +1070,10 @@ fn send_result(txid: String, verbose: bool) -> Value {
     }
 }
 
-pub async fn sendtoaddress(
+/// `sendtoaddress <address> <amount> [...] [verbose] [memo]` - pay one recipient from the
+/// Orchard pool. Sends serialize through the wallet actor (no double-spends under
+/// concurrency); fee is always ZIP-317. The trailing `memo` param is a zecd extension.
+pub(crate) async fn sendtoaddress(
     state: &AppState,
     wallet: Option<&str>,
     req: &RpcRequest,
@@ -1041,14 +1112,22 @@ pub async fn sendtoaddress(
         Some(_) => return Err(RpcError::type_error("memo must be a hex string")),
     };
     let handle = state.registry.get(wallet)?.clone();
-    let payment = build_payment(&handle.network, state.config.spend.privacy, addr, amount, memo)?;
+    let payment = build_payment(
+        &handle.network,
+        state.config.spend.privacy,
+        addr,
+        amount,
+        memo,
+    )?;
     let request = TransactionRequest::new(vec![payment])
         .map_err(|e| RpcError::wallet(format!("invalid payment request: {e}")))?;
     let txid = handle.send(request).await?;
     Ok(send_result(txid.to_string(), verbose))
 }
 
-pub async fn sendmany(
+/// `sendmany "" {address: amount, ...} [...]` - pay several recipients in one transaction
+/// (one ZIP-317 fee, one anchor).
+pub(crate) async fn sendmany(
     state: &AppState,
     wallet: Option<&str>,
     req: &RpcRequest,
@@ -1077,10 +1156,18 @@ pub async fn sendmany(
     let handle = state.registry.get(wallet)?.clone();
     let mut payments = Vec::new();
     for (addr, amount) in recipients {
-        payments.push(build_payment(&handle.network, state.config.spend.privacy, addr, amount, None)?);
+        payments.push(build_payment(
+            &handle.network,
+            state.config.spend.privacy,
+            addr,
+            amount,
+            None,
+        )?);
     }
     if payments.is_empty() {
-        return Err(RpcError::invalid_params("sendmany requires at least one recipient"));
+        return Err(RpcError::invalid_params(
+            "sendmany requires at least one recipient",
+        ));
     }
     let request = TransactionRequest::new(payments)
         .map_err(|e| RpcError::wallet(format!("invalid payment request: {e}")))?;
@@ -1092,7 +1179,9 @@ pub async fn sendmany(
 /// are silently reduced rather than rejected.
 const MAX_UNLOCK_TIMEOUT_SECS: i64 = 100_000_000;
 
-pub async fn walletpassphrase(
+/// `walletpassphrase <passphrase> <timeout>` - decrypt the seed into memory for `timeout`
+/// seconds (auto-relock after). Wrong passphrase is `-14`; an unencrypted wallet is `-15`.
+pub(crate) async fn walletpassphrase(
     state: &AppState,
     wallet: Option<&str>,
     req: &RpcRequest,
@@ -1102,10 +1191,9 @@ pub async fn walletpassphrase(
         .and_then(|v| v.as_str())
         .ok_or_else(|| RpcError::invalid_params("walletpassphrase requires a passphrase"))?;
     // Timeout (seconds) is required and must be a non-negative integer; huge values are clamped.
-    let timeout = req
-        .param(1)
-        .and_then(|v| v.as_i64())
-        .ok_or_else(|| RpcError::invalid_parameter("walletpassphrase requires an integer timeout (seconds)"))?;
+    let timeout = req.param(1).and_then(|v| v.as_i64()).ok_or_else(|| {
+        RpcError::invalid_parameter("walletpassphrase requires an integer timeout (seconds)")
+    })?;
     if timeout < 0 {
         return Err(RpcError::invalid_parameter("Timeout cannot be negative."));
     }
@@ -1114,17 +1202,23 @@ pub async fn walletpassphrase(
     }
     let timeout = timeout.min(MAX_UNLOCK_TIMEOUT_SECS);
     let handle = state.registry.get(wallet)?.clone();
-    handle.unlock(Passphrase::from(passphrase.to_owned()), timeout).await?;
+    handle
+        .unlock(Passphrase::from(passphrase.to_owned()), timeout)
+        .await?;
     Ok(Value::Null)
 }
 
-pub async fn walletlock(state: &AppState, wallet: Option<&str>) -> Result<Value, RpcError> {
+/// `walletlock` - drop the decrypted seed immediately; sends then fail with `-13` until the
+/// next `walletpassphrase`.
+pub(crate) async fn walletlock(state: &AppState, wallet: Option<&str>) -> Result<Value, RpcError> {
     let handle = state.registry.get(wallet)?.clone();
     handle.lock().await?;
     Ok(Value::Null)
 }
 
-pub async fn encryptwallet(
+/// `encryptwallet <passphrase>` - wrap the age-encrypted mnemonic under a passphrase; the
+/// wallet locks immediately afterwards.
+pub(crate) async fn encryptwallet(
     state: &AppState,
     wallet: Option<&str>,
     req: &RpcRequest,
@@ -1137,7 +1231,9 @@ pub async fn encryptwallet(
         return Err(RpcError::invalid_parameter("passphrase cannot be empty"));
     }
     let handle = state.registry.get(wallet)?.clone();
-    handle.encrypt_wallet(Passphrase::from(passphrase.to_owned())).await?;
+    handle
+        .encrypt_wallet(Passphrase::from(passphrase.to_owned()))
+        .await?;
     // Unlike Bitcoin Core, the mnemonic/seed is unchanged (no new backup needed) - only the
     // at-rest wrapping changed, so the wallet is now locked and needs walletpassphrase.
     Ok(Value::String(
@@ -1147,25 +1243,28 @@ pub async fn encryptwallet(
     ))
 }
 
-pub async fn walletpassphrasechange(
+/// `walletpassphrasechange <old> <new>` - re-wrap the seed under a new passphrase (the
+/// old one must verify; `-14` otherwise).
+pub(crate) async fn walletpassphrasechange(
     state: &AppState,
     wallet: Option<&str>,
     req: &RpcRequest,
 ) -> Result<Value, RpcError> {
-    let old = req
-        .param(0)
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| RpcError::invalid_params("walletpassphrasechange requires the old passphrase"))?;
-    let new = req
-        .param(1)
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| RpcError::invalid_params("walletpassphrasechange requires the new passphrase"))?;
+    let old = req.param(0).and_then(|v| v.as_str()).ok_or_else(|| {
+        RpcError::invalid_params("walletpassphrasechange requires the old passphrase")
+    })?;
+    let new = req.param(1).and_then(|v| v.as_str()).ok_or_else(|| {
+        RpcError::invalid_params("walletpassphrasechange requires the new passphrase")
+    })?;
     if new.is_empty() {
         return Err(RpcError::invalid_parameter("passphrase cannot be empty"));
     }
     let handle = state.registry.get(wallet)?.clone();
     handle
-        .change_passphrase(Passphrase::from(old.to_owned()), Passphrase::from(new.to_owned()))
+        .change_passphrase(
+            Passphrase::from(old.to_owned()),
+            Passphrase::from(new.to_owned()),
+        )
         .await?;
     Ok(Value::Null)
 }
@@ -1276,7 +1375,7 @@ mod tests {
     fn listunspent_filters_depth_safety_and_addresses() {
         let st = status(100); // fully_scanned 100
         let notes = vec![
-            note(Some(91), 10, false, Some("addr-a")), // 10 conf
+            note(Some(91), 10, false, Some("addr-a")),  // 10 conf
             note(Some(100), 20, false, Some("addr-b")), // 1 conf
             note(None, 30, true, None),                 // own unconfirmed change: safe
             note(None, 40, false, Some("addr-a")),      // foreign 0-conf: unsafe
@@ -1353,7 +1452,12 @@ mod tests {
     #[test]
     fn memo_fields_ride_on_entries_with_memos() {
         // A text memo yields both hex and decoded forms.
-        let mut t = tx(Some(50), false, None, vec![out(false, true, 5, Some("ua"), false)]);
+        let mut t = tx(
+            Some(50),
+            false,
+            None,
+            vec![out(false, true, 5, Some("ua"), false)],
+        );
         t.outputs[0].memo = Some(b"invoice 42".to_vec());
         let e = tx_entries(&t, &HashMap::new(), 1, 0, None);
         assert_eq!(e[0]["memo"], json!(hex::encode(b"invoice 42")));
@@ -1403,12 +1507,18 @@ mod tests {
         // FullPrivacy: an Orchard-receiving UA passes; a transparent recipient is -8 with a
         // self-diagnosing message; the default policy allows both.
         assert!(build_payment(&net, SendPrivacy::FullPrivacy, ua, &json!(0.1), None).is_ok());
-        let e = build_payment(&net, SendPrivacy::FullPrivacy, &taddr, &json!(0.1), None).unwrap_err();
+        let e =
+            build_payment(&net, SendPrivacy::FullPrivacy, &taddr, &json!(0.1), None).unwrap_err();
         assert_eq!(e.code, crate::error::codes::RPC_INVALID_PARAMETER);
         assert!(e.message.contains("privacy_policy"), "{}", e.message);
-        assert!(
-            build_payment(&net, SendPrivacy::AllowRevealedRecipients, &taddr, &json!(0.1), None).is_ok()
-        );
+        assert!(build_payment(
+            &net,
+            SendPrivacy::AllowRevealedRecipients,
+            &taddr,
+            &json!(0.1),
+            None
+        )
+        .is_ok());
     }
 
     #[test]
@@ -1444,9 +1554,20 @@ mod tests {
 
     #[test]
     fn receive_entry_shape() {
-        let t = tx(Some(100), false, None, vec![out(false, true, 150_000_000, Some("ua"), false)]);
+        let t = tx(
+            Some(100),
+            false,
+            None,
+            vec![out(false, true, 150_000_000, Some("ua"), false)],
+        );
         let st = status(102);
-        let e = tx_entries(&t, &HashMap::new(), tx_confirmations(&st, &t), tx_time(&t, None), None);
+        let e = tx_entries(
+            &t,
+            &HashMap::new(),
+            tx_confirmations(&st, &t),
+            tx_time(&t, None),
+            None,
+        );
         assert_eq!(e.len(), 1);
         assert_eq!(e[0]["category"], "receive");
         assert_eq!(e[0]["amount"].to_string(), "1.50000000");
@@ -1483,7 +1604,12 @@ mod tests {
     #[test]
     fn change_is_skipped_and_self_transfers_pair_up() {
         // Change outputs never produce entries.
-        let t = tx(Some(50), false, None, vec![out(true, true, 1, Some("self"), true)]);
+        let t = tx(
+            Some(50),
+            false,
+            None,
+            vec![out(true, true, 1, Some("self"), true)],
+        );
         assert!(tx_entries(&t, &HashMap::new(), 1, 0, None).is_empty());
 
         // A self-transfer (from us, to us, not change) is Bitcoin Core's send + receive
@@ -1509,7 +1635,12 @@ mod tests {
 
     #[test]
     fn expired_tx_is_conflicted_and_abandoned() {
-        let mut t = tx(None, true, Some(10_000), vec![out(true, false, 5, Some("dest"), false)]);
+        let mut t = tx(
+            None,
+            true,
+            Some(10_000),
+            vec![out(true, false, 5, Some("dest"), false)],
+        );
         t.account_balance_delta = -10_005;
         let st = status(100);
         let conf = tx_confirmations(&st, &t);
@@ -1526,14 +1657,30 @@ mod tests {
 
     #[test]
     fn unmined_own_tx_is_trusted_with_first_seen_time() {
-        let mut t = tx(None, false, Some(10_000), vec![out(true, false, 5, Some("dest"), false)]);
+        let mut t = tx(
+            None,
+            false,
+            Some(10_000),
+            vec![out(true, false, 5, Some("dest"), false)],
+        );
         t.account_balance_delta = -10_005;
-        let e = tx_entries(&t, &HashMap::new(), 0, tx_time(&t, Some(1_700_000_123)), None);
+        let e = tx_entries(
+            &t,
+            &HashMap::new(),
+            0,
+            tx_time(&t, Some(1_700_000_123)),
+            None,
+        );
         assert_eq!(e[0]["trusted"], json!(true));
         assert_eq!(e[0]["time"], json!(1_700_000_123));
         assert_eq!(e[0]["timereceived"], json!(1_700_000_123));
         // A foreign unmined receive is untrusted (Bitcoin Core: not our mempool tx).
-        let f = tx(None, false, None, vec![out(false, true, 5, Some("ua"), false)]);
+        let f = tx(
+            None,
+            false,
+            None,
+            vec![out(false, true, 5, Some("ua"), false)],
+        );
         let e = tx_entries(&f, &HashMap::new(), 0, tx_time(&f, None), None);
         assert_eq!(e[0]["trusted"], json!(false));
     }
@@ -1554,7 +1701,12 @@ mod tests {
     fn label_filter_keeps_only_matches() {
         let mut labels = HashMap::new();
         labels.insert("dest".to_string(), "alice".to_string());
-        let t = tx(Some(50), false, None, vec![out(false, true, 5, Some("dest"), false)]);
+        let t = tx(
+            Some(50),
+            false,
+            None,
+            vec![out(false, true, 5, Some("dest"), false)],
+        );
         assert_eq!(tx_entries(&t, &labels, 1, 0, Some("alice")).len(), 1);
         assert!(tx_entries(&t, &labels, 1, 0, Some("bob")).is_empty());
         assert_eq!(tx_entries(&t, &labels, 1, 0, None).len(), 1);
@@ -1564,11 +1716,36 @@ mod tests {
     fn received_by_address_groups_and_respects_minconf() {
         let st = status(100);
         let txs = vec![
-            tx(Some(100), false, None, vec![out(false, true, 100, Some("a"), false)]), // 1 conf
-            tx(Some(91), false, None, vec![out(false, true, 50, Some("a"), false)]),   // 10 conf
-            tx(None, false, None, vec![out(false, true, 7, Some("a"), false)]),        // 0 conf
-            tx(None, true, None, vec![out(false, true, 9, Some("a"), false)]),         // expired: -1 conf
-            tx(Some(100), false, None, vec![out(true, true, 11, Some("a"), true)]),    // change: skipped
+            tx(
+                Some(100),
+                false,
+                None,
+                vec![out(false, true, 100, Some("a"), false)],
+            ), // 1 conf
+            tx(
+                Some(91),
+                false,
+                None,
+                vec![out(false, true, 50, Some("a"), false)],
+            ), // 10 conf
+            tx(
+                None,
+                false,
+                None,
+                vec![out(false, true, 7, Some("a"), false)],
+            ), // 0 conf
+            tx(
+                None,
+                true,
+                None,
+                vec![out(false, true, 9, Some("a"), false)],
+            ), // expired: -1 conf
+            tx(
+                Some(100),
+                false,
+                None,
+                vec![out(true, true, 11, Some("a"), true)],
+            ), // change: skipped
         ];
         let m = received_by_address(&txs, &st, 1);
         let (amt, conf, txids) = m.get("a").cloned().unwrap();
@@ -1583,9 +1760,24 @@ mod tests {
     fn received_by_label_groups_and_defaults_to_empty_label() {
         let st = status(100);
         let txs = vec![
-            tx(Some(91), false, None, vec![out(false, true, 100, Some("a1"), false)]),
-            tx(Some(95), false, None, vec![out(false, true, 50, Some("a2"), false)]),
-            tx(Some(100), false, None, vec![out(false, true, 7, Some("b"), false)]),
+            tx(
+                Some(91),
+                false,
+                None,
+                vec![out(false, true, 100, Some("a1"), false)],
+            ),
+            tx(
+                Some(95),
+                false,
+                None,
+                vec![out(false, true, 50, Some("a2"), false)],
+            ),
+            tx(
+                Some(100),
+                false,
+                None,
+                vec![out(false, true, 7, Some("b"), false)],
+            ),
         ];
         let mut labels = HashMap::new();
         labels.insert("a1".to_string(), "alice".to_string());
@@ -1601,7 +1793,10 @@ mod tests {
     #[test]
     fn gettransaction_amount_adds_fee_back() {
         // Wallet-funded: delta = -(payment + fee); `amount` must be -payment.
-        assert_eq!(gettransaction_amount(-150_010_000, Some(10_000)), -150_000_000);
+        assert_eq!(
+            gettransaction_amount(-150_010_000, Some(10_000)),
+            -150_000_000
+        );
         // Pure receive: no fee known, delta already the received value.
         assert_eq!(gettransaction_amount(250_000_000, None), 250_000_000);
         // Self-transfer: delta is just -fee; nets to 0.

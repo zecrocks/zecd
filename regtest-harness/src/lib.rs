@@ -311,7 +311,11 @@ impl Lightwalletd {
     /// Launch on a *fixed* gRPC port. Used by the fault tests to bring lightwalletd back on
     /// the same address a running zecd is configured for (a fresh data dir re-ingests the
     /// chain from zebra, which takes seconds on a regtest chain).
-    pub async fn start_on(bin: &Path, zebrad_rpc_port: u16, grpc_port: u16) -> Result<Lightwalletd> {
+    pub async fn start_on(
+        bin: &Path,
+        zebrad_rpc_port: u16,
+        grpc_port: u16,
+    ) -> Result<Lightwalletd> {
         let dir = tempfile::tempdir().context("create lightwalletd dir")?;
         let http_port = pick_port()?;
         let data_dir = dir.path().join("data");
@@ -962,7 +966,12 @@ impl Tparty {
         let deadline = Instant::now() + Duration::from_secs(90);
         loop {
             let init = Command::new(&bin)
-                .args(["--datadir", datadir.path().to_str().unwrap(), "--regtest", "init"])
+                .args([
+                    "--datadir",
+                    datadir.path().to_str().unwrap(),
+                    "--regtest",
+                    "init",
+                ])
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped())
                 .output()
@@ -982,7 +991,12 @@ impl Tparty {
         }
 
         let child = Command::new(&bin)
-            .args(["--datadir", datadir.path().to_str().unwrap(), "--regtest", "run"])
+            .args([
+                "--datadir",
+                datadir.path().to_str().unwrap(),
+                "--regtest",
+                "run",
+            ])
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .spawn()
@@ -1183,7 +1197,12 @@ fn reset_datadir(datadir: &Path, cfg: &ZecdConfig) -> Result<()> {
 /// fresh init; `None` on the restore path, which prints none). The restore path applies to
 /// the default wallet only: the phrase from [`ZecdConfig::restore_mnemonic`] is fed on stdin
 /// and `--birthday` is passed when set.
-fn run_zecd_init(bin: &Path, datadir: &Path, wallet: &str, cfg: &ZecdConfig) -> Result<Option<String>> {
+fn run_zecd_init(
+    bin: &Path,
+    datadir: &Path,
+    wallet: &str,
+    cfg: &ZecdConfig,
+) -> Result<Option<String>> {
     let mut args: Vec<String> = vec![
         "--datadir".into(),
         datadir.to_str().unwrap().into(),
@@ -1204,7 +1223,11 @@ fn run_zecd_init(bin: &Path, datadir: &Path, wallet: &str, cfg: &ZecdConfig) -> 
     }
     let mut child = Command::new(bin)
         .args(&args)
-        .stdin(if restore.is_some() { Stdio::piped() } else { Stdio::null() })
+        .stdin(if restore.is_some() {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        })
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()

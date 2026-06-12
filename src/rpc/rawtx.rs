@@ -38,20 +38,22 @@ fn parse_txid_param(s: &str) -> Result<TxId, RpcError> {
         )));
     }
     let mut bytes = hex::decode(s).map_err(|_| {
-        RpcError::invalid_parameter(format!("parameter 1 must be hexadecimal string (not '{s}')"))
+        RpcError::invalid_parameter(format!(
+            "parameter 1 must be hexadecimal string (not '{s}')"
+        ))
     })?;
     bytes.reverse();
     // 64 hex chars always decode to 32 bytes, but keep this an error (not an expect) so a
     // future change to the length check above can't turn it into a panic path.
-    let bytes: [u8; 32] = bytes
-        .try_into()
-        .map_err(|_| RpcError::invalid_parameter(format!("parameter 1 must be of length 64 (not '{s}')")))?;
+    let bytes: [u8; 32] = bytes.try_into().map_err(|_| {
+        RpcError::invalid_parameter(format!("parameter 1 must be of length 64 (not '{s}')"))
+    })?;
     Ok(TxId::from_bytes(bytes))
 }
 
 /// `getrawtransaction <txid> [verbose] [blockhash]` - fetch any transaction by txid:
 /// wallet-stored raw bytes when available, otherwise via lightwalletd's `GetTransaction`.
-pub async fn getrawtransaction(
+pub(crate) async fn getrawtransaction(
     state: &AppState,
     wallet: Option<&str>,
     req: &RpcRequest,
@@ -109,7 +111,10 @@ pub async fn getrawtransaction(
         .unwrap_or(u32::MAX);
     let branch = BranchId::for_height(&handle.network, BlockHeight::from_u32(branch_height));
     let tx = Transaction::read(&data[..], branch).map_err(|e| {
-        RpcError::new(codes::RPC_DESERIALIZATION_ERROR, format!("TX decode failed: {e}"))
+        RpcError::new(
+            codes::RPC_DESERIALIZATION_ERROR,
+            format!("TX decode failed: {e}"),
+        )
     })?;
 
     let mut obj = tx_json(&handle.network, &tx, data.len());
@@ -132,7 +137,7 @@ pub async fn getrawtransaction(
 /// `sendrawtransaction <hexstring> [maxfeerate]` - broadcast caller-built raw transaction
 /// bytes through lightwalletd. `maxfeerate` is accepted and ignored: fees are ZIP-317 and a
 /// shielded transaction's fee is not computable from its serialization alone.
-pub async fn sendrawtransaction(
+pub(crate) async fn sendrawtransaction(
     state: &AppState,
     wallet: Option<&str>,
     req: &RpcRequest,
@@ -161,7 +166,11 @@ pub async fn sendrawtransaction(
 
 /// zcashd's `TxToJSON` (sans block fields, which the callers append): every field of the
 /// parsed transaction, shielded bundles included.
-fn tx_json(network: &crate::network::ZNetwork, tx: &Transaction, size: usize) -> Map<String, Value> {
+fn tx_json(
+    network: &crate::network::ZNetwork,
+    tx: &Transaction,
+    size: usize,
+) -> Map<String, Value> {
     let version = tx.version();
     let overwintered = version.has_overwinter();
 
@@ -189,7 +198,11 @@ fn tx_json(network: &crate::network::ZNetwork, tx: &Transaction, size: usize) ->
         Some(bundle) => {
             let coinbase = bundle.is_coinbase();
             (
-                bundle.vin.iter().map(|txin| vin_json(txin, coinbase)).collect(),
+                bundle
+                    .vin
+                    .iter()
+                    .map(|txin| vin_json(txin, coinbase))
+                    .collect(),
                 bundle
                     .vout
                     .iter()
@@ -287,7 +300,10 @@ fn vout_json(
     if !addresses.is_empty() {
         spk.insert(
             "addresses".into(),
-            json!(addresses.iter().map(|a| a.encode(network)).collect::<Vec<_>>()),
+            json!(addresses
+                .iter()
+                .map(|a| a.encode(network))
+                .collect::<Vec<_>>()),
         );
     }
     json!({
@@ -299,7 +315,9 @@ fn vout_json(
     })
 }
 
-fn sapling_spend_json(spend: &sapling::bundle::SpendDescription<sapling::bundle::Authorized>) -> Value {
+fn sapling_spend_json(
+    spend: &sapling::bundle::SpendDescription<sapling::bundle::Authorized>,
+) -> Value {
     json!({
         "cv": rev_hex(&spend.cv().to_bytes()),
         "anchor": rev_hex(&spend.anchor().to_bytes()),
@@ -324,7 +342,9 @@ fn sapling_output_json(
 }
 
 fn orchard_json(
-    bundle: Option<&orchard::Bundle<orchard::bundle::Authorized, zcash_protocol::value::ZatBalance>>,
+    bundle: Option<
+        &orchard::Bundle<orchard::bundle::Authorized, zcash_protocol::value::ZatBalance>,
+    >,
 ) -> Value {
     let Some(bundle) = bundle else {
         return json!({
@@ -513,7 +533,10 @@ mod tests {
 
         let vin = obj["vin"].as_array().unwrap();
         assert_eq!(vin.len(), 1);
-        assert!(vin[0]["scriptSig"]["asm"].as_str().unwrap().contains("[ALL]"));
+        assert!(vin[0]["scriptSig"]["asm"]
+            .as_str()
+            .unwrap()
+            .contains("[ALL]"));
         assert_eq!(vin[0]["vout"], json!(1));
 
         let vout = obj["vout"].as_array().unwrap();

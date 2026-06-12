@@ -87,7 +87,10 @@ async fn regtest_hung_upstream_detected_and_recovered() {
     //    empties, although the process never exited and its socket still accepts.
     let deadline = Instant::now() + DETECT_TIMEOUT;
     loop {
-        let peers = zecd.call("getpeerinfo", json!([])).await.expect("getpeerinfo");
+        let peers = zecd
+            .call("getpeerinfo", json!([]))
+            .await
+            .expect("getpeerinfo");
         if peers.as_array().is_some_and(|a| a.is_empty()) {
             break;
         }

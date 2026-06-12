@@ -59,7 +59,12 @@ impl RpcRequest {
             }
         };
 
-        Ok(RpcRequest { id, method, params, params_raw })
+        Ok(RpcRequest {
+            id,
+            method,
+            params,
+            params_raw,
+        })
     }
 
     /// Positional parameter accessor.
@@ -92,8 +97,12 @@ pub enum Body {
 /// Parse the raw HTTP body into a [`Body`]. A non-array, non-object top level, or invalid
 /// JSON, is a parse error.
 pub fn parse_body(bytes: &[u8]) -> Result<Body, RpcError> {
-    let v: Value = serde_json::from_slice(bytes)
-        .map_err(|e| RpcError::new(crate::error::codes::RPC_PARSE_ERROR, format!("Parse error: {e}")))?;
+    let v: Value = serde_json::from_slice(bytes).map_err(|e| {
+        RpcError::new(
+            crate::error::codes::RPC_PARSE_ERROR,
+            format!("Parse error: {e}"),
+        )
+    })?;
     match v {
         Value::Array(arr) => {
             if arr.is_empty() {
@@ -132,16 +141,27 @@ mod tests {
     #[test]
     fn parse_errors() {
         // Invalid JSON -> parse error.
-        assert_eq!(parse_body(b"not json").unwrap_err().code, codes::RPC_PARSE_ERROR);
+        assert_eq!(
+            parse_body(b"not json").unwrap_err().code,
+            codes::RPC_PARSE_ERROR
+        );
         // Wrong top-level type.
-        assert_eq!(parse_body(b"5").unwrap_err().code, codes::RPC_INVALID_REQUEST);
+        assert_eq!(
+            parse_body(b"5").unwrap_err().code,
+            codes::RPC_INVALID_REQUEST
+        );
         // Empty batch.
-        assert_eq!(parse_body(b"[]").unwrap_err().code, codes::RPC_INVALID_REQUEST);
+        assert_eq!(
+            parse_body(b"[]").unwrap_err().code,
+            codes::RPC_INVALID_REQUEST
+        );
     }
 
     #[test]
     fn request_from_value_ok_and_missing_method() {
-        let v: Value = serde_json::from_str(r#"{"method":"sendtoaddress","id":"x","params":["addr",1.5]}"#).unwrap();
+        let v: Value =
+            serde_json::from_str(r#"{"method":"sendtoaddress","id":"x","params":["addr",1.5]}"#)
+                .unwrap();
         let req = RpcRequest::from_value(v).unwrap();
         assert_eq!(req.method, "sendtoaddress");
         assert_eq!(req.id, Value::String("x".into()));
@@ -164,7 +184,10 @@ mod tests {
 
         let err = error(serde_json::json!(2), &RpcError::method_not_found("foo"));
         assert_eq!(err["result"], Value::Null);
-        assert_eq!(err["error"]["code"], serde_json::json!(codes::RPC_METHOD_NOT_FOUND));
+        assert_eq!(
+            err["error"]["code"],
+            serde_json::json!(codes::RPC_METHOD_NOT_FOUND)
+        );
         assert!(err["error"]["message"].is_string());
         assert_eq!(err["id"], serde_json::json!(2));
     }

@@ -74,7 +74,10 @@ fn help_lists_init_subcommand() {
     );
     assert!(out.status.success());
     let stdout = String::from_utf8_lossy(&out.stdout);
-    assert!(stdout.contains("init"), "help should list the init subcommand");
+    assert!(
+        stdout.contains("init"),
+        "help should list the init subcommand"
+    );
 }
 
 #[test]
@@ -97,7 +100,12 @@ fn invalid_network_is_rejected() {
     let out = run_with_timeout(
         {
             let mut c = zecd();
-            c.args(["--datadir", dir.path().to_str().unwrap(), "--network", "bogus"]);
+            c.args([
+                "--datadir",
+                dir.path().to_str().unwrap(),
+                "--network",
+                "bogus",
+            ]);
             c
         },
         Duration::from_secs(10),
@@ -113,11 +121,7 @@ fn invalid_network_is_rejected() {
 #[test]
 fn unknown_config_field_is_rejected() {
     let dir = tempfile::tempdir().unwrap();
-    std::fs::write(
-        dir.path().join("zecd.toml"),
-        "[rpc]\nbogus_field = 1\n",
-    )
-    .unwrap();
+    std::fs::write(dir.path().join("zecd.toml"), "[rpc]\nbogus_field = 1\n").unwrap();
     let out = run_with_timeout(
         {
             let mut c = zecd();
@@ -218,7 +222,11 @@ fn init_creates_wallet_and_refuses_reinit() {
 
     // The mnemonic is the last line on stdout (tracing also logs there): 24 words.
     let stdout = String::from_utf8_lossy(&out.stdout);
-    let mnemonic = stdout.lines().rev().find(|l| !l.trim().is_empty()).unwrap_or("");
+    let mnemonic = stdout
+        .lines()
+        .rev()
+        .find(|l| !l.trim().is_empty())
+        .unwrap_or("");
     assert_eq!(
         mnemonic.split_whitespace().count(),
         24,
@@ -279,11 +287,17 @@ fn tparty_version_prints_its_own_name() {
 /// sapling variant gets the dedicated not-yet message.
 #[test]
 fn tparty_invalid_pool_fails_startup() {
-    for (pool, expect) in [("sapling", "not supported yet"), ("sprout", "invalid [tparty] pool")] {
+    for (pool, expect) in [
+        ("sapling", "not supported yet"),
+        ("sprout", "invalid [tparty] pool"),
+    ] {
         let dir = tempfile::tempdir().unwrap();
         let conf = dir.path().join("tparty.toml");
-        std::fs::write(&conf, format!("network = \"regtest\"\n[tparty]\npool = \"{pool}\"\n"))
-            .unwrap();
+        std::fs::write(
+            &conf,
+            format!("network = \"regtest\"\n[tparty]\npool = \"{pool}\"\n"),
+        )
+        .unwrap();
         let out = run_with_timeout(
             {
                 let mut c = tparty();

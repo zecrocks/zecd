@@ -25,8 +25,8 @@ pub struct PasswordHash {
 
 impl PasswordHash {
     fn compute(password: &str, salt: &str) -> [u8; 32] {
-        let mut mac = Hmac::<Sha256>::new_from_slice(salt.as_bytes())
-            .expect("HMAC accepts any key length");
+        let mut mac =
+            Hmac::<Sha256>::new_from_slice(salt.as_bytes()).expect("HMAC accepts any key length");
         mac.update(password.as_bytes());
         mac.finalize().into_bytes().into()
     }
@@ -62,7 +62,10 @@ impl FromStr for PasswordHash {
         let mut hash = [0u8; 32];
         hex::decode_to_slice(hash_hex, &mut hash)
             .map_err(|_| anyhow!("hash is not 64 hex characters"))?;
-        Ok(PasswordHash { salt: salt.to_string(), hash })
+        Ok(PasswordHash {
+            salt: salt.to_string(),
+            hash,
+        })
     }
 }
 
@@ -116,14 +119,21 @@ impl Authenticator {
     /// Verify an `Authorization` header value (e.g. `Basic dXNlcjpwYXNz`).
     pub fn check(&self, header: Option<&str>) -> bool {
         let Some(header) = header else { return false };
-        let Some(b64) = header.strip_prefix("Basic ").or_else(|| header.strip_prefix("basic ")) else {
+        let Some(b64) = header
+            .strip_prefix("Basic ")
+            .or_else(|| header.strip_prefix("basic "))
+        else {
             return false;
         };
         let Ok(decoded) = base64::engine::general_purpose::STANDARD.decode(b64.trim()) else {
             return false;
         };
-        let Ok(creds) = std::str::from_utf8(&decoded) else { return false };
-        let Some((user, password)) = creds.split_once(':') else { return false };
+        let Ok(creds) = std::str::from_utf8(&decoded) else {
+            return false;
+        };
+        let Some((user, password)) = creds.split_once(':') else {
+            return false;
+        };
 
         // Check every configured credential without short-circuiting: always run the password
         // HMAC (via `check_ct`) and combine with bitwise `Choice` ops, so response timing does
@@ -225,7 +235,10 @@ mod tests {
             "salt$shorthex",
             "salt$zz77f0957de88ff388cf817ddbc7273d8e868390e30794e252adc9160b8656e",
         ] {
-            assert!(s.parse::<PasswordHash>().is_err(), "expected {s:?} to be rejected");
+            assert!(
+                s.parse::<PasswordHash>().is_err(),
+                "expected {s:?} to be rejected"
+            );
         }
     }
 

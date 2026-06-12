@@ -78,7 +78,10 @@ async fn regtest_tparty_deposits_auto_shield() {
     funder
         .shield(lwd.grpc_port)
         .expect("shield transparent coinbase into Orchard");
-    zebrad.generate_blocks(6).await.expect("confirm the funder's shield");
+    zebrad
+        .generate_blocks(6)
+        .await
+        .expect("confirm the funder's shield");
     funder.sync(lwd.grpc_port).expect("funder sync (shielded)");
 
     // ---- tparty against the same lightwalletd ----
@@ -90,14 +93,27 @@ async fn regtest_tparty_deposits_auto_shield() {
     // Deposit addresses are fresh base58 t-addresses (regtest P2PKH = tm…).
     let addr1 = getnewaddress(&tparty).await;
     let addr2 = getnewaddress(&tparty).await;
-    assert!(addr1.starts_with("tm"), "expected a tm… t-address, got {addr1}");
-    assert!(addr2.starts_with("tm"), "expected a tm… t-address, got {addr2}");
-    assert_ne!(addr1, addr2, "every getnewaddress call yields a fresh address");
+    assert!(
+        addr1.starts_with("tm"),
+        "expected a tm… t-address, got {addr1}"
+    );
+    assert!(
+        addr2.starts_with("tm"),
+        "expected a tm… t-address, got {addr2}"
+    );
+    assert_ne!(
+        addr1, addr2,
+        "every getnewaddress call yields a fresh address"
+    );
     let v = tparty
         .call("validateaddress", json!([addr1]))
         .await
         .expect("validateaddress");
-    assert_eq!(v["isvalid"], json!(true), "tparty's own address validates: {v}");
+    assert_eq!(
+        v["isvalid"],
+        json!(true),
+        "tparty's own address validates: {v}"
+    );
 
     // Nothing has been deposited: balances are zero, there is nothing to shield (the manual
     // trigger reports null), and no shield has happened.
@@ -108,14 +124,20 @@ async fn regtest_tparty_deposits_auto_shield() {
     assert_eq!(info["pool"], json!("orchard"), "{info}");
     assert_eq!(info["unshielded"].as_f64(), Some(0.0), "{info}");
     assert!(info["last_shield_txid"].is_null(), "{info}");
-    let manual = tparty.call("shieldfunds", json!([])).await.expect("shieldfunds");
+    let manual = tparty
+        .call("shieldfunds", json!([]))
+        .await
+        .expect("shieldfunds");
     assert!(manual.is_null(), "nothing to shield yet: {manual}");
 
     // ---- Deposit 1: the funder pays the first t-address ----
     funder
         .send(lwd.grpc_port, &addr1, DEPOSIT_ZATOSHIS)
         .expect("send the transparent deposit");
-    zebrad.generate_blocks(1).await.expect("confirm the deposit");
+    zebrad
+        .generate_blocks(1)
+        .await
+        .expect("confirm the deposit");
 
     // tparty must now, on its own: scan to the tip, discover the transparent UTXO, and
     // broadcast a shielding tx. Mine a block per poll round so the shield can confirm as
@@ -127,7 +149,11 @@ async fn regtest_tparty_deposits_auto_shield() {
         .call("getreceivedbyaddress", json!([addr1]))
         .await
         .expect("getreceivedbyaddress");
-    assert_eq!(recv.as_f64(), Some(1.0), "the 1-ZEC deposit is credited to {addr1}: {recv}");
+    assert_eq!(
+        recv.as_f64(),
+        Some(1.0),
+        "the 1-ZEC deposit is credited to {addr1}: {recv}"
+    );
     let txs = tparty
         .call("listtransactions", json!(["*", 50]))
         .await
@@ -163,35 +189,58 @@ async fn regtest_tparty_deposits_auto_shield() {
     // ...and the unshielded balance drained into the pool: nothing transparent remains
     // (balance 0, no UTXOs), while the shielded balance grew by the deposit minus the
     // ZIP-317 fee.
-    let bal = tparty.call("getbalance", json!([])).await.expect("getbalance");
+    let bal = tparty
+        .call("getbalance", json!([]))
+        .await
+        .expect("getbalance");
     assert_eq!(bal.as_f64(), Some(0.0), "no unshielded funds remain: {bal}");
-    let unspent = tparty.call("listunspent", json!([0])).await.expect("listunspent");
+    let unspent = tparty
+        .call("listunspent", json!([0]))
+        .await
+        .expect("listunspent");
     assert_eq!(unspent, json!([]), "no transparent UTXOs remain");
     let info = tparty
         .call("getshieldinginfo", json!([]))
         .await
         .expect("getshieldinginfo after the shield");
-    let in_pool = info["shielded"].as_f64().unwrap_or(0.0)
-        + info["shielded_pending"].as_f64().unwrap_or(0.0);
+    let in_pool =
+        info["shielded"].as_f64().unwrap_or(0.0) + info["shielded_pending"].as_f64().unwrap_or(0.0);
     assert!(
         in_pool > 0.99,
         "the deposit (minus fee) arrived in the shielded pool: {info}"
     );
-    assert_eq!(info["last_shield_txid"], json!(shield_txid.as_str()), "{info}");
+    assert_eq!(
+        info["last_shield_txid"],
+        json!(shield_txid.as_str()),
+        "{info}"
+    );
 
     // ---- Deposit 2: the loop keeps running, on a different address ----
     funder
         .send(lwd.grpc_port, &addr2, DEPOSIT2_ZATOSHIS)
         .expect("send the second deposit");
-    zebrad.generate_blocks(1).await.expect("confirm the second deposit");
+    zebrad
+        .generate_blocks(1)
+        .await
+        .expect("confirm the second deposit");
     let shield2 = wait_for_shield(&zebrad, &tparty, Some(&shield_txid)).await;
-    assert_ne!(shield2, shield_txid, "a fresh shield tx for the second deposit");
+    assert_ne!(
+        shield2, shield_txid,
+        "a fresh shield tx for the second deposit"
+    );
     let recv2 = tparty
         .call("getreceivedbyaddress", json!([addr2]))
         .await
         .expect("getreceivedbyaddress (second)");
-    assert_eq!(recv2.as_f64(), Some(0.5), "the 0.5-ZEC deposit credits {addr2}: {recv2}");
-    let bal = tparty.call("getbalance", json!([])).await.expect("getbalance (final)");
+    assert_eq!(
+        recv2.as_f64(),
+        Some(0.5),
+        "the 0.5-ZEC deposit credits {addr2}: {recv2}"
+    );
+    let bal = tparty
+        .call("getbalance", json!([]))
+        .await
+        .expect("getbalance (final)");
     assert_eq!(bal.as_f64(), Some(0.0), "everything shielded again: {bal}");
 
     // ---- Deposit 3: below the threshold, the auto path must NOT shield; shieldfunds must ----
@@ -204,7 +253,10 @@ async fn regtest_tparty_deposits_auto_shield() {
     funder
         .send(lwd.grpc_port, &addr3, DEPOSIT3_ZATOSHIS)
         .expect("send the sub-threshold deposit");
-    zebrad.generate_blocks(1).await.expect("confirm the dust deposit");
+    zebrad
+        .generate_blocks(1)
+        .await
+        .expect("confirm the dust deposit");
 
     // Wait until tparty has seen and confirmed the deposit (the auto-shield check runs in
     // the same caught-up pass that makes the balance visible)...
@@ -225,7 +277,10 @@ async fn regtest_tparty_deposits_auto_shield() {
     }
     // ...then hold for several sync intervals (2s each) and confirm it stayed unshielded.
     tokio::time::sleep(Duration::from_secs(8)).await;
-    let bal = tparty.call("getbalance", json!([])).await.expect("getbalance (held)");
+    let bal = tparty
+        .call("getbalance", json!([]))
+        .await
+        .expect("getbalance (held)");
     assert_eq!(
         bal.as_f64(),
         Some(0.001),
@@ -246,7 +301,10 @@ async fn regtest_tparty_deposits_auto_shield() {
         .call("shieldfunds", json!([]))
         .await
         .expect("shieldfunds flushes the dust");
-    let txid3 = txid3.as_str().expect("shieldfunds returns a txid").to_string();
+    let txid3 = txid3
+        .as_str()
+        .expect("shieldfunds returns a txid")
+        .to_string();
     assert_ne!(txid3, shield2);
     let deadline = Instant::now() + SHIELD_TIMEOUT;
     loop {
@@ -257,12 +315,25 @@ async fn regtest_tparty_deposits_auto_shield() {
         if gt["confirmations"].as_i64().unwrap_or(0) >= 1 {
             break;
         }
-        assert!(Instant::now() < deadline, "the manual shield did not confirm: {gt}");
-        zebrad.generate_blocks(1).await.expect("mine the manual shield");
+        assert!(
+            Instant::now() < deadline,
+            "the manual shield did not confirm: {gt}"
+        );
+        zebrad
+            .generate_blocks(1)
+            .await
+            .expect("mine the manual shield");
         tokio::time::sleep(Duration::from_secs(2)).await;
     }
-    let bal = tparty.call("getbalance", json!([])).await.expect("getbalance (flushed)");
-    assert_eq!(bal.as_f64(), Some(0.0), "shieldfunds drained the dust: {bal}");
+    let bal = tparty
+        .call("getbalance", json!([]))
+        .await
+        .expect("getbalance (flushed)");
+    assert_eq!(
+        bal.as_f64(),
+        Some(0.0),
+        "shieldfunds drained the dust: {bal}"
+    );
 }
 
 async fn getnewaddress(tparty: &Tparty) -> String {

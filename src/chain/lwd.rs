@@ -35,13 +35,19 @@ impl ChainSource for LwdSource {
             .await?
             .into_inner();
         // lightwalletd reports the block hash in internal byte order already.
-        Ok(ChainTip { height: block_id.height, hash: block_id.hash })
+        Ok(ChainTip {
+            height: block_id.height,
+            hash: block_id.hash,
+        })
     }
 
     async fn tree_state(&mut self, height: BlockHeight) -> anyhow::Result<service::TreeState> {
         let tree_state = self
             .client
-            .get_tree_state(service::BlockId { height: height.into(), hash: vec![] })
+            .get_tree_state(service::BlockId {
+                height: height.into(),
+                hash: vec![],
+            })
             .await?;
         Ok(tree_state.into_inner())
     }
@@ -52,8 +58,14 @@ impl ChainSource for LwdSource {
         end: BlockHeight,
     ) -> anyhow::Result<CompactBlockStream> {
         let range = service::BlockRange {
-            start: Some(service::BlockId { height: start.into(), hash: vec![] }),
-            end: Some(service::BlockId { height: end.into(), hash: vec![] }),
+            start: Some(service::BlockId {
+                height: start.into(),
+                hash: vec![],
+            }),
+            end: Some(service::BlockId {
+                height: end.into(),
+                hash: vec![],
+            }),
             pool_types: Default::default(),
         };
         let stream = self.client.get_block_range(range).await?.into_inner();
@@ -82,12 +94,21 @@ impl ChainSource for LwdSource {
     }
 
     async fn server_info(&mut self) -> anyhow::Result<ServerInfo> {
-        let info = self.client.get_lightd_info(service::Empty {}).await?.into_inner();
-        Ok(ServerInfo { chain_name: info.chain_name })
+        let info = self
+            .client
+            .get_lightd_info(service::Empty {})
+            .await?
+            .into_inner();
+        Ok(ServerInfo {
+            chain_name: info.chain_name,
+        })
     }
 
     async fn broadcast_tx(&mut self, data: Vec<u8>) -> anyhow::Result<BroadcastOutcome> {
-        let raw = service::RawTransaction { data, ..Default::default() };
+        let raw = service::RawTransaction {
+            data,
+            ..Default::default()
+        };
         let response = self.client.send_transaction(raw).await?.into_inner();
         Ok(BroadcastOutcome {
             error_code: response.error_code,
@@ -97,7 +118,10 @@ impl ChainSource for LwdSource {
 
     async fn fetch_tx(&mut self, txid: TxId) -> anyhow::Result<Option<FetchedTx>> {
         // The `TxFilter` hash is the txid's internal bytes (per zcash-devtool's enhance).
-        let filter = service::TxFilter { hash: txid.as_ref().to_vec(), ..Default::default() };
+        let filter = service::TxFilter {
+            hash: txid.as_ref().to_vec(),
+            ..Default::default()
+        };
         let raw = match self.client.get_transaction(filter).await {
             Ok(r) => r.into_inner(),
             // The upstream looked up the txid and doesn't know it: an application-level
@@ -111,7 +135,10 @@ impl ChainSource for LwdSource {
             // lightwalletd reports the mined height in `height`; mempool transactions carry
             // 0 or -1 (encoded as u64), neither of which is a real mined height here.
             let mined_height = u32::try_from(raw.height).ok().filter(|h| *h > 0);
-            Some(FetchedTx { data: raw.data, mined_height })
+            Some(FetchedTx {
+                data: raw.data,
+                mined_height,
+            })
         })
     }
 
@@ -125,7 +152,11 @@ impl ChainSource for LwdSource {
     }
 
     async fn address_utxos(&mut self, addresses: Vec<String>) -> anyhow::Result<Vec<AddressUtxo>> {
-        let request = service::GetAddressUtxosArg { addresses, start_height: 0, max_entries: 0 };
+        let request = service::GetAddressUtxosArg {
+            addresses,
+            start_height: 0,
+            max_entries: 0,
+        };
         let mut stream = self
             .client
             .get_address_utxos_stream(request)
@@ -156,8 +187,14 @@ impl ChainSource for LwdSource {
         let filter = service::TransparentAddressBlockFilter {
             address,
             range: Some(service::BlockRange {
-                start: Some(service::BlockId { height: u32::from(start).into(), hash: vec![] }),
-                end: Some(service::BlockId { height: u32::from(end).into(), hash: vec![] }),
+                start: Some(service::BlockId {
+                    height: u32::from(start).into(),
+                    hash: vec![],
+                }),
+                end: Some(service::BlockId {
+                    height: u32::from(end).into(),
+                    hash: vec![],
+                }),
                 pool_types: Default::default(),
             }),
         };
@@ -165,7 +202,10 @@ impl ChainSource for LwdSource {
         let mut txs = Vec::new();
         while let Some(raw) = stream.message().await? {
             let mined_height = u32::try_from(raw.height).ok().filter(|h| *h > 0);
-            txs.push(FetchedTx { data: raw.data, mined_height });
+            txs.push(FetchedTx {
+                data: raw.data,
+                mined_height,
+            });
         }
         Ok(txs)
     }
@@ -205,7 +245,11 @@ mod tests {
         }
         assert!(is_tx_not_found(&tonic::Status::not_found("anything")));
         // Transport-class failures must still drop the client.
-        assert!(!is_tx_not_found(&tonic::Status::unavailable("connection refused")));
-        assert!(!is_tx_not_found(&tonic::Status::deadline_exceeded("timed out")));
+        assert!(!is_tx_not_found(&tonic::Status::unavailable(
+            "connection refused"
+        )));
+        assert!(!is_tx_not_found(&tonic::Status::deadline_exceeded(
+            "timed out"
+        )));
     }
 }

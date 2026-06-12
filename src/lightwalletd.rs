@@ -46,7 +46,9 @@ impl TlsRoots {
         match s.trim().to_ascii_lowercase().as_str() {
             "native" | "system" => Ok(TlsRoots::Native),
             "webpki" | "mozilla" => Ok(TlsRoots::Webpki),
-            other => Err(anyhow!("invalid tls_roots '{other}', expected 'native' or 'webpki'")),
+            other => Err(anyhow!(
+                "invalid tls_roots '{other}', expected 'native' or 'webpki'"
+            )),
         }
     }
 }
@@ -58,7 +60,9 @@ pub fn parse_tls_mode(s: &str) -> anyhow::Result<Option<bool>> {
         "auto" => Ok(None),
         "yes" | "true" | "on" | "tls" => Ok(Some(true)),
         "no" | "false" | "off" | "plaintext" => Ok(Some(false)),
-        other => Err(anyhow!("invalid tls '{other}', expected 'auto', 'yes', or 'no'")),
+        other => Err(anyhow!(
+            "invalid tls '{other}', expected 'auto', 'yes', or 'no'"
+        )),
     }
 }
 
@@ -233,7 +237,11 @@ impl Server {
         // end to end (the proxy only sees ciphertext). Without a proxy we dial directly.
         let connect = async {
             match self.proxy {
-                Some(proxy) => endpoint.connect_with_connector(SocksConnector::new(proxy)).await,
+                Some(proxy) => {
+                    endpoint
+                        .connect_with_connector(SocksConnector::new(proxy))
+                        .await
+                }
                 None => endpoint.connect().await,
             }
         };
@@ -264,8 +272,10 @@ pub fn apply_zebra_auth(servers: &mut [Server], auth: &ZebraAuth) {
 
 // Presets as (host, port). TLS roots / force-mode are attached at resolve time.
 const ECC_TESTNET: &[(&str, u16)] = &[("lightwalletd.testnet.electriccoin.co", 9067)];
-const YWALLET_MAINNET: &[(&str, u16)] =
-    &[("lwd1.zcash-infra.com", 9067), ("lwd2.zcash-infra.com", 9067)];
+const YWALLET_MAINNET: &[(&str, u16)] = &[
+    ("lwd1.zcash-infra.com", 9067),
+    ("lwd2.zcash-infra.com", 9067),
+];
 const ZEC_ROCKS_MAINNET: &[(&str, u16)] = &[("zec.rocks", 443)];
 const ZEC_ROCKS_TESTNET: &[(&str, u16)] = &[("testnet.zec.rocks", 443)];
 
@@ -426,28 +436,62 @@ mod tests {
         let s = resolve("zecrocks", ZNetwork::Main, TlsRoots::Native, None, None).unwrap();
         assert_eq!(s[0].host.as_ref(), "zec.rocks");
         // localhost auto -> plaintext
-        let s = resolve("127.0.0.1:9067", ZNetwork::Test, TlsRoots::Native, None, None).unwrap();
+        let s = resolve(
+            "127.0.0.1:9067",
+            ZNetwork::Test,
+            TlsRoots::Native,
+            None,
+            None,
+        )
+        .unwrap();
         assert!(!s[0].use_tls());
         // forced plaintext for a co-located lightwalletd reached by service name
-        let s = resolve("lightwalletd:9067", ZNetwork::Test, TlsRoots::Native, Some(false), None).unwrap();
+        let s = resolve(
+            "lightwalletd:9067",
+            ZNetwork::Test,
+            TlsRoots::Native,
+            Some(false),
+            None,
+        )
+        .unwrap();
         assert!(!s[0].use_tls());
         // forced TLS even for localhost
-        let s = resolve("127.0.0.1:443", ZNetwork::Main, TlsRoots::Native, Some(true), None).unwrap();
+        let s = resolve(
+            "127.0.0.1:443",
+            ZNetwork::Main,
+            TlsRoots::Native,
+            Some(true),
+            None,
+        )
+        .unwrap();
         assert!(s[0].use_tls());
         assert!(resolve("ecc", ZNetwork::Main, TlsRoots::Native, None, None).is_err());
     }
 
     #[test]
     fn single_host_unchanged() {
-        let s = resolve("127.0.0.1:9067", ZNetwork::Test, TlsRoots::Native, None, None).unwrap();
+        let s = resolve(
+            "127.0.0.1:9067",
+            ZNetwork::Test,
+            TlsRoots::Native,
+            None,
+            None,
+        )
+        .unwrap();
         assert_eq!(s.len(), 1);
         assert!(!s[0].use_tls());
     }
 
     #[test]
     fn resolves_multi_host() {
-        let s = resolve("a.example:9067,b.example:443", ZNetwork::Test, TlsRoots::Native, None, None)
-            .unwrap();
+        let s = resolve(
+            "a.example:9067,b.example:443",
+            ZNetwork::Test,
+            TlsRoots::Native,
+            None,
+            None,
+        )
+        .unwrap();
         assert_eq!(s.len(), 2);
         assert_eq!(s[0].host.as_ref(), "a.example");
         assert_eq!(s[0].port, 9067);
@@ -557,7 +601,14 @@ mod tests {
     #[test]
     fn proxy_threads_through_resolve() {
         let proxy: SocketAddr = "127.0.0.1:9050".parse().unwrap();
-        let s = resolve("zecrocks", ZNetwork::Main, TlsRoots::Native, None, Some(proxy)).unwrap();
+        let s = resolve(
+            "zecrocks",
+            ZNetwork::Main,
+            TlsRoots::Native,
+            None,
+            Some(proxy),
+        )
+        .unwrap();
         assert_eq!(s[0].proxy, Some(proxy));
         // describe() surfaces the proxy so logs make the routing obvious.
         assert!(s[0].describe().contains("socks=127.0.0.1:9050"));
@@ -626,7 +677,10 @@ mod tests {
 
         // A .onion fallback hiding behind a clearnet primary is caught too.
         assert!(resolve_all(
-            &["zec.rocks:443".to_string(), "abcd1234.onion:9067".to_string()],
+            &[
+                "zec.rocks:443".to_string(),
+                "abcd1234.onion:9067".to_string()
+            ],
             ZNetwork::Main,
             TlsRoots::Native,
             None,
@@ -638,14 +692,24 @@ mod tests {
     #[test]
     fn zebra_scheme_parses_to_a_zebra_endpoint() {
         // `zebra://` marks a local zebrad JSON-RPC endpoint: plaintext, kind ZebraRpc.
-        let s = resolve("zebra://127.0.0.1:18232", crate::network::regtest(), TlsRoots::Native, None, None)
-            .unwrap();
+        let s = resolve(
+            "zebra://127.0.0.1:18232",
+            crate::network::regtest(),
+            TlsRoots::Native,
+            None,
+            None,
+        )
+        .unwrap();
         assert_eq!(s.len(), 1);
         assert_eq!(s[0].kind, ServerKind::ZebraRpc);
         assert_eq!(s[0].host.as_ref(), "127.0.0.1");
         assert_eq!(s[0].port, 18232);
         assert!(!s[0].use_tls());
-        assert!(s[0].describe().starts_with("zebra-rpc 127.0.0.1:18232"), "{}", s[0].describe());
+        assert!(
+            s[0].describe().starts_with("zebra-rpc 127.0.0.1:18232"),
+            "{}",
+            s[0].describe()
+        );
 
         // Mixed list: a local zebra primary with a public lightwalletd fallback.
         let s = resolve(
@@ -662,7 +726,14 @@ mod tests {
         assert!(s[1].use_tls());
 
         // The usual host:port validation still applies behind the scheme.
-        assert!(resolve("zebra://nohost", ZNetwork::Main, TlsRoots::Native, None, None).is_err());
+        assert!(resolve(
+            "zebra://nohost",
+            ZNetwork::Main,
+            TlsRoots::Native,
+            None,
+            None
+        )
+        .is_err());
     }
 
     /// A `zebra://` endpoint with a SOCKS proxy configured must be refused at resolve time:
@@ -685,7 +756,10 @@ mod tests {
 
         // A zebra endpoint hiding behind a clearnet lightwalletd primary is caught too.
         assert!(resolve_all(
-            &["zec.rocks:443".to_string(), "zebra://127.0.0.1:8232".to_string()],
+            &[
+                "zec.rocks:443".to_string(),
+                "zebra://127.0.0.1:8232".to_string()
+            ],
             ZNetwork::Main,
             TlsRoots::Native,
             None,
@@ -695,7 +769,10 @@ mod tests {
 
         // Without a proxy the same list is fine.
         assert!(resolve_all(
-            &["zebra://127.0.0.1:8232".to_string(), "zec.rocks:443".to_string()],
+            &[
+                "zebra://127.0.0.1:8232".to_string(),
+                "zec.rocks:443".to_string()
+            ],
             ZNetwork::Main,
             TlsRoots::Native,
             None,
@@ -721,7 +798,10 @@ mod tests {
         };
         apply_zebra_auth(&mut servers, &auth);
         assert_eq!(servers[0].zebra_auth, auth);
-        assert_eq!(servers[1].zebra_auth, crate::chain::zebra::ZebraAuth::default());
+        assert_eq!(
+            servers[1].zebra_auth,
+            crate::chain::zebra::ZebraAuth::default()
+        );
     }
 
     // --- Network integration tests (hit the public zecrocks/ECC testnet lightwalletd) ---
@@ -737,9 +817,16 @@ mod tests {
             .into_iter()
             .next()
             .unwrap();
-        let mut client = server.connect().await.expect("connect to testnet.zec.rocks");
+        let mut client = server
+            .connect()
+            .await
+            .expect("connect to testnet.zec.rocks");
         let tip = client.latest_block().await.expect("latest_block");
-        assert!(tip.height > 2_000_000, "unexpected testnet height {}", tip.height);
+        assert!(
+            tip.height > 2_000_000,
+            "unexpected testnet height {}",
+            tip.height
+        );
         assert_eq!(tip.hash.len(), 32, "block hash must be 32 bytes");
     }
 
@@ -754,7 +841,11 @@ mod tests {
         let mut client = server.connect().await.expect("connect");
 
         let info = client.server_info().await.expect("server_info");
-        assert!(info.chain_name.contains("test"), "unexpected chain_name {}", info.chain_name);
+        assert!(
+            info.chain_name.contains("test"),
+            "unexpected chain_name {}",
+            info.chain_name
+        );
 
         let tip = client.latest_block().await.expect("latest_block");
         let h = tip.height - 100;
@@ -763,16 +854,22 @@ mod tests {
             .await
             .expect("tree_state");
         assert_eq!(ts.height, h);
-        ts.to_chain_state().expect("tree state converts to chain state");
+        ts.to_chain_state()
+            .expect("tree state converts to chain state");
     }
 
     #[tokio::test]
     #[ignore = "hits testnet.zec.rocks over the network"]
     async fn failover_skips_dead_first_endpoint() {
         // A closed local port as the primary, with the live testnet endpoint as fallback.
-        let servers =
-            resolve("127.0.0.1:1,testnet.zec.rocks:443", ZNetwork::Test, TlsRoots::Native, None, None)
-                .unwrap();
+        let servers = resolve(
+            "127.0.0.1:1,testnet.zec.rocks:443",
+            ZNetwork::Test,
+            TlsRoots::Native,
+            None,
+            None,
+        )
+        .unwrap();
         assert_eq!(servers.len(), 2);
         let timeout = Duration::from_secs(10);
         // The primary must fail (and fail fast), so the actor would move on.
@@ -783,7 +880,11 @@ mod tests {
             .await
             .expect("failover endpoint connects");
         let tip = client.latest_block().await.expect("latest_block");
-        assert!(tip.height > 2_000_000, "unexpected testnet height {}", tip.height);
+        assert!(
+            tip.height > 2_000_000,
+            "unexpected testnet height {}",
+            tip.height
+        );
     }
 
     #[tokio::test]
@@ -796,6 +897,10 @@ mod tests {
             .unwrap();
         let mut client = server.connect().await.expect("connect to zec.rocks");
         let tip = client.latest_block().await.expect("latest_block");
-        assert!(tip.height > 2_500_000, "unexpected mainnet height {}", tip.height);
+        assert!(
+            tip.height > 2_500_000,
+            "unexpected mainnet height {}",
+            tip.height
+        );
     }
 }

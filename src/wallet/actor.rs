@@ -12,8 +12,8 @@ use tracing::{info, warn};
 
 use zcash_client_backend::data_api::wallet::{
     create_proposed_transactions, decrypt_and_store_transaction,
-    input_selection::GreedyInputSelector, propose_shielding, propose_transfer,
-    ConfirmationsPolicy, SpendingKeys,
+    input_selection::GreedyInputSelector, propose_shielding, propose_transfer, ConfirmationsPolicy,
+    SpendingKeys,
 };
 use zcash_client_backend::data_api::{
     Account, TransactionDataRequest, TransactionStatus, TransparentOutputFilter, WalletRead,
@@ -223,7 +223,9 @@ struct WalletActor {
 /// Open the wallet, derive its account info, optionally unlock the seed, build the prover,
 /// and spawn the actor task. Returns a clonable handle plus the task's join handle (awaited
 /// at shutdown so the wallet DB closes cleanly before the runtime is torn down).
-pub async fn spawn(cfg: ActorConfig) -> anyhow::Result<(WalletHandle, tokio::task::JoinHandle<()>)> {
+pub async fn spawn(
+    cfg: ActorConfig,
+) -> anyhow::Result<(WalletHandle, tokio::task::JoinHandle<()>)> {
     if cfg.servers.is_empty() {
         return Err(anyhow!(
             "no upstream servers configured for wallet '{}'",
@@ -477,7 +479,10 @@ impl WalletActor {
                                 // Schedule the next attempt with exponential backoff + jitter.
                                 let delay = self.backoff.next_delay();
                                 self.reconnect_at = Instant::now() + delay;
-                                warn!("[{}] reconnect failed: {e}; retrying in {delay:?}", self.name);
+                                warn!(
+                                    "[{}] reconnect failed: {e}; retrying in {delay:?}",
+                                    self.name
+                                );
                                 self.update_status();
                             }
                         } else {
@@ -534,7 +539,10 @@ impl WalletActor {
         for idx in 0..n {
             let describe = self.servers[idx].describe();
             info!("[{}] connecting to {}", self.name, describe);
-            match self.servers[idx].connect_timeout(self.connect_timeout).await {
+            match self.servers[idx]
+                .connect_timeout(self.connect_timeout)
+                .await
+            {
                 Ok(client) => {
                     self.client = Some(client);
                     let client = self.client.as_mut().expect("just set");
@@ -608,7 +616,10 @@ impl WalletActor {
             )
             .await
             {
-                warn!("[{}] primary re-probe {} not healthy: {e}", self.name, describe);
+                warn!(
+                    "[{}] primary re-probe {} not healthy: {e}",
+                    self.name, describe
+                );
                 continue;
             }
             info!(
@@ -635,7 +646,9 @@ impl WalletActor {
         if self.mempool.is_some() || self.tip_height.is_none() {
             return;
         }
-        let Some(client) = self.client.as_mut() else { return };
+        let Some(client) = self.client.as_mut() else {
+            return;
+        };
         // Bounded like other unary calls: only the subscription setup is awaited here; the
         // stream body is consumed incrementally from the idle loop.
         match tokio::time::timeout(UNARY_RPC_TIMEOUT, client.subscribe_mempool()).await {
@@ -691,7 +704,8 @@ impl WalletActor {
                         .duration_since(std::time::UNIX_EPOCH)
                         .map(|d| d.as_secs() as i64)
                         .unwrap_or(0);
-                    if let Err(e) = super::labels::record_first_seen(&self.wallet_dir, &txid_hex, now)
+                    if let Err(e) =
+                        super::labels::record_first_seen(&self.wallet_dir, &txid_hex, now)
                     {
                         tracing::debug!("[{}] failed to record first-seen time: {e}", self.name);
                     }
@@ -828,7 +842,9 @@ impl WalletActor {
             }
         };
         for (txid, data) in txs {
-            let Some(client) = self.client.as_mut() else { return };
+            let Some(client) = self.client.as_mut() else {
+                return;
+            };
             let sent = tokio::time::timeout(UNARY_RPC_TIMEOUT, client.broadcast_tx(data))
                 .await
                 .map_err(|_| anyhow!("rebroadcast timed out after {UNARY_RPC_TIMEOUT:?}"))
@@ -883,7 +899,11 @@ impl WalletActor {
                 let res = self.do_broadcast(data).await;
                 let _ = reply.send(res);
             }
-            WalletCommand::Unlock { passphrase, timeout_secs, reply } => {
+            WalletCommand::Unlock {
+                passphrase,
+                timeout_secs,
+                reply,
+            } => {
                 let res = self.do_unlock(passphrase, timeout_secs);
                 let _ = reply.send(res);
             }
@@ -909,7 +929,10 @@ impl WalletActor {
         if self.unlock_until.is_some_and(|t| Instant::now() >= t) {
             self.seed.lock();
             self.unlock_until = None;
-            info!("[{}] wallet auto-locked (walletpassphrase timeout elapsed)", self.name);
+            info!(
+                "[{}] wallet auto-locked (walletpassphrase timeout elapsed)",
+                self.name
+            );
             self.update_status();
         }
     }
@@ -950,7 +973,9 @@ impl WalletActor {
         if self.client.is_none() {
             return;
         }
-        let addresses = match self.db_data.get_transparent_receivers(self.account_id, true, true)
+        let addresses = match self
+            .db_data
+            .get_transparent_receivers(self.account_id, true, true)
         {
             Ok(receivers) => receivers
                 .into_keys()
@@ -997,7 +1022,10 @@ impl WalletActor {
                         warn!("[{}] storing transparent UTXO: {e}", self.name);
                     }
                 }
-                None => warn!("[{}] skipping malformed UTXO reply from upstream", self.name),
+                None => warn!(
+                    "[{}] skipping malformed UTXO reply from upstream",
+                    self.name
+                ),
             }
         }
     }
@@ -1165,7 +1193,9 @@ impl WalletActor {
     /// - no address ever leaves the wallet.
     async fn do_shield(&mut self, force: bool) -> Result<Option<TxId>, RpcError> {
         let Some(shield) = self.auto_shield.clone() else {
-            return Err(RpcError::wallet("auto-shield is not configured for this wallet"));
+            return Err(RpcError::wallet(
+                "auto-shield is not configured for this wallet",
+            ));
         };
         if self.tip_height.is_none() {
             return if force {
@@ -1239,15 +1269,19 @@ impl WalletActor {
             return Ok(None);
         }
 
-        let threshold = if force { Zatoshis::ZERO } else { shield.threshold };
+        let threshold = if force {
+            Zatoshis::ZERO
+        } else {
+            shield.threshold
+        };
         let pool = shield.pool.protocol();
         let n_from_addrs = from_addrs.len();
         let prover = &self.prover;
         let db = &mut self.db_data;
         // Proposal building + proving is CPU-heavy; keep it off the async runtime (the
         // do_send pattern).
-        let (txid, raw): (TxId, Vec<u8>) =
-            tokio::task::block_in_place(move || -> Result<_, RpcError> {
+        let (txid, raw): (TxId, Vec<u8>) = tokio::task::block_in_place(
+            move || -> Result<_, RpcError> {
                 let change_strategy = MultiOutputChangeStrategy::new(
                     StandardFeeRule::Zip317,
                     None,
@@ -1315,7 +1349,8 @@ impl WalletActor {
                 tx.write(&mut raw_tx)
                     .map_err(|e| RpcError::misc(format!("failed to serialize transaction: {e}")))?;
                 Ok((txid, raw_tx))
-            })?;
+            },
+        )?;
 
         info!(
             "[{}] shielding {spendable} zatoshis from {n_from_addrs} transparent address(es) \
@@ -1454,15 +1489,31 @@ impl WalletActor {
             }
         };
         if !outcome.is_accepted() {
+            // The node already holding this exact tx (a rebroadcast raced an earlier
+            // delivery, or it even mined already) means the committed send IS delivered -
+            // success, not a rejection.
+            if upstream_already_has_tx(&outcome.error_message) != AlreadyKnown::No {
+                info!(
+                    "[{}] upstream already has {txid}; treating broadcast as delivered",
+                    self.name
+                );
+                return Ok(());
+            }
             // An explicit upstream rejection (the node examined the tx and refused it) is a
             // different case from a transport failure: surface it as -26. The tx's notes stay
             // locked in the wallet until its expiry height, after which they become spendable
             // again - an immediate retry fails with -6 rather than double-paying.
             let reason = sanitize_upstream_msg(&outcome.error_message);
-            warn!("[{}] upstream rejected {txid} (code {}): {reason}", self.name, outcome.error_code);
+            warn!(
+                "[{}] upstream rejected {txid} (code {}): {reason}",
+                self.name, outcome.error_code
+            );
             return Err(RpcError::new(
                 codes::RPC_VERIFY_REJECTED,
-                format!("transaction rejected (code {}): {reason}", outcome.error_code),
+                format!(
+                    "transaction rejected (code {}): {reason}",
+                    outcome.error_code
+                ),
             ));
         }
         Ok(())
@@ -1477,7 +1528,10 @@ impl WalletActor {
             let mut buf = Vec::new();
             tx.write(&mut buf)
                 .map_err(|e| RpcError::misc(format!("failed to serialize transaction: {e}")))?;
-            return Ok(Some(RawTx { data: buf, mined_height: None }));
+            return Ok(Some(RawTx {
+                data: buf,
+                mined_height: None,
+            }));
         }
         self.fetch_tx_from_upstream(txid).await
     }
@@ -1502,7 +1556,10 @@ impl WalletActor {
                 .and_then(|r| r)
         };
         match fetched {
-            Ok(found) => Ok(found.map(|tx| RawTx { data: tx.data, mined_height: tx.mined_height })),
+            Ok(found) => Ok(found.map(|tx| RawTx {
+                data: tx.data,
+                mined_height: tx.mined_height,
+            })),
             Err(e) => {
                 // Transport failure: drop the dead client so the next op reconnects/fails over.
                 self.client = None;
@@ -1542,11 +1599,39 @@ impl WalletActor {
             }
         };
         if !outcome.is_accepted() {
+            // Bitcoin Core's sendrawtransaction is idempotent: a tx the node already has in
+            // its mempool returns the txid as success (zecd's own rebroadcast loop can race
+            // a manual resubmission of a committed send); one already mined is -27.
+            match upstream_already_has_tx(&outcome.error_message) {
+                AlreadyKnown::InMempool => {
+                    info!(
+                        "[{}] upstream already has tx in mempool; sendrawtransaction succeeds",
+                        self.name
+                    );
+                    return Ok(());
+                }
+                AlreadyKnown::InChain => {
+                    // Bitcoin Core: TransactionError::ALREADY_IN_UTXO_SET →
+                    // RPC_VERIFY_ALREADY_IN_UTXO_SET with this exact default message
+                    // (common/messages.cpp TransactionErrorString).
+                    return Err(RpcError::new(
+                        codes::RPC_VERIFY_ALREADY_IN_UTXO_SET,
+                        "Transaction outputs already in utxo set",
+                    ));
+                }
+                AlreadyKnown::No => {}
+            }
             let reason = sanitize_upstream_msg(&outcome.error_message);
-            warn!("[{}] upstream rejected tx (code {}): {reason}", self.name, outcome.error_code);
+            warn!(
+                "[{}] upstream rejected tx (code {}): {reason}",
+                self.name, outcome.error_code
+            );
             return Err(RpcError::new(
                 codes::RPC_VERIFY_REJECTED,
-                format!("transaction rejected (code {}): {reason}", outcome.error_code),
+                format!(
+                    "transaction rejected (code {}): {reason}",
+                    outcome.error_code
+                ),
             ));
         }
         Ok(())
@@ -1555,7 +1640,11 @@ impl WalletActor {
     /// `walletpassphrase`: decrypt the seed with `passphrase` and hold it unlocked until
     /// `timeout_secs` from now (argument validation/clamping happens in the RPC layer). Only
     /// valid for an encrypted wallet; an unencrypted one returns -15 like Bitcoin Core.
-    fn do_unlock(&mut self, passphrase: store::Passphrase, timeout_secs: i64) -> Result<(), RpcError> {
+    fn do_unlock(
+        &mut self,
+        passphrase: store::Passphrase,
+        timeout_secs: i64,
+    ) -> Result<(), RpcError> {
         if !self.encrypted {
             return Err(RpcError::new(
                 codes::RPC_WALLET_WRONG_ENC_STATE,
@@ -1666,11 +1755,11 @@ impl WalletActor {
             .map_err(|_| RpcError::wallet("stored mnemonic is not valid UTF-8"))?;
         tokio::task::block_in_place(|| st.rewrite_with_passphrase(&self.wallet_dir, new, phrase))
             .map_err(|e| {
-                RpcError::new(
-                    codes::RPC_WALLET_ENCRYPTION_FAILED,
-                    format!("failed to change passphrase: {e}"),
-                )
-            })?;
+            RpcError::new(
+                codes::RPC_WALLET_ENCRYPTION_FAILED,
+                format!("failed to change passphrase: {e}"),
+            )
+        })?;
         Ok(())
     }
 }
@@ -1758,6 +1847,34 @@ fn sanitize_upstream_msg(msg: &str) -> String {
     out
 }
 
+/// Classify an upstream broadcast rejection that means the node *already has* this exact
+/// transaction. zebra/zcashd reject a resubmission ("transaction already exists in mempool",
+/// "txn-already-in-mempool", "txn-already-known", "transaction already in block chain")
+/// where Bitcoin Core's `sendrawtransaction` is idempotent (node/transaction.cpp
+/// `BroadcastTransaction`): already-in-mempool returns the txid as success, already-mined is
+/// `-27` `ALREADY_IN_UTXO_SET`. Matters in practice because zecd's own rebroadcast loop can
+/// race a manual `sendrawtransaction` of the same committed tx.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AlreadyKnown {
+    No,
+    InMempool,
+    InChain,
+}
+
+fn upstream_already_has_tx(msg: &str) -> AlreadyKnown {
+    let m = msg.to_ascii_lowercase();
+    if !m.contains("already") {
+        return AlreadyKnown::No;
+    }
+    if m.contains("mempool") || m.contains("known") {
+        AlreadyKnown::InMempool
+    } else if m.contains("chain") || m.contains("in state") {
+        AlreadyKnown::InChain
+    } else {
+        AlreadyKnown::No
+    }
+}
+
 /// Await the next message on an open mempool stream, or pend forever when none is open, so
 /// the actor's idle `select!` arm simply never fires without a subscription.
 async fn mempool_next(
@@ -1792,13 +1909,14 @@ fn now_unix() -> i64 {
 fn classify_err(e: crate::error::ProposalError) -> RpcError {
     use zcash_client_backend::data_api::error::Error;
     match &e {
-        Error::InsufficientFunds { available, required } => {
-            RpcError::insufficient_funds(format!(
-                "Insufficient funds: {} zatoshis spendable, {} required (including fee)",
-                u64::from(*available),
-                u64::from(*required),
-            ))
-        }
+        Error::InsufficientFunds {
+            available,
+            required,
+        } => RpcError::insufficient_funds(format!(
+            "Insufficient funds: {} zatoshis spendable, {} required (including fee)",
+            u64::from(*available),
+            u64::from(*required),
+        )),
         // Insufficient-balance conditions can also surface from the change strategy
         // (e.g. `ChangeError::InsufficientFunds`); catch those by message.
         _ => {
@@ -1873,10 +1991,22 @@ fn enrich_insufficient_funds(db: &WriteDb, policy: ConfirmationsPolicy, err: Rpc
     };
     let (mut incoming, mut change) = (0u64, 0u64);
     for bal in summary.account_balances().values() {
-        incoming += bal.orchard_balance().value_pending_spendability().into_u64()
-            + bal.sapling_balance().value_pending_spendability().into_u64();
-        change += bal.orchard_balance().change_pending_confirmation().into_u64()
-            + bal.sapling_balance().change_pending_confirmation().into_u64();
+        incoming += bal
+            .orchard_balance()
+            .value_pending_spendability()
+            .into_u64()
+            + bal
+                .sapling_balance()
+                .value_pending_spendability()
+                .into_u64();
+        change += bal
+            .orchard_balance()
+            .change_pending_confirmation()
+            .into_u64()
+            + bal
+                .sapling_balance()
+                .change_pending_confirmation()
+                .into_u64();
     }
     if incoming == 0 && change == 0 {
         return err;
@@ -1891,6 +2021,42 @@ fn enrich_insufficient_funds(db: &WriteDb, policy: ConfirmationsPolicy, err: Rpc
 #[cfg(test)]
 mod tests {
     use super::sanitize_upstream_msg;
+
+    /// Resubmitting a tx the node already has must follow Bitcoin Core's idempotent
+    /// `sendrawtransaction` contract; these are the reject strings zebra/zcashd actually
+    /// emit (the zebra mempool one raced the rebroadcast loop in the regtest e2e).
+    #[test]
+    fn already_known_rejections_are_classified() {
+        use super::{upstream_already_has_tx, AlreadyKnown};
+
+        // zebra via lightwalletd (observed in the funded e2e).
+        assert_eq!(
+            upstream_already_has_tx("transaction already exists in mempool"),
+            AlreadyKnown::InMempool
+        );
+        // zcashd-style reject reasons.
+        assert_eq!(
+            upstream_already_has_tx("txn-already-in-mempool"),
+            AlreadyKnown::InMempool
+        );
+        assert_eq!(
+            upstream_already_has_tx("txn-already-known"),
+            AlreadyKnown::InMempool
+        );
+        assert_eq!(
+            upstream_already_has_tx("transaction already in block chain"),
+            AlreadyKnown::InChain
+        );
+        // Genuine rejections keep surfacing as -26.
+        assert_eq!(
+            upstream_already_has_tx("tx unpaid action limit exceeded"),
+            AlreadyKnown::No
+        );
+        assert_eq!(
+            upstream_already_has_tx("insufficient fee"),
+            AlreadyKnown::No
+        );
+    }
 
     /// Upstream reject reasons are relayed to RPC clients, but bounded: control characters
     /// stripped, length capped (the upstream is operator-configured, not trusted-honest).
@@ -1930,10 +2096,19 @@ mod tests {
         // What verify_server_network derives from these classifications:
         let is_main = |net: super::ZNetwork| matches!(net, super::ZNetwork::Main);
         // zebra regtest reports "test"; a regtest wallet must accept it.
-        assert_eq!(chain_name_is_main("test"), Some(is_main(crate::network::regtest())));
+        assert_eq!(
+            chain_name_is_main("test"),
+            Some(is_main(crate::network::regtest()))
+        );
         // The boundary that matters: a mainnet wallet rejects test chains and vice versa.
-        assert_ne!(chain_name_is_main("test"), Some(is_main(super::ZNetwork::Main)));
-        assert_ne!(chain_name_is_main("main"), Some(is_main(super::ZNetwork::Test)));
+        assert_ne!(
+            chain_name_is_main("test"),
+            Some(is_main(super::ZNetwork::Main))
+        );
+        assert_ne!(
+            chain_name_is_main("main"),
+            Some(is_main(super::ZNetwork::Test))
+        );
     }
 
     /// `enrich_insufficient_funds` must touch *only* a -6 whose wallet actually has value
@@ -1953,18 +2128,30 @@ mod tests {
             ChainState::empty(BlockHeight::from_u32(0), BlockHash([0u8; 32])),
             None,
         );
-        db.create_account("t", &secrecy::SecretVec::new(vec![1u8; 64]), &birthday, None)
-            .expect("create account");
+        db.create_account(
+            "t",
+            &secrecy::SecretVec::new(vec![1u8; 64]),
+            &birthday,
+            None,
+        )
+        .expect("create account");
         // The tip must be set before `get_wallet_summary` (progress-estimator underflow
         // gotcha); the production call site inherits this from the completed proposal.
-        db.update_chain_tip(BlockHeight::from_u32(5)).expect("set tip");
+        db.update_chain_tip(BlockHeight::from_u32(5))
+            .expect("set tip");
 
         let other = RpcError::wallet("some other failure");
-        assert_eq!(super::enrich_insufficient_funds(&db, Default::default(), other.clone()).message, other.message);
+        assert_eq!(
+            super::enrich_insufficient_funds(&db, Default::default(), other.clone()).message,
+            other.message
+        );
 
         let bare = RpcError::insufficient_funds("Insufficient funds: 0 zatoshis spendable");
         let out = super::enrich_insufficient_funds(&db, Default::default(), bare.clone());
         assert_eq!(out.code, codes::RPC_WALLET_INSUFFICIENT_FUNDS);
-        assert_eq!(out.message, bare.message, "no pending balance, so no enrichment");
+        assert_eq!(
+            out.message, bare.message,
+            "no pending balance, so no enrichment"
+        );
     }
 }

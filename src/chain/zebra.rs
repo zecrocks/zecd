@@ -91,20 +91,28 @@ impl ZebraAuth {
                 .with_context(|| format!("reading zebra rpc cookie {}", path.display()))?;
             let cred = contents.trim();
             if !cred.contains(':') {
-                bail!("zebra rpc cookie {} is not in user:password form", path.display());
+                bail!(
+                    "zebra rpc cookie {} is not in user:password form",
+                    path.display()
+                );
             }
             return Ok(Some(basic(cred)));
         }
         match (&self.user, &self.password) {
             (Some(u), Some(p)) => Ok(Some(basic(&format!("{u}:{p}")))),
             (None, None) => Ok(None),
-            _ => Err(anyhow!("[zebra] rpc_user and rpc_password must be set together")),
+            _ => Err(anyhow!(
+                "[zebra] rpc_user and rpc_password must be set together"
+            )),
         }
     }
 }
 
 fn basic(cred: &str) -> String {
-    format!("Basic {}", base64::engine::general_purpose::STANDARD.encode(cred))
+    format!(
+        "Basic {}",
+        base64::engine::general_purpose::STANDARD.encode(cred)
+    )
 }
 
 /// A JSON-RPC call failure, split along the trait's error contract: `Rpc` is the node
@@ -197,7 +205,9 @@ impl ZebraClient {
             });
         }
         if !status.is_success() {
-            return Err(CallError::Transport(anyhow!("zebra rpc returned HTTP {status}")));
+            return Err(CallError::Transport(anyhow!(
+                "zebra rpc returned HTTP {status}"
+            )));
         }
         Ok(envelope.get("result").cloned().unwrap_or(Value::Null))
     }
@@ -289,7 +299,9 @@ struct PoolTreeState {
 
 impl PoolTreeState {
     fn final_state(self) -> String {
-        self.commitments.and_then(|c| c.final_state).unwrap_or_default()
+        self.commitments
+            .and_then(|c| c.final_state)
+            .unwrap_or_default()
     }
 }
 
@@ -373,7 +385,10 @@ impl ChainSource for ZebraSource {
         // lightwalletd's BlockId) is internal byte order.
         let mut hash = hex::decode(&info.bestblockhash).context("decoding bestblockhash")?;
         hash.reverse();
-        Ok(ChainTip { height: u64::from(info.blocks), hash })
+        Ok(ChainTip {
+            height: u64::from(info.blocks),
+            hash,
+        })
     }
 
     async fn tree_state(&mut self, height: BlockHeight) -> anyhow::Result<service::TreeState> {
@@ -436,7 +451,9 @@ impl ChainSource for ZebraSource {
 
     async fn server_info(&mut self) -> anyhow::Result<ServerInfo> {
         let info = self.client.blockchain_info().await?;
-        Ok(ServerInfo { chain_name: info.chain })
+        Ok(ServerInfo {
+            chain_name: info.chain,
+        })
     }
 
     async fn broadcast_tx(&mut self, data: Vec<u8>) -> anyhow::Result<BroadcastOutcome> {
@@ -494,7 +511,10 @@ impl ChainSource for ZebraSource {
             tx,
             self.mempool_poll,
         ));
-        Ok(MempoolStream::Zebra(ZebraMempoolStream { rx, _task: AbortOnDrop(task) }))
+        Ok(MempoolStream::Zebra(ZebraMempoolStream {
+            rx,
+            _task: AbortOnDrop(task),
+        }))
     }
 
     async fn address_utxos(&mut self, addresses: Vec<String>) -> anyhow::Result<Vec<AddressUtxo>> {
@@ -539,10 +559,14 @@ impl ChainSource for ZebraSource {
             .await?;
         let mut txs = Vec::with_capacity(txids.len());
         for txid in txids {
-            match self.client.call("getrawtransaction", json!([txid, 1])).await {
+            match self
+                .client
+                .call("getrawtransaction", json!([txid, 1]))
+                .await
+            {
                 Ok(v) => {
-                    let verbose: VerboseTx = serde_json::from_value(v)
-                        .context("decoding getrawtransaction response")?;
+                    let verbose: VerboseTx =
+                        serde_json::from_value(v).context("decoding getrawtransaction response")?;
                     let data =
                         hex::decode(verbose.hex.trim()).context("decoding raw transaction hex")?;
                     let mined_height = verbose
@@ -588,8 +612,10 @@ impl ZebraBlockStream {
                 u32::from(block.claimed_height()),
             );
         }
-        let (sapling_size, orchard_size) =
-            self.client.block_trees(&block.header().hash().to_string()).await?;
+        let (sapling_size, orchard_size) = self
+            .client
+            .block_trees(&block.header().hash().to_string())
+            .await?;
         self.next += 1;
         Ok(Some(block_to_compact(&block, sapling_size, orchard_size)))
     }
@@ -694,8 +720,12 @@ async fn poll_mempool(
             }
             match client.call("getrawtransaction", json!([txid, 1])).await {
                 Ok(v) => {
-                    let Ok(verbose) = serde_json::from_value::<VerboseTx>(v) else { continue };
-                    let Ok(data) = hex::decode(verbose.hex.trim()) else { continue };
+                    let Ok(verbose) = serde_json::from_value::<VerboseTx>(v) else {
+                        continue;
+                    };
+                    let Ok(data) = hex::decode(verbose.hex.trim()) else {
+                        continue;
+                    };
                     let raw = service::RawTransaction { data, height: 0 };
                     if tx.send(Ok(raw)).await.is_err() {
                         return; // subscriber dropped the stream
@@ -873,9 +903,14 @@ mod tests {
 
     async fn source_for(fake: Shared) -> ZebraSource {
         let addr = serve(fake).await;
-        ZebraSource::connect(&addr.ip().to_string(), addr.port(), &ZebraAuth::default(), ZNetwork::Main)
-            .await
-            .expect("connect to fake zebrad")
+        ZebraSource::connect(
+            &addr.ip().to_string(),
+            addr.port(),
+            &ZebraAuth::default(),
+            ZNetwork::Main,
+        )
+        .await
+        .expect("connect to fake zebrad")
     }
 
     #[tokio::test]
@@ -924,15 +959,15 @@ mod tests {
         std::fs::write(&cookie, "__cookie__:s3cret\n").unwrap();
         let fake2 = Arc::new(Mutex::new(Fake::new()));
         let addr2 = serve(fake2.clone()).await;
-        let auth = ZebraAuth { user: None, password: None, cookie: Some(cookie) };
-        let mut src = ZebraSource::connect(
-            &addr2.ip().to_string(),
-            addr2.port(),
-            &auth,
-            ZNetwork::Main,
-        )
-        .await
-        .unwrap();
+        let auth = ZebraAuth {
+            user: None,
+            password: None,
+            cookie: Some(cookie),
+        };
+        let mut src =
+            ZebraSource::connect(&addr2.ip().to_string(), addr2.port(), &auth, ZNetwork::Main)
+                .await
+                .unwrap();
         src.latest_block().await.unwrap();
         let expected = format!(
             "Basic {}",
@@ -946,15 +981,23 @@ mod tests {
             .all(|a| a.as_deref() == Some(expected.as_str())));
 
         // A user without a password (or vice versa) is a configuration error.
-        assert!(ZebraAuth { user: Some("u".into()), password: None, cookie: None }
-            .header()
-            .is_err());
+        assert!(ZebraAuth {
+            user: Some("u".into()),
+            password: None,
+            cookie: None
+        }
+        .header()
+        .is_err());
         // A malformed cookie (no colon) is refused rather than sent as garbage.
         let bad = dir.path().join("bad-cookie");
         std::fs::write(&bad, "nocolon\n").unwrap();
-        assert!(ZebraAuth { user: None, password: None, cookie: Some(bad) }
-            .header()
-            .is_err());
+        assert!(ZebraAuth {
+            user: None,
+            password: None,
+            cookie: Some(bad)
+        }
+        .header()
+        .is_err());
     }
 
     #[tokio::test]
@@ -971,9 +1014,15 @@ mod tests {
         let mut src = source_for(fake).await;
         let ts = src.tree_state(BlockHeight::from_u32(415000)).await.unwrap();
         assert_eq!(ts.height, 415000);
-        assert_eq!(ts.hash, BLOCK_415000_HASH, "hash passes through as display hex");
+        assert_eq!(
+            ts.hash, BLOCK_415000_HASH,
+            "hash passes through as display hex"
+        );
         assert_eq!(ts.time, 1540144808);
-        assert_eq!(ts.sapling_tree, "", "absent finalState maps to the empty string");
+        assert_eq!(
+            ts.sapling_tree, "",
+            "absent finalState maps to the empty string"
+        );
         assert_eq!(ts.orchard_tree, "");
         // The protobuf converts exactly like a lightwalletd-served TreeState: empty tree
         // strings parse as empty frontiers and the hash round-trips into internal order.
@@ -1055,12 +1104,20 @@ mod tests {
         assert_eq!(mined.mined_height, Some(415000));
 
         // zebra reports height -1 for mempool transactions: bytes, but no mined height.
-        let unmined = src.fetch_tx(mempool_txid).await.unwrap().expect("mempool txid");
+        let unmined = src
+            .fetch_tx(mempool_txid)
+            .await
+            .unwrap()
+            .expect("mempool txid");
         assert_eq!(unmined.data, vec![0xca, 0xfe]);
         assert_eq!(unmined.mined_height, None);
 
         // -5 is an application-level miss (Ok(None)), not a transport failure.
-        assert!(src.fetch_tx(TxId::from_bytes([0x33; 32])).await.unwrap().is_none());
+        assert!(src
+            .fetch_tx(TxId::from_bytes([0x33; 32]))
+            .await
+            .unwrap()
+            .is_none());
     }
 
     /// The block-range path end to end against a real mainnet block: raw bytes are fetched
@@ -1072,7 +1129,8 @@ mod tests {
         let fake = Arc::new(Mutex::new(Fake::new()));
         {
             let mut f = fake.lock().unwrap();
-            f.raw_blocks.insert("415000".into(), BLOCK_415000_HEX.trim().into());
+            f.raw_blocks
+                .insert("415000".into(), BLOCK_415000_HEX.trim().into());
             // The verbose (trees) lookup is by the parsed block's hash, not by height.
             f.verbose_blocks.insert(
                 BLOCK_415000_HASH.into(),
@@ -1087,17 +1145,32 @@ mod tests {
 
         let cb = stream.next().await.unwrap().expect("one block");
         assert_eq!(cb.height, 415000);
-        assert_eq!(cb.hash, internal(BLOCK_415000_HASH), "hash in internal byte order");
+        assert_eq!(
+            cb.hash,
+            internal(BLOCK_415000_HASH),
+            "hash in internal byte order"
+        );
         assert_eq!(cb.prev_hash, internal(BLOCK_415000_PREV));
         assert_eq!(cb.time, 1540144808);
-        assert_eq!(cb.vtx.len(), 1, "every tx is included (lightwalletd parity)");
+        assert_eq!(
+            cb.vtx.len(),
+            1,
+            "every tx is included (lightwalletd parity)"
+        );
         let tx = &cb.vtx[0];
         assert_eq!(tx.index, 0);
-        assert_eq!(tx.txid, internal(BLOCK_415000_COINBASE_TXID), "txid in protocol order");
+        assert_eq!(
+            tx.txid,
+            internal(BLOCK_415000_COINBASE_TXID),
+            "txid in protocol order"
+        );
         assert!(tx.spends.is_empty() && tx.outputs.is_empty() && tx.actions.is_empty());
         let meta = cb.chain_metadata.as_ref().expect("chain metadata");
         assert_eq!(meta.sapling_commitment_tree_size, 7);
-        assert_eq!(meta.orchard_commitment_tree_size, 0, "absent pool size maps to 0");
+        assert_eq!(
+            meta.orchard_commitment_tree_size, 0,
+            "absent pool size maps to 0"
+        );
 
         assert!(stream.next().await.unwrap().is_none(), "range exhausted");
     }
@@ -1110,7 +1183,8 @@ mod tests {
         {
             let mut f = fake.lock().unwrap();
             // Block 415000's bytes served for height 5: the coinbase-claimed height exposes it.
-            f.raw_blocks.insert("5".into(), BLOCK_415000_HEX.trim().into());
+            f.raw_blocks
+                .insert("5".into(), BLOCK_415000_HEX.trim().into());
             f.raw_blocks.insert("6".into(), "00ff00ff".into());
         }
         let mut src = source_for(fake).await;
@@ -1120,13 +1194,19 @@ mod tests {
             .await
             .unwrap();
         let err = stream.next().await.expect_err("height mismatch must error");
-        assert!(err.to_string().contains("claiming height 415000"), "got: {err:#}");
+        assert!(
+            err.to_string().contains("claiming height 415000"),
+            "got: {err:#}"
+        );
 
         let mut stream = src
             .compact_block_range(BlockHeight::from_u32(6), BlockHeight::from_u32(6))
             .await
             .unwrap();
-        assert!(stream.next().await.is_err(), "unparseable block bytes must error");
+        assert!(
+            stream.next().await.is_err(),
+            "unparseable block bytes must error"
+        );
     }
 
     /// The transparent-address operations (tparty's deposit discovery and spend detection)
@@ -1160,7 +1240,10 @@ mod tests {
             b.reverse();
             b
         };
-        assert_eq!(utxos[0].txid, expected_txid, "utxo txid flipped to internal order");
+        assert_eq!(
+            utxos[0].txid, expected_txid,
+            "utxo txid flipped to internal order"
+        );
         assert_eq!(utxos[0].index, 3);
         assert_eq!(utxos[0].script, hex::decode("76a914ff88ac").unwrap());
         assert_eq!(utxos[0].value_zat, 12345);
@@ -1202,7 +1285,10 @@ mod tests {
         // The current mempool is streamed first.
         let first = stream.message().await.unwrap().expect("first mempool tx");
         assert_eq!(first.data, vec![0x01, 0x01]);
-        assert_eq!(first.height, 0, "mempool txs report height 0 (lightwalletd parity)");
+        assert_eq!(
+            first.height, 0,
+            "mempool txs report height 0 (lightwalletd parity)"
+        );
 
         // A tx that arrives later is picked up by a subsequent poll; the first tx is not
         // re-yielded.

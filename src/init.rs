@@ -49,9 +49,13 @@ fn read_encryption_passphrase() -> anyhow::Result<Passphrase> {
 }
 
 pub async fn run(config: &AppConfig, args: &InitArgs) -> anyhow::Result<()> {
-    let entry: WalletEntry = config.wallets.get(&args.wallet).cloned().unwrap_or(WalletEntry {
-        dir: config.datadir.join(&args.wallet),
-    });
+    let entry: WalletEntry = config
+        .wallets
+        .get(&args.wallet)
+        .cloned()
+        .unwrap_or(WalletEntry {
+            dir: config.datadir.join(&args.wallet),
+        });
     let wallet_dir = entry.dir;
     let network = config.network;
 
@@ -98,7 +102,9 @@ pub async fn run(config: &AppConfig, args: &InitArgs) -> anyhow::Result<()> {
         .next()
         .ok_or_else(|| anyhow!("no upstream servers configured"))?;
     let mut client = server
-        .connect_timeout(Duration::from_secs(config.lightwalletd.connect_timeout_secs))
+        .connect_timeout(Duration::from_secs(
+            config.lightwalletd.connect_timeout_secs,
+        ))
         .await
         .with_context(|| format!("connecting to {}", server.describe()))?;
 
@@ -152,7 +158,9 @@ pub async fn run(config: &AppConfig, args: &InitArgs) -> anyhow::Result<()> {
         // where `chain_tip - 100` underflows to 0). `AccountBirthday::from_treestate` then
         // derives the actual birthday from the returned tree state's height.
         let prior_height = u32::from(birthday_height).saturating_sub(1).max(1);
-        let treestate = client.tree_state(BlockHeight::from_u32(prior_height)).await?;
+        let treestate = client
+            .tree_state(BlockHeight::from_u32(prior_height))
+            .await?;
         AccountBirthday::from_treestate(treestate, recover_until)
             .map_err(|_| anyhow!("failed to derive account birthday from tree state"))?
     };
@@ -185,7 +193,11 @@ pub async fn run(config: &AppConfig, args: &InitArgs) -> anyhow::Result<()> {
     let mut db = open::init_dbs(network, &wallet_dir)?;
     db.create_account(&args.account_name, &seed, &birthday, None)?;
 
-    eprintln!("Wallet '{}' initialized at {}", args.wallet, wallet_dir.display());
+    eprintln!(
+        "Wallet '{}' initialized at {}",
+        args.wallet,
+        wallet_dir.display()
+    );
     if args.encrypt {
         eprintln!(
             "Wallet is passphrase-encrypted; it starts locked. Call walletpassphrase \"<pass>\" <timeout> to unlock for sending."
@@ -203,8 +215,8 @@ pub async fn run(config: &AppConfig, args: &InitArgs) -> anyhow::Result<()> {
 
 async fn ensure_identity(path: &Path) -> anyhow::Result<Vec<Box<dyn age::Recipient + Send>>> {
     if tokio::fs::try_exists(path).await.unwrap_or(false) {
-        let recipients = age::IdentityFile::from_file(path.to_string_lossy().into_owned())?
-            .to_recipients()?;
+        let recipients =
+            age::IdentityFile::from_file(path.to_string_lossy().into_owned())?.to_recipients()?;
         return Ok(recipients);
     }
 

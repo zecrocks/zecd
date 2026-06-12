@@ -52,7 +52,9 @@ async fn regtest_stop_and_restore() {
 
     // 1. The original wallet: capture its generated mnemonic and first receive address.
     let cfg_a = ZecdConfig::new(lwd.grpc_port, pick_port().expect("pick zecd rpc port"));
-    let zecd_a = Zecd::start(&cfg_a).await.expect("start the original wallet");
+    let zecd_a = Zecd::start(&cfg_a)
+        .await
+        .expect("start the original wallet");
     zecd_a
         .wait_until_synced(INITIAL_BLOCKS as u64, SYNC_TIMEOUT)
         .await
@@ -84,7 +86,9 @@ async fn regtest_stop_and_restore() {
     let mut cfg_b = ZecdConfig::new(lwd.grpc_port, pick_port().expect("pick zecd rpc port"));
     cfg_b.restore_mnemonic = Some(mnemonic);
     cfg_b.birthday = Some(2);
-    let zecd_b = Zecd::start(&cfg_b).await.expect("start the restored wallet");
+    let zecd_b = Zecd::start(&cfg_b)
+        .await
+        .expect("start the restored wallet");
     assert!(
         zecd_b.mnemonic.is_none(),
         "a restore prints no mnemonic (nothing new to back up)"
@@ -108,7 +112,10 @@ async fn regtest_stop_and_restore() {
     );
 
     // The restored wallet is empty and healthy.
-    let bal = zecd_b.call("getbalance", json!([])).await.expect("getbalance");
+    let bal = zecd_b
+        .call("getbalance", json!([]))
+        .await
+        .expect("getbalance");
     assert_eq!(bal.as_f64(), Some(0.0), "no phantom funds after restore");
     let txs = zecd_b
         .call("listtransactions", json!([]))

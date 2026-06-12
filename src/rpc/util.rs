@@ -7,7 +7,9 @@ use crate::error::RpcError;
 use crate::server::jsonrpc::RpcRequest;
 use crate::state::AppState;
 
-pub fn validateaddress(state: &AppState, req: &RpcRequest) -> Result<Value, RpcError> {
+/// `validateaddress <address>` - network-aware validity verdict for any Zcash address kind,
+/// with an `isvalid_orchard` extension flagging Orchard-receiver capability.
+pub(crate) fn validateaddress(state: &AppState, req: &RpcRequest) -> Result<Value, RpcError> {
     let addr = req
         .param(0)
         .and_then(|v| v.as_str())
@@ -38,25 +40,31 @@ pub fn validateaddress(state: &AppState, req: &RpcRequest) -> Result<Value, RpcE
 /// `settxfee` - an explicit fee instruction, so it gets the same treatment as
 /// `fee_rate`/`subtractfeefromamount`: a self-diagnosing `-8` rather than bitcoind's
 /// `true` (which would be a lie) or a bare method-not-found.
-pub fn settxfee(_req: &RpcRequest) -> Result<Value, RpcError> {
+pub(crate) fn settxfee(_req: &RpcRequest) -> Result<Value, RpcError> {
     Err(RpcError::invalid_parameter(
         "settxfee is not supported: fees follow ZIP-317 (computed at transaction-build time) \
          and are never client-settable",
     ))
 }
 
-pub fn estimatesmartfee(req: &RpcRequest) -> Result<Value, RpcError> {
+/// `estimatesmartfee [conf_target]` - a stable conventional rate (Zcash fees are ZIP-317,
+/// computed at build time; there is no estimator), so fee-probing clients succeed.
+pub(crate) fn estimatesmartfee(req: &RpcRequest) -> Result<Value, RpcError> {
     // Zcash fees are ZIP-317 (computed at build time); return a stable conventional rate so
     // clients that probe fees succeed.
     let blocks = req.param(0).and_then(|v| v.as_i64()).unwrap_or(6);
     Ok(json!({ "feerate": zats_to_value(1000), "blocks": blocks }))
 }
 
-pub fn estimatefee(_req: &RpcRequest) -> Result<Value, RpcError> {
+/// `estimatefee` - the legacy single-number fee probe; same conventional rate as
+/// [`estimatesmartfee`].
+pub(crate) fn estimatefee(_req: &RpcRequest) -> Result<Value, RpcError> {
     Ok(zats_to_value(1000))
 }
 
-pub fn getmempoolinfo() -> Result<Value, RpcError> {
+/// `getmempoolinfo` - a light client sees no mempool of its own, so this reports an empty
+/// (but loaded) pool with the conventional fee floors, satisfying client preflight checks.
+pub(crate) fn getmempoolinfo() -> Result<Value, RpcError> {
     Ok(json!({
         "loaded": true,
         "size": 0,

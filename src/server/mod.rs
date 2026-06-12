@@ -65,7 +65,10 @@ async fn handle(
     body: Bytes,
 ) -> Response {
     // Reject new work once shutdown has been requested (matches bitcoind).
-    if state.shutting_down.load(std::sync::atomic::Ordering::Relaxed) {
+    if state
+        .shutting_down
+        .load(std::sync::atomic::Ordering::Relaxed)
+    {
         return plain_response(
             StatusCode::SERVICE_UNAVAILABLE,
             "Request rejected during server shutdown",
@@ -142,12 +145,7 @@ async fn process_single(state: &AppState, wallet: Option<&str>, v: Value) -> (Va
 
 fn json_response(status: StatusCode, body: &Value) -> Response {
     let bytes = serde_json::to_vec(body).unwrap_or_else(|_| b"{}".to_vec());
-    (
-        status,
-        [(header::CONTENT_TYPE, "application/json")],
-        bytes,
-    )
-        .into_response()
+    (status, [(header::CONTENT_TYPE, "application/json")], bytes).into_response()
 }
 
 /// A plain-text response (bitcoind uses these for 503/overload and shutdown messages).
@@ -177,9 +175,7 @@ mod tests {
     use serde_json::Value;
     use tower::ServiceExt;
 
-    use crate::config::{
-        AppConfig, KeysConfig, LightwalletdConfig, RpcConfig, SyncConfig,
-    };
+    use crate::config::{AppConfig, KeysConfig, LightwalletdConfig, RpcConfig, SyncConfig};
     use crate::server::auth::Authenticator;
     use crate::wallet::WalletRegistry;
 
@@ -210,8 +206,14 @@ mod tests {
             },
             zebra: Default::default(),
             rpc: rpc.clone(),
-            keys: KeysConfig { age_identity: None, auto_unlock: true },
-            sync: SyncConfig { interval_secs: 20, rebroadcast_secs: 60 },
+            keys: KeysConfig {
+                age_identity: None,
+                auto_unlock: true,
+            },
+            sync: SyncConfig {
+                interval_secs: 20,
+                rebroadcast_secs: 60,
+            },
             spend: crate::config::SpendConfig::default(),
             health: crate::config::HealthConfig {
                 enabled: false,
@@ -219,7 +221,10 @@ mod tests {
                 port: 9233,
                 ready_progress: 0.999,
             },
-            log: crate::config::LogConfig { level: "info".into(), format: "text".into() },
+            log: crate::config::LogConfig {
+                level: "info".into(),
+                format: "text".into(),
+            },
             tparty: crate::config::TpartyConfig::default(),
         };
         AppState {
@@ -245,7 +250,9 @@ mod tests {
     }
 
     async fn body_json(resp: Response) -> Value {
-        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
         serde_json::from_slice(&bytes).unwrap()
     }
 
@@ -258,7 +265,10 @@ mod tests {
         assert_eq!(r.status(), StatusCode::UNAUTHORIZED);
 
         let r = router(test_state())
-            .oneshot(req(r#"{"method":"getnetworkinfo","id":1}"#, Some(("u", "wrong"))))
+            .oneshot(req(
+                r#"{"method":"getnetworkinfo","id":1}"#,
+                Some(("u", "wrong")),
+            ))
             .await
             .unwrap();
         assert_eq!(r.status(), StatusCode::UNAUTHORIZED);
@@ -278,7 +288,10 @@ mod tests {
     #[tokio::test]
     async fn getnetworkinfo_ok_200() {
         let r = router(test_state())
-            .oneshot(req(r#"{"method":"getnetworkinfo","id":1,"params":[]}"#, Some(("u", "p"))))
+            .oneshot(req(
+                r#"{"method":"getnetworkinfo","id":1,"params":[]}"#,
+                Some(("u", "p")),
+            ))
             .await
             .unwrap();
         assert_eq!(r.status(), StatusCode::OK);
@@ -291,7 +304,10 @@ mod tests {
     #[tokio::test]
     async fn unknown_method_is_404_with_error_code() {
         let r = router(test_state())
-            .oneshot(req(r#"{"method":"definitely_not_a_method","id":2}"#, Some(("u", "p"))))
+            .oneshot(req(
+                r#"{"method":"definitely_not_a_method","id":2}"#,
+                Some(("u", "p")),
+            ))
             .await
             .unwrap();
         // Bitcoin Core maps RPC_METHOD_NOT_FOUND to HTTP 404 (httprpc.cpp JSONErrorReply).
@@ -371,8 +387,7 @@ mod tests {
     async fn parameter_validation_codes() {
         use crate::error::codes::{RPC_INVALID_ADDRESS_OR_KEY, RPC_INVALID_PARAMETER};
         // listtransactions: negative count / from -> -8 (before wallet access).
-        let code =
-            call_err_code(r#"{"method":"listtransactions","id":1,"params":["*",-1]}"#).await;
+        let code = call_err_code(r#"{"method":"listtransactions","id":1,"params":["*",-1]}"#).await;
         assert_eq!(code, Some(RPC_INVALID_PARAMETER as i64));
         let code =
             call_err_code(r#"{"method":"listtransactions","id":1,"params":["*",10,-5]}"#).await;
@@ -404,7 +419,10 @@ mod tests {
             r#"{"method":"sendrawtransaction","id":1,"params":["00"]}"#,
         ] {
             let code = call_err_code(body).await;
-            assert!(code.is_some(), "walletless state must yield an error: {body}");
+            assert!(
+                code.is_some(),
+                "walletless state must yield an error: {body}"
+            );
             assert_ne!(
                 code,
                 Some(RPC_METHOD_NOT_FOUND as i64),
@@ -453,8 +471,15 @@ mod tests {
             r#"{"method":"shieldfunds","id":1,"params":[]}"#,
         ] {
             let code = call_err_code_as(Tparty, body).await;
-            assert!(code.is_some(), "walletless state must yield an error: {body}");
-            assert_ne!(code, Some(RPC_METHOD_NOT_FOUND as i64), "tparty serves: {body}");
+            assert!(
+                code.is_some(),
+                "walletless state must yield an error: {body}"
+            );
+            assert_ne!(
+                code,
+                Some(RPC_METHOD_NOT_FOUND as i64),
+                "tparty serves: {body}"
+            );
             assert_eq!(
                 call_err_code_as(Zecd, body).await,
                 Some(RPC_METHOD_NOT_FOUND as i64),
@@ -501,7 +526,10 @@ mod tests {
     #[tokio::test]
     async fn batch_returns_200_array() {
         let body = r#"[{"method":"uptime","id":1},{"method":"nope","id":2}]"#;
-        let r = router(test_state()).oneshot(req(body, Some(("u", "p")))).await.unwrap();
+        let r = router(test_state())
+            .oneshot(req(body, Some(("u", "p"))))
+            .await
+            .unwrap();
         assert_eq!(r.status(), StatusCode::OK);
         let v = body_json(r).await;
         let arr = v.as_array().unwrap();
@@ -518,7 +546,10 @@ mod tests {
     async fn validateaddress_matches_bitcoind_shape() {
         async fn result_for(addr: &str) -> Value {
             let body = format!(r#"{{"method":"validateaddress","id":1,"params":["{addr}"]}}"#);
-            let r = router(test_state()).oneshot(req(&body, Some(("u", "p")))).await.unwrap();
+            let r = router(test_state())
+                .oneshot(req(&body, Some(("u", "p"))))
+                .await
+                .unwrap();
             assert_eq!(r.status(), StatusCode::OK);
             body_json(r).await["result"].clone()
         }
@@ -528,7 +559,10 @@ mod tests {
             let v = result_for(addr).await;
             assert_eq!(v["isvalid"], serde_json::json!(false));
             let obj = v.as_object().unwrap();
-            assert!(!obj.contains_key("address"), "invalid result must not echo address");
+            assert!(
+                !obj.contains_key("address"),
+                "invalid result must not echo address"
+            );
             assert!(!obj.contains_key("scriptPubKey"));
             assert!(!obj.contains_key("isscript"));
             assert!(obj.contains_key("error"));
@@ -538,9 +572,15 @@ mod tests {
         // Valid testnet P2PKH: real scriptPubKey, isscript false.
         let v = result_for("tmGqwWtL7RsbxikDSN26gsbicxVr2xJNe86").await;
         assert_eq!(v["isvalid"], serde_json::json!(true));
-        assert_eq!(v["address"], serde_json::json!("tmGqwWtL7RsbxikDSN26gsbicxVr2xJNe86"));
+        assert_eq!(
+            v["address"],
+            serde_json::json!("tmGqwWtL7RsbxikDSN26gsbicxVr2xJNe86")
+        );
         let spk = v["scriptPubKey"].as_str().unwrap();
-        assert!(spk.starts_with("76a914") && spk.ends_with("88ac"), "got {spk}");
+        assert!(
+            spk.starts_with("76a914") && spk.ends_with("88ac"),
+            "got {spk}"
+        );
         assert_eq!(v["isscript"], serde_json::json!(false));
         assert_eq!(v["iswitness"], serde_json::json!(false));
     }

@@ -41,9 +41,9 @@ pub async fn run(state: AppState) {
                 warn!("health server error: {e}");
             }
         }
-        Err(e) => warn!(
-            "health server: failed to bind {addr}: {e} (continuing without health endpoints)"
-        ),
+        Err(e) => {
+            warn!("health server: failed to bind {addr}: {e} (continuing without health endpoints)")
+        }
     }
 }
 

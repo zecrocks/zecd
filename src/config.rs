@@ -106,7 +106,9 @@ impl ShieldPool {
             "sapling" => Err(anyhow::anyhow!(
                 "[tparty] pool = \"sapling\" is not supported yet; only \"orchard\" is available"
             )),
-            other => Err(anyhow::anyhow!("invalid [tparty] pool: {other:?} (expected \"orchard\")")),
+            other => Err(anyhow::anyhow!(
+                "invalid [tparty] pool: {other:?} (expected \"orchard\")"
+            )),
         }
     }
 
@@ -605,9 +607,11 @@ impl AppConfig {
             let dir = w.dir.clone().unwrap_or_else(|| datadir.join(name));
             wallets.insert(name.clone(), WalletEntry { dir });
         }
-        wallets.entry(default_wallet.clone()).or_insert_with(|| WalletEntry {
-            dir: datadir.join(&default_wallet),
-        });
+        wallets
+            .entry(default_wallet.clone())
+            .or_insert_with(|| WalletEntry {
+                dir: datadir.join(&default_wallet),
+            });
 
         let lwd_file = file.lightwalletd.unwrap_or(LightwalletdFile {
             server: None,
@@ -645,7 +649,10 @@ impl AppConfig {
             force_tls,
             connect_timeout_secs: lwd_file.connect_timeout_secs.unwrap_or(10).max(1),
             reconnect_base_secs,
-            reconnect_max_secs: lwd_file.reconnect_max_secs.unwrap_or(60).max(reconnect_base_secs),
+            reconnect_max_secs: lwd_file
+                .reconnect_max_secs
+                .unwrap_or(60)
+                .max(reconnect_base_secs),
             primary_recheck_secs: lwd_file.primary_recheck_secs.unwrap_or(60).max(1),
         };
 
@@ -749,7 +756,10 @@ impl AppConfig {
             ready_progress: health_file.ready_progress.unwrap_or(0.999),
         };
 
-        let log_file = file.log.unwrap_or(LogFile { level: None, format: None });
+        let log_file = file.log.unwrap_or(LogFile {
+            level: None,
+            format: None,
+        });
         let log = LogConfig {
             level: log_file.level.unwrap_or_else(|| "info".to_string()),
             format: log_file.format.unwrap_or_else(|| "text".to_string()),
@@ -759,7 +769,12 @@ impl AppConfig {
         let tparty = match file.tparty {
             None => tparty_defaults,
             Some(t) => TpartyConfig {
-                pool: t.pool.as_deref().map(ShieldPool::parse).transpose()?.unwrap_or_default(),
+                pool: t
+                    .pool
+                    .as_deref()
+                    .map(ShieldPool::parse)
+                    .transpose()?
+                    .unwrap_or_default(),
                 min_conf: t.min_conf.unwrap_or(tparty_defaults.min_conf),
                 threshold_zat: t.threshold_zat.unwrap_or(tparty_defaults.threshold_zat),
                 gap_limit: t.gap_limit.unwrap_or(tparty_defaults.gap_limit).max(1),
@@ -801,26 +816,41 @@ mod tests {
         let p = s.confirmations_policy().unwrap();
         assert_eq!((p.trusted().get(), p.untrusted().get()), (1, 2));
         // The defaults are ZIP 315's 3/10.
-        let p = SpendConfig { trusted_confirmations: 3, untrusted_confirmations: 10, ..Default::default() }
-            .confirmations_policy()
-            .unwrap();
+        let p = SpendConfig {
+            trusted_confirmations: 3,
+            untrusted_confirmations: 10,
+            ..Default::default()
+        }
+        .confirmations_policy()
+        .unwrap();
         assert_eq!((p.trusted().get(), p.untrusted().get()), (3, 10));
         // 0 clamps to 1 (a shielded note is never spendable unmined).
-        let p = SpendConfig { trusted_confirmations: 0, untrusted_confirmations: 1, ..Default::default() }
-            .confirmations_policy()
-            .unwrap();
+        let p = SpendConfig {
+            trusted_confirmations: 0,
+            untrusted_confirmations: 1,
+            ..Default::default()
+        }
+        .confirmations_policy()
+        .unwrap();
         assert_eq!((p.trusted().get(), p.untrusted().get()), (1, 1));
         // trusted > untrusted is rejected (surfaces as a startup error).
-        assert!(SpendConfig { trusted_confirmations: 11, untrusted_confirmations: 10, ..Default::default() }
-            .confirmations_policy()
-            .is_err());
+        assert!(SpendConfig {
+            trusted_confirmations: 11,
+            untrusted_confirmations: 10,
+            ..Default::default()
+        }
+        .confirmations_policy()
+        .is_err());
         // Unknown keys in the section are rejected like everywhere else.
         assert!(toml::from_str::<SpendFile>("min_conf = 1").is_err());
     }
 
     #[test]
     fn privacy_policy_parses_known_values_only() {
-        assert_eq!(SendPrivacy::parse("FullPrivacy").unwrap(), SendPrivacy::FullPrivacy);
+        assert_eq!(
+            SendPrivacy::parse("FullPrivacy").unwrap(),
+            SendPrivacy::FullPrivacy
+        );
         assert_eq!(
             SendPrivacy::parse("AllowRevealedRecipients").unwrap(),
             SendPrivacy::AllowRevealedRecipients
@@ -927,7 +957,11 @@ mod tests {
 
         // ...but --datadir on the CLI still wins over the file.
         let cli = Cli::parse_from([
-            "zecd", "--conf", conf.to_str().unwrap(), "--datadir", "/tmp/zecd-from-cli",
+            "zecd",
+            "--conf",
+            conf.to_str().unwrap(),
+            "--datadir",
+            "/tmp/zecd-from-cli",
         ]);
         let cfg = AppConfig::resolve(&cli).unwrap();
         assert_eq!(cfg.datadir, PathBuf::from("/tmp/zecd-from-cli"));
@@ -950,11 +984,18 @@ mod tests {
         std::fs::write(&conf, "[lightwalletd]\nconnection = \"tor\"\n").unwrap();
         let cli = Cli::parse_from(["zecd", "--conf", conf.to_str().unwrap()]);
         let cfg = AppConfig::resolve(&cli).unwrap();
-        assert_eq!(cfg.lightwalletd.proxy, Some("127.0.0.1:9050".parse().unwrap()));
+        assert_eq!(
+            cfg.lightwalletd.proxy,
+            Some("127.0.0.1:9050".parse().unwrap())
+        );
 
         // …"direct" to no proxy, and the CLI --connection flag wins over the file.
         let cli = Cli::parse_from([
-            "zecd", "--conf", conf.to_str().unwrap(), "--connection", "direct",
+            "zecd",
+            "--conf",
+            conf.to_str().unwrap(),
+            "--connection",
+            "direct",
         ]);
         let cfg = AppConfig::resolve(&cli).unwrap();
         assert_eq!(cfg.lightwalletd.proxy, None);
@@ -993,11 +1034,15 @@ mod tests {
         // Sapling is recognized but explicitly not-yet-supported; garbage is rejected.
         std::fs::write(&conf, "[tparty]\npool = \"sapling\"\n").unwrap();
         let cli = Cli::parse_from(["tparty", "--conf", conf.to_str().unwrap()]);
-        let err = AppConfig::resolve_with(&cli, &TPARTY_DEFAULTS).unwrap_err().to_string();
+        let err = AppConfig::resolve_with(&cli, &TPARTY_DEFAULTS)
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("not supported yet"), "got: {err}");
         std::fs::write(&conf, "[tparty]\npool = \"sprout\"\n").unwrap();
         let cli = Cli::parse_from(["tparty", "--conf", conf.to_str().unwrap()]);
-        let err = AppConfig::resolve_with(&cli, &TPARTY_DEFAULTS).unwrap_err().to_string();
+        let err = AppConfig::resolve_with(&cli, &TPARTY_DEFAULTS)
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("invalid [tparty] pool"), "got: {err}");
 
         // The section is legal (and inert) under zecd's resolution too, so a paired
@@ -1012,10 +1057,12 @@ mod tests {
     fn shipped_configs_parse() {
         // The example and docker configs must deserialize (deny_unknown_fields catches typos and
         // drift as the schema evolves).
-        toml::from_str::<ConfigFile>(include_str!("../zecd.example.toml")).expect("zecd.example.toml");
+        toml::from_str::<ConfigFile>(include_str!("../zecd.example.toml"))
+            .expect("zecd.example.toml");
         toml::from_str::<ConfigFile>(include_str!("../tparty.example.toml"))
             .expect("tparty.example.toml");
-        toml::from_str::<ConfigFile>(include_str!("../deploy/zecd.toml")).expect("deploy/zecd.toml");
+        toml::from_str::<ConfigFile>(include_str!("../deploy/zecd.toml"))
+            .expect("deploy/zecd.toml");
         toml::from_str::<ConfigFile>(include_str!("../deploy/zecd.mainnet.toml"))
             .expect("deploy/zecd.mainnet.toml");
     }

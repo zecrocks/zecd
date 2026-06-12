@@ -168,9 +168,9 @@ pub async fn run(config: AppConfig, opts: DaemonOptions) -> anyhow::Result<()> {
     for (name, task) in actor_tasks {
         match tokio::time::timeout(actor_stop_deadline, task).await {
             Ok(_) => info!("wallet '{name}' stopped"),
-            Err(_) => warn!(
-                "wallet '{name}' did not stop within {actor_stop_deadline:?}; exiting anyway"
-            ),
+            Err(_) => {
+                warn!("wallet '{name}' did not stop within {actor_stop_deadline:?}; exiting anyway")
+            }
         }
     }
 

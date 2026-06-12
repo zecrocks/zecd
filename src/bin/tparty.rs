@@ -22,7 +22,9 @@ async fn main() -> anyhow::Result<()> {
     // so rebind it before parsing for correct help/usage/error text).
     let matches = Cli::command()
         .name("tparty")
-        .about("transparent Zcash deposit addresses that auto-shield into the wallet's shielded pool")
+        .about(
+            "transparent Zcash deposit addresses that auto-shield into the wallet's shielded pool",
+        )
         .get_matches();
     let cli = Cli::from_arg_matches(&matches)?;
     let config = AppConfig::resolve_with(&cli, &TPARTY_DEFAULTS)?;

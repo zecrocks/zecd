@@ -29,7 +29,9 @@ const TEST_PHRASE: &str = "mechanic vehicle helmet decide plug gorilla frost dia
     moment stage";
 
 fn test_seed() -> SecretVec<u8> {
-    let mut seed = <Mnemonic<English>>::from_phrase(TEST_PHRASE).unwrap().to_seed("");
+    let mut seed = <Mnemonic<English>>::from_phrase(TEST_PHRASE)
+        .unwrap()
+        .to_seed("");
     let secret = SecretVec::new(seed.to_vec());
     seed.zeroize();
     secret
@@ -102,7 +104,9 @@ fn regtest_wallet_lifecycle() {
         Some(1_700_000_000)
     );
     assert_eq!(
-        labels::first_seen_all(wallet_dir).expect("first_seen_all").len(),
+        labels::first_seen_all(wallet_dir)
+            .expect("first_seen_all")
+            .len(),
         1
     );
 
@@ -143,7 +147,8 @@ fn tparty_addresses_never_collide_with_zecd() {
     let (account_id, _) = db
         .create_account("primary", &test_seed(), &genesis_birthday(), None)
         .expect("create regtest account");
-    db.update_chain_tip(BlockHeight::from_u32(1)).expect("set tip");
+    db.update_chain_tip(BlockHeight::from_u32(1))
+        .expect("set tip");
 
     // zecd-style addresses: Orchard-only UAs of this same account.
     let mut zecd_addrs = std::collections::BTreeSet::new();
@@ -208,7 +213,8 @@ fn transparent_gap_limit_maps_to_keypool_ran_out() {
     let (account_id, _) = db
         .create_account("primary", &test_seed(), &genesis_birthday(), None)
         .expect("create regtest account");
-    db.update_chain_tip(BlockHeight::from_u32(1)).expect("set tip");
+    db.update_chain_tip(BlockHeight::from_u32(1))
+        .expect("set tip");
 
     for _ in 0..2 {
         crate::wallet::actor::next_transparent_address(&mut db, account_id, net)
@@ -239,7 +245,8 @@ fn transparent_receive_reports_the_t_address() {
     let (account_id, _) = db
         .create_account("primary", &test_seed(), &genesis_birthday(), None)
         .expect("create regtest account");
-    db.update_chain_tip(BlockHeight::from_u32(10)).expect("set tip");
+    db.update_chain_tip(BlockHeight::from_u32(10))
+        .expect("set tip");
 
     let taddr_str = crate::wallet::actor::next_transparent_address(&mut db, account_id, net)
         .expect("derive transparent address");
@@ -249,11 +256,15 @@ fn transparent_receive_reports_the_t_address() {
     // stores when lightwalletd reports the UTXO.
     let output = WalletTransparentOutput::from_parts(
         OutPoint::new([9u8; 32], 0),
-        TxOut::new(Zatoshis::from_u64(100_000_000).unwrap(), taddr.script().into()),
+        TxOut::new(
+            Zatoshis::from_u64(100_000_000).unwrap(),
+            taddr.script().into(),
+        ),
         Some(BlockHeight::from_u32(5)),
     )
     .expect("valid P2PKH output");
-    db.put_received_transparent_utxo(&output).expect("store the deposit UTXO");
+    db.put_received_transparent_utxo(&output)
+        .expect("store the deposit UTXO");
     drop(db);
 
     // History reports the receive under the bare t-address.

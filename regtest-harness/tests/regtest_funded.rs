@@ -131,7 +131,10 @@ async fn regtest_funded_orchard_receive() {
     //    lightwalletd's mempool stream, which the 0-conf check below exercises.
     let deadline = Instant::now() + FUND_TIMEOUT;
     loop {
-        let peers = zecd.call("getpeerinfo", json!([])).await.expect("getpeerinfo");
+        let peers = zecd
+            .call("getpeerinfo", json!([]))
+            .await
+            .expect("getpeerinfo");
         if peers
             .as_array()
             .and_then(|a| a.first())
@@ -176,9 +179,10 @@ async fn regtest_funded_orchard_receive() {
         .await
         .expect("listtransactions");
     assert!(
-        txs.as_array().expect("array").iter().any(|t| {
-            t["category"] == "receive" && t["confirmations"].as_i64() == Some(0)
-        }),
+        txs.as_array()
+            .expect("array")
+            .iter()
+            .any(|t| { t["category"] == "receive" && t["confirmations"].as_i64() == Some(0) }),
         "the unconfirmed receive rides in listtransactions: {txs}"
     );
     let lu = zecd
@@ -270,7 +274,10 @@ async fn regtest_funded_orchard_receive() {
         .call("listsinceblock", json!([]))
         .await
         .expect("listsinceblock");
-    let cursor = lsb["lastblock"].as_str().expect("lastblock hash").to_string();
+    let cursor = lsb["lastblock"]
+        .as_str()
+        .expect("lastblock hash")
+        .to_string();
     assert_eq!(cursor.len(), 64, "lastblock is a block hash: {lsb}");
 
     // Encrypt the wallet (Bitcoin-Core style) and exercise the gate around a real spend:
@@ -289,7 +296,11 @@ async fn regtest_funded_orchard_receive() {
         .call("walletpassphrase", json!(["wrong-pass", 600]))
         .await
         .expect_err("a wrong passphrase must be rejected");
-    assert_eq!(err.code(), Some(-14), "expected passphrase-incorrect (-14): {err}");
+    assert_eq!(
+        err.code(),
+        Some(-14),
+        "expected passphrase-incorrect (-14): {err}"
+    );
     zecd.call("walletpassphrase", json!(["regtest-pass", 3600]))
         .await
         .expect("the real passphrase unlocks");
@@ -356,8 +367,15 @@ async fn regtest_funded_orchard_receive() {
     // WalletTxToJSON fields on an unconfirmed own send: trusted (we authored it and it can
     // still mine), walletconflicts always present, and a real time (the wallet's `created`
     // timestamp - Bitcoin Core semantics, where unmined txs carry their first-seen time).
-    assert_eq!(gt["trusted"].as_bool(), Some(true), "own unmined send is trusted: {gt}");
-    assert!(gt["walletconflicts"].is_array(), "walletconflicts is always present: {gt}");
+    assert_eq!(
+        gt["trusted"].as_bool(),
+        Some(true),
+        "own unmined send is trusted: {gt}"
+    );
+    assert!(
+        gt["walletconflicts"].is_array(),
+        "walletconflicts is always present: {gt}"
+    );
     assert!(
         gt["time"].as_i64().is_some_and(|t| t > 0),
         "an unmined send reports a real time, not 0: {gt}"
@@ -398,12 +416,17 @@ async fn regtest_funded_orchard_receive() {
         .await
         .expect("listsinceblock since the pre-send cursor");
     assert!(
-        lsb["transactions"].as_array().expect("transactions").iter().any(|t| {
-            t["txid"] == json!(txid.as_str()) && t["category"] == "send"
-        }),
+        lsb["transactions"]
+            .as_array()
+            .expect("transactions")
+            .iter()
+            .any(|t| { t["txid"] == json!(txid.as_str()) && t["category"] == "send" }),
         "the send is reported since the pre-send cursor: {lsb}"
     );
-    let cursor2 = lsb["lastblock"].as_str().expect("new lastblock").to_string();
+    let cursor2 = lsb["lastblock"]
+        .as_str()
+        .expect("new lastblock")
+        .to_string();
     let lsb2 = zecd
         .call("listsinceblock", json!([cursor2]))
         .await
@@ -445,12 +468,19 @@ async fn regtest_funded_orchard_receive() {
         .call("gettransaction", json!([txid_outage]))
         .await
         .expect("gettransaction during the outage");
-    assert_eq!(gt["confirmations"].as_i64(), Some(0), "committed, unmined: {gt}");
+    assert_eq!(
+        gt["confirmations"].as_i64(),
+        Some(0),
+        "committed, unmined: {gt}"
+    );
 
     // The daemon reports the outage once the actor notices the dead connection.
     let deadline = Instant::now() + Duration::from_secs(30);
     loop {
-        let peers = zecd.call("getpeerinfo", json!([])).await.expect("getpeerinfo");
+        let peers = zecd
+            .call("getpeerinfo", json!([]))
+            .await
+            .expect("getpeerinfo");
         if peers.as_array().is_some_and(|a| a.is_empty()) {
             break;
         }
@@ -465,10 +495,22 @@ async fn regtest_funded_orchard_receive() {
     // /readyz flips to 503 with reason "upstream_down", and /status shows the wallet's
     // conn_state as "down".
     let health = format!("http://127.0.0.1:{}", cfg.health_port());
-    let resp = reqwest::get(format!("{health}/healthz")).await.expect("GET /healthz");
-    assert_eq!(resp.status().as_u16(), 200, "/healthz is liveness, not readiness");
-    let resp = reqwest::get(format!("{health}/readyz")).await.expect("GET /readyz");
-    assert_eq!(resp.status().as_u16(), 503, "/readyz is 503 during the outage");
+    let resp = reqwest::get(format!("{health}/healthz"))
+        .await
+        .expect("GET /healthz");
+    assert_eq!(
+        resp.status().as_u16(),
+        200,
+        "/healthz is liveness, not readiness"
+    );
+    let resp = reqwest::get(format!("{health}/readyz"))
+        .await
+        .expect("GET /readyz");
+    assert_eq!(
+        resp.status().as_u16(),
+        503,
+        "/readyz is 503 during the outage"
+    );
     let body: serde_json::Value = resp.json().await.expect("readyz body is JSON");
     assert_eq!(body["ready"], json!(false), "{body}");
     assert_eq!(body["reason"], json!("upstream_down"), "{body}");
@@ -479,7 +521,11 @@ async fn regtest_funded_orchard_receive() {
         .await
         .expect("status body is JSON");
     assert_eq!(st["network"], json!("regtest"), "{st}");
-    assert_eq!(st["wallets"]["default"]["conn_state"], json!("down"), "{st}");
+    assert_eq!(
+        st["wallets"]["default"]["conn_state"],
+        json!("down"),
+        "{st}"
+    );
 
     // Upstream recovers on the same address: zecd reconnects (1-2s backoff), the
     // rebroadcast pass (2s interval) re-submits the tx, and mining confirms it.
@@ -491,7 +537,9 @@ async fn regtest_funded_orchard_receive() {
     // /readyz returns to 200 once the wallet is reconnected and caught up again.
     let deadline = Instant::now() + Duration::from_secs(60);
     loop {
-        let resp = reqwest::get(format!("{health}/readyz")).await.expect("GET /readyz");
+        let resp = reqwest::get(format!("{health}/readyz"))
+            .await
+            .expect("GET /readyz");
         if resp.status().as_u16() == 200 {
             break;
         }
@@ -614,7 +662,10 @@ async fn regtest_funded_orchard_receive() {
     let watch_active = async {
         let deadline = Instant::now() + Duration::from_secs(20);
         loop {
-            let ri = zecd.call("getrpcinfo", json!([])).await.expect("getrpcinfo");
+            let ri = zecd
+                .call("getrpcinfo", json!([]))
+                .await
+                .expect("getrpcinfo");
             let in_flight = ri["active_commands"]
                 .as_array()
                 .expect("active_commands")
@@ -685,7 +736,10 @@ async fn regtest_funded_orchard_receive() {
     // recipient, neither of which any other automated test exercises. First age the burst
     // change to trusted spendability (3 confs, +1 for the block the winner landed in).
     let tip = zecd.block_count().await.expect("getblockcount");
-    zebrad.generate_blocks(4).await.expect("age the burst change");
+    zebrad
+        .generate_blocks(4)
+        .await
+        .expect("age the burst change");
     zecd.wait_until_synced(tip + 4, FUND_TIMEOUT)
         .await
         .expect("scan the change-aging blocks");
@@ -722,13 +776,17 @@ async fn regtest_funded_orchard_receive() {
         .collect();
     assert_eq!(sends.len(), 2, "one send detail per recipient: {gt}");
     assert!(
-        sends.iter().any(|d| d["address"] == json!(funder_ua.as_str())
-            && d["amount"].as_f64() == Some(-0.05)),
+        sends
+            .iter()
+            .any(|d| d["address"] == json!(funder_ua.as_str())
+                && d["amount"].as_f64() == Some(-0.05)),
         "the shielded recipient detail carries its address and amount: {gt}"
     );
     assert!(
-        sends.iter().any(|d| d["address"] == json!(funder_taddr.as_str())
-            && d["amount"].as_f64() == Some(-0.02)),
+        sends
+            .iter()
+            .any(|d| d["address"] == json!(funder_taddr.as_str())
+                && d["amount"].as_f64() == Some(-0.02)),
         "the transparent recipient detail carries its address and amount: {gt}"
     );
     mine_until_confirmed(&zebrad, &zecd, &txid_many, "2-output sendmany").await;
@@ -791,7 +849,12 @@ async fn regtest_funded_orchard_receive() {
     // ---- conformance.py against the live, funded daemon ----
     // The wallet arrives encrypted (Phase 2) and unlocked; passing the passphrase enables
     // conformance's full encryption state machine (rotate/lock/unlock round-trips).
-    run_conformance(cfg.rpc_port, &cfg.rpc_user, &cfg.rpc_password, "regtest-pass");
+    run_conformance(
+        cfg.rpc_port,
+        &cfg.rpc_user,
+        &cfg.rpc_password,
+        "regtest-pass",
+    );
 }
 
 /// Mine one block at a time (giving the rebroadcast/scan loop time between blocks) until

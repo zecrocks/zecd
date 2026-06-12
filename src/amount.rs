@@ -25,7 +25,12 @@ pub fn zats_to_value(zats: u64) -> Value {
 pub fn signed_zats_to_value(zats: i64) -> Value {
     let neg = zats < 0;
     let abs = zats.unsigned_abs();
-    let s = format!("{}{}.{:08}", if neg { "-" } else { "" }, abs / COIN, abs % COIN);
+    let s = format!(
+        "{}{}.{:08}",
+        if neg { "-" } else { "" },
+        abs / COIN,
+        abs % COIN
+    );
     serde_json::from_str(&s).expect("formatted amount is valid JSON number")
 }
 
@@ -40,8 +45,8 @@ pub fn value_to_zats(v: &Value) -> Result<Zatoshis, RpcError> {
         Value::String(s) => s.clone(),
         _ => return Err(RpcError::type_error("Amount is not a number or string")),
     };
-    let zats = parse_fixed_point(&literal, 8)
-        .ok_or_else(|| RpcError::type_error("Invalid amount"))?;
+    let zats =
+        parse_fixed_point(&literal, 8).ok_or_else(|| RpcError::type_error("Invalid amount"))?;
     Zatoshis::from_nonnegative_i64(zats).map_err(|_| RpcError::type_error("Amount out of range"))
 }
 
@@ -158,8 +163,7 @@ fn parse_fixed_point(mut val: &str, decimals: i64) -> Option<i64> {
                             if exponent > (UPPER_BOUND / 10) {
                                 return None; // overflow
                             }
-                            exponent =
-                                exponent * 10 + i64::from(ch.to_digit(10).expect("checked"));
+                            exponent = exponent * 10 + i64::from(ch.to_digit(10).expect("checked"));
                         }
                         Some((i, _)) => {
                             val = val.split_at(i).1;
@@ -226,7 +230,10 @@ mod tests {
 
     #[test]
     fn signed_formatting() {
-        assert_eq!(signed_zats_to_value(-150_000_000).to_string(), "-1.50000000");
+        assert_eq!(
+            signed_zats_to_value(-150_000_000).to_string(),
+            "-1.50000000"
+        );
         assert_eq!(signed_zats_to_value(150_000_000).to_string(), "1.50000000");
     }
 
@@ -350,7 +357,10 @@ mod tests {
         assert_eq!(parse_fixed_point("0.0", 8), Some(0));
         assert_eq!(parse_fixed_point("-0.1", 8), Some(-10_000_000));
         assert_eq!(parse_fixed_point("1.1", 8), Some(110_000_000));
-        assert_eq!(parse_fixed_point("1.10000000000000000", 8), Some(110_000_000));
+        assert_eq!(
+            parse_fixed_point("1.10000000000000000", 8),
+            Some(110_000_000)
+        );
         assert_eq!(parse_fixed_point("1.1e1", 8), Some(1_100_000_000));
         assert_eq!(parse_fixed_point("1.1e-1", 8), Some(11_000_000));
         assert_eq!(parse_fixed_point("1000", 8), Some(100_000_000_000));
@@ -358,9 +368,18 @@ mod tests {
         assert_eq!(parse_fixed_point("0.00000001", 8), Some(1));
         assert_eq!(parse_fixed_point("0.0000000100000000", 8), Some(1));
         assert_eq!(parse_fixed_point("-0.00000001", 8), Some(-1));
-        assert_eq!(parse_fixed_point("1000000000.00000001", 8), Some(100_000_000_000_000_001));
-        assert_eq!(parse_fixed_point("9999999999.99999999", 8), Some(999_999_999_999_999_999));
-        assert_eq!(parse_fixed_point("-9999999999.99999999", 8), Some(-999_999_999_999_999_999));
+        assert_eq!(
+            parse_fixed_point("1000000000.00000001", 8),
+            Some(100_000_000_000_000_001)
+        );
+        assert_eq!(
+            parse_fixed_point("9999999999.99999999", 8),
+            Some(999_999_999_999_999_999)
+        );
+        assert_eq!(
+            parse_fixed_point("-9999999999.99999999", 8),
+            Some(-999_999_999_999_999_999)
+        );
 
         assert_eq!(parse_fixed_point("", 8), None);
         assert_eq!(parse_fixed_point("-", 8), None);

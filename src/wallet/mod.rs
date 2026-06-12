@@ -195,24 +195,32 @@ impl WalletHandle {
     }
 
     pub async fn shield_now(&self) -> Result<Option<TxId>, RpcError> {
-        self.dispatch(|reply| WalletCommand::ShieldNow { reply }).await
+        self.dispatch(|reply| WalletCommand::ShieldNow { reply })
+            .await
     }
 
     pub async fn send(&self, request: TransactionRequest) -> Result<TxId, RpcError> {
-        self.dispatch(|reply| WalletCommand::Send { request, reply }).await
+        self.dispatch(|reply| WalletCommand::Send { request, reply })
+            .await
     }
 
     pub async fn get_raw_tx(&self, txid: TxId) -> Result<Option<RawTx>, RpcError> {
-        self.dispatch(|reply| WalletCommand::GetRawTx { txid, reply }).await
+        self.dispatch(|reply| WalletCommand::GetRawTx { txid, reply })
+            .await
     }
 
     pub async fn broadcast(&self, data: Vec<u8>) -> Result<(), RpcError> {
-        self.dispatch(|reply| WalletCommand::Broadcast { data, reply }).await
+        self.dispatch(|reply| WalletCommand::Broadcast { data, reply })
+            .await
     }
 
     pub async fn unlock(&self, passphrase: Passphrase, timeout_secs: i64) -> Result<(), RpcError> {
-        self.dispatch(|reply| WalletCommand::Unlock { passphrase, timeout_secs, reply })
-            .await
+        self.dispatch(|reply| WalletCommand::Unlock {
+            passphrase,
+            timeout_secs,
+            reply,
+        })
+        .await
     }
 
     pub async fn lock(&self) -> Result<(), RpcError> {
@@ -242,7 +250,10 @@ pub struct WalletRegistry {
 
 impl WalletRegistry {
     pub fn new(default: String) -> Self {
-        WalletRegistry { wallets: HashMap::new(), default }
+        WalletRegistry {
+            wallets: HashMap::new(),
+            default,
+        }
     }
 
     pub fn insert(&mut self, handle: WalletHandle) {
@@ -279,5 +290,12 @@ pub(crate) fn make_handle(
     cmd_tx: mpsc::Sender<WalletCommand>,
     status_rx: watch::Receiver<SyncStatus>,
 ) -> WalletHandle {
-    WalletHandle { name, dir, network, confirmations, cmd_tx, status_rx }
+    WalletHandle {
+        name,
+        dir,
+        network,
+        confirmations,
+        cmd_tx,
+        status_rx,
+    }
 }

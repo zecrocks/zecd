@@ -90,6 +90,9 @@ identical chain views at every checkpoint.
 
 ## Quick start
 
+zecd is not yet published on crates.io - build from source (or use the
+[Docker stack](#docker--self-hosted-stack) / release tarballs):
+
 ```sh
 # 1. Initialize a testnet wallet (generates an age identity + 24-word mnemonic, creates an account).
 cargo run --release -- --datadir ./data --testnet init --wallet default --account-name primary

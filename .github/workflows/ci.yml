@@ -24,9 +24,14 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@stable
         with:
-          components: clippy
+          components: clippy, rustfmt
 
       - uses: Swatinem/rust-cache@v2
+
+      - name: Formatting (both workspaces)
+        run: |
+          cargo fmt --all --check
+          cargo fmt --all --check --manifest-path regtest-harness/Cargo.toml
 
       - name: Build (both binaries)
         run: cargo build --bins

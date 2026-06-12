@@ -150,7 +150,10 @@ async fn regtest_zebra_direct_e2e() {
     }
 
     // Mine it in past the untrusted-confirmations depth (10) and verify the receive.
-    zebrad.generate_blocks(12).await.expect("confirm funding send");
+    zebrad
+        .generate_blocks(12)
+        .await
+        .expect("confirm funding send");
     let deadline = Instant::now() + FUND_TIMEOUT;
     loop {
         let bal = zecd_zebra
@@ -206,13 +209,20 @@ async fn regtest_zebra_direct_e2e() {
     assert_chain_views_agree(&zecd_zebra, &zecd_lwd).await;
 
     // 8. The full Bitcoin-Core wire-format suite against the funded zebra-direct daemon.
-    run_conformance(zebra_cfg.rpc_port, &zebra_cfg.rpc_user, &zebra_cfg.rpc_password);
+    run_conformance(
+        zebra_cfg.rpc_port,
+        &zebra_cfg.rpc_user,
+        &zebra_cfg.rpc_password,
+    );
 }
 
 /// The zebra-direct and lightwalletd-backed instances must report the identical chain.
 async fn assert_chain_views_agree(zebra: &Zecd, lwd: &Zecd) {
     let (hz, hl) = (
-        zebra.block_count().await.expect("zebra-direct getblockcount"),
+        zebra
+            .block_count()
+            .await
+            .expect("zebra-direct getblockcount"),
         lwd.block_count().await.expect("lwd-backed getblockcount"),
     );
     assert_eq!(hz, hl, "block counts diverge between backends");

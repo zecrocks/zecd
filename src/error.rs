@@ -93,7 +93,10 @@ pub struct RpcError {
 
 impl RpcError {
     pub fn new(code: i32, message: impl Into<String>) -> Self {
-        RpcError { code, message: message.into() }
+        RpcError {
+            code,
+            message: message.into(),
+        }
     }
 
     pub fn misc(message: impl Into<String>) -> Self {
@@ -117,7 +120,10 @@ impl RpcError {
     }
 
     pub fn method_not_found(method: &str) -> Self {
-        Self::new(codes::RPC_METHOD_NOT_FOUND, format!("Method not found: {method}"))
+        Self::new(
+            codes::RPC_METHOD_NOT_FOUND,
+            format!("Method not found: {method}"),
+        )
     }
 
     pub fn wallet(message: impl Into<String>) -> Self {

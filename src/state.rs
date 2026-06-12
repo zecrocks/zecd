@@ -69,12 +69,15 @@ pub struct ActiveCommands {
 
 impl ActiveCommands {
     /// Register a command as active; it is removed when the returned guard is dropped.
-    pub fn begin(&self, method: &str) -> CommandGuard {
+    pub(crate) fn begin(&self, method: &str) -> CommandGuard {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         if let Ok(mut map) = self.inner.lock() {
             map.insert(id, (method.to_string(), Instant::now()));
         }
-        CommandGuard { inner: self.inner.clone(), id }
+        CommandGuard {
+            inner: self.inner.clone(),
+            id,
+        }
     }
 
     /// `(method, duration_micros)` for each currently-executing command.
@@ -90,7 +93,8 @@ impl ActiveCommands {
     }
 }
 
-pub struct CommandGuard {
+/// Removes its command from [`ActiveCommands`] on drop.
+pub(crate) struct CommandGuard {
     inner: Arc<Mutex<HashMap<u64, (String, Instant)>>>,
     id: u64,
 }

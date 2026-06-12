@@ -46,13 +46,18 @@ async fn regtest_multiwallet_routing_and_isolation() {
 
     let mut cfg = ZecdConfig::new(lwd.grpc_port, pick_port().expect("pick zecd rpc port"));
     cfg.extra_wallets = vec!["w2".to_string()];
-    let zecd = Zecd::start(&cfg).await.expect("start zecd with two wallets");
+    let zecd = Zecd::start(&cfg)
+        .await
+        .expect("start zecd with two wallets");
     zecd.wait_until_synced(INITIAL_BLOCKS as u64, SYNC_TIMEOUT)
         .await
         .expect("zecd scans the chain");
 
     // Both wallets are loaded and reported (sorted, as bitcoind does).
-    let lw = zecd.call("listwallets", json!([])).await.expect("listwallets");
+    let lw = zecd
+        .call("listwallets", json!([]))
+        .await
+        .expect("listwallets");
     assert_eq!(lw, json!(["default", "w2"]), "both wallets are served");
 
     // /wallet/<name> routes to the named wallet: each derives from its own seed, and
@@ -100,12 +105,21 @@ async fn regtest_multiwallet_routing_and_isolation() {
         .await
         .expect("listlabels (w2)");
     assert!(
-        labels.as_array().expect("array").contains(&json!("w2-label")),
+        labels
+            .as_array()
+            .expect("array")
+            .contains(&json!("w2-label")),
         "w2 sees its label: {labels}"
     );
-    let labels = zecd.call("listlabels", json!([])).await.expect("listlabels (default)");
+    let labels = zecd
+        .call("listlabels", json!([]))
+        .await
+        .expect("listlabels (default)");
     assert!(
-        !labels.as_array().expect("array").contains(&json!("w2-label")),
+        !labels
+            .as_array()
+            .expect("array")
+            .contains(&json!("w2-label")),
         "labels do not leak across wallets: {labels}"
     );
 

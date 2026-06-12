@@ -28,7 +28,9 @@ fn best_block(state: &AppState) -> Result<(u32, Option<String>, Option<i64>), Rp
     Ok((st.fully_scanned.unwrap_or(0), st.best_block_hash, None))
 }
 
-pub fn getblockchaininfo(state: &AppState) -> Result<Value, RpcError> {
+/// `getblockchaininfo` - chain/sync overview; `blocks`/`headers` follow the module-level
+/// height conventions and `initialblockdownload` mirrors the wallet's scanning state.
+pub(crate) fn getblockchaininfo(state: &AppState) -> Result<Value, RpcError> {
     let w = state.registry.get(None)?;
     let st = w.status();
     let (blocks, best_hash, best_time) = best_block(state)?;
@@ -50,19 +52,26 @@ pub fn getblockchaininfo(state: &AppState) -> Result<Value, RpcError> {
     }))
 }
 
-pub fn getblockcount(state: &AppState) -> Result<Value, RpcError> {
+/// `getblockcount` - the fully-scanned height (the height at which balances are accurate).
+pub(crate) fn getblockcount(state: &AppState) -> Result<Value, RpcError> {
     let w = state.registry.get(None)?;
     Ok(json!(w.status().fully_scanned.unwrap_or(0)))
 }
 
-pub fn getbestblockhash(state: &AppState) -> Result<Value, RpcError> {
+/// `getbestblockhash` - the hash of the [`getblockcount`] block (`-1` while nothing is
+/// scanned yet).
+pub(crate) fn getbestblockhash(state: &AppState) -> Result<Value, RpcError> {
     match best_block(state)? {
         (_, Some(hash), _) => Ok(Value::String(hash)),
-        _ => Err(RpcError::misc("best block hash not yet known (still syncing)")),
+        _ => Err(RpcError::misc(
+            "best block hash not yet known (still syncing)",
+        )),
     }
 }
 
-pub fn getblockhash(state: &AppState, req: &RpcRequest) -> Result<Value, RpcError> {
+/// `getblockhash <height>` - answered from the wallet's scanned-blocks table (or the sync
+/// status for the not-yet-scanned tip); heights outside the wallet's range are `-8`.
+pub(crate) fn getblockhash(state: &AppState, req: &RpcRequest) -> Result<Value, RpcError> {
     let height = req
         .param(0)
         .and_then(|v| v.as_u64())
@@ -107,7 +116,7 @@ fn parse_blockhash_param(s: &str) -> Result<(), RpcError> {
 /// the `previousblockhash`/`nextblockhash` links (no version/merkleroot/nonce/bits/
 /// difficulty - a light client never sees them). The common poller pattern - walk
 /// `nextblockhash` from a checkpoint, read `height`/`confirmations`/`time` - works.
-pub fn getblockheader(state: &AppState, req: &RpcRequest) -> Result<Value, RpcError> {
+pub(crate) fn getblockheader(state: &AppState, req: &RpcRequest) -> Result<Value, RpcError> {
     let hash = req
         .param(0)
         .and_then(|v| v.as_str())

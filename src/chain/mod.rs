@@ -53,7 +53,10 @@ pub struct BroadcastOutcome {
 
 impl BroadcastOutcome {
     pub fn accepted() -> Self {
-        BroadcastOutcome { error_code: 0, error_message: String::new() }
+        BroadcastOutcome {
+            error_code: 0,
+            error_message: String::new(),
+        }
     }
     pub fn is_accepted(&self) -> bool {
         self.error_code == 0
@@ -142,9 +145,7 @@ pub trait ChainSource: Send {
     /// poller). The stream yields the current mempool and newly-arriving transactions, and
     /// **closes (yields `None`) when a new block arrives** - the actor relies on that as its
     /// sync-now signal, so both backends must preserve it.
-    fn subscribe_mempool(
-        &mut self,
-    ) -> impl Future<Output = anyhow::Result<MempoolStream>> + Send;
+    fn subscribe_mempool(&mut self) -> impl Future<Output = anyhow::Result<MempoolStream>> + Send;
 
     /// The current UTXO set of the given transparent addresses (lightwalletd
     /// `GetAddressUtxos`; zebra `getaddressutxos`). tparty's deposit discovery.

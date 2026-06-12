@@ -17,7 +17,11 @@ pub struct Backoff {
 
 impl Backoff {
     pub fn new(base: Duration, max: Duration) -> Self {
-        Backoff { base, max, attempt: 0 }
+        Backoff {
+            base,
+            max,
+            attempt: 0,
+        }
     }
 
     /// The (pre-jitter) ceiling for the current attempt: `min(base * 2^attempt, max)`. The shift

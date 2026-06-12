@@ -26,7 +26,9 @@ fn version_number() -> u64 {
     major * 10000 + minor * 100 + patch
 }
 
-pub fn getnetworkinfo(state: &AppState) -> Result<Value, RpcError> {
+/// `getnetworkinfo` - daemon version/identity in Bitcoin Core's shape; `connections` counts
+/// the single lightwalletd upstream (1 when connected, 0 otherwise).
+pub(crate) fn getnetworkinfo(state: &AppState) -> Result<Value, RpcError> {
     let up = connected(state);
     Ok(json!({
         "version": version_number(),
@@ -48,11 +50,14 @@ pub fn getnetworkinfo(state: &AppState) -> Result<Value, RpcError> {
     }))
 }
 
-pub fn getconnectioncount(state: &AppState) -> Result<Value, RpcError> {
+/// `getconnectioncount` - 1 while the lightwalletd upstream is reachable, else 0.
+pub(crate) fn getconnectioncount(state: &AppState) -> Result<Value, RpcError> {
     Ok(json!(if connected(state) { 1 } else { 0 }))
 }
 
-pub fn getpeerinfo(state: &AppState) -> Result<Value, RpcError> {
+/// `getpeerinfo` - the active lightwalletd upstream as the single "peer", with its
+/// `conn_state` (down|syncing|ready) as an extension field.
+pub(crate) fn getpeerinfo(state: &AppState) -> Result<Value, RpcError> {
     // zecd's single "peer" is the active lightwalletd upstream. Report it (with its connection
     // state) when connected; otherwise an empty peer list, as bitcoind does with no peers.
     let Ok(w) = state.registry.get(None) else {
@@ -71,7 +76,8 @@ pub fn getpeerinfo(state: &AppState) -> Result<Value, RpcError> {
     }]))
 }
 
-pub fn ping() -> Result<Value, RpcError> {
+/// `ping` - liveness no-op (there is no P2P peer to ping).
+pub(crate) fn ping() -> Result<Value, RpcError> {
     Ok(Value::Null)
 }
 
@@ -82,6 +88,14 @@ mod tests {
         let v = super::version_number();
         assert!(v > 0, "version must encode to a nonzero number");
         // 0.1.0 -> 100, 1.2.3 -> 10203; sanity-check the arithmetic shape.
-        assert_eq!(v % 100, env!("CARGO_PKG_VERSION").split('.').nth(2).unwrap().parse::<u64>().unwrap());
+        assert_eq!(
+            v % 100,
+            env!("CARGO_PKG_VERSION")
+                .split('.')
+                .nth(2)
+                .unwrap()
+                .parse::<u64>()
+                .unwrap()
+        );
     }
 }
