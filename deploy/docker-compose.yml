@@ -1,13 +1,19 @@
-# Example self-hosted Zcash stack:  zebra (full node) -> lightwalletd -> zecd.
+# Example self-hosted Zcash stack:  zebra (full node) -> zecd.
+#
+# zecd talks straight to zebra's JSON-RPC (zebra:// mode, the default backend). The optional
+# `lightwalletd` profile adds a lightwalletd in front of the same zebra - enable it when this
+# stack should also serve other light clients (mobile wallets) over gRPC, and add
+# "http://lightwalletd:9067" to the failover list in zecd.toml.
 #
 # Testnet by default. For mainnet, add `-f docker-compose.mainnet.yml` to each command below (it
 # swaps in the *.mainnet.* config files). The image tags are EXAMPLES - pin them to releases you
 # have verified; the zebra/lightwalletd flags can vary between versions.
 #
-# First run (zebra must sync enough for lightwalletd before zecd can init):
-#   docker compose up -d zebra lightwalletd        # let these sync
+# First run (zebra must sync enough before zecd can init):
+#   docker compose up -d zebra                     # let it sync
 #   docker compose run --rm zecd init --wallet default --account-name primary
 #   docker compose up -d                           # start zecd (and the rest)
+# With the lightwalletd profile: docker compose --profile lightwalletd up -d
 #
 # Probes:   curl localhost:9233/healthz ; curl localhost:9233/readyz
 # RPC:      curl --user zec:CHANGE-ME --data-binary '{"method":"getblockchaininfo","id":1}' localhost:18232/
@@ -21,10 +27,11 @@ services:
       - ./zebrad.toml:/etc/zebra/zebrad.toml:ro
       - zebra-state:/var/cache/zebra
     expose:
-      - "18232"   # JSON-RPC, reached by lightwalletd over the compose network
+      - "18234"   # JSON-RPC, reached by zecd (and lightwalletd, if enabled) over the compose network
 
   lightwalletd:
     image: electriccoinco/lightwalletd:v0.4.19   # pin to a verified release
+    profiles: ["lightwalletd"]                   # optional: serve other light clients over gRPC
     restart: unless-stopped
     depends_on:
       - zebra
@@ -46,7 +53,7 @@ services:
       dockerfile: Dockerfile
     restart: unless-stopped
     depends_on:
-      - lightwalletd
+      - zebra
     command: ["--datadir=/var/lib/zecd", "--conf=/etc/zecd/zecd.toml"]
     environment:
       - RUST_LOG=info

@@ -1,11 +1,16 @@
-# Minimal Zebra config for serving lightwalletd. Testnet default; the mainnet variant is
-# zebrad.mainnet.toml (used via docker-compose.mainnet.yml).
+# Minimal Zebra config for serving zecd (and lightwalletd, if that profile is enabled).
+# Testnet default; the mainnet variant is zebrad.mainnet.toml (used via docker-compose.mainnet.yml).
 [network]
 network = "Testnet"
 
 [rpc]
-# Expose JSON-RPC on the compose network for lightwalletd. Keep this off any public interface.
-listen_addr = "0.0.0.0:18232"
+# Expose JSON-RPC on the compose network for zecd / lightwalletd. 18234 is the port zecd's
+# default `server = "zebra"` expects on testnet (8234 on mainnet; zebra ships with RPC
+# disabled, so there is no upstream default to follow). Keep this off any public interface.
+listen_addr = "0.0.0.0:18234"
+# The compose network is private and the clients (zecd, lightwalletd) authenticate with
+# user/password or not at all, so the cookie file isn't shared between containers.
+enable_cookie_auth = false
 
 [state]
 cache_dir = "/var/cache/zebra"

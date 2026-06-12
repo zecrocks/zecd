@@ -10,12 +10,13 @@ dir = "/var/lib/zecd/default"
 
 [lightwalletd]
 # Failover, tried in order, always preferring the first (the daemon snaps back to it when it
-# recovers). Here: the co-located lightwalletd first, then the public testnet endpoint if the
-# local node is down. The scheme prefix sets TLS per endpoint - http:// for the plaintext local
-# node (it runs with --no-tls-very-insecure), https:// for the public TLS endpoint.
-servers = ["http://lightwalletd:9067", "https://testnet.zec.rocks:443"]
+# recovers). Here: the co-located zebra full node first (zebra:// = its JSON-RPC, no
+# lightwalletd in between), then the public testnet endpoint if the local node is down.
+servers = ["zebra://zebra:18234", "https://testnet.zec.rocks:443"]
 # For a MAINNET deployment, set network = "main" above and use the public zecrocks failover pair:
-# servers = ["http://lightwalletd:9067", "https://zec.rocks:443", "https://eu.zec.rocks:443"]
+# servers = ["zebra://zebra:18234", "https://zec.rocks:443", "https://eu.zec.rocks:443"]
+# Running the optional lightwalletd profile (e.g. to also serve mobile light clients)? Slot it
+# in as a fallback: servers = ["zebra://zebra:18234", "http://lightwalletd:9067", ...]
 connect_timeout_secs = 10
 reconnect_base_secs = 1
 reconnect_max_secs = 60

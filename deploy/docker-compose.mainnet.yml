@@ -2,7 +2,7 @@
 # this override swaps each service's config file for its mainnet variant. Ports and wiring are
 # unchanged, so the same workflow applies - just add `-f docker-compose.mainnet.yml`:
 #
-#   docker compose -f docker-compose.yml -f docker-compose.mainnet.yml up -d zebra lightwalletd
+#   docker compose -f docker-compose.yml -f docker-compose.mainnet.yml up -d zebra
 #   docker compose -f docker-compose.yml -f docker-compose.mainnet.yml run --rm zecd init --wallet default --account-name primary
 #   docker compose -f docker-compose.yml -f docker-compose.mainnet.yml up -d
 #
@@ -14,6 +14,7 @@ services:
     volumes:
       - ./zebrad.mainnet.toml:/etc/zebra/zebrad.toml:ro
 
+  # Only used with the optional `--profile lightwalletd` (see docker-compose.yml).
   lightwalletd:
     volumes:
       - ./lightwalletd-zcash.mainnet.conf:/etc/lightwalletd/zcash.conf:ro

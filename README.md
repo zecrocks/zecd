@@ -17,8 +17,8 @@ to access funds.
 
 zecd is a light client, for quick scalability. It syncs compact blocks in the background and
 never speaks P2P or indexes the chain itself. Production deployments should connect to a
-self-hosted Zcash full node - either directly (`zebra://`) or through your own lightwalletd -
-see [Choosing a chain backend](#choosing-a-chain-backend).
+self-hosted Zcash full node - directly (`zebra://`, the default) or through your own
+lightwalletd - see [Choosing a chain backend](#choosing-a-chain-backend).
 
 All zecd funds are recoverable by a seed phrase. Importing private keys per-address is not
 supported, all addresses are dervied from wallet seeds.
@@ -28,21 +28,26 @@ supported, all addresses are dervied from wallet seeds.
 ```mermaid
 flowchart LR
     app["your app /<br>Bitcoin RPC client"] -->|JSON-RPC| zecd
-    zecd -->|gRPC| lwd[lightwalletd] --> zebra["zebra<br>(full node)"]
-    zecd -.->|"JSON-RPC (zebra:// mode)"| zebra
+    zecd -->|"JSON-RPC (default)"| zebra["zebra<br>(full node)"]
+    zecd -.->|gRPC| lwd[lightwalletd] -.-> zebra
 ```
 
 Two ways to reach the chain, sharing one ordered failover list:
 
-- **lightwalletd (default):** point zecd at your own lightwalletd with
+- **zebra (default):** point zecd straight at a **local** zebrad's JSON-RPC. The default
+  `[lightwalletd] server = "zebra"` is shorthand for `zebra://127.0.0.1:8234` on mainnet /
+  `zebra://127.0.0.1:18234` on testnet (set zebrad's `rpc.listen_addr` to that port - zebra
+  ships with RPC disabled, and 8232/18232 are zecd's own RPC ports); any explicit
+  `zebra://host:port` works too. zecd derives compact blocks, tree state, and mempool
+  visibility from the node RPCs itself (the same ones lightwalletd uses), so there is no
+  lightwalletd to operate.
+- **lightwalletd:** point zecd at your own lightwalletd with
   `[lightwalletd] server = "127.0.0.1:9067"`, or use the public zecrocks infrastructure
-  (`zec.rocks:443` mainnet, `testnet.zec.rocks:443` testnet) - the out-of-the-box default,
-  no node to stand up. This is the only mode that works with remote/public endpoints (and Tor).
-- **zebra-direct:** point zecd straight at a **local** zebrad's JSON-RPC with
-  `server = "zebra://127.0.0.1:8232"` - one less daemon to run. zecd derives compact blocks,
-  tree state, and mempool visibility from the node RPCs itself (the same ones lightwalletd
-  uses). Both can share the list: `servers = ["zebra://127.0.0.1:8232", "zec.rocks:443"]`
-  is a local node with a public fallback.
+  (`server = "zecrocks"` → `zec.rocks:443` mainnet, `testnet.zec.rocks:443` testnet) - no
+  node to stand up. This is the only mode that works with remote/public endpoints (and Tor).
+
+Both can share the list: `servers = ["zebra", "zec.rocks:443"]` is a local node with a
+public fallback.
 
 The [Docker stack](#docker--self-hosted-stack) below runs the full self-hosted pipeline with
 one compose file.
@@ -60,7 +65,7 @@ in your threat model. Public infrastructure like `zec.rocks` is great for gettin
 development, and as an emergency *fallback* - not as the primary for a treasury or a
 payment processor.
 
-| | `zebra://` (zebra-direct) | local lightwalletd | public lightwalletd (`zec.rocks`, …) |
+| | zebra (default, `zebra://`) | local lightwalletd | public lightwalletd (`zec.rocks`, …) |
 |---|---|---|---|
 | Trust/privacy | best - only your own node | best - only your own infra | sync pattern + broadcasts visible to the operator |
 | Daemons to run | zebra | zebra + lightwalletd | none |
@@ -72,33 +77,38 @@ payment processor.
 
 Rules of thumb:
 
-- **Simplest production setup:** `servers = ["zebra://127.0.0.1:8232"]` - one node, one
-  wallet daemon, no lightwalletd to operate. Prefer this when zecd is the only light client
-  you run and a slower first sync (and ~2 s of 0-conf latency) is acceptable.
+- **Simplest production setup (the default):** `server = "zebra"` - one node, one wallet
+  daemon, no lightwalletd to operate. Prefer this when zecd is the only light client you run
+  and a slower first sync (and ~2 s of 0-conf latency) is acceptable.
 - **Run lightwalletd in front of your zebra** when you also serve mobile/other light
   wallets from the same node, want the fastest initial sync, or want push-based mempool
-  delivery. This is what `deploy/docker-compose.yml` ships.
-- **Mix them for resilience:** `servers = ["zebra://127.0.0.1:8232", "https://zec.rocks:443"]`
+  delivery. `deploy/docker-compose.yml` ships this as an opt-in profile.
+- **Mix them for resilience:** `servers = ["zebra", "https://zec.rocks:443"]`
   keeps your own node as the primary and only ever touches the public fallback while your
   node is down (zecd snaps back automatically; see failover below).
 - **Tor/remote endpoints require lightwalletd mode:** `zebra://` is deliberately
   local-only (plaintext, no SOCKS) - never expose a zebra RPC port to the network.
 
 The two backends are interchangeable and equivalence-tested in CI: the regtest suite runs a
-zebra-direct zecd and a lightwalletd-backed zecd against the same chain and requires
+zebra-backed zecd and a lightwalletd-backed zecd against the same chain and requires
 identical chain views at every checkpoint.
 
 ## Quick start
 
 zecd is not yet published on crates.io - build from source (or use the
-[Docker stack](#docker--self-hosted-stack) / release tarballs):
+[Docker stack](#docker--self-hosted-stack) / release tarballs).
+
+By default zecd expects a local zebrad (`server = "zebra"` → `zebra://127.0.0.1:18234` on
+testnet). For a no-node test drive, point it at the public lightwalletd infrastructure with
+`--server zecrocks`, as below; drop that flag once you run your own node:
 
 ```sh
 # 1. Initialize a testnet wallet (generates an age identity + 24-word mnemonic, creates an account).
-cargo run --release -- --datadir ./data --testnet init --wallet default --account-name primary
+cargo run --release -- --datadir ./data --testnet --server zecrocks \
+    init --wallet default --account-name primary
 
 # 2. Run the daemon (syncs in the background, serves JSON-RPC).
-cargo run --release -- --datadir ./data --testnet \
+cargo run --release -- --datadir ./data --testnet --server zecrocks \
     --rpcuser zec --rpcpassword secret --rpcbind 127.0.0.1 --rpcport 18232
 ```
 
@@ -135,14 +145,17 @@ default_wallet = "default"
 dir = "./data/default"
 
 [lightwalletd]
-server = "zecrocks"              # "ecc" | "ywallet" | "zecrocks" | "host:port" (or "h:p,h:p")
-                                 #   | "zebra://host:port" (a local zebrad's JSON-RPC, no lightwalletd)
+server = "zebra"                 # default: a local zebrad's JSON-RPC, no lightwalletd
+                                 #   ("zebra" = zebra://127.0.0.1:8234 main / :18234 test -
+                                 #   point zebrad's rpc.listen_addr there). Other tokens:
+                                 #   "zebra://host:port" | "ecc" | "ywallet" | "zecrocks"
+                                 #   | "host:port" (or "h:p,h:p") for lightwalletd
 # Or list multiple endpoints for failover, tried in order and always preferring the first; the
 # daemon snaps back to the primary when it recovers. `servers` takes precedence over `server`.
 # A scheme prefix sets the kind/TLS per endpoint (zebra:// local full node; http:// plaintext
 # lightwalletd; https:// TLS lightwalletd), so a local node and public fallbacks share one list:
-#   mainnet:  servers = ["zebra://127.0.0.1:8232", "https://zec.rocks:443", "https://eu.zec.rocks:443"]
-#   testnet:  servers = ["http://127.0.0.1:9067", "https://testnet.zec.rocks:443"]
+#   mainnet:  servers = ["zebra", "https://zec.rocks:443", "https://eu.zec.rocks:443"]
+#   testnet:  servers = ["zebra", "https://testnet.zec.rocks:443"]
 connection = "direct"           # "direct" | "tor" | "socks5://host:port" - route all lightwalletd
                                 #   traffic through a SOCKS5 proxy ("tor" = 127.0.0.1:9050). TLS is
                                 #   still layered on top, so the proxy only sees ciphertext.
@@ -259,12 +272,14 @@ load, so cover the brief prover-init at boot with a `startupProbe` / `initialDel
 
 ## Docker / self-hosted stack
 
-`deploy/docker-compose.yml` runs the full stack (zebra, lightwalletd, zecd; testnet by default);
-`Dockerfile` builds the zecd image.
+`deploy/docker-compose.yml` runs the self-hosted stack (zebra → zecd, testnet by default;
+zecd talks straight to zebra's JSON-RPC). An optional `lightwalletd` compose profile adds a
+lightwalletd in front of the same zebra for serving other light clients. `Dockerfile` builds
+the zecd image.
 
 ```sh
 cd deploy
-docker compose up -d zebra lightwalletd     # let these sync first
+docker compose up -d zebra                  # let it sync first
 docker compose run --rm zecd init --wallet default --account-name primary
 docker compose up -d
 curl localhost:9233/readyz
@@ -276,7 +291,7 @@ mainnet config (`zebrad.mainnet.toml`, `lightwalletd-zcash.mainnet.conf`, `zecd.
 local node primary with `zec.rocks:443` / `eu.zec.rocks:443` failover):
 
 ```sh
-docker compose -f docker-compose.yml -f docker-compose.mainnet.yml up -d zebra lightwalletd
+docker compose -f docker-compose.yml -f docker-compose.mainnet.yml up -d zebra
 docker compose -f docker-compose.yml -f docker-compose.mainnet.yml run --rm zecd init --wallet default --account-name primary
 docker compose -f docker-compose.yml -f docker-compose.mainnet.yml up -d
 ```
@@ -378,8 +393,8 @@ Out of scope by design:
 Edges to be aware of (consequences of being a shielded light wallet):
 
 - Spending needs confirmations: an incoming mempool payment is visible immediately
-  (`getunconfirmedbalance` / `listtransactions` at 0 conf, via lightwalletd's mempool stream
-  or, in zebra-direct mode, a `getrawmempool` poller),
+  (`getunconfirmedbalance` / `listtransactions` at 0 conf, via the zebra backend's
+  `getrawmempool` poller or lightwalletd's mempool stream),
   but received notes must mine and reach the confirmation minimum before they are spendable.
   The default minimum is [ZIP 315](https://zips.z.cash/zip-0315)'s: 3 confirmations for the
   wallet's own change, 10 for third-party payments (~12.5 minutes at 75-second blocks);

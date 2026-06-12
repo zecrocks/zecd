@@ -3,7 +3,7 @@
 Transparent Zcash deposit addresses that auto-shield. `tparty` is built from the zecd
 repository (`cargo build --release --bin tparty`) and shares zecd's library: same JSON-RPC
 1.0 wire format, Basic/cookie auth, Bitcoin Core error codes, wallet format, and
-light-client architecture (`zebra → lightwalletd → tparty`).
+light-client architecture (`zebra → tparty` by default, optionally through lightwalletd).
 
 ## When to run it
 

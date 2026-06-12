@@ -608,9 +608,9 @@ pub struct Zecd {
 /// How `zecd` should reach the regtest chain (lightwalletd gRPC and/or zebrad JSON-RPC
 /// directly), and what RPC port/creds to expose.
 pub struct ZecdConfig {
-    /// Primary lightwalletd gRPC port (`None` for zebra-direct mode).
+    /// Primary lightwalletd gRPC port (`None` for zebra mode).
     pub lightwalletd_port: Option<u16>,
-    /// zebrad JSON-RPC port for direct (`zebra://`) mode; listed before any lightwalletd.
+    /// zebrad JSON-RPC port for zebra (`zebra://`) mode; listed before any lightwalletd.
     pub zebra_rpc_port: Option<u16>,
     /// Optional fallback lightwalletd (for the failover tests); listed after the primary.
     pub fallback_lightwalletd_port: Option<u16>,
@@ -650,10 +650,10 @@ impl ZecdConfig {
         }
     }
 
-    /// Zebra-direct mode: zecd talks straight to zebrad's JSON-RPC (`zebra://`), with no
+    /// Zebra mode: zecd talks straight to zebrad's JSON-RPC (`zebra://`), with no
     /// lightwalletd anywhere in its server list - so a bug in the zebra backend can't be
     /// silently rescued by failover.
-    pub fn new_zebra_direct(zebra_rpc_port: u16, rpc_port: u16) -> ZecdConfig {
+    pub fn new_zebra(zebra_rpc_port: u16, rpc_port: u16) -> ZecdConfig {
         ZecdConfig {
             lightwalletd_port: None,
             zebra_rpc_port: Some(zebra_rpc_port),

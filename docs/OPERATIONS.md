@@ -1,9 +1,9 @@
 # zecd operations runbook
 
 How to run `zecd` in production (mainnet) without losing funds or sleep. Read the
-README first for the architecture (`zebra → lightwalletd → zecd`) and configuration
-reference; this document covers backup/restore, monitoring, upgrades, and the mainnet
-checklist.
+README first for the architecture (`zebra → zecd` by default, optionally with your own
+lightwalletd in between) and configuration reference; this document covers
+backup/restore, monitoring, upgrades, and the mainnet checklist.
 
 Everything here applies equally to **`tparty`** (same wallet format, key custody,
 health endpoints - default health port 9237 - and restore procedures; substitute
@@ -18,7 +18,7 @@ health endpoints - default health port 9237 - and restore procedures; substitute
   or totals below `[tparty] threshold_zat`; `shieldfunds` flushes dust manually).
 - When pairing tparty with zecd on one seed, give each daemon its **own datadir**
   (each owns its wallet database exclusively); they may share the mnemonic and even
-  the lightwalletd.
+  the upstream node.
 
 ## What to back up
 
@@ -58,8 +58,8 @@ are not final until `/readyz` reports ready.
 - `GET /healthz` (health port, default 9233) - liveness.
 - `GET /readyz` - readiness: 200 once connected and scanned past `[health]
   ready_progress`. When 503, the body's `reason` distinguishes `upstream_down`
-  (lightwalletd unreachable - page someone) from `syncing` (normal catch-up).
-- `GET /status` - per-wallet sync state, active lightwalletd endpoint, `conn_state`
+  (zebra/lightwalletd unreachable - page someone) from `syncing` (normal catch-up).
+- `GET /status` - per-wallet sync state, active upstream endpoint, `conn_state`
   (`down` | `syncing` | `ready`). Alert if `conn_state` stays `down`.
 - `getrpcinfo.active_commands` - what's executing right now (visibility under load).
 - Logs: set `[log] format = "json"` for aggregation. Every RPC call logs method,
@@ -117,7 +117,8 @@ need a rollback path (stop the daemon before copying).
       human-operated wallets, `zecd init --encrypt` (or `encryptwallet`) so spending
       requires a verified `walletpassphrase` with an enforced timeout.
 - [ ] Mnemonic + birthday recorded offline; restore procedure tested on testnet.
-- [ ] Own `lightwalletd` as primary, public endpoints as fallback (`[lightwalletd]
-      servers`); Docker images pinned to verified releases.
+- [ ] Own node as primary - `server = "zebra"` (or your own lightwalletd) - with public
+      endpoints only as fallback (`[lightwalletd] servers`); Docker images pinned to
+      verified releases.
 - [ ] `/readyz` wired into your orchestrator with a `startupProbe` covering initial
       sync; alerts on `upstream_down`.

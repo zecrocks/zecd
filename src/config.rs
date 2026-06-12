@@ -15,10 +15,11 @@ use zcash_client_backend::data_api::wallet::ConfirmationsPolicy;
 
 use crate::network::ZNetwork;
 
-/// Default lightwalletd endpoint: the public zecrocks infrastructure
-/// (`zec.rocks:443` on mainnet, `testnet.zec.rocks:443` on testnet). Self-hosted
-/// deployments override `[lightwalletd] server` with their local node.
-pub const DEFAULT_LIGHTWALLETD: &str = "zecrocks";
+/// Default chain upstream: a local zebrad's JSON-RPC (`zebra://127.0.0.1:8234` on mainnet,
+/// `zebra://127.0.0.1:18234` on testnet/regtest - see `lightwalletd::ZEBRA_RPC_PORT_*`).
+/// Deployments without a local node set `[lightwalletd] server` to their own lightwalletd
+/// or a public preset (`zecrocks`).
+pub const DEFAULT_SERVER: &str = "zebra";
 
 /// Per-binary configuration defaults, so `zecd` and `tparty` running side by side on one
 /// host never collide on config files, datadirs, or ports.
@@ -54,8 +55,9 @@ pub const TPARTY_DEFAULTS: BinaryDefaults = BinaryDefaults {
     health_port: 9237,
 };
 
-/// Resolve the ordered list of lightwalletd server tokens by precedence:
-/// CLI `--server` > file `servers` array > file `server` string > built-in default.
+/// Resolve the ordered list of upstream server tokens by precedence:
+/// CLI `--server` > file `servers` array > file `server` string > built-in default
+/// (a local zebrad).
 fn select_server_tokens(
     cli_server: Option<String>,
     file_servers: Option<Vec<String>>,
@@ -68,7 +70,7 @@ fn select_server_tokens(
     } else if let Some(s) = file_server {
         vec![s]
     } else {
-        vec![DEFAULT_LIGHTWALLETD.to_string()]
+        vec![DEFAULT_SERVER.to_string()]
     }
 }
 
@@ -179,8 +181,9 @@ pub struct WalletEntry {
 
 #[derive(Debug, Clone)]
 pub struct LightwalletdConfig {
-    /// Ordered list of server tokens; each is `ecc` | `ywallet` | `zecrocks` or a `host:port`
-    /// (or a comma-separated `host:port` list). Tried in order, always preferring the first.
+    /// Ordered list of server tokens; each is `zebra` (a local zebrad, the default) |
+    /// `zebra://host:port` | `ecc` | `ywallet` | `zecrocks` or a `host:port` (or a
+    /// comma-separated `host:port` list). Tried in order, always preferring the first.
     pub servers: Vec<String>,
     /// Optional SOCKS5 proxy to route every lightwalletd connection through, parsed from the
     /// `connection` setting (`direct` | `tor` | `socks5://host:port`). `None` = direct.
@@ -466,7 +469,7 @@ pub struct Cli {
     #[arg(long)]
     pub testnet: bool,
 
-    /// Use regtest - a local zebra+lightwalletd chain (overrides config `network`).
+    /// Use regtest - a local zebra regtest chain (overrides config `network`).
     #[arg(long)]
     pub regtest: bool,
 
@@ -494,7 +497,8 @@ pub struct Cli {
     #[arg(long = "rpcauth", value_name = "USER:SALT$HASH")]
     pub rpc_auth: Vec<String>,
 
-    /// lightwalletd server: ecc | ywallet | zecrocks | host:port[,host:port].
+    /// Chain upstream: zebra (local zebrad, default) | zebra://host:port | ecc | ywallet |
+    /// zecrocks | host:port[,host:port] (lightwalletd).
     #[arg(long, value_name = "SERVER")]
     pub server: Option<String>,
 
@@ -886,10 +890,10 @@ mod tests {
             select_server_tokens(None, Some(vec![]), Some("str:1".into())),
             vec!["str:1".to_string()]
         );
-        // Nothing configured -> built-in default.
+        // Nothing configured -> built-in default (a local zebrad).
         assert_eq!(
             select_server_tokens(None, None, None),
-            vec![DEFAULT_LIGHTWALLETD.to_string()]
+            vec![DEFAULT_SERVER.to_string()]
         );
     }
 

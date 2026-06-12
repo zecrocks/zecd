@@ -10,10 +10,11 @@ default_wallet = "default"
 dir = "/var/lib/zecd/default"
 
 [lightwalletd]
-# Failover, tried in order, always preferring the first: the co-located lightwalletd, then the
-# public zecrocks mainnet endpoints if the local node is down. The scheme prefix sets TLS per
-# endpoint - http:// for the plaintext local node, https:// for the public TLS endpoints.
-servers = ["http://lightwalletd:9067", "https://zec.rocks:443", "https://eu.zec.rocks:443"]
+# Failover, tried in order, always preferring the first: the co-located zebra full node
+# (zebra:// = its JSON-RPC, no lightwalletd in between), then the public zecrocks mainnet
+# endpoints if the local node is down. With the optional lightwalletd profile enabled, slot
+# "http://lightwalletd:9067" in as the second entry.
+servers = ["zebra://zebra:18234", "https://zec.rocks:443", "https://eu.zec.rocks:443"]
 connect_timeout_secs = 10
 reconnect_base_secs = 1
 reconnect_max_secs = 60

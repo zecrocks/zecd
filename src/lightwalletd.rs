@@ -4,10 +4,11 @@
 //! (e.g. a co-located plaintext lightwalletd reached by service name in docker-compose).
 //!
 //! Two endpoint kinds share the one ordered failover list (see [`ServerKind`]):
-//! lightwalletd gRPC endpoints (`host:port`, presets, `http(s)://` prefixes) and local
-//! zebrad JSON-RPC endpoints (`zebra://host:port`) - so `servers = ["zebra://127.0.0.1:8232",
-//! "zec.rocks:443"]` gives a local full node with a public lightwalletd fallback. Connecting
-//! yields an [`AnySource`] either way; everything above this module is backend-agnostic.
+//! local zebrad JSON-RPC endpoints (`zebra://host:port`, or the `zebra` preset - the
+//! default) and lightwalletd gRPC endpoints (`host:port`, presets, `http(s)://` prefixes) -
+//! so `servers = ["zebra://127.0.0.1:8234", "zec.rocks:443"]` gives a local full node with
+//! a public lightwalletd fallback. Connecting yields an [`AnySource`] either way; everything
+//! above this module is backend-agnostic.
 //!
 //! Connections can optionally be routed through a SOCKS5 proxy (`[lightwalletd] connection`),
 //! which covers Tor, Nym, and any other SOCKS5 proxy - see [`parse_connection_mode`]. The proxy,
@@ -270,6 +271,13 @@ pub fn apply_zebra_auth(servers: &mut [Server], auth: &ZebraAuth) {
     }
 }
 
+/// The `zebra` preset's local zebrad JSON-RPC ports (the default upstream). zebra ships with
+/// RPC disabled - there is no upstream default port to inherit - and the zcashd-convention
+/// RPC ports (8232/18232) are zecd's own, so the recommended `rpc.listen_addr` for a zebrad
+/// serving zecd sits next to zebra's P2P ports (8233/18233) instead.
+pub const ZEBRA_RPC_PORT_MAIN: u16 = 8234;
+pub const ZEBRA_RPC_PORT_TEST: u16 = 18234;
+
 // Presets as (host, port). TLS roots / force-mode are attached at resolve time.
 const ECC_TESTNET: &[(&str, u16)] = &[("lightwalletd.testnet.electriccoin.co", 9067)];
 const YWALLET_MAINNET: &[(&str, u16)] = &[
@@ -279,8 +287,9 @@ const YWALLET_MAINNET: &[(&str, u16)] = &[
 const ZEC_ROCKS_MAINNET: &[(&str, u16)] = &[("zec.rocks", 443)];
 const ZEC_ROCKS_TESTNET: &[(&str, u16)] = &[("testnet.zec.rocks", 443)];
 
-/// Resolve a single server token (`ecc` | `ywallet` | `zecrocks` | `host:port[,host:port]` |
-/// `zebra://host:port`) for the given network into an ordered, non-empty list of [`Server`]s.
+/// Resolve a single server token (`zebra` | `ecc` | `ywallet` | `zecrocks` |
+/// `host:port[,host:port]` | `zebra://host:port`) for the given network into an ordered,
+/// non-empty list of [`Server`]s.
 /// Multi-endpoint presets and comma-separated host lists expand to all of their endpoints
 /// (the first is the primary). A `host:port` may carry an `http://`/`https://` scheme to
 /// force that endpoint's TLS mode, overriding the global `tls` setting (e.g. a plaintext
@@ -293,8 +302,28 @@ pub fn resolve(
     force_tls: Option<bool>,
     proxy: Option<SocketAddr>,
 ) -> anyhow::Result<Vec<Server>> {
-    // The named presets are public mainnet/testnet infrastructure; regtest has none, so a
-    // regtest deployment must give an explicit `host:port` (handled by `parse_host_list`).
+    // `zebra` (the default token) is a local zebrad's JSON-RPC on the recommended
+    // `rpc.listen_addr` port for the network - shorthand for `zebra://127.0.0.1:8234`
+    // (mainnet) / `zebra://127.0.0.1:18234` (testnet/regtest).
+    if server == "zebra" {
+        let port = match network {
+            ZNetwork::Main => ZEBRA_RPC_PORT_MAIN,
+            ZNetwork::Test | ZNetwork::Regtest(_) => ZEBRA_RPC_PORT_TEST,
+        };
+        return Ok(vec![Server::new(
+            Cow::Borrowed("127.0.0.1"),
+            port,
+            ServerKind::ZebraRpc,
+            network,
+            roots,
+            Some(false),
+            proxy,
+        )]);
+    }
+
+    // The named lightwalletd presets are public mainnet/testnet infrastructure; regtest has
+    // none, so a regtest deployment must give an explicit `host:port` (handled by
+    // `parse_host_list`).
     let preset: Option<&[(&str, u16)]> = match (server, network) {
         ("ecc", ZNetwork::Test) => Some(ECC_TESTNET),
         ("ecc", _) => None,
@@ -685,6 +714,43 @@ mod tests {
             TlsRoots::Native,
             None,
             None,
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn zebra_preset_resolves_to_local_zebrad_per_network() {
+        // `zebra` (the built-in default) is a local zebrad on the recommended RPC port:
+        // 8234 mainnet, 18234 testnet/regtest. Plaintext, kind ZebraRpc.
+        for (network, port) in [
+            (ZNetwork::Main, ZEBRA_RPC_PORT_MAIN),
+            (ZNetwork::Test, ZEBRA_RPC_PORT_TEST),
+            (crate::network::regtest(), ZEBRA_RPC_PORT_TEST),
+        ] {
+            let s = resolve("zebra", network, TlsRoots::Native, None, None).unwrap();
+            assert_eq!(s.len(), 1);
+            assert_eq!(s[0].kind, ServerKind::ZebraRpc);
+            assert_eq!(s[0].host.as_ref(), "127.0.0.1");
+            assert_eq!(s[0].port, port);
+            assert!(!s[0].use_tls());
+        }
+        // The preset must never clash with zecd's own default RPC ports (the wallet would
+        // dial itself).
+        assert_ne!(
+            ZEBRA_RPC_PORT_MAIN,
+            crate::config::ZECD_DEFAULTS.rpc_port_main
+        );
+        assert_ne!(
+            ZEBRA_RPC_PORT_TEST,
+            crate::config::ZECD_DEFAULTS.rpc_port_test
+        );
+        // Like any zebra endpoint, the preset refuses to combine with a SOCKS proxy.
+        assert!(resolve_all(
+            &["zebra".to_string()],
+            ZNetwork::Main,
+            TlsRoots::Native,
+            None,
+            Some("127.0.0.1:9050".parse().unwrap()),
         )
         .is_err());
     }

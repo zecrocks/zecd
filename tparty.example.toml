@@ -18,9 +18,10 @@ default_wallet = "default"
 dir = "./tparty-data/default"
 
 [lightwalletd]
-# Same options as zecd: "ecc" | "ywallet" | "zecrocks" | "host:port", `servers` for failover,
+# Same options as zecd: "zebra" (a local zebrad's JSON-RPC, the default) | "zebra://host:port"
+# | "ecc" | "ywallet" | "zecrocks" | "host:port" (lightwalletd), `servers` for failover,
 # `connection` for SOCKS5/Tor. See zecd.example.toml for the full commentary.
-server = "zecrocks"
+server = "zebra"
 connection = "direct"
 connect_timeout_secs = 10
 reconnect_base_secs = 1

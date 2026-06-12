@@ -4,8 +4,9 @@ name: Regtest E2E
 # drives the real zecd binary over its JSON-RPC (see regtest-harness/). It also builds
 # zcash-devtool (regtest-enabled) as a funding wallet, used to shield a mined transparent coinbase
 # into Orchard and fund zecd (the funded e2e). The suite covers both chain backends: the funded
-# e2e runs zecd through lightwalletd, and regtest_zebra_direct.rs runs it straight against
-# zebrad's JSON-RPC ("zebra://") with a lightwalletd-backed twin asserting chain-view equality.
+# e2e runs zecd through lightwalletd (a supported backend), and regtest_zebra.rs runs it straight
+# against zebrad's JSON-RPC ("zebra://", the default backend) with a lightwalletd-backed twin
+# asserting chain-view equality.
 # No zingo-infra: the harness mines via zebrad's
 # Regtest-only `generate` RPC, so it has no zebra crate dependency and works against any zebrad
 # release. zebrad + lightwalletd are extracted from their official Docker images.
@@ -73,7 +74,7 @@ jobs:
         image: ${{ github.event_name == 'schedule' && fromJSON('["pinned", "latest"]') || fromJSON('["event"]') }}
         include:
           - suite: zecd
-            tests: --test regtest_e2e --test regtest_funded --test regtest_failover --test regtest_hang --test regtest_reorg --test regtest_multiwallet --test regtest_restore --test regtest_zebra_direct
+            tests: --test regtest_e2e --test regtest_funded --test regtest_failover --test regtest_hang --test regtest_reorg --test regtest_multiwallet --test regtest_restore --test regtest_zebra
           - suite: tparty
             tests: --test regtest_tparty
     name: regtest (${{ matrix.suite }}, ${{ matrix.image }})

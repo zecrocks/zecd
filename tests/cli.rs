@@ -213,7 +213,15 @@ fn init_creates_wallet_and_refuses_reinit() {
     let out = run_with_timeout(
         {
             let mut c = zecd();
-            c.args(["--datadir", &datadir, "--network", "test", "init"]);
+            c.args([
+                "--datadir",
+                &datadir,
+                "--network",
+                "test",
+                "--server",
+                "zecrocks",
+                "init",
+            ]);
             c
         },
         Duration::from_secs(120),
@@ -248,7 +256,15 @@ fn init_creates_wallet_and_refuses_reinit() {
     let out = run_with_timeout(
         {
             let mut c = zecd();
-            c.args(["--datadir", &datadir, "--network", "test", "init"]);
+            c.args([
+                "--datadir",
+                &datadir,
+                "--network",
+                "test",
+                "--server",
+                "zecrocks",
+                "init",
+            ]);
             c
         },
         Duration::from_secs(120),

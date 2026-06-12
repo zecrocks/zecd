@@ -1,4 +1,4 @@
-//! Zebra-direct regtest end-to-end: `zecd` runs with **no lightwalletd in its server list**
+//! Zebra-backend regtest end-to-end: `zecd` runs with **no lightwalletd in its server list**
 //! (`servers = ["zebra://127.0.0.1:<rpc>"]`), deriving everything from zebrad's JSON-RPC -
 //! init (tree state + tip), subtree roots, compact-block sync (raw-block parsing +
 //! local CompactBlock conversion), 0-conf mempool visibility (the `getrawmempool` poller),
@@ -30,19 +30,19 @@ const MATURITY_TAIL: u32 = 130;
 const TAIL_MINER_ADDRESS: &str = "t27eWDgjFYJGVXmzrXeVjnb5J3uXDM9xH9v";
 /// 1 ZEC, in zatoshis.
 const FUND_ZATOSHIS: u64 = 100_000_000;
-/// Generous: zebra-direct sync is two RPCs per block, plus Orchard proving on the spend.
+/// Generous: zebra-backed sync is two RPCs per block, plus Orchard proving on the spend.
 const FUND_TIMEOUT: Duration = Duration::from_secs(240);
 
 #[tokio::test]
-async fn regtest_zebra_direct_e2e() {
+async fn regtest_zebra_e2e() {
     let (Some(zebrad_bin), Some(lwd_bin), Some(devtool_bin)) = (
         resolve_bin("ZEBRAD_BIN"),
         resolve_bin("LIGHTWALLETD_BIN"),
         resolve_bin("DEVTOOL_BIN"),
     ) else {
         eprintln!(
-            "SKIP regtest_zebra_direct_e2e: set ZEBRAD_BIN, LIGHTWALLETD_BIN and DEVTOOL_BIN \
-             to run the zebra-direct e2e (see README.md). The harness still compiled and linked."
+            "SKIP regtest_zebra_e2e: set ZEBRAD_BIN, LIGHTWALLETD_BIN and DEVTOOL_BIN \
+             to run the zebra-backed e2e (see README.md). The harness still compiled and linked."
         );
         return;
     };
@@ -81,7 +81,7 @@ async fn regtest_zebra_direct_e2e() {
 
     // 3. The system under test: zecd direct against zebrad, no lightwalletd to fall back to.
     //    `Zecd::start` also runs `zecd init` against the zebra endpoint (tip + tree state).
-    let zebra_cfg = ZecdConfig::new_zebra_direct(zebrad.rpc_port, pick_port().expect("rpc port"));
+    let zebra_cfg = ZecdConfig::new_zebra(zebrad.rpc_port, pick_port().expect("rpc port"));
     let zecd_zebra = Zecd::start(&zebra_cfg)
         .await
         .expect("start zecd directly against zebrad");
@@ -102,7 +102,7 @@ async fn regtest_zebra_direct_e2e() {
     zecd_zebra
         .wait_until_synced(tip, FUND_TIMEOUT)
         .await
-        .expect("zebra-direct zecd syncs to the tip");
+        .expect("zebra-backed zecd syncs to the tip");
     zecd_lwd
         .wait_until_synced(tip, FUND_TIMEOUT)
         .await
@@ -117,7 +117,7 @@ async fn regtest_zebra_direct_e2e() {
         .expect("getblockchaininfo");
     assert_eq!(info["chain"].as_str(), Some("regtest"), "{info}");
 
-    // 5. Fund the zebra-direct wallet with a real Orchard note.
+    // 5. Fund the zebra-backed wallet with a real Orchard note.
     let zecd_ua = zecd_zebra
         .call("getnewaddress", json!([]))
         .await
@@ -167,7 +167,7 @@ async fn regtest_zebra_direct_e2e() {
             break;
         }
         if Instant::now() >= deadline {
-            panic!("zebra-direct zecd did not see the funded Orchard note within {FUND_TIMEOUT:?}");
+            panic!("zebra-backed zecd did not see the funded Orchard note within {FUND_TIMEOUT:?}");
         }
         tokio::time::sleep(Duration::from_millis(500)).await;
     }
@@ -198,7 +198,7 @@ async fn regtest_zebra_direct_e2e() {
         .expect("gettransaction on the unmined send");
     assert_eq!(gt["amount"].as_f64(), Some(-0.4), "{gt}");
     assert_eq!(gt["confirmations"].as_i64(), Some(0), "{gt}");
-    mine_until_confirmed(&zebrad, &zecd_zebra, &txid, "zebra-direct send").await;
+    mine_until_confirmed(&zebrad, &zecd_zebra, &txid, "zebra-backed send").await;
 
     // 7. After all activity, the two instances still agree on the chain.
     let tip = zecd_zebra.block_count().await.expect("getblockcount");
@@ -208,7 +208,7 @@ async fn regtest_zebra_direct_e2e() {
         .expect("comparison zecd catches up");
     assert_chain_views_agree(&zecd_zebra, &zecd_lwd).await;
 
-    // 8. The full Bitcoin-Core wire-format suite against the funded zebra-direct daemon.
+    // 8. The full Bitcoin-Core wire-format suite against the funded zebra-backed daemon.
     run_conformance(
         zebra_cfg.rpc_port,
         &zebra_cfg.rpc_user,
@@ -216,20 +216,20 @@ async fn regtest_zebra_direct_e2e() {
     );
 }
 
-/// The zebra-direct and lightwalletd-backed instances must report the identical chain.
+/// The zebra-backed and lightwalletd-backed instances must report the identical chain.
 async fn assert_chain_views_agree(zebra: &Zecd, lwd: &Zecd) {
     let (hz, hl) = (
         zebra
             .block_count()
             .await
-            .expect("zebra-direct getblockcount"),
+            .expect("zebra-backed getblockcount"),
         lwd.block_count().await.expect("lwd-backed getblockcount"),
     );
     assert_eq!(hz, hl, "block counts diverge between backends");
     let bz = zebra
         .call("getbestblockhash", json!([]))
         .await
-        .expect("zebra-direct getbestblockhash");
+        .expect("zebra-backed getbestblockhash");
     let bl = lwd
         .call("getbestblockhash", json!([]))
         .await
@@ -259,7 +259,7 @@ async fn mine_until_confirmed(zebrad: &Zebrad, zecd: &Zecd, txid: &str, what: &s
     panic!("{what}: tx {txid} did not confirm within the mining budget");
 }
 
-/// Run `scripts/conformance.py` against the zebra-direct daemon (same helper as the funded
+/// Run `scripts/conformance.py` against the zebra-backed daemon (same helper as the funded
 /// lightwalletd e2e). Skips with a notice if `python3` isn't available; CI always has it.
 fn run_conformance(rpc_port: u16, user: &str, password: &str) {
     let script = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
