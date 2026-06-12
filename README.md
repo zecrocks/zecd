@@ -174,7 +174,7 @@ HTTP status and error codes match Bitcoin Core (`rpc/protocol.h`, `httprpc.cpp`)
 Batches always return HTTP 200 with per-item errors in the array.
 
 For visibility under load, `getrpcinfo` returns `active_commands`: one entry per executing call
-with `method` and `duration` (µs). Combine with `getwalletinfo` (`txcount`, balances, `scanning`),
+with `method` and `duration` (microseconds). Combine with `getwalletinfo` (`txcount`, balances, `scanning`),
 `listtransactions`/`gettransaction` (per-tx `confirmations`), and the `/status` health endpoint.
 
 ## Health & readiness
@@ -222,14 +222,70 @@ real RPC password in `zecd.toml` / `zecd.mainnet.toml` before exposing the port.
 
 ## Supported RPC methods
 
-| Category | Methods |
-|---|---|
-| Wallet | `getnewaddress` (returns an Orchard UA), `getbalance`, `getbalances`, `getunconfirmedbalance`, `getwalletinfo`, `getaddressinfo`, `setlabel`, `getaddressesbylabel`, `listlabels`, `listtransactions`, `listsinceblock`, `gettransaction`, `listunspent`, `getreceivedbyaddress`, `listreceivedbyaddress`, `getreceivedbylabel`, `listreceivedbylabel`, `sendtoaddress` (extra trailing `memo` hex param beyond Bitcoin Core's arguments), `sendmany`, `encryptwallet`, `walletpassphrase`, `walletpassphrasechange`, `walletlock`, `listwallets` |
-| Raw transactions | `getrawtransaction` (verbose form is zcashd's `TxToJSON` shape, matching Zallet, shielded bundles included), `sendrawtransaction` (broadcasts caller-built raw bytes through lightwalletd) |
-| Blockchain | `getblockchaininfo`, `getblockcount`, `getbestblockhash`, `getblockhash`, `getblockheader` (verbose form only, fields a compact block carries: hash/confirmations/height/time/mediantime/prev/next) |
-| Network | `getnetworkinfo`, `getconnectioncount`, `getpeerinfo`, `ping` |
-| Utility | `validateaddress`, `estimatesmartfee`, `estimatefee`, `getmempoolinfo`, `settxfee` (always `-8`: fees are ZIP-317) |
-| Control | `stop`, `uptime`, `help`, `getrpcinfo` |
+The table compares each method against **Bitcoin Core** (current master) and **Zallet** (the
+zcashd wallet replacement). Bitcoin Core column: ✓ = exists upstream with the semantics zecd
+mirrors; *removed* = no longer exists in current bitcoind (zecd keeps it for older clients).
+Zallet column: ✓ = Zallet serves the same method name; - = it does not (nearest `z_*`
+equivalent in parentheses). Zallet is wallet-only - chain, network, mempool, and fee RPC are
+the validator's job there - so those rows are all - .
+
+| Method | Bitcoin Core | Zallet | What to expect from zecd |
+|---|---|---|---|
+| **Wallet** | | | |
+| `getnewaddress` | ✓ | - (`z_getaddressforaccount`) | Fresh diversified Orchard UA of the wallet's single account; `label` honored; Bitcoin `address_type` values rejected `-5` |
+| `getbalance` | ✓ | - (`z_gettotalbalance`) | Spendable balance under the ZIP-315 confirmations policy; explicit `minconf` overrides it per call (`minconf=0` is treated as 1 - a shielded note is never spendable unmined) |
+| `getbalances` | ✓ | - (`z_getbalances`, per-account) | `mine.trusted/untrusted_pending/immature` + `lastprocessedblock`; no `watchonly` object |
+| `getunconfirmedbalance` | *removed* | - | Incoming funds below the confirmation policy (incl. 0-conf via mempool stream) |
+| `getwalletinfo` | ✓ | ✓ (several fields stubbed) | bitcoind shape; `keypoolsize:1`, `descriptors:false`, `scanning` progress, `unlocked_until` when encrypted |
+| `getaddressinfo` | ✓ | - | `ismine`/`solvable`/`labels`; `scriptPubKey` empty (shielded) |
+| `setlabel` | ✓ | - (accounts replace labels) | Full address book incl. foreign addresses (purpose `"send"`) |
+| `getaddressesbylabel`, `listlabels` | ✓ | - | Core shapes and error codes (`-11` for unknown label) |
+| `listtransactions` | ✓ | - (`z_listtransactions`, different shape) | Core categories/fields (`fee` on sends, label filter, count/skip); adds `memo`/`memoStr` |
+| `listsinceblock` | ✓ | - | Cursor pattern; `removed` always `[]`; reorged/unknown cursor → `-5`, re-baseline (no fork-point walk-back) |
+| `gettransaction` | ✓ | - (`z_viewtransaction`, different shape) | `amount`/`fee`/`confirmations`/`details`/`hex`; foreign tx hex fetched via lightwalletd |
+| `listunspent` | ✓ | - (`z_listunspent`, different shape) | One entry per unspent Orchard note; synthesized `txid`/`vout`; `address` empty for change |
+| `getreceivedbyaddress`, `listreceivedbyaddress`, `getreceivedbylabel`, `listreceivedbylabel` | ✓ | - | Core shapes over diversified receiving addresses; change never counted |
+| `sendtoaddress` | ✓ | - (`z_sendmany` is async, returns an operation id) | Synchronous: builds, proves, broadcasts, returns txid; ZIP-317 fee; `subtractfeefromamount`/`fee_rate` → `-8`; extra trailing `memo` hex param |
+| `sendmany` | ✓ | - (`z_sendmany`) | Same; dummy `""` first arg as in Core |
+| `encryptwallet` | ✓ | - (encrypted at init) | Encrypts the age keystore in place; mnemonic and addresses unchanged (Core re-seeds and demands a new backup) |
+| `walletpassphrase` | ✓ | ✓ | Unlock with a timeout in seconds (capped at 100,000,000 - about 3 years, same cap as Bitcoin Core), auto-relock when it expires; locked send → `-13`, wrong passphrase `-14`, unencrypted wallet `-15` |
+| `walletpassphrasechange` | ✓ | - | Core semantics |
+| `walletlock` | ✓ | ✓ | Core semantics |
+| `listwallets` | ✓ | - (one wallet per instance) | Names from `[wallets.<name>]` config |
+| **Raw transactions** | | | |
+| `getrawtransaction` | ✓ (verbose JSON differs) | ✓ | Hex, or verbose JSON in zcashd's `TxToJSON` shape with shielded bundles - matches Zallet, not bitcoind; `blockhash` param rejected; wallet store first, lightwalletd fallback |
+| `sendrawtransaction` | ✓ | - (planned) | Broadcasts caller-built bytes via lightwalletd; `maxfeerate` ignored |
+| **Blockchain** | | | |
+| `getblockchaininfo` | ✓ | - | `blocks` = fully-scanned height, `headers` = tip, `initialblockdownload` = scanning; `difficulty`/`size_on_disk` stubs |
+| `getblockcount` | ✓ | - | Fully-scanned height, so `getblockhash(getblockcount())` always answers |
+| `getbestblockhash` | ✓ | - | Hash at the fully-scanned height |
+| `getblockhash` | ✓ | - | From the wallet's scanned blocks; pre-birthday or beyond-tip heights → `-8` |
+| `getblockheader` | ✓ | - | Verbose only, compact-block fields (hash/confirmations/height/time/mediantime/prev/next); `verbose=false` → `-8` |
+| **Network** | | | |
+| `getnetworkinfo` | ✓ | - | zecd version/subversion; `connections` is 0 or 1 (the lightwalletd upstream is the only "peer") |
+| `getconnectioncount` | ✓ | - | 0 or 1 |
+| `getpeerinfo` | ✓ | - | At most one entry, describing the active lightwalletd, plus `conn_state`/`syncing` extensions |
+| `ping` | ✓ | - | No-op success (no P2P ping to measure) |
+| **Utility** | | | |
+| `validateaddress` | ✓ | ✓ (transparent-only: a valid UA gets `isvalid:false`) | Validates every Zcash address kind; valid UA → `isvalid:true`, `scriptPubKey` empty |
+| `estimatesmartfee` | ✓ | - | Inert stub: conventional ZIP-317 rate (0.00001) + `blocks` echo |
+| `estimatefee` | *removed* | - | Same stub rate, for old clients |
+| `getmempoolinfo` | ✓ | - | Fixed shape with empty-mempool numbers (a light client holds no mempool) |
+| `settxfee` | *removed* | - | Always `-8`: fees are ZIP-317, never client-settable |
+| **Control** | | | |
+| `stop` | ✓ | ✓ (regtest-only) | Graceful shutdown; returns `"zecd stopping"` |
+| `uptime` | ✓ | - | Seconds since start |
+| `help` | ✓ | ✓ | Static one-line summary only; the optional `command` argument is ignored (see below) |
+| `getrpcinfo` | ✓ | - | `active_commands` (each in-flight method with its elapsed time in microseconds); `logpath` empty (logs go to stderr) |
+
+Known gaps in the table worth fixing:
+
+- `help <method>` ignores its argument and returns a generic blurb that names only a few
+  methods. bitcoind lists every command and returns per-method usage for `help <method>`;
+  tooling that introspects via `help` gets nothing useful from zecd today.
+- `estimatefee`, `settxfee`, and `getunconfirmedbalance` were removed from Bitcoin Core
+  master; zecd keeps them deliberately (zcashd-era and older bitcoind clients still call
+  them), but don't model new integrations on them.
 
 Multiwallet is addressed bitcoind-style via `POST /wallet/<name>`; the default wallet is used at
 `POST /`.
