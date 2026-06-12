@@ -110,6 +110,9 @@ pub struct ActorConfig {
     pub primary_recheck: Duration,
     pub age_identity: Option<PathBuf>,
     pub auto_unlock: bool,
+    /// The wallet-wide confirmations policy (`[spend]` config; ZIP-315 3/10 by default),
+    /// anchoring balances, spend proposals, and the `-6` enrichment.
+    pub confirmations_policy: ConfirmationsPolicy,
     /// Flips to `true` on Ctrl-C/`stop`; the actor exits its loop (between sync batches)
     /// so the `WalletDb` is dropped cleanly before the process ends.
     pub shutdown: watch::Receiver<bool>,
@@ -132,6 +135,7 @@ struct WalletActor {
     sync_interval: Duration,
     rebroadcast_interval: Duration,
     age_identity: Option<PathBuf>,
+    confirmations_policy: ConfirmationsPolicy,
     account_id: AccountUuid,
     account_index: Option<zip32::AccountId>,
     db_data: WriteDb,
@@ -254,6 +258,7 @@ pub async fn spawn(cfg: ActorConfig) -> anyhow::Result<(WalletHandle, tokio::tas
         sync_interval: cfg.sync_interval,
         rebroadcast_interval: cfg.rebroadcast_interval,
         age_identity: cfg.age_identity,
+        confirmations_policy: cfg.confirmations_policy,
         account_id,
         account_index,
         db_data,
@@ -276,7 +281,14 @@ pub async fn spawn(cfg: ActorConfig) -> anyhow::Result<(WalletHandle, tokio::tas
     let task = tokio::spawn(actor.run());
 
     Ok((
-        make_handle(cfg.name, cfg.wallet_dir, cfg.network, cmd_tx, status_rx),
+        make_handle(
+            cfg.name,
+            cfg.wallet_dir,
+            cfg.network,
+            cfg.confirmations_policy,
+            cmd_tx,
+            status_rx,
+        ),
         task,
     ))
 }
@@ -610,7 +622,24 @@ impl WalletActor {
         };
         let txid = tx.txid();
         match decrypt_and_store_transaction(&self.network, &mut self.db_data, &tx, mined_height) {
-            Ok(()) => tracing::debug!("[{}] processed mempool tx {txid}", self.name),
+            Ok(()) => {
+                tracing::debug!("[{}] processed mempool tx {txid}", self.name);
+                // If the tx turned out to be ours (decrypt stored a row), record when we
+                // first saw it: `gettransaction`/`listtransactions` report it as
+                // `time`/`timereceived` while the tx is unmined, like Bitcoin Core's
+                // `nTimeReceived`. Best-effort, idempotent (INSERT OR IGNORE).
+                let txid_hex = txid.to_string();
+                if super::read::tx_exists(&self.wallet_dir, &txid_hex) {
+                    let now = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_secs() as i64)
+                        .unwrap_or(0);
+                    if let Err(e) = super::labels::record_first_seen(&self.wallet_dir, &txid_hex, now)
+                    {
+                        tracing::debug!("[{}] failed to record first-seen time: {e}", self.name);
+                    }
+                }
+            }
             Err(e) => warn!("[{}] failed to store mempool tx {txid}: {e}", self.name),
         }
     }
@@ -672,7 +701,7 @@ impl WalletActor {
         let summary = if self.tip_height.is_some() {
             SILENCE_PROGRESS_PANIC.with(|f| f.set(true));
             let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                self.db_data.get_wallet_summary(ConfirmationsPolicy::default())
+                self.db_data.get_wallet_summary(self.confirmations_policy)
             }));
             SILENCE_PROGRESS_PANIC.with(|f| f.set(false));
             r.ok().and_then(|r| r.ok()).flatten()
@@ -859,6 +888,7 @@ impl WalletActor {
         // single send doesn't block the actor thread from being cooperatively yielded.
         let net = self.network;
         let account_id = self.account_id;
+        let policy = self.confirmations_policy;
         let prover = &self.prover;
         let db = &mut self.db_data;
         let (txid, raw): (TxId, service::RawTransaction) =
@@ -882,10 +912,10 @@ impl WalletActor {
                     &input_selector,
                     &change_strategy,
                     request,
-                    ConfirmationsPolicy::default(),
+                    policy,
                     None,
                 )
-                .map_err(|e| enrich_insufficient_funds(db, classify_err(e)))?;
+                .map_err(|e| enrich_insufficient_funds(db, policy, classify_err(e)))?;
 
                 let txids = create_proposed_transactions(
                     db,
@@ -897,7 +927,7 @@ impl WalletActor {
                     &proposal,
                     None,
                 )
-                .map_err(|e| enrich_insufficient_funds(db, classify_err(e)))?;
+                .map_err(|e| enrich_insufficient_funds(db, policy, classify_err(e)))?;
 
                 if txids.len() > 1 {
                     return Err(RpcError::wallet(
@@ -1344,11 +1374,11 @@ fn classify_err(e: crate::error::ProposalError) -> RpcError {
 /// safe: a `-6` means a proposal actually ran, which implies the chain tip is set (the
 /// `get_wallet_summary` progress-estimator underflow guarded against in `update_status`
 /// can't fire), and a failed lookup just leaves the message unenriched.
-fn enrich_insufficient_funds(db: &WriteDb, err: RpcError) -> RpcError {
+fn enrich_insufficient_funds(db: &WriteDb, policy: ConfirmationsPolicy, err: RpcError) -> RpcError {
     if err.code != codes::RPC_WALLET_INSUFFICIENT_FUNDS {
         return err;
     }
-    let Ok(Some(summary)) = db.get_wallet_summary(ConfirmationsPolicy::default()) else {
+    let Ok(Some(summary)) = db.get_wallet_summary(policy) else {
         return err;
     };
     let (mut incoming, mut change) = (0u64, 0u64);
@@ -1474,10 +1504,10 @@ mod tests {
         db.update_chain_tip(BlockHeight::from_u32(5)).expect("set tip");
 
         let other = RpcError::wallet("some other failure");
-        assert_eq!(super::enrich_insufficient_funds(&db, other.clone()).message, other.message);
+        assert_eq!(super::enrich_insufficient_funds(&db, Default::default(), other.clone()).message, other.message);
 
         let bare = RpcError::insufficient_funds("Insufficient funds: 0 zatoshis spendable");
-        let out = super::enrich_insufficient_funds(&db, bare.clone());
+        let out = super::enrich_insufficient_funds(&db, Default::default(), bare.clone());
         assert_eq!(out.code, codes::RPC_WALLET_INSUFFICIENT_FUNDS);
         assert_eq!(out.message, bare.message, "no pending balance, so no enrichment");
     }

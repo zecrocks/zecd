@@ -108,6 +108,8 @@ async fn run_daemon(config: AppConfig) -> anyhow::Result<()> {
             primary_recheck: Duration::from_secs(config.lightwalletd.primary_recheck_secs),
             age_identity: config.keys.age_identity.clone(),
             auto_unlock: config.keys.auto_unlock,
+            // Validated at config load; re-derive here rather than carrying a second copy.
+            confirmations_policy: config.spend.confirmations_policy()?,
             shutdown: shutdown_tx.subscribe(),
         };
         match actor::spawn(actor_cfg).await {

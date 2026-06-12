@@ -43,9 +43,11 @@ pub async fn dispatch(
         "getblockcount" => blockchain::getblockcount(state),
         "getbestblockhash" => blockchain::getbestblockhash(state),
         "getblockhash" => blockchain::getblockhash(state, req),
+        "getblockheader" => blockchain::getblockheader(state, req),
 
         // Utility
         "validateaddress" => util::validateaddress(state, req),
+        "settxfee" => util::settxfee(req),
         "estimatesmartfee" => util::estimatesmartfee(req),
         "estimatefee" => util::estimatefee(req),
         "getmempoolinfo" => util::getmempoolinfo(),
@@ -55,7 +57,7 @@ pub async fn dispatch(
         "sendrawtransaction" => rawtx::sendrawtransaction(state, wallet, req).await,
 
         // Wallet - reads
-        "getbalance" => wallet_methods::getbalance(state, wallet),
+        "getbalance" => wallet_methods::getbalance(state, wallet, req),
         "getbalances" => wallet_methods::getbalances(state, wallet),
         "getunconfirmedbalance" => wallet_methods::getunconfirmedbalance(state, wallet),
         "getwalletinfo" => wallet_methods::getwalletinfo(state, wallet),

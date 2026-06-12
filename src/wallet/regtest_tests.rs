@@ -20,7 +20,7 @@ use zcash_protocol::consensus::BlockHeight;
 
 use crate::network;
 use crate::wallet::keys::SeedKeeper;
-use crate::wallet::{open, read};
+use crate::wallet::{labels, open, read};
 
 /// The committed testnet test mnemonic (valueless TAZ wallet); reused here purely as a
 /// deterministic seed source for a throwaway regtest wallet.
@@ -76,12 +76,35 @@ fn regtest_wallet_lifecycle() {
     drop(db);
 
     // 3. Read helpers operate on a regtest wallet: empty-but-valid balances and note set.
-    let bal = read::balance(net, wallet_dir).expect("balance");
+    let bal = read::balance(net, wallet_dir, Default::default()).expect("balance");
     assert_eq!(bal.total_spendable, 0);
     assert_eq!(bal.pending, 0);
     assert!(read::list_unspent(net, wallet_dir)
         .expect("listunspent")
         .is_empty());
+    // The transaction queries (v_transactions joined with blocks + raw transactions for
+    // blockhash / blockindex / created_time) run against the real librustzcash schema.
+    assert!(read::list_transactions(wallet_dir)
+        .expect("listtransactions")
+        .is_empty());
+    assert!(read::get_transaction(wallet_dir, &"ab".repeat(32))
+        .expect("gettransaction")
+        .is_none());
+    assert!(!read::tx_exists(wallet_dir, &"ab".repeat(32)));
+    assert!(read::first_scanned_block(wallet_dir)
+        .expect("first_scanned_block")
+        .is_none());
+    // First-seen side table: record once, ignore duplicates, read back.
+    labels::record_first_seen(wallet_dir, &"cd".repeat(32), 1_700_000_000).expect("record");
+    labels::record_first_seen(wallet_dir, &"cd".repeat(32), 1_900_000_000).expect("record dup");
+    assert_eq!(
+        labels::first_seen(wallet_dir, &"cd".repeat(32)).expect("first_seen"),
+        Some(1_700_000_000)
+    );
+    assert_eq!(
+        labels::first_seen_all(wallet_dir).expect("first_seen_all").len(),
+        1
+    );
 
     // 4. is_mine is network-scoped: true for our own regtest address, false for a testnet UA.
     assert!(
@@ -136,6 +159,7 @@ fn offline_actor_cfg(
         primary_recheck: Duration::from_secs(60),
         age_identity: None,
         auto_unlock: true,
+        confirmations_policy: Default::default(),
         shutdown,
     };
     (cfg, shutdown_tx)

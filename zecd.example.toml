@@ -66,3 +66,21 @@ interval_secs = 20
 # How often (at most) to re-broadcast wallet txs that are unmined and unexpired (seconds).
 # Covers sends whose initial broadcast failed and mempool drops across upstream restarts.
 rebroadcast_secs = 60
+
+[spend]
+# The wallet-wide confirmations policy (ZIP 315 defaults, like Zallet): how deep an output
+# must be before it is spendable. Anchors getbalance/getbalances/getwalletinfo and spend
+# proposals; getbalance's explicit minconf argument overrides it per call. Lowering these
+# trades reorg/double-spend safety for latency.
+# Confirmations before the wallet's *own* outputs (change) are spendable.
+trusted_confirmations = 3
+# Confirmations before third-party payments are spendable (must be >= trusted_confirmations).
+untrusted_confirmations = 10
+# What sends may reveal on-chain (zcashd/Zallet's privacy-policy opt-in, reduced to the one
+# distinction that matters for an Orchard-only wallet):
+#   "AllowRevealedRecipients" (default) - recipients without an Orchard receiver (transparent
+#       and Sapling-only addresses) are allowed; such sends reveal the amount (and a
+#       transparent recipient) on-chain.
+#   "FullPrivacy" - every recipient must have an Orchard receiver; sends that would reveal
+#       anything are rejected with -8.
+privacy_policy = "AllowRevealedRecipients"

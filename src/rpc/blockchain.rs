@@ -84,3 +84,88 @@ pub fn getblockhash(state: &AppState, req: &RpcRequest) -> Result<Value, RpcErro
     }
     Err(RpcError::invalid_parameter("Block height out of range"))
 }
+
+/// Validate a display-hex block-hash parameter with Bitcoin Core's `ParseHashV` errors (-8).
+fn parse_blockhash_param(s: &str) -> Result<(), RpcError> {
+    if s.len() != 64 {
+        return Err(RpcError::invalid_parameter(format!(
+            "blockhash must be of length 64 (not {}, for '{s}')",
+            s.len()
+        )));
+    }
+    if hex::decode(s).is_err() {
+        return Err(RpcError::invalid_parameter(format!(
+            "blockhash must be hexadecimal string (not '{s}')"
+        )));
+    }
+    Ok(())
+}
+
+/// `getblockheader <blockhash> [verbose]` - served from the wallet's scanned-blocks table,
+/// so only blocks in the wallet's scan range can be answered, and only the fields a compact
+/// block carries are present: `hash`, `confirmations`, `height`, `time`, `mediantime`, and
+/// the `previousblockhash`/`nextblockhash` links (no version/merkleroot/nonce/bits/
+/// difficulty - a light client never sees them). The common poller pattern - walk
+/// `nextblockhash` from a checkpoint, read `height`/`confirmations`/`time` - works.
+pub fn getblockheader(state: &AppState, req: &RpcRequest) -> Result<Value, RpcError> {
+    let hash = req
+        .param(0)
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| RpcError::invalid_params("getblockheader requires a block hash"))?;
+    parse_blockhash_param(hash)?;
+    // Param 1 (verbose, default true): the non-verbose form is the serialized 80-byte-style
+    // header, which a compact-block wallet does not store - reject rather than fabricate.
+    match req.param(1) {
+        None | Some(Value::Null) | Some(Value::Bool(true)) => {}
+        Some(Value::Bool(false)) => {
+            return Err(RpcError::invalid_parameter(
+                "verbose=false is not supported: a light wallet does not store serialized \
+                 block headers",
+            ))
+        }
+        Some(_) => return Err(RpcError::type_error("verbose must be a boolean")),
+    }
+
+    let w = state.registry.get(None)?;
+    let height = read::block_height_by_hash(&w.dir, hash)?
+        .ok_or_else(|| RpcError::invalid_address_or_key("Block not found"))?;
+    let (_, time) = read::block_info_at(&w.dir, height)?
+        .ok_or_else(|| RpcError::invalid_address_or_key("Block not found"))?;
+    let st = w.status();
+    let mediantime = read::median_time_past(&w.dir, height).ok().flatten();
+
+    let mut obj = json!({
+        "hash": hash,
+        "confirmations": st.confirmations(Some(height)),
+        "height": height,
+        "time": time,
+        "mediantime": mediantime.unwrap_or(time),
+    });
+    // Chain links, where the neighbors are in the wallet's scan range (Bitcoin Core also
+    // omits previousblockhash on genesis and nextblockhash on the tip).
+    if let Some(h) = height.checked_sub(1) {
+        if let Some((prev, _)) = read::block_info_at(&w.dir, h)? {
+            obj["previousblockhash"] = json!(prev);
+        }
+    }
+    if let Some((next, _)) = read::block_info_at(&w.dir, height + 1)? {
+        obj["nextblockhash"] = json!(next);
+    }
+    Ok(obj)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn blockhash_param_errors_match_parse_hash_v() {
+        let e = parse_blockhash_param("abcd").unwrap_err();
+        assert_eq!(e.code, crate::error::codes::RPC_INVALID_PARAMETER);
+        assert!(e.message.contains("must be of length 64"), "{}", e.message);
+        let e = parse_blockhash_param(&"zz".repeat(32)).unwrap_err();
+        assert_eq!(e.code, crate::error::codes::RPC_INVALID_PARAMETER);
+        assert!(e.message.contains("must be hexadecimal"), "{}", e.message);
+        assert!(parse_blockhash_param(&"ab".repeat(32)).is_ok());
+    }
+}

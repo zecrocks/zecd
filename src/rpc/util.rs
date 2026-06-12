@@ -35,6 +35,16 @@ pub fn validateaddress(state: &AppState, req: &RpcRequest) -> Result<Value, RpcE
     }))
 }
 
+/// `settxfee` - an explicit fee instruction, so it gets the same treatment as
+/// `fee_rate`/`subtractfeefromamount`: a self-diagnosing `-8` rather than bitcoind's
+/// `true` (which would be a lie) or a bare method-not-found.
+pub fn settxfee(_req: &RpcRequest) -> Result<Value, RpcError> {
+    Err(RpcError::invalid_parameter(
+        "settxfee is not supported: fees follow ZIP-317 (computed at transaction-build time) \
+         and are never client-settable",
+    ))
+}
+
 pub fn estimatesmartfee(req: &RpcRequest) -> Result<Value, RpcError> {
     // Zcash fees are ZIP-317 (computed at build time); return a stable conventional rate so
     // clients that probe fees succeed.
@@ -57,4 +67,20 @@ pub fn getmempoolinfo() -> Result<Value, RpcError> {
         "mempoolminfee": zats_to_value(1000),
         "minrelaytxfee": zats_to_value(1000)
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn settxfee_is_rejected_with_fee_explanation() {
+        let req = crate::server::jsonrpc::RpcRequest {
+            id: serde_json::Value::Null,
+            method: "settxfee".into(),
+            params: vec![serde_json::json!(0.0001)],
+            params_raw: serde_json::Value::Null,
+        };
+        let e = super::settxfee(&req).unwrap_err();
+        assert_eq!(e.code, crate::error::codes::RPC_INVALID_PARAMETER);
+        assert!(e.message.contains("ZIP-317"), "{}", e.message);
+    }
 }

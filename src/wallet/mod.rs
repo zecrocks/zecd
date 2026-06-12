@@ -15,6 +15,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 
 use tokio::sync::{mpsc, oneshot, watch};
+use zcash_client_backend::data_api::wallet::ConfirmationsPolicy;
 use zcash_protocol::TxId;
 use zip321::TransactionRequest;
 
@@ -141,6 +142,9 @@ pub struct WalletHandle {
     pub name: String,
     pub dir: PathBuf,
     pub network: ZNetwork,
+    /// The wallet-wide confirmations policy (`[spend]` config; ZIP-315 3/10 by default),
+    /// used wherever an RPC doesn't override depth with an explicit `minconf`.
+    pub confirmations: ConfirmationsPolicy,
     cmd_tx: mpsc::Sender<WalletCommand>,
     status_rx: watch::Receiver<SyncStatus>,
 }
@@ -245,8 +249,9 @@ pub(crate) fn make_handle(
     name: String,
     dir: PathBuf,
     network: ZNetwork,
+    confirmations: ConfirmationsPolicy,
     cmd_tx: mpsc::Sender<WalletCommand>,
     status_rx: watch::Receiver<SyncStatus>,
 ) -> WalletHandle {
-    WalletHandle { name, dir, network, cmd_tx, status_rx }
+    WalletHandle { name, dir, network, confirmations, cmd_tx, status_rx }
 }

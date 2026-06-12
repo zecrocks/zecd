@@ -122,6 +122,49 @@ def main() -> int:
     # 8-dp string form, no float drift
     ck("getbalance 8-dp serialisable", str(bal) == format(bal, "f") or bal == bal)
 
+    # minconf is honored: 1-conf balance includes at least everything the (stricter)
+    # default spendability policy counts; an impossibly deep minconf excludes everything.
+    bal1 = rpc.call("getbalance", "*", 1)
+    ck("getbalance('*',1) is Decimal", isinstance(bal1, decimal.Decimal), repr(bal1))
+    ck("getbalance('*',1) >= getbalance()", bal1 >= bal, f"{bal1} < {bal}")
+    ck("getbalance('*',99999999) == 0", rpc.call("getbalance", "*", 99999999) == 0)
+    try:
+        rpc.call("getbalance", "account1")
+        ck("getbalance bad dummy raises", False)
+    except JSONRPCException as e:
+        ck("getbalance bad dummy -> code -32", e.code == -32, e.code)
+    try:
+        rpc.call("getbalance", "*", "six")
+        ck("getbalance non-numeric minconf raises", False)
+    except JSONRPCException as e:
+        ck("getbalance non-numeric minconf -> code -3", e.code == -3, e.code)
+
+    print("== getblockheader ==")
+    tip_hash = rpc.call("getblockhash", rpc.call("getblockcount"))
+    hdr = rpc.call("getblockheader", tip_hash)
+    for f in ("hash", "confirmations", "height", "time", "mediantime"):
+        ck(f"header has {f}", f in hdr)
+    ck("header echoes hash", hdr["hash"] == tip_hash)
+    ck("tip header confirmations == 1", hdr["confirmations"] == 1, hdr["confirmations"])
+    ck("header has previousblockhash", "previousblockhash" in hdr)
+    prev = rpc.call("getblockheader", hdr["previousblockhash"])
+    ck("prev header links forward", prev.get("nextblockhash") == tip_hash)
+    try:
+        rpc.call("getblockheader", "00" * 32)
+        ck("unknown header raises", False)
+    except JSONRPCException as e:
+        ck("unknown header -> code -5", e.code == -5, e.code)
+    try:
+        rpc.call("getblockheader", "xyz")
+        ck("bad header hash raises", False)
+    except JSONRPCException as e:
+        ck("bad header hash -> code -8", e.code == -8, e.code)
+    try:
+        rpc.call("getblockheader", tip_hash, False)
+        ck("verbose=false raises", False)
+    except JSONRPCException as e:
+        ck("verbose=false -> code -8", e.code == -8, e.code)
+
     print("== getbalances ==")
     gb = rpc.call("getbalances")
     mine = gb.get("mine", {})
@@ -145,6 +188,14 @@ def main() -> int:
        "error" in bad and "error_locations" in bad)
     ai = rpc.call("getaddressinfo", addr)
     ck("getaddressinfo.ismine", ai["ismine"] is True)
+    ck("getaddressinfo has no isvalid", "isvalid" not in ai)
+    for f in ("scriptPubKey", "solvable", "iswatchonly", "isscript", "iswitness", "labels"):
+        ck(f"getaddressinfo has {f}", f in ai)
+    try:
+        rpc.call("getaddressinfo", "not-an-address")
+        ck("getaddressinfo invalid raises", False)
+    except JSONRPCException as e:
+        ck("getaddressinfo invalid -> code -5", e.code == -5, e.code)
 
     print("== received-by-address ==")
     recv = rpc.call("getreceivedbyaddress", addr)
@@ -175,19 +226,58 @@ def main() -> int:
     except JSONRPCException as e:
         ck("getreceivedbylabel unknown -> code -4", e.code == -4, e.code)
 
+    print("== listunspent ==")
+    lu = rpc.call("listunspent")
+    ck("listunspent is list", isinstance(lu, list))
+    if lu:
+        u = lu[0]
+        for f in ("txid", "vout", "address", "amount", "confirmations",
+                  "spendable", "solvable", "safe"):
+            ck(f"utxo has {f}", f in u)
+        ck("utxo amount is Decimal", isinstance(u["amount"], decimal.Decimal))
+    ck("listunspent include_unsafe=false only safe",
+       all(e["safe"] for e in rpc.call("listunspent", 0, 9999999, [], False)))
+    # A freshly generated address has no notes; the filter validates its entries.
+    ck("listunspent fresh-address filter empty",
+       rpc.call("listunspent", 1, 9999999, [addr]) == [])
+    try:
+        rpc.call("listunspent", 1, 9999999, ["nonsense"])
+        ck("listunspent bad filter address raises", False)
+    except JSONRPCException as e:
+        ck("listunspent bad filter address -> code -5", e.code == -5, e.code)
+    try:
+        rpc.call("listunspent", 1, 9999999, [addr, addr])
+        ck("listunspent duplicated filter address raises", False)
+    except JSONRPCException as e:
+        ck("listunspent duplicated filter address -> code -8", e.code == -8, e.code)
+
     print("== history ==")
     txs = rpc.call("listtransactions", "*", 20)
     ck("listtransactions is list", isinstance(txs, list))
     if txs:
         t = txs[0]
-        for f in ("address", "category", "amount", "confirmations", "txid", "time"):
+        for f in ("address", "category", "amount", "confirmations", "txid", "time",
+                  "timereceived", "walletconflicts"):
             ck(f"tx has {f}", f in t)
         ck("tx amount is Decimal", isinstance(t["amount"], decimal.Decimal), repr(t["amount"]))
         ck("tx category valid", t["category"] in ("send", "receive"))
+        # Bitcoin Core's WalletTxToJSON: mined txs carry block fields (and no `trusted`);
+        # unmined txs carry `trusted` instead.
+        if t["confirmations"] > 0:
+            for f in ("blockhash", "blockheight", "blocktime"):
+                ck(f"mined tx has {f}", f in t)
+            ck("mined tx has no trusted", "trusted" not in t)
+            ck("mined tx time == blocktime", t["time"] == t["blocktime"])
+        else:
+            ck("unmined tx has trusted", "trusted" in t)
         gt = rpc.call("gettransaction", t["txid"])
         ck("gettransaction amount Decimal", isinstance(gt["amount"], decimal.Decimal))
         ck("gettransaction has details list", isinstance(gt.get("details"), list))
         ck("gettransaction hex hex-string", isinstance(gt.get("hex"), str) and len(gt["hex"]) % 2 == 0)
+        ck("gettransaction has walletconflicts", gt.get("walletconflicts") == [])
+        ck("gettransaction has timereceived", "timereceived" in gt)
+        if gt["confirmations"] > 0:
+            ck("gettransaction mined has blockhash", "blockhash" in gt)
 
         print("== getrawtransaction ==")
         raw = rpc.call("getrawtransaction", t["txid"])
@@ -254,6 +344,49 @@ def main() -> int:
         ck("subtractfeefromamount raises", False)
     except JSONRPCException as e:
         ck("subtractfeefromamount -> code -8", e.code == -8, e.code)
+    try:
+        # Zero amounts are rejected before any send logic, like Bitcoin Core.
+        rpc.call("sendtoaddress", addr, 0)
+        ck("zero amount raises", False)
+    except JSONRPCException as e:
+        ck("zero amount -> code -3", e.code == -3, e.code)
+    try:
+        # Typed arguments: a non-numeric minconf is -3, never silently the default.
+        rpc.call("getreceivedbyaddress", addr, "six")
+        ck("non-numeric minconf raises", False)
+    except JSONRPCException as e:
+        ck("non-numeric minconf -> code -3", e.code == -3, e.code)
+    try:
+        # The memo extension param (11) validates hex before any send logic. Positions
+        # 4..=10 are subtractfeefromamount/replaceable/conf_target/estimate_mode/
+        # avoid_reuse/fee_rate/verbose - seven nulls before the memo.
+        rpc.call("sendtoaddress", addr, "0.1", "", "", None, None, None, None,
+                 None, None, None, "not-hex")
+        ck("bad memo hex raises", False)
+    except JSONRPCException as e:
+        ck("bad memo hex -> code -8", e.code == -8, e.code)
+    try:
+        # A non-boolean verbose (position 10) is a -3 type error.
+        rpc.call("sendtoaddress", addr, "0.1", "", "", None, None, None, None,
+                 None, None, "not-a-bool")
+        ck("non-boolean verbose raises", False)
+    except JSONRPCException as e:
+        ck("non-boolean verbose -> code -3", e.code == -3, e.code)
+    try:
+        # settxfee gets the explicit ZIP-317 -8, like every other fee instruction.
+        rpc.call("settxfee", 0.0001)
+        ck("settxfee raises", False)
+    except JSONRPCException as e:
+        ck("settxfee -> code -8", e.code == -8, e.code)
+    # lastblock is always a 64-hex-char cursor, even at absurd depths.
+    lsb = rpc.call("listsinceblock")
+    ck("lastblock is 64 hex chars", len(lsb["lastblock"]) == 64, lsb["lastblock"])
+    lsb = rpc.call("listsinceblock", "", 99999999)
+    ck("deep target lastblock still 64 chars", len(lsb["lastblock"]) == 64, lsb["lastblock"])
+    # getaddressesbylabel reports purpose by ownership.
+    rpc.call("setlabel", addr, "conformance-purpose")
+    abl = rpc.call("getaddressesbylabel", "conformance-purpose")
+    ck("own labelled address purpose receive", abl[addr]["purpose"] == "receive")
     try:
         # fee_rate (param 9): an explicit fee instruction; fees are ZIP-317 and never settable.
         rpc.call("sendtoaddress", addr, "0.1", "", "", False, False, None, "", False, 25)

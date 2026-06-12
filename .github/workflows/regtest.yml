@@ -26,11 +26,13 @@ on:
     paths:
       - "regtest-harness/**"
       - "src/**"
+      - "scripts/**"
       - ".github/workflows/regtest.yml"
   pull_request:
     paths:
       - "regtest-harness/**"
       - "src/**"
+      - "scripts/**"
       - ".github/workflows/regtest.yml"
 
 # The pinned zebra image used by PR/push runs; the schedule runs `latest` instead, and a manual

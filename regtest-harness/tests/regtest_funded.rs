@@ -232,9 +232,15 @@ async fn regtest_funded_orchard_receive() {
         "unlocked_until reports the relock time while unlocked: {wi}"
     );
 
-    // The send-success path: a real Orchard spend back to the funder.
+    // The send-success path: a real Orchard spend back to the funder, carrying a ZIP-302
+    // memo via the trailing extension param (after Bitcoin Core's comment/fee-knob/verbose
+    // slots): hex for "regtest memo".
+    let memo_hex = "72656774657374206d656d6f";
     let txid = zecd
-        .call("sendtoaddress", json!([funder_ua, 0.4]))
+        .call(
+            "sendtoaddress",
+            json!([funder_ua, 0.4, "", "", null, null, null, null, null, null, null, memo_hex]),
+        )
         .await
         .expect("sendtoaddress succeeds with spendable funds");
     let txid = txid.as_str().expect("txid is a string").to_string();
@@ -259,11 +265,32 @@ async fn regtest_funded_orchard_receive() {
         gt["hex"].as_str().is_some_and(|h| !h.is_empty()),
         "raw hex is stored for our own send: {gt}"
     );
+    let send_detail = gt["details"]
+        .as_array()
+        .expect("details")
+        .iter()
+        .find(|d| d["category"] == "send" && d["address"] == json!(funder_ua.as_str()))
+        .cloned()
+        .unwrap_or_else(|| panic!("details carry the send to the funder: {gt}"));
+    // The memo round-trips onto the send detail (hex + decoded text, zcashd's field names).
+    assert_eq!(
+        send_detail["memo"].as_str(),
+        Some(memo_hex),
+        "send detail carries the memo hex: {send_detail}"
+    );
+    assert_eq!(
+        send_detail["memoStr"].as_str(),
+        Some("regtest memo"),
+        "send detail decodes the text memo: {send_detail}"
+    );
+    // WalletTxToJSON fields on an unconfirmed own send: trusted (we authored it and it can
+    // still mine), walletconflicts always present, and a real time (the wallet's `created`
+    // timestamp - Bitcoin Core semantics, where unmined txs carry their first-seen time).
+    assert_eq!(gt["trusted"].as_bool(), Some(true), "own unmined send is trusted: {gt}");
+    assert!(gt["walletconflicts"].is_array(), "walletconflicts is always present: {gt}");
     assert!(
-        gt["details"].as_array().expect("details").iter().any(|d| {
-            d["category"] == "send" && d["address"] == json!(funder_ua.as_str())
-        }),
-        "details carry the send to the funder: {gt}"
+        gt["time"].as_i64().is_some_and(|t| t > 0),
+        "an unmined send reports a real time, not 0: {gt}"
     );
 
     // Mine it in and let zecd scan; the send confirms.
@@ -281,6 +308,18 @@ async fn regtest_funded_orchard_receive() {
         "the send is confirmed: {gt}"
     );
     assert!(gt["blockheight"].is_u64(), "mined height is reported: {gt}");
+    assert!(
+        gt["blockhash"].as_str().is_some_and(|h| h.len() == 64),
+        "mined send carries its blockhash: {gt}"
+    );
+    assert!(
+        gt["blocktime"].as_i64().is_some_and(|t| t > 0),
+        "mined send carries its blocktime: {gt}"
+    );
+    assert!(
+        gt.get("trusted").is_none(),
+        "trusted rides on unmined txs only once confirmed: {gt}"
+    );
 
     // The poller loop closes: since the pre-send cursor, the send appears; since the fresh
     // cursor, nothing confirmed is left to report.

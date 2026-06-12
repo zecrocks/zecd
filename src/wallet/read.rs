@@ -26,11 +26,18 @@ pub struct BalanceInfo {
     pub immature: u64,
 }
 
-/// Aggregate balances via `get_wallet_summary` (mirrors devtool's `balance.rs`).
-pub fn balance(network: ZNetwork, wallet_dir: &Path) -> anyhow::Result<BalanceInfo> {
+/// Aggregate balances via `get_wallet_summary` (mirrors devtool's `balance.rs`), under the
+/// given confirmations policy (callers default to [`ConfirmationsPolicy::default`], the
+/// ZIP-315 trusted-3/untrusted-10 policy; `getbalance` maps an explicit `minconf` onto a
+/// symmetric override).
+pub fn balance(
+    network: ZNetwork,
+    wallet_dir: &Path,
+    policy: ConfirmationsPolicy,
+) -> anyhow::Result<BalanceInfo> {
     let db = open_read(network, wallet_dir)?;
     let mut info = BalanceInfo::default();
-    if let Some(summary) = db.get_wallet_summary(ConfirmationsPolicy::default())? {
+    if let Some(summary) = db.get_wallet_summary(policy)? {
         for bal in summary.account_balances().values() {
             info.orchard_spendable += bal.orchard_balance().spendable_value().into_u64();
             info.sapling_spendable += bal.sapling_balance().spendable_value().into_u64();
@@ -62,6 +69,8 @@ pub struct TxOutputRecord {
     pub to_address: Option<String>,
     pub value: i64,
     pub is_change: bool,
+    /// The output's ZIP-302 memo bytes, when the wallet decrypted/stored one.
+    pub memo: Option<Vec<u8>>,
 }
 
 /// One transaction row from `v_transactions`, plus its outputs.
@@ -79,6 +88,13 @@ pub struct TxRecord {
     pub received_note_count: i64,
     pub block_time: Option<i64>,
     pub expired_unmined: bool,
+    /// Position of the transaction within its block, when known (`blockindex`).
+    pub tx_index: Option<u32>,
+    /// Display-hex hash of the mining block, when scanned (`blockhash`).
+    pub block_hash: Option<String>,
+    /// Unix time the wallet created the transaction (librustzcash sets `created` only for
+    /// wallet-authored sends); the unmined-tx `time`/`timereceived` fallback.
+    pub created_time: Option<i64>,
     pub outputs: Vec<TxOutputRecord>,
     /// Raw serialized transaction bytes, when available (populated by `get_transaction`).
     pub raw: Option<Vec<u8>>,
@@ -95,6 +111,9 @@ pub struct UnspentNote {
     /// account). Bitcoin Core's `listunspent.safe` analog: an *own* unconfirmed note (change)
     /// is trusted, a foreign unconfirmed note is not.
     pub trusted: bool,
+    /// The diversified address the note was received on, when the wallet recorded one
+    /// (change/internal notes have none).
+    pub address: Option<String>,
 }
 
 fn open_conn(wallet_dir: &Path) -> anyhow::Result<Connection> {
@@ -123,7 +142,7 @@ fn txid_internal(display_hex: &str) -> Option<Vec<u8>> {
 fn load_outputs(conn: &Connection, txid: &[u8]) -> anyhow::Result<Vec<TxOutputRecord>> {
     let mut stmt = conn.prepare(
         "SELECT output_pool, output_index, from_account_uuid, to_account_uuid,
-                to_address, value, is_change
+                to_address, value, is_change, memo
          FROM v_tx_outputs
          WHERE txid = :txid",
     )?;
@@ -136,6 +155,7 @@ fn load_outputs(conn: &Connection, txid: &[u8]) -> anyhow::Result<Vec<TxOutputRe
             to_address: row.get("to_address")?,
             value: row.get("value")?,
             is_change: row.get("is_change")?,
+            memo: row.get("memo")?,
         })
     })?;
     let mut out = Vec::new();
@@ -145,39 +165,61 @@ fn load_outputs(conn: &Connection, txid: &[u8]) -> anyhow::Result<Vec<TxOutputRe
     Ok(out)
 }
 
+/// The column list shared by [`list_transactions`] and [`get_transaction`]: `v_transactions`
+/// joined with the mining block's hash and the raw `transactions` row's `created` timestamp
+/// (set only for wallet-authored sends; stored as `yyyy-MM-dd HH:mm:ss.fffffffzzz`, which
+/// SQLite's date parser understands).
+const TX_COLS: &str = "v.mined_height, v.txid, v.expiry_height, v.account_balance_delta,
+            v.fee_paid, v.sent_note_count, v.received_note_count, v.block_time,
+            v.expired_unmined, v.tx_index,
+            b.hash AS block_hash,
+            CAST(strftime('%s', t.created) AS INTEGER) AS created_time";
+
+/// The matching source clause for [`TX_COLS`].
+const TX_FROM: &str = "FROM v_transactions v
+     LEFT JOIN blocks b ON b.height = v.mined_height
+     LEFT JOIN transactions t ON t.txid = v.txid";
+
+/// Parse one [`TX_COLS`] row into `(internal txid, TxRecord)` (outputs filled by callers).
+fn tx_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<(Vec<u8>, TxRecord)> {
+    let txid: Vec<u8> = row.get("txid")?;
+    Ok((
+        txid.clone(),
+        TxRecord {
+            mined_height: row.get("mined_height")?,
+            txid_hex: txid_display(&txid),
+            expiry_height: row.get("expiry_height")?,
+            account_balance_delta: row.get("account_balance_delta")?,
+            fee_paid: row.get::<_, Option<i64>>("fee_paid")?.map(|v| v as u64),
+            sent_note_count: row.get("sent_note_count")?,
+            received_note_count: row.get("received_note_count")?,
+            block_time: row.get("block_time")?,
+            expired_unmined: row.get("expired_unmined")?,
+            tx_index: row.get("tx_index")?,
+            block_hash: row
+                .get::<_, Option<Vec<u8>>>("block_hash")?
+                .map(|h| txid_display(&h)),
+            created_time: row.get("created_time")?,
+            outputs: Vec::new(),
+            raw: None,
+        },
+    ))
+}
+
 /// All transactions, oldest first (callers apply skip/count). Mirrors `list_tx.rs`.
 pub fn list_transactions(wallet_dir: &Path) -> anyhow::Result<Vec<TxRecord>> {
     let conn = open_conn(wallet_dir)?;
-    let mut stmt = conn.prepare(
-        "SELECT mined_height, txid, expiry_height, account_balance_delta, fee_paid,
-                sent_note_count, received_note_count, block_time, expired_unmined,
-                COALESCE(
-                    mined_height,
-                    CASE WHEN expiry_height == 0 THEN NULL ELSE expiry_height END
-                ) AS sort_height
-         FROM v_transactions
+    let mut stmt = conn.prepare(&format!(
+        "SELECT {TX_COLS},
+            COALESCE(
+                v.mined_height,
+                CASE WHEN v.expiry_height == 0 THEN NULL ELSE v.expiry_height END
+            ) AS sort_height
+         {TX_FROM}
          ORDER BY sort_height ASC NULLS LAST",
-    )?;
+    ))?;
     let mut records = Vec::new();
-    let rows = stmt.query_map([], |row| {
-        let txid: Vec<u8> = row.get("txid")?;
-        Ok((
-            txid.clone(),
-            TxRecord {
-                mined_height: row.get("mined_height")?,
-                txid_hex: txid_display(&txid),
-                expiry_height: row.get("expiry_height")?,
-                account_balance_delta: row.get("account_balance_delta")?,
-                fee_paid: row.get::<_, Option<i64>>("fee_paid")?.map(|v| v as u64),
-                sent_note_count: row.get("sent_note_count")?,
-                received_note_count: row.get("received_note_count")?,
-                block_time: row.get("block_time")?,
-                expired_unmined: row.get("expired_unmined")?,
-                outputs: Vec::new(),
-                raw: None,
-            },
-        ))
-    })?;
+    let rows = stmt.query_map([], tx_from_row)?;
     let mut pending: Vec<(Vec<u8>, TxRecord)> = Vec::new();
     for r in rows {
         pending.push(r?);
@@ -195,30 +237,12 @@ pub fn get_transaction(wallet_dir: &Path, txid_hex: &str) -> anyhow::Result<Opti
         return Ok(None);
     };
     let conn = open_conn(wallet_dir)?;
-    let mut stmt = conn.prepare(
-        "SELECT mined_height, txid, expiry_height, account_balance_delta, fee_paid,
-                sent_note_count, received_note_count, block_time, expired_unmined
-         FROM v_transactions
-         WHERE txid = :txid",
-    )?;
+    let mut stmt = conn.prepare(&format!("SELECT {TX_COLS} {TX_FROM} WHERE v.txid = :txid"))?;
     let mut rows = stmt.query(named_params! {":txid": internal})?;
     let Some(row) = rows.next()? else {
         return Ok(None);
     };
-    let txid: Vec<u8> = row.get("txid")?;
-    let mut rec = TxRecord {
-        mined_height: row.get("mined_height")?,
-        txid_hex: txid_display(&txid),
-        expiry_height: row.get("expiry_height")?,
-        account_balance_delta: row.get("account_balance_delta")?,
-        fee_paid: row.get::<_, Option<i64>>("fee_paid")?.map(|v| v as u64),
-        sent_note_count: row.get("sent_note_count")?,
-        received_note_count: row.get("received_note_count")?,
-        block_time: row.get("block_time")?,
-        expired_unmined: row.get("expired_unmined")?,
-        outputs: Vec::new(),
-        raw: None,
-    };
+    let (txid, mut rec) = tx_from_row(row)?;
     drop(rows);
     rec.outputs = load_outputs(&conn, &txid)?;
     // Fetch the raw transaction bytes for `gettransaction.hex`, if stored.
@@ -231,6 +255,26 @@ pub fn get_transaction(wallet_dir: &Path, txid_hex: &str) -> anyhow::Result<Opti
         .optional()?
         .flatten();
     Ok(Some(rec))
+}
+
+/// Whether the wallet database has a row for this transaction (display-hex txid). The actor
+/// uses this to record first-seen times only for transactions that concern the wallet.
+pub fn tx_exists(wallet_dir: &Path, txid_hex: &str) -> bool {
+    let Some(internal) = txid_internal(txid_hex) else {
+        return false;
+    };
+    let Ok(conn) = open_conn(wallet_dir) else {
+        return false;
+    };
+    conn.query_row(
+        "SELECT 1 FROM transactions WHERE txid = :txid",
+        named_params! {":txid": internal},
+        |_| Ok(()),
+    )
+    .optional()
+    .ok()
+    .flatten()
+    .is_some()
 }
 
 /// Wallet transactions that are still unmined and unexpired at `tip` - candidates for
@@ -286,6 +330,20 @@ pub fn block_info_at(wallet_dir: &Path, height: u32) -> anyhow::Result<Option<(S
     Ok(row.map(|(hash, time)| (txid_display(&hash), time)))
 }
 
+/// The earliest block the wallet has scanned, as `(height, display-hex hash)` - the lowest
+/// cursor `listsinceblock` can hand out when the requested depth predates the wallet.
+pub fn first_scanned_block(wallet_dir: &Path) -> anyhow::Result<Option<(u32, String)>> {
+    let conn = open_conn(wallet_dir)?;
+    let row = conn
+        .query_row(
+            "SELECT height, hash FROM blocks ORDER BY height ASC LIMIT 1",
+            [],
+            |r| Ok((r.get::<_, u32>(0)?, r.get::<_, Vec<u8>>(1)?)),
+        )
+        .optional()?;
+    Ok(row.map(|(h, hash)| (h, txid_display(&hash))))
+}
+
 /// The height of a wallet-scanned block, looked up by its display-hex hash (for
 /// `listsinceblock`). Hashes are stored in internal byte order, displayed reversed.
 pub fn block_height_by_hash(wallet_dir: &Path, display_hash: &str) -> anyhow::Result<Option<u32>> {
@@ -330,6 +388,9 @@ pub fn list_unspent(network: ZNetwork, wallet_dir: &Path) -> anyhow::Result<Vec<
     // Map txid (display hex) -> (mined height, authored-by-us) for confirmations and trust.
     // A negative balance delta means the wallet spent notes in the tx, i.e. it authored it.
     let mut tx_meta: HashMap<String, (Option<u32>, bool)> = HashMap::new();
+    // Map (txid, action index) -> receiving address for the Orchard outputs the wallet
+    // recorded one for (change/internal notes have none).
+    let mut out_addr: HashMap<(String, u32), String> = HashMap::new();
     {
         let conn = open_conn(wallet_dir)?;
         let mut stmt = conn
@@ -345,6 +406,21 @@ pub fn list_unspent(network: ZNetwork, wallet_dir: &Path) -> anyhow::Result<Vec<
             let (txid, mh, delta) = row?;
             tx_meta.insert(txid_display(&txid), (mh, delta < 0));
         }
+        let mut stmt = conn.prepare(
+            "SELECT txid, output_index, to_address FROM v_tx_outputs
+             WHERE output_pool = 3 AND to_address IS NOT NULL",
+        )?;
+        let rows = stmt.query_map([], |r| {
+            Ok((
+                r.get::<_, Vec<u8>>(0)?,
+                r.get::<_, u32>(1)?,
+                r.get::<_, String>(2)?,
+            ))
+        })?;
+        for row in rows {
+            let (txid, idx, addr) = row?;
+            out_addr.insert((txid_display(&txid), idx), addr);
+        }
     }
 
     let mut out = Vec::new();
@@ -352,14 +428,17 @@ pub fn list_unspent(network: ZNetwork, wallet_dir: &Path) -> anyhow::Result<Vec<
         let notes = db.select_unspent_notes(account, &[ShieldedProtocol::Orchard], target_height, &[])?;
         for note in notes.orchard() {
             let txid = note.txid().to_string();
+            let vout = note.output_index() as u32;
             let value = note.note_value().map_err(|e| anyhow!("note value: {e:?}"))?.into_u64();
             let (mined_height, trusted) = tx_meta.get(&txid).copied().unwrap_or((None, false));
+            let address = out_addr.get(&(txid.clone(), vout)).cloned();
             out.push(UnspentNote {
-                vout: note.output_index() as u32,
+                vout,
                 txid,
                 value,
                 mined_height,
                 trusted,
+                address,
             });
         }
     }
@@ -400,4 +479,27 @@ pub fn is_mine(network: ZNetwork, wallet_dir: &Path, addr: &str) -> bool {
         }
     }
     false
+}
+
+#[cfg(test)]
+mod tests {
+    /// The `created_time` expression in [`super::TX_COLS`] must parse rusqlite's
+    /// `OffsetDateTime` encoding (`yyyy-MM-dd HH:mm:ss.fffffffzzz`, what librustzcash stores
+    /// in `transactions.created`), honoring the offset, and yield NULL for NULL input.
+    #[test]
+    fn sqlite_parses_created_timestamp_format() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        let parse = |s: Option<&str>| -> Option<i64> {
+            conn.query_row(
+                "SELECT CAST(strftime('%s', ?1) AS INTEGER)",
+                rusqlite::params![s],
+                |r| r.get(0),
+            )
+            .unwrap()
+        };
+        assert_eq!(parse(Some("2026-06-11 09:31:53.1234567+00:00")), Some(1_781_170_313));
+        // A non-UTC offset is normalized to the same UTC epoch.
+        assert_eq!(parse(Some("2026-06-11 09:31:53.1234567+02:00")), Some(1_781_163_113));
+        assert_eq!(parse(None), None);
+    }
 }

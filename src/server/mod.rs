@@ -211,6 +211,7 @@ mod tests {
             rpc: rpc.clone(),
             keys: KeysConfig { age_identity: None, auto_unlock: true },
             sync: SyncConfig { interval_secs: 20, rebroadcast_secs: 60 },
+            spend: crate::config::SpendConfig::default(),
             health: crate::config::HealthConfig {
                 enabled: false,
                 bind: "127.0.0.1".parse().unwrap(),

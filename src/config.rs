@@ -5,11 +5,13 @@
 
 use std::collections::BTreeMap;
 use std::net::{IpAddr, SocketAddr};
+use std::num::NonZeroU32;
 use std::path::PathBuf;
 
 use anyhow::Context;
 use clap::Parser;
 use serde::Deserialize;
+use zcash_client_backend::data_api::wallet::ConfirmationsPolicy;
 
 use crate::network::ZNetwork;
 
@@ -46,6 +48,7 @@ pub struct AppConfig {
     pub rpc: RpcConfig,
     pub keys: KeysConfig,
     pub sync: SyncConfig,
+    pub spend: SpendConfig,
     pub health: HealthConfig,
     pub log: LogConfig,
 }
@@ -126,6 +129,77 @@ pub struct SyncConfig {
     pub rebroadcast_secs: u64,
 }
 
+/// `[spend]` - the wallet-wide confirmations policy (ZIP 315 defaults, like Zallet's
+/// `trusted_confirmations`/`untrusted_confirmations`): how deep an output must be before
+/// the wallet treats it as spendable, which also anchors `getbalance`/`getbalances`/
+/// `getwalletinfo` and the sync engine's spend proposals.
+#[derive(Debug, Clone)]
+pub struct SpendConfig {
+    /// Confirmations before the wallet's *own* outputs (change) are spendable. Default 3.
+    pub trusted_confirmations: u32,
+    /// Confirmations before third-party outputs are spendable. Must be at least
+    /// `trusted_confirmations`. Default 10.
+    pub untrusted_confirmations: u32,
+    /// What sends are allowed to reveal on-chain. Default `AllowRevealedRecipients`.
+    pub privacy: SendPrivacy,
+}
+
+impl Default for SpendConfig {
+    fn default() -> Self {
+        Self {
+            trusted_confirmations: 3,
+            untrusted_confirmations: 10,
+            privacy: SendPrivacy::AllowRevealedRecipients,
+        }
+    }
+}
+
+/// `[spend] privacy_policy` - Zallet/zcashd's privacy-policy idea reduced to what matters
+/// for an Orchard-only wallet: whether a send may leave the Orchard pool. Crossing pools
+/// reveals the transferred amount on-chain (and, for transparent recipients, the recipient
+/// too); zcashd and Zallet require an explicit `AllowRevealed*` opt-in for that, and this
+/// knob is zecd's equivalent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SendPrivacy {
+    /// Every recipient must be able to receive in the Orchard pool, so a send never reveals
+    /// amounts or recipients.
+    FullPrivacy,
+    /// Recipients without an Orchard receiver (transparent and Sapling-only addresses) are
+    /// allowed; such sends reveal the amount (and a transparent recipient) on-chain. This is
+    /// the default: the Bitcoin-RPC dialect promises "send to any valid address".
+    AllowRevealedRecipients,
+}
+
+impl SendPrivacy {
+    fn parse(s: &str) -> anyhow::Result<Self> {
+        match s {
+            "FullPrivacy" => Ok(Self::FullPrivacy),
+            "AllowRevealedRecipients" => Ok(Self::AllowRevealedRecipients),
+            other => anyhow::bail!(
+                "[spend] privacy_policy must be \"FullPrivacy\" or \"AllowRevealedRecipients\" \
+                 (got \"{other}\")"
+            ),
+        }
+    }
+}
+
+impl SpendConfig {
+    /// Build the [`ConfirmationsPolicy`] this configuration describes. Values are clamped
+    /// to at least 1 (a shielded note is never spendable unmined); trusted exceeding
+    /// untrusted is a configuration error, as in librustzcash.
+    pub fn confirmations_policy(&self) -> anyhow::Result<ConfirmationsPolicy> {
+        let trusted = NonZeroU32::new(self.trusted_confirmations.max(1)).expect("clamped");
+        let untrusted = NonZeroU32::new(self.untrusted_confirmations.max(1)).expect("clamped");
+        ConfirmationsPolicy::new(trusted, untrusted).map_err(|_| {
+            anyhow::anyhow!(
+                "[spend] trusted_confirmations ({}) must not exceed untrusted_confirmations ({})",
+                self.trusted_confirmations,
+                self.untrusted_confirmations
+            )
+        })
+    }
+}
+
 impl AppConfig {
     /// Default RPC port for a network when none is configured (zcashd convention).
     pub fn default_rpc_port(network: ZNetwork) -> u16 {
@@ -152,6 +226,7 @@ struct ConfigFile {
     rpc: Option<RpcFile>,
     keys: Option<KeysFile>,
     sync: Option<SyncFile>,
+    spend: Option<SpendFile>,
     health: Option<HealthFile>,
     log: Option<LogFile>,
 }
@@ -216,6 +291,14 @@ struct KeysFile {
 struct SyncFile {
     interval_secs: Option<u64>,
     rebroadcast_secs: Option<u64>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SpendFile {
+    trusted_confirmations: Option<u32>,
+    untrusted_confirmations: Option<u32>,
+    privacy_policy: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -478,6 +561,20 @@ impl AppConfig {
             rebroadcast_secs: sync_file.rebroadcast_secs.unwrap_or(60).max(1),
         };
 
+        let spend_file = file.spend.unwrap_or_default();
+        let spend = SpendConfig {
+            trusted_confirmations: spend_file.trusted_confirmations.unwrap_or(3),
+            untrusted_confirmations: spend_file.untrusted_confirmations.unwrap_or(10),
+            privacy: spend_file
+                .privacy_policy
+                .as_deref()
+                .map(SendPrivacy::parse)
+                .transpose()?
+                .unwrap_or(SendPrivacy::AllowRevealedRecipients),
+        };
+        // Fail at startup, not on the first balance/send call.
+        spend.confirmations_policy()?;
+
         let health_file = file.health.unwrap_or(HealthFile {
             enabled: None,
             bind: None,
@@ -510,6 +607,7 @@ impl AppConfig {
             rpc,
             keys,
             sync,
+            spend,
             health,
             log,
         })
@@ -519,6 +617,49 @@ impl AppConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn spend_section_builds_policy_and_validates() {
+        // Parses from TOML; explicit values land in the policy.
+        let f: SpendFile =
+            toml::from_str("trusted_confirmations = 1\nuntrusted_confirmations = 2").unwrap();
+        let s = SpendConfig {
+            trusted_confirmations: f.trusted_confirmations.unwrap_or(3),
+            untrusted_confirmations: f.untrusted_confirmations.unwrap_or(10),
+            ..Default::default()
+        };
+        let p = s.confirmations_policy().unwrap();
+        assert_eq!((p.trusted().get(), p.untrusted().get()), (1, 2));
+        // The defaults are ZIP 315's 3/10.
+        let p = SpendConfig { trusted_confirmations: 3, untrusted_confirmations: 10, ..Default::default() }
+            .confirmations_policy()
+            .unwrap();
+        assert_eq!((p.trusted().get(), p.untrusted().get()), (3, 10));
+        // 0 clamps to 1 (a shielded note is never spendable unmined).
+        let p = SpendConfig { trusted_confirmations: 0, untrusted_confirmations: 1, ..Default::default() }
+            .confirmations_policy()
+            .unwrap();
+        assert_eq!((p.trusted().get(), p.untrusted().get()), (1, 1));
+        // trusted > untrusted is rejected (surfaces as a startup error).
+        assert!(SpendConfig { trusted_confirmations: 11, untrusted_confirmations: 10, ..Default::default() }
+            .confirmations_policy()
+            .is_err());
+        // Unknown keys in the section are rejected like everywhere else.
+        assert!(toml::from_str::<SpendFile>("min_conf = 1").is_err());
+    }
+
+    #[test]
+    fn privacy_policy_parses_known_values_only() {
+        assert_eq!(SendPrivacy::parse("FullPrivacy").unwrap(), SendPrivacy::FullPrivacy);
+        assert_eq!(
+            SendPrivacy::parse("AllowRevealedRecipients").unwrap(),
+            SendPrivacy::AllowRevealedRecipients
+        );
+        // Unknown values (including other zcashd policies that don't apply to an
+        // Orchard-only wallet) are a startup error, never a silent default.
+        assert!(SendPrivacy::parse("NoPrivacy").is_err());
+        assert!(SendPrivacy::parse("fullprivacy").is_err());
+    }
 
     #[test]
     fn server_token_precedence() {

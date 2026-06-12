@@ -111,6 +111,12 @@ auto_unlock = true               # decrypt the seed at startup so sends need no 
 interval_secs = 20
 rebroadcast_secs = 60            # max spacing of unmined-tx re-broadcast passes
 
+[spend]
+trusted_confirmations = 3        # depth before the wallet's own change is spendable
+untrusted_confirmations = 10     # depth before third-party payments are spendable (>= trusted)
+privacy_policy = "AllowRevealedRecipients"  # or "FullPrivacy": reject recipients without an
+                                 #   Orchard receiver instead of revealing amounts on-chain
+
 [log]
 level = "info"                   # tracing filter; RUST_LOG overrides
 format = "text"                  # "text" | "json" (structured, for log aggregation)
@@ -135,7 +141,11 @@ Loki/CloudWatch/Elastic.
 Each wallet is owned by a single-writer actor, so sends serialize per wallet, the same guarantee
 Bitcoin Core gets from `cs_wallet`. Concurrent `sendtoaddress`/`sendmany` calls are processed one
 at a time and never select the same note, so there is no double-spend; queued sends block their
-HTTP call until complete. Because freshly-created change is unconfirmed (not yet spendable), rapid
+HTTP call until complete. Unlike bitcoind's millisecond sends, a shielded send computes Orchard
+proofs, so the call holds the HTTP connection for a few seconds (plus any queueing behind other
+sends): set client-side send timeouts well above that. A client that times out and retries a send
+that actually succeeded will pay twice - exactly as with bitcoind, but the longer window makes it
+worth calling out: on timeout, reconcile with `listtransactions` before retrying. Because freshly-created change is unconfirmed (not yet spendable), rapid
 back-to-back sends exhaust spendable notes and return `RPC_WALLET_INSUFFICIENT_FUNDS (-6)` until
 confirmations arrive, the same code bitcoind returns for spent/locked funds. The `-6` message
 reports any balance awaiting confirmations, so a client can tell "retry after the next block" from
@@ -214,11 +224,11 @@ real RPC password in `zecd.toml` / `zecd.mainnet.toml` before exposing the port.
 
 | Category | Methods |
 |---|---|
-| Wallet | `getnewaddress` (returns an Orchard UA), `getbalance`, `getbalances`, `getunconfirmedbalance`, `getwalletinfo`, `getaddressinfo`, `setlabel`, `getaddressesbylabel`, `listlabels`, `listtransactions`, `listsinceblock`, `gettransaction`, `listunspent`, `getreceivedbyaddress`, `listreceivedbyaddress`, `getreceivedbylabel`, `listreceivedbylabel`, `sendtoaddress`, `sendmany`, `encryptwallet`, `walletpassphrase`, `walletpassphrasechange`, `walletlock`, `listwallets` |
+| Wallet | `getnewaddress` (returns an Orchard UA), `getbalance`, `getbalances`, `getunconfirmedbalance`, `getwalletinfo`, `getaddressinfo`, `setlabel`, `getaddressesbylabel`, `listlabels`, `listtransactions`, `listsinceblock`, `gettransaction`, `listunspent`, `getreceivedbyaddress`, `listreceivedbyaddress`, `getreceivedbylabel`, `listreceivedbylabel`, `sendtoaddress` (extra trailing `memo` hex param beyond Bitcoin Core's arguments), `sendmany`, `encryptwallet`, `walletpassphrase`, `walletpassphrasechange`, `walletlock`, `listwallets` |
 | Raw transactions | `getrawtransaction` (verbose form is zcashd's `TxToJSON` shape, matching Zallet, shielded bundles included), `sendrawtransaction` (broadcasts caller-built raw bytes through lightwalletd) |
-| Blockchain | `getblockchaininfo`, `getblockcount`, `getbestblockhash`, `getblockhash` |
+| Blockchain | `getblockchaininfo`, `getblockcount`, `getbestblockhash`, `getblockhash`, `getblockheader` (verbose form only, fields a compact block carries: hash/confirmations/height/time/mediantime/prev/next) |
 | Network | `getnetworkinfo`, `getconnectioncount`, `getpeerinfo`, `ping` |
-| Utility | `validateaddress`, `estimatesmartfee`, `estimatefee`, `getmempoolinfo` |
+| Utility | `validateaddress`, `estimatesmartfee`, `estimatefee`, `getmempoolinfo`, `settxfee` (always `-8`: fees are ZIP-317) |
 | Control | `stop`, `uptime`, `help`, `getrpcinfo` |
 
 Multiwallet is addressed bitcoind-style via `POST /wallet/<name>`; the default wallet is used at
@@ -250,19 +260,46 @@ Edges to be aware of (consequences of being a shielded light wallet):
 - Spending needs confirmations: an incoming mempool payment is visible immediately
   (`getunconfirmedbalance` / `listtransactions` at 0 conf, via lightwalletd's mempool stream),
   but received notes must mine and reach the confirmation minimum before they are spendable.
+  The default minimum is [ZIP 315](https://zips.z.cash/zip-0315)'s: 3 confirmations for the
+  wallet's own change, 10 for third-party payments (~12.5 minutes at 75-second blocks);
+  `[spend] trusted_confirmations`/`untrusted_confirmations` tune it wallet-wide.
+  A parameterless `getbalance` reports what is spendable under that policy - funds with
+  fewer confirmations show in `getunconfirmedbalance` / `getbalances.mine.untrusted_pending`
+  meanwhile. Passing an explicit `minconf` (`getbalance "*" 1`) overrides the policy and
+  counts everything at that depth, like Bitcoin Core; `minconf` 0 is served as 1 because a
+  shielded note is never spendable unmined.
 - Fees are never client-settable. Fees follow ZIP-317, a deterministic formula (5,000 zatoshis ×
   max(2, logical actions); a typical send is 0.0001 ZEC) computed at transaction-build time, with
   no fee market to outbid. Explicit fee instructions are rejected with `-8` rather than silently
-  ignored: `subtractfeefromamount`/`subtractfeefrom` and `fee_rate` on `sendtoaddress`/`sendmany`
-  (`settxfee` does not exist; `conf_target`/`estimate_mode` are estimation hints and are safely
+  ignored: `subtractfeefromamount`/`subtractfeefrom` and `fee_rate` on `sendtoaddress`/`sendmany`,
+  and `settxfee` (`conf_target`/`estimate_mode` are estimation hints and are safely
   ignored). `estimatesmartfee`/`estimatefee` remain as inert probe-compat stubs returning a stable
   conventional rate; the exact fee paid is reported after the fact in `gettransaction.fee`.
 - Addresses are shielded UAs (`u1...`/`utest1...`): clients that parse the address string as a
   transparent Bitcoin address will not understand them; clients that treat addresses as opaque
   strings are fine.
+- Sending to a recipient without an Orchard receiver (a transparent or Sapling-only address)
+  moves funds out of the Orchard pool and reveals the amount on-chain (plus the recipient,
+  if transparent). Allowed by default; set `[spend] privacy_policy = "FullPrivacy"` to reject
+  such sends with `-8` instead (the zcashd/Zallet `AllowRevealed*` opt-in, inverted).
+- Shielded memos (ZIP 302) are supported as extensions beyond Bitcoin Core's surface:
+  `sendtoaddress` takes a hex memo as an extra trailing parameter (after `verbose`, zcashd's
+  `z_sendmany` conventions: ≤512 bytes, rejected for transparent recipients), and history
+  entries (`listtransactions`/`gettransaction.details`) carry `memo` (hex) and `memoStr`
+  (decoded text) fields when an output has one.
 - `listunspent` lists each unspent Orchard note as one entry. Its `txid`/`vout` identify the
-  shielded action that created the note (there is no transparent `scriptPubKey`), and `address`
-  is empty.
+  shielded action that created the note (there is no transparent `scriptPubKey`); `address` is
+  the diversified address the note was received on, or empty for change/internal notes. The
+  `addresses` filter and `include_unsafe` parameters work as in Bitcoin Core (an address
+  filter never matches change notes).
+- During initial sync (or a post-restore rescan), read RPCs serve whatever has been scanned
+  so far: `getbalance` on a half-synced wallet is a partial number, not an error (bitcoind
+  would block or warm-up here). Gate automation on `GET /readyz`, or on
+  `getwalletinfo.scanning` / `getblockchaininfo.initialblockdownload`, before trusting
+  balances.
+- `sendmany` recipients arrive as a JSON object, and JSON parsing collapses duplicate keys
+  (last one wins) before zecd sees them - Bitcoin Core's "duplicated address" error cannot
+  be reproduced. Don't list the same address twice; combine the amounts instead.
 - Reorgs invalidate `listsinceblock` cursors. zecd keeps only the current chain's scanned block
   hashes (a light wallet has no stale-header index), so if the cursor block is reorged away (or
   is below the wallet birthday), `listsinceblock <hash>` returns `-5 Block not found` instead of
@@ -286,7 +323,9 @@ cargo test -- --include-ignored
 
 # Conformance suite against a running daemon, using the same client logic python-bitcoinrpc's
 # AuthServiceProxy uses: Basic auth, the 1.0 envelope, amounts decoded as decimal.Decimal
-# (no float drift), JSONRPCException codes, batching. Validated live against testnet: 49/49.
+# (no float drift), JSONRPCException codes, batching. The full suite (~140 checks) runs in CI
+# on every PR against a live, funded regtest daemon (the Regtest E2E workflow's funded test);
+# the original 49 checks were additionally validated against the public testnet.
 python3 scripts/conformance.py --url http://127.0.0.1:18232/ --user u --password p
 
 # Stdlib-only smoke test of the wire format, amounts, and error codes over HTTP:
