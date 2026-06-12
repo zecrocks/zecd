@@ -13,13 +13,20 @@
 //! Skips cleanly unless `ZEBRAD_BIN`, `LIGHTWALLETD_BIN` and `DEVTOOL_BIN` are all set (see
 //! README.md).
 //!
-//! Phase 1: funded receive (funder → zecd, balance + history). Phase 2: zecd *spends* - the
-//! walletlock/-13/walletpassphrase gate, a real `sendtoaddress` back to the funder with
-//! `gettransaction` shape checks through confirmation, and the payment-poller methods
-//! (`listsinceblock` cursor loop, `getreceivedbyaddress`/`listreceivedbyaddress`), then a
-//! concurrent-send burst proving the no-double-spend invariant (exactly one winner, losers
-//! get -6). Finally `scripts/conformance.py` runs against the live funded daemon, putting its
-//! full Bitcoin-Core wire-format suite under CI.
+//! Phase 1: funded receive (funder → zecd) - first observed at **0 conf via the mempool
+//! stream** (`getunconfirmedbalance`/`listtransactions`/`listunspent minconf=0`), then
+//! confirmed (balance + history). Phase 2: zecd *spends* - the walletlock/-13/walletpassphrase
+//! gate, a real `sendtoaddress` back to the funder with `gettransaction` shape checks through
+//! confirmation, and the payment-poller methods (`listsinceblock` cursor loop,
+//! `getreceivedbyaddress`/`listreceivedbyaddress`). Phase 3: a send during an upstream outage
+//! (committed-send contract), with the health endpoints (`/healthz` `/readyz` `/status`)
+//! checked through the outage and the recovery. Phase 4: an expired send releases its funds.
+//! Then a concurrent-send burst proving the no-double-spend invariant (exactly one winner,
+//! losers get -6, and `getrpcinfo.active_commands` shows the burst in flight). Phase 6: a
+//! 2-output `sendmany` (shielded + transparent recipient). Phase 7: `sendrawtransaction`
+//! happy path (manually delivering a committed-but-unbroadcast send). Finally
+//! `scripts/conformance.py` runs against the live funded daemon, putting its full
+//! Bitcoin-Core wire-format suite under CI.
 
 use std::time::{Duration, Instant};
 
@@ -119,13 +126,76 @@ async fn regtest_funded_orchard_receive() {
         "expected a uregtest1 address, got {zecd_ua}"
     );
 
-    // 6. Fund zecd: send Orchard funds from the funder to zecd's UA, then confirm. zecd's
-    //    getbalance uses the default confirmations policy, under which an externally-received
-    //    (untrusted) note needs 10 confirmations before it counts; mine a couple extra for the
-    //    tip skew.
+    // 6. Fund zecd: send Orchard funds from the funder to zecd's UA. First wait for zecd to
+    //    be fully caught up (conn_state "ready"): only a caught-up actor subscribes to
+    //    lightwalletd's mempool stream, which the 0-conf check below exercises.
+    let deadline = Instant::now() + FUND_TIMEOUT;
+    loop {
+        let peers = zecd.call("getpeerinfo", json!([])).await.expect("getpeerinfo");
+        if peers
+            .as_array()
+            .and_then(|a| a.first())
+            .is_some_and(|p| p["conn_state"] == "ready")
+        {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "zecd never reached conn_state ready before funding: {peers}"
+        );
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+    // One sync interval of slack so the caught-up pass has opened the mempool stream.
+    tokio::time::sleep(Duration::from_secs(3)).await;
     funder
         .send(lwd.grpc_port, &zecd_ua, FUND_ZATOSHIS)
         .expect("send Orchard funds to zecd");
+
+    // 0-conf visibility via the mempool stream: before any block confirms the funding tx,
+    // zecd trial-decrypts it out of the mempool and reports it bitcoind-style in
+    // getunconfirmedbalance, listtransactions, and listunspent minconf=0.
+    let deadline = Instant::now() + FUND_TIMEOUT;
+    loop {
+        let pending = zecd
+            .call("getunconfirmedbalance", json!([]))
+            .await
+            .expect("getunconfirmedbalance")
+            .as_f64()
+            .unwrap_or(0.0);
+        if pending > 0.0 {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the funding tx never appeared at 0 conf (mempool stream)"
+        );
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+    let txs = zecd
+        .call("listtransactions", json!([]))
+        .await
+        .expect("listtransactions");
+    assert!(
+        txs.as_array().expect("array").iter().any(|t| {
+            t["category"] == "receive" && t["confirmations"].as_i64() == Some(0)
+        }),
+        "the unconfirmed receive rides in listtransactions: {txs}"
+    );
+    let lu = zecd
+        .call("listunspent", json!([0]))
+        .await
+        .expect("listunspent minconf=0");
+    assert!(
+        lu.as_array()
+            .expect("array")
+            .iter()
+            .any(|u| u["confirmations"].as_i64() == Some(0)),
+        "listunspent minconf=0 lists the unconfirmed note: {lu}"
+    );
+
+    // Confirm the funding send. zecd's getbalance uses the default confirmations policy,
+    // under which an externally-received (untrusted) note needs 10 confirmations before it
+    // counts; mine a couple extra for the tip skew.
     zebrad
         .generate_blocks(12)
         .await
@@ -391,12 +461,46 @@ async fn regtest_funded_orchard_receive() {
         tokio::time::sleep(Duration::from_millis(500)).await;
     }
 
+    // The health endpoints report the same outage: /healthz stays 200 (pure liveness),
+    // /readyz flips to 503 with reason "upstream_down", and /status shows the wallet's
+    // conn_state as "down".
+    let health = format!("http://127.0.0.1:{}", cfg.health_port());
+    let resp = reqwest::get(format!("{health}/healthz")).await.expect("GET /healthz");
+    assert_eq!(resp.status().as_u16(), 200, "/healthz is liveness, not readiness");
+    let resp = reqwest::get(format!("{health}/readyz")).await.expect("GET /readyz");
+    assert_eq!(resp.status().as_u16(), 503, "/readyz is 503 during the outage");
+    let body: serde_json::Value = resp.json().await.expect("readyz body is JSON");
+    assert_eq!(body["ready"], json!(false), "{body}");
+    assert_eq!(body["reason"], json!("upstream_down"), "{body}");
+    let st: serde_json::Value = reqwest::get(format!("{health}/status"))
+        .await
+        .expect("GET /status")
+        .json()
+        .await
+        .expect("status body is JSON");
+    assert_eq!(st["network"], json!("regtest"), "{st}");
+    assert_eq!(st["wallets"]["default"]["conn_state"], json!("down"), "{st}");
+
     // Upstream recovers on the same address: zecd reconnects (1-2s backoff), the
     // rebroadcast pass (2s interval) re-submits the tx, and mining confirms it.
     let lwd = Lightwalletd::start_on(&lwd_bin, zebrad.rpc_port, lwd_port)
         .await
         .expect("restart lightwalletd on the same port");
     mine_until_confirmed(&zebrad, &zecd, &txid_outage, "outage send after recovery").await;
+
+    // /readyz returns to 200 once the wallet is reconnected and caught up again.
+    let deadline = Instant::now() + Duration::from_secs(60);
+    loop {
+        let resp = reqwest::get(format!("{health}/readyz")).await.expect("GET /readyz");
+        if resp.status().as_u16() == 200 {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "/readyz did not return to 200 after the upstream recovered"
+        );
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
 
     // ---- Phase 4: a send that can never broadcast expires, and the funds come back ----
 
@@ -431,7 +535,7 @@ async fn regtest_funded_orchard_receive() {
         .generate_blocks(45)
         .await
         .expect("mine past the 40-block expiry");
-    let _lwd = Lightwalletd::start_on(&lwd_bin, zebrad.rpc_port, lwd_port)
+    let lwd = Lightwalletd::start_on(&lwd_bin, zebrad.rpc_port, lwd_port)
         .await
         .expect("restart lightwalletd");
     zecd.wait_until_synced(tip + 45, FUND_TIMEOUT)
@@ -504,11 +608,38 @@ async fn regtest_funded_orchard_receive() {
         .expect("zecd scans the change-aging blocks");
 
     let burst = json!([funder_ua, 0.25]);
-    let (a, b, c, d) = tokio::join!(
+    // While the burst is in flight, getrpcinfo.active_commands must show the concurrent
+    // sendtoaddress calls - the manual "busy-server demo" assertion, in CI. The losers
+    // queue behind the winner's proving in the wallet actor, so the window is wide.
+    let watch_active = async {
+        let deadline = Instant::now() + Duration::from_secs(20);
+        loop {
+            let ri = zecd.call("getrpcinfo", json!([])).await.expect("getrpcinfo");
+            let in_flight = ri["active_commands"]
+                .as_array()
+                .expect("active_commands")
+                .iter()
+                .filter(|c| c["method"] == "sendtoaddress")
+                .count();
+            if in_flight >= 1 {
+                break in_flight;
+            }
+            if Instant::now() >= deadline {
+                break 0;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    };
+    let (a, b, c, d, seen_in_flight) = tokio::join!(
         zecd.call("sendtoaddress", burst.clone()),
         zecd.call("sendtoaddress", burst.clone()),
         zecd.call("sendtoaddress", burst.clone()),
         zecd.call("sendtoaddress", burst.clone()),
+        watch_active,
+    );
+    assert!(
+        seen_in_flight >= 1,
+        "getrpcinfo.active_commands showed the burst in flight"
     );
     let results = [a, b, c, d];
     let winners: Vec<&str> = results
@@ -547,8 +678,120 @@ async fn regtest_funded_orchard_receive() {
         "the burst winner confirmed on-chain: {gt}"
     );
 
+    // ---- Phase 6: sendmany - the multi-output happy path ----
+    //
+    // A 2-output sendmany pays the funder's unified address AND its transparent address in
+    // one transaction: the multi-output proposal path and a transparent (deshielding)
+    // recipient, neither of which any other automated test exercises. First age the burst
+    // change to trusted spendability (3 confs, +1 for the block the winner landed in).
+    let tip = zecd.block_count().await.expect("getblockcount");
+    zebrad.generate_blocks(4).await.expect("age the burst change");
+    zecd.wait_until_synced(tip + 4, FUND_TIMEOUT)
+        .await
+        .expect("scan the change-aging blocks");
+
+    let mut recipients = serde_json::Map::new();
+    recipients.insert(funder_ua.clone(), json!(0.05));
+    recipients.insert(funder_taddr.clone(), json!(0.02));
+    let txid_many = zecd
+        .call("sendmany", json!(["", recipients]))
+        .await
+        .expect("sendmany with two recipients succeeds");
+    let txid_many = txid_many.as_str().expect("txid is a string").to_string();
+    assert_eq!(txid_many.len(), 64, "sendmany txid is display hex");
+
+    let gt = zecd
+        .call("gettransaction", json!([txid_many]))
+        .await
+        .expect("gettransaction on the sendmany");
+    assert_eq!(
+        gt["amount"].as_f64(),
+        Some(-0.07),
+        "amount sums both outputs, fee excluded: {gt}"
+    );
+    assert!(
+        gt["fee"].as_f64().is_some_and(|f| f < 0.0),
+        "fee is present and negative: {gt}"
+    );
+    let sends: Vec<_> = gt["details"]
+        .as_array()
+        .expect("details")
+        .iter()
+        .filter(|d| d["category"] == "send")
+        .cloned()
+        .collect();
+    assert_eq!(sends.len(), 2, "one send detail per recipient: {gt}");
+    assert!(
+        sends.iter().any(|d| d["address"] == json!(funder_ua.as_str())
+            && d["amount"].as_f64() == Some(-0.05)),
+        "the shielded recipient detail carries its address and amount: {gt}"
+    );
+    assert!(
+        sends.iter().any(|d| d["address"] == json!(funder_taddr.as_str())
+            && d["amount"].as_f64() == Some(-0.02)),
+        "the transparent recipient detail carries its address and amount: {gt}"
+    );
+    mine_until_confirmed(&zebrad, &zecd, &txid_many, "2-output sendmany").await;
+
+    // ---- Phase 7: sendrawtransaction - broadcasting committed raw bytes by hand ----
+    //
+    // Build a committed-but-unbroadcast send the same way Phase 3 does (upstream down),
+    // capture its raw hex, and deliver it via sendrawtransaction. Blocks are mined during
+    // the outage so zecd is behind on reconnect: the automatic rebroadcast pass only runs
+    // once caught up, while the manual call is queued to the wallet actor ahead of the
+    // catch-up scan - so sendrawtransaction, not the rebroadcast loop, first delivers the
+    // tx. First mature the sendmany change.
+    let tip = zecd.block_count().await.expect("getblockcount");
+    zebrad
+        .generate_blocks(4)
+        .await
+        .expect("mature the sendmany change");
+    zecd.wait_until_synced(tip + 4, FUND_TIMEOUT)
+        .await
+        .expect("scan the maturity blocks");
+
+    let lwd_port = lwd.grpc_port;
+    lwd.stop();
+    let txid_raw = zecd
+        .call("sendtoaddress", json!([funder_ua, 0.01]))
+        .await
+        .expect("committed send during the outage")
+        .as_str()
+        .expect("txid is a string")
+        .to_string();
+    let raw_hex = zecd
+        .call("gettransaction", json!([txid_raw]))
+        .await
+        .expect("gettransaction during the outage")["hex"]
+        .as_str()
+        .expect("raw hex is stored for the committed send")
+        .to_string();
+    let tip = zecd.block_count().await.expect("getblockcount");
+    zebrad
+        .generate_blocks(20)
+        .await
+        .expect("mine while the upstream is down (stays well below the 40-block expiry)");
+    let _lwd = Lightwalletd::start_on(&lwd_bin, zebrad.rpc_port, lwd_port)
+        .await
+        .expect("restart lightwalletd");
+    let echoed = zecd
+        .call("sendrawtransaction", json!([raw_hex]))
+        .await
+        .expect("sendrawtransaction accepts the committed raw bytes");
+    assert_eq!(
+        echoed.as_str(),
+        Some(txid_raw.as_str()),
+        "sendrawtransaction returns the canonical txid"
+    );
+    zecd.wait_until_synced(tip + 20, FUND_TIMEOUT)
+        .await
+        .expect("catch up past the outage blocks");
+    mine_until_confirmed(&zebrad, &zecd, &txid_raw, "manually rebroadcast send").await;
+
     // ---- conformance.py against the live, funded daemon ----
-    run_conformance(cfg.rpc_port, &cfg.rpc_user, &cfg.rpc_password);
+    // The wallet arrives encrypted (Phase 2) and unlocked; passing the passphrase enables
+    // conformance's full encryption state machine (rotate/lock/unlock round-trips).
+    run_conformance(cfg.rpc_port, &cfg.rpc_user, &cfg.rpc_password, "regtest-pass");
 }
 
 /// Mine one block at a time (giving the rebroadcast/scan loop time between blocks) until
@@ -571,7 +814,7 @@ async fn mine_until_confirmed(zebrad: &Zebrad, zecd: &Zecd, txid: &str, what: &s
 /// Run `scripts/conformance.py` (the python-bitcoinrpc-equivalent wire-format suite) against
 /// the regtest daemon. Skips with a notice if `python3` isn't available so local runs without
 /// it don't fail confusingly; CI always has it.
-fn run_conformance(rpc_port: u16, user: &str, password: &str) {
+fn run_conformance(rpc_port: u16, user: &str, password: &str, passphrase: &str) {
     let script = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .expect("harness lives inside the zecd repo")
@@ -585,6 +828,8 @@ fn run_conformance(rpc_port: u16, user: &str, password: &str) {
             user,
             "--password",
             password,
+            "--passphrase",
+            passphrase,
         ])
         .output();
     match out {

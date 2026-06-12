@@ -581,6 +581,13 @@ pub fn zecd_bin() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("zecd"))
 }
 
+/// Whether the extended ("big run") regtest tier is enabled: set `ZECD_REGTEST_EXTENDED=1`.
+/// PR runs skip these tests (each spins a full zebra+lightwalletd stack); the scheduled and
+/// manually dispatched workflow runs set the variable.
+pub fn extended_enabled() -> bool {
+    std::env::var("ZECD_REGTEST_EXTENDED").is_ok_and(|v| !v.is_empty() && v != "0")
+}
+
 /// A running `zecd` daemon plus the HTTP client and credentials to drive it.
 pub struct Zecd {
     child: Child,
@@ -588,6 +595,9 @@ pub struct Zecd {
     user: String,
     password: String,
     http: reqwest::Client,
+    /// The default wallet's generated mnemonic, captured from `zecd init`'s stdout. `None`
+    /// when the wallet was restored ([`ZecdConfig::restore_mnemonic`]) - a restore prints none.
+    pub mnemonic: Option<String>,
     _datadir: tempfile::TempDir,
 }
 
@@ -604,6 +614,14 @@ pub struct ZecdConfig {
     pub rebroadcast_secs: u64,
     /// `[lightwalletd] primary_recheck_secs` - how fast a recovered primary is re-adopted.
     pub primary_recheck_secs: u64,
+    /// Additional `[wallets.<name>]` entries beyond `default` (multiwallet tests); each gets
+    /// its own `zecd init --wallet <name>` before the daemon starts.
+    pub extra_wallets: Vec<String>,
+    /// Restore the default wallet from this mnemonic (`zecd init --restore`, phrase on stdin)
+    /// instead of generating a fresh one.
+    pub restore_mnemonic: Option<String>,
+    /// `--birthday` for the restore path (a fresh init defaults near the tip on its own).
+    pub birthday: Option<u32>,
 }
 
 impl ZecdConfig {
@@ -618,7 +636,16 @@ impl ZecdConfig {
             rpc_password: "pass".to_string(),
             rebroadcast_secs: 2,
             primary_recheck_secs: 3,
+            extra_wallets: Vec::new(),
+            restore_mnemonic: None,
+            birthday: None,
         }
+    }
+
+    /// The `[health]` port (`/healthz`, `/readyz`, `/status`) the daemon is configured with -
+    /// [`write_zecd_toml`]'s convention is the RPC port + 1.
+    pub fn health_port(&self) -> u16 {
+        self.rpc_port + 1
     }
 }
 
@@ -641,32 +668,24 @@ impl Zecd {
 
         // `zecd init` contacts lightwalletd (get_latest_block + get_tree_state). Just after launch
         // lightwalletd may still be ingesting from zebrad, so retry, resetting the datadir between
-        // attempts so a partial init can't wedge the next one.
+        // attempts so a partial init can't wedge the next one. The default wallet's init is the
+        // retry gate; extra wallets are initialised once lightwalletd has proven warm.
         let deadline = Instant::now() + Duration::from_secs(90);
-        loop {
-            let init = Command::new(&bin)
-                .args([
-                    "--datadir",
-                    datadir.path().to_str().unwrap(),
-                    "--regtest",
-                    "init",
-                ])
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped())
-                .output()
-                .context("spawn zecd init")?;
-            if init.status.success() {
-                break;
+        let mnemonic = loop {
+            match run_zecd_init(&bin, datadir.path(), "default", cfg) {
+                Ok(mnemonic) => break mnemonic,
+                Err(e) => {
+                    if Instant::now() >= deadline {
+                        return Err(e.context("zecd init failed after retries"));
+                    }
+                    reset_datadir(datadir.path(), cfg)?;
+                    tokio::time::sleep(Duration::from_secs(2)).await;
+                }
             }
-            if Instant::now() >= deadline {
-                bail!(
-                    "zecd init failed after retries ({}):\n{}",
-                    init.status,
-                    String::from_utf8_lossy(&init.stderr)
-                );
-            }
-            reset_datadir(datadir.path(), cfg)?;
-            tokio::time::sleep(Duration::from_secs(2)).await;
+        };
+        for name in &cfg.extra_wallets {
+            run_zecd_init(&bin, datadir.path(), name, cfg)
+                .with_context(|| format!("init extra wallet '{name}'"))?;
         }
 
         let child = Command::new(&bin)
@@ -687,6 +706,7 @@ impl Zecd {
             user: cfg.rpc_user.clone(),
             password: cfg.rpc_password.clone(),
             http: reqwest::Client::new(),
+            mnemonic,
             _datadir: datadir,
         };
 
@@ -694,13 +714,59 @@ impl Zecd {
         Ok(zecd)
     }
 
+    /// Graceful shutdown via the `stop` RPC: asserts bitcoind's reply shape ("zecd stopping"),
+    /// then waits for the process to exit cleanly (status 0).
+    pub async fn shutdown(mut self) -> Result<()> {
+        let reply = self
+            .call("stop", json!([]))
+            .await
+            .map_err(|e| anyhow!("stop RPC failed: {e}"))?;
+        anyhow::ensure!(
+            reply == json!("zecd stopping"),
+            "unexpected stop reply: {reply}"
+        );
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            match self.child.try_wait() {
+                Ok(Some(status)) => {
+                    anyhow::ensure!(status.success(), "zecd exited with {status} after stop");
+                    return Ok(());
+                }
+                Ok(None) => {
+                    anyhow::ensure!(
+                        Instant::now() < deadline,
+                        "zecd did not exit within 30s of the stop RPC"
+                    );
+                    tokio::time::sleep(Duration::from_millis(200)).await;
+                }
+                Err(e) => return Err(anyhow!("waiting for zecd to exit: {e}")),
+            }
+        }
+    }
+
     /// Issue a JSON-RPC call, returning the `result` on success or an error carrying the
     /// Bitcoin Core error `code` (so tests can assert e.g. `-6` for insufficient funds).
     pub async fn call(&self, method: &str, params: Value) -> Result<Value, RpcError> {
+        self.call_at(self.base_url.clone(), method, params).await
+    }
+
+    /// Issue a JSON-RPC call against a named wallet's `/wallet/<name>` endpoint (multiwallet
+    /// routing; the bare [`Zecd::call`] serves the default wallet).
+    pub async fn call_wallet(
+        &self,
+        wallet: &str,
+        method: &str,
+        params: Value,
+    ) -> Result<Value, RpcError> {
+        self.call_at(format!("{}wallet/{wallet}", self.base_url), method, params)
+            .await
+    }
+
+    async fn call_at(&self, url: String, method: &str, params: Value) -> Result<Value, RpcError> {
         let body = json!({ "jsonrpc": "1.0", "id": "harness", "method": method, "params": params });
         let resp = self
             .http
-            .post(&self.base_url)
+            .post(url)
             .basic_auth(&self.user, Some(&self.password))
             .json(&body)
             .send()
@@ -1090,10 +1156,72 @@ fn reset_datadir(datadir: &Path, cfg: &ZecdConfig) -> Result<()> {
     write_zecd_toml(datadir, cfg)
 }
 
+/// Run `zecd init` for one wallet, returning the generated mnemonic (printed on stdout by a
+/// fresh init; `None` on the restore path, which prints none). The restore path applies to
+/// the default wallet only: the phrase from [`ZecdConfig::restore_mnemonic`] is fed on stdin
+/// and `--birthday` is passed when set.
+fn run_zecd_init(bin: &Path, datadir: &Path, wallet: &str, cfg: &ZecdConfig) -> Result<Option<String>> {
+    let mut args: Vec<String> = vec![
+        "--datadir".into(),
+        datadir.to_str().unwrap().into(),
+        "--regtest".into(),
+        "init".into(),
+        "--wallet".into(),
+        wallet.into(),
+    ];
+    let restore = (wallet == "default")
+        .then(|| cfg.restore_mnemonic.clone())
+        .flatten();
+    if restore.is_some() {
+        args.push("--restore".into());
+        if let Some(b) = cfg.birthday {
+            args.push("--birthday".into());
+            args.push(b.to_string());
+        }
+    }
+    let mut child = Command::new(bin)
+        .args(&args)
+        .stdin(if restore.is_some() { Stdio::piped() } else { Stdio::null() })
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .context("spawn zecd init")?;
+    if let Some(phrase) = &restore {
+        use std::io::Write as _;
+        child
+            .stdin
+            .take()
+            .expect("piped stdin")
+            .write_all(format!("{phrase}\n").as_bytes())
+            .context("write the mnemonic to zecd init")?;
+    }
+    let out = child.wait_with_output().context("wait for zecd init")?;
+    if !out.status.success() {
+        bail!(
+            "zecd init --wallet {wallet} failed ({}):\n{}",
+            out.status,
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+    let phrase = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    Ok((!phrase.is_empty()).then_some(phrase))
+}
+
 fn write_zecd_toml(datadir: &Path, cfg: &ZecdConfig) -> Result<()> {
     let mut servers = format!(r#""127.0.0.1:{}""#, cfg.lightwalletd_port);
     if let Some(fb) = cfg.fallback_lightwalletd_port {
         servers.push_str(&format!(r#", "127.0.0.1:{fb}""#));
+    }
+    // The default wallet plus any extra `[wallets.<name>]` entries (multiwallet tests).
+    let mut wallets = format!(
+        "[wallets.default]\ndir = \"{}/default\"\n",
+        datadir.display()
+    );
+    for name in &cfg.extra_wallets {
+        wallets.push_str(&format!(
+            "\n[wallets.{name}]\ndir = \"{}/{name}\"\n",
+            datadir.display()
+        ));
     }
     // Fast reconnect backoff (1..2s) so outage-recovery tests converge quickly.
     let toml = format!(
@@ -1101,9 +1229,7 @@ fn write_zecd_toml(datadir: &Path, cfg: &ZecdConfig) -> Result<()> {
 datadir = "{datadir}"
 default_wallet = "default"
 
-[wallets.default]
-dir = "{datadir}/default"
-
+{wallets}
 [lightwalletd]
 servers = [{servers}]
 connection = "direct"
@@ -1132,12 +1258,13 @@ bind = "127.0.0.1"
 port = {health_port}
 "#,
         datadir = datadir.display(),
+        wallets = wallets,
         primary_recheck = cfg.primary_recheck_secs,
         rpc_port = cfg.rpc_port,
         user = cfg.rpc_user,
         password = cfg.rpc_password,
         rebroadcast = cfg.rebroadcast_secs,
-        health_port = cfg.rpc_port + 1,
+        health_port = cfg.health_port(),
     );
     std::fs::write(datadir.join("zecd.toml"), toml)?;
     Ok(())

@@ -131,6 +131,11 @@ async fn regtest_end_to_end() {
         .await
         .expect_err("walletpassphrase on an unencrypted wallet must fail");
     assert_eq!(err.code(), Some(-15), "expected -15, got: {err}");
+    let err = zecd
+        .call("walletpassphrasechange", json!(["x", "y"]))
+        .await
+        .expect_err("walletpassphrasechange on an unencrypted wallet must fail");
+    assert_eq!(err.code(), Some(-15), "expected -15, got: {err}");
 
     // encryptwallet flips it to the Bitcoin-Core encrypted state: the wallet locks (send ->
     // -13; the seed check precedes input selection so no funds are needed), a wrong

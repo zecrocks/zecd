@@ -7,9 +7,11 @@ name: Regtest E2E
 # Regtest-only `generate` RPC, so it has no zebra crate dependency and works against any zebrad
 # release. zebrad + lightwalletd are extracted from their official Docker images.
 #
-# Runs on PRs and pushes to main against the pinned zebra image, and weekly (or on dispatch with
-# an image tag of your choice) against zfnd/zebra:latest as an early-warning canary for upstream
-# zebra changes.
+# Runs on PRs and pushes to main against the pinned zebra image. The weekly schedule is the
+# "big run": it tests BOTH the pinned image (re-validating the baseline) and zfnd/zebra:latest
+# (an early-warning canary for upstream zebra changes), and - like manual dispatches - sets
+# ZECD_REGTEST_EXTENDED=1 so the extended tests (reorg, multiwallet, stop/restore) run too;
+# on PR runs those skip in seconds (each spins its own zebra+lightwalletd stack).
 
 on:
   workflow_dispatch:
@@ -55,16 +57,23 @@ jobs:
     # One matrix leg per binary, so a tparty failure is attributable at a glance and the
     # suites run in parallel rather than serializing behind each other on one runner.
     # NB: new harness test files must be added to a leg here (the legs enumerate --test
-    # targets; nothing runs them implicitly).
+    # targets; nothing runs them implicitly). Extended tests (gated on
+    # ZECD_REGTEST_EXTENDED) are listed too: on PR runs they compile and skip in seconds.
+    #
+    # The `image` dimension is "event" except on the weekly schedule, where both the pinned
+    # baseline and `latest` run ("event" resolves the tag from the trigger: dispatch input
+    # or the pinned default).
     strategy:
       fail-fast: false
       matrix:
+        suite: [zecd, tparty]
+        image: ${{ github.event_name == 'schedule' && fromJSON('["pinned", "latest"]') || fromJSON('["event"]') }}
         include:
           - suite: zecd
-            tests: --test regtest_e2e --test regtest_funded --test regtest_failover --test regtest_hang
+            tests: --test regtest_e2e --test regtest_funded --test regtest_failover --test regtest_hang --test regtest_reorg --test regtest_multiwallet --test regtest_restore
           - suite: tparty
             tests: --test regtest_tparty
-    name: regtest (${{ matrix.suite }})
+    name: regtest (${{ matrix.suite }}, ${{ matrix.image }})
     steps:
       - uses: actions/checkout@v4
 
@@ -114,14 +123,20 @@ jobs:
         if: steps.devtool-bin.outputs.cache-hit != 'true'
         run: cargo build --release --manifest-path zcash-devtool/Cargo.toml --bin zcash-devtool
 
-      # Pick the zebra image: the pinned tag for PR/push runs, `latest` for the weekly canary,
-      # or whatever a manual dispatch asked for.
+      # Pick the zebra image. The matrix names it outright on the weekly schedule
+      # (pinned + latest legs); otherwise ("event") it comes from the trigger: a manual
+      # dispatch's input, or the pinned tag for PR/push runs.
       - name: Select zebra image tag
         run: |
-          case "${{ github.event_name }}" in
-            schedule) tag="latest" ;;
-            workflow_dispatch) tag="${{ inputs.zebra-image }}"; tag="${tag:-$ZEBRAD_IMAGE_PINNED}" ;;
-            *) tag="$ZEBRAD_IMAGE_PINNED" ;;
+          case "${{ matrix.image }}" in
+            pinned) tag="$ZEBRAD_IMAGE_PINNED" ;;
+            latest) tag="latest" ;;
+            *)
+              case "${{ github.event_name }}" in
+                workflow_dispatch) tag="${{ inputs.zebra-image }}"; tag="${tag:-$ZEBRAD_IMAGE_PINNED}" ;;
+                *) tag="$ZEBRAD_IMAGE_PINNED" ;;
+              esac
+              ;;
           esac
           echo "Testing against zfnd/zebra:$tag"
           echo "ZEBRAD_IMAGE_TAG=$tag" >> "$GITHUB_ENV"
@@ -158,6 +173,9 @@ jobs:
           DEVTOOL_BIN: ${{ github.workspace }}/zcash-devtool/target/release/zcash-devtool
           # Capture zebrad's logs so a startup failure is diagnosable from the CI run.
           ZEBRAD_STDERR: ${{ runner.temp }}/zebrad.log
+          # The extended tier (reorg, multiwallet, stop/restore) runs on the weekly "big
+          # run" and on manual dispatches; PR/push runs let those tests skip in seconds.
+          ZECD_REGTEST_EXTENDED: ${{ (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && '1' || '' }}
           # ZEBRAD_BIN / LIGHTWALLETD_BIN are exported by the provisioning step above.
         # --locked: build against the committed lock. Single-threaded: two zebrad+lightwalletd
         # stacks plus Orchard proving would contend badly on a 2-core runner.

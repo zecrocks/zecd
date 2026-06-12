@@ -10,6 +10,11 @@ amounts round-trip as exact decimals (not floats), batching works, and errors ca
 expected Bitcoin Core codes.
 
 Usage:  python3 scripts/conformance.py [--url http://127.0.0.1:18232/] [--user u] [--password p]
+                                       [--passphrase <wallet passphrase>]
+
+`--passphrase`: the wallet passphrase, when the wallet under test is encrypted. Enables the
+full encryption state machine (lock/unlock/passphrase-change round-trips); the wallet is left
+as it was found (same passphrase, unlocked).
 """
 import argparse
 import base64
@@ -65,6 +70,8 @@ def main() -> int:
     ap.add_argument("--url", default="http://127.0.0.1:18232/")
     ap.add_argument("--user", default="u")
     ap.add_argument("--password", default="p")
+    ap.add_argument("--passphrase", default="",
+                    help="wallet passphrase (enables the encrypted-wallet state-machine checks)")
     args = ap.parse_args()
     rpc = AuthServiceProxy(args.url, args.user, args.password)
 
@@ -97,6 +104,34 @@ def main() -> int:
     at_count = rpc.call("getblockhash", count)
     ck("getblockhash(getblockcount()) == getbestblockhash", best == at_count, f"{best} != {at_count}")
 
+    print("== control methods ==")
+    h = rpc.call("help")
+    ck("help is a string naming methods", isinstance(h, str) and "getblockchaininfo" in h)
+    up = rpc.call("uptime")
+    ck("uptime is a non-negative int", isinstance(up, int) and up >= 0, up)
+    ck("ping returns null", rpc.call("ping") is None)
+    ri = rpc.call("getrpcinfo")
+    ck("getrpcinfo.active_commands is list", isinstance(ri.get("active_commands"), list))
+    # Bitcoin Core's getrpcinfo reports itself as an active command.
+    ck("getrpcinfo lists itself active",
+       any(c.get("method") == "getrpcinfo" for c in ri.get("active_commands", [])))
+    ck("active command carries duration",
+       all("duration" in c for c in ri.get("active_commands", [])))
+    ck("getrpcinfo has logpath", "logpath" in ri)
+
+    print("== fee & mempool stubs ==")
+    esf = rpc.call("estimatesmartfee", 2)
+    ck("estimatesmartfee.feerate is Decimal",
+       isinstance(esf.get("feerate"), decimal.Decimal), repr(esf.get("feerate")))
+    ck("estimatesmartfee echoes blocks", esf.get("blocks") == 2, esf.get("blocks"))
+    ck("estimatefee is Decimal", isinstance(rpc.call("estimatefee"), decimal.Decimal))
+    mp = rpc.call("getmempoolinfo")
+    ck("getmempoolinfo.loaded", mp.get("loaded") is True)
+    for f in ("size", "bytes", "usage", "maxmempool"):
+        ck(f"getmempoolinfo.{f} is int", isinstance(mp.get(f), int), repr(mp.get(f)))
+    ck("getmempoolinfo.mempoolminfee is Decimal",
+       isinstance(mp.get("mempoolminfee"), decimal.Decimal), repr(mp.get("mempoolminfee")))
+
     print("== getnetworkinfo fields ==")
     ni = rpc.call("getnetworkinfo")
     for f in ("version", "subversion", "protocolversion", "connections", "relayfee", "networks", "warnings"):
@@ -109,6 +144,9 @@ def main() -> int:
     # Reflects the active lightwalletd upstream; on a synced daemon there should be one "peer".
     if pi:
         ck("peer has addr", isinstance(pi[0].get("addr"), str) and bool(pi[0]["addr"]))
+    # getconnectioncount agrees with the peer list (the single lightwalletd "peer").
+    cc = rpc.call("getconnectioncount")
+    ck("getconnectioncount matches getpeerinfo", cc == len(pi), f"{cc} != {len(pi)}")
 
     print("== getwalletinfo fields ==")
     wi = rpc.call("getwalletinfo")
@@ -119,6 +157,8 @@ def main() -> int:
     print("== amounts are exact decimals ==")
     bal = rpc.call("getbalance")
     ck("getbalance is Decimal", isinstance(bal, decimal.Decimal), repr(bal))
+    ck("getunconfirmedbalance is Decimal",
+       isinstance(rpc.call("getunconfirmedbalance"), decimal.Decimal))
     # 8-dp string form, no float drift
     ck("getbalance 8-dp serialisable", str(bal) == format(bal, "f") or bal == bal)
 
@@ -225,6 +265,15 @@ def main() -> int:
         ck("getreceivedbylabel unknown raises", False)
     except JSONRPCException as e:
         ck("getreceivedbylabel unknown -> code -4", e.code == -4, e.code)
+
+    print("== wallets & labels ==")
+    lw = rpc.call("listwallets")
+    ck("listwallets is a non-empty list of strings",
+       isinstance(lw, list) and bool(lw) and all(isinstance(w, str) for w in lw), lw)
+    ll = rpc.call("listlabels")
+    ck("listlabels is list", isinstance(ll, list))
+    # `getnewaddress "conformance"` above created the label.
+    ck("listlabels includes the conformance label", "conformance" in ll, ll)
 
     print("== listunspent ==")
     lu = rpc.call("listunspent")
@@ -430,6 +479,39 @@ def main() -> int:
             ck("wrong passphrase raises", False)
         except JSONRPCException as e:
             ck("wrong passphrase -> -14", e.code == -14, e.code)
+        try:
+            rpc.call("walletpassphrasechange", "definitely-not-the-passphrase", "tmp")
+            ck("passphrasechange wrong old raises", False)
+        except JSONRPCException as e:
+            ck("passphrasechange wrong old -> -14", e.code == -14, e.code)
+        if args.passphrase:
+            # The full state machine, with the real passphrase: rotate it (old one stops
+            # working, the new one unlocks), rotate back, lock (send -> -13), re-unlock.
+            # The wallet ends as it was found: same passphrase, unlocked.
+            rotated = args.passphrase + "-rotated"
+            ck("walletpassphrasechange returns null",
+               rpc.call("walletpassphrasechange", args.passphrase, rotated) is None)
+            try:
+                rpc.call("walletpassphrase", args.passphrase, 60)
+                ck("old passphrase rejected after change", False)
+            except JSONRPCException as e:
+                ck("old passphrase after change -> -14", e.code == -14, e.code)
+            ck("new passphrase unlocks",
+               rpc.call("walletpassphrase", rotated, 600) is None)
+            ck("unlocked_until > 0 while unlocked",
+               rpc.call("getwalletinfo")["unlocked_until"] > 0)
+            rpc.call("walletpassphrasechange", rotated, args.passphrase)
+            ck("walletlock returns null", rpc.call("walletlock") is None)
+            ck("locked wallet reports unlocked_until 0",
+               rpc.call("getwalletinfo")["unlocked_until"] == 0)
+            try:
+                # The lock check precedes input selection, so no funds are needed.
+                rpc.call("sendtoaddress", addr, "0.01")
+                ck("locked wallet refuses to send", False)
+            except JSONRPCException as e:
+                ck("locked send -> -13", e.code == -13, e.code)
+            ck("re-unlocked after the lock round-trip",
+               rpc.call("walletpassphrase", args.passphrase, 600) is None)
     else:
         ck("getwalletinfo omits unlocked_until when unencrypted", "unlocked_until" not in wi)
         try:
@@ -442,6 +524,11 @@ def main() -> int:
             ck("walletlock on unencrypted raises", False)
         except JSONRPCException as e:
             ck("walletlock unencrypted -> -15", e.code == -15, e.code)
+        try:
+            rpc.call("walletpassphrasechange", "old", "new")
+            ck("walletpassphrasechange on unencrypted raises", False)
+        except JSONRPCException as e:
+            ck("walletpassphrasechange unencrypted -> -15", e.code == -15, e.code)
     # Argument validation happens before the encryption-state check: a negative timeout is -8
     # in both wallet states.
     try:
