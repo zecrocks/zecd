@@ -76,6 +76,9 @@ fn minconf_policy(
                 let min = u32::try_from(n.max(1)).unwrap_or(u32::MAX);
                 Ok(ConfirmationsPolicy::new_symmetrical(
                     NonZeroU32::new(min).expect("clamped to >= 1"),
+                    // cfg(transparent-inputs) arg: an explicit minconf must not loosen
+                    // transparent spends to 0-conf.
+                    false,
                 ))
             }
             None => Err(RpcError::type_error("minconf must be a number")),
@@ -84,8 +87,9 @@ fn minconf_policy(
 }
 
 /// Validate `getbalance`'s legacy first argument, which Bitcoin Core requires to be
-/// excluded or `"*"` (anything else is `-32 RPC_METHOD_DEPRECATED`).
-fn check_balance_dummy(v: Option<&Value>) -> Result<(), RpcError> {
+/// excluded or `"*"` (anything else is `-32 RPC_METHOD_DEPRECATED`). Shared with tparty's
+/// `getbalance`.
+pub(crate) fn check_balance_dummy(v: Option<&Value>) -> Result<(), RpcError> {
     match v {
         None | Some(Value::Null) => Ok(()),
         Some(Value::String(s)) if s == "*" => Ok(()),

@@ -396,6 +396,17 @@ All wallet RPCs have been exercised against the live public testnet (zecrocks): 
 addresses/labels, history (`listtransactions`/`gettransaction` incl. `hex`), `listunspent`, the
 `walletlock`/`walletpassphrase` gate, and real Orchard `sendtoaddress`/`sendmany` broadcasts.
 
+## tparty: transparent deposit addresses
+
+zecd never hands out transparent addresses. If an integration requires t-addresses (legacy
+exchange/payment flows that parse the address format), run the companion binary `tparty`
+from this repository instead of weakening zecd: it serves the same Bitcoin RPC dialect,
+returns a fresh t-address from `getnewaddress`, and auto-shields every confirmed deposit
+into the wallet seed's shielded pool. Restore the same mnemonic into a zecd instance
+(separate datadirs) and the shielded deposits appear in zecd's balance; the two daemons'
+addresses can never collide.
+
+
 ## Operations
 
 `docs/OPERATIONS.md` is the production runbook: what to back up (mnemonic, `keys.toml`, age

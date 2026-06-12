@@ -252,3 +252,81 @@ fn init_creates_wallet_and_refuses_reinit() {
         stderr_of(&out)
     );
 }
+
+// --- tparty binary (same CLI surface under its own name/defaults) ---
+
+fn tparty() -> Command {
+    Command::new(env!("CARGO_BIN_EXE_tparty"))
+}
+
+#[test]
+fn tparty_version_prints_its_own_name() {
+    let out = run_with_timeout(
+        {
+            let mut c = tparty();
+            c.arg("--version");
+            c
+        },
+        Duration::from_secs(10),
+    );
+    assert!(out.status.success());
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let mut words = stdout.split_whitespace();
+    assert_eq!(words.next(), Some("tparty"), "got: {stdout}");
+}
+
+/// An invalid `[tparty] pool` must fail at startup (before any wallet/network I/O), and the
+/// sapling variant gets the dedicated not-yet message.
+#[test]
+fn tparty_invalid_pool_fails_startup() {
+    for (pool, expect) in [("sapling", "not supported yet"), ("sprout", "invalid [tparty] pool")] {
+        let dir = tempfile::tempdir().unwrap();
+        let conf = dir.path().join("tparty.toml");
+        std::fs::write(&conf, format!("network = \"regtest\"\n[tparty]\npool = \"{pool}\"\n"))
+            .unwrap();
+        let out = run_with_timeout(
+            {
+                let mut c = tparty();
+                c.args(["--conf", conf.to_str().unwrap()]);
+                c
+            },
+            Duration::from_secs(10),
+        );
+        assert_eq!(out.status.code(), Some(1), "pool {pool}");
+        assert!(
+            stderr_of(&out).contains(expect),
+            "pool {pool}: stderr: {}",
+            stderr_of(&out)
+        );
+    }
+}
+
+/// Like zecd, tparty refuses to start on mainnet with the example placeholder password -
+/// auto-shielding spend authority must never run behind a known credential.
+#[test]
+fn tparty_mainnet_placeholder_password_refuses_to_start() {
+    let dir = tempfile::tempdir().unwrap();
+    let out = run_with_timeout(
+        {
+            let mut c = tparty();
+            c.args([
+                "--datadir",
+                dir.path().to_str().unwrap(),
+                "--network",
+                "main",
+                "--rpcuser",
+                "zec",
+                "--rpcpassword",
+                "CHANGE-ME",
+            ]);
+            c
+        },
+        Duration::from_secs(15),
+    );
+    assert_eq!(out.status.code(), Some(1));
+    assert!(
+        stderr_of(&out).contains("CHANGE-ME"),
+        "stderr: {}",
+        stderr_of(&out)
+    );
+}

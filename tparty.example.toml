@@ -1,0 +1,70 @@
+# Example tparty configuration. Copy to <datadir>/tparty.toml (or pass --conf) and edit.
+# CLI flags (e.g. --rpcuser, --rpcport, --testnet, --datadir, --server) override these.
+#
+# tparty serves transparent (t-) deposit addresses whose funds auto-shield into the wallet
+# seed's shielded pool as soon as deposits confirm. It shares zecd's config schema; the
+# [tparty] section below holds the auto-shield policy.
+
+# Network: "main" or "test".
+network = "test"
+
+# Keep tparty's datadir separate from zecd's, even when both run from the same seed: each
+# daemon owns its wallet database exclusively.
+datadir = "./tparty-data"
+
+default_wallet = "default"
+
+[wallets.default]
+dir = "./tparty-data/default"
+
+[lightwalletd]
+# Same options as zecd: "ecc" | "ywallet" | "zecrocks" | "host:port", `servers` for failover,
+# `connection` for SOCKS5/Tor. See zecd.example.toml for the full commentary.
+server = "zecrocks"
+connection = "direct"
+connect_timeout_secs = 10
+reconnect_base_secs = 1
+reconnect_max_secs = 60
+primary_recheck_secs = 60
+
+[rpc]
+bind = "127.0.0.1"
+# tparty's defaults stay off zecd's ports: mainnet 8237, testnet 18237.
+port = 18237
+user = "zec"
+password = "change-me"
+
+[keys]
+# Auto-shielding signs transactions unattended, so it needs the seed decrypted at startup.
+# (On a passphrase-encrypted wallet, deposits accumulate unshielded until walletpassphrase.)
+age_identity = "./tparty-data/identity.txt"
+auto_unlock = true
+
+[sync]
+interval_secs = 20
+rebroadcast_secs = 60
+
+[tparty]
+# Shielded pool deposits are moved into. Only "orchard" today (sapling may come later). The
+# destination is the account's *internal* receiver in this pool - the address every
+# librustzcash wallet scans by default when restoring the seed, and one that no
+# `getnewaddress` (tparty's or zecd's) ever hands out.
+pool = "orchard"
+# Confirmations a deposit needs before it is shielded. 1 = shield in the first block after
+# the deposit confirms. 0 = shield straight out of the mempool (fastest, but a double-spent
+# deposit can strand the shielding tx).
+min_conf = 1
+# Don't shield while the spendable transparent total is below this many zatoshis, so the
+# ZIP-317 fee (>= 10000 zatoshis) isn't burned on dust. `shieldfunds` overrides this.
+threshold_zat = 100000
+# How many consecutive *unused* deposit addresses getnewaddress may hand out before it
+# returns -12 (keypool ran out). Deposits to earlier addresses slide the window forward.
+# Larger values weaken seed-restore discovery of *unshielded* funds; auto-shielding keeps
+# that window small in practice.
+gap_limit = 100
+
+[health]
+enabled = true
+bind = "127.0.0.1"
+# zecd's default health port is 9233; tparty's is 9237.
+port = 9237

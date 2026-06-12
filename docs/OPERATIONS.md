@@ -5,6 +5,21 @@ README first for the architecture (`zebra → lightwalletd → zecd`) and config
 reference; this document covers backup/restore, monitoring, upgrades, and the mainnet
 checklist.
 
+Everything here applies equally to **`tparty`** (same wallet format, key custody,
+health endpoints - default health port 9237 - and restore procedures; substitute
+`tparty` for `zecd` in commands). tparty-specific operational notes:
+
+- Auto-shielding signs unattended, so it needs `[keys] auto_unlock = true` (the
+  default) or an operator who runs `walletpassphrase` after every restart; while the
+  seed is locked, deposits accumulate **unshielded** in the transparent pool.
+- Alert on `getbalance` (unshielded funds) staying above zero for longer than a few
+  blocks, and on `getshieldinginfo.last_shield_txid` not advancing while deposits
+  arrive - both mean the shielding pipeline is stuck (locked wallet, upstream down,
+  or totals below `[tparty] threshold_zat`; `shieldfunds` flushes dust manually).
+- When pairing tparty with zecd on one seed, give each daemon its **own datadir**
+  (each owns its wallet database exclusively); they may share the mnemonic and even
+  the lightwalletd.
+
 ## What to back up
 
 Funds are recoverable from **the mnemonic alone**. Everything else is convenience.

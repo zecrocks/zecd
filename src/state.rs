@@ -11,6 +11,17 @@ use crate::config::AppConfig;
 use crate::server::auth::Authenticator;
 use crate::wallet::WalletRegistry;
 
+/// Which binary's RPC method table this server dispatches: `zecd` (Orchard-only wallet
+/// methods) or `tparty` (transparent deposit + auto-shield methods). One enum rather than a
+/// trait object so the dispatch stays a plain `match` and unknown methods keep returning
+/// per-binary `-32601`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Dispatcher {
+    #[default]
+    Zecd,
+    Tparty,
+}
+
 #[derive(Clone)]
 pub struct AppState {
     pub config: Arc<AppConfig>,
@@ -27,6 +38,8 @@ pub struct AppState {
     pub work_queue: Arc<Semaphore>,
     /// Currently-executing commands, for `getrpcinfo.active_commands`.
     pub active: ActiveCommands,
+    /// Which RPC method table to serve (zecd vs tparty).
+    pub dispatcher: Dispatcher,
 }
 
 impl AppState {

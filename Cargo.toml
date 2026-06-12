@@ -7,6 +7,16 @@ license = "MIT OR Apache-2.0"
 publish = false
 description = "A Bitcoin-Core-style JSON-RPC server for Orchard-only Zcash, built on librustzcash"
 
+# Two binaries share the `zecd` library: `zecd` (the Orchard-only wallet server) and
+# `tparty` (transparent deposit addresses that auto-shield into the same seed's pool).
+[[bin]]
+name = "zecd"
+path = "src/main.rs"
+
+[[bin]]
+name = "tparty"
+path = "src/bin/tparty.rs"
+
 [dependencies]
 # Async runtime + HTTP server
 tokio = { version = "1.21", features = ["rt-multi-thread", "macros", "fs", "signal", "sync", "time", "io-util"] }
@@ -60,8 +70,10 @@ rayon = "1.7"
 # Zcash - versions identical to zcash-devtool/Cargo.toml
 orchard = { version = "0.14", default-features = false }
 zcash_address = "0.12"
-zcash_client_backend = { version = "0.23", features = ["lightwalletd-tonic-tls-webpki-roots", "orchard"] }
-zcash_client_sqlite = { version = "0.21", features = ["unstable", "orchard", "serde"] }
+# `transparent-inputs` is required by `tparty` (transparent deposit detection + shielding);
+# it is additive for `zecd`, whose wallets never expose transparent receivers.
+zcash_client_backend = { version = "0.23", features = ["lightwalletd-tonic-tls-webpki-roots", "orchard", "transparent-inputs"] }
+zcash_client_sqlite = { version = "0.21", features = ["unstable", "orchard", "serde", "transparent-inputs"] }
 zcash_keys = { version = "0.14", features = ["unstable", "orchard"] }
 zcash_primitives = "0.28"
 zcash_proofs = { version = "0.28", features = ["bundled-prover"] }

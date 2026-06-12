@@ -124,6 +124,164 @@ fn regtest_wallet_lifecycle() {
         .expect("derive USK on regtest");
 }
 
+/// The tparty address-derivation invariants, offline on regtest:
+///
+/// 1. tparty's `getnewaddress` yields base58 transparent addresses (`tm…` on regtest) and a
+///    fresh one per call;
+/// 2. **no collisions with zecd, even on the same seed and account**: zecd's addresses are
+///    Orchard-only unified addresses carrying *no* transparent receiver, so the two address
+///    sets are disjoint by receiver type - a deposit address handed out by tparty can never
+///    equal an invoice address handed out by zecd;
+/// 3. the read helpers see the t-addresses as the wallet's own.
+#[test]
+fn tparty_addresses_never_collide_with_zecd() {
+    let net = network::regtest();
+    let dir = tempfile::tempdir().unwrap();
+    let wallet_dir = dir.path();
+
+    let mut db = open::init_dbs_with(net, wallet_dir, Some(100)).expect("init regtest dbs");
+    let (account_id, _) = db
+        .create_account("primary", &test_seed(), &genesis_birthday(), None)
+        .expect("create regtest account");
+    db.update_chain_tip(BlockHeight::from_u32(1)).expect("set tip");
+
+    // zecd-style addresses: Orchard-only UAs of this same account.
+    let mut zecd_addrs = std::collections::BTreeSet::new();
+    for _ in 0..5 {
+        let (ua, _) = db
+            .get_next_available_address(account_id, UnifiedAddressRequest::ORCHARD)
+            .expect("address query")
+            .expect("address available");
+        assert!(
+            ua.transparent().is_none(),
+            "zecd's Orchard-only UA must carry no transparent receiver"
+        );
+        zecd_addrs.insert(ua.encode(&net));
+    }
+
+    // tparty-style addresses from the SAME account: transparent P2PKH receivers.
+    let mut taddrs = std::collections::BTreeSet::new();
+    for _ in 0..5 {
+        let addr = crate::wallet::actor::next_transparent_address(&mut db, account_id, net)
+            .expect("derive transparent address");
+        assert!(
+            addr.starts_with("tm"),
+            "regtest transparent P2PKH addresses are base58 tm…, got {addr}"
+        );
+        assert!(taddrs.insert(addr), "every call yields a fresh address");
+    }
+
+    // The collision guarantee: the two sets are disjoint (different receiver types - a
+    // base58 t-address can never equal a bech32m unified address).
+    assert!(
+        zecd_addrs.is_disjoint(&taddrs),
+        "tparty and zecd address sets must never intersect"
+    );
+
+    drop(db);
+
+    // The read helpers know the t-addresses as the wallet's own.
+    let listed = read::transparent_addresses(net, wallet_dir);
+    for addr in &taddrs {
+        assert!(listed.contains(addr), "transparent_addresses lists {addr}");
+        assert!(read::is_mine(net, wallet_dir, addr), "{addr} is mine");
+    }
+    // Unshielded balances on a fresh wallet are zero but well-formed.
+    let (spendable, pending) =
+        read::transparent_balance(net, wallet_dir, 1).expect("transparent balance");
+    assert_eq!((spendable, pending), (0, 0));
+    assert!(read::list_transparent_unspent(net, wallet_dir)
+        .expect("list transparent unspent")
+        .is_empty());
+}
+
+/// The transparent gap limit surfaces as Bitcoin Core's -12 (keypool ran out). The unused
+/// window includes the account's default (index-0) address exposed at creation, so a gap
+/// limit of N yields N-1 fresh `getnewaddress` calls before the refusal. (Deposits to the
+/// earlier addresses would slide the window forward; none exist in this offline test.)
+#[test]
+fn transparent_gap_limit_maps_to_keypool_ran_out() {
+    let net = network::regtest();
+    let dir = tempfile::tempdir().unwrap();
+
+    let mut db = open::init_dbs_with(net, dir.path(), Some(3)).expect("init regtest dbs");
+    let (account_id, _) = db
+        .create_account("primary", &test_seed(), &genesis_birthday(), None)
+        .expect("create regtest account");
+    db.update_chain_tip(BlockHeight::from_u32(1)).expect("set tip");
+
+    for _ in 0..2 {
+        crate::wallet::actor::next_transparent_address(&mut db, account_id, net)
+            .expect("addresses within the gap limit");
+    }
+    let err = crate::wallet::actor::next_transparent_address(&mut db, account_id, net)
+        .expect_err("the gap limit refuses the next unused address");
+    assert_eq!(err.code, codes::RPC_WALLET_KEYPOOL_RAN_OUT, "{err}");
+}
+
+/// Received transparent outputs must surface in history under the **t-address** the payer
+/// actually paid, not the address row's unified encoding (`v_tx_outputs.to_address` carries
+/// the latter - the gap that originally broke `getreceivedbyaddress` in the tparty e2e).
+/// Offline: store a fabricated deposit UTXO for a derived t-address and read history back.
+#[test]
+fn transparent_receive_reports_the_t_address() {
+    use zcash_client_backend::wallet::WalletTransparentOutput;
+    use zcash_keys::encoding::AddressCodec as _;
+    use zcash_protocol::value::Zatoshis;
+    use zcash_transparent::address::TransparentAddress;
+    use zcash_transparent::bundle::{OutPoint, TxOut};
+
+    let net = network::regtest();
+    let dir = tempfile::tempdir().unwrap();
+    let wallet_dir = dir.path();
+
+    let mut db = open::init_dbs_with(net, wallet_dir, Some(100)).expect("init regtest dbs");
+    let (account_id, _) = db
+        .create_account("primary", &test_seed(), &genesis_birthday(), None)
+        .expect("create regtest account");
+    db.update_chain_tip(BlockHeight::from_u32(10)).expect("set tip");
+
+    let taddr_str = crate::wallet::actor::next_transparent_address(&mut db, account_id, net)
+        .expect("derive transparent address");
+    let taddr = TransparentAddress::decode(&net, &taddr_str).expect("decode own t-address");
+
+    // A 1-ZEC deposit to the t-address, "mined" at height 5 - what refresh_transparent_utxos
+    // stores when lightwalletd reports the UTXO.
+    let output = WalletTransparentOutput::from_parts(
+        OutPoint::new([9u8; 32], 0),
+        TxOut::new(Zatoshis::from_u64(100_000_000).unwrap(), taddr.script().into()),
+        Some(BlockHeight::from_u32(5)),
+    )
+    .expect("valid P2PKH output");
+    db.put_received_transparent_utxo(&output).expect("store the deposit UTXO");
+    drop(db);
+
+    // History reports the receive under the bare t-address.
+    let txs = read::list_transactions(wallet_dir).expect("list transactions");
+    let receive = txs
+        .iter()
+        .flat_map(|t| &t.outputs)
+        .find(|o| o.to_account.is_some() && !o.is_change)
+        .expect("the deposit output is in history");
+    assert_eq!(receive.pool, 0, "transparent pool");
+    assert_eq!(receive.value, 100_000_000);
+    assert_eq!(
+        receive.to_address.as_deref(),
+        Some(taddr_str.as_str()),
+        "received transparent outputs report the paid t-address"
+    );
+
+    // The unshielded balance sees the (confirmed) deposit, and listunspent lists the outpoint.
+    let (spendable, _pending) =
+        read::transparent_balance(net, wallet_dir, 1).expect("transparent balance");
+    assert_eq!(spendable, 100_000_000);
+    let utxos = read::list_transparent_unspent(net, wallet_dir).expect("list unspent");
+    assert_eq!(utxos.len(), 1);
+    assert_eq!(utxos[0].address, taddr_str);
+    assert_eq!(utxos[0].value, 100_000_000);
+    assert_eq!(utxos[0].mined_height, Some(5));
+}
+
 // --- Actor-level encryption plumbing (offline, but `#[ignore]`d because `actor::spawn` loads the
 // bundled Sapling prover, which is slow). Run with `cargo test -- --include-ignored`. The actor
 // serves walletpassphrase/walletlock commands even while its lightwalletd connection is failing,
@@ -159,6 +317,8 @@ fn offline_actor_cfg(
         primary_recheck: Duration::from_secs(60),
         age_identity: None,
         auto_unlock: true,
+        auto_shield: None,
+        gap_limit: None,
         confirmations_policy: Default::default(),
         shutdown,
     };

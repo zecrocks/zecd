@@ -65,6 +65,9 @@ pub struct SyncStatus {
     /// For an encrypted wallet: the unix time the seed auto-relocks (0 = locked now), matching
     /// Bitcoin Core's `getwalletinfo.unlocked_until`. `None` for unencrypted wallets.
     pub unlocked_until: Option<i64>,
+    /// Display-hex txid of the most recent auto-shield transaction this process created
+    /// (tparty only; surfaced by `getshieldinginfo`).
+    pub last_shield_txid: Option<String>,
 }
 
 impl SyncStatus {
@@ -94,6 +97,17 @@ pub enum WalletCommand {
     GetNewAddress {
         label: Option<String>,
         reply: oneshot::Sender<Result<String, RpcError>>,
+    },
+    /// Derive the next transparent (P2PKH) deposit address (tparty's `getnewaddress`).
+    GetNewTransparentAddress {
+        label: Option<String>,
+        reply: oneshot::Sender<Result<String, RpcError>>,
+    },
+    /// Immediately attempt to shield all spendable transparent funds, ignoring the
+    /// configured threshold (tparty's `shieldfunds`). Replies with the shielding txid, or
+    /// `None` when there was nothing spendable to shield.
+    ShieldNow {
+        reply: oneshot::Sender<Result<Option<TxId>, RpcError>>,
     },
     Send {
         request: TransactionRequest,
@@ -170,6 +184,18 @@ impl WalletHandle {
     pub async fn get_new_address(&self, label: Option<String>) -> Result<String, RpcError> {
         self.dispatch(|reply| WalletCommand::GetNewAddress { label, reply })
             .await
+    }
+
+    pub async fn get_new_transparent_address(
+        &self,
+        label: Option<String>,
+    ) -> Result<String, RpcError> {
+        self.dispatch(|reply| WalletCommand::GetNewTransparentAddress { label, reply })
+            .await
+    }
+
+    pub async fn shield_now(&self) -> Result<Option<TxId>, RpcError> {
+        self.dispatch(|reply| WalletCommand::ShieldNow { reply }).await
     }
 
     pub async fn send(&self, request: TransactionRequest) -> Result<TxId, RpcError> {

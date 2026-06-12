@@ -4,6 +4,7 @@ pub mod blockchain;
 pub mod control;
 pub mod network;
 pub mod rawtx;
+pub mod tparty_methods;
 pub mod util;
 pub mod wallet_methods;
 
@@ -12,15 +13,28 @@ use serde_json::Value;
 use crate::error::RpcError;
 use crate::network::ZNetwork;
 use crate::server::jsonrpc::RpcRequest;
-use crate::state::AppState;
+use crate::state::{AppState, Dispatcher};
 
 pub(crate) fn net_name(network: ZNetwork) -> &'static str {
     network.name()
 }
 
-/// Route a parsed request to its handler. `wallet` is the wallet name from a `/wallet/<name>`
-/// path (or `None` for the default wallet).
+/// Route a parsed request to the method table of the binary being served (`zecd` or
+/// `tparty`). `wallet` is the wallet name from a `/wallet/<name>` path (or `None` for the
+/// default wallet).
 pub async fn dispatch(
+    state: &AppState,
+    wallet: Option<&str>,
+    req: &RpcRequest,
+) -> Result<Value, RpcError> {
+    match state.dispatcher {
+        Dispatcher::Zecd => dispatch_zecd(state, wallet, req).await,
+        Dispatcher::Tparty => tparty_methods::dispatch(state, wallet, req).await,
+    }
+}
+
+/// zecd's method table.
+async fn dispatch_zecd(
     state: &AppState,
     wallet: Option<&str>,
     req: &RpcRequest,

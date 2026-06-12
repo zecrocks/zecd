@@ -28,8 +28,8 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
-      - name: Build
-        run: cargo build --bin zecd
+      - name: Build (both binaries)
+        run: cargo build --bins
 
       - name: Test (offline - includes the regtest network + wallet-lifecycle tests)
         run: cargo test

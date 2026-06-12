@@ -219,6 +219,7 @@ mod tests {
                 ready_progress: 0.999,
             },
             log: crate::config::LogConfig { level: "info".into(), format: "text".into() },
+            tparty: crate::config::TpartyConfig::default(),
         };
         AppState {
             auth: Authenticator::from_config(&rpc).unwrap(),
@@ -229,6 +230,7 @@ mod tests {
             shutting_down: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             work_queue: Arc::new(tokio::sync::Semaphore::new(16)),
             active: crate::state::ActiveCommands::default(),
+            dispatcher: crate::state::Dispatcher::Zecd,
         }
     }
 
@@ -407,6 +409,91 @@ mod tests {
                 Some(RPC_METHOD_NOT_FOUND as i64),
                 "method must be dispatched: {body}"
             );
+        }
+    }
+
+    /// One-shot a single RPC call against a given dispatcher and return the envelope error
+    /// code (None = success).
+    async fn call_err_code_as(dispatcher: crate::state::Dispatcher, body: &str) -> Option<i64> {
+        let mut state = test_state();
+        state.dispatcher = dispatcher;
+        let r = router(state)
+            .oneshot(req(body, Some(("u", "p"))))
+            .await
+            .unwrap();
+        let v = body_json(r).await;
+        v["error"]["code"].as_i64()
+    }
+
+    /// The two binaries serve different method tables off the same server: tparty's
+    /// deposit-funnel surface has no spend methods (-32601), its own methods don't exist on
+    /// zecd, and the shared methods dispatch on both.
+    #[tokio::test]
+    async fn tparty_dispatch_table_is_separate() {
+        use crate::error::codes::RPC_METHOD_NOT_FOUND;
+        use crate::state::Dispatcher::{Tparty, Zecd};
+
+        // tparty is not a spending wallet: the zecd-only spend methods are method-not-found.
+        for body in [
+            r#"{"method":"sendtoaddress","id":1,"params":["taddr","1.0"]}"#,
+            r#"{"method":"sendmany","id":1,"params":["",{"a":1.0}]}"#,
+        ] {
+            assert_eq!(
+                call_err_code_as(Tparty, body).await,
+                Some(RPC_METHOD_NOT_FOUND as i64),
+                "tparty must not serve: {body}"
+            );
+        }
+
+        // tparty's own methods are dispatched there (they fail on the missing wallet, never
+        // -32601) and are absent from zecd.
+        for body in [
+            r#"{"method":"getshieldinginfo","id":1,"params":[]}"#,
+            r#"{"method":"shieldfunds","id":1,"params":[]}"#,
+        ] {
+            let code = call_err_code_as(Tparty, body).await;
+            assert!(code.is_some(), "walletless state must yield an error: {body}");
+            assert_ne!(code, Some(RPC_METHOD_NOT_FOUND as i64), "tparty serves: {body}");
+            assert_eq!(
+                call_err_code_as(Zecd, body).await,
+                Some(RPC_METHOD_NOT_FOUND as i64),
+                "zecd must not serve: {body}"
+            );
+        }
+
+        // Shared methods dispatch on both tables.
+        for body in [
+            r#"{"method":"listtransactions","id":1,"params":[]}"#,
+            r#"{"method":"getreceivedbyaddress","id":1,"params":["a"]}"#,
+            r#"{"method":"getblockchaininfo","id":1,"params":[]}"#,
+        ] {
+            assert_ne!(
+                call_err_code_as(Tparty, body).await,
+                Some(RPC_METHOD_NOT_FOUND as i64),
+                "tparty serves shared method: {body}"
+            );
+        }
+    }
+
+    /// tparty's getnewaddress returns t-addresses, so the only acceptable `address_type` is
+    /// bitcoind's name for base58 P2PKH ("legacy"); anything else is -5, before wallet access.
+    #[tokio::test]
+    async fn tparty_getnewaddress_validates_address_type() {
+        use crate::error::codes::{RPC_INVALID_ADDRESS_OR_KEY, RPC_WALLET_NOT_FOUND};
+        use crate::state::Dispatcher::Tparty;
+        let code = call_err_code_as(
+            Tparty,
+            r#"{"method":"getnewaddress","id":1,"params":["","bech32"]}"#,
+        )
+        .await;
+        assert_eq!(code, Some(RPC_INVALID_ADDRESS_OR_KEY as i64));
+        // "legacy" (and omitted) pass validation and fail later on the missing wallet.
+        for body in [
+            r#"{"method":"getnewaddress","id":1,"params":["","legacy"]}"#,
+            r#"{"method":"getnewaddress","id":1,"params":[]}"#,
+        ] {
+            let code = call_err_code_as(Tparty, body).await;
+            assert_eq!(code, Some(RPC_WALLET_NOT_FOUND as i64), "{body}");
         }
     }
 

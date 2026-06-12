@@ -1,7 +1,7 @@
 //! The per-wallet actor: the single owner/writer of the `WalletDb`, running the sync loop
 //! and serving writer commands (address generation, sends, lock/unlock) from RPC handlers.
 
-use std::num::NonZeroUsize;
+use std::num::{NonZeroU32, NonZeroUsize};
 use std::path::PathBuf;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -13,24 +13,34 @@ use tracing::{info, warn};
 
 use zcash_client_backend::data_api::wallet::{
     create_proposed_transactions, decrypt_and_store_transaction,
-    input_selection::GreedyInputSelector, propose_transfer, ConfirmationsPolicy, SpendingKeys,
+    input_selection::GreedyInputSelector, propose_shielding, propose_transfer,
+    ConfirmationsPolicy, SpendingKeys,
 };
-use zcash_client_backend::data_api::{Account, WalletRead, WalletWrite};
+use zcash_client_backend::data_api::{
+    Account, TransactionDataRequest, TransactionStatus, TransparentOutputFilter, WalletRead,
+    WalletWrite,
+};
 use zcash_client_backend::fees::{
     standard::MultiOutputChangeStrategy, DustOutputPolicy, SplitPolicy, StandardFeeRule,
 };
 use zcash_client_backend::proto::service::{
     self, compact_tx_streamer_client::CompactTxStreamerClient,
 };
-use zcash_client_backend::wallet::OvkPolicy;
+use zcash_client_backend::wallet::{OvkPolicy, WalletTransparentOutput};
+use zcash_client_sqlite::error::SqliteClientError;
 use zcash_client_sqlite::{AccountUuid, FsBlockDb};
-use zcash_keys::keys::UnifiedAddressRequest;
+use zcash_keys::encoding::AddressCodec as _;
+use zcash_keys::keys::{ReceiverRequirement, UnifiedAddressRequest};
 use zcash_primitives::transaction::Transaction;
 use zcash_proofs::prover::LocalTxProver;
 use zcash_protocol::consensus::{BlockHeight, BranchId};
 use zcash_protocol::value::Zatoshis;
 use zcash_protocol::{ShieldedProtocol, TxId};
+use zcash_transparent::address::{Script, TransparentAddress};
+use zcash_transparent::bundle::{OutPoint, TxOut};
 use zip321::TransactionRequest;
+
+use crate::config::ShieldPool;
 
 use crate::backoff::Backoff;
 use crate::error::{codes, RpcError};
@@ -91,6 +101,34 @@ pub fn install_panic_hook() {
     }));
 }
 
+/// Auto-shield policy for a tparty wallet actor: every spendable transparent deposit is
+/// moved into the account's *internal* receiver of the configured shielded pool as soon as
+/// it satisfies `min_conf` (and the total clears `threshold`).
+#[derive(Clone, Debug)]
+pub struct AutoShield {
+    /// Destination pool. The shield pays the account's internal (change) address in this
+    /// pool - the address every librustzcash wallet scans by default on a seed restore, and
+    /// one no `getnewaddress` (zecd's or tparty's) ever hands out, so it can never collide
+    /// with externally-shared addresses.
+    pub pool: ShieldPool,
+    /// Confirmations a deposit needs before it is shielded (0 = shield from the mempool).
+    pub min_conf: u32,
+    /// Skip shielding while the spendable transparent total is below this (don't burn the
+    /// ZIP-317 fee on dust).
+    pub threshold: Zatoshis,
+}
+
+impl AutoShield {
+    /// The confirmations policy implementing `min_conf` for transparent spends.
+    fn confirmations_policy(&self) -> ConfirmationsPolicy {
+        match NonZeroU32::new(self.min_conf) {
+            // 0-conf: ZIP-315's standard allowance for shielding unconfirmed UTXOs.
+            None => ConfirmationsPolicy::MIN,
+            Some(n) => ConfirmationsPolicy::new_symmetrical(n, false),
+        }
+    }
+}
+
 /// Parameters needed to launch a wallet actor.
 pub struct ActorConfig {
     pub name: String,
@@ -110,6 +148,11 @@ pub struct ActorConfig {
     pub primary_recheck: Duration,
     pub age_identity: Option<PathBuf>,
     pub auto_unlock: bool,
+    /// `Some` = tparty mode: detect transparent deposits (servicing the wallet's
+    /// transaction-data requests against lightwalletd) and auto-shield them.
+    pub auto_shield: Option<AutoShield>,
+    /// External transparent-address gap limit override (tparty).
+    pub gap_limit: Option<u32>,
     /// The wallet-wide confirmations policy (`[spend]` config; ZIP-315 3/10 by default),
     /// anchoring balances, spend proposals, and the `-6` enrichment.
     pub confirmations_policy: ConfirmationsPolicy,
@@ -166,6 +209,13 @@ struct WalletActor {
     /// For an encrypted wallet that's currently unlocked: when the seed auto-relocks. Re-running
     /// `walletpassphrase` overwrites it (resetting the timer); `walletlock` clears it.
     unlock_until: Option<Instant>,
+    /// tparty mode: transparent deposit detection + auto-shield policy (`None` for zecd).
+    auto_shield: Option<AutoShield>,
+    /// Display-hex txid of the most recent shielding tx created this process.
+    last_shield_txid: Option<String>,
+    /// Set after warning once that auto-shield is blocked on a locked seed, so a locked
+    /// encrypted wallet doesn't spam the log every sync interval. Cleared on unlock.
+    shield_locked_warned: bool,
     /// Graceful-shutdown signal (see [`ActorConfig::shutdown`]).
     shutdown: watch::Receiver<bool>,
 }
@@ -189,7 +239,7 @@ pub async fn spawn(cfg: ActorConfig) -> anyhow::Result<(WalletHandle, tokio::tas
         ));
     }
 
-    let db_data = open::init_dbs(cfg.network, &cfg.wallet_dir)?;
+    let db_data = open::init_dbs_with(cfg.network, &cfg.wallet_dir, cfg.gap_limit)?;
     let db_cache = open::open_fsblockdb(&cfg.wallet_dir)?;
     let (account_id, account_index) = select_account(&db_data)?;
 
@@ -275,6 +325,9 @@ pub async fn spawn(cfg: ActorConfig) -> anyhow::Result<(WalletHandle, tokio::tas
         subtree_roots_synced: false,
         encrypted,
         unlock_until: None,
+        auto_shield: cfg.auto_shield,
+        last_shield_txid: None,
+        shield_locked_warned: false,
         shutdown: cfg.shutdown,
     };
 
@@ -350,6 +403,15 @@ impl WalletActor {
                             // Caught up: give any unmined wallet txs another shot at the mempool,
                             // and (re)subscribe to incoming mempool txs for 0-conf visibility.
                             self.maybe_rebroadcast().await;
+                            // tparty: discover transparent deposits (compact blocks don't
+                            // carry transparent outputs) and shield whatever is spendable.
+                            if self.auto_shield.is_some() {
+                                self.refresh_transparent_utxos().await;
+                                self.service_transparent_requests().await;
+                                if let Err(e) = self.do_shield(false).await {
+                                    warn!("[{}] auto-shield failed: {e}", self.name);
+                                }
+                            }
                             self.ensure_mempool_stream().await;
                         }
                     }
@@ -747,6 +809,7 @@ impl WalletActor {
             scanning,
             encrypted: self.encrypted,
             unlocked_until,
+            last_shield_txid: self.last_shield_txid.clone(),
         };
         let _ = self.status_tx.send(status);
     }
@@ -815,6 +878,14 @@ impl WalletActor {
                 let res = self.get_new_address(label);
                 let _ = reply.send(res);
             }
+            WalletCommand::GetNewTransparentAddress { label, reply } => {
+                let res = self.get_new_transparent_address(label);
+                let _ = reply.send(res);
+            }
+            WalletCommand::ShieldNow { reply } => {
+                let res = self.do_shield(true).await;
+                let _ = reply.send(res);
+            }
             WalletCommand::Send { request, reply } => {
                 let res = self.do_send(request).await;
                 let _ = reply.send(res);
@@ -871,6 +942,459 @@ impl WalletActor {
             }
         }
         Ok(encoded)
+    }
+
+    /// tparty's `getnewaddress` (see [`next_transparent_address`]).
+    fn get_new_transparent_address(&mut self, label: Option<String>) -> Result<String, RpcError> {
+        let encoded = next_transparent_address(&mut self.db_data, self.account_id, self.network)?;
+        if let Some(label) = label {
+            if let Err(e) = labels::set_label(&self.wallet_dir, &encoded, &label) {
+                warn!("[{}] failed to store label: {e}", self.name);
+            }
+        }
+        Ok(encoded)
+    }
+
+    /// Discover incoming transparent deposits: ask lightwalletd for the *current* UTXO set
+    /// of every transparent receiver the wallet has exposed and upsert each into the wallet
+    /// DB. This is the step that first tells the wallet a deposit exists - the backend's
+    /// `transaction_data_requests` only cover follow-up work (spend detection, enhancement)
+    /// for outputs it already knows about. Ported from zcash-devtool's `refresh_utxos`.
+    /// Best-effort: failures are logged and retried on the next caught-up pass.
+    async fn refresh_transparent_utxos(&mut self) {
+        if self.client.is_none() {
+            return;
+        }
+        let addresses = match self.db_data.get_transparent_receivers(self.account_id, true, true)
+        {
+            Ok(receivers) => receivers
+                .into_keys()
+                .map(|addr| addr.encode(&self.network))
+                .collect::<Vec<_>>(),
+            Err(e) => {
+                warn!("[{}] querying transparent receivers: {e}", self.name);
+                return;
+            }
+        };
+        if addresses.is_empty() {
+            return;
+        }
+        let request = service::GetAddressUtxosArg { addresses, start_height: 0, max_entries: 0 };
+        let mut stream = {
+            let client = self.client.as_mut().expect("checked above");
+            match tokio::time::timeout(UNARY_RPC_TIMEOUT, client.get_address_utxos_stream(request))
+                .await
+            {
+                Ok(Ok(s)) => s.into_inner(),
+                Ok(Err(e)) => {
+                    warn!("[{}] get_address_utxos failed: {e}", self.name);
+                    self.client = None;
+                    self.update_status();
+                    return;
+                }
+                Err(_) => {
+                    warn!(
+                        "[{}] get_address_utxos timed out after {UNARY_RPC_TIMEOUT:?}",
+                        self.name
+                    );
+                    self.client = None;
+                    self.update_status();
+                    return;
+                }
+            }
+        };
+        loop {
+            let reply = match tokio::time::timeout(UNARY_RPC_TIMEOUT, stream.message()).await {
+                Ok(Ok(Some(reply))) => reply,
+                Ok(Ok(None)) => break,
+                Ok(Err(e)) => {
+                    warn!("[{}] get_address_utxos stream: {e}", self.name);
+                    self.client = None;
+                    self.update_status();
+                    return;
+                }
+                Err(_) => {
+                    warn!("[{}] get_address_utxos stream stalled", self.name);
+                    self.client = None;
+                    self.update_status();
+                    return;
+                }
+            };
+            let output = <[u8; 32]>::try_from(&reply.txid[..])
+                .ok()
+                .zip(u32::try_from(reply.index).ok())
+                .zip(
+                    Zatoshis::from_nonnegative_i64(reply.value_zat)
+                        .ok()
+                        .zip(u32::try_from(reply.height).ok()),
+                )
+                .and_then(|((txid, index), (value, height))| {
+                    WalletTransparentOutput::from_parts(
+                        OutPoint::new(txid, index),
+                        TxOut::new(value, Script(zcash_script::script::Code(reply.script))),
+                        Some(BlockHeight::from_u32(height)),
+                    )
+                });
+            match output {
+                Some(output) => {
+                    if let Err(e) = self.db_data.put_received_transparent_utxo(&output) {
+                        warn!("[{}] storing transparent UTXO: {e}", self.name);
+                    }
+                }
+                None => warn!("[{}] skipping malformed UTXO reply from upstream", self.name),
+            }
+        }
+    }
+
+    /// Service the wallet's pending transaction-data requests against lightwalletd: follow-up
+    /// work the backend asks for once it knows about transparent outputs - `GetStatus`/
+    /// `Enhancement` for referenced txs, and `TransactionsInvolvingAddress` spend detection
+    /// (compact blocks carry no transparent data, so spends of wallet UTXOs must be searched
+    /// by address). Best-effort: each failed request is logged and the pass moves on;
+    /// transport failures drop the client so the next operation reconnects/fails over.
+    async fn service_transparent_requests(&mut self) {
+        let Some(tip) = self.tip_height else { return };
+        if self.client.is_none() {
+            return;
+        }
+        let requests = match self.db_data.transaction_data_requests() {
+            Ok(r) => r,
+            Err(e) => {
+                warn!("[{}] querying transaction data requests: {e}", self.name);
+                return;
+            }
+        };
+        for request in requests {
+            let result = match request {
+                TransactionDataRequest::GetStatus(txid) => self.service_get_status(txid).await,
+                TransactionDataRequest::Enhancement(txid) => {
+                    self.service_enhancement(txid, tip).await
+                }
+                TransactionDataRequest::TransactionsInvolvingAddress(r) => {
+                    self.service_address_check(r, tip).await
+                }
+            };
+            if let Err(e) = result {
+                warn!("[{}] transaction data request failed: {e}", self.name);
+                if self.client.is_none() {
+                    // The failure dropped the connection; stop this pass.
+                    return;
+                }
+            }
+        }
+    }
+
+    async fn service_get_status(&mut self, txid: TxId) -> Result<(), RpcError> {
+        let status = match self.fetch_tx_from_upstream(txid).await? {
+            None => TransactionStatus::TxidNotRecognized,
+            Some(raw) => match raw.mined_height {
+                Some(h) => TransactionStatus::Mined(BlockHeight::from_u32(h)),
+                None => TransactionStatus::NotInMainChain,
+            },
+        };
+        self.db_data
+            .set_transaction_status(txid, status)
+            .map_err(|e| RpcError::wallet(format!("recording tx status for {txid}: {e}")))
+    }
+
+    async fn service_enhancement(&mut self, txid: TxId, tip: u32) -> Result<(), RpcError> {
+        match self.fetch_tx_from_upstream(txid).await? {
+            None => self
+                .db_data
+                .set_transaction_status(txid, TransactionStatus::TxidNotRecognized)
+                .map_err(|e| RpcError::wallet(format!("recording tx status for {txid}: {e}"))),
+            Some(raw) => self.store_fetched_tx(&raw.data, raw.mined_height, tip),
+        }
+    }
+
+    /// Detect transactions involving one of the wallet's transparent addresses via
+    /// lightwalletd's `GetTaddressTxids`, store each through trial decryption (which records
+    /// the wallet-relevant transparent outputs/spends), and acknowledge the checked range.
+    async fn service_address_check(
+        &mut self,
+        request: zcash_client_backend::data_api::TransactionsInvolvingAddress,
+        tip: u32,
+    ) -> Result<(), RpcError> {
+        // Honor the privacy pacing the backend asks for: requests scheduled for the future
+        // are simply picked up by a later pass.
+        if request
+            .request_at()
+            .is_some_and(|at| at > SystemTime::now())
+        {
+            return Ok(());
+        }
+        let start = u32::from(request.block_range_start()).max(1);
+        // The request's range end is exclusive; GetTaddressTxids takes an inclusive range.
+        // When an explicit end is set, `notify_address_checked` requires the acknowledgement
+        // to name exactly `end - 1`, so a range reaching past the current tip is left for a
+        // later pass rather than partially scanned and mis-acknowledged.
+        let end = match request.block_range_end() {
+            Some(e) => {
+                let want = u32::from(e).saturating_sub(1);
+                if want > tip {
+                    return Ok(());
+                }
+                want
+            }
+            None => tip,
+        };
+        if start > end {
+            return Ok(());
+        }
+        let address = request.address().encode(&self.network);
+        let filter = service::TransparentAddressBlockFilter {
+            address,
+            range: Some(service::BlockRange {
+                start: Some(service::BlockId { height: u64::from(start), ..Default::default() }),
+                end: Some(service::BlockId { height: u64::from(end), ..Default::default() }),
+                ..Default::default()
+            }),
+        };
+        let stream = {
+            let client = self
+                .client
+                .as_mut()
+                .ok_or_else(|| RpcError::misc("not connected to lightwalletd"))?;
+            match tokio::time::timeout(UNARY_RPC_TIMEOUT, client.get_taddress_txids(filter)).await
+            {
+                Ok(Ok(s)) => s.into_inner(),
+                Ok(Err(e)) => {
+                    self.client = None;
+                    self.update_status();
+                    return Err(RpcError::misc(format!("get_taddress_txids failed: {e}")));
+                }
+                Err(_) => {
+                    self.client = None;
+                    self.update_status();
+                    return Err(RpcError::misc(format!(
+                        "get_taddress_txids timed out after {UNARY_RPC_TIMEOUT:?}"
+                    )));
+                }
+            }
+        };
+        let mut stream = stream;
+        loop {
+            let next = tokio::time::timeout(UNARY_RPC_TIMEOUT, stream.message()).await;
+            match next {
+                Ok(Ok(Some(raw))) => {
+                    let mined_height =
+                        u32::try_from(raw.height).ok().filter(|h| *h > 0 && *h <= tip);
+                    if let Err(e) = self.store_fetched_tx(&raw.data, mined_height, tip) {
+                        warn!("[{}] storing taddress tx: {e}", self.name);
+                    }
+                }
+                Ok(Ok(None)) => break,
+                Ok(Err(e)) => {
+                    self.client = None;
+                    self.update_status();
+                    return Err(RpcError::misc(format!("get_taddress_txids stream: {e}")));
+                }
+                Err(_) => {
+                    self.client = None;
+                    self.update_status();
+                    return Err(RpcError::misc("get_taddress_txids stream stalled"));
+                }
+            }
+        }
+        self.db_data
+            .notify_address_checked(request, BlockHeight::from_u32(end))
+            .map_err(|e| RpcError::wallet(format!("acknowledging address check: {e}")))
+    }
+
+    /// Parse raw transaction bytes and store them through trial decryption (no-op for
+    /// unrelated txs; records shielded notes and wallet transparent outputs/spends).
+    fn store_fetched_tx(
+        &mut self,
+        data: &[u8],
+        mined_height: Option<u32>,
+        tip: u32,
+    ) -> Result<(), RpcError> {
+        let branch_height = mined_height.unwrap_or(tip + 1);
+        let tx = Transaction::read(
+            data,
+            BranchId::for_height(&self.network, BlockHeight::from_u32(branch_height)),
+        )
+        .map_err(|e| RpcError::misc(format!("unparseable transaction from upstream: {e}")))?;
+        decrypt_and_store_transaction(
+            &self.network,
+            &mut self.db_data,
+            &tx,
+            mined_height.map(BlockHeight::from_u32),
+        )
+        .map_err(|e| RpcError::wallet(format!("storing transaction {}: {e}", tx.txid())))
+    }
+
+    /// Shield the wallet's spendable transparent funds into the configured pool's internal
+    /// address. `force` ignores the value threshold (the `shieldfunds` RPC); the automatic
+    /// path returns `Ok(None)` quietly whenever there is nothing (or not yet enough) to do.
+    /// The destination is the account's own internal receiver, chosen by the change strategy
+    /// - no address ever leaves the wallet.
+    async fn do_shield(&mut self, force: bool) -> Result<Option<TxId>, RpcError> {
+        let Some(shield) = self.auto_shield.clone() else {
+            return Err(RpcError::wallet("auto-shield is not configured for this wallet"));
+        };
+        if self.tip_height.is_none() {
+            return if force {
+                Err(RpcError::misc("wallet is not yet synced to a chain tip"))
+            } else {
+                Ok(None)
+            };
+        }
+        self.relock_if_expired();
+        let account_index = self
+            .account_index
+            .ok_or_else(|| RpcError::wallet("Cannot spend from a view-only account"))?;
+        let usk = match self.seed.derive_usk(self.network, account_index) {
+            Ok(usk) => {
+                self.shield_locked_warned = false;
+                usk
+            }
+            Err(e) if !force => {
+                // Auto path on a locked wallet: deposits accumulate unshielded until
+                // walletpassphrase unlocks the seed. Warn once, not every sync interval.
+                if !self.shield_locked_warned {
+                    warn!(
+                        "[{}] transparent funds cannot auto-shield while the wallet is locked; \
+                         call walletpassphrase to unlock",
+                        self.name
+                    );
+                    self.shield_locked_warned = true;
+                }
+                let _ = e;
+                return Ok(None);
+            }
+            Err(e) => return Err(e),
+        };
+
+        let policy = shield.confirmations_policy();
+        let net = self.network;
+        let account_id = self.account_id;
+
+        // What is currently spendable, and from which addresses? Cheap when nothing is
+        // pending, which is the common case for the every-sync-interval auto path.
+        let (from_addrs, spendable) = {
+            let chain_height = self
+                .db_data
+                .chain_height()
+                .map_err(RpcError::database_internal)?
+                .ok_or_else(|| RpcError::misc("wallet has no chain height"))?;
+            let balances = self
+                .db_data
+                .get_transparent_balances(account_id, (chain_height + 1).into(), policy)
+                .map_err(RpcError::database_internal)?;
+            let mut from_addrs: Vec<TransparentAddress> = Vec::new();
+            let mut spendable: u64 = 0;
+            for (addr, (_origin, balance)) in balances {
+                let v = balance.spendable_value().into_u64();
+                if v > 0 {
+                    from_addrs.push(addr);
+                    spendable += v;
+                }
+            }
+            (from_addrs, spendable)
+        };
+        if spendable == 0 {
+            return Ok(None);
+        }
+        if !force && spendable < shield.threshold.into_u64() {
+            tracing::debug!(
+                "[{}] {spendable} zatoshis transparent, below the shield threshold ({})",
+                self.name,
+                shield.threshold.into_u64()
+            );
+            return Ok(None);
+        }
+
+        let threshold = if force { Zatoshis::ZERO } else { shield.threshold };
+        let pool = shield.pool.protocol();
+        let n_from_addrs = from_addrs.len();
+        let prover = &self.prover;
+        let db = &mut self.db_data;
+        // Proposal building + proving is CPU-heavy; keep it off the async runtime (the
+        // do_send pattern).
+        let (txid, raw): (TxId, service::RawTransaction) =
+            tokio::task::block_in_place(move || -> Result<_, RpcError> {
+                let change_strategy = MultiOutputChangeStrategy::new(
+                    StandardFeeRule::Zip317,
+                    None,
+                    pool,
+                    DustOutputPolicy::default(),
+                    SplitPolicy::with_min_output_value(
+                        NonZeroUsize::new(TARGET_NOTE_COUNT).expect("nonzero"),
+                        Zatoshis::from_u64(MIN_SPLIT_OUTPUT_VALUE).expect("valid"),
+                    ),
+                );
+                let input_selector = GreedyInputSelector::new();
+
+                let proposal = propose_shielding::<
+                    _,
+                    _,
+                    _,
+                    _,
+                    zcash_client_sqlite::wallet::commitment_tree::Error,
+                >(
+                    db,
+                    &net,
+                    &input_selector,
+                    &change_strategy,
+                    threshold,
+                    &from_addrs,
+                    account_id,
+                    policy,
+                    TransparentOutputFilter::All,
+                )
+                .map_err(classify_err_display)?;
+
+                // The unconstrained inputs/change error params are pinned to the greedy
+                // selector's types (matching the proposal built above) so `map_err` infers.
+                let txids = create_proposed_transactions::<
+                    _,
+                    _,
+                    zcash_client_backend::data_api::wallet::input_selection::GreedyInputSelectorError,
+                    _,
+                    zcash_primitives::transaction::fees::zip317::FeeError,
+                    _,
+                >(
+                    db,
+                    &net,
+                    prover,
+                    prover,
+                    &SpendingKeys::from_unified_spending_key(usk),
+                    OvkPolicy::Sender,
+                    &proposal,
+                    None,
+                )
+                .map_err(classify_err_display)?;
+
+                if txids.len() > 1 {
+                    return Err(RpcError::wallet(
+                        "multi-transaction shielding proposals are not supported",
+                    ));
+                }
+                let txid = *txids.first();
+
+                let tx = db
+                    .get_transaction(txid)
+                    .map_err(RpcError::database_internal)?
+                    .ok_or_else(|| RpcError::wallet("created transaction not found in wallet"))?;
+                let mut raw_tx = service::RawTransaction::default();
+                tx.write(&mut raw_tx.data)
+                    .map_err(|e| RpcError::misc(format!("failed to serialize transaction: {e}")))?;
+                Ok((txid, raw_tx))
+            })?;
+
+        info!(
+            "[{}] shielding {spendable} zatoshis from {n_from_addrs} transparent address(es) \
+             into the {} pool: {txid}",
+            self.name,
+            shield.pool.name(),
+        );
+        self.last_shield_txid = Some(txid.to_string());
+        // Committed-send contract (see do_send): the tx is in the wallet DB and rides the
+        // rebroadcast loop, so only an explicit upstream rejection is an error.
+        self.broadcast_committed(txid, raw).await?;
+        self.update_status();
+        Ok(Some(txid))
     }
 
     async fn do_send(&mut self, request: TransactionRequest) -> Result<TxId, RpcError> {
@@ -946,13 +1470,26 @@ impl WalletActor {
                 Ok((txid, raw_tx))
             })?;
 
-        // The transaction is now committed to the wallet DB (its input notes are locked until
-        // expiry) and `maybe_rebroadcast` keeps re-submitting it while it is unmined and
-        // unexpired. From here on, a transport-level broadcast failure must NOT surface as an
-        // RPC error: bitcoind's contract is that once the wallet has committed the tx,
-        // `sendtoaddress` returns the txid even if initial relay fails - returning an error
-        // here would invite the caller to retry the payment while the original can still be
-        // re-broadcast and confirm (an application-level double-pay).
+        self.broadcast_committed(txid, raw).await?;
+        self.update_status();
+        Ok(txid)
+    }
+
+    /// Broadcast a transaction that is already committed to the wallet DB (its inputs are
+    /// locked until expiry) and that `maybe_rebroadcast` keeps re-submitting while it is
+    /// unmined and unexpired. A transport-level failure must NOT surface as an error:
+    /// bitcoind's contract is that once the wallet has committed the tx, the call returns
+    /// the txid even if initial relay fails - an error would invite the caller to retry the
+    /// payment while the original can still be re-broadcast and confirm (an
+    /// application-level double-pay). Only an explicit upstream rejection (the node examined
+    /// the tx and refused it) is surfaced, as -26; the tx's inputs stay locked until its
+    /// expiry height, after which they become spendable again - an immediate retry fails
+    /// with -6 rather than double-paying.
+    async fn broadcast_committed(
+        &mut self,
+        txid: TxId,
+        raw: service::RawTransaction,
+    ) -> Result<(), RpcError> {
         if self.client.is_none() {
             if let Err(e) = self.connect().await {
                 warn!(
@@ -960,7 +1497,7 @@ impl WalletActor {
                      re-broadcast once a connection recovers",
                     self.name
                 );
-                return Ok(txid);
+                return Ok(());
             }
         }
         let response = {
@@ -987,14 +1524,10 @@ impl WalletActor {
                     "[{}] broadcast of {txid} failed in transport ({e}); it will be re-broadcast",
                     self.name
                 );
-                return Ok(txid);
+                return Ok(());
             }
         };
         if response.error_code != 0 {
-            // An explicit upstream rejection (the node examined the tx and refused it) is a
-            // different case from a transport failure: surface it as -26. The tx's notes stay
-            // locked in the wallet until its expiry height, after which they become spendable
-            // again - an immediate retry fails with -6 rather than double-paying.
             let reason = sanitize_upstream_msg(&response.error_message);
             warn!("[{}] upstream rejected {txid} (code {}): {reason}", self.name, response.error_code);
             return Err(RpcError::new(
@@ -1002,14 +1535,11 @@ impl WalletActor {
                 format!("transaction rejected (code {}): {reason}", response.error_code),
             ));
         }
-
-        self.update_status();
-        Ok(txid)
+        Ok(())
     }
 
     /// Return raw transaction bytes: prefer the locally-stored copy (present for txs we
-    /// created or have enhanced), otherwise fetch the full tx from lightwalletd. The
-    /// `TxFilter` hash is the txid's internal bytes (per zcash-devtool's enhance).
+    /// created or have enhanced), otherwise fetch the full tx from lightwalletd.
     async fn do_get_raw_tx(&mut self, txid: TxId) -> Result<Option<RawTx>, RpcError> {
         if let Ok(Some(tx)) = self.db_data.get_transaction(txid) {
             let mut buf = Vec::new();
@@ -1017,6 +1547,13 @@ impl WalletActor {
                 .map_err(|e| RpcError::misc(format!("failed to serialize transaction: {e}")))?;
             return Ok(Some(RawTx { data: buf, mined_height: None }));
         }
+        self.fetch_tx_from_upstream(txid).await
+    }
+
+    /// Fetch a full transaction from lightwalletd by txid (the chain's view, never the local
+    /// copy - used both by `do_get_raw_tx` and by transaction-data-request servicing). The
+    /// `TxFilter` hash is the txid's internal bytes (per zcash-devtool's enhance).
+    async fn fetch_tx_from_upstream(&mut self, txid: TxId) -> Result<Option<RawTx>, RpcError> {
         if self.client.is_none() {
             self.connect()
                 .await
@@ -1364,6 +1901,51 @@ fn classify_err(e: crate::error::ProposalError) -> RpcError {
                 RpcError::wallet(s)
             }
         }
+    }
+}
+
+/// Derive the next diversified transparent (P2PKH) receiver of the account, returned as a
+/// base58 t-address - tparty's `getnewaddress`. The underlying row is a Unified Address
+/// whose Orchard receiver shares the diversifier index, but only the transparent receiver
+/// is ever exposed - zecd hands out Orchard-only UAs, so the two binaries' address sets are
+/// disjoint by receiver type even on a shared seed. Exhausting the unused-address gap limit
+/// maps to Bitcoin Core's -12 (keypool ran out): deposits to earlier addresses slide the
+/// window forward.
+pub fn next_transparent_address(
+    db: &mut WriteDb,
+    account_id: AccountUuid,
+    network: ZNetwork,
+) -> Result<String, RpcError> {
+    use ReceiverRequirement::{Omit, Require};
+    let request = UnifiedAddressRequest::custom(Require, Omit, Require)
+        .expect("orchard+p2pkh is a valid receiver combination");
+    let (ua, _) = db
+        .get_next_available_address(account_id, request)
+        .map_err(|e| match e {
+            SqliteClientError::ReachedGapLimit(_, _) => RpcError::new(
+                codes::RPC_WALLET_KEYPOOL_RAN_OUT,
+                "Error: Keypool ran out: the transparent address gap limit was reached \
+                 (too many consecutive unused deposit addresses). Receive funds on an \
+                 existing address, or raise [tparty] gap_limit.",
+            ),
+            e => RpcError::wallet(format!("address generation failed: {e}")),
+        })?
+        .ok_or_else(|| RpcError::wallet("no address available for account"))?;
+    let taddr = ua
+        .transparent()
+        .ok_or_else(|| RpcError::wallet("derived address has no transparent receiver"))?;
+    Ok(taddr.encode(&network))
+}
+
+/// Classify a librustzcash error by its `Display` text alone, for call sites (the shielding
+/// path) whose concrete error type differs from [`crate::error::ProposalError`] in its
+/// selector/change generics. Insufficient-balance conditions map to -6, the rest to -4.
+fn classify_err_display<E: std::fmt::Display>(e: E) -> RpcError {
+    let s = e.to_string();
+    if s.to_lowercase().contains("insufficient") {
+        RpcError::insufficient_funds(s)
+    } else {
+        RpcError::wallet(s)
     }
 }
 
