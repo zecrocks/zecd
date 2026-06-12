@@ -79,6 +79,7 @@ pub struct AppConfig {
     pub default_wallet: String,
     pub wallets: BTreeMap<String, WalletEntry>,
     pub lightwalletd: LightwalletdConfig,
+    pub zebra: ZebraConfig,
     pub rpc: RpcConfig,
     pub keys: KeysConfig,
     pub sync: SyncConfig,
@@ -194,6 +195,27 @@ pub struct LightwalletdConfig {
     pub reconnect_max_secs: u64,
     /// While running on a fallback, how often (seconds) to re-probe higher-priority servers.
     pub primary_recheck_secs: u64,
+}
+
+/// `[zebra]` - credentials for `zebra://host:port` endpoints in the `[lightwalletd]`
+/// server list (direct-to-zebrad mode). All `zebra://` endpoints share these; a cookie
+/// file wins over user/password, and nothing set means no auth (zebrad with
+/// `enable_cookie_auth = false`).
+#[derive(Debug, Clone, Default)]
+pub struct ZebraConfig {
+    pub rpc_user: Option<String>,
+    pub rpc_password: Option<String>,
+    pub rpc_cookie: Option<PathBuf>,
+}
+
+impl ZebraConfig {
+    pub fn auth(&self) -> crate::chain::zebra::ZebraAuth {
+        crate::chain::zebra::ZebraAuth {
+            user: self.rpc_user.clone(),
+            password: self.rpc_password.clone(),
+            cookie: self.rpc_cookie.clone(),
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -325,6 +347,7 @@ struct ConfigFile {
     #[serde(default)]
     wallets: BTreeMap<String, WalletFile>,
     lightwalletd: Option<LightwalletdFile>,
+    zebra: Option<ZebraFile>,
     rpc: Option<RpcFile>,
     keys: Option<KeysFile>,
     sync: Option<SyncFile>,
@@ -377,6 +400,14 @@ struct LightwalletdFile {
     reconnect_base_secs: Option<u64>,
     reconnect_max_secs: Option<u64>,
     primary_recheck_secs: Option<u64>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ZebraFile {
+    rpc_user: Option<String>,
+    rpc_password: Option<String>,
+    rpc_cookie: Option<PathBuf>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -618,6 +649,13 @@ impl AppConfig {
             primary_recheck_secs: lwd_file.primary_recheck_secs.unwrap_or(60).max(1),
         };
 
+        let zebra_file = file.zebra.unwrap_or_default();
+        let zebra = ZebraConfig {
+            rpc_user: zebra_file.rpc_user,
+            rpc_password: zebra_file.rpc_password,
+            rpc_cookie: zebra_file.rpc_cookie,
+        };
+
         let rpc_file = file.rpc.unwrap_or(RpcFile {
             bind: None,
             port: None,
@@ -734,6 +772,7 @@ impl AppConfig {
             default_wallet,
             wallets,
             lightwalletd,
+            zebra,
             rpc,
             keys,
             sync,
@@ -847,6 +886,31 @@ mod tests {
     fn lightwalletd_file_rejects_unknown_field() {
         // `deny_unknown_fields` must still reject typos/unsupported keys.
         assert!(toml::from_str::<LightwalletdFile>("bogus_key = 1").is_err());
+    }
+
+    #[test]
+    fn zebra_section_parses_and_validates() {
+        let f: ConfigFile = toml::from_str(
+            "[zebra]\nrpc_user = \"u\"\nrpc_password = \"p\"\nrpc_cookie = \"/tmp/.cookie\"\n",
+        )
+        .unwrap();
+        let z = f.zebra.unwrap();
+        assert_eq!(z.rpc_user.as_deref(), Some("u"));
+        assert_eq!(z.rpc_password.as_deref(), Some("p"));
+        assert_eq!(z.rpc_cookie, Some(PathBuf::from("/tmp/.cookie")));
+        // The section maps onto the zebra backend's auth type.
+        let auth = ZebraConfig {
+            rpc_user: z.rpc_user,
+            rpc_password: z.rpc_password,
+            rpc_cookie: z.rpc_cookie,
+        }
+        .auth();
+        assert_eq!(auth.user.as_deref(), Some("u"));
+        assert!(auth.cookie.is_some());
+        // Typos are rejected like every other section.
+        assert!(toml::from_str::<ZebraFile>("user = \"u\"").is_err());
+        // An absent section resolves to no credentials.
+        assert!(ZebraConfig::default().auth().header().unwrap().is_none());
     }
 
     #[test]

@@ -8,7 +8,6 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use anyhow::anyhow;
 use secrecy::ExposeSecret;
 use tokio::sync::{mpsc, watch};
-use tonic::transport::Channel;
 use tracing::{info, warn};
 
 use zcash_client_backend::data_api::wallet::{
@@ -23,9 +22,7 @@ use zcash_client_backend::data_api::{
 use zcash_client_backend::fees::{
     standard::MultiOutputChangeStrategy, DustOutputPolicy, SplitPolicy, StandardFeeRule,
 };
-use zcash_client_backend::proto::service::{
-    self, compact_tx_streamer_client::CompactTxStreamerClient,
-};
+use zcash_client_backend::proto::service;
 use zcash_client_backend::wallet::{OvkPolicy, WalletTransparentOutput};
 use zcash_client_sqlite::error::SqliteClientError;
 use zcash_client_sqlite::{AccountUuid, FsBlockDb};
@@ -43,6 +40,7 @@ use zip321::TransactionRequest;
 use crate::config::ShieldPool;
 
 use crate::backoff::Backoff;
+use crate::chain::{AnySource, ChainSource, MempoolStream};
 use crate::error::{codes, RpcError};
 use crate::lightwalletd::Server;
 use crate::network::ZNetwork;
@@ -134,7 +132,8 @@ pub struct ActorConfig {
     pub name: String,
     pub network: ZNetwork,
     pub wallet_dir: PathBuf,
-    /// Ordered lightwalletd endpoints (non-empty); tried in order, preferring the first.
+    /// Ordered upstream endpoints (lightwalletd or zebra; non-empty); tried in order,
+    /// preferring the first.
     pub servers: Vec<Server>,
     pub sync_interval: Duration,
     /// Minimum spacing between unmined-tx rebroadcast passes.
@@ -165,7 +164,7 @@ struct WalletActor {
     name: String,
     network: ZNetwork,
     wallet_dir: PathBuf,
-    /// Ordered lightwalletd endpoints (non-empty); `active` indexes the connected one.
+    /// Ordered upstream endpoints (non-empty); `active` indexes the connected one.
     servers: Vec<Server>,
     active: usize,
     connect_timeout: Duration,
@@ -183,14 +182,15 @@ struct WalletActor {
     account_index: Option<zip32::AccountId>,
     db_data: WriteDb,
     db_cache: FsBlockDb,
-    client: Option<CompactTxStreamerClient<Channel>>,
-    /// Live mempool subscription (`GetMempoolStream`), open only while caught up to the tip.
-    /// lightwalletd streams current + newly-arriving mempool txs and closes the stream when a
-    /// new block is mined; each tx is trial-decrypted and stored unmined if it pays this
-    /// wallet, which is what lets `getunconfirmedbalance`/`listtransactions` reflect an
-    /// incoming payment before its first confirmation (bitcoind parity). Best-effort: any
-    /// stream error just drops it and the next caught-up pass reopens.
-    mempool: Option<tonic::Streaming<service::RawTransaction>>,
+    client: Option<AnySource>,
+    /// Live mempool subscription, open only while caught up to the tip. Both backends
+    /// stream current + newly-arriving mempool txs and close the stream when a new block
+    /// is mined (lightwalletd does this natively; the zebra backend synthesizes it from a
+    /// `getrawmempool` poller); each tx is trial-decrypted and stored unmined if it pays
+    /// this wallet, which is what lets `getunconfirmedbalance`/`listtransactions` reflect
+    /// an incoming payment before its first confirmation (bitcoind parity). Best-effort:
+    /// any stream error just drops it and the next caught-up pass reopens.
+    mempool: Option<MempoolStream>,
     prover: LocalTxProver,
     seed: SeedKeeper,
     status_tx: watch::Sender<SyncStatus>,
@@ -226,7 +226,7 @@ struct WalletActor {
 pub async fn spawn(cfg: ActorConfig) -> anyhow::Result<(WalletHandle, tokio::task::JoinHandle<()>)> {
     if cfg.servers.is_empty() {
         return Err(anyhow!(
-            "no lightwalletd servers configured for wallet '{}'",
+            "no upstream servers configured for wallet '{}'",
             cfg.name
         ));
     }
@@ -361,7 +361,7 @@ fn select_account(db: &WriteDb) -> anyhow::Result<(AccountUuid, Option<zip32::Ac
 impl WalletActor {
     async fn run(mut self) {
         if let Err(e) = self.connect().await {
-            warn!("[{}] initial lightwalletd connect failed: {e}", self.name);
+            warn!("[{}] initial upstream connect failed: {e}", self.name);
         }
         if self.client.is_some() {
             if let Err(e) = self.refresh_tip().await {
@@ -440,7 +440,7 @@ impl WalletActor {
                     Cmd(Option<WalletCommand>),
                     Relock,
                     Tick,
-                    Mempool(Result<Option<service::RawTransaction>, tonic::Status>),
+                    Mempool(anyhow::Result<Option<service::RawTransaction>>),
                 }
                 let event = {
                     let mut mempool = self.mempool.take();
@@ -521,7 +521,7 @@ impl WalletActor {
         }
     }
 
-    /// Connect to lightwalletd, always preferring the primary: try the configured endpoints in
+    /// Connect to an upstream, always preferring the primary: try the configured endpoints in
     /// order from the top and use the first that connects (and passes the subtree-root sync). On
     /// success, store the client, record the active server, and reset the reconnect backoff. On
     /// total failure, leave `self.client` as `None` and return the last error.
@@ -533,7 +533,7 @@ impl WalletActor {
         let mut last_err = None;
         for idx in 0..n {
             let describe = self.servers[idx].describe();
-            info!("[{}] connecting to lightwalletd {}", self.name, describe);
+            info!("[{}] connecting to {}", self.name, describe);
             match self.servers[idx].connect_timeout(self.connect_timeout).await {
                 Ok(client) => {
                     self.client = Some(client);
@@ -556,7 +556,7 @@ impl WalletActor {
                     }
                     if idx != self.active {
                         warn!(
-                            "[{}] lightwalletd now using {} (was {})",
+                            "[{}] now using {} (was {})",
                             self.name,
                             describe,
                             self.servers[self.active].describe()
@@ -612,7 +612,7 @@ impl WalletActor {
                 continue;
             }
             info!(
-                "[{}] preferred lightwalletd {} recovered; switching back from {}",
+                "[{}] preferred upstream {} recovered; switching back from {}",
                 self.name,
                 describe,
                 self.servers[self.active].describe()
@@ -626,27 +626,22 @@ impl WalletActor {
         }
     }
 
-    /// Subscribe to lightwalletd's mempool stream if not already subscribed. Called only when
+    /// Subscribe to the upstream's mempool stream if not already subscribed. Called only when
     /// caught up to the chain tip (mempool txs are meaningless to a wallet that's still
     /// scanning history). Failures are logged at debug and retried on the next caught-up
-    /// pass - older or unusual upstreams may not serve `GetMempoolStream`, and 0-conf
+    /// pass - older or unusual upstreams may not serve a mempool view, and 0-conf
     /// visibility is a best-effort improvement, not a correctness requirement.
     async fn ensure_mempool_stream(&mut self) {
         if self.mempool.is_some() || self.tip_height.is_none() {
             return;
         }
         let Some(client) = self.client.as_mut() else { return };
-        // Bounded like other unary calls: only the response headers are awaited here; the
+        // Bounded like other unary calls: only the subscription setup is awaited here; the
         // stream body is consumed incrementally from the idle loop.
-        match tokio::time::timeout(
-            UNARY_RPC_TIMEOUT,
-            client.get_mempool_stream(service::Empty::default()),
-        )
-        .await
-        {
+        match tokio::time::timeout(UNARY_RPC_TIMEOUT, client.subscribe_mempool()).await {
             Ok(Ok(stream)) => {
                 tracing::debug!("[{}] subscribed to the mempool stream", self.name);
-                self.mempool = Some(stream.into_inner());
+                self.mempool = Some(stream);
             }
             Ok(Err(e)) => {
                 tracing::debug!("[{}] mempool stream unavailable: {e}", self.name);
@@ -707,25 +702,21 @@ impl WalletActor {
     }
 
     async fn refresh_tip(&mut self) -> anyhow::Result<()> {
-        let block_id = {
+        let chain_tip = {
             let client = self
                 .client
                 .as_mut()
                 .ok_or_else(|| anyhow!("not connected"))?;
-            tokio::time::timeout(
-                UNARY_RPC_TIMEOUT,
-                client.get_latest_block(service::ChainSpec::default()),
-            )
-            .await
-            .map_err(|_| anyhow!("get_latest_block timed out after {UNARY_RPC_TIMEOUT:?}"))??
-            .into_inner()
+            tokio::time::timeout(UNARY_RPC_TIMEOUT, client.latest_block())
+                .await
+                .map_err(|_| anyhow!("latest_block timed out after {UNARY_RPC_TIMEOUT:?}"))??
         };
-        let tip = BlockHeight::try_from(block_id.height)
+        let tip = BlockHeight::try_from(chain_tip.height)
             .map_err(|_| anyhow!("chain tip height out of range"))?;
         self.db_data.update_chain_tip(tip)?;
         self.tip_height = Some(u32::from(tip));
-        if block_id.hash.len() == 32 {
-            let mut h = block_id.hash.clone();
+        if chain_tip.hash.len() == 32 {
+            let mut h = chain_tip.hash.clone();
             h.reverse();
             self.tip_hash = Some(hex::encode(h));
         }
@@ -838,26 +829,20 @@ impl WalletActor {
         };
         for (txid, data) in txs {
             let Some(client) = self.client.as_mut() else { return };
-            let raw = service::RawTransaction { data, ..Default::default() };
-            let sent = tokio::time::timeout(UNARY_RPC_TIMEOUT, client.send_transaction(raw))
+            let sent = tokio::time::timeout(UNARY_RPC_TIMEOUT, client.broadcast_tx(data))
                 .await
-                .map_err(|_| {
-                    tonic::Status::deadline_exceeded(format!(
-                        "rebroadcast timed out after {UNARY_RPC_TIMEOUT:?}"
-                    ))
-                })
+                .map_err(|_| anyhow!("rebroadcast timed out after {UNARY_RPC_TIMEOUT:?}"))
                 .and_then(|r| r);
             match sent {
-                Ok(r) => {
-                    let r = r.into_inner();
-                    if r.error_code == 0 {
+                Ok(outcome) => {
+                    if outcome.is_accepted() {
                         info!("[{}] re-broadcast unmined tx {txid}", self.name);
                     } else {
                         tracing::debug!(
                             "[{}] rebroadcast of {txid} rejected (code {}): {}",
                             self.name,
-                            r.error_code,
-                            r.error_message
+                            outcome.error_code,
+                            outcome.error_message
                         );
                     }
                 }
@@ -955,7 +940,7 @@ impl WalletActor {
         Ok(encoded)
     }
 
-    /// Discover incoming transparent deposits: ask lightwalletd for the *current* UTXO set
+    /// Discover incoming transparent deposits: ask the upstream for the *current* UTXO set
     /// of every transparent receiver the wallet has exposed and upsert each into the wallet
     /// DB. This is the step that first tells the wallet a deposit exists - the backend's
     /// `transaction_data_requests` only cover follow-up work (spend detection, enhancement)
@@ -979,60 +964,31 @@ impl WalletActor {
         if addresses.is_empty() {
             return;
         }
-        let request = service::GetAddressUtxosArg { addresses, start_height: 0, max_entries: 0 };
-        let mut stream = {
+        let utxos = {
             let client = self.client.as_mut().expect("checked above");
-            match tokio::time::timeout(UNARY_RPC_TIMEOUT, client.get_address_utxos_stream(request))
+            tokio::time::timeout(UNARY_RPC_TIMEOUT, client.address_utxos(addresses))
                 .await
-            {
-                Ok(Ok(s)) => s.into_inner(),
-                Ok(Err(e)) => {
-                    warn!("[{}] get_address_utxos failed: {e}", self.name);
-                    self.client = None;
-                    self.update_status();
-                    return;
-                }
-                Err(_) => {
-                    warn!(
-                        "[{}] get_address_utxos timed out after {UNARY_RPC_TIMEOUT:?}",
-                        self.name
-                    );
-                    self.client = None;
-                    self.update_status();
-                    return;
-                }
+                .map_err(|_| anyhow!("address_utxos timed out after {UNARY_RPC_TIMEOUT:?}"))
+                .and_then(|r| r)
+        };
+        let utxos = match utxos {
+            Ok(utxos) => utxos,
+            Err(e) => {
+                warn!("[{}] address_utxos failed: {e}", self.name);
+                self.client = None;
+                self.update_status();
+                return;
             }
         };
-        loop {
-            let reply = match tokio::time::timeout(UNARY_RPC_TIMEOUT, stream.message()).await {
-                Ok(Ok(Some(reply))) => reply,
-                Ok(Ok(None)) => break,
-                Ok(Err(e)) => {
-                    warn!("[{}] get_address_utxos stream: {e}", self.name);
-                    self.client = None;
-                    self.update_status();
-                    return;
-                }
-                Err(_) => {
-                    warn!("[{}] get_address_utxos stream stalled", self.name);
-                    self.client = None;
-                    self.update_status();
-                    return;
-                }
-            };
-            let output = <[u8; 32]>::try_from(&reply.txid[..])
+        for utxo in utxos {
+            let output = <[u8; 32]>::try_from(&utxo.txid[..])
                 .ok()
-                .zip(u32::try_from(reply.index).ok())
-                .zip(
-                    Zatoshis::from_nonnegative_i64(reply.value_zat)
-                        .ok()
-                        .zip(u32::try_from(reply.height).ok()),
-                )
-                .and_then(|((txid, index), (value, height))| {
+                .zip(Zatoshis::from_nonnegative_i64(utxo.value_zat).ok())
+                .and_then(|(txid, value)| {
                     WalletTransparentOutput::from_parts(
-                        OutPoint::new(txid, index),
-                        TxOut::new(value, Script(zcash_script::script::Code(reply.script))),
-                        Some(BlockHeight::from_u32(height)),
+                        OutPoint::new(txid, utxo.index),
+                        TxOut::new(value, Script(zcash_script::script::Code(utxo.script))),
+                        Some(BlockHeight::from_u32(utxo.height)),
                     )
                 });
             match output {
@@ -1107,9 +1063,10 @@ impl WalletActor {
         }
     }
 
-    /// Detect transactions involving one of the wallet's transparent addresses via
-    /// lightwalletd's `GetTaddressTxids`, store each through trial decryption (which records
-    /// the wallet-relevant transparent outputs/spends), and acknowledge the checked range.
+    /// Detect transactions involving one of the wallet's transparent addresses via the
+    /// upstream's address index (lightwalletd `GetTaddressTxids` / zebra `getaddresstxids`),
+    /// store each through trial decryption (which records the wallet-relevant transparent
+    /// outputs/spends), and acknowledge the checked range.
     async fn service_address_check(
         &mut self,
         request: zcash_client_backend::data_api::TransactionsInvolvingAddress,
@@ -1124,7 +1081,7 @@ impl WalletActor {
             return Ok(());
         }
         let start = u32::from(request.block_range_start()).max(1);
-        // The request's range end is exclusive; GetTaddressTxids takes an inclusive range.
+        // The request's range end is exclusive; the upstream lookup takes an inclusive range.
         // When an explicit end is set, `notify_address_checked` requires the acknowledgement
         // to name exactly `end - 1`, so a range reaching past the current tip is left for a
         // later pass rather than partially scanned and mis-acknowledged.
@@ -1142,58 +1099,35 @@ impl WalletActor {
             return Ok(());
         }
         let address = request.address().encode(&self.network);
-        let filter = service::TransparentAddressBlockFilter {
-            address,
-            range: Some(service::BlockRange {
-                start: Some(service::BlockId { height: u64::from(start), ..Default::default() }),
-                end: Some(service::BlockId { height: u64::from(end), ..Default::default() }),
-                ..Default::default()
-            }),
-        };
-        let stream = {
+        let txs = {
             let client = self
                 .client
                 .as_mut()
-                .ok_or_else(|| RpcError::misc("not connected to lightwalletd"))?;
-            match tokio::time::timeout(UNARY_RPC_TIMEOUT, client.get_taddress_txids(filter)).await
-            {
-                Ok(Ok(s)) => s.into_inner(),
-                Ok(Err(e)) => {
-                    self.client = None;
-                    self.update_status();
-                    return Err(RpcError::misc(format!("get_taddress_txids failed: {e}")));
-                }
-                Err(_) => {
-                    self.client = None;
-                    self.update_status();
-                    return Err(RpcError::misc(format!(
-                        "get_taddress_txids timed out after {UNARY_RPC_TIMEOUT:?}"
-                    )));
-                }
+                .ok_or_else(|| RpcError::misc("not connected to upstream"))?;
+            tokio::time::timeout(
+                UNARY_RPC_TIMEOUT,
+                client.taddress_txs(
+                    address,
+                    BlockHeight::from_u32(start),
+                    BlockHeight::from_u32(end),
+                ),
+            )
+            .await
+            .map_err(|_| anyhow!("taddress_txs timed out after {UNARY_RPC_TIMEOUT:?}"))
+            .and_then(|r| r)
+        };
+        let txs = match txs {
+            Ok(txs) => txs,
+            Err(e) => {
+                self.client = None;
+                self.update_status();
+                return Err(RpcError::misc(format!("taddress_txs failed: {e}")));
             }
         };
-        let mut stream = stream;
-        loop {
-            let next = tokio::time::timeout(UNARY_RPC_TIMEOUT, stream.message()).await;
-            match next {
-                Ok(Ok(Some(raw))) => {
-                    let mined_height =
-                        u32::try_from(raw.height).ok().filter(|h| *h > 0 && *h <= tip);
-                    if let Err(e) = self.store_fetched_tx(&raw.data, mined_height, tip) {
-                        warn!("[{}] storing taddress tx: {e}", self.name);
-                    }
-                }
-                Ok(Ok(None)) => break,
-                Ok(Err(e)) => {
-                    self.client = None;
-                    self.update_status();
-                    return Err(RpcError::misc(format!("get_taddress_txids stream: {e}")));
-                }
-                Err(_) => {
-                    self.client = None;
-                    self.update_status();
-                    return Err(RpcError::misc("get_taddress_txids stream stalled"));
-                }
+        for raw in txs {
+            let mined_height = raw.mined_height.filter(|h| *h <= tip);
+            if let Err(e) = self.store_fetched_tx(&raw.data, mined_height, tip) {
+                warn!("[{}] storing taddress tx: {e}", self.name);
             }
         }
         self.db_data
@@ -1312,7 +1246,7 @@ impl WalletActor {
         let db = &mut self.db_data;
         // Proposal building + proving is CPU-heavy; keep it off the async runtime (the
         // do_send pattern).
-        let (txid, raw): (TxId, service::RawTransaction) =
+        let (txid, raw): (TxId, Vec<u8>) =
             tokio::task::block_in_place(move || -> Result<_, RpcError> {
                 let change_strategy = MultiOutputChangeStrategy::new(
                     StandardFeeRule::Zip317,
@@ -1377,8 +1311,8 @@ impl WalletActor {
                     .get_transaction(txid)
                     .map_err(RpcError::database_internal)?
                     .ok_or_else(|| RpcError::wallet("created transaction not found in wallet"))?;
-                let mut raw_tx = service::RawTransaction::default();
-                tx.write(&mut raw_tx.data)
+                let mut raw_tx = Vec::new();
+                tx.write(&mut raw_tx)
                     .map_err(|e| RpcError::misc(format!("failed to serialize transaction: {e}")))?;
                 Ok((txid, raw_tx))
             })?;
@@ -1415,7 +1349,7 @@ impl WalletActor {
         let policy = self.confirmations_policy;
         let prover = &self.prover;
         let db = &mut self.db_data;
-        let (txid, raw): (TxId, service::RawTransaction) =
+        let (txid, raw): (TxId, Vec<u8>) =
             tokio::task::block_in_place(move || -> Result<_, RpcError> {
                 let change_strategy = MultiOutputChangeStrategy::new(
                     StandardFeeRule::Zip317,
@@ -1464,8 +1398,8 @@ impl WalletActor {
                     .get_transaction(txid)
                     .map_err(RpcError::database_internal)?
                     .ok_or_else(|| RpcError::wallet("created transaction not found in wallet"))?;
-                let mut raw_tx = service::RawTransaction::default();
-                tx.write(&mut raw_tx.data)
+                let mut raw_tx = Vec::new();
+                tx.write(&mut raw_tx)
                     .map_err(|e| RpcError::misc(format!("failed to serialize transaction: {e}")))?;
                 Ok((txid, raw_tx))
             })?;
@@ -1485,15 +1419,11 @@ impl WalletActor {
     /// the tx and refused it) is surfaced, as -26; the tx's inputs stay locked until its
     /// expiry height, after which they become spendable again - an immediate retry fails
     /// with -6 rather than double-paying.
-    async fn broadcast_committed(
-        &mut self,
-        txid: TxId,
-        raw: service::RawTransaction,
-    ) -> Result<(), RpcError> {
+    async fn broadcast_committed(&mut self, txid: TxId, raw: Vec<u8>) -> Result<(), RpcError> {
         if self.client.is_none() {
             if let Err(e) = self.connect().await {
                 warn!(
-                    "[{}] created {txid} but no lightwalletd is reachable ({e}); it will be \
+                    "[{}] created {txid} but no upstream is reachable ({e}); it will be \
                      re-broadcast once a connection recovers",
                     self.name
                 );
@@ -1504,17 +1434,13 @@ impl WalletActor {
             let client = self.client.as_mut().expect("connected above");
             // Bounded: a peer that hangs mid-broadcast is treated like any other transport
             // failure - the committed tx rides on the rebroadcast loop either way.
-            tokio::time::timeout(UNARY_RPC_TIMEOUT, client.send_transaction(raw))
+            tokio::time::timeout(UNARY_RPC_TIMEOUT, client.broadcast_tx(raw))
                 .await
-                .map_err(|_| {
-                    tonic::Status::deadline_exceeded(format!(
-                        "broadcast timed out after {UNARY_RPC_TIMEOUT:?}"
-                    ))
-                })
+                .map_err(|_| anyhow!("broadcast timed out after {UNARY_RPC_TIMEOUT:?}"))
                 .and_then(|r| r)
         };
-        let response = match response {
-            Ok(r) => r.into_inner(),
+        let outcome = match response {
+            Ok(outcome) => outcome,
             Err(e) => {
                 // Transport failure: drop the dead client so the next op reconnects/fails over.
                 // The committed tx rides on the rebroadcast loop.
@@ -1527,19 +1453,25 @@ impl WalletActor {
                 return Ok(());
             }
         };
-        if response.error_code != 0 {
-            let reason = sanitize_upstream_msg(&response.error_message);
-            warn!("[{}] upstream rejected {txid} (code {}): {reason}", self.name, response.error_code);
+        if !outcome.is_accepted() {
+            // An explicit upstream rejection (the node examined the tx and refused it) is a
+            // different case from a transport failure: surface it as -26. The tx's notes stay
+            // locked in the wallet until its expiry height, after which they become spendable
+            // again - an immediate retry fails with -6 rather than double-paying.
+            let reason = sanitize_upstream_msg(&outcome.error_message);
+            warn!("[{}] upstream rejected {txid} (code {}): {reason}", self.name, outcome.error_code);
             return Err(RpcError::new(
                 codes::RPC_VERIFY_REJECTED,
-                format!("transaction rejected (code {}): {reason}", response.error_code),
+                format!("transaction rejected (code {}): {reason}", outcome.error_code),
             ));
         }
         Ok(())
     }
 
     /// Return raw transaction bytes: prefer the locally-stored copy (present for txs we
-    /// created or have enhanced), otherwise fetch the full tx from lightwalletd.
+    /// created or have enhanced), otherwise fetch the full tx from the upstream. "Upstream
+    /// doesn't know the txid" is an application-level miss encoded as `Ok(None)` by the
+    /// backend (so the healthy connection is kept); only transport failures drop the client.
     async fn do_get_raw_tx(&mut self, txid: TxId) -> Result<Option<RawTx>, RpcError> {
         if let Ok(Some(tx)) = self.db_data.get_transaction(txid) {
             let mut buf = Vec::new();
@@ -1557,46 +1489,27 @@ impl WalletActor {
         if self.client.is_none() {
             self.connect()
                 .await
-                .map_err(|e| RpcError::misc(format!("connect to lightwalletd: {e}")))?;
+                .map_err(|e| RpcError::misc(format!("connect to upstream: {e}")))?;
         }
-        let filter = service::TxFilter {
-            hash: txid.as_ref().to_vec(),
-            ..Default::default()
-        };
-        let raw = {
+        let fetched = {
             let client = self
                 .client
                 .as_mut()
-                .ok_or_else(|| RpcError::misc("not connected to lightwalletd"))?;
-            tokio::time::timeout(UNARY_RPC_TIMEOUT, client.get_transaction(filter))
+                .ok_or_else(|| RpcError::misc("not connected to upstream"))?;
+            tokio::time::timeout(UNARY_RPC_TIMEOUT, client.fetch_tx(txid))
                 .await
-                .map_err(|_| {
-                    tonic::Status::deadline_exceeded(format!(
-                        "get_transaction timed out after {UNARY_RPC_TIMEOUT:?}"
-                    ))
-                })
+                .map_err(|_| anyhow!("fetch_tx timed out after {UNARY_RPC_TIMEOUT:?}"))
                 .and_then(|r| r)
         };
-        let raw = match raw {
-            Ok(r) => r.into_inner(),
-            // The upstream looked up the txid and doesn't know it: an application-level
-            // miss, not a failure - keep the (healthy) client and report "no such tx".
-            Err(status) if is_tx_not_found(&status) => return Ok(None),
+        match fetched {
+            Ok(found) => Ok(found.map(|tx| RawTx { data: tx.data, mined_height: tx.mined_height })),
             Err(e) => {
                 // Transport failure: drop the dead client so the next op reconnects/fails over.
                 self.client = None;
                 self.update_status();
-                return Err(RpcError::misc(format!("get_transaction RPC failed: {e}")));
+                Err(RpcError::misc(format!("transaction fetch failed: {e}")))
             }
-        };
-        Ok(if raw.data.is_empty() {
-            None
-        } else {
-            // lightwalletd reports the mined height in `height`; mempool transactions carry
-            // 0 or -1 (encoded as u64), neither of which is a real mined height here.
-            let mined_height = u32::try_from(raw.height).ok().filter(|h| *h > 0);
-            Some(RawTx { data: raw.data, mined_height })
-        })
+        }
     }
 
     /// Broadcast caller-supplied raw transaction bytes (`sendrawtransaction`). Unlike
@@ -1607,38 +1520,33 @@ impl WalletActor {
         if self.client.is_none() {
             self.connect()
                 .await
-                .map_err(|e| RpcError::misc(format!("connect to lightwalletd: {e}")))?;
+                .map_err(|e| RpcError::misc(format!("connect to upstream: {e}")))?;
         }
-        let raw = service::RawTransaction { data, ..Default::default() };
         let response = {
             let client = self
                 .client
                 .as_mut()
-                .ok_or_else(|| RpcError::misc("not connected to lightwalletd"))?;
-            tokio::time::timeout(UNARY_RPC_TIMEOUT, client.send_transaction(raw))
+                .ok_or_else(|| RpcError::misc("not connected to upstream"))?;
+            tokio::time::timeout(UNARY_RPC_TIMEOUT, client.broadcast_tx(data))
                 .await
-                .map_err(|_| {
-                    tonic::Status::deadline_exceeded(format!(
-                        "broadcast timed out after {UNARY_RPC_TIMEOUT:?}"
-                    ))
-                })
+                .map_err(|_| anyhow!("broadcast timed out after {UNARY_RPC_TIMEOUT:?}"))
                 .and_then(|r| r)
         };
-        let response = match response {
-            Ok(r) => r.into_inner(),
+        let outcome = match response {
+            Ok(outcome) => outcome,
             Err(e) => {
                 // Transport/deadline failure: drop the client so the next op reconnects/fails over.
                 self.client = None;
                 self.update_status();
-                return Err(RpcError::misc(format!("send_transaction RPC failed: {e}")));
+                return Err(RpcError::misc(format!("transaction broadcast failed: {e}")));
             }
         };
-        if response.error_code != 0 {
-            let reason = sanitize_upstream_msg(&response.error_message);
-            warn!("[{}] upstream rejected tx (code {}): {reason}", self.name, response.error_code);
+        if !outcome.is_accepted() {
+            let reason = sanitize_upstream_msg(&outcome.error_message);
+            warn!("[{}] upstream rejected tx (code {}): {reason}", self.name, outcome.error_code);
             return Err(RpcError::new(
                 codes::RPC_VERIFY_REJECTED,
-                format!("transaction rejected (code {}): {reason}", response.error_code),
+                format!("transaction rejected (code {}): {reason}", outcome.error_code),
             ));
         }
         Ok(())
@@ -1767,18 +1675,18 @@ impl WalletActor {
     }
 }
 
-/// Ensure a freshly-connected lightwalletd `client` is healthy, serves the chain this wallet
+/// Ensure a freshly-connected upstream `client` is healthy, serves the chain this wallet
 /// is configured for, and the wallet has its note-commitment subtree roots. The
-/// `get_lightd_info` call doubles as the liveness probe and the wrong-chain guard (a mainnet
-/// zecd pointed at a testnet lightwalletd would otherwise happily scan the wrong chain). The
+/// `server_info` call doubles as the liveness probe and the wrong-chain guard (a mainnet
+/// zecd pointed at a testnet upstream would otherwise happily scan the wrong chain). The
 /// first successful call this process additionally downloads the subtree roots and sets
 /// `roots_synced`; the roots persist in the wallet DB, so they aren't re-streamed on each
 /// reconnect / primary re-probe.
 ///
 /// The whole check is bounded by `budget`: a peer that accepts connections but never answers
 /// (the dial timeout can't see this) must not stall the actor's command loop.
-async fn prepare_client(
-    client: &mut CompactTxStreamerClient<Channel>,
+async fn prepare_client<C: ChainSource>(
+    client: &mut C,
     db_data: &mut WriteDb,
     network: ZNetwork,
     roots_synced: &mut bool,
@@ -1796,18 +1704,18 @@ async fn prepare_client(
     .map_err(|_| anyhow!("upstream health check timed out after {budget:?}"))?
 }
 
-/// Refuse a lightwalletd whose `chain_name` contradicts the configured network. Only the
+/// Refuse an upstream whose `chain_name` contradicts the configured network. Only the
 /// mainnet/non-mainnet boundary is enforced: zebra reports `"test"` for regtest too (its
 /// `bip70_network_name` only distinguishes mainnet), so test vs regtest cannot be told
 /// apart from here - and the guard's job is ensuring a mainnet wallet never scans a test
 /// chain (or vice versa). A definitive cross is a hard error so the caller fails over to
 /// the next candidate; an unrecognized name is only a warning, since not every server
 /// reports one.
-async fn verify_server_network(
-    client: &mut CompactTxStreamerClient<Channel>,
+async fn verify_server_network<C: ChainSource>(
+    client: &mut C,
     network: ZNetwork,
 ) -> anyhow::Result<()> {
-    let info = client.get_lightd_info(service::Empty {}).await?.into_inner();
+    let info = client.server_info().await?;
     match chain_name_is_main(&info.chain_name) {
         Some(server_is_main) => {
             let wallet_is_main = matches!(network, ZNetwork::Main);
@@ -1837,7 +1745,7 @@ fn chain_name_is_main(chain_name: &str) -> Option<bool> {
     }
 }
 
-/// Bound an upstream-supplied string before echoing it into an RPC error. lightwalletd's
+/// Bound an upstream-supplied string before echoing it into an RPC error. Upstream
 /// reject reasons are genuinely useful to clients (Bitcoin Core relays its own), but the
 /// upstream is only operator-trusted, so strip control characters and cap the length rather
 /// than relay arbitrary bytes (the same bounded text is what call sites log).
@@ -1853,8 +1761,8 @@ fn sanitize_upstream_msg(msg: &str) -> String {
 /// Await the next message on an open mempool stream, or pend forever when none is open, so
 /// the actor's idle `select!` arm simply never fires without a subscription.
 async fn mempool_next(
-    stream: &mut Option<tonic::Streaming<service::RawTransaction>>,
-) -> Result<Option<service::RawTransaction>, tonic::Status> {
+    stream: &mut Option<MempoolStream>,
+) -> anyhow::Result<Option<service::RawTransaction>> {
     match stream {
         Some(s) => s.message().await,
         None => std::future::pending().await,
@@ -1980,23 +1888,9 @@ fn enrich_insufficient_funds(db: &WriteDb, policy: ConfirmationsPolicy, err: Rpc
     ))
 }
 
-/// True when a `GetTransaction` error status means the node simply does not know the txid -
-/// an application-level miss the RPC layer reports as -5, not a transport failure worth
-/// dropping the connection over. lightwalletd proxies the backing node's message through:
-/// zcashd says "No such mempool transaction" / "No such mempool or blockchain transaction"
-/// (with -txindex) or, historically, "No information available about transaction"; zebrad
-/// says "No such mempool or main chain transaction".
-fn is_tx_not_found(status: &tonic::Status) -> bool {
-    if status.code() == tonic::Code::NotFound {
-        return true;
-    }
-    let msg = status.message().to_lowercase();
-    msg.contains("no such mempool") || msg.contains("no information available about transaction")
-}
-
 #[cfg(test)]
 mod tests {
-    use super::{is_tx_not_found, sanitize_upstream_msg};
+    use super::sanitize_upstream_msg;
 
     /// Upstream reject reasons are relayed to RPC clients, but bounded: control characters
     /// stripped, length capped (the upstream is operator-configured, not trusted-honest).
@@ -2015,26 +1909,6 @@ mod tests {
         // Exactly at the cap: no marker.
         let exact = "y".repeat(200);
         assert_eq!(sanitize_upstream_msg(&exact), exact);
-    }
-
-    #[test]
-    fn tx_not_found_statuses_are_misses_not_failures() {
-        for msg in [
-            "No such mempool transaction. Use -txindex to enable blockchain transaction queries.",
-            "No such mempool or blockchain transaction",
-            "No such mempool or main chain transaction",
-            "-5: No such mempool or main chain transaction",
-            "No information available about transaction",
-        ] {
-            assert!(
-                is_tx_not_found(&tonic::Status::unknown(msg)),
-                "{msg:?} must classify as not-found"
-            );
-        }
-        assert!(is_tx_not_found(&tonic::Status::not_found("anything")));
-        // Transport-class failures must still drop the client.
-        assert!(!is_tx_not_found(&tonic::Status::unavailable("connection refused")));
-        assert!(!is_tx_not_found(&tonic::Status::deadline_exceeded("timed out")));
     }
 
     /// The wrong-chain guard enforces only the mainnet/non-mainnet boundary. The regtest

@@ -16,8 +16,9 @@ goes badly wrong with zecd, its seed phrases can be entered into any other libru
 to access funds.
 
 zecd is a light client, for quick scalability. It syncs compact blocks in the background and
-never speaks P2P or indexes the chain itself. Production deployments should connect to a full
-self-hosted Zcash node (Zebra + Lightwalletd, or Zaino).
+never speaks P2P or indexes the chain itself. Production deployments should connect to a
+self-hosted Zcash full node - either directly (`zebra://`) or through your own lightwalletd -
+see [Choosing a chain backend](#choosing-a-chain-backend).
 
 All zecd funds are recoverable by a seed phrase. Importing private keys per-address is not
 supported, all addresses are dervied from wallet seeds.
@@ -26,13 +27,66 @@ supported, all addresses are dervied from wallet seeds.
 
 ```mermaid
 flowchart LR
-    app["your app /<br>Bitcoin RPC client"] -->|JSON-RPC| zecd -->|gRPC| lwd[lightwalletd] --> zebra["zebra<br>(full node)"]
+    app["your app /<br>Bitcoin RPC client"] -->|JSON-RPC| zecd
+    zecd -->|gRPC| lwd[lightwalletd] --> zebra["zebra<br>(full node)"]
+    zecd -.->|"JSON-RPC (zebra:// mode)"| zebra
 ```
 
-Self-hosted: point zecd at your own lightwalletd with `[lightwalletd] server = "127.0.0.1:9067"`;
-the [Docker stack](#docker--self-hosted-stack) below runs the full node pipeline with one compose
-file. By default zecd uses the public zecrocks infrastructure (`zec.rocks:443` mainnet,
-`testnet.zec.rocks:443` testnet), so it runs out of the box with no node to stand up.
+Two ways to reach the chain, sharing one ordered failover list:
+
+- **lightwalletd (default):** point zecd at your own lightwalletd with
+  `[lightwalletd] server = "127.0.0.1:9067"`, or use the public zecrocks infrastructure
+  (`zec.rocks:443` mainnet, `testnet.zec.rocks:443` testnet) - the out-of-the-box default,
+  no node to stand up. This is the only mode that works with remote/public endpoints (and Tor).
+- **zebra-direct:** point zecd straight at a **local** zebrad's JSON-RPC with
+  `server = "zebra://127.0.0.1:8232"` - one less daemon to run. zecd derives compact blocks,
+  tree state, and mempool visibility from the node RPCs itself (the same ones lightwalletd
+  uses). Both can share the list: `servers = ["zebra://127.0.0.1:8232", "zec.rocks:443"]`
+  is a local node with a public fallback.
+
+The [Docker stack](#docker--self-hosted-stack) below runs the full self-hosted pipeline with
+one compose file.
+
+### Choosing a chain backend
+
+**Run the full stack yourself in production.** Whichever backend you choose, a production
+deployment should sit on a **self-hosted zebra full node** (with or without your own
+lightwalletd in front). zecd holds spend authority over real funds; its entire view of the
+chain - balances, confirmations, incoming payments - is whatever the upstream serves it. A
+public endpoint you don't operate can observe your wallet's sync pattern and broadcasts
+(a privacy leak even though it can never steal funds: all data is validated locally and keys
+never leave zecd), can go down or rate-limit you at the worst moment, and is one more party
+in your threat model. Public infrastructure like `zec.rocks` is great for getting started,
+development, and as an emergency *fallback* - not as the primary for a treasury or a
+payment processor.
+
+| | `zebra://` (zebra-direct) | local lightwalletd | public lightwalletd (`zec.rocks`, …) |
+|---|---|---|---|
+| Trust/privacy | best - only your own node | best - only your own infra | sync pattern + broadcasts visible to the operator |
+| Daemons to run | zebra | zebra + lightwalletd | none |
+| Transport | plaintext HTTP, localhost only | gRPC, plaintext or TLS | gRPC over TLS; Tor/SOCKS supported |
+| Initial sync speed | slower (two `getblock` RPCs per block, sequential) | fast (pre-built CompactBlock cache) | fast |
+| 0-conf latency | ~2 s (`getrawmempool` poll) | push (mempool stream) | push (mempool stream) |
+| Serves other light clients too | no (zecd-internal) | yes (any CompactTxStreamer client) | n/a |
+| Remote / Tor reachable | no - refused by design | yes | yes |
+
+Rules of thumb:
+
+- **Simplest production setup:** `servers = ["zebra://127.0.0.1:8232"]` - one node, one
+  wallet daemon, no lightwalletd to operate. Prefer this when zecd is the only light client
+  you run and a slower first sync (and ~2 s of 0-conf latency) is acceptable.
+- **Run lightwalletd in front of your zebra** when you also serve mobile/other light
+  wallets from the same node, want the fastest initial sync, or want push-based mempool
+  delivery. This is what `deploy/docker-compose.yml` ships.
+- **Mix them for resilience:** `servers = ["zebra://127.0.0.1:8232", "https://zec.rocks:443"]`
+  keeps your own node as the primary and only ever touches the public fallback while your
+  node is down (zecd snaps back automatically; see failover below).
+- **Tor/remote endpoints require lightwalletd mode:** `zebra://` is deliberately
+  local-only (plaintext, no SOCKS) - never expose a zebra RPC port to the network.
+
+The two backends are interchangeable and equivalence-tested in CI: the regtest suite runs a
+zebra-direct zecd and a lightwalletd-backed zecd against the same chain and requires
+identical chain views at every checkpoint.
 
 ## Quick start
 
@@ -79,21 +133,28 @@ dir = "./data/default"
 
 [lightwalletd]
 server = "zecrocks"              # "ecc" | "ywallet" | "zecrocks" | "host:port" (or "h:p,h:p")
+                                 #   | "zebra://host:port" (a local zebrad's JSON-RPC, no lightwalletd)
 # Or list multiple endpoints for failover, tried in order and always preferring the first; the
 # daemon snaps back to the primary when it recovers. `servers` takes precedence over `server`.
-# A scheme prefix sets TLS per endpoint (http:// plaintext, https:// TLS), so a plaintext local
-# node and TLS public fallbacks can share one list:
-#   mainnet:  servers = ["http://127.0.0.1:9067", "https://zec.rocks:443", "https://eu.zec.rocks:443"]
+# A scheme prefix sets the kind/TLS per endpoint (zebra:// local full node; http:// plaintext
+# lightwalletd; https:// TLS lightwalletd), so a local node and public fallbacks share one list:
+#   mainnet:  servers = ["zebra://127.0.0.1:8232", "https://zec.rocks:443", "https://eu.zec.rocks:443"]
 #   testnet:  servers = ["http://127.0.0.1:9067", "https://testnet.zec.rocks:443"]
 connection = "direct"           # "direct" | "tor" | "socks5://host:port" - route all lightwalletd
                                 #   traffic through a SOCKS5 proxy ("tor" = 127.0.0.1:9050). TLS is
                                 #   still layered on top, so the proxy only sees ciphertext.
+                                #   (zebra:// endpoints are local-only and refuse to combine with a proxy.)
 tls_roots = "native"            # "native" (OS store, honors SSL_CERT_FILE) | "webpki"
 tls = "auto"                    # "auto" (TLS for remote, plaintext for localhost) | "yes" | "no"
 connect_timeout_secs = 10       # per-attempt dial timeout (so a hung endpoint can't stall sync)
 reconnect_base_secs = 1         # reconnect backoff: base delay (doubles, full jitter)
 reconnect_max_secs = 60         # reconnect backoff: ceiling
 primary_recheck_secs = 60       # while on a fallback, how often to re-probe higher-priority servers
+
+[zebra]                          # credentials for zebra:// endpoints (omit when zebrad has
+# rpc_cookie = "/path/.cookie"   #   `enable_cookie_auth = false`); a cookie wins over user/password
+# rpc_user = "user"
+# rpc_password = "pass"
 
 [rpc]
 bind = "127.0.0.1"
@@ -183,7 +244,7 @@ With `[health] enabled` (default), zecd serves unauthenticated probes on a separ
 (default 9233):
 
 - `GET /healthz`: liveness. `200 ok` while the process is running.
-- `GET /readyz`: readiness. `200` once every wallet is connected to lightwalletd and synced to
+- `GET /readyz`: readiness. `200` once every wallet is connected to its upstream and synced to
   `[health] ready_progress`, otherwise `503`. Body is JSON with per-wallet detail; when not ready
   it carries a `reason` (`"upstream_down"` vs `"syncing"`) so alerting can tell an unreachable
   lightwalletd apart from normal catch-up.
@@ -242,7 +303,7 @@ the validator's job there - so those rows are all - .
 | `getaddressesbylabel`, `listlabels` | ✓ | - | Core shapes and error codes (`-11` for unknown label) |
 | `listtransactions` | ✓ | - (`z_listtransactions`, different shape) | Core categories/fields (`fee` on sends, label filter, count/skip); adds `memo`/`memoStr` |
 | `listsinceblock` | ✓ | - | Cursor pattern; `removed` always `[]`; reorged/unknown cursor → `-5`, re-baseline (no fork-point walk-back) |
-| `gettransaction` | ✓ | - (`z_viewtransaction`, different shape) | `amount`/`fee`/`confirmations`/`details`/`hex`; foreign tx hex fetched via lightwalletd |
+| `gettransaction` | ✓ | - (`z_viewtransaction`, different shape) | `amount`/`fee`/`confirmations`/`details`/`hex`; foreign tx hex fetched from the upstream (lightwalletd or zebra) |
 | `listunspent` | ✓ | - (`z_listunspent`, different shape) | One entry per unspent Orchard note; synthesized `txid`/`vout`; `address` empty for change |
 | `getreceivedbyaddress`, `listreceivedbyaddress`, `getreceivedbylabel`, `listreceivedbylabel` | ✓ | - | Core shapes over diversified receiving addresses; change never counted |
 | `sendtoaddress` | ✓ | - (`z_sendmany` is async, returns an operation id) | Synchronous: builds, proves, broadcasts, returns txid; ZIP-317 fee; `subtractfeefromamount`/`fee_rate` → `-8`; extra trailing `memo` hex param |
@@ -253,8 +314,8 @@ the validator's job there - so those rows are all - .
 | `walletlock` | ✓ | ✓ | Core semantics |
 | `listwallets` | ✓ | - (one wallet per instance) | Names from `[wallets.<name>]` config |
 | **Raw transactions** | | | |
-| `getrawtransaction` | ✓ (verbose JSON differs) | ✓ | Hex, or verbose JSON in zcashd's `TxToJSON` shape with shielded bundles - matches Zallet, not bitcoind; `blockhash` param rejected; wallet store first, lightwalletd fallback |
-| `sendrawtransaction` | ✓ | - (planned) | Broadcasts caller-built bytes via lightwalletd; `maxfeerate` ignored |
+| `getrawtransaction` | ✓ (verbose JSON differs) | ✓ | Hex, or verbose JSON in zcashd's `TxToJSON` shape with shielded bundles - matches Zallet, not bitcoind; `blockhash` param rejected; wallet store first, upstream fallback |
+| `sendrawtransaction` | ✓ | - (planned) | Broadcasts caller-built bytes through the upstream; `maxfeerate` ignored |
 | **Blockchain** | | | |
 | `getblockchaininfo` | ✓ | - | `blocks` = fully-scanned height, `headers` = tip, `initialblockdownload` = scanning; `difficulty`/`size_on_disk` stubs |
 | `getblockcount` | ✓ | - | Fully-scanned height, so `getblockhash(getblockcount())` always answers |
@@ -262,9 +323,9 @@ the validator's job there - so those rows are all - .
 | `getblockhash` | ✓ | - | From the wallet's scanned blocks; pre-birthday or beyond-tip heights → `-8` |
 | `getblockheader` | ✓ | - | Verbose only, compact-block fields (hash/confirmations/height/time/mediantime/prev/next); `verbose=false` → `-8` |
 | **Network** | | | |
-| `getnetworkinfo` | ✓ | - | zecd version/subversion; `connections` is 0 or 1 (the lightwalletd upstream is the only "peer") |
+| `getnetworkinfo` | ✓ | - | zecd version/subversion; `connections` is 0 or 1 (the chain upstream is the only "peer") |
 | `getconnectioncount` | ✓ | - | 0 or 1 |
-| `getpeerinfo` | ✓ | - | At most one entry, describing the active lightwalletd, plus `conn_state`/`syncing` extensions |
+| `getpeerinfo` | ✓ | - | At most one entry, describing the active upstream (lightwalletd or zebra), plus `conn_state`/`syncing` extensions |
 | `ping` | ✓ | - | No-op success (no P2P ping to measure) |
 | **Utility** | | | |
 | `validateaddress` | ✓ | ✓ (transparent-only: a valid UA gets `isvalid:false`) | Validates every Zcash address kind; valid UA → `isvalid:true`, `scriptPubKey` empty |
@@ -314,7 +375,8 @@ Out of scope by design:
 Edges to be aware of (consequences of being a shielded light wallet):
 
 - Spending needs confirmations: an incoming mempool payment is visible immediately
-  (`getunconfirmedbalance` / `listtransactions` at 0 conf, via lightwalletd's mempool stream),
+  (`getunconfirmedbalance` / `listtransactions` at 0 conf, via lightwalletd's mempool stream
+  or, in zebra-direct mode, a `getrawmempool` poller),
   but received notes must mine and reach the confirmation minimum before they are spendable.
   The default minimum is [ZIP 315](https://zips.z.cash/zip-0315)'s: 3 confirmations for the
   wallet's own change, 10 for third-party payments (~12.5 minutes at 75-second blocks);

@@ -17,14 +17,17 @@ dir = "./data/default"
 
 [lightwalletd]
 # "ecc" | "ywallet" | "zecrocks" | a "host:port" (use your local lightwalletd in production,
-# e.g. "127.0.0.1:9067"). Defaults to the public zecrocks infrastructure (testnet.zec.rocks here).
+# e.g. "127.0.0.1:9067") | "zebra://host:port" (talk straight to a LOCAL zebrad's JSON-RPC,
+# no lightwalletd needed - see [zebra] below for credentials). Defaults to the public
+# zecrocks infrastructure (testnet.zec.rocks here).
 server = "zecrocks"
 # Or list multiple endpoints for failover, tried in order and always preferring the first (the
 # daemon snaps back to the primary when it recovers). `servers` takes precedence over `server`.
-# A scheme prefix sets TLS per endpoint (http:// = plaintext, https:// = TLS); without a prefix
-# TLS is auto (on for remote hosts, off for localhost).
+# A scheme prefix sets the endpoint kind / TLS (zebra:// = local zebrad; http:// = plaintext
+# lightwalletd; https:// = TLS lightwalletd); without a prefix TLS is auto (on for remote
+# hosts, off for localhost).
 #   testnet:  servers = ["http://127.0.0.1:9067", "https://testnet.zec.rocks:443"]
-#   mainnet:  servers = ["http://127.0.0.1:9067", "https://zec.rocks:443", "https://eu.zec.rocks:443"]
+#   mainnet:  servers = ["zebra://127.0.0.1:8232", "https://zec.rocks:443", "https://eu.zec.rocks:443"]
 # How to reach lightwalletd:
 #   "direct" - connect directly (TLS for remote hosts, plaintext for localhost).
 #   "tor" - route all traffic through Tor's default SOCKS port (127.0.0.1:9050);
@@ -41,6 +44,14 @@ reconnect_base_secs = 1
 reconnect_max_secs = 60
 # While running on a fallback, how often (seconds) to re-probe higher-priority servers.
 primary_recheck_secs = 60
+
+# Credentials for any "zebra://host:port" endpoints above. Omit the whole section when zebrad
+# runs with `enable_cookie_auth = false`. A cookie file wins over user/password and is re-read
+# on every reconnect (zebrad regenerates it at startup).
+# [zebra]
+# rpc_cookie = "/var/lib/zebrad/.cookie"
+# rpc_user = "user"
+# rpc_password = "pass"
 
 [rpc]
 bind = "127.0.0.1"

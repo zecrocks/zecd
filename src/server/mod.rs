@@ -208,6 +208,7 @@ mod tests {
                 reconnect_max_secs: 60,
                 primary_recheck_secs: 60,
             },
+            zebra: Default::default(),
             rpc: rpc.clone(),
             keys: KeysConfig { age_identity: None, auto_unlock: true },
             sync: SyncConfig { interval_secs: 20, rebroadcast_secs: 60 },

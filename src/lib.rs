@@ -10,6 +10,7 @@
 pub mod address;
 pub mod amount;
 pub mod backoff;
+pub mod chain;
 pub mod config;
 pub mod daemon;
 pub mod error;

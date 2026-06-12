@@ -11,9 +11,9 @@ use secrecy::{SecretVec, Zeroize};
 use tokio::io::AsyncWriteExt as _;
 
 use zcash_client_backend::data_api::{AccountBirthday, WalletWrite};
-use zcash_client_backend::proto::service;
 use zcash_protocol::consensus::{BlockHeight, NetworkUpgrade, Parameters};
 
+use crate::chain::ChainSource as _;
 use crate::config::{AppConfig, InitArgs, WalletEntry};
 use crate::lightwalletd;
 use crate::wallet::open;
@@ -85,25 +85,26 @@ pub async fn run(config: &AppConfig, args: &InitArgs) -> anyhow::Result<()> {
 
     // init is a one-shot interactive command; it uses only the first configured endpoint (no
     // failover) - the daemon's actor does the multi-server failover at runtime.
-    let server = lightwalletd::resolve_all(
+    let mut servers = lightwalletd::resolve_all(
         &config.lightwalletd.servers,
         network,
         config.lightwalletd.tls_roots,
         config.lightwalletd.force_tls,
         config.lightwalletd.proxy,
-    )?
-    .into_iter()
-    .next()
-    .ok_or_else(|| anyhow!("no lightwalletd servers configured"))?;
+    )?;
+    lightwalletd::apply_zebra_auth(&mut servers, &config.zebra.auth());
+    let server = servers
+        .into_iter()
+        .next()
+        .ok_or_else(|| anyhow!("no upstream servers configured"))?;
     let mut client = server
         .connect_timeout(Duration::from_secs(config.lightwalletd.connect_timeout_secs))
         .await
-        .with_context(|| format!("connecting to lightwalletd {}", server.describe()))?;
+        .with_context(|| format!("connecting to {}", server.describe()))?;
 
     let chain_tip: u32 = client
-        .get_latest_block(service::ChainSpec::default())
+        .latest_block()
         .await?
-        .into_inner()
         .height
         .try_into()
         .map_err(|_| anyhow!("chain tip height does not fit into u32"))?;
@@ -150,9 +151,8 @@ pub async fn run(config: &AppConfig, args: &InitArgs) -> anyhow::Result<()> {
         // pre-genesis tree state. This happens on short chains (e.g. a fresh regtest network
         // where `chain_tip - 100` underflows to 0). `AccountBirthday::from_treestate` then
         // derives the actual birthday from the returned tree state's height.
-        let prior_height = u64::from(birthday_height).saturating_sub(1).max(1);
-        let request = service::BlockId { height: prior_height, ..Default::default() };
-        let treestate = client.get_tree_state(request).await?.into_inner();
+        let prior_height = u32::from(birthday_height).saturating_sub(1).max(1);
+        let treestate = client.tree_state(BlockHeight::from_u32(prior_height)).await?;
         AccountBirthday::from_treestate(treestate, recover_until)
             .map_err(|_| anyhow!("failed to derive account birthday from tree state"))?
     };

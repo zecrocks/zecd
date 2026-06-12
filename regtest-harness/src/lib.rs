@@ -601,10 +601,13 @@ pub struct Zecd {
     _datadir: tempfile::TempDir,
 }
 
-/// How `zecd` should reach the regtest lightwalletd, and what RPC port/creds to expose.
+/// How `zecd` should reach the regtest chain (lightwalletd gRPC and/or zebrad JSON-RPC
+/// directly), and what RPC port/creds to expose.
 pub struct ZecdConfig {
-    /// Primary lightwalletd gRPC port.
-    pub lightwalletd_port: u16,
+    /// Primary lightwalletd gRPC port (`None` for zebra-direct mode).
+    pub lightwalletd_port: Option<u16>,
+    /// zebrad JSON-RPC port for direct (`zebra://`) mode; listed before any lightwalletd.
+    pub zebra_rpc_port: Option<u16>,
     /// Optional fallback lightwalletd (for the failover tests); listed after the primary.
     pub fallback_lightwalletd_port: Option<u16>,
     pub rpc_port: u16,
@@ -629,7 +632,27 @@ impl ZecdConfig {
     /// 3s primary re-check, fast reconnect backoff (written by [`write_zecd_toml`]).
     pub fn new(lightwalletd_port: u16, rpc_port: u16) -> ZecdConfig {
         ZecdConfig {
-            lightwalletd_port,
+            lightwalletd_port: Some(lightwalletd_port),
+            zebra_rpc_port: None,
+            fallback_lightwalletd_port: None,
+            rpc_port,
+            rpc_user: "user".to_string(),
+            rpc_password: "pass".to_string(),
+            rebroadcast_secs: 2,
+            primary_recheck_secs: 3,
+            extra_wallets: Vec::new(),
+            restore_mnemonic: None,
+            birthday: None,
+        }
+    }
+
+    /// Zebra-direct mode: zecd talks straight to zebrad's JSON-RPC (`zebra://`), with no
+    /// lightwalletd anywhere in its server list - so a bug in the zebra backend can't be
+    /// silently rescued by failover.
+    pub fn new_zebra_direct(zebra_rpc_port: u16, rpc_port: u16) -> ZecdConfig {
+        ZecdConfig {
+            lightwalletd_port: None,
+            zebra_rpc_port: Some(zebra_rpc_port),
             fallback_lightwalletd_port: None,
             rpc_port,
             rpc_user: "user".to_string(),
@@ -1208,10 +1231,18 @@ fn run_zecd_init(bin: &Path, datadir: &Path, wallet: &str, cfg: &ZecdConfig) -> 
 }
 
 fn write_zecd_toml(datadir: &Path, cfg: &ZecdConfig) -> Result<()> {
-    let mut servers = format!(r#""127.0.0.1:{}""#, cfg.lightwalletd_port);
-    if let Some(fb) = cfg.fallback_lightwalletd_port {
-        servers.push_str(&format!(r#", "127.0.0.1:{fb}""#));
+    let mut tokens = Vec::new();
+    if let Some(z) = cfg.zebra_rpc_port {
+        tokens.push(format!(r#""zebra://127.0.0.1:{z}""#));
     }
+    if let Some(lwd) = cfg.lightwalletd_port {
+        tokens.push(format!(r#""127.0.0.1:{lwd}""#));
+    }
+    if let Some(fb) = cfg.fallback_lightwalletd_port {
+        tokens.push(format!(r#""127.0.0.1:{fb}""#));
+    }
+    anyhow::ensure!(!tokens.is_empty(), "ZecdConfig has no upstream endpoint");
+    let servers = tokens.join(", ");
     // The default wallet plus any extra `[wallets.<name>]` entries (multiwallet tests).
     let mut wallets = format!(
         "[wallets.default]\ndir = \"{}/default\"\n",

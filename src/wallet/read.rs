@@ -482,6 +482,63 @@ pub fn list_unspent(network: ZNetwork, wallet_dir: &Path) -> anyhow::Result<Vec<
             });
         }
     }
+
+    // Mempool-received notes are invisible to `select_unspent_notes`: a note stored by
+    // trial-decrypting an *unmined* transaction carries no nullifier (upstream's
+    // `DecryptedOutput<orchard::Note>::nullifier()` is `None`; nf/position are filled in
+    // when the tx is later scanned in a block) and the selector requires `nf IS NOT NULL`.
+    // bitcoind's `listunspent minconf=0` lists unconfirmed wallet outputs, so supplement
+    // with a direct query for unmined, unexpired, unspent Orchard notes. A spend only
+    // suppresses a note while its spending tx is mined or unexpired - mirroring
+    // `spent_notes_clause` - so an expired spend releases the note again.
+    {
+        let conn = open_conn(wallet_dir)?;
+        let seen: std::collections::HashSet<(String, u32)> =
+            out.iter().map(|u| (u.txid.clone(), u.vout)).collect();
+        let mut stmt = conn.prepare(
+            "SELECT t.txid, rn.action_index, rn.value
+             FROM orchard_received_notes rn
+             JOIN transactions t ON t.id_tx = rn.transaction_id
+             WHERE t.mined_height IS NULL
+               AND (t.expiry_height IS NULL OR t.expiry_height = 0
+                    OR t.expiry_height >= :target)
+               AND rn.id NOT IN (
+                   SELECT rns.orchard_received_note_id
+                   FROM orchard_received_note_spends rns
+                   JOIN transactions stx ON stx.id_tx = rns.transaction_id
+                   WHERE stx.mined_height IS NOT NULL
+                      OR stx.expiry_height IS NULL OR stx.expiry_height = 0
+                      OR stx.expiry_height >= :target
+               )",
+        )?;
+        let rows = stmt.query_map(
+            named_params! { ":target": u32::from(chain_height) + 1 },
+            |r| {
+                Ok((
+                    r.get::<_, Vec<u8>>(0)?,
+                    r.get::<_, u32>(1)?,
+                    r.get::<_, i64>(2)?,
+                ))
+            },
+        )?;
+        for row in rows {
+            let (txid, vout, value) = row?;
+            let txid = txid_display(&txid);
+            if seen.contains(&(txid.clone(), vout)) {
+                continue;
+            }
+            let (mined_height, trusted) = tx_meta.get(&txid).copied().unwrap_or((None, false));
+            let address = out_addr.get(&(txid.clone(), vout)).cloned();
+            out.push(UnspentNote {
+                vout,
+                txid,
+                value: u64::try_from(value).unwrap_or(0),
+                mined_height,
+                trusted,
+                address,
+            });
+        }
+    }
     Ok(out)
 }
 

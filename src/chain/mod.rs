@@ -1,0 +1,295 @@
+//! The chain-data abstraction: everything the wallet needs from "upstream" (chain tip,
+//! compact blocks, tree state, subtree roots, tx broadcast/fetch, mempool visibility),
+//! expressed as the [`ChainSource`] trait with two backends:
+//!
+//! - [`lwd::LwdSource`] - the lightwalletd gRPC client (`CompactTxStreamer`), for remote /
+//!   public endpoints (`zec.rocks`, a self-hosted lightwalletd, Tor, …).
+//! - [`zebra::ZebraSource`] - a native zebrad JSON-RPC client that derives the same data
+//!   directly from a local full node (`getblock`, `z_gettreestate`, `z_getsubtreesbyindex`,
+//!   `sendrawtransaction`, `getrawmempool`, …), removing the lightwalletd hop.
+//!
+//! The operations are exactly the lightwalletd calls the actor/sync engine were built
+//! on; the zebra backend reproduces each one's semantics (see `zebra.rs` for the mapping),
+//! so everything above this trait - the sync engine, reorg recovery, the rebroadcast loop,
+//! the mempool-driven 0-conf flow - is backend-agnostic and unchanged.
+//!
+//! [`AnySource`] is the enum the actor stores (both backends behind one concrete type); a
+//! future backend (e.g. an embedded Zaino service) is one more variant + impl.
+
+pub mod lwd;
+pub mod zebra;
+
+use std::future::Future;
+
+use zcash_client_backend::proto::compact_formats::CompactBlock;
+use zcash_client_backend::proto::service;
+use zcash_protocol::consensus::BlockHeight;
+use zcash_protocol::{ShieldedProtocol, TxId};
+
+/// The chain tip as reported by the upstream. `hash` is in internal byte order (reverse of
+/// the familiar display hex); it may be empty if the upstream didn't report one.
+#[derive(Clone, Debug)]
+pub struct ChainTip {
+    pub height: u64,
+    pub hash: Vec<u8>,
+}
+
+/// Upstream identity, used by the wrong-chain guard. `chain_name` follows zcashd's
+/// `getblockchaininfo.chain` / lightwalletd's `chain_name`: `"main"`, `"test"`, `"regtest"`.
+#[derive(Clone, Debug)]
+pub struct ServerInfo {
+    pub chain_name: String,
+}
+
+/// The upstream's verdict on a broadcast transaction. `error_code == 0` means accepted;
+/// anything else is an explicit rejection (the node examined the tx and refused it), which
+/// callers surface as `-26` - as distinct from a transport failure, which is the method's
+/// `Err` and means "unknown whether anyone saw it".
+#[derive(Clone, Debug)]
+pub struct BroadcastOutcome {
+    pub error_code: i32,
+    pub error_message: String,
+}
+
+impl BroadcastOutcome {
+    pub fn accepted() -> Self {
+        BroadcastOutcome { error_code: 0, error_message: String::new() }
+    }
+    pub fn is_accepted(&self) -> bool {
+        self.error_code == 0
+    }
+}
+
+/// A transaction fetched from the upstream: raw bytes plus the mined height when the
+/// upstream knows it (`None` for mempool transactions).
+#[derive(Clone, Debug)]
+pub struct FetchedTx {
+    pub data: Vec<u8>,
+    pub mined_height: Option<u32>,
+}
+
+/// One note-commitment-subtree root: the raw node hash (protocol byte order, NOT reversed)
+/// and the height of the block that completed the subtree.
+#[derive(Clone, Debug)]
+pub struct SubtreeRootInfo {
+    pub root_hash: Vec<u8>,
+    pub completing_height: u32,
+}
+
+/// One unspent transparent output of a watched address (the tparty deposit-discovery path).
+/// `txid` is in internal (protocol) byte order.
+#[derive(Clone, Debug)]
+pub struct AddressUtxo {
+    pub txid: Vec<u8>,
+    pub index: u32,
+    pub script: Vec<u8>,
+    pub value_zat: i64,
+    pub height: u32,
+}
+
+/// A connected chain-data backend. All methods take `&mut self` (the lightwalletd client
+/// requires it) and return `Send` futures so the wallet actor task stays spawnable.
+///
+/// Error contract: an `Err` from any method is a transport-class failure - the caller should
+/// drop the connection and reconnect/fail over. Application-level outcomes that must not
+/// kill the connection are encoded in the `Ok` value instead: an upstream tx rejection is
+/// `Ok(BroadcastOutcome { error_code != 0, .. })`, an unknown txid is `Ok(None)`.
+pub trait ChainSource: Send {
+    /// The current chain tip (lightwalletd `GetLatestBlock`; zebra `getblockchaininfo`).
+    fn latest_block(&mut self) -> impl Future<Output = anyhow::Result<ChainTip>> + Send;
+
+    /// The commitment-tree state at `height` (lightwalletd `GetTreeState`; zebra
+    /// `z_gettreestate`), in lightwalletd's protobuf form so both
+    /// `TreeState::to_chain_state` and `AccountBirthday::from_treestate` work unchanged.
+    fn tree_state(
+        &mut self,
+        height: BlockHeight,
+    ) -> impl Future<Output = anyhow::Result<service::TreeState>> + Send;
+
+    /// Stream the compact blocks for `start..=end` in order (lightwalletd `GetBlockRange`;
+    /// zebra `getblock` + local full-block→CompactBlock conversion).
+    fn compact_block_range(
+        &mut self,
+        start: BlockHeight,
+        end: BlockHeight,
+    ) -> impl Future<Output = anyhow::Result<CompactBlockStream>> + Send;
+
+    /// All note-commitment-subtree roots for `protocol`, from index 0 (lightwalletd
+    /// `GetSubtreeRoots`; zebra `z_getsubtreesbyindex`).
+    fn subtree_roots(
+        &mut self,
+        protocol: ShieldedProtocol,
+    ) -> impl Future<Output = anyhow::Result<Vec<SubtreeRootInfo>>> + Send;
+
+    /// Upstream identity/liveness (lightwalletd `GetLightdInfo`; zebra `getblockchaininfo`).
+    fn server_info(&mut self) -> impl Future<Output = anyhow::Result<ServerInfo>> + Send;
+
+    /// Broadcast raw transaction bytes (lightwalletd `SendTransaction`; zebra
+    /// `sendrawtransaction`). See the trait-level error contract.
+    fn broadcast_tx(
+        &mut self,
+        data: Vec<u8>,
+    ) -> impl Future<Output = anyhow::Result<BroadcastOutcome>> + Send;
+
+    /// Fetch a transaction by txid (lightwalletd `GetTransaction`; zebra
+    /// `getrawtransaction`). `Ok(None)` when the upstream does not know the txid.
+    fn fetch_tx(
+        &mut self,
+        txid: TxId,
+    ) -> impl Future<Output = anyhow::Result<Option<FetchedTx>>> + Send;
+
+    /// Subscribe to the mempool (lightwalletd `GetMempoolStream`; zebra a `getrawmempool`
+    /// poller). The stream yields the current mempool and newly-arriving transactions, and
+    /// **closes (yields `None`) when a new block arrives** - the actor relies on that as its
+    /// sync-now signal, so both backends must preserve it.
+    fn subscribe_mempool(
+        &mut self,
+    ) -> impl Future<Output = anyhow::Result<MempoolStream>> + Send;
+
+    /// The current UTXO set of the given transparent addresses (lightwalletd
+    /// `GetAddressUtxos`; zebra `getaddressutxos`). tparty's deposit discovery.
+    fn address_utxos(
+        &mut self,
+        addresses: Vec<String>,
+    ) -> impl Future<Output = anyhow::Result<Vec<AddressUtxo>>> + Send;
+
+    /// The mined transactions involving `address` within `start..=end`, as raw bytes plus
+    /// mined heights (lightwalletd `GetTaddressTxids`; zebra `getaddresstxids` +
+    /// `getrawtransaction`). tparty's transparent spend detection/enhancement.
+    fn taddress_txs(
+        &mut self,
+        address: String,
+        start: BlockHeight,
+        end: BlockHeight,
+    ) -> impl Future<Output = anyhow::Result<Vec<FetchedTx>>> + Send;
+}
+
+/// A connected backend of either kind: what the actor and `init` actually hold. Delegates
+/// every [`ChainSource`] method to the inner backend.
+// One instance exists per wallet actor, so the variant size gap is irrelevant.
+#[allow(clippy::large_enum_variant)]
+pub enum AnySource {
+    Lwd(lwd::LwdSource),
+    Zebra(zebra::ZebraSource),
+}
+
+impl ChainSource for AnySource {
+    async fn latest_block(&mut self) -> anyhow::Result<ChainTip> {
+        match self {
+            AnySource::Lwd(s) => s.latest_block().await,
+            AnySource::Zebra(s) => s.latest_block().await,
+        }
+    }
+
+    async fn tree_state(&mut self, height: BlockHeight) -> anyhow::Result<service::TreeState> {
+        match self {
+            AnySource::Lwd(s) => s.tree_state(height).await,
+            AnySource::Zebra(s) => s.tree_state(height).await,
+        }
+    }
+
+    async fn compact_block_range(
+        &mut self,
+        start: BlockHeight,
+        end: BlockHeight,
+    ) -> anyhow::Result<CompactBlockStream> {
+        match self {
+            AnySource::Lwd(s) => s.compact_block_range(start, end).await,
+            AnySource::Zebra(s) => s.compact_block_range(start, end).await,
+        }
+    }
+
+    async fn subtree_roots(
+        &mut self,
+        protocol: ShieldedProtocol,
+    ) -> anyhow::Result<Vec<SubtreeRootInfo>> {
+        match self {
+            AnySource::Lwd(s) => s.subtree_roots(protocol).await,
+            AnySource::Zebra(s) => s.subtree_roots(protocol).await,
+        }
+    }
+
+    async fn server_info(&mut self) -> anyhow::Result<ServerInfo> {
+        match self {
+            AnySource::Lwd(s) => s.server_info().await,
+            AnySource::Zebra(s) => s.server_info().await,
+        }
+    }
+
+    async fn broadcast_tx(&mut self, data: Vec<u8>) -> anyhow::Result<BroadcastOutcome> {
+        match self {
+            AnySource::Lwd(s) => s.broadcast_tx(data).await,
+            AnySource::Zebra(s) => s.broadcast_tx(data).await,
+        }
+    }
+
+    async fn fetch_tx(&mut self, txid: TxId) -> anyhow::Result<Option<FetchedTx>> {
+        match self {
+            AnySource::Lwd(s) => s.fetch_tx(txid).await,
+            AnySource::Zebra(s) => s.fetch_tx(txid).await,
+        }
+    }
+
+    async fn subscribe_mempool(&mut self) -> anyhow::Result<MempoolStream> {
+        match self {
+            AnySource::Lwd(s) => s.subscribe_mempool().await,
+            AnySource::Zebra(s) => s.subscribe_mempool().await,
+        }
+    }
+
+    async fn address_utxos(&mut self, addresses: Vec<String>) -> anyhow::Result<Vec<AddressUtxo>> {
+        match self {
+            AnySource::Lwd(s) => s.address_utxos(addresses).await,
+            AnySource::Zebra(s) => s.address_utxos(addresses).await,
+        }
+    }
+
+    async fn taddress_txs(
+        &mut self,
+        address: String,
+        start: BlockHeight,
+        end: BlockHeight,
+    ) -> anyhow::Result<Vec<FetchedTx>> {
+        match self {
+            AnySource::Lwd(s) => s.taddress_txs(address, start, end).await,
+            AnySource::Zebra(s) => s.taddress_txs(address, start, end).await,
+        }
+    }
+}
+
+/// An in-order stream of compact blocks for one requested range.
+// At most one stream exists per sync batch, so the variant size gap is irrelevant.
+#[allow(clippy::large_enum_variant)]
+pub enum CompactBlockStream {
+    Lwd(tonic::Streaming<CompactBlock>),
+    Zebra(zebra::ZebraBlockStream),
+}
+
+impl CompactBlockStream {
+    /// The next block, `Ok(None)` at end of range, or a transport-class error.
+    pub async fn next(&mut self) -> anyhow::Result<Option<CompactBlock>> {
+        match self {
+            CompactBlockStream::Lwd(s) => Ok(s.message().await?),
+            CompactBlockStream::Zebra(s) => s.next().await,
+        }
+    }
+}
+
+/// A live mempool subscription. Yields raw transactions; `Ok(None)` means the upstream
+/// closed the stream because a new block arrived (the actor's sync-now signal); `Err` is a
+/// transport-class failure (the actor just drops the subscription).
+// At most one subscription exists per wallet actor, so the variant size gap is irrelevant.
+#[allow(clippy::large_enum_variant)]
+pub enum MempoolStream {
+    Lwd(tonic::Streaming<service::RawTransaction>),
+    Zebra(zebra::ZebraMempoolStream),
+}
+
+impl MempoolStream {
+    pub async fn message(&mut self) -> anyhow::Result<Option<service::RawTransaction>> {
+        match self {
+            MempoolStream::Lwd(s) => Ok(s.message().await?),
+            MempoolStream::Zebra(s) => s.message().await,
+        }
+    }
+}

@@ -21,6 +21,7 @@ import base64
 import decimal
 import json
 import sys
+import time
 import urllib.request
 import urllib.error
 
@@ -346,7 +347,18 @@ def main() -> int:
     ck("has transactions list", isinstance(lsb.get("transactions"), list))
     ck("has removed list", isinstance(lsb.get("removed"), list))
     ck("lastblock 64-hex", isinstance(lsb.get("lastblock"), str) and len(lsb["lastblock"]) == 64)
-    ck("lastblock == getbestblockhash", lsb["lastblock"] == best)
+    # The daemon may still be scanning a just-mined block when this suite starts (the
+    # harness proceeds as soon as a tx hits 1 confirmation), so the `best` captured at the
+    # top of the run can be stale here. Compare lastblock against the *current* best hash,
+    # re-reading both until they settle (bounded), instead of pinning the earlier snapshot.
+    lsb_matches_best = False
+    for _ in range(40):
+        if lsb["lastblock"] == rpc.call("getbestblockhash"):
+            lsb_matches_best = True
+            break
+        time.sleep(0.5)
+        lsb = rpc.call("listsinceblock")
+    ck("lastblock == getbestblockhash", lsb_matches_best, lsb["lastblock"])
     again = rpc.call("listsinceblock", lsb["lastblock"])
     ck("since lastblock reports only unconfirmed",
        all(t["confirmations"] < 1 for t in again["transactions"]))

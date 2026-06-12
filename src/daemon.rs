@@ -90,13 +90,14 @@ pub async fn run(config: AppConfig, opts: DaemonOptions) -> anyhow::Result<()> {
             );
             continue;
         }
-        let servers = lightwalletd::resolve_all(
+        let mut servers = lightwalletd::resolve_all(
             &config.lightwalletd.servers,
             config.network,
             config.lightwalletd.tls_roots,
             config.lightwalletd.force_tls,
             config.lightwalletd.proxy,
         )?;
+        lightwalletd::apply_zebra_auth(&mut servers, &config.zebra.auth());
         let actor_cfg = ActorConfig {
             name: name.clone(),
             network: config.network,

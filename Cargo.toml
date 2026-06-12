@@ -18,11 +18,13 @@ name = "tparty"
 path = "src/bin/tparty.rs"
 
 [dependencies]
-# Async runtime + HTTP server
+# Async runtime + HTTP server (hyper's client side drives the zebra JSON-RPC backend)
 tokio = { version = "1.21", features = ["rt-multi-thread", "macros", "fs", "signal", "sync", "time", "io-util"] }
 axum = { version = "0.7", features = ["json"] }
 tower = { version = "0.5", features = ["util"] }
-hyper = "1"
+hyper = { version = "1", features = ["client", "http1"] }
+http-body-util = "0.1"
+bytes = "1"
 futures-util = "0.3"
 
 # Serialization. `arbitrary_precision` is REQUIRED: bitcoind emits amounts as JSON numbers
@@ -59,9 +61,10 @@ secrecy = "0.8"
 tonic = { version = "0.14", features = ["gzip", "tls-ring", "tls-native-roots", "tls-webpki-roots"] }
 prost = "0.14"
 # SOCKS5 proxy support for routing lightwalletd connections through Tor/Nym/any SOCKS5 proxy.
-# `hyper-util`'s `TokioIo` adapts the proxied TCP stream to tonic's connector interface.
+# `hyper-util`'s `TokioIo` adapts the proxied TCP stream to tonic's connector interface; its
+# legacy client is the HTTP/1.1 client behind the zebra JSON-RPC backend.
 tokio-socks = "0.5"
-hyper-util = { version = "0.1", features = ["tokio"] }
+hyper-util = { version = "0.1", features = ["tokio", "client-legacy", "http1"] }
 rusqlite = { version = "0.37", features = ["time"] }
 time = "0.3"
 uuid = { version = "1", features = ["v4", "serde"] }

@@ -1,11 +1,19 @@
-//! lightwalletd connection management. Ported from `zcash-devtool/src/remote.rs`. TLS is used
-//! for remote hosts and skipped for localhost (and `.onion`), but can be forced on/off explicitly
+//! Upstream-endpoint management: parsing/resolving the `[lightwalletd] servers` list and
+//! dialing its entries. Ported from `zcash-devtool/src/remote.rs`. TLS is used for remote
+//! hosts and skipped for localhost (and `.onion`), but can be forced on/off explicitly
 //! (e.g. a co-located plaintext lightwalletd reached by service name in docker-compose).
+//!
+//! Two endpoint kinds share the one ordered failover list (see [`ServerKind`]):
+//! lightwalletd gRPC endpoints (`host:port`, presets, `http(s)://` prefixes) and local
+//! zebrad JSON-RPC endpoints (`zebra://host:port`) - so `servers = ["zebra://127.0.0.1:8232",
+//! "zec.rocks:443"]` gives a local full node with a public lightwalletd fallback. Connecting
+//! yields an [`AnySource`] either way; everything above this module is backend-agnostic.
 //!
 //! Connections can optionally be routed through a SOCKS5 proxy (`[lightwalletd] connection`),
 //! which covers Tor, Nym, and any other SOCKS5 proxy - see [`parse_connection_mode`]. The proxy,
 //! like the TLS settings, is attached to every resolved [`Server`] so no connection can silently
-//! bypass it.
+//! bypass it. `zebra://` endpoints are for local nodes and refuse to combine with a proxy
+//! (see [`resolve_all`]).
 
 use std::borrow::Cow;
 use std::net::SocketAddr;
@@ -15,6 +23,9 @@ use anyhow::anyhow;
 use tonic::transport::{Channel, ClientTlsConfig};
 use zcash_client_backend::proto::service::compact_tx_streamer_client::CompactTxStreamerClient;
 
+use crate::chain::lwd::LwdSource;
+use crate::chain::zebra::{ZebraAuth, ZebraSource};
+use crate::chain::AnySource;
 use crate::network::ZNetwork;
 use crate::socks::SocksConnector;
 
@@ -84,27 +95,54 @@ fn parse_socks_addr(addr: &str) -> anyhow::Result<SocketAddr> {
         .map_err(|_| anyhow!("invalid SOCKS5 proxy address '{addr}', expected <ip>:<port>"))
 }
 
-/// A resolved lightwalletd endpoint.
+/// What protocol a resolved endpoint speaks.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ServerKind {
+    /// A lightwalletd `CompactTxStreamer` gRPC endpoint.
+    Lightwalletd,
+    /// A local zebrad JSON-RPC endpoint (`zebra://host:port`), plaintext HTTP.
+    ZebraRpc,
+}
+
+/// A resolved upstream endpoint (lightwalletd or local zebrad).
 #[derive(Clone, Debug)]
 pub struct Server {
     host: Cow<'static, str>,
     port: u16,
+    kind: ServerKind,
+    /// Needed by the zebra backend to parse raw blocks (consensus branch IDs).
+    network: ZNetwork,
     roots: TlsRoots,
     /// `Some(true/false)` forces TLS on/off; `None` uses the localhost heuristic.
+    /// lightwalletd only; `zebra://` endpoints are always plaintext HTTP.
     force_tls: Option<bool>,
     /// When set, every connection to this endpoint is dialed through this SOCKS5 proxy.
     proxy: Option<SocketAddr>,
+    /// zebrad RPC credentials (`[zebra]` config); ignored by lightwalletd endpoints.
+    zebra_auth: ZebraAuth,
 }
 
 impl Server {
+    #[allow(clippy::too_many_arguments)]
     fn new(
         host: Cow<'static, str>,
         port: u16,
+        kind: ServerKind,
+        network: ZNetwork,
         roots: TlsRoots,
         force_tls: Option<bool>,
         proxy: Option<SocketAddr>,
     ) -> Self {
-        Server { host, port, roots, force_tls, proxy }
+        Server {
+            host,
+            port,
+            kind,
+            network,
+            roots,
+            force_tls,
+            proxy,
+            zebra_auth: ZebraAuth::default(),
+        }
     }
 
     fn use_tls(&self) -> bool {
@@ -126,17 +164,42 @@ impl Server {
     }
 
     pub fn describe(&self) -> String {
-        match self.proxy {
-            Some(proxy) => {
-                format!("{}:{} (tls={}, socks={proxy})", self.host, self.port, self.use_tls())
+        let base = match self.kind {
+            ServerKind::Lightwalletd => {
+                format!("{}:{} (tls={})", self.host, self.port, self.use_tls())
             }
-            None => format!("{}:{} (tls={})", self.host, self.port, self.use_tls()),
+            ServerKind::ZebraRpc => format!("zebra-rpc {}:{}", self.host, self.port),
+        };
+        match self.proxy {
+            Some(proxy) => format!("{} (socks={proxy})", base.trim_end()),
+            None => base,
+        }
+    }
+
+    /// Connect to this endpoint, bounding the whole dial with `timeout` so a hung/black-holed
+    /// endpoint can't stall the caller. For lightwalletd that is the TCP/TLS connect; for a
+    /// zebra endpoint it is the client construction (cookie read) plus one
+    /// `getblockchaininfo` round-trip, the closest analog of a dial.
+    pub async fn connect_timeout(&self, timeout: Duration) -> anyhow::Result<AnySource> {
+        match self.kind {
+            ServerKind::Lightwalletd => {
+                let client = self.connect_lwd_timeout(timeout).await?;
+                Ok(AnySource::Lwd(LwdSource::new(client)))
+            }
+            ServerKind::ZebraRpc => {
+                let connect =
+                    ZebraSource::connect(&self.host, self.port, &self.zebra_auth, self.network);
+                let source = tokio::time::timeout(timeout, connect).await.map_err(|_| {
+                    anyhow!("connect to {} timed out after {timeout:?}", self.describe())
+                })??;
+                Ok(AnySource::Zebra(source))
+            }
         }
     }
 
     /// Open a gRPC connection to this lightwalletd server, bounding the whole dial (including
-    /// the TLS handshake) with `timeout` so a hung/black-holed endpoint can't stall the caller.
-    pub async fn connect_timeout(
+    /// the TLS handshake) with `timeout`.
+    async fn connect_lwd_timeout(
         &self,
         timeout: Duration,
     ) -> anyhow::Result<CompactTxStreamerClient<Channel>> {
@@ -180,11 +243,22 @@ impl Server {
         Ok(CompactTxStreamerClient::new(connected))
     }
 
-    /// Open a gRPC connection with a default dial timeout. Convenience for the network
-    /// integration tests; production callers use [`connect_timeout`](Server::connect_timeout).
+    /// Connect with a default dial timeout. Convenience for the network integration tests;
+    /// production callers use [`connect_timeout`](Server::connect_timeout).
     #[cfg(test)]
-    pub async fn connect(&self) -> anyhow::Result<CompactTxStreamerClient<Channel>> {
+    pub async fn connect(&self) -> anyhow::Result<AnySource> {
         self.connect_timeout(Duration::from_secs(30)).await
+    }
+}
+
+/// Attach zebrad RPC credentials (the `[zebra]` config section) to every `zebra://` endpoint
+/// in the resolved list. Applied after [`resolve_all`] so the resolve signatures (and their
+/// many test call sites) stay credential-free.
+pub fn apply_zebra_auth(servers: &mut [Server], auth: &ZebraAuth) {
+    for server in servers {
+        if server.kind == ServerKind::ZebraRpc {
+            server.zebra_auth = auth.clone();
+        }
     }
 }
 
@@ -195,11 +269,13 @@ const YWALLET_MAINNET: &[(&str, u16)] =
 const ZEC_ROCKS_MAINNET: &[(&str, u16)] = &[("zec.rocks", 443)];
 const ZEC_ROCKS_TESTNET: &[(&str, u16)] = &[("testnet.zec.rocks", 443)];
 
-/// Resolve a single server token (`ecc` | `ywallet` | `zecrocks` | `host:port[,host:port]`) for
-/// the given network into an ordered, non-empty list of [`Server`]s. Multi-endpoint presets and
-/// comma-separated host lists expand to all of their endpoints (the first is the primary). A
-/// `host:port` may carry an `http://`/`https://` scheme to force that endpoint's TLS mode,
-/// overriding the global `tls` setting (e.g. a plaintext local node + TLS public fallbacks).
+/// Resolve a single server token (`ecc` | `ywallet` | `zecrocks` | `host:port[,host:port]` |
+/// `zebra://host:port`) for the given network into an ordered, non-empty list of [`Server`]s.
+/// Multi-endpoint presets and comma-separated host lists expand to all of their endpoints
+/// (the first is the primary). A `host:port` may carry an `http://`/`https://` scheme to
+/// force that endpoint's TLS mode, overriding the global `tls` setting (e.g. a plaintext
+/// local node + TLS public fallbacks), or a `zebra://` scheme to mark it as a local zebrad
+/// JSON-RPC endpoint instead of a lightwalletd.
 pub fn resolve(
     server: &str,
     network: ZNetwork,
@@ -217,14 +293,24 @@ pub fn resolve(
         ("zecrocks", ZNetwork::Main) => Some(ZEC_ROCKS_MAINNET),
         ("zecrocks", ZNetwork::Test) => Some(ZEC_ROCKS_TESTNET),
         ("zecrocks", _) => None,
-        _ => return parse_host_list(server, roots, force_tls, proxy),
+        _ => return parse_host_list(server, network, roots, force_tls, proxy),
     };
 
     match preset {
         // Preset consts are non-empty by construction, so the result is non-empty.
         Some(entries) => Ok(entries
             .iter()
-            .map(|&(host, port)| Server::new(Cow::Borrowed(host), port, roots, force_tls, proxy))
+            .map(|&(host, port)| {
+                Server::new(
+                    Cow::Borrowed(host),
+                    port,
+                    ServerKind::Lightwalletd,
+                    network,
+                    roots,
+                    force_tls,
+                    proxy,
+                )
+            })
             .collect()),
         None => Err(anyhow!(
             "lightwalletd preset '{server}' does not serve {}",
@@ -263,11 +349,26 @@ pub fn resolve_all(
             ));
         }
     }
+    // The proxy invariant says no connection may silently bypass the configured SOCKS proxy,
+    // and the zebra backend (plain HTTP to a local node) does not implement proxying - so the
+    // combination is refused at startup rather than silently leaking direct connections.
+    if proxy.is_some() {
+        if let Some(s) = out.iter().find(|s| s.kind == ServerKind::ZebraRpc) {
+            return Err(anyhow!(
+                "zebra endpoint {}:{} cannot be combined with a SOCKS5 proxy; zebra:// \
+                 endpoints are for local nodes - set [lightwalletd] connection = \"direct\" \
+                 or remove the zebra endpoint",
+                s.host,
+                s.port
+            ));
+        }
+    }
     Ok(out)
 }
 
 fn parse_host_list(
     s: &str,
+    network: ZNetwork,
     roots: TlsRoots,
     force_tls: Option<bool>,
     proxy: Option<SocketAddr>,
@@ -278,22 +379,34 @@ fn parse_host_list(
         if entry.is_empty() {
             continue;
         }
-        // An optional `http://`/`https://` scheme sets TLS per endpoint, overriding the global
-        // `tls` setting - so a plaintext local node and TLS public fallbacks can share one list.
-        let (force, rest) = if let Some(r) = entry.strip_prefix("https://") {
-            (Some(true), r)
+        // An optional scheme sets the endpoint kind and TLS mode: `zebra://` marks a local
+        // zebrad JSON-RPC endpoint (always plaintext HTTP); `http://`/`https://` set TLS per
+        // lightwalletd endpoint, overriding the global `tls` setting - so a plaintext local
+        // node and TLS public fallbacks can share one list.
+        let (kind, force, rest) = if let Some(r) = entry.strip_prefix("zebra://") {
+            (ServerKind::ZebraRpc, Some(false), r)
+        } else if let Some(r) = entry.strip_prefix("https://") {
+            (ServerKind::Lightwalletd, Some(true), r)
         } else if let Some(r) = entry.strip_prefix("http://") {
-            (Some(false), r)
+            (ServerKind::Lightwalletd, Some(false), r)
         } else {
-            (force_tls, entry)
+            (ServerKind::Lightwalletd, force_tls, entry)
         };
         let (host, port_str) = rest
             .rsplit_once(':')
-            .ok_or_else(|| anyhow!("invalid lightwalletd address '{entry}', expected host:port"))?;
+            .ok_or_else(|| anyhow!("invalid server address '{entry}', expected host:port"))?;
         let port: u16 = port_str
             .parse()
             .map_err(|_| anyhow!("invalid port in '{entry}'"))?;
-        servers.push(Server::new(Cow::Owned(host.to_string()), port, roots, force, proxy));
+        servers.push(Server::new(
+            Cow::Owned(host.to_string()),
+            port,
+            kind,
+            network,
+            roots,
+            force,
+            proxy,
+        ));
     }
     if servers.is_empty() {
         return Err(anyhow!("no lightwalletd hosts in '{s}'"));
@@ -522,24 +635,110 @@ mod tests {
         .is_err());
     }
 
+    #[test]
+    fn zebra_scheme_parses_to_a_zebra_endpoint() {
+        // `zebra://` marks a local zebrad JSON-RPC endpoint: plaintext, kind ZebraRpc.
+        let s = resolve("zebra://127.0.0.1:18232", crate::network::regtest(), TlsRoots::Native, None, None)
+            .unwrap();
+        assert_eq!(s.len(), 1);
+        assert_eq!(s[0].kind, ServerKind::ZebraRpc);
+        assert_eq!(s[0].host.as_ref(), "127.0.0.1");
+        assert_eq!(s[0].port, 18232);
+        assert!(!s[0].use_tls());
+        assert!(s[0].describe().starts_with("zebra-rpc 127.0.0.1:18232"), "{}", s[0].describe());
+
+        // Mixed list: a local zebra primary with a public lightwalletd fallback.
+        let s = resolve(
+            "zebra://127.0.0.1:8232,https://zec.rocks:443",
+            ZNetwork::Main,
+            TlsRoots::Native,
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(s.len(), 2);
+        assert_eq!(s[0].kind, ServerKind::ZebraRpc);
+        assert_eq!(s[1].kind, ServerKind::Lightwalletd);
+        assert!(s[1].use_tls());
+
+        // The usual host:port validation still applies behind the scheme.
+        assert!(resolve("zebra://nohost", ZNetwork::Main, TlsRoots::Native, None, None).is_err());
+    }
+
+    /// A `zebra://` endpoint with a SOCKS proxy configured must be refused at resolve time:
+    /// the zebra backend dials direct plaintext HTTP, which would silently bypass the proxy
+    /// the operator configured (the same invariant as the `.onion` refusal).
+    #[test]
+    fn zebra_with_proxy_is_refused() {
+        let proxy: SocketAddr = "127.0.0.1:9050".parse().unwrap();
+        let err = resolve_all(
+            &["zebra://127.0.0.1:8232".to_string()],
+            ZNetwork::Main,
+            TlsRoots::Native,
+            None,
+            Some(proxy),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("zebra"), "got: {err}");
+        assert!(err.contains("SOCKS5"), "got: {err}");
+
+        // A zebra endpoint hiding behind a clearnet lightwalletd primary is caught too.
+        assert!(resolve_all(
+            &["zec.rocks:443".to_string(), "zebra://127.0.0.1:8232".to_string()],
+            ZNetwork::Main,
+            TlsRoots::Native,
+            None,
+            Some(proxy),
+        )
+        .is_err());
+
+        // Without a proxy the same list is fine.
+        assert!(resolve_all(
+            &["zebra://127.0.0.1:8232".to_string(), "zec.rocks:443".to_string()],
+            ZNetwork::Main,
+            TlsRoots::Native,
+            None,
+            None,
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn zebra_auth_applies_only_to_zebra_endpoints() {
+        let mut servers = resolve(
+            "zebra://127.0.0.1:8232,zec.rocks:443",
+            ZNetwork::Main,
+            TlsRoots::Native,
+            None,
+            None,
+        )
+        .unwrap();
+        let auth = crate::chain::zebra::ZebraAuth {
+            user: Some("u".into()),
+            password: Some("p".into()),
+            cookie: None,
+        };
+        apply_zebra_auth(&mut servers, &auth);
+        assert_eq!(servers[0].zebra_auth, auth);
+        assert_eq!(servers[1].zebra_auth, crate::chain::zebra::ZebraAuth::default());
+    }
+
     // --- Network integration tests (hit the public zecrocks/ECC testnet lightwalletd) ---
     // Run with: cargo test -- --include-ignored
+
+    use crate::chain::ChainSource as _;
 
     #[tokio::test]
     #[ignore = "hits testnet.zec.rocks over the network"]
     async fn testnet_zecrocks_get_latest_block() {
-        use zcash_client_backend::proto::service;
         let server = resolve("zecrocks", ZNetwork::Test, TlsRoots::Native, None, None)
             .unwrap()
             .into_iter()
             .next()
             .unwrap();
         let mut client = server.connect().await.expect("connect to testnet.zec.rocks");
-        let tip = client
-            .get_latest_block(service::ChainSpec::default())
-            .await
-            .expect("get_latest_block")
-            .into_inner();
+        let tip = client.latest_block().await.expect("latest_block");
         assert!(tip.height > 2_000_000, "unexpected testnet height {}", tip.height);
         assert_eq!(tip.hash.len(), 32, "block hash must be 32 bytes");
     }
@@ -547,7 +746,6 @@ mod tests {
     #[tokio::test]
     #[ignore = "hits testnet.zec.rocks over the network"]
     async fn testnet_zecrocks_lightd_info_and_treestate() {
-        use zcash_client_backend::proto::service;
         let server = resolve("zecrocks", ZNetwork::Test, TlsRoots::Native, None, None)
             .unwrap()
             .into_iter()
@@ -555,21 +753,15 @@ mod tests {
             .unwrap();
         let mut client = server.connect().await.expect("connect");
 
-        let info = client
-            .get_lightd_info(service::Empty {})
-            .await
-            .expect("get_lightd_info")
-            .into_inner();
-        assert!(!info.vendor.is_empty());
-        assert!(info.block_height > 2_000_000);
+        let info = client.server_info().await.expect("server_info");
         assert!(info.chain_name.contains("test"), "unexpected chain_name {}", info.chain_name);
 
-        let h = info.block_height - 100;
+        let tip = client.latest_block().await.expect("latest_block");
+        let h = tip.height - 100;
         let ts = client
-            .get_tree_state(service::BlockId { height: h, hash: vec![] })
+            .tree_state(zcash_protocol::consensus::BlockHeight::from_u32(h as u32))
             .await
-            .expect("get_tree_state")
-            .into_inner();
+            .expect("tree_state");
         assert_eq!(ts.height, h);
         ts.to_chain_state().expect("tree state converts to chain state");
     }
@@ -577,7 +769,6 @@ mod tests {
     #[tokio::test]
     #[ignore = "hits testnet.zec.rocks over the network"]
     async fn failover_skips_dead_first_endpoint() {
-        use zcash_client_backend::proto::service;
         // A closed local port as the primary, with the live testnet endpoint as fallback.
         let servers =
             resolve("127.0.0.1:1,testnet.zec.rocks:443", ZNetwork::Test, TlsRoots::Native, None, None)
@@ -591,29 +782,20 @@ mod tests {
             .connect_timeout(timeout)
             .await
             .expect("failover endpoint connects");
-        let tip = client
-            .get_latest_block(service::ChainSpec::default())
-            .await
-            .expect("get_latest_block")
-            .into_inner();
+        let tip = client.latest_block().await.expect("latest_block");
         assert!(tip.height > 2_000_000, "unexpected testnet height {}", tip.height);
     }
 
     #[tokio::test]
     #[ignore = "hits zec.rocks (mainnet) over the network"]
     async fn mainnet_zecrocks_get_latest_block() {
-        use zcash_client_backend::proto::service;
         let server = resolve("zecrocks", ZNetwork::Main, TlsRoots::Native, None, None)
             .unwrap()
             .into_iter()
             .next()
             .unwrap();
         let mut client = server.connect().await.expect("connect to zec.rocks");
-        let tip = client
-            .get_latest_block(service::ChainSpec::default())
-            .await
-            .expect("get_latest_block")
-            .into_inner();
+        let tip = client.latest_block().await.expect("latest_block");
         assert!(tip.height > 2_500_000, "unexpected mainnet height {}", tip.height);
     }
 }
