@@ -1,10 +1,10 @@
-target
-.git
-**/*.sqlite
-**/*.sqlite-wal
-**/*.sqlite-shm
-**/blocks
-zecd-data
-data
-*.cookie
-identity.txt
+# Allowlist: exclude everything, then un-exclude only what the cargo build needs.
+# A minimal, stable build context keeps the StageX image reproducible (stray local
+# files - datadirs, cookies, target/ - can never leak into the build).
+*
+
+!Cargo.toml
+!Cargo.lock
+!rust-toolchain.toml
+!src
+!vendor

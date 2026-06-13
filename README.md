@@ -275,7 +275,27 @@ load, so cover the brief prover-init at boot with a `startupProbe` / `initialDel
 `deploy/docker-compose.yml` runs the self-hosted stack (zebra → zecd, testnet by default;
 zecd talks straight to zebra's JSON-RPC). An optional `lightwalletd` compose profile adds a
 lightwalletd in front of the same zebra for serving other light clients. `Dockerfile` builds
-the zecd image.
+the zecd image as a **reproducible [StageX](https://stagex.tools) build**: every base image is
+full-source-bootstrapped and pinned by digest, and `zecd` + `tparty` are statically linked musl
+binaries in a from-scratch runtime image, so independent builders can reproduce the binaries
+bit-for-bit. (`vendor/i18n-embed-fl` carries a two-line upstream-merged determinism fix that
+this depends on - see the comment on `[patch.crates-io]` in `Cargo.toml`.) The `export` stage
+extracts the static binaries without running a container:
+
+```sh
+docker build --target export -o ./out .     # ./out/zecd, ./out/tparty
+```
+
+**ARM (arm64) hosts:** StageX publishes amd64 base images only, so the full-source-
+bootstrapped reproducible build is **amd64-only right now**. For ARM, `Dockerfile.arm64`
+builds the same two binaries with the same runtime contract (user, datadirs, ports,
+entrypoint) from a conventional but fully *pinned* toolchain (base images by digest, Rust
+by version, determinism flags) - deterministic and independently rebuildable, just without
+StageX's bootstrapped-toolchain trust story. Released images carry `-arm64` suffixed tags:
+
+```sh
+docker build -f Dockerfile.arm64 -t zecd .
+```
 
 ```sh
 cd deploy

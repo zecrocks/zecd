@@ -50,7 +50,7 @@ services:
   zecd:
     build:
       context: ..
-      dockerfile: Dockerfile
+      dockerfile: Dockerfile   # StageX build is amd64-only; on ARM hosts use Dockerfile.arm64
     restart: unless-stopped
     depends_on:
       - zebra

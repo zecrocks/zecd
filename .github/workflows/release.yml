@@ -1,8 +1,9 @@
 name: Release
 
 # Tag-driven release tier: pushing a `v*` tag builds the release binary tarball and
-# attaches it to a *draft* GitHub release (a human reviews and publishes), and pushes a
-# Docker image to GHCR tagged with the semver version.
+# attaches it to a *draft* GitHub release (a human reviews and publishes), and pushes
+# Docker images to GHCR tagged with the semver version: the reproducible StageX build
+# for amd64 (bare tags) and the conventional Debian build for arm64 (`-arm64` tags).
 
 on:
   push:
@@ -46,6 +47,9 @@ jobs:
             zecd-*.tar.gz
             zecd-*.tar.gz.sha256
 
+  # amd64: the reproducible StageX build (bare semver tags). rewrite-timestamp + forced
+  # compression keep the pushed layers deterministic too, and the SBOM/provenance
+  # attestations ride along with the image (mirrors zallet's publish flow).
   docker:
     runs-on: ubuntu-latest
     steps:
@@ -73,5 +77,46 @@ jobs:
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
+          sbom: true
+          provenance: mode=max
+          outputs: |
+            type=registry,rewrite-timestamp=true,force-compression=true
           cache-from: type=gha
           cache-to: type=gha,mode=max
+
+  # arm64: the conventional Debian build (`-arm64` suffixed tags), built natively on a
+  # GitHub arm64 runner. StageX publishes no arm64 images yet, so only the amd64 builds
+  # above are reproducible right now - see Dockerfile.arm64.
+  docker-arm64:
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: docker/metadata-action@v5
+        id: meta
+        with:
+          images: ghcr.io/${{ github.repository }}
+          flavor: |
+            suffix=-arm64
+          tags: |
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile.arm64
+          platforms: linux/arm64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha,scope=arm64
+          cache-to: type=gha,mode=max,scope=arm64

@@ -1,0 +1,89 @@
+# Vendored copy of i18n-embed-fl 0.9.4 from crates.io, with ONE change: the fix from
+# kellpossible/cargo-i18n#151 (released in 0.10.0) backported onto src/lib.rs so the
+# fl! macro emits fluent message arguments in sorted order instead of std HashMap
+# iteration order (randomly seeded per rustc process). Without it, every build of the
+# `age` dependency is a coin flip on argument order at one call site, breaking
+# bit-for-bit reproducible builds. Applied via [patch.crates-io] in the root Cargo.toml.
+#
+# REMOVE this vendored crate (and the [patch]) once an `age` release depends on
+# i18n-embed-fl 0.10+. Upstream tracking: https://github.com/kellpossible/cargo-i18n/pull/151
+#
+# (Manifest below is the cargo-normalized 0.9.4 manifest with the [[test]] target and
+# dev-dependencies dropped; the tests directory is not vendored.)
+
+[package]
+edition = "2018"
+name = "i18n-embed-fl"
+version = "0.9.4"
+authors = ["Luke Frisken <l.frisken@gmail.com>"]
+build = false
+autobins = false
+autoexamples = false
+autotests = false
+autobenches = false
+description = "Macro to perform compile time checks when using the i18n-embed crate and the fluent localization system"
+readme = "README.md"
+categories = [
+    "localization",
+    "internationalization",
+    "development-tools",
+]
+license = "MIT"
+repository = "https://github.com/kellpossible/cargo-i18n/tree/master/i18n-embed-fl"
+
+[lib]
+name = "i18n_embed_fl"
+path = "src/lib.rs"
+proc-macro = true
+
+[dependencies.dashmap]
+version = "6.0"
+optional = true
+
+[dependencies.find-crate]
+version = "0.6"
+
+[dependencies.fluent]
+version = "0.16"
+
+[dependencies.fluent-syntax]
+version = "0.11"
+
+[dependencies.i18n-config]
+version = "0.4.7"
+
+[dependencies.i18n-embed]
+version = "0.15.4"
+features = [
+    "fluent-system",
+    "filesystem-assets",
+]
+
+[dependencies.proc-macro-error2]
+version = "2.0.1"
+
+[dependencies.proc-macro2]
+version = "1.0"
+
+[dependencies.quote]
+version = "1.0"
+
+[dependencies.strsim]
+version = "0.11"
+
+[dependencies.syn]
+version = "2.0"
+features = [
+    "derive",
+    "proc-macro",
+    "parsing",
+    "printing",
+    "extra-traits",
+    "full",
+]
+
+[dependencies.unic-langid]
+version = "0.9"
+
+[features]
+dashmap = ["dep:dashmap"]

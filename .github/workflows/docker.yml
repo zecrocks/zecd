@@ -1,0 +1,82 @@
+name: Docker
+
+# Builds both Docker images and smoke-tests both binaries, mirroring zallet's
+# test-docker-container workflow:
+#   - Dockerfile - the reproducible StageX build (amd64 only; StageX publishes
+#                         no arm64 images yet)
+#   - Dockerfile.arm64 - the conventional Debian build for ARM hosts (NOT reproducible),
+#                         run natively on a GitHub arm64 runner
+# The full static release builds are slow, so this only runs when the image inputs
+# change (the crate itself is built and tested by CI on every PR).
+
+on:
+  pull_request:
+    paths:
+      - Dockerfile
+      - Dockerfile.arm64
+      - .dockerignore
+      - Cargo.toml
+      - Cargo.lock
+      - rust-toolchain.toml
+      - .github/workflows/docker.yml
+  push:
+    branches: [main, master]
+    paths:
+      - Dockerfile
+      - Dockerfile.arm64
+      - .dockerignore
+      - Cargo.toml
+      - Cargo.lock
+      - rust-toolchain.toml
+      - .github/workflows/docker.yml
+  workflow_dispatch:
+
+concurrency:
+  group: docker-${{ github.ref }}
+  cancel-in-progress: true
+
+# contents:read is required for checkout - this repo is private, so zallet's
+# `permissions: {}` pattern strips even repo read access from GITHUB_TOKEN.
+permissions:
+  contents: read
+
+jobs:
+  build_and_run:
+    name: ${{ matrix.name }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: stagex-amd64
+            runner: ubuntu-latest
+            dockerfile: Dockerfile
+          - name: conventional-arm64
+            runner: ubuntu-24.04-arm
+            dockerfile: Dockerfile.arm64
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Build Docker image
+        run: docker build -f ${{ matrix.dockerfile }} -t zecd .
+
+      - name: Run zecd inside the container
+        run: docker run --rm zecd --version
+
+      - name: Run tparty inside the container
+        run: docker run --rm --entrypoint tparty zecd --version
+
+      - name: Extract static binaries via the export stage
+        run: |
+          docker build -f ${{ matrix.dockerfile }} --target export -o ./out .
+          test -x out/zecd && test -x out/tparty
+          file out/zecd out/tparty
+
+      # Logged so any two runs of the same commit can be diffed by hand - they should
+      # be bit-for-bit identical (the i18n-embed-fl nondeterminism is patched in
+      # vendor/; see the project docs "Gotchas").
+      - name: Print binary hashes
+        run: sha256sum out/zecd out/tparty

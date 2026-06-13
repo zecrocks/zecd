@@ -1,0 +1,65 @@
+# Conventional pinned build - for ARM hosts (StageX, used by the primary `Dockerfile`,
+# publishes amd64 base images only).
+#
+# Everything is pinned so the binaries are deterministic and independently rebuildable:
+# base images by digest, the Rust toolchain by version (RUSTUP_TOOLCHAIN overrides
+# rust-toolchain.toml's floating `channel = "stable"`), dependencies by Cargo.lock, and
+# the usual determinism knobs (SOURCE_DATE_EPOCH, CARGO_INCREMENTAL=0, codegen-units=1,
+# --build-id=none; the build path is fixed by WORKDIR). What this still is NOT is
+# StageX-grade *trust*: the toolchain and base images are upstream binary artifacts
+# (Docker official images / static.rust-lang.org), not full-source-bootstrapped.
+#
+# Bit-for-bit reproducibility additionally requires the vendored i18n-embed-fl patch
+# (see [patch.crates-io] in Cargo.toml and the project docs "Gotchas") - without it, `age`'s
+# fl! macro flips two fluent args' order per build.
+#
+# Keep the runtime contract (binaries, user 10001:10001, datadirs, ports, entrypoint)
+# in lockstep with the StageX runtime stage so the two images are interchangeable.
+#
+#   docker build -f Dockerfile.arm64 -t zecd .
+#   docker build -f Dockerfile.arm64 --target export -o ./out .   # extract the binaries
+#
+# Dependencies are released librustzcash crates from crates.io (versions pinned by the
+# committed Cargo.lock), so the build needs network access to fetch them.
+
+# rust:1.96.0-bookworm (multi-arch index digest; keep RUSTUP_TOOLCHAIN below in lockstep)
+FROM rust:1.96.0-bookworm@sha256:19817ead3289c8c631c73df281e18b59b172f6a31f4f563290f69cddd06c30e9 AS builder
+# protoc is needed by zcash_client_backend's build script.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends protobuf-compiler \
+    && rm -rf /var/lib/apt/lists/*
+# Pin the toolchain to the image's preinstalled one; without this, rustup honors
+# rust-toolchain.toml's `channel = "stable"` and downloads whatever stable is today.
+ENV RUSTUP_TOOLCHAIN=1.96.0
+ENV SOURCE_DATE_EPOCH=1
+ENV CARGO_INCREMENTAL=0
+ENV RUSTFLAGS="-C codegen-units=1 -C link-arg=-Wl,--build-id=none"
+WORKDIR /usr/src/zecd
+COPY . .
+# Build both binaries (zecd + tparty)
+RUN cargo install --locked --path . --bins --root /usr/local
+
+# --- layer for local binary extraction ---
+FROM scratch AS export
+COPY --from=builder /usr/local/bin/zecd /zecd
+COPY --from=builder /usr/local/bin/tparty /tparty
+
+# --- runtime ---
+# debian:bookworm-slim (multi-arch index digest)
+FROM debian:bookworm-slim@sha256:96e378d7e6531ac9a15ad505478fcc2e69f371b10f5cdf87857c4b8188404716 AS runtime
+# ca-certificates lets native TLS roots validate public lightwalletd (e.g. zec.rocks).
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates \
+    && rm -rf /var/lib/apt/lists/* \
+    && groupadd -g 10001 zecd \
+    && useradd -r -u 10001 -g zecd -m -d /var/lib/zecd zecd \
+    && install -d -m 0755 -o zecd -g zecd /var/lib/tparty
+COPY --from=builder /usr/local/bin/zecd /usr/local/bin/zecd
+COPY --from=builder /usr/local/bin/tparty /usr/local/bin/tparty
+USER zecd
+WORKDIR /var/lib/zecd
+# zecd JSON-RPC (mainnet 8232 / testnet 18232) + health (9233), and the same for
+# tparty (8237 / 18237 / 9237; run it with `--entrypoint tparty`).
+EXPOSE 8232 18232 9233 8237 18237 9237
+ENTRYPOINT ["zecd"]
+CMD ["--datadir", "/var/lib/zecd"]

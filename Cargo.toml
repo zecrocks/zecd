@@ -93,3 +93,11 @@ zip321 = "0.8"
 tempfile = "3"
 # Frontier bookkeeping for the fabricated-chain reorg test (matches librustzcash's version).
 incrementalmerkletree = "0.8"
+
+# The ONLY patched dependency (librustzcash etc. stay on released crates.io versions -
+# see the project docs): a vendored i18n-embed-fl 0.9.4 with the deterministic-argument-order
+# fix from kellpossible/cargo-i18n#151 backported, so `age`'s fl! macro expansions (and
+# therefore the reproducible Docker builds) stop being a per-build coin flip. Remove
+# when an `age` release depends on i18n-embed-fl 0.10+.
+[patch.crates-io]
+i18n-embed-fl = { path = "vendor/i18n-embed-fl" }
