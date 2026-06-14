@@ -451,3 +451,147 @@ fn tparty_mainnet_placeholder_password_refuses_to_start() {
         stderr_of(&out)
     );
 }
+
+/// End-to-end keystore migration: `zecd rewrap` re-wraps an identity-model wallet onto a
+/// (fake, in-process) AWS KMS keystore, and the result unlocks via the keystore. Offline:
+/// rewrap touches only keys.toml and the KMS endpoint - no chain access.
+#[cfg(feature = "keystore")]
+#[tokio::test(flavor = "multi_thread")]
+async fn rewrap_migrates_identity_wallet_onto_kms_keystore() {
+    use age::secrecy::ExposeSecret as _;
+
+    // The committed testnet test mnemonic (valueless), as a deterministic fixture.
+    const PHRASE: &str = "mechanic vehicle helmet decide plug gorilla frost dial october \
+        midnight culture idea mountain fame park social drip bid doctor scatter glance defy \
+        moment stage";
+    const KEY_ARN: &str = "arn:aws:kms:us-east-1:111122223333:key/cli-rewrap-test";
+
+    zecd::keystore::fake::set_fake_credentials();
+    let endpoint = zecd::keystore::fake::spawn_aws(KEY_ARN).await;
+
+    // Fabricate an identity-model wallet (what `init` would produce, minus the chain I/O
+    // and the wallet DB - rewrap reads neither).
+    let dir = tempfile::tempdir().unwrap();
+    let datadir = dir.path();
+    let identity = age::x25519::Identity::generate();
+    std::fs::write(
+        datadir.join("identity.txt"),
+        format!("{}\n", identity.to_string().expose_secret()),
+    )
+    .unwrap();
+    let mnemonic = <bip0039::Mnemonic<bip0039::English>>::from_phrase(PHRASE).unwrap();
+    let recipient = identity.to_public();
+    zecd::wallet::store::WalletStore::init_with_mnemonic(
+        &datadir.join("default"),
+        std::iter::once(&recipient as &dyn age::Recipient),
+        &mnemonic,
+        zcash_protocol::consensus::BlockHeight::from_u32(1),
+        zecd::network::ZNetwork::Test,
+    )
+    .unwrap();
+    std::fs::write(
+        datadir.join("zecd.toml"),
+        format!(
+            "network = \"test\"\n[keystore]\nprovider = \"aws-kms\"\nkey = \"{KEY_ARN}\"\nendpoint = \"{endpoint}\"\n"
+        ),
+    )
+    .unwrap();
+
+    let out = tokio::task::spawn_blocking({
+        let datadir = datadir.to_path_buf();
+        move || {
+            run_with_timeout(
+                {
+                    let mut c = zecd();
+                    c.args(["--datadir", datadir.to_str().unwrap(), "rewrap"]);
+                    // The compiled binary resolves AWS credentials from its own env.
+                    c.env("AWS_ACCESS_KEY_ID", "test")
+                        .env("AWS_SECRET_ACCESS_KEY", "test")
+                        .env("AWS_EC2_METADATA_DISABLED", "true");
+                    c
+                },
+                Duration::from_secs(30),
+            )
+        }
+    })
+    .await
+    .unwrap();
+    assert!(out.status.success(), "rewrap failed: {}", stderr_of(&out));
+    assert!(
+        stderr_of(&out).contains("aws-kms"),
+        "stderr: {}",
+        stderr_of(&out)
+    );
+
+    // keys.toml now carries the KMS marker and metadata...
+    let keys_toml = std::fs::read_to_string(datadir.join("default/keys.toml")).unwrap();
+    assert!(keys_toml.contains("encryption = \"kms\""), "{keys_toml}");
+    assert!(keys_toml.contains(KEY_ARN), "{keys_toml}");
+
+    // ...and the wallet unlocks through the keystore (the daemon's startup path).
+    let st = zecd::wallet::store::WalletStore::read(&datadir.join("default")).unwrap();
+    assert!(
+        !st.is_encrypted(),
+        "KMS wallets are Bitcoin-Core-unencrypted"
+    );
+    let back = zecd::wallet::keys::decrypt_mnemonic_with_keystore(&st, Some(&endpoint))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        secrecy::ExposeSecret::expose_secret(&back).as_slice(),
+        PHRASE.as_bytes()
+    );
+}
+
+/// `init --keystore` must fail fast (before any chain I/O) when no [keystore] is configured.
+#[test]
+fn init_keystore_without_config_fails_fast() {
+    let dir = tempfile::tempdir().unwrap();
+    let out = run_with_timeout(
+        {
+            let mut c = zecd();
+            c.args([
+                "--datadir",
+                dir.path().to_str().unwrap(),
+                "--testnet",
+                "init",
+                "--keystore",
+            ]);
+            c
+        },
+        Duration::from_secs(10),
+    );
+    assert_eq!(out.status.code(), Some(1));
+    assert!(
+        stderr_of(&out).contains("no cloud keystore configured"),
+        "stderr: {}",
+        stderr_of(&out)
+    );
+}
+
+/// A half-configured [keystore] (provider without key) is a startup error, not a surprise
+/// at the first unlock.
+#[test]
+fn half_configured_keystore_is_a_startup_error() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("zecd.toml"),
+        "network = \"test\"\n[keystore]\nprovider = \"aws-kms\"\n",
+    )
+    .unwrap();
+    let out = run_with_timeout(
+        {
+            let mut c = zecd();
+            c.args(["--datadir", dir.path().to_str().unwrap()]);
+            c
+        },
+        Duration::from_secs(10),
+    );
+    assert_eq!(out.status.code(), Some(1));
+    assert!(
+        stderr_of(&out).contains("[keystore]"),
+        "stderr: {}",
+        stderr_of(&out)
+    );
+}

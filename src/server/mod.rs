@@ -210,6 +210,7 @@ mod tests {
                 age_identity: None,
                 auto_unlock: true,
             },
+            keystore: Default::default(),
             sync: SyncConfig {
                 interval_secs: 20,
                 rebroadcast_secs: 60,

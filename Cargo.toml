@@ -88,6 +88,23 @@ zcash_script = "0.4.5"
 sapling = { package = "sapling-crypto", version = "0.7" }
 zip32 = "0.2"
 zip321 = "0.8"
+# Cloud-KMS keystore providers (the `keystore` feature; on by default, excludable with
+# --no-default-features for a leaner dependency tree). aws-sdk-kms's default `rustls`
+# feature would pull the *legacy* rustls 0.21 TLS stack (RUSTSEC-flagged webpki 0.101);
+# default-https-client is the maintained rustls 0.23 client aws-config's defaults also use.
+aws-config = { version = "1.8.13", optional = true }
+aws-sdk-kms = { version = "1.99.0", default-features = false, features = ["default-https-client", "rt-tokio"], optional = true }
+gcp_auth = { version = "0.12.6", optional = true }
+hyper-rustls = { version = "0.27", features = ["http1", "native-tokio"], optional = true }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"], optional = true }
+libc = "0.2.186"
+
+[features]
+default = ["keystore"]
+# Cloud-KMS key custody ([keystore] config, `init --keystore`, `rewrap`): wrap the wallet's
+# at-rest encryption key with AWS KMS / Google Cloud KMS. Without it, KMS-related config and
+# keys.toml markers still parse, but any wrap/unwrap reports that support isn't compiled in.
+keystore = ["dep:aws-config", "dep:aws-sdk-kms", "dep:gcp_auth", "dep:hyper-rustls", "dep:rustls"]
 
 [dev-dependencies]
 tempfile = "3"

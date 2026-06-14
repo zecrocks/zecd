@@ -127,6 +127,30 @@ impl AutoShield {
     }
 }
 
+/// Retry state for a KMS wallet whose startup unlock failed: exponential backoff between
+/// cloud Decrypt attempts, checked opportunistically as the actor loop turns over.
+struct KmsUnlockRetry {
+    backoff: Backoff,
+    retry_at: Instant,
+}
+
+impl KmsUnlockRetry {
+    fn new() -> Self {
+        let mut backoff = Backoff::new(Duration::from_secs(5), Duration::from_secs(300));
+        // Full jitter can return ~0; floor the wait so a hard-down KMS isn't hammered.
+        let delay = backoff.next_delay().max(Duration::from_secs(2));
+        KmsUnlockRetry {
+            backoff,
+            retry_at: Instant::now() + delay,
+        }
+    }
+
+    fn reschedule(&mut self) {
+        let delay = self.backoff.next_delay().max(Duration::from_secs(2));
+        self.retry_at = Instant::now() + delay;
+    }
+}
+
 /// Parameters needed to launch a wallet actor.
 pub struct ActorConfig {
     pub name: String,
@@ -147,6 +171,9 @@ pub struct ActorConfig {
     pub primary_recheck: Duration,
     pub age_identity: Option<PathBuf>,
     pub auto_unlock: bool,
+    /// `[keystore] endpoint` override for cloud-KMS unlock calls (emulators/VPC endpoints).
+    /// The provider and key come from the wallet's own `keys.toml`.
+    pub keystore_endpoint: Option<String>,
     /// `Some` = tparty mode: detect transparent deposits (servicing the wallet's
     /// transaction-data requests against lightwalletd) and auto-shield them.
     pub auto_shield: Option<AutoShield>,
@@ -206,6 +233,16 @@ struct WalletActor {
     /// Whether the wallet is passphrase-encrypted (read from `keys.toml` at spawn). Gates the
     /// Bitcoin-Core-style `walletpassphrase`/`walletlock`/`encryptwallet` behavior.
     encrypted: bool,
+    /// Whether the wallet's age identity is cloud-KMS-wrapped (`encryption = "kms"`). Such a
+    /// wallet auto-unlocks at startup like the identity model ("unencrypted" to the RPCs);
+    /// `encryptwallet` migrates it onto a passphrase.
+    kms_wallet: bool,
+    /// `[keystore] endpoint` override for KMS unlock calls.
+    keystore_endpoint: Option<String>,
+    /// `Some` while a KMS wallet's startup unlock is failing (e.g. a KMS/IAM outage at
+    /// boot): the actor keeps retrying with backoff so a transient outage doesn't require a
+    /// human restart. Cleared on success, `encryptwallet`, or a non-retryable condition.
+    kms_unlock_retry: Option<KmsUnlockRetry>,
     /// Whether the wallet is watch-only (its account is an imported UFVK with no spending
     /// material). Spend and encryption commands refuse with Bitcoin Core's -4.
     watch_only: bool,
@@ -251,11 +288,15 @@ pub async fn spawn(
     // Determine the wallet's encryption mode, and for unencrypted wallets optionally decrypt
     // the seed up-front for unattended sending. An encrypted wallet has no passphrase at rest,
     // so it cannot auto-unlock - it starts locked and requires `walletpassphrase` (matching
-    // Bitcoin Core's encrypted-wallet behavior). A watch-only wallet has no seed anywhere, so
-    // the whole unlock machinery is moot for it.
+    // Bitcoin Core's encrypted-wallet behavior). A cloud-KMS wallet auto-unlocks via one
+    // IAM-gated KMS Decrypt; a failure there (KMS/IAM outage at boot) is retried with
+    // backoff by the actor loop rather than requiring a human restart. A watch-only wallet
+    // has no seed anywhere, so the whole unlock machinery is moot for it.
     let st = store::WalletStore::read(&cfg.wallet_dir)?;
     let encrypted = st.is_encrypted();
+    let kms_wallet = st.kms().is_some();
     let mut seed = SeedKeeper::locked();
+    let mut kms_unlock_retry = None;
     if watch_only {
         info!(
             "[{}] watch-only wallet (imported UFVK): balances, history, and addresses are \
@@ -267,6 +308,36 @@ pub async fn spawn(
             "[{}] wallet is passphrase-encrypted; it starts locked - call walletpassphrase to unlock for sending",
             cfg.name
         );
+    } else if kms_wallet {
+        if cfg.auto_unlock {
+            match keys::decrypt_seed_with_keystore(&st, cfg.keystore_endpoint.as_deref()).await {
+                Ok(Some(s)) => {
+                    seed.set(s);
+                    info!(
+                        "[{}] seed unlocked via {} for unattended sending",
+                        cfg.name,
+                        st.kms().expect("kms wallet").provider.name()
+                    );
+                }
+                Ok(None) => {}
+                Err(e) => {
+                    warn!(
+                        "[{}] KMS unlock failed at startup: {e:#}; sends will fail (-13) until it succeeds - retrying with backoff",
+                        cfg.name
+                    );
+                    kms_unlock_retry = Some(KmsUnlockRetry::new());
+                }
+            }
+        } else {
+            // Mirrors the identity-model dead end below: nothing can unlock a KMS wallet
+            // at runtime (walletpassphrase is -15 on it), so warn loudly.
+            warn!(
+                "[{}] auto_unlock=false on a KMS-wrapped wallet: sends will fail (-13) and \
+                 walletpassphrase cannot unlock it (-15). Enable auto_unlock, or migrate to a \
+                 passphrase with encryptwallet.",
+                cfg.name
+            );
+        }
     } else if cfg.auto_unlock {
         if let Some(identity) = &cfg.age_identity {
             if st.has_seed() {
@@ -345,6 +416,9 @@ pub async fn spawn(
         last_rebroadcast: None,
         subtree_roots_synced: false,
         encrypted,
+        kms_wallet,
+        keystore_endpoint: cfg.keystore_endpoint,
+        kms_unlock_retry,
         watch_only,
         unlock_until: None,
         auto_shield: cfg.auto_shield,
@@ -421,6 +495,8 @@ impl WalletActor {
             // iteration (between sync batches) so the seed doesn't linger long past expiry; the
             // `select!` branch below handles the idle case, and `do_send` has a hard backstop.
             self.relock_if_expired();
+            // A KMS wallet whose startup unlock failed retries here (cheap deadline check).
+            self.maybe_retry_kms_unlock().await;
             if more_work {
                 // Service any queued commands first so writers aren't starved by sync.
                 loop {
@@ -949,7 +1025,7 @@ impl WalletActor {
                 let _ = reply.send(res);
             }
             WalletCommand::EncryptWallet { passphrase, reply } => {
-                let res = self.do_encrypt_wallet(passphrase);
+                let res = self.do_encrypt_wallet(passphrase).await;
                 let _ = reply.send(res);
             }
             WalletCommand::ChangePassphrase { old, new, reply } => {
@@ -971,6 +1047,53 @@ impl WalletActor {
                 self.name
             );
             self.update_status();
+        }
+    }
+
+    /// Retry a KMS wallet's failed startup unlock once its backoff deadline passes, so a
+    /// transient KMS/IAM outage at boot heals without a restart. No-op (one `Option` check)
+    /// unless a retry is pending and due.
+    async fn maybe_retry_kms_unlock(&mut self) {
+        let due = self
+            .kms_unlock_retry
+            .as_ref()
+            .is_some_and(|r| Instant::now() >= r.retry_at);
+        if !due {
+            return;
+        }
+        let result = match store::WalletStore::read(&self.wallet_dir) {
+            Ok(st) => {
+                keys::decrypt_seed_with_keystore(&st, self.keystore_endpoint.as_deref()).await
+            }
+            Err(e) => Err(e),
+        };
+        match result {
+            Ok(Some(seed)) => {
+                self.seed.set(seed);
+                self.kms_unlock_retry = None;
+                info!(
+                    "[{}] KMS unlock succeeded; seed unlocked for sending",
+                    self.name
+                );
+                self.update_status();
+            }
+            Ok(None) => {
+                // No stored mnemonic - retrying can't help.
+                warn!(
+                    "[{}] KMS wallet has no stored mnemonic; giving up unlock",
+                    self.name
+                );
+                self.kms_unlock_retry = None;
+            }
+            Err(e) => {
+                let retry = self.kms_unlock_retry.as_mut().expect("checked due above");
+                retry.reschedule();
+                warn!(
+                    "[{}] KMS unlock retry failed: {e:#}; next attempt in ~{:?}",
+                    self.name,
+                    retry.retry_at.saturating_duration_since(Instant::now())
+                );
+            }
         }
     }
 
@@ -1733,10 +1856,12 @@ impl WalletActor {
         Ok(())
     }
 
-    /// `encryptwallet`: re-wrap the (currently identity-encrypted) mnemonic under `passphrase`
-    /// and leave the wallet locked. -15 if already encrypted. Unlike Bitcoin Core, the seed is
-    /// NOT regenerated - the same mnemonic is preserved, only its at-rest wrapping changes.
-    fn do_encrypt_wallet(&mut self, passphrase: store::Passphrase) -> Result<(), RpcError> {
+    /// `encryptwallet`: re-wrap the (currently identity-encrypted or KMS-wrapped) mnemonic
+    /// under `passphrase` and leave the wallet locked. -15 if already encrypted. Unlike
+    /// Bitcoin Core, the seed is NOT regenerated - the same mnemonic is preserved, only its
+    /// at-rest wrapping changes. For a KMS wallet this is the migration path *off* the
+    /// cloud keystore (the `[kms]` table is dropped from `keys.toml`).
+    async fn do_encrypt_wallet(&mut self, passphrase: store::Passphrase) -> Result<(), RpcError> {
         // A watch-only wallet stores no mnemonic at all; there is nothing to wrap under a
         // passphrase (the UFVK must stay readable for scanning). Bitcoin Core's exact refusal
         // for wallets without private keys is -16, not the generic -4 (wallet/rpc/encrypt.cpp).
@@ -1752,14 +1877,20 @@ impl WalletActor {
                 "Error: running with an encrypted wallet, but encryptwallet was called.",
             ));
         }
-        let identity = self.age_identity.as_ref().ok_or_else(|| {
-            RpcError::wallet("no age identity configured; cannot read the mnemonic to encrypt")
-        })?;
         let st = store::WalletStore::read(&self.wallet_dir)
             .map_err(|e| RpcError::wallet(format!("reading keys.toml: {e}")))?;
-        let mnemonic = keys::decrypt_mnemonic_with_identity(&st, identity)
-            .map_err(|e| RpcError::wallet(format!("decrypting mnemonic: {e}")))?
-            .ok_or_else(|| RpcError::wallet("wallet has no stored mnemonic"))?;
+        let mnemonic = if self.kms_wallet {
+            keys::decrypt_mnemonic_with_keystore(&st, self.keystore_endpoint.as_deref())
+                .await
+                .map_err(|e| RpcError::wallet(format!("decrypting mnemonic via KMS: {e:#}")))?
+        } else {
+            let identity = self.age_identity.as_ref().ok_or_else(|| {
+                RpcError::wallet("no age identity configured; cannot read the mnemonic to encrypt")
+            })?;
+            keys::decrypt_mnemonic_with_identity(&st, identity)
+                .map_err(|e| RpcError::wallet(format!("decrypting mnemonic: {e}")))?
+        };
+        let mnemonic = mnemonic.ok_or_else(|| RpcError::wallet("wallet has no stored mnemonic"))?;
         let phrase = std::str::from_utf8(mnemonic.expose_secret().as_slice())
             .map_err(|_| RpcError::wallet("stored mnemonic is not valid UTF-8"))?;
         // scrypt key derivation for the new wrapping is deliberately slow; keep it off the
@@ -1774,7 +1905,10 @@ impl WalletActor {
             )
         })?;
         // Now Bitcoin-Core "encrypted": lock and require walletpassphrase from here on.
+        // A former KMS wallet stops being one (keys.toml no longer carries the [kms] table).
         self.encrypted = true;
+        self.kms_wallet = false;
+        self.kms_unlock_retry = None;
         self.seed.lock();
         self.unlock_until = None;
         self.update_status();

@@ -42,6 +42,9 @@ jobs:
       - name: Clippy
         run: cargo clippy --all-targets -- -D warnings
 
+      - name: Check the lean build (no cloud-keystore providers)
+        run: cargo check --all-targets --no-default-features
+
   # Dependency policy: RustSec advisories (vulnerabilities AND unmaintained crates),
   # license allowlist, wildcard-version ban, and registry/git source pinning. Exceptions
   # (with rationale) live in deny.toml; .cargo/audit.toml mirrors the advisory exceptions

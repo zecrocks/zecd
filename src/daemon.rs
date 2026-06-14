@@ -111,6 +111,7 @@ pub async fn run(config: AppConfig, opts: DaemonOptions) -> anyhow::Result<()> {
             primary_recheck: Duration::from_secs(config.lightwalletd.primary_recheck_secs),
             age_identity: config.keys.age_identity.clone(),
             auto_unlock: config.keys.auto_unlock,
+            keystore_endpoint: config.keystore.endpoint.clone(),
             auto_shield: opts.auto_shield.clone(),
             gap_limit: opts.gap_limit,
             // Validated at config load; re-derive here rather than carrying a second copy.

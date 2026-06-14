@@ -74,6 +74,20 @@ age_identity = "./data/identity.txt"
 # Decrypt the seed at startup so sendtoaddress/sendmany work without walletpassphrase.
 auto_unlock = true
 
+# Cloud-KMS keystore ("envelope encryption" / auto-unseal): the wallet's at-rest encryption
+# key is wrapped by a key held in AWS KMS or Google Cloud KMS, and the daemon unlocks it at
+# startup with one IAM-gated KMS Decrypt - no identity file, no passphrase, and every unlock
+# is a CloudTrail / Cloud Audit Logs entry. Create such a wallet with `zecd init --keystore`,
+# or migrate an existing one with `zecd rewrap`.
+# [keystore]
+# provider = "aws-kms"                # or "gcp-kms"
+# AWS: a key ARN (preferred - its region wins), key id, or alias. GCP: the full resource
+# name projects/<p>/locations/<l>/keyRings/<r>/cryptoKeys/<k>.
+# key = "arn:aws:kms:us-east-1:111122223333:key/<uuid>"
+# API endpoint override - for KMS emulators in tests (moto/local-kms) or VPC/private
+# endpoints. Omit for the provider default.
+# endpoint = "http://localhost:8080"
+
 [sync]
 # How often to poll lightwalletd for new blocks (seconds).
 interval_secs = 20

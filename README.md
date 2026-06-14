@@ -184,6 +184,11 @@ work_queue = 100                 # max in-flight requests before HTTP 503 (= bit
 age_identity = "./data/identity.txt"
 auto_unlock = true               # decrypt the seed at startup so sends need no walletpassphrase
 
+# [keystore]                     # cloud-KMS key custody (auto-unseal)
+# provider = "aws-kms"           # "aws-kms" | "gcp-kms"
+# key = "arn:aws:kms:us-east-1:111122223333:key/<uuid>"   # or a GCP cryptoKey resource name
+# endpoint = "http://localhost:8080"   # optional: KMS emulators / VPC endpoints
+
 [sync]
 interval_secs = 20
 rebroadcast_secs = 60            # max spacing of unmined-tx re-broadcast passes
@@ -560,7 +565,8 @@ upgrades, and the mainnet checklist.
 
 ## Security
 
-Two key-custody models, mirroring bitcoind's unencrypted/encrypted wallet states:
+Three key-custody models - the first two mirror bitcoind's unencrypted/encrypted wallet states,
+the third is cloud-native key wrapping for ops teams:
 
 - Unencrypted (default): the mnemonic in `<wallet>/keys.toml` is wrapped to the age identity file
   (`[keys] age_identity`, default `<datadir>/identity.txt`); with the default `auto_unlock = true`
@@ -576,9 +582,39 @@ Two key-custody models, mirroring bitcoind's unencrypted/encrypted wallet states
   wrong) and auto-relocks at the timeout; `walletpassphrasechange` rotates it;
   `getwalletinfo.unlocked_until` reports the relock time. Unlike Bitcoin Core, `encryptwallet`
   does not regenerate the seed, only its at-rest wrapping, so existing backups stay valid.
+- Cloud keystore (`zecd init --keystore`, or `zecd rewrap` to migrate an existing wallet): the
+  mnemonic is age-encrypted to a dedicated x25519 identity whose secret is wrapped by an
+  **AWS KMS or Google Cloud KMS key** (`[keystore]`). The daemon unlocks at startup with one
+  IAM-gated KMS `Decrypt` - no identity file on disk, no passphrase to type - and every unlock
+  is an attributable CloudTrail / Cloud Audit Logs entry. The cloud provider never sees the
+  mnemonic or seed, only the wrap key (envelope encryption); `keys.toml` alone (backups,
+  snapshots, stolen disks) is useless without the cloud credentials. To the RPCs the wallet is
+  "unencrypted" (passphrase RPCs return `-15`); `encryptwallet` migrates it off KMS onto a
+  passphrase, `zecd rewrap` rotates to a new KMS key. A KMS outage at startup degrades to a
+  locked wallet (reads fine, sends `-13`) and the daemon retries with backoff. Keystore
+  support is compiled in by default; build with `--no-default-features` to exclude the cloud
+  SDKs entirely (the `keystore` cargo feature). Full operator guide - IAM policies, rotation,
+  break-glass recovery, emulator testing: **docs/KEYSTORE.md**.
 
-In both models, anyone with RPC access to an unlocked wallet can spend: treat RPC credentials as
+In all models, anyone with RPC access to an unlocked wallet can spend: treat RPC credentials as
 spend authority.
+
+Memory hardening (in-memory seed): once unlocked, the seed lives in process memory regardless of
+custody model. zecd hardens that against *passive* capture, best-effort at startup (each step is
+a no-op-with-warning if the platform/privileges disallow it, never a startup failure):
+
+- **`mlock`** pins the seed's pages into RAM so it is never written to swap. A denied `mlock`
+  (e.g. an unprivileged container with `RLIMIT_MEMLOCK=0`) logs a warning - raise the memlock
+  limit to fix; for the residue (transient key copies made during proving), back swap with an
+  encrypted device.
+- **Core dumps disabled** (`RLIMIT_CORE=0`) so a crash can't spill the seed to a core file. Set
+  `ZECD_ALLOW_CORE_DUMPS=1` to keep core dumps for debugging.
+- **Non-dumpable** (`PR_SET_DUMPABLE=0` on Linux) so other non-root processes can't `ptrace`
+  zecd or read `/proc/<pid>/mem` to scrape the seed.
+
+This defends passive disclosure (swap, core dumps, another process reading this one's memory),
+not an attacker with code execution inside zecd - for that isolation, run zecd watch-only and
+keep spend authority in a separate signer (see *Watch-only*).
 
 RPC surface:
 

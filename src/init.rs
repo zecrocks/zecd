@@ -20,7 +20,7 @@ use crate::chain::ChainSource as _;
 use crate::config::{AppConfig, ExportUfvkArgs, InitArgs, WalletEntry};
 use crate::lightwalletd;
 use crate::wallet::open;
-use crate::wallet::store::{Passphrase, WalletStore};
+use crate::wallet::store::{KmsInfo, Passphrase, WalletStore};
 
 /// Read the encryption passphrase for `init --encrypt`. Prefers the `ZECD_WALLET_PASSPHRASE`
 /// environment variable (for non-interactive/automated init); otherwise prompts on stderr and
@@ -87,19 +87,62 @@ pub async fn run(config: &AppConfig, args: &InitArgs) -> anyhow::Result<()> {
         .age_identity
         .clone()
         .unwrap_or_else(|| config.datadir.join("identity.txt"));
-    // An encrypted wallet wraps its mnemonic with a passphrase (age scrypt) and needs no
-    // identity file; an unencrypted wallet wraps it to the age identity for unattended unlock.
-    // A watch-only wallet has no mnemonic at all, so it needs neither.
-    let recipients = if args.encrypt || ufvk.is_some() {
-        None
+    // How the mnemonic is protected at rest. All settled *before* any network I/O so a bad
+    // passphrase / missing identity / misconfigured KMS fails fast:
+    // - view-only (imported UFVK): no mnemonic at all, so there is no at-rest secret;
+    // - keystore: age-encrypt to a fresh x25519 identity and wrap that identity with the
+    //   configured cloud KMS key (auto-unlocks at startup via IAM-gated Decrypt);
+    // - encrypt: wrap with a passphrase (age scrypt) - starts locked, `walletpassphrase`;
+    // - default: wrap to the age identity file for unattended unlock.
+    enum AtRest {
+        ViewOnly,
+        Kms {
+            keystore: crate::keystore::Keystore,
+            identity: age::x25519::Identity,
+            wrapped: Vec<u8>,
+        },
+        Passphrase(Passphrase),
+        Identity(Vec<Box<dyn age::Recipient + Send>>),
+    }
+    let at_rest = if ufvk.is_some() {
+        AtRest::ViewOnly
+    } else if args.keystore {
+        let keystore = config.keystore.required()?;
+        let identity = age::x25519::Identity::generate();
+        let ctx = crate::keystore::WrapContext {
+            wallet: args.wallet.clone(),
+            network: network.name().to_string(),
+        };
+        eprintln!(
+            "Wrapping the wallet key with {} key {}",
+            keystore.provider.name(),
+            keystore.key
+        );
+        let identity_str = identity.to_string();
+        let wrapped = keystore
+            .wrap(identity_str.expose_secret().as_bytes(), &ctx)
+            .await
+            .context("wrapping the wallet key (the credentials must allow KMS Encrypt)")?;
+        // Prove the same credentials can unlock before committing anything to disk - an
+        // Encrypt-only policy would otherwise brick sending until IAM is fixed.
+        let back = keystore
+            .unwrap(&wrapped, &ctx)
+            .await
+            .context("verifying KMS unwrap (the credentials must also allow KMS Decrypt)")?;
+        if secrecy::ExposeSecret::expose_secret(&back).as_slice()
+            != identity_str.expose_secret().as_bytes()
+        {
+            bail!("KMS unwrap verification returned different bytes");
+        }
+        AtRest::Kms {
+            keystore,
+            identity,
+            wrapped,
+        }
+    } else if args.encrypt {
+        AtRest::Passphrase(read_encryption_passphrase()?)
     } else {
-        Some(ensure_identity(&identity_path).await?)
-    };
-    // Read the passphrase early (before any network I/O) so we fail fast on mismatch/empty.
-    let passphrase = if args.encrypt {
-        Some(read_encryption_passphrase()?)
-    } else {
-        None
+        AtRest::Identity(ensure_identity(&identity_path).await?)
     };
 
     // init is a one-shot interactive command; it uses only the first configured endpoint (no
@@ -185,25 +228,46 @@ pub async fn run(config: &AppConfig, args: &InitArgs) -> anyhow::Result<()> {
             .map_err(|_| anyhow!("failed to derive account birthday from tree state"))?
     };
 
-    match (&mnemonic, passphrase, &recipients) {
-        (None, _, _) => WalletStore::init_view_only(&wallet_dir, birthday.height(), network)?,
-        (Some(mnemonic), Some(passphrase), _) => WalletStore::init_with_passphrase(
+    // Non-view-only models always have a mnemonic (the `AtRest` variant and `ufvk.is_none()`
+    // agree by construction); `expect` documents that invariant.
+    let require_mnemonic = || {
+        mnemonic
+            .as_ref()
+            .expect("non-view-only init always has a mnemonic")
+    };
+    match &at_rest {
+        AtRest::ViewOnly => WalletStore::init_view_only(&wallet_dir, birthday.height(), network)?,
+        AtRest::Kms {
+            keystore,
+            identity,
+            wrapped,
+        } => WalletStore::init_with_kms(
             &wallet_dir,
-            passphrase,
-            mnemonic,
+            &identity.to_public(),
+            &KmsInfo {
+                provider: keystore.provider,
+                key: keystore.key.clone(),
+                wrapped_identity: wrapped.clone(),
+                context_wallet: args.wallet.clone(),
+            },
+            require_mnemonic(),
             birthday.height(),
             network,
         )?,
-        (Some(mnemonic), None, Some(recipients)) => WalletStore::init_with_mnemonic(
+        AtRest::Passphrase(passphrase) => WalletStore::init_with_passphrase(
+            &wallet_dir,
+            passphrase.clone(),
+            require_mnemonic(),
+            birthday.height(),
+            network,
+        )?,
+        AtRest::Identity(recipients) => WalletStore::init_with_mnemonic(
             &wallet_dir,
             recipients.iter().map(|r| r.as_ref() as _),
-            mnemonic,
+            require_mnemonic(),
             birthday.height(),
             network,
         )?,
-        (Some(_), None, None) => {
-            unreachable!("non-encrypted init always builds identity recipients")
-        }
     }
 
     let mut db = open::init_dbs(network, &wallet_dir)?;
@@ -234,17 +298,21 @@ pub async fn run(config: &AppConfig, args: &InitArgs) -> anyhow::Result<()> {
         args.wallet,
         wallet_dir.display()
     );
-    if ufvk.is_some() {
-        eprintln!(
+    match &at_rest {
+        AtRest::ViewOnly => eprintln!(
             "Watch-only wallet (imported UFVK): balances, history, and addresses are \
              available; spending and wallet-encryption RPCs are disabled."
-        );
-    } else if args.encrypt {
-        eprintln!(
+        ),
+        AtRest::Kms { keystore, .. } => eprintln!(
+            "Wallet key is wrapped by {} key {}; the daemon auto-unlocks it at startup via \
+             the cloud credentials (no identity file, no passphrase).",
+            keystore.provider.name(),
+            keystore.key
+        ),
+        AtRest::Passphrase(_) => eprintln!(
             "Wallet is passphrase-encrypted; it starts locked. Call walletpassphrase \"<pass>\" <timeout> to unlock for sending."
-        );
-    } else {
-        eprintln!("age identity: {}", identity_path.display());
+        ),
+        AtRest::Identity(_) => eprintln!("age identity: {}", identity_path.display()),
     }
     if let Some(mnemonic) = mnemonic.filter(|_| !args.restore) {
         eprintln!("\nIMPORTANT - record this mnemonic seed phrase and keep it safe:\n");

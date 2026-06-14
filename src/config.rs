@@ -84,6 +84,7 @@ pub struct AppConfig {
     pub zebra: ZebraConfig,
     pub rpc: RpcConfig,
     pub keys: KeysConfig,
+    pub keystore: KeystoreConfig,
     pub sync: SyncConfig,
     pub spend: SpendConfig,
     pub health: HealthConfig,
@@ -247,6 +248,36 @@ pub struct KeysConfig {
     pub auto_unlock: bool,
 }
 
+/// `[keystore]` - a cloud KMS key that wraps the wallet's at-rest encryption key
+/// ("envelope encryption" / auto-unseal). `provider` + `key` are required to *create* a
+/// KMS wallet (`init --keystore`, `rewrap`); a daemon unlocking an existing KMS wallet
+/// reads provider/key from the wallet's own `keys.toml` and uses only `endpoint` from here.
+#[derive(Debug, Clone, Default)]
+pub struct KeystoreConfig {
+    pub provider: Option<crate::keystore::KeystoreProvider>,
+    /// AWS key ARN/id/alias, or GCP cryptoKey resource name.
+    pub key: Option<String>,
+    /// API endpoint override (emulators, VPC/private endpoints).
+    pub endpoint: Option<String>,
+}
+
+impl KeystoreConfig {
+    /// The configured keystore, required (for `init --keystore` / `rewrap`).
+    pub fn required(&self) -> anyhow::Result<crate::keystore::Keystore> {
+        match (self.provider, &self.key) {
+            (Some(provider), Some(key)) => Ok(crate::keystore::Keystore {
+                provider,
+                key: key.clone(),
+                endpoint: self.endpoint.clone(),
+            }),
+            _ => Err(anyhow::anyhow!(
+                "no cloud keystore configured: set [keystore] provider (\"aws-kms\" or \
+                 \"gcp-kms\") and key in the config file"
+            )),
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct SyncConfig {
     pub interval_secs: u64,
@@ -355,6 +386,7 @@ struct ConfigFile {
     zebra: Option<ZebraFile>,
     rpc: Option<RpcFile>,
     keys: Option<KeysFile>,
+    keystore: Option<KeystoreFile>,
     sync: Option<SyncFile>,
     spend: Option<SpendFile>,
     health: Option<HealthFile>,
@@ -432,6 +464,14 @@ struct RpcFile {
 struct KeysFile {
     age_identity: Option<PathBuf>,
     auto_unlock: Option<bool>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct KeystoreFile {
+    provider: Option<String>,
+    key: Option<String>,
+    endpoint: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -520,6 +560,9 @@ pub struct Cli {
 pub enum Command {
     /// Create and initialize a new wallet (mnemonic + accounts), then exit.
     Init(InitArgs),
+    /// Re-wrap an existing wallet's mnemonic under the configured [keystore] cloud KMS key
+    /// (migrate at-rest custody onto AWS/GCP KMS, or rotate to a new KMS key), then exit.
+    Rewrap(RewrapArgs),
     /// Print a wallet's Unified Full Viewing Key (for pairing a watch-only instance via
     /// `init --ufvk`), then exit.
     ExportUfvk(ExportUfvkArgs),
@@ -547,16 +590,29 @@ pub struct InitArgs {
     #[arg(long)]
     pub encrypt: bool,
 
+    /// Wrap the wallet's at-rest encryption key with the cloud KMS key configured under
+    /// [keystore] (AWS KMS or Google Cloud KMS). The wallet auto-unlocks at startup via one
+    /// IAM-gated KMS Decrypt - no identity file, no passphrase.
+    #[arg(long, conflicts_with = "encrypt")]
+    pub keystore: bool,
+
     /// Create a watch-only wallet from this Unified Full Viewing Key instead of a mnemonic
     /// (export it from the spending wallet with `export-ufvk`). The wallet sees balances,
     /// history, and addresses, but holds no spending material - spend and encryption RPCs
-    /// are disabled.
-    #[arg(long, value_name = "UFVK", conflicts_with_all = ["restore", "encrypt"])]
+    /// are disabled. A watch-only wallet has no key to wrap, so this excludes `--keystore`.
+    #[arg(long, value_name = "UFVK", conflicts_with_all = ["restore", "encrypt", "keystore"])]
     pub ufvk: Option<String>,
 
     /// Optional birthday height; defaults to the current chain tip for new wallets.
     #[arg(long)]
     pub birthday: Option<u32>,
+}
+
+#[derive(Debug, clap::Args)]
+pub struct RewrapArgs {
+    /// Wallet name (selects <datadir>/<name>).
+    #[arg(long, default_value = "default")]
+    pub wallet: String,
 }
 
 #[derive(Debug, clap::Args)]
@@ -737,6 +793,25 @@ impl AppConfig {
             auto_unlock: keys_file.auto_unlock.unwrap_or(true),
         };
 
+        let keystore_file = file.keystore.unwrap_or_default();
+        let keystore = KeystoreConfig {
+            provider: keystore_file
+                .provider
+                .as_deref()
+                .map(crate::keystore::KeystoreProvider::parse)
+                .transpose()
+                .context("parsing [keystore] provider")?,
+            key: keystore_file.key,
+            endpoint: keystore_file.endpoint,
+        };
+        // Half-configured keystores fail at startup, not at the first init/rewrap/unlock.
+        if keystore.provider.is_some() && keystore.key.is_none() {
+            anyhow::bail!("[keystore] provider is set but key is missing");
+        }
+        if keystore.provider.is_none() && keystore.key.is_some() {
+            anyhow::bail!("[keystore] key is set but provider is missing");
+        }
+
         let sync_file = file.sync.unwrap_or(SyncFile {
             interval_secs: None,
             rebroadcast_secs: None,
@@ -811,6 +886,7 @@ impl AppConfig {
             zebra,
             rpc,
             keys,
+            keystore,
             sync,
             spend,
             health,
@@ -864,6 +940,26 @@ mod tests {
         .is_err());
         // Unknown keys in the section are rejected like everywhere else.
         assert!(toml::from_str::<SpendFile>("min_conf = 1").is_err());
+    }
+
+    #[test]
+    fn keystore_section_parses_and_validates() {
+        let f: KeystoreFile = toml::from_str(
+            "provider = \"aws-kms\"\nkey = \"arn:aws:kms:us-east-1:1:key/k\"\nendpoint = \"http://localhost:4566\"",
+        )
+        .unwrap();
+        assert_eq!(f.provider.as_deref(), Some("aws-kms"));
+        // Unknown keys in the section are rejected like everywhere else.
+        assert!(toml::from_str::<KeystoreFile>("region = \"us-east-1\"").is_err());
+
+        // `required()` needs both provider and key (init --keystore / rewrap).
+        let cfg = KeystoreConfig {
+            provider: Some(crate::keystore::KeystoreProvider::GcpKms),
+            key: Some("projects/p/locations/l/keyRings/r/cryptoKeys/k".to_string()),
+            endpoint: None,
+        };
+        assert_eq!(cfg.required().unwrap().key, cfg.key.clone().unwrap());
+        assert!(KeystoreConfig::default().required().is_err());
     }
 
     #[test]

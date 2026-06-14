@@ -456,6 +456,7 @@ fn offline_actor_cfg(
         primary_recheck: Duration::from_secs(60),
         age_identity: None,
         auto_unlock: true,
+        keystore_endpoint: None,
         auto_shield: None,
         gap_limit: None,
         confirmations_policy: Default::default(),
