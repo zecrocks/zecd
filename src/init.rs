@@ -10,11 +10,14 @@ use bip0039::{Count, English, Mnemonic};
 use secrecy::{SecretVec, Zeroize};
 use tokio::io::AsyncWriteExt as _;
 
-use zcash_client_backend::data_api::{AccountBirthday, WalletWrite};
+use zcash_client_backend::data_api::{
+    Account as _, AccountBirthday, AccountPurpose, WalletRead, WalletWrite,
+};
+use zcash_keys::keys::UnifiedFullViewingKey;
 use zcash_protocol::consensus::{BlockHeight, NetworkUpgrade, Parameters};
 
 use crate::chain::ChainSource as _;
-use crate::config::{AppConfig, InitArgs, WalletEntry};
+use crate::config::{AppConfig, ExportUfvkArgs, InitArgs, WalletEntry};
 use crate::lightwalletd;
 use crate::wallet::open;
 use crate::wallet::store::{Passphrase, WalletStore};
@@ -68,6 +71,17 @@ pub async fn run(config: &AppConfig, args: &InitArgs) -> anyhow::Result<()> {
     }
     std::fs::create_dir_all(&wallet_dir)?;
 
+    // Watch-only init: parse the UFVK up front (before any network I/O) so a malformed key
+    // fails fast. `--ufvk` conflicts with `--restore`/`--encrypt` at the clap level.
+    let ufvk = args
+        .ufvk
+        .as_deref()
+        .map(|s| {
+            UnifiedFullViewingKey::decode(&network, s.trim())
+                .map_err(|e| anyhow!("invalid unified full viewing key: {e}"))
+        })
+        .transpose()?;
+
     let identity_path = config
         .keys
         .age_identity
@@ -75,7 +89,8 @@ pub async fn run(config: &AppConfig, args: &InitArgs) -> anyhow::Result<()> {
         .unwrap_or_else(|| config.datadir.join("identity.txt"));
     // An encrypted wallet wraps its mnemonic with a passphrase (age scrypt) and needs no
     // identity file; an unencrypted wallet wraps it to the age identity for unattended unlock.
-    let recipients = if args.encrypt {
+    // A watch-only wallet has no mnemonic at all, so it needs neither.
+    let recipients = if args.encrypt || ufvk.is_some() {
         None
     } else {
         Some(ensure_identity(&identity_path).await?)
@@ -115,26 +130,31 @@ pub async fn run(config: &AppConfig, args: &InitArgs) -> anyhow::Result<()> {
         .try_into()
         .map_err(|_| anyhow!("chain tip height does not fit into u32"))?;
 
-    let (mnemonic, recover_until) = if args.restore {
+    let (mnemonic, recover_until) = if ufvk.is_some() {
+        // A watch-only wallet has no mnemonic; the imported key may have history, so treat
+        // it like a restore (recovery window up to the current tip).
+        (None, Some(BlockHeight::from(chain_tip)))
+    } else if args.restore {
         eprintln!("Enter the mnemonic phrase to restore, then press Enter:");
         let mut line = String::new();
         std::io::stdin().read_line(&mut line)?;
         let phrase = line.trim();
         (
-            <Mnemonic<English>>::from_phrase(phrase)?,
+            Some(<Mnemonic<English>>::from_phrase(phrase)?),
             Some(BlockHeight::from(chain_tip)),
         )
     } else {
-        (Mnemonic::generate(Count::Words24), None)
+        (Some(Mnemonic::generate(Count::Words24)), None)
     };
 
     // A freshly-generated wallet can have no history, so its birthday defaults to just below
-    // the tip. A *restored* wallet may hold notes from any point in its past; defaulting
-    // anywhere near the tip would silently skip them (the funds exist on chain but are never
-    // scanned), so without --birthday we scan from Sapling activation - the start of the
-    // shielded-note era - trading sync time for never missing funds.
+    // the tip. A *restored* wallet (or an imported viewing key) may hold notes from any point
+    // in its past; defaulting anywhere near the tip would silently skip them (the funds exist
+    // on chain but are never scanned), so without --birthday we scan from Sapling activation -
+    // the start of the shielded-note era - trading sync time for never missing funds.
+    let key_may_have_history = args.restore || ufvk.is_some();
     let birthday_height = BlockHeight::from(args.birthday.unwrap_or_else(|| {
-        if args.restore {
+        if key_may_have_history {
             let sapling = u32::from(
                 network
                     .activation_height(NetworkUpgrade::Sapling)
@@ -165,51 +185,126 @@ pub async fn run(config: &AppConfig, args: &InitArgs) -> anyhow::Result<()> {
             .map_err(|_| anyhow!("failed to derive account birthday from tree state"))?
     };
 
-    match (passphrase, &recipients) {
-        (Some(passphrase), _) => WalletStore::init_with_passphrase(
+    match (&mnemonic, passphrase, &recipients) {
+        (None, _, _) => WalletStore::init_view_only(&wallet_dir, birthday.height(), network)?,
+        (Some(mnemonic), Some(passphrase), _) => WalletStore::init_with_passphrase(
             &wallet_dir,
             passphrase,
-            &mnemonic,
+            mnemonic,
             birthday.height(),
             network,
         )?,
-        (None, Some(recipients)) => WalletStore::init_with_mnemonic(
+        (Some(mnemonic), None, Some(recipients)) => WalletStore::init_with_mnemonic(
             &wallet_dir,
             recipients.iter().map(|r| r.as_ref() as _),
-            &mnemonic,
+            mnemonic,
             birthday.height(),
             network,
         )?,
-        (None, None) => unreachable!("non-encrypted init always builds identity recipients"),
+        (Some(_), None, None) => {
+            unreachable!("non-encrypted init always builds identity recipients")
+        }
     }
 
-    let seed = {
-        let mut s = mnemonic.to_seed("");
-        let secret = SecretVec::new(s.to_vec());
-        s.zeroize();
-        secret
-    };
-
     let mut db = open::init_dbs(network, &wallet_dir)?;
-    db.create_account(&args.account_name, &seed, &birthday, None)?;
+    match (&ufvk, &mnemonic) {
+        (Some(ufvk), _) => {
+            db.import_account_ufvk(
+                &args.account_name,
+                ufvk,
+                &birthday,
+                AccountPurpose::ViewOnly,
+                None,
+            )?;
+        }
+        (None, Some(mnemonic)) => {
+            let seed = {
+                let mut s = mnemonic.to_seed("");
+                let secret = SecretVec::new(s.to_vec());
+                s.zeroize();
+                secret
+            };
+            db.create_account(&args.account_name, &seed, &birthday, None)?;
+        }
+        (None, None) => unreachable!("init either imports a UFVK or has a mnemonic"),
+    }
 
     eprintln!(
         "Wallet '{}' initialized at {}",
         args.wallet,
         wallet_dir.display()
     );
-    if args.encrypt {
+    if ufvk.is_some() {
+        eprintln!(
+            "Watch-only wallet (imported UFVK): balances, history, and addresses are \
+             available; spending and wallet-encryption RPCs are disabled."
+        );
+    } else if args.encrypt {
         eprintln!(
             "Wallet is passphrase-encrypted; it starts locked. Call walletpassphrase \"<pass>\" <timeout> to unlock for sending."
         );
     } else {
         eprintln!("age identity: {}", identity_path.display());
     }
-    if !args.restore {
+    if let Some(mnemonic) = mnemonic.filter(|_| !args.restore) {
         eprintln!("\nIMPORTANT - record this mnemonic seed phrase and keep it safe:\n");
         println!("{}", mnemonic.phrase());
         eprintln!();
     }
+    Ok(())
+}
+
+/// `zecd export-ufvk`: print the wallet's Unified Full Viewing Key to stdout, for setting up
+/// a watch-only zecd elsewhere (`init --ufvk`). The UFVK is read from the wallet DB (where it
+/// is stored for scanning anyway), so this works for locked and passphrase-encrypted wallets
+/// alike and never touches spending material. Offline: no upstream connection is made.
+pub fn export_ufvk(config: &AppConfig, args: &ExportUfvkArgs) -> anyhow::Result<()> {
+    let entry: WalletEntry = config
+        .wallets
+        .get(&args.wallet)
+        .cloned()
+        .unwrap_or(WalletEntry {
+            dir: config.datadir.join(&args.wallet),
+        });
+    let wallet_dir = entry.dir;
+
+    if !WalletStore::exists(&wallet_dir) {
+        return Err(anyhow!(
+            "wallet '{}' is not initialized at {}",
+            args.wallet,
+            wallet_dir.display()
+        ));
+    }
+    // The UFVK encoding is network-scoped; refuse a network flag that contradicts the wallet
+    // on disk rather than emit a key the watch-only side would reject.
+    let st = WalletStore::read(&wallet_dir)?;
+    if st.network != config.network {
+        return Err(anyhow!(
+            "wallet '{}' is a {} wallet, but the configuration selects {}",
+            args.wallet,
+            st.network.name(),
+            config.network.name()
+        ));
+    }
+
+    let db = open::open_read(config.network, &wallet_dir)?;
+    let account_id = *db
+        .get_account_ids()?
+        .first()
+        .ok_or_else(|| anyhow!("wallet has no accounts; run `init` first"))?;
+    let account = db
+        .get_account(account_id)?
+        .ok_or_else(|| anyhow!("selected account not found"))?;
+    let ufvk = account
+        .ufvk()
+        .ok_or_else(|| anyhow!("account has no unified full viewing key"))?;
+
+    eprintln!(
+        "Unified Full Viewing Key for wallet '{}' (grants full VIEW access - balances and \
+         all transaction history - but cannot spend):",
+        args.wallet
+    );
+    println!("{}", ufvk.encode(&config.network));
     Ok(())
 }
 

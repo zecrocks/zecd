@@ -202,6 +202,97 @@ fn malformed_rpcauth_fails_startup() {
     );
 }
 
+/// A malformed `--ufvk` fails fast and offline: the key is parsed before any upstream
+/// connection (so no server is contacted for a key that can never import).
+#[test]
+fn init_with_invalid_ufvk_fails_before_any_network_io() {
+    let dir = tempfile::tempdir().unwrap();
+    let out = run_with_timeout(
+        {
+            let mut c = zecd();
+            c.args([
+                "--datadir",
+                dir.path().to_str().unwrap(),
+                "--regtest",
+                // A dead local endpoint: if init wrongly dialed before parsing the UFVK, the
+                // connect error (not the parse error) would surface.
+                "--server",
+                "127.0.0.1:1",
+                "init",
+                "--ufvk",
+                "not-a-viewing-key",
+            ]);
+            c
+        },
+        Duration::from_secs(30),
+    );
+    assert_eq!(out.status.code(), Some(1), "stderr: {}", stderr_of(&out));
+    assert!(
+        stderr_of(&out).contains("invalid unified full viewing key"),
+        "stderr: {}",
+        stderr_of(&out)
+    );
+    // No wallet was created for the bad key.
+    assert!(!dir.path().join("default").join("keys.toml").exists());
+}
+
+/// `--ufvk` is a watch-only init: combining it with `--restore` (a mnemonic) or `--encrypt`
+/// (a passphrase over the mnemonic) is contradictory, refused at the clap level.
+#[test]
+fn init_ufvk_conflicts_with_restore_and_encrypt() {
+    for other in ["--restore", "--encrypt"] {
+        let dir = tempfile::tempdir().unwrap();
+        let out = run_with_timeout(
+            {
+                let mut c = zecd();
+                c.args([
+                    "--datadir",
+                    dir.path().to_str().unwrap(),
+                    "--regtest",
+                    "init",
+                    "--ufvk",
+                    "uviewregtest1fake",
+                    other,
+                ]);
+                c
+            },
+            Duration::from_secs(10),
+        );
+        // clap's conventional usage-error exit code.
+        assert_eq!(out.status.code(), Some(2), "stderr: {}", stderr_of(&out));
+        assert!(
+            stderr_of(&out).contains("cannot be used with"),
+            "stderr: {}",
+            stderr_of(&out)
+        );
+    }
+}
+
+/// `export-ufvk` refuses cleanly when the wallet does not exist (nothing to export).
+#[test]
+fn export_ufvk_requires_an_initialized_wallet() {
+    let dir = tempfile::tempdir().unwrap();
+    let out = run_with_timeout(
+        {
+            let mut c = zecd();
+            c.args([
+                "--datadir",
+                dir.path().to_str().unwrap(),
+                "--regtest",
+                "export-ufvk",
+            ]);
+            c
+        },
+        Duration::from_secs(10),
+    );
+    assert_eq!(out.status.code(), Some(1), "stderr: {}", stderr_of(&out));
+    assert!(
+        stderr_of(&out).contains("not initialized"),
+        "stderr: {}",
+        stderr_of(&out)
+    );
+}
+
 /// Full `zecd init` flow against the public testnet lightwalletd, then a re-init refusal.
 /// Network: follows the repo convention for live tests (`--include-ignored`).
 #[test]

@@ -335,8 +335,8 @@ the validator's job there - so those rows are all - .
 | `getbalance` | ✓ | - (`z_gettotalbalance`) | Spendable balance under the ZIP-315 confirmations policy; explicit `minconf` overrides it per call (`minconf=0` is treated as 1 - a shielded note is never spendable unmined) |
 | `getbalances` | ✓ | - (`z_getbalances`, per-account) | `mine.trusted/untrusted_pending/immature` + `lastprocessedblock`; no `watchonly` object |
 | `getunconfirmedbalance` | *removed* | - | Incoming funds below the confirmation policy (incl. 0-conf via mempool stream) |
-| `getwalletinfo` | ✓ | ✓ (several fields stubbed) | bitcoind shape; `keypoolsize:1`, `descriptors:false`, `scanning` progress, `unlocked_until` when encrypted |
-| `getaddressinfo` | ✓ | - | `ismine`/`solvable`/`labels`; `scriptPubKey` empty (shielded) |
+| `getwalletinfo` | ✓ | ✓ (several fields stubbed) | bitcoind shape; `keypoolsize:1`, `descriptors:false`, `scanning` progress, `unlocked_until` when encrypted, `private_keys_enabled:false` when watch-only |
+| `getaddressinfo` | ✓ | - | `ismine`/`solvable`/`labels`; `scriptPubKey` empty (shielded); `iswatchonly` always false (deprecated in Core; the watch-only signal is `getwalletinfo.private_keys_enabled`) |
 | `setlabel` | ✓ | - (accounts replace labels) | Full address book incl. foreign addresses (purpose `"send"`) |
 | `getaddressesbylabel`, `listlabels` | ✓ | - | Core shapes and error codes (`-11` for unknown label) |
 | `listtransactions` | ✓ | - (`z_listtransactions`, different shape) | Core categories/fields (`fee` on sends, label filter, count/skip); adds `memo`/`memoStr` |
@@ -397,6 +397,51 @@ ZIP-32 account (`m/32'/coin_type'/account'`), and each address is a different di
 that account's Orchard key. librustzcash advances to the next unused diversifier and persists it,
 so each call yields a new, unused address. All of them receive into the same account and are
 spendable by the same key (ZIP-316 + ZIP-32 diversification).
+
+## Watch-only wallets (UFVK)
+
+A zecd wallet can run **watch-only**: initialized from a ZIP-316 Unified Full Viewing Key
+instead of a mnemonic, it sees everything the paired spending wallet sees - balances, incoming
+payments (including 0-conf via the mempool stream), full history - and hands out diversified
+receive addresses **of the same account**, but holds no spending material anywhere on disk or
+in memory.
+Typical split: an internet-facing payment server runs watch-only (issues invoices, detects
+payments), while the spending wallet lives elsewhere.
+
+```sh
+# On the spending wallet's host: print the wallet's Unified Full Viewing Key (offline; reads
+# only the wallet DB, works for locked/encrypted wallets too).
+zecd --datadir ./data --testnet export-ufvk --wallet default
+
+# On the watch-only host: initialize from that key. Like a restore, pass --birthday (a height
+# at or before the wallet's first transaction) to avoid the safe-but-slow default scan from
+# Sapling activation.
+zecd --datadir ./watch --testnet --server zecrocks \
+    init --ufvk "uviewtest1..." --birthday 2500000
+```
+
+Semantics, following Bitcoin Core's wallets without private keys (the modern
+`createwallet disable_private_keys=true` descriptor model - watch-only is a property of the
+whole wallet, never of individual addresses):
+
+- `getwalletinfo.private_keys_enabled: false` is **the** watch-only signal, as in Core.
+  `getaddressinfo` is unchanged: `iswatchonly` stays `false` (deprecated in Core master,
+  always false there too) and own addresses stay `solvable` (Core defines it "ignoring the
+  possible lack of private keys").
+- `getnewaddress` works (diversified addresses derive from the viewing key), and every
+  invoice the watch-only instance issues is a diversified address of the shared account -
+  always detected and spendable by the paired spending wallet, whose note detection is
+  viewing-key-based and doesn't depend on which instance issued the address. (The two
+  instances do not hand out literally identical address *sequences*: librustzcash picks
+  shielded diversifier indexes from the clock - the same is true of two same-seed zecd
+  instances.)
+- `sendtoaddress`/`sendmany` (and tparty's `shieldfunds`) fail with `-4`
+  `Error: Private keys are disabled for this wallet`; `encryptwallet` is `-16`
+  `Error: wallet does not contain private keys, nothing to encrypt.`; the passphrase RPCs
+  are `-15`, as for any unencrypted wallet - all three byte-identical to Core.
+- The UFVK grants **full view access** (all amounts, addresses, and history - ZIP-316 keys
+  carry no per-pool trimming here): share it only with hosts that may see your transaction
+  graph, and remember a watch-only datadir still deserves protection for privacy.
 
 ## Compatibility boundary
 

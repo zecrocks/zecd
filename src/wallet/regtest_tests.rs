@@ -13,7 +13,7 @@
 use bip0039::{English, Mnemonic};
 use secrecy::{SecretVec, Zeroize};
 use zcash_client_backend::data_api::chain::ChainState;
-use zcash_client_backend::data_api::{AccountBirthday, WalletWrite};
+use zcash_client_backend::data_api::{AccountBirthday, WalletRead as _, WalletWrite};
 use zcash_keys::keys::UnifiedAddressRequest;
 use zcash_primitives::block::BlockHash;
 use zcash_protocol::consensus::BlockHeight;
@@ -225,6 +225,134 @@ fn transparent_gap_limit_maps_to_keypool_ran_out() {
     assert_eq!(err.code, codes::RPC_WALLET_KEYPOOL_RAN_OUT, "{err}");
 }
 
+/// The watch-only (UFVK) pairing guarantee, offline on regtest:
+///
+/// 1. a wallet built from the spending wallet's exported UFVK (`init --ufvk` ≙
+///    `import_account_ufvk` + `AccountPurpose::ViewOnly`) derives addresses from **the same
+///    key material**: at any given diversifier index both wallets produce the identical
+///    address, so an invoice handed out by the watch-only instance is a diversified address
+///    of the account the spending wallet controls (note detection is IVK-based and
+///    diversifier-independent). NB: equality is asserted at *fixed* indexes via
+///    `get_address_for_index` - `get_next_available_address` picks its index from the wall
+///    clock (`zcash_client_sqlite`'s time-based shielded diversifiers), so two wallets'
+///    `getnewaddress` results only coincide within the same second;
+/// 2. the imported account carries no key derivation (the actor's "can this wallet spend?"
+///    signal) and reports the ViewOnly purpose (the actor's `watch_only` signal);
+/// 3. the read helpers (`is_mine`, balances) work against the watch-only DB.
+#[test]
+fn watch_only_ufvk_wallet_pairs_with_spending_wallet() {
+    use zcash_client_backend::data_api::{Account as _, AccountPurpose, AccountSource};
+    use zcash_keys::keys::UnifiedSpendingKey;
+
+    let net = network::regtest();
+
+    // The spending wallet, and the UFVK an operator would get from `export-ufvk`.
+    let spend_dir = tempfile::tempdir().unwrap();
+    let mut spend_db = open::init_dbs(net, spend_dir.path()).expect("init spending dbs");
+    let (spend_account, _) = spend_db
+        .create_account("primary", &test_seed(), &genesis_birthday(), None)
+        .expect("create spending account");
+    spend_db
+        .update_chain_tip(BlockHeight::from_u32(1))
+        .expect("set tip");
+    let ufvk = {
+        use secrecy::ExposeSecret as _;
+        let seed = test_seed();
+        UnifiedSpendingKey::from_seed(
+            &net,
+            seed.expose_secret(),
+            zip32::AccountId::try_from(0u32).unwrap(),
+        )
+        .expect("derive USK")
+        .to_unified_full_viewing_key()
+    };
+    // What export-ufvk prints is the encoding of the account's stored UFVK; both must agree.
+    let exported = spend_db
+        .get_account(spend_account)
+        .expect("read spending account")
+        .expect("spending account exists")
+        .ufvk()
+        .expect("spending account has a UFVK")
+        .encode(&net);
+    assert_eq!(
+        exported,
+        ufvk.encode(&net),
+        "exported UFVK matches the seed-derived one"
+    );
+
+    // The watch-only wallet: same UFVK, fresh DB, ViewOnly purpose (the init --ufvk path).
+    let watch_dir = tempfile::tempdir().unwrap();
+    let mut watch_db = open::init_dbs(net, watch_dir.path()).expect("init watch-only dbs");
+    let account = watch_db
+        .import_account_ufvk(
+            "watch",
+            &ufvk,
+            &genesis_birthday(),
+            AccountPurpose::ViewOnly,
+            None,
+        )
+        .expect("import the UFVK view-only");
+    let watch_account = account.id();
+    assert!(
+        account.source().key_derivation().is_none(),
+        "a view-only import carries no spending derivation"
+    );
+    assert!(
+        matches!(
+            account.source(),
+            AccountSource::Imported {
+                purpose: AccountPurpose::ViewOnly,
+                ..
+            }
+        ),
+        "the imported account reports the ViewOnly purpose"
+    );
+    watch_db
+        .update_chain_tip(BlockHeight::from_u32(1))
+        .expect("set tip");
+
+    // Address determinism: at any fixed diversifier index, both wallets derive the
+    // identical Orchard UA (same UFVK → same address space). Clock-independent, unlike
+    // `get_next_available_address` (see the test doc comment). Index 0 is skipped: it is
+    // already exposed as each account's default address with a different receiver set, and
+    // librustzcash refuses to expose a second UA at a used index (DiversifierIndexReuse).
+    for index in [1u32, 77, 4242, 1_000_000] {
+        let j = zip32::DiversifierIndex::from(index);
+        let spend_ua = spend_db
+            .get_address_for_index(spend_account, j, UnifiedAddressRequest::ORCHARD)
+            .expect("spending address query")
+            .expect("index is valid for orchard");
+        let watch_ua = watch_db
+            .get_address_for_index(watch_account, j, UnifiedAddressRequest::ORCHARD)
+            .expect("watch-only address query")
+            .expect("a view-only account still derives addresses");
+        assert_eq!(
+            watch_ua.encode(&net),
+            spend_ua.encode(&net),
+            "watch-only and spending wallets derive the same address at index {index}"
+        );
+    }
+
+    // ...and the watch-only wallet's `getnewaddress` path works from the viewing key alone.
+    let (watch_ua, _) = watch_db
+        .get_next_available_address(watch_account, UnifiedAddressRequest::ORCHARD)
+        .expect("watch-only address query")
+        .expect("a view-only account derives fresh addresses");
+    let addr = watch_ua.encode(&net);
+    assert!(addr.starts_with("uregtest1"), "{addr}");
+
+    drop(spend_db);
+    drop(watch_db);
+
+    // The read paths the RPC handlers use work against the watch-only DB.
+    assert!(
+        read::is_mine(net, watch_dir.path(), &addr),
+        "the watch-only wallet recognises its own address"
+    );
+    let bal = read::balance(net, watch_dir.path(), Default::default()).expect("balance");
+    assert_eq!((bal.total_spendable, bal.pending), (0, 0));
+}
+
 /// Received transparent outputs must surface in history under the **t-address** the payer
 /// actually paid, not the address row's unified encoding (`v_tx_outputs.to_address` carries
 /// the latter - the gap that originally broke `getreceivedbyaddress` in the tparty e2e).
@@ -428,4 +556,98 @@ async fn unencrypted_wallet_rejects_passphrase_rpcs() {
 
     // ...and it reports no unlock deadline at all.
     assert_eq!(handle.status().unlocked_until, None);
+}
+
+/// A watch-only wallet through the actor: addresses still derive, but spending and
+/// encryption commands refuse with Bitcoin Core's -4 (Private keys are disabled), and the
+/// published status carries `watch_only` (→ `getwalletinfo.private_keys_enabled: false`).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "spawns an actor that loads the bundled prover (slow); offline otherwise"]
+async fn watch_only_wallet_disables_spending_rpcs() {
+    use secrecy::ExposeSecret as _;
+    use zcash_client_backend::data_api::AccountPurpose;
+    use zcash_keys::keys::UnifiedSpendingKey;
+    use zcash_protocol::value::Zatoshis;
+    use zip321::{Payment, TransactionRequest};
+
+    let net = network::regtest();
+    let dir = tempfile::tempdir().unwrap();
+    let wd = dir.path().to_path_buf();
+
+    // Build the watch-only wallet exactly as `init --ufvk` does: a seedless keys.toml plus a
+    // view-only UFVK import (the UFVK derived from the committed test seed).
+    WalletStore::init_view_only(&wd, BlockHeight::from_u32(1), net).unwrap();
+    let ufvk = {
+        let seed = test_seed();
+        UnifiedSpendingKey::from_seed(
+            &net,
+            seed.expose_secret(),
+            zip32::AccountId::try_from(0u32).unwrap(),
+        )
+        .unwrap()
+        .to_unified_full_viewing_key()
+    };
+    let mut db = open::init_dbs(net, &wd).unwrap();
+    db.import_account_ufvk(
+        "watch",
+        &ufvk,
+        &genesis_birthday(),
+        AccountPurpose::ViewOnly,
+        None,
+    )
+    .unwrap();
+    // Address generation consults the chain height; the actor is offline here (dead
+    // upstream), so record a tip directly like the other offline tests.
+    db.update_chain_tip(BlockHeight::from_u32(1)).unwrap();
+    drop(db);
+
+    let (cfg, _shutdown_tx) = offline_actor_cfg("watch", wd);
+    let (handle, _task) = actor::spawn(cfg).await.unwrap();
+
+    // Address generation works from the viewing key alone. (Round-tripping a command also
+    // guarantees the actor has published its first status snapshot, which `spawn` itself
+    // does not wait for.)
+    let addr = handle.get_new_address(None).await.unwrap();
+    assert!(addr.starts_with("uregtest1"), "{addr}");
+
+    // The status feed marks the wallet watch-only (not encrypted - there is nothing to lock).
+    let st = handle.status();
+    assert!(st.watch_only, "status must report watch_only");
+    assert!(!st.encrypted);
+    assert_eq!(st.unlocked_until, None);
+
+    // sendtoaddress/sendmany surface Bitcoin Core's -4 before touching keys or the network.
+    let payment = Payment::new(
+        zcash_address::ZcashAddress::try_from_encoded(&addr).unwrap(),
+        Some(Zatoshis::from_u64(10_000).unwrap()),
+        None,
+        None,
+        None,
+        vec![],
+    )
+    .unwrap();
+    let e = handle
+        .send(TransactionRequest::new(vec![payment]).unwrap())
+        .await
+        .unwrap_err();
+    assert_eq!(e.code, codes::RPC_WALLET_ERROR, "{e}");
+    assert!(
+        e.message.contains("Private keys are disabled"),
+        "Bitcoin Core's watch-only refusal: {e}"
+    );
+
+    // The encryption state machine is unavailable: encryptwallet is Bitcoin Core's -16
+    // ("nothing to encrypt", wallet/rpc/encrypt.cpp), and the passphrase RPCs see an
+    // unencrypted wallet (-15), like bitcoind without privkeys.
+    let e = handle
+        .encrypt_wallet(Passphrase::from("pw".to_string()))
+        .await
+        .unwrap_err();
+    assert_eq!(e.code, codes::RPC_WALLET_ENCRYPTION_FAILED, "{e}");
+    assert!(e.message.contains("nothing to encrypt"), "{e}");
+    let e = handle
+        .unlock(Passphrase::from("pw".to_string()), 60)
+        .await
+        .unwrap_err();
+    assert_eq!(e.code, codes::RPC_WALLET_WRONG_ENC_STATE, "{e}");
 }

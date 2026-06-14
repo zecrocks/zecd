@@ -129,9 +129,10 @@ pub(crate) fn getunconfirmedbalance(
     Ok(zats_to_value(info.pending))
 }
 
-/// `getbalances` - the modern (Bitcoin Core 0.19+) balance triple. There is no watch-only
-/// support, so the `watchonly` object is omitted (as Bitcoin Core does for wallets without
-/// watch-only funds).
+/// `getbalances` - the modern (Bitcoin Core 0.19+) balance triple. The legacy `watchonly`
+/// object is always omitted: like Bitcoin Core's descriptor wallets, a zecd watch-only
+/// (UFVK) wallet reports its funds under `mine` (the addresses are the wallet's own; only
+/// signing is impossible).
 pub(crate) fn getbalances(state: &AppState, wallet: Option<&str>) -> Result<Value, RpcError> {
     let handle = state.registry.get(wallet)?;
     let info = read::balance(handle.network, &handle.dir, handle.confirmations)?;
@@ -175,7 +176,9 @@ pub(crate) fn getwalletinfo(state: &AppState, wallet: Option<&str>) -> Result<Va
         "keypoolsize": 1,
         "keypoolsize_hd_internal": 0,
         "paytxfee": zats_to_value(0),
-        "private_keys_enabled": true,
+        // False for a watch-only wallet (imported UFVK) - Bitcoin Core's signal for
+        // "this wallet cannot sign" (`disable_private_keys` wallets report the same).
+        "private_keys_enabled": !st.watch_only,
         "avoid_reuse": false,
         "scanning": scanning,
         "descriptors": false
@@ -223,8 +226,12 @@ fn addressinfo_json(
         // form, so the field stays empty (same convention as validateaddress).
         "scriptPubKey": v.script_pub_key.unwrap_or_default(),
         "ismine": ismine,
-        // The wallet can produce a spend for exactly the addresses it derives.
+        // Core: "If we know how to spend coins sent to this address, ignoring the possible
+        // lack of private keys" - so a watch-only (UFVK) wallet's own addresses are solvable
+        // too; the wallet-level signal is getwalletinfo.private_keys_enabled.
         "solvable": ismine,
+        // "(DEPRECATED) Always false" in Bitcoin Core master: per-address watch-only died
+        // with legacy wallets (descriptor wallets are watch-only per wallet, like zecd).
         "iswatchonly": false,
         "isscript": v.is_script,
         "iswitness": false,
@@ -1534,7 +1541,10 @@ mod tests {
         let e = addressinfo_json(invalid, "nonsense", false, None).unwrap_err();
         assert_eq!(e.code, crate::error::codes::RPC_INVALID_ADDRESS_OR_KEY);
 
-        // Valid: Bitcoin Core's field set, without an isvalid field.
+        // Valid: Bitcoin Core's field set, without an isvalid field. The shape is identical
+        // on watch-only (UFVK) wallets: master's `iswatchonly` is deprecated/always-false
+        // and `solvable` ignores the lack of private keys, so neither field varies - the
+        // watch-only signal is `getwalletinfo.private_keys_enabled`.
         let valid = Validation {
             is_valid: true,
             is_orchard: true,

@@ -53,6 +53,17 @@ the restore scans from Sapling activation - safe (never misses notes) but slow o
 mainnet. The wallet's receive/send history reappears as the scan progresses; balances
 are not final until `/readyz` reports ready.
 
+**Watch-only instance (have a spending wallet somewhere else):** export the viewing key
+with `zecd export-ufvk` on the spending wallet's host, then on the watch-only host:
+
+```sh
+zecd init --datadir /var/lib/zecd-watch --ufvk "uview1..." --birthday <height>
+```
+
+A watch-only wallet has no mnemonic and nothing spendable to back up - it is fully
+reconstructable from the UFVK + birthday (record both). Treat the UFVK as confidential:
+it reveals the wallet's entire transaction graph, though it cannot spend.
+
 ## Monitoring
 
 - `GET /healthz` (health port, default 9233) - liveness.

@@ -16,8 +16,8 @@ use zcash_client_backend::data_api::wallet::{
     SpendingKeys,
 };
 use zcash_client_backend::data_api::{
-    Account, TransactionDataRequest, TransactionStatus, TransparentOutputFilter, WalletRead,
-    WalletWrite,
+    Account, AccountPurpose, AccountSource, TransactionDataRequest, TransactionStatus,
+    TransparentOutputFilter, WalletRead, WalletWrite,
 };
 use zcash_client_backend::fees::{
     standard::MultiOutputChangeStrategy, DustOutputPolicy, SplitPolicy, StandardFeeRule,
@@ -206,6 +206,9 @@ struct WalletActor {
     /// Whether the wallet is passphrase-encrypted (read from `keys.toml` at spawn). Gates the
     /// Bitcoin-Core-style `walletpassphrase`/`walletlock`/`encryptwallet` behavior.
     encrypted: bool,
+    /// Whether the wallet is watch-only (its account is an imported UFVK with no spending
+    /// material). Spend and encryption commands refuse with Bitcoin Core's -4.
+    watch_only: bool,
     /// For an encrypted wallet that's currently unlocked: when the seed auto-relocks. Re-running
     /// `walletpassphrase` overwrites it (resetting the timer); `walletlock` clears it.
     unlock_until: Option<Instant>,
@@ -243,16 +246,23 @@ pub async fn spawn(
 
     let db_data = open::init_dbs_with(cfg.network, &cfg.wallet_dir, cfg.gap_limit)?;
     let db_cache = open::open_fsblockdb(&cfg.wallet_dir)?;
-    let (account_id, account_index) = select_account(&db_data)?;
+    let (account_id, account_index, watch_only) = select_account(&db_data)?;
 
     // Determine the wallet's encryption mode, and for unencrypted wallets optionally decrypt
     // the seed up-front for unattended sending. An encrypted wallet has no passphrase at rest,
     // so it cannot auto-unlock - it starts locked and requires `walletpassphrase` (matching
-    // Bitcoin Core's encrypted-wallet behavior).
+    // Bitcoin Core's encrypted-wallet behavior). A watch-only wallet has no seed anywhere, so
+    // the whole unlock machinery is moot for it.
     let st = store::WalletStore::read(&cfg.wallet_dir)?;
     let encrypted = st.is_encrypted();
     let mut seed = SeedKeeper::locked();
-    if encrypted {
+    if watch_only {
+        info!(
+            "[{}] watch-only wallet (imported UFVK): balances, history, and addresses are \
+             available; spending and wallet-encryption RPCs are disabled",
+            cfg.name
+        );
+    } else if encrypted {
         info!(
             "[{}] wallet is passphrase-encrypted; it starts locked - call walletpassphrase to unlock for sending",
             cfg.name
@@ -294,7 +304,16 @@ pub async fn spawn(
         .map_err(|e| anyhow!("failed to build prover: {e}"))?;
 
     let (cmd_tx, cmd_rx) = mpsc::channel(64);
-    let (status_tx, status_rx) = watch::channel(SyncStatus::default());
+    // Seed the status channel with the wallet's static facts (encryption mode, watch-only)
+    // so an RPC racing the actor's first `update_status` - which only runs after the initial
+    // connect attempt - never reports a default-shaped wallet (e.g. `private_keys_enabled:
+    // true` for a watch-only wallet, or a missing `unlocked_until` for an encrypted one).
+    let (status_tx, status_rx) = watch::channel(SyncStatus {
+        encrypted,
+        watch_only,
+        unlocked_until: encrypted.then_some(0),
+        ..SyncStatus::default()
+    });
 
     let actor = WalletActor {
         name: cfg.name.clone(),
@@ -326,6 +345,7 @@ pub async fn spawn(
         last_rebroadcast: None,
         subtree_roots_synced: false,
         encrypted,
+        watch_only,
         unlock_until: None,
         auto_shield: cfg.auto_shield,
         last_shield_txid: None,
@@ -348,7 +368,10 @@ pub async fn spawn(
     ))
 }
 
-fn select_account(db: &WriteDb) -> anyhow::Result<(AccountUuid, Option<zip32::AccountId>)> {
+/// The actor's view of the wallet's (single) account: its id, the ZIP-32 index spending keys
+/// derive at (`None` when no spending is possible), and whether the account is watch-only
+/// (imported UFVK - `init --ufvk`).
+fn select_account(db: &WriteDb) -> anyhow::Result<(AccountUuid, Option<zip32::AccountId>, bool)> {
     let ids = db.get_account_ids()?;
     let id = *ids
         .first()
@@ -357,7 +380,20 @@ fn select_account(db: &WriteDb) -> anyhow::Result<(AccountUuid, Option<zip32::Ac
         .get_account(id)?
         .ok_or_else(|| anyhow!("selected account not found"))?;
     let index = account.source().key_derivation().map(|d| d.account_index());
-    Ok((id, index))
+    let watch_only = matches!(
+        account.source(),
+        AccountSource::Imported {
+            purpose: AccountPurpose::ViewOnly,
+            ..
+        }
+    );
+    Ok((id, index, watch_only))
+}
+
+/// Bitcoin Core's exact refusal for spend/key operations on a wallet without private keys
+/// (`-4`, wallet.cpp); zecd's watch-only (UFVK) wallets surface it for the same calls.
+fn private_keys_disabled() -> RpcError {
+    RpcError::wallet("Error: Private keys are disabled for this wallet")
 }
 
 impl WalletActor {
@@ -813,6 +849,7 @@ impl WalletActor {
             scan_progress,
             scanning,
             encrypted: self.encrypted,
+            watch_only: self.watch_only,
             unlocked_until,
             last_shield_txid: self.last_shield_txid.clone(),
         };
@@ -1205,9 +1242,20 @@ impl WalletActor {
             };
         }
         self.relock_if_expired();
-        let account_index = self
-            .account_index
-            .ok_or_else(|| RpcError::wallet("Cannot spend from a view-only account"))?;
+        if self.watch_only && !force {
+            // Auto path on a watch-only wallet: nothing can ever shield. Warn once, not
+            // every sync interval (mirrors the locked-seed case below).
+            if !self.shield_locked_warned {
+                warn!(
+                    "[{}] auto-shield is configured but this is a watch-only wallet (no \
+                     spending keys); transparent deposits will accumulate unshielded",
+                    self.name
+                );
+                self.shield_locked_warned = true;
+            }
+            return Ok(None);
+        }
+        let account_index = self.account_index.ok_or_else(private_keys_disabled)?;
         let usk = match self.seed.derive_usk(self.network, account_index) {
             Ok(usk) => {
                 self.shield_locked_warned = false;
@@ -1371,9 +1419,7 @@ impl WalletActor {
         // hasn't fired yet (e.g. a long sync batch was in progress), lock now so the spend
         // can't slip through past its timeout. `derive_usk` then returns -13 as expected.
         self.relock_if_expired();
-        let account_index = self
-            .account_index
-            .ok_or_else(|| RpcError::wallet("Cannot spend from a view-only account"))?;
+        let account_index = self.account_index.ok_or_else(private_keys_disabled)?;
         let usk = self.seed.derive_usk(self.network, account_index)?;
 
         // Proposal building + proving is CPU-heavy (Sapling/Orchard proofs take seconds).
@@ -1691,6 +1737,15 @@ impl WalletActor {
     /// and leave the wallet locked. -15 if already encrypted. Unlike Bitcoin Core, the seed is
     /// NOT regenerated - the same mnemonic is preserved, only its at-rest wrapping changes.
     fn do_encrypt_wallet(&mut self, passphrase: store::Passphrase) -> Result<(), RpcError> {
+        // A watch-only wallet stores no mnemonic at all; there is nothing to wrap under a
+        // passphrase (the UFVK must stay readable for scanning). Bitcoin Core's exact refusal
+        // for wallets without private keys is -16, not the generic -4 (wallet/rpc/encrypt.cpp).
+        if self.watch_only {
+            return Err(RpcError::new(
+                codes::RPC_WALLET_ENCRYPTION_FAILED,
+                "Error: wallet does not contain private keys, nothing to encrypt.",
+            ));
+        }
         if self.encrypted {
             return Err(RpcError::new(
                 codes::RPC_WALLET_WRONG_ENC_STATE,

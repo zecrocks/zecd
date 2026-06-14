@@ -92,6 +92,23 @@ impl WalletStore {
         write_keys_atomic(wallet_dir, &encoding, true)
     }
 
+    /// Create a new `keys.toml` for a watch-only wallet (imported UFVK): network and birthday
+    /// only, no mnemonic. The viewing key itself lives (in the clear, as for every wallet) in
+    /// the wallet DB's accounts table; there is no spending material on disk at all.
+    pub fn init_view_only(
+        wallet_dir: &Path,
+        birthday: BlockHeight,
+        network: ZNetwork,
+    ) -> anyhow::Result<()> {
+        let encoding = StoreEncoding {
+            mnemonic: None,
+            network: Some(network.name().to_string()),
+            birthday: Some(u32::from(birthday)),
+            encryption: None,
+        };
+        write_keys_atomic(wallet_dir, &encoding, true)
+    }
+
     pub fn read(wallet_dir: &Path) -> anyhow::Result<WalletStore> {
         let path = keys_path(wallet_dir);
         let mut text = String::new();
@@ -347,6 +364,26 @@ mod tests {
         assert!(st
             .decrypt_seed_with_passphrase(Passphrase::from("wrong".to_string()))
             .is_err());
+    }
+
+    #[test]
+    fn view_only_wallet_stores_no_seed() {
+        let dir = tempfile::tempdir().unwrap();
+        WalletStore::init_view_only(dir.path(), BlockHeight::from_u32(7), ZNetwork::Test).unwrap();
+        let st = WalletStore::read(dir.path()).unwrap();
+        assert!(!st.has_seed(), "a watch-only wallet has no stored mnemonic");
+        assert!(
+            !st.is_encrypted(),
+            "no spending material, so nothing is passphrase-encrypted"
+        );
+        assert_eq!(st.network, ZNetwork::Test);
+        assert_eq!(u32::from(st.birthday), 7);
+        // Nothing to decrypt: the seed accessors yield None rather than erroring.
+        let identity = age::x25519::Identity::generate();
+        assert!(st
+            .decrypt_seed(std::iter::once(&identity as &dyn age::Identity))
+            .unwrap()
+            .is_none());
     }
 
     #[test]

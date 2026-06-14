@@ -13,6 +13,7 @@ async fn main() -> anyhow::Result<()> {
 
     match &cli.command {
         Some(Command::Init(args)) => zecd::init::run(&config, args).await,
+        Some(Command::ExportUfvk(args)) => zecd::init::export_ufvk(&config, args),
         _ => daemon::run(config, DaemonOptions::zecd()).await,
     }
 }

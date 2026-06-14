@@ -1,13 +1,15 @@
 //! Wallet lifecycle test: graceful `stop`, then restore-from-mnemonic.
 //!
-//! A fresh wallet's first receive address is a deterministic function of its seed (one
-//! ZIP-32 account, first diversifier index), so a restored wallet deriving the same first
-//! address as the original proves the mnemonic round-trip end to end - init's stdout
-//! phrase, `init --restore --birthday` (phrase on stdin), and the daemon coming up on the
-//! restored DB - without needing funds. (The funds-restore flow is validated manually on
-//! testnet; see the project docs.) Along the way the original daemon is shut down with the `stop`
-//! RPC, asserting bitcoind's reply shape and a clean exit - the only live verification of
-//! `stop` semantics.
+//! A wallet's Unified Full Viewing Key is a deterministic function of its seed (one ZIP-32
+//! account), so a restored wallet exporting the identical UFVK proves the mnemonic
+//! round-trip end to end - init's stdout phrase, `init --restore --birthday` (phrase on
+//! stdin), and the daemon coming up on the restored DB - without needing funds. (The
+//! funds-restore flow is validated manually on testnet; see the project docs. Receive *addresses*
+//! are deliberately not compared: librustzcash picks shielded diversifier indexes from the
+//! wall clock, so two `getnewaddress` calls minutes apart yield different diversified
+//! addresses of the same account.) Along the way the original daemon is shut down with the
+//! `stop` RPC, asserting bitcoind's reply shape and a clean exit - the only live
+//! verification of `stop` semantics.
 //!
 //! Extended tier: set `ZECD_REGTEST_EXTENDED=1` (plus ZEBRAD_BIN / LIGHTWALLETD_BIN).
 //! Skips cleanly otherwise.
@@ -50,7 +52,9 @@ async fn regtest_stop_and_restore() {
         .await
         .expect("launch lightwalletd");
 
-    // 1. The original wallet: capture its generated mnemonic and first receive address.
+    // 1. The original wallet: capture its generated mnemonic and its UFVK (the
+    //    deterministic fingerprint of the seed's key material; exported before `stop`
+    //    tears down the datadir).
     let cfg_a = ZecdConfig::new(lwd.grpc_port, pick_port().expect("pick zecd rpc port"));
     let zecd_a = Zecd::start(&cfg_a)
         .await
@@ -76,6 +80,9 @@ async fn regtest_stop_and_restore() {
         .expect("address is a string")
         .to_string();
     assert!(addr_a.starts_with("uregtest1"), "{addr_a}");
+    let ufvk_a = zecd_a
+        .export_ufvk("default")
+        .expect("export-ufvk on the original wallet");
 
     // 2. Graceful shutdown: `stop` answers "zecd stopping" and the process exits 0
     //    (asserted inside `shutdown`).
@@ -98,7 +105,15 @@ async fn regtest_stop_and_restore() {
         .await
         .expect("the restored wallet scans from its birthday to the tip");
 
-    // Same seed, fresh DB: the first derived address matches the original wallet's.
+    // Same seed, fresh DB: the restored wallet derives the identical UFVK - same account
+    // key material, so every address either instance ever issued belongs to it.
+    assert_eq!(
+        zecd_b
+            .export_ufvk("default")
+            .expect("export-ufvk on the restored wallet"),
+        ufvk_a,
+        "the restored wallet derives the same key material as the original"
+    );
     let addr_b = zecd_b
         .call("getnewaddress", json!([]))
         .await
@@ -106,10 +121,7 @@ async fn regtest_stop_and_restore() {
         .as_str()
         .expect("address is a string")
         .to_string();
-    assert_eq!(
-        addr_b, addr_a,
-        "the restored wallet derives the same first address as the original"
-    );
+    assert!(addr_b.starts_with("uregtest1"), "{addr_b}");
 
     // The restored wallet is empty and healthy.
     let bal = zecd_b

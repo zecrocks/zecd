@@ -62,6 +62,10 @@ pub struct SyncStatus {
     /// True when the wallet is passphrase-encrypted (Bitcoin Core's `HasEncryptionKeys()`).
     /// Drives whether `getwalletinfo` reports `unlocked_until` and how the passphrase RPCs behave.
     pub encrypted: bool,
+    /// True for a watch-only wallet (imported UFVK; no spending material anywhere). Drives
+    /// `getwalletinfo.private_keys_enabled` - the wallet-level signal, as in Bitcoin Core's
+    /// descriptor wallets (per-address `iswatchonly` is deprecated there and stays false).
+    pub watch_only: bool,
     /// For an encrypted wallet: the unix time the seed auto-relocks (0 = locked now), matching
     /// Bitcoin Core's `getwalletinfo.unlocked_until`. `None` for unencrypted wallets.
     pub unlocked_until: Option<i64>,

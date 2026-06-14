@@ -14,7 +14,7 @@ name: Regtest E2E
 # Runs on PRs and pushes to main against the pinned zebra image. The weekly schedule is the
 # "big run": it tests BOTH the pinned image (re-validating the baseline) and zfnd/zebra:latest
 # (an early-warning canary for upstream zebra changes), and - like manual dispatches - sets
-# ZECD_REGTEST_EXTENDED=1 so the extended tests (reorg, multiwallet, stop/restore) run too;
+# ZECD_REGTEST_EXTENDED=1 so the extended tests (reorg, multiwallet, stop/restore, watch-only) run too;
 # on PR runs those skip in seconds (each spins its own zebra+lightwalletd stack).
 
 on:
@@ -74,7 +74,7 @@ jobs:
         image: ${{ github.event_name == 'schedule' && fromJSON('["pinned", "latest"]') || fromJSON('["event"]') }}
         include:
           - suite: zecd
-            tests: --test regtest_e2e --test regtest_funded --test regtest_failover --test regtest_hang --test regtest_reorg --test regtest_multiwallet --test regtest_restore --test regtest_zebra
+            tests: --test regtest_e2e --test regtest_funded --test regtest_failover --test regtest_hang --test regtest_reorg --test regtest_multiwallet --test regtest_restore --test regtest_watchonly --test regtest_zebra
           - suite: tparty
             tests: --test regtest_tparty
     name: regtest (${{ matrix.suite }}, ${{ matrix.image }})
@@ -177,7 +177,7 @@ jobs:
           DEVTOOL_BIN: ${{ github.workspace }}/zcash-devtool/target/release/zcash-devtool
           # Capture zebrad's logs so a startup failure is diagnosable from the CI run.
           ZEBRAD_STDERR: ${{ runner.temp }}/zebrad.log
-          # The extended tier (reorg, multiwallet, stop/restore) runs on the weekly "big
+          # The extended tier (reorg, multiwallet, stop/restore, watch-only) runs on the weekly "big
           # run" and on manual dispatches; PR/push runs let those tests skip in seconds.
           ZECD_REGTEST_EXTENDED: ${{ (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && '1' || '' }}
           # ZEBRAD_BIN / LIGHTWALLETD_BIN are exported by the provisioning step above.

@@ -627,7 +627,11 @@ pub struct ZecdConfig {
     /// Restore the default wallet from this mnemonic (`zecd init --restore`, phrase on stdin)
     /// instead of generating a fresh one.
     pub restore_mnemonic: Option<String>,
-    /// `--birthday` for the restore path (a fresh init defaults near the tip on its own).
+    /// Create the default wallet watch-only from this Unified Full Viewing Key
+    /// (`zecd init --ufvk`) instead of a mnemonic.
+    pub ufvk: Option<String>,
+    /// `--birthday` for the restore/watch-only paths (a fresh init defaults near the tip on
+    /// its own).
     pub birthday: Option<u32>,
 }
 
@@ -646,6 +650,7 @@ impl ZecdConfig {
             primary_recheck_secs: 3,
             extra_wallets: Vec::new(),
             restore_mnemonic: None,
+            ufvk: None,
             birthday: None,
         }
     }
@@ -665,6 +670,7 @@ impl ZecdConfig {
             primary_recheck_secs: 3,
             extra_wallets: Vec::new(),
             restore_mnemonic: None,
+            ufvk: None,
             birthday: None,
         }
     }
@@ -739,6 +745,38 @@ impl Zecd {
 
         zecd.wait_until_rpc_up().await?;
         Ok(zecd)
+    }
+
+    /// Run `zecd export-ufvk` against this daemon's datadir and return the printed Unified
+    /// Full Viewing Key (the last stdout line). Safe while the daemon runs: the command only
+    /// reads the wallet DB.
+    pub fn export_ufvk(&self, wallet: &str) -> Result<String> {
+        let out = Command::new(zecd_bin())
+            .args([
+                "--datadir",
+                self._datadir.path().to_str().unwrap(),
+                "--regtest",
+                "export-ufvk",
+                "--wallet",
+                wallet,
+            ])
+            .output()
+            .context("spawn zecd export-ufvk")?;
+        if !out.status.success() {
+            bail!(
+                "zecd export-ufvk failed ({}):\n{}",
+                out.status,
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        stdout
+            .lines()
+            .rev()
+            .map(str::trim)
+            .find(|l| !l.is_empty())
+            .map(str::to_string)
+            .ok_or_else(|| anyhow!("export-ufvk printed nothing on stdout"))
     }
 
     /// Graceful shutdown via the `stop` RPC: asserts bitcoind's reply shape ("zecd stopping"),
@@ -1214,8 +1252,15 @@ fn run_zecd_init(
     let restore = (wallet == "default")
         .then(|| cfg.restore_mnemonic.clone())
         .flatten();
+    let ufvk = (wallet == "default").then(|| cfg.ufvk.clone()).flatten();
     if restore.is_some() {
         args.push("--restore".into());
+    }
+    if let Some(key) = &ufvk {
+        args.push("--ufvk".into());
+        args.push(key.clone());
+    }
+    if restore.is_some() || ufvk.is_some() {
         if let Some(b) = cfg.birthday {
             args.push("--birthday".into());
             args.push(b.to_string());

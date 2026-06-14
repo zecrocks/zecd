@@ -154,6 +154,9 @@ def main() -> int:
     for f in ("walletname", "balance", "unconfirmed_balance", "immature_balance", "txcount", "paytxfee"):
         ck(f"has {f}", f in wi)
     ck("balance is Decimal (not float)", isinstance(wi["balance"], decimal.Decimal), repr(wi["balance"]))
+    # A seeded wallet can sign; only watch-only (init --ufvk) wallets report False here.
+    ck("private_keys_enabled is True", wi.get("private_keys_enabled") is True,
+       repr(wi.get("private_keys_enabled")))
 
     print("== amounts are exact decimals ==")
     bal = rpc.call("getbalance")
@@ -232,6 +235,10 @@ def main() -> int:
     ck("getaddressinfo has no isvalid", "isvalid" not in ai)
     for f in ("scriptPubKey", "solvable", "iswatchonly", "isscript", "iswitness", "labels"):
         ck(f"getaddressinfo has {f}", f in ai)
+    # Own addresses are solvable; iswatchonly is deprecated/always false in Core master
+    # (these hold on watch-only wallets too - the signal is private_keys_enabled).
+    ck("getaddressinfo.solvable on own address", ai["solvable"] is True)
+    ck("getaddressinfo.iswatchonly always False", ai["iswatchonly"] is False)
     try:
         rpc.call("getaddressinfo", "not-an-address")
         ck("getaddressinfo invalid raises", False)

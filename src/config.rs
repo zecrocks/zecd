@@ -520,6 +520,9 @@ pub struct Cli {
 pub enum Command {
     /// Create and initialize a new wallet (mnemonic + accounts), then exit.
     Init(InitArgs),
+    /// Print a wallet's Unified Full Viewing Key (for pairing a watch-only instance via
+    /// `init --ufvk`), then exit.
+    ExportUfvk(ExportUfvkArgs),
     /// Run the JSON-RPC daemon (default).
     Run,
 }
@@ -544,9 +547,23 @@ pub struct InitArgs {
     #[arg(long)]
     pub encrypt: bool,
 
+    /// Create a watch-only wallet from this Unified Full Viewing Key instead of a mnemonic
+    /// (export it from the spending wallet with `export-ufvk`). The wallet sees balances,
+    /// history, and addresses, but holds no spending material - spend and encryption RPCs
+    /// are disabled.
+    #[arg(long, value_name = "UFVK", conflicts_with_all = ["restore", "encrypt"])]
+    pub ufvk: Option<String>,
+
     /// Optional birthday height; defaults to the current chain tip for new wallets.
     #[arg(long)]
     pub birthday: Option<u32>,
+}
+
+#[derive(Debug, clap::Args)]
+pub struct ExportUfvkArgs {
+    /// Wallet name (selects <datadir>/<name>).
+    #[arg(long, default_value = "default")]
+    pub wallet: String,
 }
 
 impl AppConfig {

@@ -221,7 +221,8 @@ fn getwalletinfo(state: &AppState, wallet: Option<&str>) -> Result<Value, RpcErr
         "keypoolsize": state.config.tparty.gap_limit,
         "keypoolsize_hd_internal": 0,
         "paytxfee": zats_to_value(0),
-        "private_keys_enabled": true,
+        // False for a watch-only wallet (imported UFVK; auto-shield cannot run on one).
+        "private_keys_enabled": !st.watch_only,
         "avoid_reuse": false,
         "scanning": scanning,
         "descriptors": false
