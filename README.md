@@ -621,7 +621,16 @@ RPC surface:
 - Credentials follow bitcoind: `rpcuser`/`rpcpassword`, bitcoind-style `rpcauth` entries
   (`[rpc] auth = ["<user>:<salt>$<hmac-sha256>"]` or repeated `--rpcauth` flags, generated with
   bitcoin's `share/rpcauth/rpcauth.py`), and a generated cookie file (`<datadir>/.cookie`, mode
-  0600) when no user/password pair is set. There is no per-method whitelist.
+  0600) when no user/password pair is set.
+- Optional **RPC method safelist** (`[rpc] allowed_methods`): a coarse, server-wide allow-list
+  that restricts the surface to a chosen subset of methods. When the list is non-empty, any
+  method not on it is rejected with `-32601` (HTTP 404) - indistinguishable from a method that
+  doesn't exist, so a locked-down server discloses nothing about what it disabled. Absent or
+  empty means every method is served (the default); entries are validated at startup, so a typo
+  fails fast. It is *not* per-user (RPC credentials are already spend authority), but it lets you
+  shrink the blast radius of a leaked credential or buggy client - e.g. a receive-only invoicer
+  can disable `sendtoaddress`/`sendmany`/`encryptwallet`/`stop` and everything else it never
+  calls. The example config lists every method, annotated and commented, ready to uncomment.
 - Do not expose the RPC port to untrusted networks. Bind to `127.0.0.1` and/or front it with TLS
   or a reverse proxy. On mainnet, zecd refuses to start while the password is the example
   placeholder (`CHANGE-ME`).

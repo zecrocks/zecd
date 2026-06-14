@@ -238,6 +238,10 @@ pub struct RpcConfig {
     /// Max concurrent in-flight requests before returning HTTP 503 (Bitcoin Core's
     /// `-rpcworkqueue`, default 100).
     pub work_queue: usize,
+    /// RPC method safelist. Empty (the default) serves every method; non-empty serves *only*
+    /// these methods, with anything else rejected as method-not-found (`-32601`). Names are
+    /// validated at startup against [`crate::rpc::ALL_METHODS`], so a typo fails fast.
+    pub allowed_methods: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -457,6 +461,7 @@ struct RpcFile {
     auth: Option<Vec<String>>,
     cookiefile: Option<PathBuf>,
     work_queue: Option<usize>,
+    allowed_methods: Option<Vec<String>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -748,7 +753,22 @@ impl AppConfig {
             auth: None,
             cookiefile: None,
             work_queue: None,
+            allowed_methods: None,
         });
+        // RPC method safelist: validate every entry against the known method set so a typo
+        // fails at startup rather than silently disabling a method the operator meant to keep
+        // (or, worse, appearing to allow one it doesn't). An absent or empty list means "no
+        // restriction" - never "deny everything", which would be a useless footgun.
+        let allowed_methods = rpc_file.allowed_methods.unwrap_or_default();
+        for m in &allowed_methods {
+            if !crate::rpc::is_known_method(m) {
+                anyhow::bail!(
+                    "[rpc] allowed_methods contains unknown method {m:?}; \
+                     it is not an RPC method this build implements (see the example config \
+                     for the full list)"
+                );
+            }
+        }
         let bind: IpAddr = cli
             .rpc_bind
             .clone()
@@ -776,6 +796,7 @@ impl AppConfig {
                 .cookiefile
                 .or_else(|| Some(datadir.join(".cookie"))),
             work_queue: rpc_file.work_queue.unwrap_or(100).max(1),
+            allowed_methods,
         };
 
         let keys_file = file.keys.unwrap_or(KeysFile {
@@ -1168,6 +1189,53 @@ mod tests {
         let cli = Cli::parse_from(["zecd", "--conf", conf.to_str().unwrap()]);
         let cfg = AppConfig::resolve(&cli).unwrap();
         assert_eq!(cfg.tparty.min_conf, 2);
+    }
+
+    #[test]
+    fn rpc_allowed_methods_parses_and_validates() {
+        use clap::Parser as _;
+        let dir = tempfile::tempdir().unwrap();
+        let conf = dir.path().join("zecd.toml");
+
+        // Absent -> empty list (no restriction; every method served).
+        std::fs::write(&conf, "network = \"test\"\n").unwrap();
+        let cli = Cli::parse_from(["zecd", "--conf", conf.to_str().unwrap()]);
+        let cfg = AppConfig::resolve(&cli).unwrap();
+        assert!(cfg.rpc.allowed_methods.is_empty());
+
+        // A valid list is preserved verbatim - including a method only the *other* binary
+        // serves (`shieldfunds`), so a shared config can lock down a paired deployment.
+        std::fs::write(
+            &conf,
+            "[rpc]\nallowed_methods = [\"getbalance\", \"getnewaddress\", \"shieldfunds\"]\n",
+        )
+        .unwrap();
+        let cli = Cli::parse_from(["zecd", "--conf", conf.to_str().unwrap()]);
+        let cfg = AppConfig::resolve(&cli).unwrap();
+        assert_eq!(
+            cfg.rpc.allowed_methods,
+            vec![
+                "getbalance".to_string(),
+                "getnewaddress".to_string(),
+                "shieldfunds".to_string()
+            ]
+        );
+
+        // An explicit empty array is "no restriction", never "deny everything".
+        std::fs::write(&conf, "[rpc]\nallowed_methods = []\n").unwrap();
+        let cli = Cli::parse_from(["zecd", "--conf", conf.to_str().unwrap()]);
+        let cfg = AppConfig::resolve(&cli).unwrap();
+        assert!(cfg.rpc.allowed_methods.is_empty());
+
+        // An unknown method name is a startup error (typo protection), naming the offender.
+        std::fs::write(
+            &conf,
+            "[rpc]\nallowed_methods = [\"getbalance\", \"getblance\"]\n",
+        )
+        .unwrap();
+        let cli = Cli::parse_from(["zecd", "--conf", conf.to_str().unwrap()]);
+        let err = AppConfig::resolve(&cli).unwrap_err().to_string();
+        assert!(err.contains("getblance"), "got: {err}");
     }
 
     #[test]

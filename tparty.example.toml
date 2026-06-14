@@ -34,6 +34,65 @@ bind = "127.0.0.1"
 port = 18237
 user = "zec"
 password = "change-me"
+#
+# RPC method safelist - same semantics as zecd (see zecd.example.toml for the full commentary):
+# absent/empty serves every method below; a non-empty list serves ONLY those, with anything
+# else rejected as -32601. tparty is a deposit funnel, not a spending wallet, so it never serves
+# sendtoaddress/sendmany; its extras are getshieldinginfo/shieldfunds. Names are validated at
+# startup. ⚠ = administrative or moves funds.
+# allowed_methods = [
+#   # --- Deposit + monitoring surface ---
+#   "getnewaddress",           # hand out a fresh transparent (t-) deposit address
+#   "getbalance",              # unshielded (not-yet-shielded) balance
+#   "getunconfirmedbalance",
+#   "getbalances",
+#   "getwalletinfo",
+#   "listunspent",
+#   "getshieldinginfo",        # auto-shield pipeline health
+#   "listtransactions",
+#   "listsinceblock",
+#   "gettransaction",
+#   "getreceivedbyaddress",
+#   "listreceivedbyaddress",
+#   "getreceivedbylabel",
+#   "listreceivedbylabel",
+#   "getaddressinfo",
+#   "getaddressesbylabel",
+#   "listlabels",
+#   "setlabel",
+#   "listwallets",
+#   "validateaddress",
+#   "shieldfunds",             # ⚠ forces a shield immediately, ignoring the threshold
+#
+#   # --- Chain / network / fee (read-only) ---
+#   "getrawtransaction",
+#   "sendrawtransaction",      # ⚠ broadcasts caller-built transactions
+#   "getblockchaininfo",
+#   "getblockcount",
+#   "getbestblockhash",
+#   "getblockhash",
+#   "getblockheader",
+#   "getnetworkinfo",
+#   "getconnectioncount",
+#   "getpeerinfo",
+#   "ping",
+#   "getmempoolinfo",
+#   "estimatesmartfee",
+#   "estimatefee",
+#   "settxfee",                # inert stub (always returns -8)
+#
+#   # --- Control ---
+#   "uptime",
+#   "help",
+#   "getrpcinfo",
+#   "stop",                    # ⚠ shuts the daemon down (SIGTERM / Ctrl-C also work)
+#
+#   # --- At-rest encryption / lock state (administrative) ---
+#   "walletpassphrase",
+#   "walletlock",
+#   "walletpassphrasechange",  # ⚠ rotate the passphrase
+#   "encryptwallet",           # ⚠ re-wraps the seed at rest; can lock the owner out
+# ]
 
 [keys]
 # Auto-shielding signs transactions unattended, so it needs the seed decrypted at startup.

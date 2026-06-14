@@ -202,6 +202,37 @@ fn malformed_rpcauth_fails_startup() {
     );
 }
 
+/// A typo'd method in the `[rpc] allowed_methods` safelist must fail at startup, not silently
+/// disable a method the operator believed they had enabled.
+#[test]
+fn unknown_allowed_method_fails_startup() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("zecd.toml"),
+        "[rpc]\nallowed_methods = [\"getbalance\", \"not_a_real_method\"]\n",
+    )
+    .unwrap();
+    let out = run_with_timeout(
+        {
+            let mut c = zecd();
+            c.args([
+                "--datadir",
+                dir.path().to_str().unwrap(),
+                "--network",
+                "test",
+            ]);
+            c
+        },
+        Duration::from_secs(10),
+    );
+    assert_eq!(out.status.code(), Some(1));
+    assert!(
+        stderr_of(&out).contains("not_a_real_method"),
+        "stderr: {}",
+        stderr_of(&out)
+    );
+}
+
 /// A malformed `--ufvk` fails fast and offline: the key is parsed before any upstream
 /// connection (so no server is contacted for a key that can never import).
 #[test]

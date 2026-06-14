@@ -67,6 +67,79 @@ password = "change-me"
 # Generate entries with bitcoin's share/rpcauth/rpcauth.py: `rpcauth.py <user> [password]`.
 # auth = ["alice:<salt>$<hmac-sha256 hex>"]
 # cookiefile = "./data/.cookie"
+#
+# RPC method safelist. By default (this key absent or empty) every method below is served.
+# Uncomment `allowed_methods` and keep ONLY the methods you want reachable: any method not on
+# a non-empty list is rejected with -32601 ("Method not found"), exactly as if it did not
+# exist - so a locked-down server discloses nothing about what it has disabled. Names are
+# validated at startup, so a typo fails fast instead of silently disabling a method.
+#
+# This is a coarse, server-wide gate, NOT per-user - remember RPC credentials are already spend
+# authority (see the README's SECURITY notes). Its value is shrinking the surface: a pure
+# invoicing integration only needs an address + a few read methods, so disabling the rest means
+# a leaked credential (or a buggy client) can't reach sendtoaddress, encryptwallet, stop, etc.
+#
+# Every implemented method is listed below; methods left commented stay disabled. Lines marked
+# ⚠ are administrative or move funds - think twice before exposing them.
+# allowed_methods = [
+#   # --- Typical invoicing / payment-monitoring surface (receive + read) ---
+#   "getnewaddress",           # hand out a fresh receive address
+#   "getbalance",
+#   "getbalances",
+#   "getunconfirmedbalance",
+#   "getwalletinfo",
+#   "listtransactions",
+#   "listsinceblock",
+#   "gettransaction",
+#   "listunspent",
+#   "getreceivedbyaddress",
+#   "listreceivedbyaddress",
+#   "getreceivedbylabel",
+#   "listreceivedbylabel",
+#   "getaddressinfo",
+#   "getaddressesbylabel",
+#   "listlabels",
+#   "setlabel",
+#   "listwallets",
+#   "validateaddress",
+#
+#   # --- Spending (omit entirely on a receive-only deployment) ---
+#   "sendtoaddress",           # ⚠ moves funds
+#   "sendmany",                # ⚠ moves funds
+#   "sendrawtransaction",      # ⚠ broadcasts caller-built transactions
+#
+#   # --- Chain / network / fee (read-only) ---
+#   "getrawtransaction",
+#   "getblockchaininfo",
+#   "getblockcount",
+#   "getbestblockhash",
+#   "getblockhash",
+#   "getblockheader",
+#   "getnetworkinfo",
+#   "getconnectioncount",
+#   "getpeerinfo",
+#   "ping",
+#   "getmempoolinfo",
+#   "estimatesmartfee",
+#   "estimatefee",
+#   "settxfee",                # inert stub (always returns -8)
+#
+#   # --- Control ---
+#   "uptime",
+#   "help",
+#   "getrpcinfo",
+#   "stop",                    # ⚠ shuts the daemon down (SIGTERM / Ctrl-C also work)
+#
+#   # --- At-rest encryption / lock state (administrative) ---
+#   "walletpassphrase",        # unlock an encrypted wallet for the session
+#   "walletlock",              # re-lock
+#   "walletpassphrasechange",  # ⚠ rotate the passphrase
+#   "encryptwallet",           # ⚠ re-wraps the seed at rest; can lock the owner out
+#
+#   # --- tparty only (inert under zecd; listed so one file can serve a paired deployment) ---
+#   "getshieldinginfo",
+#   "shieldfunds",             # ⚠ forces a shield immediately
+# ]
 
 [keys]
 # age identity file used to decrypt the wallet seed for unattended sending.

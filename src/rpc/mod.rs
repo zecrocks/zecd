@@ -15,6 +15,75 @@ use crate::network::ZNetwork;
 use crate::server::jsonrpc::RpcRequest;
 use crate::state::{AppState, Dispatcher};
 
+/// Every RPC method name implemented by either binary, used to validate the
+/// `[rpc] allowed_methods` safelist at startup. This is the *union* of both dispatch tables:
+/// a name served by only one binary (tparty's `getshieldinginfo`/`shieldfunds`, or zecd's
+/// `sendtoaddress`/`sendmany`) is still a valid safelist entry - it is simply inert for the
+/// binary that does not serve it, which lets one shared config file lock down a paired
+/// zecd+tparty deployment. Keep this in lockstep with `dispatch_zecd` and
+/// `tparty_methods::dispatch`; the `all_methods_matches_dispatch_tables` test enforces it.
+pub const ALL_METHODS: &[&str] = &[
+    // Control
+    "stop",
+    "uptime",
+    "help",
+    "getrpcinfo",
+    // Network
+    "getnetworkinfo",
+    "getconnectioncount",
+    "getpeerinfo",
+    "ping",
+    // Blockchain
+    "getblockchaininfo",
+    "getblockcount",
+    "getbestblockhash",
+    "getblockhash",
+    "getblockheader",
+    // Utility
+    "validateaddress",
+    "settxfee",
+    "estimatesmartfee",
+    "estimatefee",
+    "getmempoolinfo",
+    // Raw transactions
+    "getrawtransaction",
+    "sendrawtransaction",
+    // Wallet - reads
+    "getbalance",
+    "getbalances",
+    "getunconfirmedbalance",
+    "getwalletinfo",
+    "getaddressinfo",
+    "getaddressesbylabel",
+    "listlabels",
+    "listtransactions",
+    "listsinceblock",
+    "gettransaction",
+    "listunspent",
+    "getreceivedbyaddress",
+    "listreceivedbyaddress",
+    "getreceivedbylabel",
+    "listreceivedbylabel",
+    "listwallets",
+    "setlabel",
+    // Wallet - writes / async
+    "getnewaddress",
+    "sendtoaddress",
+    "sendmany",
+    "encryptwallet",
+    "walletpassphrase",
+    "walletpassphrasechange",
+    "walletlock",
+    // tparty only
+    "getshieldinginfo",
+    "shieldfunds",
+];
+
+/// Whether `name` is an RPC method implemented by either binary (see [`ALL_METHODS`]).
+pub fn is_known_method(name: &str) -> bool {
+    ALL_METHODS.contains(&name)
+}
+
 pub(crate) fn net_name(network: ZNetwork) -> &'static str {
     network.name()
 }
@@ -27,6 +96,15 @@ pub(crate) async fn dispatch(
     wallet: Option<&str>,
     req: &RpcRequest,
 ) -> Result<Value, RpcError> {
+    // RPC method safelist: when `[rpc] allowed_methods` is non-empty, ONLY those methods are
+    // served. A blocked method is rejected exactly like one that does not exist (-32601 →
+    // HTTP 404), so a locked-down server discloses nothing about the surface it has disabled.
+    // An empty safelist (the default) imposes no restriction. The gate runs ahead of the
+    // per-binary table so it applies uniformly to zecd and tparty.
+    let safelist = &state.config.rpc.allowed_methods;
+    if !safelist.is_empty() && !safelist.iter().any(|m| m == &req.method) {
+        return Err(RpcError::method_not_found(&req.method));
+    }
     match state.dispatcher {
         Dispatcher::Zecd => dispatch_zecd(state, wallet, req).await,
         Dispatcher::Tparty => tparty_methods::dispatch(state, wallet, req).await,
@@ -101,5 +179,49 @@ async fn dispatch_zecd(
         "walletlock" => wallet_methods::walletlock(state, wallet).await,
 
         other => Err(RpcError::method_not_found(other)),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeSet;
+
+    /// Extract the method names from a dispatch `match` by scanning the non-test source for
+    /// `"name" =>` arms - the only place either dispatch module uses that shape. Splitting at
+    /// `#[cfg(test)]` keeps this test's own string literals out of the result.
+    fn dispatch_arms(src: &str) -> BTreeSet<String> {
+        let code = src.split("#[cfg(test)]").next().unwrap_or(src);
+        let mut out = BTreeSet::new();
+        for line in code.lines() {
+            if let Some(rest) = line.trim_start().strip_prefix('"') {
+                if let Some(end) = rest.find('"') {
+                    if rest[end + 1..].trim_start().starts_with("=>") {
+                        out.insert(rest[..end].to_string());
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    /// `ALL_METHODS` must be exactly the union of the two dispatch tables - no stale entries
+    /// (a safelist would reject a real method) and nothing missing (a real method couldn't be
+    /// safelisted). This pins the list to the source of truth without probing dispatch (which
+    /// has side effects, e.g. `stop`).
+    #[test]
+    fn all_methods_matches_dispatch_tables() {
+        let mut from_tables = dispatch_arms(include_str!("mod.rs"));
+        from_tables.extend(dispatch_arms(include_str!("tparty_methods.rs")));
+        let declared: BTreeSet<String> = super::ALL_METHODS.iter().map(|s| s.to_string()).collect();
+        assert_eq!(
+            from_tables, declared,
+            "ALL_METHODS is out of sync with the dispatch tables (zecd + tparty union)"
+        );
+        // No duplicates in the declared slice (the set would silently absorb them otherwise).
+        assert_eq!(
+            super::ALL_METHODS.len(),
+            declared.len(),
+            "ALL_METHODS contains duplicate method names"
+        );
     }
 }

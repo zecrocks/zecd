@@ -188,6 +188,7 @@ mod tests {
             auth: vec![],
             cookiefile: None,
             work_queue: 16,
+            allowed_methods: vec![],
         };
         let config = AppConfig {
             network: crate::network::ZNetwork::Test,
@@ -332,6 +333,51 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(r.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    /// One-shot a single RPC call against a state whose `[rpc] allowed_methods` safelist is
+    /// `safelist`, returning `(http_status, envelope_error_code)`.
+    async fn call_with_safelist(safelist: Vec<String>, body: &str) -> (StatusCode, Option<i64>) {
+        let mut state = test_state();
+        let mut cfg = (*state.config).clone();
+        cfg.rpc.allowed_methods = safelist;
+        state.config = Arc::new(cfg);
+        let r = router(state)
+            .oneshot(req(body, Some(("u", "p"))))
+            .await
+            .unwrap();
+        let status = r.status();
+        let code = body_json(r).await["error"]["code"].as_i64();
+        (status, code)
+    }
+
+    /// A non-empty `allowed_methods` safelist serves only the listed methods; every other
+    /// implemented method is rejected exactly like a nonexistent one (-32601 / HTTP 404), so a
+    /// locked-down server leaks nothing about what it disabled. An empty safelist is the
+    /// unrestricted default.
+    #[tokio::test]
+    async fn allowed_methods_safelist_restricts_surface() {
+        use crate::error::codes::RPC_METHOD_NOT_FOUND;
+        let only_uptime = vec!["uptime".to_string()];
+
+        // A listed method dispatches normally.
+        let (status, code) =
+            call_with_safelist(only_uptime.clone(), r#"{"method":"uptime","id":1}"#).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(code, None);
+
+        // A real, implemented method that is NOT on the safelist is blocked, indistinguishable
+        // from one that doesn't exist.
+        let (status, code) =
+            call_with_safelist(only_uptime, r#"{"method":"getnetworkinfo","id":1}"#).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(code, Some(RPC_METHOD_NOT_FOUND as i64));
+
+        // An empty safelist imposes no restriction (the default): the same method now works.
+        let (status, code) =
+            call_with_safelist(vec![], r#"{"method":"getnetworkinfo","id":1}"#).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(code, None);
     }
 
     /// One-shot a single RPC call and return the error code from the envelope (None = success).
