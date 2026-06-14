@@ -10,10 +10,7 @@ use crate::state::AppState;
 /// `validateaddress <address>` - network-aware validity verdict for any Zcash address kind,
 /// with an `isvalid_orchard` extension flagging Orchard-receiver capability.
 pub(crate) fn validateaddress(state: &AppState, req: &RpcRequest) -> Result<Value, RpcError> {
-    let addr = req
-        .param(0)
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| RpcError::invalid_params("validateaddress requires an address"))?;
+    let addr = req.require_str(0, "validateaddress requires an address")?;
     let v = crate::address::validate(&state.config.network, addr);
     // Bitcoin Core returns only the verdict plus error details for invalid input; the
     // address echo and script fields appear only when the address is valid.
@@ -85,7 +82,6 @@ mod tests {
             id: serde_json::Value::Null,
             method: "settxfee".into(),
             params: vec![serde_json::json!(0.0001)],
-            params_raw: serde_json::Value::Null,
         };
         let e = super::settxfee(&req).unwrap_err();
         assert_eq!(e.code, crate::error::codes::RPC_INVALID_PARAMETER);

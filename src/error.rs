@@ -19,31 +19,18 @@ pub mod codes {
     pub const RPC_INTERNAL_ERROR: i32 = -32603;
     pub const RPC_PARSE_ERROR: i32 = -32700;
 
-    // General application errors.
+    // General application errors. (Bitcoin Core's `protocol.h` defines more - including a P2P
+    // client block - but a shielded light wallet has no occasion to emit them; only the codes
+    // zecd actually returns are kept. Clients still match on the numeric values.)
     pub const RPC_MISC_ERROR: i32 = -1;
-    pub const RPC_FORBIDDEN_BY_SAFE_MODE: i32 = -2;
     pub const RPC_TYPE_ERROR: i32 = -3;
     pub const RPC_INVALID_ADDRESS_OR_KEY: i32 = -5;
-    pub const RPC_OUT_OF_MEMORY: i32 = -7;
     pub const RPC_INVALID_PARAMETER: i32 = -8;
     pub const RPC_DATABASE_ERROR: i32 = -20;
     pub const RPC_DESERIALIZATION_ERROR: i32 = -22;
-    pub const RPC_VERIFY_ERROR: i32 = -25;
     pub const RPC_VERIFY_REJECTED: i32 = -26;
     pub const RPC_VERIFY_ALREADY_IN_UTXO_SET: i32 = -27;
-    pub const RPC_IN_WARMUP: i32 = -28;
     pub const RPC_METHOD_DEPRECATED: i32 = -32;
-
-    // P2P client errors (defined for completeness; a light wallet rarely emits these).
-    pub const RPC_CLIENT_NOT_CONNECTED: i32 = -9;
-    pub const RPC_CLIENT_IN_INITIAL_DOWNLOAD: i32 = -10;
-    pub const RPC_CLIENT_NODE_ALREADY_ADDED: i32 = -23;
-    pub const RPC_CLIENT_NODE_NOT_ADDED: i32 = -24;
-    pub const RPC_CLIENT_NODE_NOT_CONNECTED: i32 = -29;
-    pub const RPC_CLIENT_INVALID_IP_OR_SUBNET: i32 = -30;
-    pub const RPC_CLIENT_P2P_DISABLED: i32 = -31;
-    pub const RPC_CLIENT_MEMPOOL_DISABLED: i32 = -33;
-    pub const RPC_CLIENT_NODE_CAPACITY_REACHED: i32 = -34;
 
     // Wallet errors.
     pub const RPC_WALLET_ERROR: i32 = -4;
@@ -57,8 +44,6 @@ pub mod codes {
     pub const RPC_WALLET_ALREADY_UNLOCKED: i32 = -17;
     pub const RPC_WALLET_NOT_FOUND: i32 = -18;
     pub const RPC_WALLET_NOT_SPECIFIED: i32 = -19;
-    pub const RPC_WALLET_ALREADY_LOADED: i32 = -35;
-    pub const RPC_WALLET_ALREADY_EXISTS: i32 = -36;
 }
 
 /// Map an RPC error code to the HTTP status Bitcoin Core uses (`httprpc.cpp` `JSONErrorReply`):

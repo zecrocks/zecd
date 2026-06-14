@@ -172,6 +172,14 @@ impl WalletHandle {
         self.status_rx.borrow().clone()
     }
 
+    /// Whether the wallet actor task is still running. Becomes false once the actor stops -
+    /// e.g. it panicked outside the per-command guard, or shut down - which lets the health
+    /// endpoint surface a wallet whose *writes* are dead even though reads (which bypass the
+    /// actor) still work.
+    pub fn actor_alive(&self) -> bool {
+        !self.cmd_tx.is_closed()
+    }
+
     async fn dispatch<T>(
         &self,
         make: impl FnOnce(oneshot::Sender<Result<T, RpcError>>) -> WalletCommand,

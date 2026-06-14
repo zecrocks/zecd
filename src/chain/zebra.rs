@@ -246,6 +246,15 @@ impl ZebraClient {
     async fn block_trees(&self, hash: &str) -> anyhow::Result<(u32, u32)> {
         let verbose: VerboseBlock = self.call_as("getblock", json!([hash, 1])).await?;
         let trees = verbose.trees.unwrap_or_default();
+        // A pool that isn't active yet at this block is reported by zebra as an empty object
+        // (`"orchard": {}`), i.e. present with no `size`, so a missing size legitimately means
+        // 0 here. That makes a *malformed* post-activation response (size omitted when the pool
+        // IS active) indistinguishable from the pre-activation case without an activation-height
+        // check - see the TODO below; for now both default to 0 as lightwalletd does.
+        // TODO(hardening): once validated against a live zebra, error on a missing size for a
+        // block at/after the pool's activation height (a hostile/buggy node could otherwise feed
+        // a wrong commitment-tree size). Bounded today by the subtree-root sync + the local-node
+        // trust model.
         Ok((
             trees.sapling.and_then(|t| t.size).unwrap_or(0),
             trees.orchard.and_then(|t| t.size).unwrap_or(0),
@@ -575,9 +584,17 @@ impl ChainSource for ZebraSource {
                         .and_then(|h| u32::try_from(h).ok());
                     txs.push(FetchedTx { data, mined_height });
                 }
-                // The tx vanished between the two calls (reorged out): skip it; the next
-                // address-check pass sees the replacement chain's view.
-                Err(CallError::Rpc { .. }) => continue,
+                // The tx vanished between the two calls (reorged out / evicted): skip it; the
+                // next address-check pass sees the replacement chain's view. Only a genuine
+                // "no such transaction" is a miss - any other RPC error is surfaced rather than
+                // silently dropping the tx (which for tparty would be a missed deposit/spend),
+                // mirroring `fetch_tx`'s classification.
+                Err(CallError::Rpc { code: -5, .. }) => continue,
+                Err(CallError::Rpc { message, .. })
+                    if message.to_lowercase().contains("no such mempool") =>
+                {
+                    continue
+                }
                 Err(e) => return Err(e.into_anyhow("getrawtransaction")),
             }
         }
@@ -714,6 +731,12 @@ async fn poll_mempool(
                 return;
             }
         };
+        // Bound `seen` to the current mempool: drop txids that have left it (mined or evicted)
+        // so the set can't grow without bound if the tip doesn't advance for a long time. A tx
+        // that leaves and later reappears is then re-yielded, which is the correct "fresh
+        // arrival to scan" behavior.
+        let current: HashSet<String> = txids.iter().cloned().collect();
+        seen.retain(|t| current.contains(t));
         for txid in txids {
             if !seen.insert(txid.clone()) {
                 continue;
@@ -731,8 +754,15 @@ async fn poll_mempool(
                         return; // subscriber dropped the stream
                     }
                 }
-                // The tx left the mempool between the two calls (mined or evicted): skip.
-                Err(CallError::Rpc { .. }) => continue,
+                // The tx left the mempool between the two calls (mined or evicted): skip only on
+                // a genuine "no such transaction". Any other RPC error ends the stream (reported
+                // once) rather than being silently swallowed, matching `fetch_tx`.
+                Err(CallError::Rpc { code: -5, .. }) => continue,
+                Err(CallError::Rpc { message, .. })
+                    if message.to_lowercase().contains("no such mempool") =>
+                {
+                    continue
+                }
                 Err(e) => {
                     let _ = tx.send(Err(e.into_anyhow("getrawtransaction"))).await;
                     return;

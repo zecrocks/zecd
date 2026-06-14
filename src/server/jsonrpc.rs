@@ -18,9 +18,6 @@ pub struct RpcRequest {
     /// missing `params` yields an empty vector here; object params are uncommon for the
     /// methods we implement.
     pub params: Vec<Value>,
-    /// Raw params, preserved for the rare object-style call.
-    #[allow(dead_code)] // retained for object-style param support
-    pub params_raw: Value,
 }
 
 impl RpcRequest {
@@ -59,17 +56,21 @@ impl RpcRequest {
             }
         };
 
-        Ok(RpcRequest {
-            id,
-            method,
-            params,
-            params_raw,
-        })
+        Ok(RpcRequest { id, method, params })
     }
 
     /// Positional parameter accessor.
     pub fn param(&self, i: usize) -> Option<&Value> {
         self.params.get(i)
+    }
+
+    /// A required string parameter, or Bitcoin Core's `-32602` invalid-params error carrying
+    /// `msg` when the parameter is missing or is not a string. Centralizes the most common
+    /// param-parsing idiom in the handlers.
+    pub fn require_str(&self, i: usize, msg: &str) -> Result<&str, RpcError> {
+        self.param(i)
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| RpcError::invalid_params(msg))
     }
 }
 

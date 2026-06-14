@@ -11,7 +11,6 @@ pub mod wallet_methods;
 use serde_json::Value;
 
 use crate::error::RpcError;
-use crate::network::ZNetwork;
 use crate::server::jsonrpc::RpcRequest;
 use crate::state::{AppState, Dispatcher};
 
@@ -82,10 +81,6 @@ pub const ALL_METHODS: &[&str] = &[
 /// Whether `name` is an RPC method implemented by either binary (see [`ALL_METHODS`]).
 pub fn is_known_method(name: &str) -> bool {
     ALL_METHODS.contains(&name)
-}
-
-pub(crate) fn net_name(network: ZNetwork) -> &'static str {
-    network.name()
 }
 
 /// Route a parsed request to the method table of the binary being served (`zecd` or

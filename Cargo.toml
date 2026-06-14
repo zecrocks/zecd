@@ -56,8 +56,11 @@ age = { version = "0.11", features = ["armor"] }
 bip0039 = { version = "0.12", features = ["std", "all-languages"] }
 secrecy = "0.8"
 
-# lightwalletd transport. `tls-ring` installs the rustls crypto provider; `tls-native-roots`
-# lets us trust the OS store (and SSL_CERT_FILE), which `tls-webpki-roots` alone does not.
+# lightwalletd transport. `tls-ring` makes tonic select the `ring` rustls crypto provider for
+# its own ClientConfig (tonic 0.14 does this internally - no CryptoProvider::install_default
+# needed); keep it the *only* rustls provider feature, or tonic's auto-selection breaks (see the
+# the project docs crypto-provider gotcha). `tls-native-roots` lets us trust the OS store (and
+# SSL_CERT_FILE), which `tls-webpki-roots` alone does not.
 tonic = { version = "0.14", features = ["gzip", "tls-ring", "tls-native-roots", "tls-webpki-roots"] }
 prost = "0.14"
 # SOCKS5 proxy support for routing lightwalletd connections through Tor/Nym/any SOCKS5 proxy.

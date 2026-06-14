@@ -115,11 +115,7 @@ async fn getnewaddress(
     wallet: Option<&str>,
     req: &RpcRequest,
 ) -> Result<Value, RpcError> {
-    let label = req
-        .param(0)
-        .and_then(|v| v.as_str())
-        .map(str::to_string)
-        .filter(|s| !s.is_empty());
+    let label = wallet_methods::opt_str(req, 0).filter(|s| !s.is_empty());
     if let Some(t) = req
         .param(1)
         .and_then(|v| v.as_str())
@@ -241,8 +237,10 @@ fn listunspent(
     wallet: Option<&str>,
     req: &RpcRequest,
 ) -> Result<Value, RpcError> {
-    let minconf = req.param(0).and_then(|v| v.as_i64()).unwrap_or(1);
-    let maxconf = req.param(1).and_then(|v| v.as_i64()).unwrap_or(9_999_999);
+    // Strict typed parsing (a non-number is -3), matching zecd's listunspent and bitcoind -
+    // rather than silently swallowing a wrong-typed minconf/maxconf and using the default.
+    let minconf = wallet_methods::depth_param(req.param(0), "minconf", 1)?;
+    let maxconf = wallet_methods::depth_param(req.param(1), "maxconf", 9_999_999)?;
     let handle = state.registry.get(wallet)?;
     let st = handle.status();
     let utxos = read::list_transparent_unspent(handle.network, &handle.dir)?;

@@ -17,7 +17,7 @@ use crate::state::AppState;
 use crate::wallet::store::Passphrase;
 use crate::wallet::{labels, read, SyncStatus};
 
-fn opt_str(req: &RpcRequest, i: usize) -> Option<String> {
+pub(crate) fn opt_str(req: &RpcRequest, i: usize) -> Option<String> {
     req.param(i).and_then(|v| v.as_str()).map(|s| s.to_string())
 }
 
@@ -198,10 +198,7 @@ pub(crate) fn getaddressinfo(
     wallet: Option<&str>,
     req: &RpcRequest,
 ) -> Result<Value, RpcError> {
-    let addr = req
-        .param(0)
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| RpcError::invalid_params("getaddressinfo requires an address"))?;
+    let addr = req.require_str(0, "getaddressinfo requires an address")?;
     let handle = state.registry.get(wallet)?;
     let v = crate::address::validate(&handle.network, addr);
     let label = labels::get_label(&handle.dir, addr).ok().flatten();
@@ -247,10 +244,7 @@ pub(crate) fn setlabel(
     wallet: Option<&str>,
     req: &RpcRequest,
 ) -> Result<Value, RpcError> {
-    let addr = req
-        .param(0)
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| RpcError::invalid_params("setlabel requires an address"))?;
+    let addr = req.require_str(0, "setlabel requires an address")?;
     let label = opt_str(req, 1).unwrap_or_default();
     let handle = state.registry.get(wallet)?;
     if !crate::address::validate(&handle.network, addr).is_valid {
@@ -269,10 +263,7 @@ pub(crate) fn getaddressesbylabel(
     wallet: Option<&str>,
     req: &RpcRequest,
 ) -> Result<Value, RpcError> {
-    let label = req
-        .param(0)
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| RpcError::invalid_params("getaddressesbylabel requires a label"))?;
+    let label = req.require_str(0, "getaddressesbylabel requires a label")?;
     let handle = state.registry.get(wallet)?;
     let addrs =
         labels::addresses_for_label(&handle.dir, label).map_err(RpcError::database_internal)?;
@@ -552,10 +543,7 @@ pub(crate) fn getreceivedbyaddress(
     wallet: Option<&str>,
     req: &RpcRequest,
 ) -> Result<Value, RpcError> {
-    let addr = req
-        .param(0)
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| RpcError::invalid_params("getreceivedbyaddress requires an address"))?;
+    let addr = req.require_str(0, "getreceivedbyaddress requires an address")?;
     let minconf = depth_param(req.param(1), "minconf", 1)?;
     let handle = state.registry.get(wallet)?;
     if !crate::address::validate(&handle.network, addr).is_valid {
@@ -642,10 +630,7 @@ pub(crate) fn getreceivedbylabel(
     wallet: Option<&str>,
     req: &RpcRequest,
 ) -> Result<Value, RpcError> {
-    let label = req
-        .param(0)
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| RpcError::invalid_params("getreceivedbylabel requires a label"))?;
+    let label = req.require_str(0, "getreceivedbylabel requires a label")?;
     let minconf = depth_param(req.param(1), "minconf", 1)?;
     let handle = state.registry.get(wallet)?;
     let addrs =
@@ -791,10 +776,7 @@ pub(crate) async fn gettransaction(
     wallet: Option<&str>,
     req: &RpcRequest,
 ) -> Result<Value, RpcError> {
-    let txid = req
-        .param(0)
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| RpcError::invalid_params("gettransaction requires a txid"))?;
+    let txid = req.require_str(0, "gettransaction requires a txid")?;
     let handle = state.registry.get(wallet)?.clone();
     let st = handle.status();
     let rec = read::get_transaction(&handle.dir, txid)?
@@ -884,7 +866,7 @@ async fn gettransaction_hex(handle: &crate::wallet::WalletHandle, rec: &read::Tx
 
 /// Parse one of `listunspent`'s integer depth params with Bitcoin Core's typed-argument
 /// strictness (wrong type is a -3, not silently the default).
-fn depth_param(v: Option<&Value>, name: &str, default: i64) -> Result<i64, RpcError> {
+pub(crate) fn depth_param(v: Option<&Value>, name: &str, default: i64) -> Result<i64, RpcError> {
     match v {
         None | Some(Value::Null) => Ok(default),
         Some(v) => v
@@ -1085,10 +1067,7 @@ pub(crate) async fn sendtoaddress(
     wallet: Option<&str>,
     req: &RpcRequest,
 ) -> Result<Value, RpcError> {
-    let addr = req
-        .param(0)
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| RpcError::invalid_params("sendtoaddress requires an address"))?;
+    let addr = req.require_str(0, "sendtoaddress requires an address")?;
     let amount = req
         .param(1)
         .ok_or_else(|| RpcError::invalid_params("sendtoaddress requires an amount"))?;
@@ -1193,10 +1172,7 @@ pub(crate) async fn walletpassphrase(
     wallet: Option<&str>,
     req: &RpcRequest,
 ) -> Result<Value, RpcError> {
-    let passphrase = req
-        .param(0)
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| RpcError::invalid_params("walletpassphrase requires a passphrase"))?;
+    let passphrase = req.require_str(0, "walletpassphrase requires a passphrase")?;
     // Timeout (seconds) is required and must be a non-negative integer; huge values are clamped.
     let timeout = req.param(1).and_then(|v| v.as_i64()).ok_or_else(|| {
         RpcError::invalid_parameter("walletpassphrase requires an integer timeout (seconds)")
@@ -1230,10 +1206,7 @@ pub(crate) async fn encryptwallet(
     wallet: Option<&str>,
     req: &RpcRequest,
 ) -> Result<Value, RpcError> {
-    let passphrase = req
-        .param(0)
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| RpcError::invalid_params("encryptwallet requires a passphrase"))?;
+    let passphrase = req.require_str(0, "encryptwallet requires a passphrase")?;
     if passphrase.is_empty() {
         return Err(RpcError::invalid_parameter("passphrase cannot be empty"));
     }
@@ -1257,12 +1230,8 @@ pub(crate) async fn walletpassphrasechange(
     wallet: Option<&str>,
     req: &RpcRequest,
 ) -> Result<Value, RpcError> {
-    let old = req.param(0).and_then(|v| v.as_str()).ok_or_else(|| {
-        RpcError::invalid_params("walletpassphrasechange requires the old passphrase")
-    })?;
-    let new = req.param(1).and_then(|v| v.as_str()).ok_or_else(|| {
-        RpcError::invalid_params("walletpassphrasechange requires the new passphrase")
-    })?;
+    let old = req.require_str(0, "walletpassphrasechange requires the old passphrase")?;
+    let new = req.require_str(1, "walletpassphrasechange requires the new passphrase")?;
     if new.is_empty() {
         return Err(RpcError::invalid_parameter("passphrase cannot be empty"));
     }

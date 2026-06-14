@@ -8,7 +8,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use anyhow::anyhow;
 use secrecy::ExposeSecret;
 use tokio::sync::{mpsc, watch};
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 
 use zcash_client_backend::data_api::wallet::{
     create_proposed_transactions, decrypt_and_store_transaction,
@@ -502,7 +502,7 @@ impl WalletActor {
                 loop {
                     match self.cmd_rx.try_recv() {
                         Ok(cmd) => {
-                            if self.handle_command(cmd).await {
+                            if self.handle_command_caught(cmd).await {
                                 return;
                             }
                         }
@@ -579,7 +579,7 @@ impl WalletActor {
                         }
                     }
                     IdleEvent::Cmd(Some(cmd)) => {
-                        if self.handle_command(cmd).await {
+                        if self.handle_command_caught(cmd).await {
                             return;
                         }
                     }
@@ -612,7 +612,21 @@ impl WalletActor {
                             }
                         }
                     }
-                    IdleEvent::Mempool(Ok(Some(raw))) => self.store_mempool_tx(raw),
+                    IdleEvent::Mempool(Ok(Some(raw))) => {
+                        // Mempool txs come from a not-necessarily-honest upstream and are
+                        // trial-decrypted here; isolate any panic so it can't take the actor
+                        // (and thus all wallet writes) down. See `handle_command_caught`.
+                        if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                            self.store_mempool_tx(raw)
+                        }))
+                        .is_err()
+                        {
+                            error!(
+                                "[{}] mempool tx handler panicked; the actor continues",
+                                self.name
+                            );
+                        }
+                    }
                     IdleEvent::Mempool(Ok(None)) => {
                         // lightwalletd closes the stream when a new block is mined: sync it
                         // now instead of waiting out the rest of the poll interval. The next
@@ -634,6 +648,31 @@ impl WalletActor {
                         self.mempool = None;
                     }
                 }
+            }
+        }
+    }
+
+    /// Run one writer command, catching any panic so a single bad command can't silently take
+    /// the whole actor - and thus every wallet *write* - down until process restart (reads
+    /// bypass the actor and would keep working, masking the outage). The one *expected* panic
+    /// (the librustzcash progress-estimator underflow) is handled at its own call site; this is
+    /// the backstop for anything unforeseen on the send/shield/store path, e.g. a librustzcash
+    /// edge or odd data from a not-fully-trusted upstream. On a caught panic the command's reply
+    /// sender is dropped (the caller sees an error), but the actor loop survives.
+    async fn handle_command_caught(&mut self, cmd: WalletCommand) -> bool {
+        use futures_util::FutureExt as _;
+        match std::panic::AssertUnwindSafe(self.handle_command(cmd))
+            .catch_unwind()
+            .await
+        {
+            Ok(stop) => stop,
+            Err(_) => {
+                error!(
+                    "[{}] wallet command handler panicked; the actor continues and the command \
+                     failed (this is a bug - please report it)",
+                    self.name
+                );
+                false
             }
         }
     }

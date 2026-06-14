@@ -58,10 +58,7 @@ pub(crate) async fn getrawtransaction(
     wallet: Option<&str>,
     req: &RpcRequest,
 ) -> Result<Value, RpcError> {
-    let txid_str = req
-        .param(0)
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| RpcError::invalid_params("getrawtransaction requires a txid"))?;
+    let txid_str = req.require_str(0, "getrawtransaction requires a txid")?;
     // `verbose` is a bool in Bitcoin Core and an int in zcashd; accept both.
     let verbose = match req.param(1) {
         None | Some(Value::Null) => false,
@@ -142,10 +139,7 @@ pub(crate) async fn sendrawtransaction(
     wallet: Option<&str>,
     req: &RpcRequest,
 ) -> Result<Value, RpcError> {
-    let hexstr = req
-        .param(0)
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| RpcError::invalid_params("sendrawtransaction requires a hex string"))?;
+    let hexstr = req.require_str(0, "sendrawtransaction requires a hex string")?;
     let data = hex::decode(hexstr)
         .map_err(|_| RpcError::new(codes::RPC_DESERIALIZATION_ERROR, "TX decode failed"))?;
     let handle = state.registry.get(wallet)?.clone();

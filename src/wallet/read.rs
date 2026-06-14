@@ -28,9 +28,10 @@ pub struct BalanceInfo {
 }
 
 /// Aggregate balances via `get_wallet_summary` (mirrors devtool's `balance.rs`), under the
-/// given confirmations policy (callers default to [`ConfirmationsPolicy::default`], the
-/// ZIP-315 trusted-3/untrusted-10 policy; `getbalance` maps an explicit `minconf` onto a
-/// symmetric override).
+/// given confirmations policy. Callers pass the wallet's configured policy
+/// (`handle.confirmations`; ZIP-315 trusted-3/untrusted-10 by default) - never
+/// `ConfirmationsPolicy::default()` directly - so balances agree with what a send can spend;
+/// `getbalance` maps an explicit `minconf` onto a symmetric override.
 pub fn balance(
     network: ZNetwork,
     wallet_dir: &Path,
@@ -580,7 +581,9 @@ pub fn all_addresses(network: ZNetwork, wallet_dir: &Path) -> Vec<String> {
 }
 
 /// The wallet's exposed transparent receivers as base58 t-addresses, sorted (tparty's
-/// deposit-address universe).
+/// deposit-address universe). Test-only: tparty's RPCs surface unspent UTXOs and balances,
+/// not the raw address list, so this exists only to assert deposit-address derivation.
+#[cfg(test)]
 pub fn transparent_addresses(network: ZNetwork, wallet_dir: &Path) -> Vec<String> {
     let Ok(db) = open_read(network, wallet_dir) else {
         return Vec::new();

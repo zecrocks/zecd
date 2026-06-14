@@ -10,7 +10,6 @@
 use serde_json::{json, Value};
 
 use crate::error::RpcError;
-use crate::rpc::net_name;
 use crate::server::jsonrpc::RpcRequest;
 use crate::state::AppState;
 use crate::wallet::read;
@@ -37,7 +36,7 @@ pub(crate) fn getblockchaininfo(state: &AppState) -> Result<Value, RpcError> {
     let headers = st.chain_tip.unwrap_or(blocks);
     let mediantime = read::median_time_past(&w.dir, blocks).ok().flatten();
     Ok(json!({
-        "chain": net_name(w.network),
+        "chain": w.network.name(),
         "blocks": blocks,
         "headers": headers,
         "bestblockhash": best_hash.unwrap_or_default(),
@@ -117,10 +116,7 @@ fn parse_blockhash_param(s: &str) -> Result<(), RpcError> {
 /// difficulty - a light client never sees them). The common poller pattern - walk
 /// `nextblockhash` from a checkpoint, read `height`/`confirmations`/`time` - works.
 pub(crate) fn getblockheader(state: &AppState, req: &RpcRequest) -> Result<Value, RpcError> {
-    let hash = req
-        .param(0)
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| RpcError::invalid_params("getblockheader requires a block hash"))?;
+    let hash = req.require_str(0, "getblockheader requires a block hash")?;
     parse_blockhash_param(hash)?;
     // Param 1 (verbose, default true): the non-verbose form is the serialized 80-byte-style
     // header, which a compact-block wallet does not store - reject rather than fabricate.

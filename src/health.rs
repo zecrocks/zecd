@@ -51,24 +51,35 @@ async fn healthz() -> &'static str {
     "ok"
 }
 
-/// Compute overall readiness, whether any wallet's upstream is down, and a per-wallet status map.
-fn snapshot(state: &AppState) -> (bool, bool, Value) {
+/// Compute overall readiness, whether any wallet's upstream is down, whether any wallet's
+/// writer actor has died, and a per-wallet status map.
+fn snapshot(state: &AppState) -> (bool, bool, bool, Value) {
     let names = state.registry.names();
     let mut ready = !names.is_empty();
     let mut any_down = false;
+    let mut any_actor_down = false;
     let mut wallets = Map::new();
     for name in names {
         if let Ok(h) = state.registry.get(Some(&name)) {
             let st = h.status();
-            let w_ready = st.connected && st.scan_progress >= state.config.health.ready_progress;
+            // A dead writer actor means sends/address-generation are broken even though reads
+            // still answer from the DB - so it must fail readiness, not silently report ready.
+            let actor_alive = h.actor_alive();
+            let w_ready = actor_alive
+                && st.connected
+                && st.scan_progress >= state.config.health.ready_progress;
             ready = ready && w_ready;
             if matches!(st.conn_state, crate::wallet::ConnState::Down) {
                 any_down = true;
+            }
+            if !actor_alive {
+                any_actor_down = true;
             }
             wallets.insert(
                 name,
                 json!({
                     "connected": st.connected,
+                    "actor_alive": actor_alive,
                     "server": st.server,
                     "conn_state": st.conn_state.as_str(),
                     "chain_tip": st.chain_tip,
@@ -80,11 +91,11 @@ fn snapshot(state: &AppState) -> (bool, bool, Value) {
             );
         }
     }
-    (ready, any_down, Value::Object(wallets))
+    (ready, any_down, any_actor_down, Value::Object(wallets))
 }
 
 async fn readyz(State(state): State<AppState>) -> Response {
-    let (ready, any_down, wallets) = snapshot(&state);
+    let (ready, any_down, any_actor_down, wallets) = snapshot(&state);
     let code = if ready {
         StatusCode::OK
     } else {
@@ -92,17 +103,24 @@ async fn readyz(State(state): State<AppState>) -> Response {
     };
     let mut body = json!({ "ready": ready, "wallets": wallets });
     if !ready {
-        // Distinguish "all upstreams down" from "still syncing" so probes/alerts can tell them apart.
-        body["reason"] = json!(if any_down { "upstream_down" } else { "syncing" });
+        // Distinguish a dead writer actor from "all upstreams down" from "still syncing" so
+        // probes/alerts can tell them apart (a dead actor needs a process restart).
+        body["reason"] = json!(if any_actor_down {
+            "actor_down"
+        } else if any_down {
+            "upstream_down"
+        } else {
+            "syncing"
+        });
     }
     (code, Json(body)).into_response()
 }
 
 async fn status(State(state): State<AppState>) -> Response {
-    let (ready, _any_down, wallets) = snapshot(&state);
+    let (ready, _any_down, _any_actor_down, wallets) = snapshot(&state);
     Json(json!({
         "ready": ready,
-        "network": crate::rpc::net_name(state.config.network),
+        "network": state.config.network.name(),
         "wallets": wallets,
     }))
     .into_response()
