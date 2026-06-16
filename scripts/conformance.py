@@ -349,6 +349,33 @@ def main() -> int:
         ck("verbose hex matches", v.get("hex") == raw)
         ck("verbose vin/vout are lists", isinstance(v.get("vin"), list) and isinstance(v.get("vout"), list))
 
+    # z_listtransactions is a zecd EXTENSION (no such method in zcashd) with zcashd's z_*
+    # vocabulary, so it is checked for self-consistency, not held to a bitcoind shape.
+    print("== z_listtransactions (extension) ==")
+    ztx = rpc.call("z_listtransactions", 20)
+    ck("z_listtransactions is list", isinstance(ztx, list))
+    if ztx:
+        z = ztx[0]
+        for f in ("txid", "status", "confirmations", "pool", "category", "amount",
+                  "amountZat", "address", "outindex", "change", "outgoing",
+                  "walletconflicts"):
+            ck(f"z_listtransactions entry has {f}", f in z)
+        ck("z_listtransactions amount is Decimal", isinstance(z["amount"], decimal.Decimal))
+        ck("z_listtransactions amountZat is int", isinstance(z["amountZat"], int))
+        ck("z_listtransactions pool valid",
+           z["pool"] in ("transparent", "sapling", "orchard"))
+        ck("z_listtransactions category valid", z["category"] in ("send", "receive"))
+        ck("z_listtransactions status valid",
+           z["status"] in ("mined", "waiting", "expired", "expiringsoon"))
+        ck("z_listtransactions outgoing is bool", isinstance(z["outgoing"], bool))
+        # A send entry's amount is negative; outgoing tracks the send category.
+        ck("z_listtransactions send sign", (z["amountZat"] < 0) == (z["category"] == "send"))
+    try:
+        rpc.call("z_listtransactions", -1)
+        ck("z_listtransactions negative count raises", False)
+    except JSONRPCException as e:
+        ck("z_listtransactions negative count -> -8", e.code == -8, e.code)
+
     print("== listsinceblock (restart-safe poller) ==")
     lsb = rpc.call("listsinceblock")
     ck("has transactions list", isinstance(lsb.get("transactions"), list))

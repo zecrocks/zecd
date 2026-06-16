@@ -449,6 +449,113 @@ fn gettransaction_amount(account_balance_delta: i64, fee_paid: Option<u64>) -> i
     account_balance_delta + fee_paid.unwrap_or(0) as i64
 }
 
+/// The most recent `count` history entries after skipping `from`, in oldest-to-newest order,
+/// shared by `listtransactions` and `z_listtransactions`. Rather than expanding the whole
+/// wallet then slicing the tail, fetch transactions newest-first in growing pages and expand
+/// only as many as the window needs (zcashd's "iterate backwards until `count + from` items"
+/// done in SQL).
+///
+/// `expand` maps one transaction to its entries in natural (within-tx) order; each tx's
+/// entries are pushed reversed so that, after a final reverse of the accumulated
+/// newest-first list, the original within-tx order is restored - matching the build-all-then-
+/// slice output exactly.
+fn paginate_history(
+    wallet_dir: &std::path::Path,
+    from: usize,
+    count: usize,
+    expand: impl Fn(&read::TxRecord) -> Vec<Value>,
+) -> Result<Vec<Value>, RpcError> {
+    let want = from.saturating_add(count);
+    // Grow the transaction page until the window is covered or the wallet is exhausted. Once a
+    // page returns fewer txs than requested there are no more, so the doubling is bounded by
+    // the wallet size. We over-fetch transactions (not entries): a tx may expand to several
+    // entries, so a page of N txs yields >= N entries - enough once N txs cover the window.
+    let mut limit: u32 = (want.max(1)).min(u32::MAX as usize) as u32;
+    loop {
+        let query = read::TxQuery {
+            start_height: None,
+            end_height: None,
+            offset: 0,
+            limit: Some(limit),
+            newest_first: true,
+        };
+        let txs = read::query_transactions(wallet_dir, &query)?;
+        let full_page = txs.len() as u32 >= limit;
+        let entries = window_history_from_txs(&txs, from, count, &expand);
+        // The window is fully covered when either we produced exactly the requested count, or
+        // there are no more transactions to fetch (a non-full page is the whole tail).
+        if entries.len() >= count || !full_page {
+            return Ok(entries);
+        }
+        // More transactions may exist and the window isn't covered yet; double the page,
+        // saturating at u32::MAX (the next pass then sees a non-full page and returns).
+        match limit.checked_mul(2) {
+            Some(next) => limit = next,
+            None => {
+                if limit == u32::MAX {
+                    return Ok(entries);
+                }
+                limit = u32::MAX;
+            }
+        }
+    }
+}
+
+/// The pure windowing core of [`paginate_history`]: given transactions in newest-first order
+/// (a superset of the window suffices), expand each - pushing its entries reversed - to build
+/// the newest-first entry list, then take the `[from, from+count)` slice and reverse it back
+/// to oldest-first. Equivalent to the old "expand all oldest-first, then return the
+/// `count`-long tail after skipping `from`", but without materializing the whole history.
+fn window_history_from_txs(
+    newest_first_txs: &[read::TxRecord],
+    from: usize,
+    count: usize,
+    expand: impl Fn(&read::TxRecord) -> Vec<Value>,
+) -> Vec<Value> {
+    let want = from.saturating_add(count);
+    let mut entries: Vec<Value> = Vec::new();
+    for tx in newest_first_txs {
+        let mut tx_entries = expand(tx);
+        tx_entries.reverse();
+        entries.extend(tx_entries);
+        // Short-circuit once enough newest-first entries to satisfy the window are in hand.
+        if entries.len() >= want {
+            break;
+        }
+    }
+    let start = from.min(entries.len());
+    let end = want.min(entries.len());
+    let mut window = entries[start..end].to_vec();
+    window.reverse();
+    window
+}
+
+/// Parse `listtransactions`/`z_listtransactions`'s `count` and `from` positional args with
+/// Bitcoin Core's strictness: a negative value is `-8`, a non-integer is `-3`.
+fn count_from_params(
+    req: &RpcRequest,
+    count_i: usize,
+    from_i: usize,
+) -> Result<(usize, usize), RpcError> {
+    let count = match req.param(count_i).filter(|v| !v.is_null()) {
+        None => 10,
+        Some(v) => match v.as_i64() {
+            Some(n) if n >= 0 => n as usize,
+            Some(_) => return Err(RpcError::invalid_parameter("Negative count")),
+            None => return Err(RpcError::type_error("count must be a number")),
+        },
+    };
+    let from = match req.param(from_i).filter(|v| !v.is_null()) {
+        None => 0,
+        Some(v) => match v.as_i64() {
+            Some(n) if n >= 0 => n as usize,
+            Some(_) => return Err(RpcError::invalid_parameter("Negative from")),
+            None => return Err(RpcError::type_error("from must be a number")),
+        },
+    };
+    Ok((count, from))
+}
+
 /// `listtransactions [label] [count] [from]` - the most recent wallet history entries, one
 /// per non-change output (see [`tx_entries`] for the entry shape and sign conventions).
 pub(crate) fn listtransactions(
@@ -463,46 +570,135 @@ pub(crate) fn listtransactions(
         .and_then(|v| v.as_str())
         .filter(|s| *s != "*")
         .map(str::to_string);
-    let count = match req.param(1).filter(|v| !v.is_null()) {
-        None => 10,
-        Some(v) => match v.as_i64() {
-            Some(n) if n >= 0 => n as usize,
-            Some(_) => return Err(RpcError::invalid_parameter("Negative count")),
-            None => return Err(RpcError::type_error("count must be a number")),
-        },
-    };
-    let skip = match req.param(2).filter(|v| !v.is_null()) {
-        None => 0,
-        Some(v) => match v.as_i64() {
-            Some(n) if n >= 0 => n as usize,
-            Some(_) => return Err(RpcError::invalid_parameter("Negative from")),
-            None => return Err(RpcError::type_error("from must be a number")),
-        },
-    };
+    let (count, skip) = count_from_params(req, 1, 2)?;
     let handle = state.registry.get(wallet)?;
     let st = handle.status();
-    let txs = read::list_transactions(&handle.dir)?;
     let label_map = labels::all(&handle.dir).unwrap_or_default();
     let first_seen = labels::first_seen_all(&handle.dir).unwrap_or_default();
 
-    let mut entries: Vec<Value> = Vec::new();
-    for tx in &txs {
+    let entries = paginate_history(&handle.dir, skip, count, |tx| {
         let confirmations = tx_confirmations(&st, tx);
         let time = tx_time(tx, first_seen.get(&tx.txid_hex).copied());
-        entries.extend(tx_entries(
-            tx,
-            &label_map,
-            confirmations,
-            time,
-            label_filter.as_deref(),
-        ));
-    }
+        tx_entries(tx, &label_map, confirmations, time, label_filter.as_deref())
+    })?;
+    Ok(Value::Array(entries))
+}
 
-    // `entries` is oldest-first; return the most recent `count` after skipping `skip`.
-    let total = entries.len();
-    let end = total.saturating_sub(skip);
-    let start = end.saturating_sub(count);
-    Ok(Value::Array(entries[start..end].to_vec()))
+/// The shielded value pool name for a `v_tx_outputs.output_pool` code (zcashd's `pool`
+/// field): 0 = transparent, 2 = Sapling, 3 = Orchard.
+fn pool_name(pool: i64) -> &'static str {
+    match pool {
+        0 => "transparent",
+        2 => "sapling",
+        3 => "orchard",
+        _ => "unknown",
+    }
+}
+
+/// zcashd's per-transaction `status` (`WalletTxToJSON`): "mined" once it has a block, else
+/// "expired" for an expired-unmined tx, else "waiting". We do not surface "expiringsoon" - it
+/// needs the expiry-vs-tip window, which the wallet view does not cheaply expose here.
+fn z_tx_status(tx: &read::TxRecord) -> &'static str {
+    if tx.mined_height.is_some() {
+        "mined"
+    } else if tx.expired_unmined {
+        "expired"
+    } else {
+        "waiting"
+    }
+}
+
+/// Build the `z_listtransactions` entries for one transaction: one object per non-change
+/// output, in zcashd's vocabulary (`pool`/`outindex`/`amountZat`/`outgoing`/`status`, plus
+/// `memo`/`memoStr`). Self-transfers pair send+receive like `listtransactions`. Each entry
+/// repeats the tx-level fields, as zcashd's flattened history does.
+fn z_tx_entries(tx: &read::TxRecord, confirmations: i64, time: i64) -> Vec<Value> {
+    let status = z_tx_status(tx);
+    let mut entries = Vec::new();
+    for out in &tx.outputs {
+        if out.is_change {
+            continue;
+        }
+        let categories = output_categories(out.from_account.is_some(), out.to_account.is_some());
+        for category in categories {
+            let send = *category == "send";
+            let amount = if send { -out.value } else { out.value };
+            let mut entry = json!({
+                "txid": tx.txid_hex,
+                "status": status,
+                "confirmations": confirmations,
+                "time": time,
+                "walletconflicts": [],
+                "pool": pool_name(out.pool),
+                "category": category,
+                "amount": signed_zats_to_value(amount),
+                "amountZat": amount,
+                "address": out.to_address.clone().unwrap_or_default(),
+                "outindex": out.output_index,
+                // Change is filtered above, but the key is always present (zcashd's
+                // `walletInternal`); `outgoing` is true on the send side of a pairing.
+                "change": false,
+                "outgoing": send,
+            });
+            let obj = entry.as_object_mut().expect("entry is a JSON object");
+            if let Some(h) = tx.mined_height {
+                if let Some(hash) = &tx.block_hash {
+                    obj.insert("blockhash".into(), json!(hash));
+                }
+                obj.insert("blockheight".into(), json!(h));
+                if let Some(i) = tx.tx_index {
+                    obj.insert("blockindex".into(), json!(i));
+                }
+                if let Some(t) = tx.block_time {
+                    obj.insert("blocktime".into(), json!(t));
+                }
+            }
+            // A non-zero expiry height (0 means "never expires").
+            if let Some(e) = tx.expiry_height.filter(|e| *e != 0) {
+                obj.insert("expiryheight".into(), json!(e));
+            }
+            if send {
+                if let Some(fee) = tx.fee_paid {
+                    obj.insert("fee".into(), signed_zats_to_value(-(fee as i64)));
+                    obj.insert("feeZat".into(), json!(-(fee as i64)));
+                }
+            }
+            push_memo_fields(&mut entry, out.memo.as_deref());
+            entries.push(entry);
+        }
+    }
+    entries
+}
+
+/// `z_listtransactions [count=10] [from=0] [includeWatchonly=false]` - a zecd extension (no
+/// such method exists in zcashd) listing per-output history in zcashd's `z_*` vocabulary:
+/// `pool`/`category`/`amount`/`amountZat`/`address`/`outindex`/`outgoing`/`status`, plus
+/// `memo`/`memoStr` for shielded outputs and `fee`/`feeZat` on sends. Pagination is identical
+/// to `listtransactions` (newest-first cursor, oldest-first output). `includeWatchonly` is
+/// accepted and ignored (no watch-only support); there is no account filter.
+pub(crate) fn z_listtransactions(
+    state: &AppState,
+    wallet: Option<&str>,
+    req: &RpcRequest,
+) -> Result<Value, RpcError> {
+    // Positional args: count, from, includeWatchonly. count/from use zcashd's strictness
+    // (negative -> -8, wrong type -> -3).
+    let (count, from) = count_from_params(req, 0, 1)?;
+    // includeWatchonly: accepted (bool or omitted) and ignored.
+    match req.param(2) {
+        None | Some(Value::Null) | Some(Value::Bool(_)) => {}
+        Some(_) => return Err(RpcError::type_error("includeWatchonly must be a boolean")),
+    }
+    let handle = state.registry.get(wallet)?;
+    let st = handle.status();
+    let first_seen = labels::first_seen_all(&handle.dir).unwrap_or_default();
+
+    let entries = paginate_history(&handle.dir, from, count, |tx| {
+        let confirmations = tx_confirmations(&st, tx);
+        let time = tx_time(tx, first_seen.get(&tx.txid_hex).copied());
+        z_tx_entries(tx, confirmations, time)
+    })?;
+    Ok(Value::Array(entries))
 }
 
 /// Aggregate wallet-received outputs (non-change, paying one of our accounts) per address,
@@ -555,7 +751,9 @@ pub(crate) fn getreceivedbyaddress(
         return Err(RpcError::wallet("Address not found in wallet"));
     }
     let st = handle.status();
-    let txs = read::list_transactions(&handle.dir)?;
+    // Push the single-address filter into SQL (sublinear) rather than scanning the whole
+    // history; the aggregation then sees only this address's outputs.
+    let txs = read::received_tx_records(&handle.dir, Some(addr))?;
     let total = received_by_address(&txs, &st, minconf)
         .remove(addr)
         .map(|(amt, _, _)| amt)
@@ -576,7 +774,7 @@ pub(crate) fn listreceivedbyaddress(
     let address_filter = req.param(3).and_then(|v| v.as_str()).map(str::to_string);
     let handle = state.registry.get(wallet)?;
     let st = handle.status();
-    let txs = read::list_transactions(&handle.dir)?;
+    let txs = read::received_tx_records(&handle.dir, None)?;
     let label_map = labels::all(&handle.dir).unwrap_or_default();
     let mut received = received_by_address(&txs, &st, minconf);
 
@@ -639,7 +837,7 @@ pub(crate) fn getreceivedbylabel(
         return Err(RpcError::wallet("Label not found in wallet"));
     }
     let st = handle.status();
-    let txs = read::list_transactions(&handle.dir)?;
+    let txs = read::received_tx_records(&handle.dir, None)?;
     let received = received_by_address(&txs, &st, minconf);
     let total: u64 = addrs
         .iter()
@@ -659,7 +857,7 @@ pub(crate) fn listreceivedbylabel(
     let include_empty = req.param(1).and_then(|v| v.as_bool()).unwrap_or(false);
     let handle = state.registry.get(wallet)?;
     let st = handle.status();
-    let txs = read::list_transactions(&handle.dir)?;
+    let txs = read::received_tx_records(&handle.dir, None)?;
     let label_map = labels::all(&handle.dir).unwrap_or_default();
     let received = received_by_address(&txs, &st, minconf);
     let mut by_label = received_by_label(&received, &label_map);
@@ -724,19 +922,21 @@ pub(crate) fn listsinceblock(
         },
     };
 
-    let txs = read::list_transactions(&handle.dir)?;
+    // Push the since-height filter into SQL: `start_height = since + 1` keeps mined txs above
+    // the reference block, and an open `end_height` admits all unmined txs (matching the prior
+    // Rust predicate `h > since || mined_height IS NULL`). No reference block means everything.
+    let query = read::TxQuery {
+        start_height: since_height.map(|h| h.saturating_add(1)),
+        end_height: None,
+        offset: 0,
+        limit: None,
+        newest_first: false,
+    };
+    let txs = read::query_transactions(&handle.dir, &query)?;
     let label_map = labels::all(&handle.dir).unwrap_or_default();
     let first_seen = labels::first_seen_all(&handle.dir).unwrap_or_default();
     let mut transactions: Vec<Value> = Vec::new();
     for tx in &txs {
-        let include = match (tx.mined_height, since_height) {
-            (Some(h), Some(since)) => h > since,
-            // Unmined txs (and everything, when no reference block was given).
-            _ => true,
-        };
-        if !include {
-            continue;
-        }
         let confirmations = tx_confirmations(&st, tx);
         let time = tx_time(tx, first_seen.get(&tx.txid_hex).copied());
         transactions.extend(tx_entries(tx, &label_map, confirmations, time, None));
@@ -1791,5 +1991,162 @@ mod tests {
         // matching what getblockcount-based client math would compute.
         assert_eq!(st.confirmations(Some(101)), 0);
         assert_eq!(st.confirmations(None), 0);
+    }
+
+    /// Build a `TxRecord` with a distinct txid byte and a list of `(from, to, value,
+    /// is_change, output_index)` outputs - enough to make per-tx and within-tx ordering
+    /// observable in the windowing tests.
+    fn tx_with(
+        id: u8,
+        mined: Option<u32>,
+        expired: bool,
+        outs: &[(bool, bool, i64, bool, u32)],
+    ) -> TxRecord {
+        let outputs = outs
+            .iter()
+            .map(|&(from, to, value, is_change, idx)| {
+                let mut o = out(from, to, value, Some("addr"), is_change);
+                o.output_index = idx;
+                o
+            })
+            .collect();
+        TxRecord {
+            mined_height: mined,
+            txid_hex: format!("{id:02x}").repeat(32),
+            expiry_height: None,
+            account_balance_delta: 0,
+            fee_paid: Some(1_000),
+            sent_note_count: 0,
+            received_note_count: 0,
+            block_time: mined.map(|h| 1_700_000_000 + i64::from(h)),
+            expired_unmined: expired,
+            tx_index: mined.map(|_| 1),
+            block_hash: mined.map(|_| "ee".repeat(32)),
+            created_time: None,
+            outputs,
+            raw: None,
+        }
+    }
+
+    /// The NEW newest-first windowing (`window_history_from_txs`) must produce byte-identical
+    /// JSON to the OLD "expand all oldest-first, then return the `count`-long tail after
+    /// skipping `from`" logic, across a matrix of (count, from) including edges. The OLD logic
+    /// is kept inline here as the reference oracle.
+    #[test]
+    fn listtransactions_windowing_matches_old_slice() {
+        // A representative history (oldest-first): plain receives, a self-transfer (send +
+        // receive), a 2-recipient sendmany (2 sends), a change-only tx (0 entries), an unmined
+        // own send, and an expired send.
+        let txs_oldest_first = vec![
+            tx_with(0x01, Some(10), false, &[(false, true, 100, false, 0)]), // receive
+            tx_with(0x02, Some(11), false, &[(false, true, 200, false, 0)]), // receive
+            tx_with(0x03, Some(12), false, &[(true, true, 50, false, 0)]),   // self-transfer
+            tx_with(
+                0x04,
+                Some(13),
+                false,
+                &[(true, false, 60, false, 0), (true, false, 70, false, 1)],
+            ), // sendmany
+            tx_with(0x05, Some(14), false, &[(true, true, 80, true, 0)]), // change only -> 0 entries
+            tx_with(0x06, None, false, &[(true, false, 90, false, 0)]),   // unmined own send
+            tx_with(0x07, None, true, &[(true, false, 95, false, 0)]),    // expired send
+            tx_with(0x08, Some(15), false, &[(false, true, 110, false, 0)]), // receive
+        ];
+        let st = status(20);
+        let labels = HashMap::new();
+
+        // The shared expander, identical to what `listtransactions` feeds the windower.
+        let expand = |tx: &TxRecord| {
+            let confirmations = tx_confirmations(&st, tx);
+            let time = tx_time(tx, None);
+            tx_entries(tx, &labels, confirmations, time, None)
+        };
+
+        // OLD reference oracle: expand everything oldest-first, slice the `count`-long tail.
+        let old = |count: usize, from: usize| -> Vec<Value> {
+            let mut entries: Vec<Value> = Vec::new();
+            for tx in &txs_oldest_first {
+                entries.extend(expand(tx));
+            }
+            let total = entries.len();
+            let end = total.saturating_sub(from);
+            let start = end.saturating_sub(count);
+            entries[start..end].to_vec()
+        };
+
+        // NEW windowing operates on the newest-first tx list.
+        let newest_first: Vec<TxRecord> = txs_oldest_first.iter().rev().cloned().collect();
+
+        let total_entries = old(usize::MAX, 0).len();
+        assert!(
+            total_entries > 5,
+            "fixture should expand to several entries"
+        );
+        for &count in &[0usize, 1, 2, 3, 5, total_entries, total_entries + 5, 1000] {
+            for &from in &[0usize, 1, 2, total_entries, total_entries + 5, 1000] {
+                let want = old(count, from);
+                let got = window_history_from_txs(&newest_first, from, count, expand);
+                assert_eq!(got, want, "windowing diverged at count={count} from={from}");
+            }
+        }
+    }
+
+    #[test]
+    fn z_listtransactions_entry_shape() {
+        // A mined Orchard send carrying a text memo and a known fee.
+        let mut t = tx_with(
+            0x09,
+            Some(50),
+            false,
+            &[(true, false, 150_000_000, false, 2)],
+        );
+        t.expiry_height = Some(60);
+        t.outputs[0].pool = 3;
+        t.outputs[0].memo = Some(b"hello world".to_vec());
+        let st = status(52);
+        let e = z_tx_entries(&t, tx_confirmations(&st, &t), tx_time(&t, None));
+        assert_eq!(e.len(), 1);
+        let s = &e[0];
+        assert_eq!(s["pool"], json!("orchard"));
+        assert_eq!(s["category"], json!("send"));
+        assert_eq!(s["amountZat"], json!(-150_000_000));
+        assert_eq!(s["amount"].to_string(), "-1.50000000");
+        assert_eq!(s["outindex"], json!(2));
+        assert_eq!(s["outgoing"], json!(true));
+        assert_eq!(s["change"], json!(false));
+        assert_eq!(s["status"], json!("mined"));
+        assert_eq!(s["confirmations"], json!(3));
+        assert_eq!(s["blockheight"], json!(50));
+        assert_eq!(s["blockhash"], json!("ee".repeat(32)));
+        assert_eq!(s["expiryheight"], json!(60));
+        assert_eq!(s["feeZat"], json!(-1_000));
+        assert_eq!(s["fee"].to_string(), "-0.00001000");
+        assert_eq!(s["walletconflicts"], json!([]));
+        assert_eq!(s["memo"], json!(hex::encode(b"hello world")));
+        assert_eq!(s["memoStr"], json!("hello world"));
+
+        // A transparent receive: pool "transparent", positive amounts, no fee/outgoing, and
+        // an unmined receive reports status "waiting" with no block fields.
+        let mut r = tx_with(0x0a, None, false, &[(false, true, 250, false, 0)]);
+        r.fee_paid = None;
+        r.outputs[0].pool = 0;
+        let e = z_tx_entries(&r, tx_confirmations(&st, &r), tx_time(&r, None));
+        assert_eq!(e[0]["pool"], json!("transparent"));
+        assert_eq!(e[0]["category"], json!("receive"));
+        assert_eq!(e[0]["amountZat"], json!(250));
+        assert_eq!(e[0]["outgoing"], json!(false));
+        assert_eq!(e[0]["status"], json!("waiting"));
+        assert!(e[0].get("fee").is_none());
+        assert!(e[0].get("blockhash").is_none());
+        assert!(e[0].get("memo").is_none());
+
+        // An expired unmined tx reports status "expired".
+        let x = tx_with(0x0b, None, true, &[(true, false, 5, false, 0)]);
+        let e = z_tx_entries(&x, tx_confirmations(&st, &x), tx_time(&x, None));
+        assert_eq!(e[0]["status"], json!("expired"));
+
+        // Change outputs are filtered out (no entries).
+        let c = tx_with(0x0c, Some(50), false, &[(true, true, 5, true, 0)]);
+        assert!(z_tx_entries(&c, 1, 0).is_empty());
     }
 }

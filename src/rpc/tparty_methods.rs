@@ -70,6 +70,7 @@ pub(crate) async fn dispatch(
         "listlabels" => wallet_methods::listlabels(state, wallet),
         "setlabel" => wallet_methods::setlabel(state, wallet, req),
         "listtransactions" => wallet_methods::listtransactions(state, wallet, req),
+        "z_listtransactions" => wallet_methods::z_listtransactions(state, wallet, req),
         "listsinceblock" => wallet_methods::listsinceblock(state, wallet, req),
         "gettransaction" => wallet_methods::gettransaction(state, wallet, req).await,
         "getreceivedbyaddress" => wallet_methods::getreceivedbyaddress(state, wallet, req),

@@ -255,9 +255,37 @@ fn tx_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<(Vec<u8>, TxRecord)>
     ))
 }
 
-/// All transactions, oldest first (callers apply skip/count). Mirrors `list_tx.rs`.
-pub fn list_transactions(wallet_dir: &Path) -> anyhow::Result<Vec<TxRecord>> {
+/// Filter/pagination for [`query_transactions`], mirroring zcashd's height-range and
+/// count/from arguments. The history/received-by RPCs push their windowing through this so
+/// neither memory nor the per-tx [`load_outputs`] query scales with the whole wallet.
+#[derive(Debug, Clone, Default)]
+pub struct TxQuery {
+    /// Lowest mined height to include (inclusive); `None` imposes no lower bound. Unmined txs
+    /// are included only when `end_height` is also `None` (matching zcashd's predicate, which
+    /// keeps unmined txs in an open-ended range but drops them once an upper bound is set).
+    pub start_height: Option<u32>,
+    /// Exclusive upper mined-height bound; `None` imposes no upper bound (and admits unmined).
+    pub end_height: Option<u32>,
+    /// Rows to skip after ordering (`LIMIT ... OFFSET`).
+    pub offset: u32,
+    /// Maximum rows to return; `None` means all (`LIMIT -1`).
+    pub limit: Option<u32>,
+    /// Order newest-first (`sort_height DESC NULLS FIRST`) instead of oldest-first.
+    pub newest_first: bool,
+}
+
+/// Transactions matching `q`, each with its outputs. The WHERE clause mirrors zcashd's
+/// height predicate (`rpcwallet.cpp` `listsinceblock`/`listreceivedbyaddress` range), and the
+/// `sort_height` ordering (mined height, else a non-zero expiry height) matches what
+/// [`list_transactions`] used before pagination moved into SQL. [`load_outputs`] stays per-tx
+/// but is now bounded by `limit`, not the whole wallet.
+pub fn query_transactions(wallet_dir: &Path, q: &TxQuery) -> anyhow::Result<Vec<TxRecord>> {
     let conn = open_conn(wallet_dir)?;
+    let order = if q.newest_first {
+        "ORDER BY sort_height DESC NULLS FIRST"
+    } else {
+        "ORDER BY sort_height ASC NULLS LAST"
+    };
     let mut stmt = conn.prepare(&format!(
         "SELECT {TX_COLS},
             COALESCE(
@@ -265,20 +293,136 @@ pub fn list_transactions(wallet_dir: &Path) -> anyhow::Result<Vec<TxRecord>> {
                 CASE WHEN v.expiry_height == 0 THEN NULL ELSE v.expiry_height END
             ) AS sort_height
          {TX_FROM}
-         ORDER BY sort_height ASC NULLS LAST",
+         WHERE (:start_height IS NULL OR v.mined_height >= :start_height
+                OR (v.mined_height IS NULL AND :end_height IS NULL))
+           AND (:end_height IS NULL OR v.mined_height < :end_height)
+         {order}
+         LIMIT :limit OFFSET :offset",
     ))?;
-    let mut records = Vec::new();
-    let rows = stmt.query_map([], tx_from_row)?;
+    let rows = stmt.query_map(
+        named_params! {
+            ":start_height": q.start_height,
+            ":end_height": q.end_height,
+            // LIMIT -1 means "no limit" in SQLite.
+            ":limit": q.limit.map(i64::from).unwrap_or(-1),
+            ":offset": q.offset,
+        },
+        tx_from_row,
+    )?;
     let mut pending: Vec<(Vec<u8>, TxRecord)> = Vec::new();
     for r in rows {
         pending.push(r?);
     }
     let taddr_map = transparent_receiver_map(&conn)?;
+    let mut records = Vec::with_capacity(pending.len());
     for (txid, mut rec) in pending {
         rec.outputs = load_outputs(&conn, &txid, &taddr_map)?;
         records.push(rec);
     }
     Ok(records)
+}
+
+/// All transactions, oldest first (callers apply skip/count). Mirrors `list_tx.rs`. A thin
+/// wrapper over [`query_transactions`] with no filtering, kept for callers that genuinely
+/// want the whole history (`gettransaction.details` aggregation, tests).
+pub fn list_transactions(wallet_dir: &Path) -> anyhow::Result<Vec<TxRecord>> {
+    query_transactions(wallet_dir, &TxQuery::default())
+}
+
+/// A lightweight data source for the received-by aggregations
+/// (`getreceivedbyaddress`/`listreceivedbyaddress`/`getreceivedbylabel`/`listreceivedbylabel`),
+/// avoiding [`list_transactions`]'s N+1 [`load_outputs`] and its per-tx memo/raw/block-hash
+/// overhead. One flat query joins `v_transactions` to `v_tx_outputs`; the rows are grouped
+/// into [`TxRecord`]s carrying only the fields the aggregation reads (`mined_height`,
+/// `expired_unmined`, and each output's `to_account`/`to_address`/`value`/`is_change`), so the
+/// existing - and tested - `received_by_address` logic produces identical output.
+///
+/// `address_filter` (display encoding) is pushed into SQL for `getreceivedbyaddress`, which
+/// asks about a single address: only its outputs are loaded. The transparent-receiver rewrite
+/// (a no-op for zecd, which exposes no transparent receivers) matches [`load_outputs`] so a
+/// tparty caller's bare t-address aggregates the same as through the full path.
+pub fn received_tx_records(
+    wallet_dir: &Path,
+    address_filter: Option<&str>,
+) -> anyhow::Result<Vec<TxRecord>> {
+    let conn = open_conn(wallet_dir)?;
+    let taddr_map = transparent_receiver_map(&conn)?;
+    // The filter may be a bare t-address (tparty); map it back to the unified encoding stored
+    // in `v_tx_outputs.to_address` so the pushed-down predicate matches the stored rows.
+    let ua_for_taddr: HashMap<&str, &str> = taddr_map
+        .iter()
+        .map(|(ua, t)| (t.as_str(), ua.as_str()))
+        .collect();
+    let stored_filter = address_filter.map(|a| ua_for_taddr.get(a).copied().unwrap_or(a));
+    // Order by the same `sort_height` (oldest-first) as `list_transactions`, so the per-address
+    // `txids` list `listreceivedbyaddress` emits is in the identical order it was before this
+    // flat path replaced the full N+1 load.
+    let mut stmt = conn.prepare(
+        "SELECT v.txid, v.mined_height, v.expired_unmined,
+                o.to_address, o.value, o.is_change, o.to_account_uuid, o.output_pool
+         FROM v_transactions v
+         JOIN v_tx_outputs o ON o.txid = v.txid
+         WHERE (:addr IS NULL OR o.to_address = :addr)
+         ORDER BY COALESCE(
+                v.mined_height,
+                CASE WHEN v.expiry_height == 0 THEN NULL ELSE v.expiry_height END
+            ) ASC NULLS LAST",
+    )?;
+    let rows = stmt.query_map(named_params! { ":addr": stored_filter }, |row| {
+        Ok((
+            row.get::<_, Vec<u8>>(0)?,
+            row.get::<_, Option<u32>>(1)?,
+            row.get::<_, bool>(2)?,
+            TxOutputRecord {
+                // `output_index`/`from_account`/`memo` are unused by the aggregation; `pool`
+                // is read because it gates the transparent-receiver rewrite below (it must be
+                // the real pool, exactly as `load_outputs` does - not a hardcoded 0).
+                pool: row.get(7)?,
+                output_index: 0,
+                from_account: None,
+                to_account: row.get::<_, Option<Uuid>>(6)?,
+                to_address: row.get(3)?,
+                value: row.get(4)?,
+                is_change: row.get(5)?,
+                memo: None,
+            },
+        ))
+    })?;
+    // Group outputs back under their transaction, preserving first-seen txid order.
+    let mut order: Vec<Vec<u8>> = Vec::new();
+    let mut by_txid: HashMap<Vec<u8>, TxRecord> = HashMap::new();
+    for r in rows {
+        let (txid, mined_height, expired_unmined, mut out) = r?;
+        if out.pool == 0 && out.to_account.is_some() {
+            if let Some(t) = out.to_address.as_ref().and_then(|a| taddr_map.get(a)) {
+                out.to_address = Some(t.clone());
+            }
+        }
+        let rec = by_txid.entry(txid.clone()).or_insert_with(|| {
+            order.push(txid.clone());
+            TxRecord {
+                mined_height,
+                txid_hex: txid_display(&txid),
+                expiry_height: None,
+                account_balance_delta: 0,
+                fee_paid: None,
+                sent_note_count: 0,
+                received_note_count: 0,
+                block_time: None,
+                expired_unmined,
+                tx_index: None,
+                block_hash: None,
+                created_time: None,
+                outputs: Vec::new(),
+                raw: None,
+            }
+        });
+        rec.outputs.push(out);
+    }
+    Ok(order
+        .into_iter()
+        .map(|txid| by_txid.remove(&txid).expect("inserted above"))
+        .collect())
 }
 
 /// A single transaction by its display-hex txid.

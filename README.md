@@ -345,6 +345,7 @@ the validator's job there - so those rows are all - .
 | `setlabel` | ✓ | - (accounts replace labels) | Full address book incl. foreign addresses (purpose `"send"`) |
 | `getaddressesbylabel`, `listlabels` | ✓ | - | Core shapes and error codes (`-11` for unknown label) |
 | `listtransactions` | ✓ | - (`z_listtransactions`, different shape) | Core categories/fields (`fee` on sends, label filter, count/skip); adds `memo`/`memoStr` |
+| `z_listtransactions` | *(extension)* | ✓ (zecd matches its shape, no `account` arg) | zcashd's per-output history vocabulary: `pool`/`category`/`amount`/`amountZat`/`address`/`outindex`/`outgoing`/`status`, `memo`/`memoStr`, `fee`/`feeZat` on sends; `[count] [from] [includeWatchonly]` paging like `listtransactions` |
 | `listsinceblock` | ✓ | - | Cursor pattern; `removed` always `[]`; reorged/unknown cursor → `-5`, re-baseline (no fork-point walk-back) |
 | `gettransaction` | ✓ | - (`z_viewtransaction`, different shape) | `amount`/`fee`/`confirmations`/`details`/`hex`; foreign tx hex fetched from the upstream (lightwalletd or zebra) |
 | `listunspent` | ✓ | - (`z_listunspent`, different shape) | One entry per unspent Orchard note; synthesized `txid`/`vout`; `address` empty for change |
