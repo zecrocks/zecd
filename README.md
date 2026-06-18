@@ -280,6 +280,14 @@ With `[health] enabled` (default), zecd serves unauthenticated probes on a separ
   lightwalletd apart from normal catch-up.
 - `GET /status`: JSON snapshot of per-wallet sync state, including the active `server` endpoint
   and `conn_state` (`down` | `syncing` | `ready`). `getpeerinfo` reflects the same active upstream.
+- `GET /metrics`: Prometheus text exposition for scraping (same unauthenticated trust model as
+  `/status`). Per-wallet gauges - `zecd_chain_tip_height`, `zecd_wallet_scanned_height` (tip minus
+  this is the sync lag), `zecd_scan_progress_ratio`, `zecd_connected`, `zecd_conn_state` - plus
+  counters/histograms for RPC traffic (`zecd_rpc_requests_total`,
+  `zecd_rpc_request_duration_seconds`, `zecd_rpc_overload_total`, `zecd_rpc_auth_failures_total`),
+  upstream failover (`zecd_connection_failures_total`, `zecd_server_switches_total`), sends
+  (`zecd_sends_total`, `zecd_send_proposal_duration_seconds`), 0-conf deposits
+  (`zecd_mempool_txs_decrypted_total`), and reorgs (`zecd_reorgs_total`).
 
 Set `[health] bind = "0.0.0.0"` for Kubernetes/LB probes. The health server starts after wallets
 load, so cover the brief prover-init at boot with a `startupProbe` / `initialDelaySeconds`.

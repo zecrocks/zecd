@@ -136,6 +136,7 @@ impl AsyncOperation {
         }));
 
         let handle = data.clone();
+        let method = context.as_ref().map(|c| c.method).unwrap_or("unknown");
         tokio::spawn(async move {
             // Transition to Executing. The guard is dropped before `.await` below (a
             // `std::sync::MutexGuard` is `!Send`), keeping the spawned future `Send`.
@@ -156,6 +157,11 @@ impl AsyncOperation {
                 serde_json::to_value(&ret)
                     .expect("async return values should be serializable to JSON")
             });
+
+            crate::metrics::record_async_operation(
+                method,
+                if res.is_ok() { "success" } else { "failed" },
+            );
 
             let mut d = handle.lock().expect("operation lock poisoned");
             d.state = if res.is_ok() {

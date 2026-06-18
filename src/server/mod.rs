@@ -79,6 +79,7 @@ async fn handle(
         .get(header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok());
     if !state.auth.check(auth_header) {
+        crate::metrics::inc_auth_failure();
         // Bitcoin Core inserts a small delay on auth failure to deter brute-forcing.
         tokio::time::sleep(std::time::Duration::from_millis(250)).await;
         return unauthorized();
@@ -88,7 +89,8 @@ async fn handle(
     let _permit = match state.work_queue.clone().try_acquire_owned() {
         Ok(p) => p,
         Err(_) => {
-            return plain_response(StatusCode::SERVICE_UNAVAILABLE, "Work queue depth exceeded")
+            crate::metrics::inc_rpc_overload();
+            return plain_response(StatusCode::SERVICE_UNAVAILABLE, "Work queue depth exceeded");
         }
     };
 
@@ -128,7 +130,10 @@ async fn process_single(state: &AppState, wallet: Option<&str>, v: Value) -> (Va
             let _active = state.active.begin(&req.method);
             let start = std::time::Instant::now();
             let result = rpc::dispatch(state, wallet, &req).await;
-            let elapsed_ms = start.elapsed().as_millis() as u64;
+            let elapsed = start.elapsed();
+            let elapsed_ms = elapsed.as_millis() as u64;
+            let outcome = if result.is_ok() { "success" } else { "error" };
+            crate::metrics::record_rpc(&req.method, outcome, elapsed);
             match result {
                 Ok(value) => {
                     tracing::debug!(method = %req.method, wallet = wallet.unwrap_or("default"), elapsed_ms, "rpc ok");
@@ -237,6 +242,7 @@ mod tests {
             shutting_down: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             work_queue: Arc::new(tokio::sync::Semaphore::new(16)),
             active: crate::state::ActiveCommands::default(),
+            metrics_handle: None,
             operations: Arc::new(crate::operations::OperationRegistry::new()),
         }
     }

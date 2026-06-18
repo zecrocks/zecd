@@ -5,6 +5,7 @@
 //! - `GET /readyz` - readiness: 200 when every wallet is connected to lightwalletd and
 //!   synced to at least `[health] ready_progress`; otherwise 503.
 //! - `GET /status` - JSON snapshot of per-wallet sync state (for humans/ops).
+//! - `GET /metrics` - Prometheus text exposition (only when the recorder is installed).
 
 use std::net::SocketAddr;
 
@@ -25,15 +26,19 @@ pub async fn run(state: AppState) {
     }
     let addr = SocketAddr::new(state.config.health.bind, state.config.health.port);
     let shutdown = state.shutdown_signal();
-    let app = Router::new()
+    let mut app = Router::new()
         .route("/healthz", get(healthz))
         .route("/readyz", get(readyz))
-        .route("/status", get(status))
-        .with_state(state);
+        .route("/status", get(status));
+    // Only mount /metrics when the Prometheus recorder was installed (it isn't in unit tests).
+    if state.metrics_handle.is_some() {
+        app = app.route("/metrics", get(metrics));
+    }
+    let app = app.with_state(state);
 
     match tokio::net::TcpListener::bind(addr).await {
         Ok(listener) => {
-            info!("health server listening on http://{addr} (/healthz /readyz /status)");
+            info!("health server listening on http://{addr} (/healthz /readyz /status /metrics)");
             if let Err(e) = axum::serve(listener, app)
                 .with_graceful_shutdown(shutdown)
                 .await
@@ -124,4 +129,22 @@ async fn status(State(state): State<AppState>) -> Response {
         "wallets": wallets,
     }))
     .into_response()
+}
+
+/// Prometheus text exposition. Refreshes the pull-style per-wallet gauges from the current
+/// `SyncStatus` snapshots, then renders the global recorder. Only routed when the recorder is
+/// installed, so the handle is always present here.
+async fn metrics(State(state): State<AppState>) -> Response {
+    crate::metrics::refresh_gauges(&state);
+    match &state.metrics_handle {
+        Some(handle) => (
+            [(
+                axum::http::header::CONTENT_TYPE,
+                "text/plain; version=0.0.4",
+            )],
+            handle.render(),
+        )
+            .into_response(),
+        None => StatusCode::NOT_FOUND.into_response(),
+    }
 }

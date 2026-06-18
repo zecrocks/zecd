@@ -13,6 +13,7 @@ pub mod hardening;
 pub mod health;
 pub mod init;
 pub mod keystore;
+pub mod metrics;
 pub mod network;
 pub mod operations;
 pub mod rewrap;

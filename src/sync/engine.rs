@@ -239,6 +239,9 @@ fn scan_blocks(
             // valid checkpoint when the requested height has none; the cache is then
             // truncated to the height actually rewound to.
             let rewind_height = perform_rewind(db_data, err.at_height(), requested)?;
+            crate::metrics::record_reorg(
+                u32::from(err.at_height()).saturating_sub(u32::from(rewind_height)),
+            );
             db_cache
                 .with_blocks(Some(rewind_height + 1), None, |block| {
                     let meta = BlockMeta {

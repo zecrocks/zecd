@@ -57,12 +57,20 @@ it reveals the wallet's entire transaction graph, though it cannot spend.
   (zebra/lightwalletd unreachable - page someone) from `syncing` (normal catch-up).
 - `GET /status` - per-wallet sync state, active upstream endpoint, `conn_state`
   (`down` | `syncing` | `ready`). Alert if `conn_state` stays `down`.
-- `getrpcinfo.active_commands` - what's executing right now (visibility under load).
+- `GET /metrics` - Prometheus text exposition (unauthenticated, like `/status`).
+  Key series: `zecd_chain_tip_height` − `zecd_wallet_scanned_height` is the sync
+  lag (per `wallet`); `zecd_conn_state{state="down"}` for upstream health;
+  `zecd_rpc_requests_total{outcome="error"}` and `zecd_rpc_request_duration_seconds`
+  for the request error rate / latency; `zecd_rpc_overload_total` for work-queue
+  503s; `zecd_sends_total{outcome=...}` and `zecd_reorgs_total` for wallet activity.
+- `getrpcinfo.active_commands` - what's executing right now (also
+  `zecd_rpc_active_commands`).
 - Logs: set `[log] format = "json"` for aggregation. Every RPC call logs method,
   wallet, elapsed_ms (errors add code/message); connection failover logs at warn.
 
-Suggested alerts: `/readyz` 503 with `reason=upstream_down` for >5 min; `/status`
-`fully_scanned` not advancing for >30 min; daemon restarts.
+Suggested alerts: `/readyz` 503 with `reason=upstream_down` for >5 min; sync lag
+(`zecd_chain_tip_height` − `zecd_wallet_scanned_height`) not shrinking for >30 min;
+sustained `zecd_rpc_overload_total` rate; daemon restarts.
 
 ## Send semantics worth knowing
 

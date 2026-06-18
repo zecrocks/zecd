@@ -652,6 +652,7 @@ impl WalletActor {
                     .await
                     {
                         warn!("[{}] health check failed on {}: {e}", self.name, describe);
+                        crate::metrics::inc_connection_failure(&self.name);
                         self.client = None;
                         last_err = Some(e);
                         continue;
@@ -663,6 +664,7 @@ impl WalletActor {
                             describe,
                             self.servers[self.active].describe()
                         );
+                        crate::metrics::inc_server_switch(&self.name);
                         self.active = idx;
                     }
                     self.backoff.reset();
@@ -673,6 +675,7 @@ impl WalletActor {
                 }
                 Err(e) => {
                     warn!("[{}] connect to {} failed: {e}", self.name, describe);
+                    crate::metrics::inc_connection_failure(&self.name);
                     last_err = Some(e);
                 }
             }
@@ -724,6 +727,7 @@ impl WalletActor {
             );
             self.client = Some(client);
             self.mempool = None; // belonged to the fallback's channel; reopened on next pass
+            crate::metrics::inc_server_switch(&self.name);
             self.active = idx;
             self.backoff.reset();
             self.update_status();
@@ -923,6 +927,7 @@ impl WalletActor {
                 // `nTimeReceived`. Best-effort, idempotent (INSERT OR IGNORE).
                 let txid_hex = txid.to_string();
                 if super::read::tx_exists(&self.wallet_dir, &txid_hex) {
+                    crate::metrics::inc_mempool_decrypt(&self.name);
                     let now = std::time::SystemTime::now()
                         .duration_since(std::time::UNIX_EPOCH)
                         .map(|d| d.as_secs() as i64)
@@ -1240,6 +1245,7 @@ impl WalletActor {
         let policy = confirmations.unwrap_or(self.confirmations_policy);
         let prover = &self.prover;
         let db = &mut self.db_data;
+        let proposal_start = Instant::now();
         let (txid, raw): (TxId, Vec<u8>) =
             tokio::task::block_in_place(move || -> Result<_, RpcError> {
                 let change_strategy = MultiOutputChangeStrategy::new(
@@ -1294,6 +1300,7 @@ impl WalletActor {
                     .map_err(|e| RpcError::misc(format!("failed to serialize transaction: {e}")))?;
                 Ok((txid, raw_tx))
             })?;
+        crate::metrics::record_send_proposal(proposal_start.elapsed());
 
         self.broadcast_committed(txid, raw).await?;
         self.update_status();
@@ -1318,6 +1325,7 @@ impl WalletActor {
                      re-broadcast once a connection recovers",
                     self.name
                 );
+                crate::metrics::record_send("deferred");
                 return Ok(());
             }
         }
@@ -1341,6 +1349,7 @@ impl WalletActor {
                     "[{}] broadcast of {txid} failed in transport ({e}); it will be re-broadcast",
                     self.name
                 );
+                crate::metrics::record_send("transport_fail");
                 return Ok(());
             }
         };
@@ -1353,6 +1362,7 @@ impl WalletActor {
                     "[{}] upstream already has {txid}; treating broadcast as delivered",
                     self.name
                 );
+                crate::metrics::record_send("accepted");
                 return Ok(());
             }
             // An explicit upstream rejection (the node examined the tx and refused it) is a
@@ -1364,6 +1374,7 @@ impl WalletActor {
                 "[{}] upstream rejected {txid} (code {}): {reason}",
                 self.name, outcome.error_code
             );
+            crate::metrics::record_send("rejected");
             return Err(RpcError::new(
                 codes::RPC_VERIFY_REJECTED,
                 format!(
@@ -1372,6 +1383,7 @@ impl WalletActor {
                 ),
             ));
         }
+        crate::metrics::record_send("accepted");
         Ok(())
     }
 

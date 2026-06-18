@@ -45,6 +45,9 @@ pub async fn run(config: AppConfig) -> anyhow::Result<()> {
         );
     }
     actor::install_panic_hook();
+    // Install the Prometheus recorder before any actor/RPC work so early emissions are captured.
+    // Best-effort: `None` simply means no `/metrics` endpoint (non-fatal).
+    let metrics_handle = crate::metrics::install();
     let config = Arc::new(config);
     let auth = server::auth::Authenticator::from_config(&config.rpc)?;
 
@@ -136,6 +139,7 @@ pub async fn run(config: AppConfig) -> anyhow::Result<()> {
         shutting_down: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         work_queue: Arc::new(tokio::sync::Semaphore::new(config.rpc.work_queue)),
         active: crate::state::ActiveCommands::default(),
+        metrics_handle,
         operations: Arc::new(crate::operations::OperationRegistry::new()),
     };
 

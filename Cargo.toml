@@ -26,6 +26,13 @@ futures-util = "0.3"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = { version = "1.0", features = ["arbitrary_precision"] }
 
+# Prometheus `/metrics`: the lightweight `metrics` facade (global recorder, like `tracing`) plus
+# the Prometheus text exporter. `default-features = false` drops the exporter's built-in HTTP
+# listener / push-gateway (and their hyper/tokio extras) - we render through the existing axum
+# health router instead, keeping the dependency surface (and TLS providers) untouched.
+metrics = "0.24"
+metrics-exporter-prometheus = { version = "0.16", default-features = false }
+
 # CLI / config / logging
 clap = { version = "4.5", features = ["derive", "string", "env"] }
 toml = "0.8"
