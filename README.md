@@ -302,6 +302,21 @@ StageX's bootstrapped-toolchain trust story. Released images carry `-arm64` suff
 docker build -f Dockerfile.arm64 -t zecd .
 ```
 
+**Prebuilt release binaries:** pushing a `v*` tag runs the `Release` workflow, which extracts
+the binary from each Dockerfile's `export` stage - so the published binaries inherit the same
+reproducible pipeline as the images - and attaches them to a draft GitHub release. The same
+workflow can be run manually (Actions → Release → Run workflow) with a `version` input to
+dry-run the packaging without cutting a tag; the GHCR image push is opt-in for those runs. Each Linux
+target (`x86_64-unknown-linux-musl`, static; `aarch64-unknown-linux-gnu`, glibc-dynamic) ships
+a reproducible `.tar.gz` and a reproducible `.deb` (`scripts/build-deb.sh`: fixed-mtime,
+root-owned, `SOURCE_DATE_EPOCH`-anchored; verified bit-for-bit), each with a `.sha256` sidecar.
+The `.deb` installs `zecd` to `/usr/bin` plus a (not-enabled) `zecd.service` systemd unit:
+
+```sh
+sudo apt install ./zecd_<version>_amd64.deb     # or _arm64.deb on ARM
+sudo systemctl enable --now zecd                 # optional: run as a service
+```
+
 ```sh
 cd deploy
 docker compose up -d zebra                  # let it sync first

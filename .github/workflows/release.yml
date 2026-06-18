@@ -1,56 +1,161 @@
 name: Release
 
-# Tag-driven release tier: pushing a `v*` tag builds the release binary tarball and
-# attaches it to a *draft* GitHub release (a human reviews and publishes), and pushes
-# Docker images to GHCR tagged with the semver version: the reproducible StageX build
-# for amd64 (bare tags) and the conventional Debian build for arm64 (`-arm64` tags).
+# Tag-driven release tier: pushing a `v*` tag builds the release artifacts for both Linux
+# targets and attaches them to a *draft* GitHub release (a human reviews and publishes),
+# and pushes Docker images to GHCR tagged with the semver version.
+#
+# Binaries are extracted from the `export` stage of the project Dockerfiles rather than a
+# fresh `cargo build`, so the published binaries inherit the exact *reproducible* build
+# pipeline the images use:
+#   * x86_64 (amd64): the StageX `Dockerfile` - full-source-bootstrapped, static musl,
+#     bit-for-bit reproducible.
+#   * aarch64 (arm64): the pinned `Dockerfile.arm64` - deterministic (digest-pinned base,
+#     fixed toolchain, SOURCE_DATE_EPOCH, --build-id=none), glibc-dynamic, built natively
+#     on an arm64 runner.
+# Each target ships a `.tar.gz` (reproducible tar: sorted, fixed mtime, root-owned) and a
+# reproducible `.deb` (see scripts/build-deb.sh), each with a `.sha256` sidecar.
+#
+# It can also be run manually (Actions tab -> Release -> Run workflow), e.g. to dry-run the
+# packaging without cutting a real tag: supply a `version` and, off by default, choose
+# whether to also push the GHCR images. Manual runs still produce a *draft* release.
 
 on:
   push:
     tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Release version (with or without a leading v), e.g. 0.1.0 or v0.1.0-rc1"
+        required: true
+        default: "0.0.0-test"
+      push_images:
+        description: "Also build and push the GHCR Docker images (off for a packaging dry-run)"
+        type: boolean
+        required: false
+        default: false
 
 permissions:
   contents: write
   packages: write
 
 jobs:
-  binary:
+  # Resolve the version/tag once so tag pushes and manual dispatch share one source of truth.
+  setup:
     runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.v.outputs.version }}
+      tag: ${{ steps.v.outputs.tag }}
+    steps:
+      - id: v
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            RAW="${{ inputs.version }}"
+          else
+            RAW="${GITHUB_REF_NAME}"
+          fi
+          VERSION="${RAW#v}"          # strip a leading v if present
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "tag=v${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "Resolved version=${VERSION} tag=v${VERSION}"
+
+  # Build the reproducible binary + tarball + .deb for one Linux target.
+  binary:
+    needs: setup
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-latest
+            dockerfile: Dockerfile
+            target_triple: x86_64-unknown-linux-musl
+            deb_arch: amd64
+          - runner: ubuntu-24.04-arm
+            dockerfile: Dockerfile.arm64
+            target_triple: aarch64-unknown-linux-gnu
+            deb_arch: arm64
+    runs-on: ${{ matrix.runner }}
+    env:
+      # Determinism anchor - matches the Dockerfiles and scripts/build-deb.sh.
+      SOURCE_DATE_EPOCH: "1"
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install protobuf compiler
-        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+      - uses: docker/setup-buildx-action@v3
 
-      - uses: dtolnay/rust-toolchain@stable
+      # Extract the bare, reproducible binary from the Dockerfile's `export` stage.
+      - name: Build binary (Docker export stage)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ${{ matrix.dockerfile }}
+          target: export
+          outputs: type=local,dest=out
+          cache-from: type=gha,scope=binary-${{ matrix.deb_arch }}
+          cache-to: type=gha,mode=max,scope=binary-${{ matrix.deb_arch }}
 
-      - uses: Swatinem/rust-cache@v2
-
-      - name: Build (release)
-        run: cargo build --release --bin zecd
-
-      - name: Package tarball + checksum
+      - name: Package tarball + checksum (reproducible)
         run: |
-          VERSION="${GITHUB_REF_NAME#v}"
-          STAGE="zecd-${VERSION}-x86_64-unknown-linux-gnu"
-          mkdir "$STAGE"
-          cp target/release/zecd README.md CHANGELOG.md LICENSE-MIT LICENSE-APACHE zecd.example.toml "$STAGE/"
-          tar czf "$STAGE.tar.gz" "$STAGE"
+          VERSION="${{ needs.setup.outputs.version }}"
+          STAGE="zecd-${VERSION}-${{ matrix.target_triple }}"
+          install -D -m 0755 out/zecd "$STAGE/zecd"
+          cp README.md CHANGELOG.md LICENSE-MIT LICENSE-APACHE zecd.example.toml "$STAGE/"
+          # Reproducible tar: stable order, fixed mtime, root owner; gzip -n drops the
+          # embedded name/timestamp.
+          tar --sort=name --owner=0 --group=0 --numeric-owner \
+              --mtime="@${SOURCE_DATE_EPOCH}" -cf "$STAGE.tar" "$STAGE"
+          gzip -9n "$STAGE.tar"
           sha256sum "$STAGE.tar.gz" > "$STAGE.tar.gz.sha256"
+
+      - name: Build .deb (reproducible)
+        run: |
+          VERSION="${{ needs.setup.outputs.version }}"
+          ./scripts/build-deb.sh out/zecd "$VERSION" "${{ matrix.deb_arch }}" .
+          DEB="zecd_${VERSION}_${{ matrix.deb_arch }}.deb"
+          sha256sum "$DEB" > "$DEB.sha256"
+
+      - name: Upload release artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-${{ matrix.deb_arch }}
+          path: |
+            zecd-*.tar.gz
+            zecd-*.tar.gz.sha256
+            zecd_*.deb
+            zecd_*.deb.sha256
+          if-no-files-found: error
+
+  # Collect every target's artifacts and attach them to a single draft release.
+  release:
+    needs: [setup, binary]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
 
       - name: Create draft GitHub release
         uses: softprops/action-gh-release@v2
         with:
           draft: true
           generate_release_notes: true
+          # Explicit so manual dispatch (which has no tag ref) targets the right release;
+          # a draft does not create the git tag until it is published.
+          tag_name: ${{ needs.setup.outputs.tag }}
+          name: ${{ needs.setup.outputs.tag }}
           files: |
-            zecd-*.tar.gz
-            zecd-*.tar.gz.sha256
+            dist/zecd-*.tar.gz
+            dist/zecd-*.tar.gz.sha256
+            dist/zecd_*.deb
+            dist/zecd_*.deb.sha256
 
-  # amd64: the reproducible StageX build (bare semver tags). rewrite-timestamp + forced
+  # amd64: the reproducible StageX image (bare semver tags). rewrite-timestamp + forced
   # compression keep the pushed layers deterministic too, and the SBOM/provenance
   # attestations ride along with the image (mirrors zallet's publish flow).
   docker:
+    needs: setup
+    # Always on a tag push; on manual dispatch only when push_images was requested.
+    if: github.event_name == 'push' || inputs.push_images
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -70,6 +175,7 @@ jobs:
           tags: |
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
+            type=raw,value=${{ needs.setup.outputs.version }},enable=${{ github.event_name == 'workflow_dispatch' }}
 
       - uses: docker/build-push-action@v6
         with:
@@ -84,10 +190,13 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
-  # arm64: the conventional Debian build (`-arm64` suffixed tags), built natively on a
+  # arm64: the conventional Debian image (`-arm64` suffixed tags), built natively on a
   # GitHub arm64 runner. StageX publishes no arm64 images yet, so only the amd64 builds
   # above are reproducible right now - see Dockerfile.arm64.
   docker-arm64:
+    needs: setup
+    # Always on a tag push; on manual dispatch only when push_images was requested.
+    if: github.event_name == 'push' || inputs.push_images
     runs-on: ubuntu-24.04-arm
     steps:
       - uses: actions/checkout@v4
@@ -109,6 +218,7 @@ jobs:
           tags: |
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
+            type=raw,value=${{ needs.setup.outputs.version }},enable=${{ github.event_name == 'workflow_dispatch' }}
 
       - uses: docker/build-push-action@v6
         with:

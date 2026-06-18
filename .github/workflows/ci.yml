@@ -7,7 +7,34 @@ name: CI
 on:
   push:
     branches: [main, master, "feature/**"]
+    # Skip the Rust build/test/clippy/deny/msrv tier for changes that can't affect it:
+    # docs, deploy samples, the release/docker/regtest workflows, the Dockerfiles, and the
+    # release packaging script. (Editing ci.yml itself still runs - it's not ignored.)
+    paths-ignore:
+      - "**.md"
+      - "docs/**"
+      - "deploy/**"
+      - "LICENSE-*"
+      - "zecd.example.toml"
+      - "Dockerfile*"
+      - ".dockerignore"
+      - "scripts/build-deb.sh"
+      - ".github/workflows/release.yml"
+      - ".github/workflows/docker.yml"
+      - ".github/workflows/regtest.yml"
   pull_request:
+    paths-ignore:
+      - "**.md"
+      - "docs/**"
+      - "deploy/**"
+      - "LICENSE-*"
+      - "zecd.example.toml"
+      - "Dockerfile*"
+      - ".dockerignore"
+      - "scripts/build-deb.sh"
+      - ".github/workflows/release.yml"
+      - ".github/workflows/docker.yml"
+      - ".github/workflows/regtest.yml"
 
 concurrency:
   group: ci-${{ github.ref }}
