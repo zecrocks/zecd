@@ -491,6 +491,148 @@ async fn rewrap_migrates_identity_wallet_onto_kms_keystore() {
     );
 }
 
+/// Keystore migration from the *passphrase* model: `zecd rewrap` decrypts a
+/// passphrase-encrypted wallet (passphrase supplied via `ZECD_WALLET_PASSPHRASE`) and
+/// re-wraps it onto the cloud KMS keystore. The result is Bitcoin-Core-unencrypted and
+/// unlocks through the keystore. Offline: rewrap touches only keys.toml and the KMS endpoint.
+#[cfg(feature = "keystore")]
+#[tokio::test(flavor = "multi_thread")]
+async fn rewrap_migrates_passphrase_wallet_onto_kms_keystore() {
+    const PHRASE: &str = "mechanic vehicle helmet decide plug gorilla frost dial october \
+        midnight culture idea mountain fame park social drip bid doctor scatter glance defy \
+        moment stage";
+    const KEY_ARN: &str = "arn:aws:kms:us-east-1:111122223333:key/cli-rewrap-pass-test";
+    const PASSPHRASE: &str = "correct horse battery staple";
+
+    zecd::keystore::fake::set_fake_credentials();
+    let endpoint = zecd::keystore::fake::spawn_aws(KEY_ARN).await;
+
+    // Fabricate a passphrase-encrypted wallet (what `init` + `encryptwallet` would produce,
+    // minus chain I/O and the wallet DB - rewrap reads neither).
+    let dir = tempfile::tempdir().unwrap();
+    let datadir = dir.path();
+    let mnemonic = <bip0039::Mnemonic<bip0039::English>>::from_phrase(PHRASE).unwrap();
+    zecd::wallet::store::WalletStore::init_with_passphrase(
+        &datadir.join("default"),
+        zecd::wallet::store::Passphrase::from(PASSPHRASE.to_string()),
+        &mnemonic,
+        zcash_protocol::consensus::BlockHeight::from_u32(1),
+        zecd::network::ZNetwork::Test,
+    )
+    .unwrap();
+    std::fs::write(
+        datadir.join("zecd.toml"),
+        format!(
+            "network = \"test\"\n[keystore]\nprovider = \"aws-kms\"\nkey = \"{KEY_ARN}\"\nendpoint = \"{endpoint}\"\n"
+        ),
+    )
+    .unwrap();
+
+    let out = tokio::task::spawn_blocking({
+        let datadir = datadir.to_path_buf();
+        move || {
+            run_with_timeout(
+                {
+                    let mut c = zecd();
+                    c.args(["--datadir", datadir.to_str().unwrap(), "rewrap"]);
+                    c.env("ZECD_WALLET_PASSPHRASE", PASSPHRASE)
+                        .env("AWS_ACCESS_KEY_ID", "test")
+                        .env("AWS_SECRET_ACCESS_KEY", "test")
+                        .env("AWS_EC2_METADATA_DISABLED", "true");
+                    c
+                },
+                Duration::from_secs(30),
+            )
+        }
+    })
+    .await
+    .unwrap();
+    assert!(out.status.success(), "rewrap failed: {}", stderr_of(&out));
+
+    // keys.toml now carries the KMS marker and drops the passphrase encryption.
+    let st = zecd::wallet::store::WalletStore::read(&datadir.join("default")).unwrap();
+    assert!(
+        !st.is_encrypted(),
+        "after migrating onto KMS the wallet is Bitcoin-Core-unencrypted"
+    );
+    assert!(st.kms().is_some(), "the [kms] table must be present");
+
+    // ...and the wallet unlocks through the keystore, recovering the exact mnemonic.
+    let back = zecd::wallet::keys::decrypt_mnemonic_with_keystore(&st, Some(&endpoint))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        secrecy::ExposeSecret::expose_secret(&back).as_slice(),
+        PHRASE.as_bytes()
+    );
+}
+
+/// A `rewrap` of an encrypted wallet with the wrong passphrase must fail cleanly and leave
+/// `keys.toml` untouched (still passphrase-encrypted) - a botched re-wrap must never strand
+/// the only copy of the seed.
+#[cfg(feature = "keystore")]
+#[tokio::test(flavor = "multi_thread")]
+async fn rewrap_with_wrong_passphrase_fails_and_preserves_keys_toml() {
+    const PHRASE: &str = "mechanic vehicle helmet decide plug gorilla frost dial october \
+        midnight culture idea mountain fame park social drip bid doctor scatter glance defy \
+        moment stage";
+    const KEY_ARN: &str = "arn:aws:kms:us-east-1:111122223333:key/cli-rewrap-badpass-test";
+
+    zecd::keystore::fake::set_fake_credentials();
+    let endpoint = zecd::keystore::fake::spawn_aws(KEY_ARN).await;
+
+    let dir = tempfile::tempdir().unwrap();
+    let datadir = dir.path();
+    let mnemonic = <bip0039::Mnemonic<bip0039::English>>::from_phrase(PHRASE).unwrap();
+    zecd::wallet::store::WalletStore::init_with_passphrase(
+        &datadir.join("default"),
+        zecd::wallet::store::Passphrase::from("the real passphrase".to_string()),
+        &mnemonic,
+        zcash_protocol::consensus::BlockHeight::from_u32(1),
+        zecd::network::ZNetwork::Test,
+    )
+    .unwrap();
+    std::fs::write(
+        datadir.join("zecd.toml"),
+        format!(
+            "network = \"test\"\n[keystore]\nprovider = \"aws-kms\"\nkey = \"{KEY_ARN}\"\nendpoint = \"{endpoint}\"\n"
+        ),
+    )
+    .unwrap();
+    let before = std::fs::read_to_string(datadir.join("default/keys.toml")).unwrap();
+
+    let out = tokio::task::spawn_blocking({
+        let datadir = datadir.to_path_buf();
+        move || {
+            run_with_timeout(
+                {
+                    let mut c = zecd();
+                    c.args(["--datadir", datadir.to_str().unwrap(), "rewrap"]);
+                    c.env("ZECD_WALLET_PASSPHRASE", "WRONG passphrase")
+                        .env("AWS_ACCESS_KEY_ID", "test")
+                        .env("AWS_SECRET_ACCESS_KEY", "test")
+                        .env("AWS_EC2_METADATA_DISABLED", "true");
+                    c
+                },
+                Duration::from_secs(30),
+            )
+        }
+    })
+    .await
+    .unwrap();
+    assert!(
+        !out.status.success(),
+        "a wrong passphrase must fail the rewrap"
+    );
+
+    // keys.toml is byte-for-byte unchanged: still passphrase-encrypted, seed intact.
+    let after = std::fs::read_to_string(datadir.join("default/keys.toml")).unwrap();
+    assert_eq!(before, after, "a failed rewrap must not touch keys.toml");
+    let st = zecd::wallet::store::WalletStore::read(&datadir.join("default")).unwrap();
+    assert!(st.is_encrypted() && st.kms().is_none());
+}
+
 /// `init --keystore` must fail fast (before any chain I/O) when no [keystore] is configured.
 #[test]
 fn init_keystore_without_config_fails_fast() {

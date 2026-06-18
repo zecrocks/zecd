@@ -132,12 +132,9 @@ impl ChainSource for LwdSource {
         Ok(if raw.data.is_empty() {
             None
         } else {
-            // lightwalletd reports the mined height in `height`; mempool transactions carry
-            // 0 or -1 (encoded as u64), neither of which is a real mined height here.
-            let mined_height = u32::try_from(raw.height).ok().filter(|h| *h > 0);
             Some(FetchedTx {
                 data: raw.data,
-                mined_height,
+                mined_height: mined_height_from_raw(raw.height),
             })
         })
     }
@@ -150,6 +147,14 @@ impl ChainSource for LwdSource {
             .into_inner();
         Ok(MempoolStream::Lwd(stream))
     }
+}
+
+/// Interpret a `RawTransaction.height` as a mined block height. lightwalletd reports the
+/// mined height there for a confirmed tx, but a mempool (unmined) tx carries `0` or `-1`
+/// (the latter encoded into the unsigned field as `u64::MAX`) - neither is a real height.
+/// So only a positive, in-`u32`-range value counts as mined; everything else is "unmined".
+fn mined_height_from_raw(height: u64) -> Option<u32> {
+    u32::try_from(height).ok().filter(|h| *h > 0)
 }
 
 /// True when a `GetTransaction` error status means the node simply does not know the txid -
@@ -168,7 +173,32 @@ fn is_tx_not_found(status: &tonic::Status) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::is_tx_not_found;
+    use super::{is_tx_not_found, mined_height_from_raw};
+
+    /// `fetch_tx`'s mempool-vs-mined rule: only a positive in-range `height` is a mined
+    /// height. A mempool tx (0, or -1 encoded as `u64::MAX`) and an out-of-range value are
+    /// "unmined" - this is what keeps a 0-conf mempool payment reported with no confirmations.
+    #[test]
+    fn mined_height_distinguishes_mempool_from_confirmed() {
+        assert_eq!(mined_height_from_raw(0), None, "0 is the mempool sentinel");
+        assert_eq!(
+            mined_height_from_raw(u64::MAX),
+            None,
+            "-1 (encoded as u64::MAX) is the other mempool sentinel"
+        );
+        assert_eq!(mined_height_from_raw(1), Some(1));
+        assert_eq!(mined_height_from_raw(2_500_000), Some(2_500_000));
+        assert_eq!(
+            mined_height_from_raw(u32::MAX as u64),
+            Some(u32::MAX),
+            "the largest representable block height is still mined"
+        );
+        assert_eq!(
+            mined_height_from_raw(u32::MAX as u64 + 1),
+            None,
+            "out of u32 range is not a real height"
+        );
+    }
 
     #[test]
     fn tx_not_found_statuses_are_misses_not_failures() {

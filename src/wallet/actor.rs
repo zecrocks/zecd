@@ -32,7 +32,7 @@ use zcash_protocol::{ShieldedProtocol, TxId};
 use zip321::TransactionRequest;
 
 use crate::backoff::Backoff;
-use crate::chain::{AnySource, ChainSource, MempoolStream};
+use crate::chain::{AnySource, BroadcastOutcome, ChainSource, MempoolStream};
 use crate::error::{codes, RpcError};
 use crate::lightwalletd::Server;
 use crate::network::ZNetwork;
@@ -1322,43 +1322,20 @@ impl WalletActor {
                 return Err(RpcError::misc(format!("transaction broadcast failed: {e}")));
             }
         };
-        if !outcome.is_accepted() {
-            // Bitcoin Core's sendrawtransaction is idempotent: a tx the node already has in
-            // its mempool returns the txid as success (zecd's own rebroadcast loop can race
-            // a manual resubmission of a committed send); one already mined is -27.
-            match upstream_already_has_tx(&outcome.error_message) {
-                AlreadyKnown::InMempool => {
-                    info!(
-                        "[{}] upstream already has tx in mempool; sendrawtransaction succeeds",
-                        self.name
-                    );
-                    return Ok(());
-                }
-                AlreadyKnown::InChain => {
-                    // Bitcoin Core: TransactionError::ALREADY_IN_UTXO_SET →
-                    // RPC_VERIFY_ALREADY_IN_UTXO_SET with this exact default message
-                    // (common/messages.cpp TransactionErrorString).
-                    return Err(RpcError::new(
-                        codes::RPC_VERIFY_ALREADY_IN_UTXO_SET,
-                        "Transaction outputs already in utxo set",
-                    ));
-                }
-                AlreadyKnown::No => {}
-            }
-            let reason = sanitize_upstream_msg(&outcome.error_message);
-            warn!(
-                "[{}] upstream rejected tx (code {}): {reason}",
-                self.name, outcome.error_code
-            );
-            return Err(RpcError::new(
-                codes::RPC_VERIFY_REJECTED,
-                format!(
-                    "transaction rejected (code {}): {reason}",
-                    outcome.error_code
-                ),
-            ));
+        let result = classify_broadcast_outcome(&outcome);
+        match &result {
+            // Accepted-but-not-fresh is the idempotent already-in-mempool case (worth a note).
+            Ok(()) if !outcome.is_accepted() => info!(
+                "[{}] upstream already has tx in mempool; sendrawtransaction succeeds",
+                self.name
+            ),
+            Err(e) if e.code == codes::RPC_VERIFY_REJECTED => warn!(
+                "[{}] upstream rejected tx (code {}): {}",
+                self.name, outcome.error_code, e.message
+            ),
+            _ => {}
         }
-        Ok(())
+        result
     }
 
     /// `walletpassphrase`: decrypt the seed with `passphrase` and hold it unlocked until
@@ -1619,6 +1596,37 @@ fn upstream_already_has_tx(msg: &str) -> AlreadyKnown {
     }
 }
 
+/// Map an upstream broadcast verdict onto Bitcoin Core's `sendrawtransaction` contract:
+/// an accepted tx - or one the node already holds in its mempool (idempotent resubmission) -
+/// is success; an already-mined tx is `-27` `ALREADY_IN_UTXO_SET`; any other rejection is
+/// `-26` `RPC_VERIFY_REJECTED` carrying the upstream's (bounded, sanitized) reason. Pure so
+/// the code mapping is unit-testable; the caller handles transport failures and logging.
+fn classify_broadcast_outcome(outcome: &BroadcastOutcome) -> Result<(), RpcError> {
+    if outcome.is_accepted() {
+        return Ok(());
+    }
+    match upstream_already_has_tx(&outcome.error_message) {
+        // Already in the mempool: zecd's own rebroadcast loop can race a manual resubmission
+        // of the same committed send, so this is success (as in Bitcoin Core).
+        AlreadyKnown::InMempool => Ok(()),
+        // Already mined: Bitcoin Core's TransactionError::ALREADY_IN_UTXO_SET maps to
+        // RPC_VERIFY_ALREADY_IN_UTXO_SET with this exact default message
+        // (common/messages.cpp TransactionErrorString).
+        AlreadyKnown::InChain => Err(RpcError::new(
+            codes::RPC_VERIFY_ALREADY_IN_UTXO_SET,
+            "Transaction outputs already in utxo set",
+        )),
+        AlreadyKnown::No => Err(RpcError::new(
+            codes::RPC_VERIFY_REJECTED,
+            format!(
+                "transaction rejected (code {}): {}",
+                outcome.error_code,
+                sanitize_upstream_msg(&outcome.error_message)
+            ),
+        )),
+    }
+}
+
 /// Await the next message on an open mempool stream, or pend forever when none is open, so
 /// the actor's idle `select!` arm simply never fires without a subscription.
 async fn mempool_next(
@@ -1851,6 +1859,82 @@ mod tests {
         assert_eq!(
             out.message, bare.message,
             "no pending balance, so no enrichment"
+        );
+    }
+
+    /// `sendrawtransaction`'s upstream verdict must follow Bitcoin Core's exact codes:
+    /// accepted/already-in-mempool succeed, already-mined is -27, anything else is -26 with a
+    /// bounded reason. This locks the RPC-code mapping that `do_broadcast` defers to.
+    #[test]
+    fn broadcast_outcome_maps_to_bitcoind_codes() {
+        use super::{classify_broadcast_outcome, codes};
+        use crate::chain::BroadcastOutcome;
+
+        let outcome = |code, msg: &str| BroadcastOutcome {
+            error_code: code,
+            error_message: msg.to_string(),
+        };
+
+        // Accepted (error_code 0) is success.
+        assert!(classify_broadcast_outcome(&outcome(0, "")).is_ok());
+
+        // Already in the mempool is idempotent success (Core's sendrawtransaction contract).
+        assert!(
+            classify_broadcast_outcome(&outcome(-25, "transaction already exists in mempool"))
+                .is_ok()
+        );
+
+        // Already mined -> -27 with Bitcoin Core's exact default message.
+        let e = classify_broadcast_outcome(&outcome(-25, "transaction already in block chain"))
+            .unwrap_err();
+        assert_eq!(e.code, codes::RPC_VERIFY_ALREADY_IN_UTXO_SET);
+        assert_eq!(e.message, "Transaction outputs already in utxo set");
+
+        // A genuine rejection -> -26, surfacing the upstream code and reason.
+        let e = classify_broadcast_outcome(&outcome(64, "tx unpaid action limit exceeded"))
+            .unwrap_err();
+        assert_eq!(e.code, codes::RPC_VERIFY_REJECTED);
+        assert!(e.message.contains("code 64"), "{}", e.message);
+        assert!(e.message.contains("unpaid action limit"), "{}", e.message);
+
+        // The upstream reason is sanitized (no control chars) before it reaches the client.
+        let e = classify_broadcast_outcome(&outcome(1, "bad\r\n\x1b[31mtx")).unwrap_err();
+        assert_eq!(e.code, codes::RPC_VERIFY_REJECTED);
+        assert!(
+            !e.message.contains('\n') && !e.message.contains('\u{1b}'),
+            "control chars leaked: {:?}",
+            e.message
+        );
+    }
+
+    /// The KMS startup-unlock retry must always schedule a *future* attempt and never busy-loop:
+    /// the first wait is floored above zero and bounded by the backoff base, and rescheduling
+    /// stays within the configured ceiling - so a hard-down KMS is retried forever, gently.
+    #[test]
+    fn kms_unlock_retry_schedules_bounded_future_attempts() {
+        use super::KmsUnlockRetry;
+        use std::time::{Duration, Instant};
+
+        let mut retry = KmsUnlockRetry::new();
+        let wait = retry.retry_at.saturating_duration_since(Instant::now());
+        assert!(
+            wait >= Duration::from_secs(1),
+            "first retry too soon: {wait:?}"
+        );
+        assert!(
+            wait <= Duration::from_secs(6),
+            "first retry past the base: {wait:?}"
+        );
+
+        retry.reschedule();
+        let wait = retry.retry_at.saturating_duration_since(Instant::now());
+        assert!(
+            wait >= Duration::from_secs(1),
+            "rescheduled retry too soon: {wait:?}"
+        );
+        assert!(
+            wait <= Duration::from_secs(301),
+            "rescheduled retry exceeds the 300s ceiling: {wait:?}"
         );
     }
 }

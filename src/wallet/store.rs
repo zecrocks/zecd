@@ -561,6 +561,52 @@ mod tests {
         assert!(st2.kms().is_none());
     }
 
+    /// `walletpassphrasechange` core: re-wrapping the mnemonic from an old passphrase to a new
+    /// one (the sequence the actor's `do_change_passphrase` runs). The new passphrase opens
+    /// the wallet to the same seed, network/birthday survive, and the old passphrase is revoked.
+    #[test]
+    fn passphrase_rotation_roundtrips_and_revokes_the_old() {
+        let dir = tempfile::tempdir().unwrap();
+        let mnemonic = <Mnemonic<English>>::from_phrase(PHRASE).unwrap();
+        WalletStore::init_with_passphrase(
+            dir.path(),
+            Passphrase::from("old pass".to_string()),
+            &mnemonic,
+            BlockHeight::from_u32(42),
+            ZNetwork::Test,
+        )
+        .unwrap();
+
+        // Decrypt with the old passphrase, then re-wrap under the new one.
+        let st = WalletStore::read(dir.path()).unwrap();
+        let phrase_bytes = st
+            .decrypt_mnemonic_with_passphrase(Passphrase::from("old pass".to_string()))
+            .unwrap()
+            .unwrap();
+        let phrase = std::str::from_utf8(phrase_bytes.expose_secret()).unwrap();
+        st.rewrite_with_passphrase(dir.path(), Passphrase::from("new pass".to_string()), phrase)
+            .unwrap();
+
+        let st = WalletStore::read(dir.path()).unwrap();
+        assert!(st.is_encrypted());
+        assert_eq!(u32::from(st.birthday), 42, "rotation preserves birthday");
+
+        // The new passphrase recovers the exact seed.
+        let seed = st
+            .decrypt_seed_with_passphrase(Passphrase::from("new pass".to_string()))
+            .unwrap()
+            .unwrap();
+        let expected = <Mnemonic<English>>::from_phrase(PHRASE)
+            .unwrap()
+            .to_seed("");
+        assert_eq!(seed.expose_secret().as_slice(), &expected[..]);
+
+        // The old passphrase is revoked.
+        assert!(st
+            .decrypt_seed_with_passphrase(Passphrase::from("old pass".to_string()))
+            .is_err());
+    }
+
     /// A "kms" marker without usable metadata must fail at open, not at first send.
     #[test]
     fn kms_marker_without_table_is_rejected() {
