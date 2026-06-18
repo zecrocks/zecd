@@ -462,7 +462,11 @@ async fn watch_only_wallet_disables_spending_rpcs() {
     )
     .unwrap();
     let e = handle
-        .send(TransactionRequest::new(vec![payment]).unwrap(), None)
+        .send(
+            TransactionRequest::new(vec![payment]).unwrap(),
+            None,
+            crate::config::SendPrivacy::AllowRevealedRecipients,
+        )
         .await
         .unwrap_err();
     assert_eq!(e.code, codes::RPC_WALLET_ERROR, "{e}");

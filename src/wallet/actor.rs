@@ -21,6 +21,7 @@ use zcash_client_backend::data_api::{
 use zcash_client_backend::fees::{
     standard::MultiOutputChangeStrategy, DustOutputPolicy, SplitPolicy, StandardFeeRule,
 };
+use zcash_client_backend::proposal::Proposal;
 use zcash_client_backend::proto::service;
 use zcash_client_backend::wallet::OvkPolicy;
 use zcash_client_sqlite::{AccountUuid, FsBlockDb};
@@ -28,12 +29,13 @@ use zcash_primitives::transaction::Transaction;
 use zcash_proofs::prover::LocalTxProver;
 use zcash_protocol::consensus::{BlockHeight, BranchId};
 use zcash_protocol::value::Zatoshis;
-use zcash_protocol::TxId;
+use zcash_protocol::{PoolType, TxId};
 use zip321::TransactionRequest;
 
 use crate::backend::Server;
 use crate::backoff::Backoff;
 use crate::chain::{AnySource, BroadcastOutcome, ChainSource, MempoolStream};
+use crate::config::SendPrivacy;
 use crate::error::{codes, RpcError};
 use crate::network::ZNetwork;
 use crate::pools::PoolSet;
@@ -1126,9 +1128,10 @@ impl WalletActor {
             WalletCommand::Send {
                 request,
                 confirmations,
+                privacy,
                 reply,
             } => {
-                let res = self.do_send(request, confirmations).await;
+                let res = self.do_send(request, confirmations, privacy).await;
                 let _ = reply.send(res);
             }
             WalletCommand::GetRawTx { txid, reply } => {
@@ -1270,6 +1273,7 @@ impl WalletActor {
         &mut self,
         request: TransactionRequest,
         confirmations: Option<ConfirmationsPolicy>,
+        privacy: SendPrivacy,
     ) -> Result<TxId, RpcError> {
         // Hard backstop: if an encrypted wallet's unlock has expired but proactive relock
         // hasn't fired yet (e.g. a long sync batch was in progress), lock now so the spend
@@ -1318,6 +1322,16 @@ impl WalletActor {
                     None,
                 )
                 .map_err(|e| enrich_insufficient_funds(db, policy, classify_err(e)))?;
+
+                // FullPrivacy: reject before the (expensive) proving step if the proposal would
+                // leave a single shielded pool - i.e. involve a transparent component or cross
+                // the Sapling↔Orchard turnstile (which reveals the crossed amount on-chain).
+                // The input pool is only known now that the proposal is built, so this is where
+                // the no-cross-pool half of the policy is enforced (the no-transparent-recipient
+                // half is a cheap pre-check in `build_payment`).
+                if privacy == SendPrivacy::FullPrivacy {
+                    enforce_full_privacy(&proposal)?;
+                }
 
                 let txids = create_proposed_transactions(
                     db,
@@ -1849,6 +1863,36 @@ fn now_unix() -> i64 {
 /// Classify a librustzcash spend/proposal error into a Bitcoin-Core RPC code. Insufficient
 /// funds maps to -6; everything else to the generic wallet error -4. Client-facing messages
 /// use `Display` (not `Debug`) so internal note/proposal structure isn't leaked.
+/// The `FullPrivacy` single-pool rule, factored out for unit testing: a step violates it if it
+/// has any transparent component, or if it touches **both** shielded pools (a Sapling↔Orchard
+/// turnstile crossing, which reveals the crossed amount on-chain via `valueBalance`).
+fn single_pool_violated(transparent: bool, sapling: bool, orchard: bool) -> bool {
+    transparent || (sapling && orchard)
+}
+
+/// Enforce `[spend] privacy_policy = FullPrivacy` on a built proposal: every step must stay within
+/// a single shielded pool (no transparent inputs/outputs/change, no Sapling↔Orchard crossing).
+/// `Step::involves` reports whether a step's inputs, payment outputs, *or* change touch a pool, so
+/// this mirrors zallet's `enforce_privacy_policy`. Returns `-8` if the policy can't be honoured.
+fn enforce_full_privacy<FeeRuleT, NoteRef>(
+    proposal: &Proposal<FeeRuleT, NoteRef>,
+) -> Result<(), RpcError> {
+    for step in proposal.steps() {
+        let transparent = step.involves(PoolType::Transparent);
+        let sapling = step.involves(PoolType::SAPLING);
+        let orchard = step.involves(PoolType::ORCHARD);
+        if single_pool_violated(transparent, sapling, orchard) {
+            return Err(RpcError::invalid_parameter(
+                "Privacy policy FullPrivacy rejects this send: it would leave a single shielded \
+                 pool (a transparent component, or a Sapling<->Orchard crossing that reveals the \
+                 transferred amount on-chain). Set [spend] privacy_policy = \
+                 \"AllowRevealedRecipients\" to permit this.",
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn classify_err(e: crate::error::ProposalError) -> RpcError {
     use zcash_client_backend::data_api::error::Error;
     match &e {
@@ -1919,6 +1963,23 @@ fn enrich_insufficient_funds(db: &WriteDb, policy: ConfirmationsPolicy, err: Rpc
 #[cfg(test)]
 mod tests {
     use super::sanitize_upstream_msg;
+
+    /// FullPrivacy's single-pool rule: violated by any transparent component, or by touching
+    /// both shielded pools (a Sapling<->Orchard turnstile crossing). A transaction confined to
+    /// one shielded pool is fine.
+    #[test]
+    fn single_pool_rule() {
+        use super::single_pool_violated;
+        // Single shielded pool - allowed.
+        assert!(!single_pool_violated(false, true, false)); // Sapling only
+        assert!(!single_pool_violated(false, false, true)); // Orchard only
+                                                            // Cross-pool turnstile - rejected.
+        assert!(single_pool_violated(false, true, true));
+        // Any transparent component - rejected.
+        assert!(single_pool_violated(true, false, true));
+        assert!(single_pool_violated(true, true, false));
+        assert!(single_pool_violated(true, false, false));
+    }
 
     /// Resubmitting a tx the node already has must follow Bitcoin Core's idempotent
     /// `sendrawtransaction` contract; these are the reject strings zebra/zcashd actually

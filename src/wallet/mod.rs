@@ -19,6 +19,7 @@ use zcash_client_backend::data_api::wallet::ConfirmationsPolicy;
 use zcash_protocol::TxId;
 use zip321::TransactionRequest;
 
+use crate::config::SendPrivacy;
 use crate::error::RpcError;
 use crate::network::ZNetwork;
 use crate::pools::PoolSet;
@@ -108,6 +109,9 @@ pub enum WalletCommand {
         /// Per-call confirmations override (`z_sendmany`'s `minconf`). `None` uses the
         /// wallet-wide policy; `Some` overrides note selection for this send only.
         confirmations: Option<ConfirmationsPolicy>,
+        /// Privacy policy for this send; `FullPrivacy` is enforced on the built proposal
+        /// (no transparent component, no cross-pool turnstile).
+        privacy: SendPrivacy,
         reply: oneshot::Sender<Result<TxId, RpcError>>,
     },
     /// Fetch the raw bytes of a transaction (from the wallet, else lightwalletd).
@@ -206,15 +210,18 @@ impl WalletHandle {
 
     /// Build, prove, and broadcast a send. `confirmations` overrides the wallet-wide
     /// confirmations policy for this send's note selection (`z_sendmany`'s `minconf`); `None`
-    /// uses the configured policy, as the synchronous `sendtoaddress`/`sendmany` do.
+    /// uses the configured policy, as the synchronous `sendtoaddress`/`sendmany` do. `privacy`
+    /// is the resolved send privacy policy (`FullPrivacy` enforced on the built proposal).
     pub async fn send(
         &self,
         request: TransactionRequest,
         confirmations: Option<ConfirmationsPolicy>,
+        privacy: SendPrivacy,
     ) -> Result<TxId, RpcError> {
         self.dispatch(|reply| WalletCommand::Send {
             request,
             confirmations,
+            privacy,
             reply,
         })
         .await

@@ -1239,17 +1239,20 @@ fn build_payment(
     memo_hex: Option<&str>,
 ) -> Result<Payment, RpcError> {
     let zaddr = crate::address::parse_recipient_on_network(network, addr)?;
-    // A recipient without an Orchard receiver pulls the send out of the Orchard pool,
-    // revealing the amount on-chain (and the recipient, if transparent). zcashd/Zallet
-    // require an explicit AllowRevealed* opt-in for that; zecd's is `[spend]
-    // privacy_policy`, which defaults to allowing it.
+    // FullPrivacy forbids a transparent component, so a recipient with no shielded receiver
+    // (a transparent-only address) is rejected up front - paying it would force a transparent
+    // output, revealing the amount and the recipient on-chain. This is the cheap per-recipient
+    // half of the policy; the no-cross-pool (Sapling↔Orchard turnstile) half can only be judged
+    // once the proposal's input pool is known, and is enforced on the built proposal in the
+    // actor's `do_send`. zcashd/Zallet require an explicit AllowRevealed* opt-in for either;
+    // zecd's is `[spend] privacy_policy`, which defaults to allowing both.
     if privacy == SendPrivacy::FullPrivacy {
-        let receives_orchard = crate::address::decode_on_network(network, addr)
-            .is_some_and(|a| crate::address::has_orchard_receiver(&a));
-        if !receives_orchard {
+        let receives_shielded = crate::address::decode_on_network(network, addr)
+            .is_some_and(|a| crate::address::has_shielded_receiver(&a));
+        if !receives_shielded {
             return Err(RpcError::invalid_parameter(format!(
-                "Privacy policy FullPrivacy rejects {addr}: it cannot receive in the Orchard \
-                 pool, so paying it would reveal the amount on-chain. Set [spend] \
+                "Privacy policy FullPrivacy rejects {addr}: it has no shielded receiver, so \
+                 paying it would reveal the amount and recipient on-chain. Set [spend] \
                  privacy_policy = \"AllowRevealedRecipients\" to permit this."
             )));
         }
@@ -1350,7 +1353,9 @@ pub(crate) async fn sendtoaddress(
     )?;
     let request = TransactionRequest::new(vec![payment])
         .map_err(|e| RpcError::wallet(format!("invalid payment request: {e}")))?;
-    let txid = handle.send(request, None).await?;
+    let txid = handle
+        .send(request, None, state.config.spend.privacy)
+        .await?;
     Ok(send_result(txid.to_string(), verbose))
 }
 
@@ -1400,7 +1405,9 @@ pub(crate) async fn sendmany(
     }
     let request = TransactionRequest::new(payments)
         .map_err(|e| RpcError::wallet(format!("invalid payment request: {e}")))?;
-    let txid = handle.send(request, None).await?;
+    let txid = handle
+        .send(request, None, state.config.spend.privacy)
+        .await?;
     Ok(send_result(txid.to_string(), verbose))
 }
 
@@ -1567,7 +1574,7 @@ pub(crate) fn z_sendmany(
     // no-double-spend invariant holds exactly as for the synchronous sends.
     let send_handle = handle.clone();
     let op = AsyncOperation::new(Some(context), async move {
-        let txid = send_handle.send(request, Some(policy)).await?;
+        let txid = send_handle.send(request, Some(policy), privacy).await?;
         Ok::<Value, RpcError>(json!({ "txid": txid.to_string() }))
     });
     let opid = state.operations.insert(&handle.name, op);
@@ -2040,16 +2047,21 @@ mod tests {
     }
 
     #[test]
-    fn full_privacy_rejects_non_orchard_recipients() {
+    fn full_privacy_rejects_transparent_recipients() {
         use zcash_keys::encoding::AddressCodec as _;
         let net = crate::network::ZNetwork::Test;
+        // An Orchard-receiving UA and a bare Sapling address both have a shielded receiver, so
+        // both pass the per-recipient FullPrivacy pre-check (whether the *transaction* stays in
+        // one pool is decided later, on the built proposal, in the actor).
         let ua = "utest12r53eljnr7kev8ychw3ahzjgm6fwxm7fd8vfay7hn9uylj05x0pxxhze800h9dcgyr8hkc7kz3s2crnrhjcy2p90yfce2vl8mq667zw0";
+        let sapling = "ztestsapling1knww2nyjc62njkard0jmx7hlsj6twxmxwprn7anvrv4dc2zxanl3nemc0qx2hvplxmd2uau8gyw";
         let taddr =
             zcash_transparent::address::TransparentAddress::PublicKeyHash([0u8; 20]).encode(&net);
 
-        // FullPrivacy: an Orchard-receiving UA passes; a transparent recipient is -8 with a
-        // self-diagnosing message; the default policy allows both.
+        // FullPrivacy: any shielded recipient passes build_payment; a transparent recipient is
+        // -8 with a self-diagnosing message; the default policy allows all of them.
         assert!(build_payment(&net, SendPrivacy::FullPrivacy, ua, &json!(0.1), None).is_ok());
+        assert!(build_payment(&net, SendPrivacy::FullPrivacy, sapling, &json!(0.1), None).is_ok());
         let e =
             build_payment(&net, SendPrivacy::FullPrivacy, &taddr, &json!(0.1), None).unwrap_err();
         assert_eq!(e.code, crate::error::codes::RPC_INVALID_PARAMETER);

@@ -196,8 +196,8 @@ rebroadcast_secs = 60            # max spacing of unmined-tx re-broadcast passes
 [spend]
 trusted_confirmations = 3        # depth before the wallet's own change is spendable
 untrusted_confirmations = 10     # depth before third-party payments are spendable (>= trusted)
-privacy_policy = "AllowRevealedRecipients"  # or "FullPrivacy": reject recipients without an
-                                 #   Orchard receiver instead of revealing amounts on-chain
+privacy_policy = "AllowRevealedRecipients"  # or "FullPrivacy": only single-shielded-pool sends
+                                 #   (no transparent recipients, no Sapling<->Orchard crossing)
 
 [log]
 level = "info"                   # tracing filter; RUST_LOG overrides
@@ -560,10 +560,13 @@ Edges to be aware of (consequences of being a shielded light wallet):
 - Addresses are shielded UAs (`u1...`/`utest1...`): clients that parse the address string as a
   transparent Bitcoin address will not understand them; clients that treat addresses as opaque
   strings are fine.
-- Sending to a recipient without an Orchard receiver (a transparent or Sapling-only address)
-  moves funds out of the Orchard pool and reveals the amount on-chain (plus the recipient,
-  if transparent). Allowed by default; set `[spend] privacy_policy = "FullPrivacy"` to reject
-  such sends with `-8` instead (the zcashd/Zallet `AllowRevealed*` opt-in, inverted).
+- A send that leaves a single shielded pool reveals information on-chain: a transparent
+  recipient reveals the amount and the recipient, and crossing the Sapling↔Orchard turnstile
+  (spending one pool, paying the other) reveals the crossed amount via `valueBalance`. Both are
+  allowed by default; set `[spend] privacy_policy = "FullPrivacy"` to reject them with `-8` -
+  FullPrivacy permits only fully-shielded sends confined to one pool (matching zcashd/Zallet,
+  zcash/zcash#6240). The transparent-recipient half is caught up front; the no-cross-pool half
+  is enforced on the built transaction proposal (the input pool isn't known until then).
 - Shielded memos (ZIP 302) are supported as extensions beyond Bitcoin Core's surface:
   `sendtoaddress` takes a hex memo as an extra trailing parameter (after `verbose`, zcashd's
   `z_sendmany` conventions: ≤512 bytes, rejected for transparent recipients), and history

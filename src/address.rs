@@ -31,6 +31,13 @@ pub fn has_orchard_receiver(addr: &Address) -> bool {
     addr.can_receive_as(PoolType::ORCHARD)
 }
 
+/// Whether a (network-checked) address can receive into any shielded pool (Sapling or Orchard).
+/// Used by the `FullPrivacy` per-recipient pre-check: a recipient with no shielded receiver would
+/// force a transparent output, which `FullPrivacy` forbids.
+pub fn has_shielded_receiver(addr: &Address) -> bool {
+    addr.can_receive_as(PoolType::SAPLING) || addr.can_receive_as(PoolType::ORCHARD)
+}
+
 /// The pools a (network-checked) address can receive into, in canonical order. For a unified
 /// address this enumerates its receivers - so a `u1...` reveals whether it carries transparent,
 /// Sapling, and/or Orchard receivers; a bare t-addr is `["transparent"]`, a bare Sapling

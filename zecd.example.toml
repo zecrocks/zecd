@@ -201,11 +201,11 @@ rebroadcast_secs = 60
 trusted_confirmations = 3
 # Confirmations before third-party payments are spendable (must be >= trusted_confirmations).
 untrusted_confirmations = 10
-# What sends may reveal on-chain (zcashd/Zallet's privacy-policy opt-in, reduced to the one
-# distinction that matters for an Orchard-only wallet):
-#   "AllowRevealedRecipients" (default) - recipients without an Orchard receiver (transparent
-#       and Sapling-only addresses) are allowed; such sends reveal the amount (and a
-#       transparent recipient) on-chain.
-#   "FullPrivacy" - every recipient must have an Orchard receiver; sends that would reveal
-#       anything are rejected with -8.
+# What sends may reveal on-chain (zcashd/Zallet's privacy-policy opt-in, zcash/zcash#6240):
+#   "AllowRevealedRecipients" (default) - allow transparent recipients and Sapling<->Orchard
+#       cross-pool sends; such sends reveal the transferred amount on-chain (and the recipient,
+#       if transparent).
+#   "FullPrivacy" - only fully-shielded sends confined to a single shielded pool: no transparent
+#       recipients, and no Sapling<->Orchard crossing. Anything that would reveal an amount or a
+#       recipient is rejected with -8.
 privacy_policy = "AllowRevealedRecipients"

@@ -318,8 +318,60 @@ async fn regtest_sapling_and_orchard_balances() {
         .count();
     assert!(receives >= 2, "both receives show in history: {txs}");
 
-    // 8. Spend across pools back to the funder (greedy input selection draws from both pools;
-    //    change lands in Orchard, the strongest enabled pool). auto_unlock is on.
+    // 8a. FullPrivacy rejects a cross-pool (turnstile) send. Paying 1.5 ZEC to a Sapling-only
+    //     recipient forces Orchard inputs (the Sapling note is only 1 ZEC), so the proposal spans
+    //     both pools - which reveals the crossed amount and FullPrivacy forbids. This rejection
+    //     happens on the *built proposal* inside the async send, so it surfaces via the
+    //     operation's error (code -8), not synchronously. The default policy permits it (8b).
+    let fp_opid = zecd
+        .call(
+            "z_sendmany",
+            json!([default_ua, [{ "address": sapling_ua, "amount": 1.5 }], null, null, "FullPrivacy"]),
+        )
+        .await
+        .expect("z_sendmany returns an opid")
+        .as_str()
+        .expect("opid string")
+        .to_string();
+    let mut saw_full_privacy_reject = false;
+    for _ in 0..120 {
+        let st = zecd
+            .call("z_getoperationstatus", json!([[fp_opid]]))
+            .await
+            .expect("z_getoperationstatus");
+        let obj = st
+            .as_array()
+            .expect("array")
+            .first()
+            .expect("our op")
+            .clone();
+        match obj["status"].as_str().expect("status string") {
+            "failed" => {
+                assert_eq!(
+                    obj["error"]["code"].as_i64(),
+                    Some(-8),
+                    "FullPrivacy cross-pool send fails with -8: {obj}"
+                );
+                assert!(
+                    obj["error"]["message"]
+                        .as_str()
+                        .is_some_and(|m| m.contains("FullPrivacy")),
+                    "the failure names the policy: {obj}"
+                );
+                saw_full_privacy_reject = true;
+                break;
+            }
+            "success" => panic!("FullPrivacy cross-pool send must not succeed: {obj}"),
+            _ => tokio::time::sleep(Duration::from_millis(300)).await,
+        }
+    }
+    assert!(
+        saw_full_privacy_reject,
+        "the FullPrivacy cross-pool send reached the failed state"
+    );
+
+    // 8b. The same cross-pool spend under the default policy succeeds (greedy input selection
+    //     draws from both pools; change lands in Orchard, the strongest enabled pool).
     let funder_ua = funder.unified_address().expect("funder unified address");
     let txid = zecd
         .call("sendtoaddress", json!([funder_ua, 1.5]))

@@ -269,19 +269,21 @@ impl Default for SpendConfig {
     }
 }
 
-/// `[spend] privacy_policy` - Zallet/zcashd's privacy-policy idea reduced to what matters
-/// for an Orchard-only wallet: whether a send may leave the Orchard pool. Crossing pools
-/// reveals the transferred amount on-chain (and, for transparent recipients, the recipient
-/// too); zcashd and Zallet require an explicit `AllowRevealed*` opt-in for that, and this
-/// knob is zecd's equivalent.
+/// `[spend] privacy_policy` - Zallet/zcashd's privacy-policy idea (zcash/zcash#6240) reduced to
+/// the two points that matter for a shielded-only wallet that can hold both Sapling and Orchard
+/// notes: whether a send may include a transparent recipient, and whether it may cross between
+/// shielded pools. Crossing pools (Sapling↔Orchard) reveals the transferred amount on-chain via
+/// `valueBalance`; a transparent recipient additionally reveals the recipient. zcashd/Zallet
+/// require an explicit `AllowRevealed*` opt-in for either, and this knob is zecd's equivalent.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SendPrivacy {
-    /// Every recipient must be able to receive in the Orchard pool, so a send never reveals
-    /// amounts or recipients.
+    /// Only fully-shielded transactions confined to a **single** shielded value pool: no
+    /// transparent recipients, and no Sapling↔Orchard crossing. Such a send reveals neither the
+    /// amount nor the recipient. (Enforced on the built proposal - see the actor's `do_send`.)
     FullPrivacy,
-    /// Recipients without an Orchard receiver (transparent and Sapling-only addresses) are
-    /// allowed; such sends reveal the amount (and a transparent recipient) on-chain. This is
-    /// the default: the Bitcoin-RPC dialect promises "send to any valid address".
+    /// Permits transparent recipients and cross-pool sends (which reveal the transferred amount,
+    /// and the recipient if transparent). This is the default: the Bitcoin-RPC dialect promises
+    /// "send to any valid address".
     AllowRevealedRecipients,
 }
 
