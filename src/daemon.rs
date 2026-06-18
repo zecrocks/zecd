@@ -1,5 +1,5 @@
-//! Daemon wiring shared by the `zecd` and `tparty` binaries: tracing init, wallet-actor
-//! spawning, the health and RPC servers, and graceful shutdown.
+//! Daemon wiring for the `zecd` binary: tracing init, wallet-actor spawning, the health and
+//! RPC servers, and graceful shutdown.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -10,36 +10,10 @@ use crate::config::{self, AppConfig};
 use crate::health;
 use crate::lightwalletd;
 use crate::server;
-use crate::state::{AppState, Dispatcher};
-use crate::wallet::actor::{self, ActorConfig, AutoShield};
+use crate::state::AppState;
+use crate::wallet::actor::{self, ActorConfig};
 use crate::wallet::store::WalletStore;
 use crate::wallet::WalletRegistry;
-
-/// What distinguishes one binary's daemon from the other's: the RPC dispatch table and the
-/// wallet actors' transparent/auto-shield behavior.
-pub struct DaemonOptions {
-    /// Program name used in operator-facing messages ("zecd" | "tparty").
-    pub prog: &'static str,
-    /// Which RPC method table to serve.
-    pub dispatcher: Dispatcher,
-    /// When set, every wallet actor detects transparent deposits and auto-shields them
-    /// (the `tparty` mode). `None` = zecd's Orchard-only behavior.
-    pub auto_shield: Option<AutoShield>,
-    /// External transparent-address gap limit override (tparty); `None` keeps the
-    /// librustzcash default.
-    pub gap_limit: Option<u32>,
-}
-
-impl DaemonOptions {
-    pub fn zecd() -> Self {
-        DaemonOptions {
-            prog: "zecd",
-            dispatcher: Dispatcher::Zecd,
-            auto_shield: None,
-            gap_limit: None,
-        }
-    }
-}
 
 /// Initialize tracing. The filter defaults to `[log] level` and is overridden by `RUST_LOG`;
 /// `[log] format = "json"` emits structured logs for cloud-native log aggregation.
@@ -54,8 +28,8 @@ pub fn init_tracing(log: &config::LogConfig) {
     }
 }
 
-pub async fn run(config: AppConfig, opts: DaemonOptions) -> anyhow::Result<()> {
-    let prog = opts.prog;
+pub async fn run(config: AppConfig) -> anyhow::Result<()> {
+    let prog = "zecd";
     // The example/deploy configs ship with a placeholder RPC password; on mainnet that is
     // spend authority, so refuse to start until it has been changed.
     if matches!(config.network, crate::network::ZNetwork::Main)
@@ -112,8 +86,6 @@ pub async fn run(config: AppConfig, opts: DaemonOptions) -> anyhow::Result<()> {
             age_identity: config.keys.age_identity.clone(),
             auto_unlock: config.keys.auto_unlock,
             keystore_endpoint: config.keystore.endpoint.clone(),
-            auto_shield: opts.auto_shield.clone(),
-            gap_limit: opts.gap_limit,
             // Validated at config load; re-derive here rather than carrying a second copy.
             confirmations_policy: config.spend.confirmations_policy()?,
             shutdown: shutdown_tx.subscribe(),
@@ -144,7 +116,6 @@ pub async fn run(config: AppConfig, opts: DaemonOptions) -> anyhow::Result<()> {
         shutting_down: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         work_queue: Arc::new(tokio::sync::Semaphore::new(config.rpc.work_queue)),
         active: crate::state::ActiveCommands::default(),
-        dispatcher: opts.dispatcher,
     };
 
     // Translate Ctrl-C into a graceful shutdown (flag first, so in-flight new requests 503).

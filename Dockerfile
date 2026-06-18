@@ -7,7 +7,7 @@
 # reproduce the image bit-for-bit. (That requires the vendored i18n-embed-fl patch -
 # see [patch.crates-io] in Cargo.toml and the project docs "Gotchas".)
 #
-#   docker build -t zecd .                      # runtime image (zecd + tparty)
+#   docker build -t zecd .                      # runtime image (zecd)
 #   docker build --target export -o ./out .     # extract the static binaries
 #
 # Dependencies are released librustzcash crates from crates.io (versions pinned by the
@@ -50,39 +50,36 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
         --locked \
         --target ${TARGET_ARCH}
 
-# Build both binaries (zecd + tparty)
+# Build the zecd binary
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/usr/local/cargo/git \
     --mount=type=cache,target=/usr/src/zecd/target \
     cargo install \
         --frozen \
         --path . \
-        --bins \
+        --bin zecd \
         --target ${TARGET_ARCH} \
     # Skeleton dirs for the scratch runtime, COPY'd below with --chown so the
     # unprivileged runtime user can write its datadirs (and SQLite its temp files).
-    && install -d -m 0755 /rootfs/var/lib/zecd /rootfs/var/lib/tparty \
+    && install -d -m 0755 /rootfs/var/lib/zecd \
     && install -d -m 1777 /rootfs/tmp
 
 # --- Stage 2: layer for local binary extraction ---
 FROM scratch AS export
 
-# Binaries at the root for easy extraction
+# Binary at the root for easy extraction
 COPY --from=builder /usr/local/cargo/bin/zecd /zecd
-COPY --from=builder /usr/local/cargo/bin/tparty /tparty
 
 # --- Stage 3: Minimal runtime with stagex ---
 FROM scratch AS runtime
 COPY --from=export /zecd /usr/local/bin/zecd
-COPY --from=export /tparty /usr/local/bin/tparty
 # CA bundle so native TLS roots can validate public lightwalletd endpoints (e.g. zec.rocks).
 COPY --from=ca-certificates /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
 ENV SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt
 COPY --from=builder --chown=10001:10001 /rootfs/ /
 USER 10001:10001
 WORKDIR /var/lib/zecd
-# zecd JSON-RPC (mainnet 8232 / testnet 18232) + health (9233), and the same for
-# tparty (8237 / 18237 / 9237; run it with `--entrypoint tparty`).
-EXPOSE 8232 18232 9233 8237 18237 9237
+# zecd JSON-RPC (mainnet 8232 / testnet 18232) + health (9233).
+EXPOSE 8232 18232 9233
 ENTRYPOINT ["zecd"]
 CMD ["--datadir", "/var/lib/zecd"]

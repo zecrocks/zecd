@@ -36,13 +36,12 @@ ENV CARGO_INCREMENTAL=0
 ENV RUSTFLAGS="-C codegen-units=1 -C link-arg=-Wl,--build-id=none"
 WORKDIR /usr/src/zecd
 COPY . .
-# Build both binaries (zecd + tparty)
-RUN cargo install --locked --path . --bins --root /usr/local
+# Build the zecd binary
+RUN cargo install --locked --path . --bin zecd --root /usr/local
 
 # --- layer for local binary extraction ---
 FROM scratch AS export
 COPY --from=builder /usr/local/bin/zecd /zecd
-COPY --from=builder /usr/local/bin/tparty /tparty
 
 # --- runtime ---
 # debian:bookworm-slim (multi-arch index digest)
@@ -52,14 +51,11 @@ RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates \
     && rm -rf /var/lib/apt/lists/* \
     && groupadd -g 10001 zecd \
-    && useradd -r -u 10001 -g zecd -m -d /var/lib/zecd zecd \
-    && install -d -m 0755 -o zecd -g zecd /var/lib/tparty
+    && useradd -r -u 10001 -g zecd -m -d /var/lib/zecd zecd
 COPY --from=builder /usr/local/bin/zecd /usr/local/bin/zecd
-COPY --from=builder /usr/local/bin/tparty /usr/local/bin/tparty
 USER zecd
 WORKDIR /var/lib/zecd
-# zecd JSON-RPC (mainnet 8232 / testnet 18232) + health (9233), and the same for
-# tparty (8237 / 18237 / 9237; run it with `--entrypoint tparty`).
-EXPOSE 8232 18232 9233 8237 18237 9237
+# zecd JSON-RPC (mainnet 8232 / testnet 18232) + health (9233).
+EXPOSE 8232 18232 9233
 ENTRYPOINT ["zecd"]
 CMD ["--datadir", "/var/lib/zecd"]

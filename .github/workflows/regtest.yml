@@ -58,9 +58,7 @@ concurrency:
 jobs:
   regtest:
     runs-on: ubuntu-latest
-    # One matrix leg per binary, so a tparty failure is attributable at a glance and the
-    # suites run in parallel rather than serializing behind each other on one runner.
-    # NB: new harness test files must be added to a leg here (the legs enumerate --test
+    # NB: new harness test files must be added to the leg here (it enumerates --test
     # targets; nothing runs them implicitly). Extended tests (gated on
     # ZECD_REGTEST_EXTENDED) are listed too: on PR runs they compile and skip in seconds.
     #
@@ -70,13 +68,11 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        suite: [zecd, tparty]
+        suite: [zecd]
         image: ${{ github.event_name == 'schedule' && fromJSON('["pinned", "latest"]') || fromJSON('["event"]') }}
         include:
           - suite: zecd
             tests: --test regtest_e2e --test regtest_funded --test regtest_failover --test regtest_hang --test regtest_reorg --test regtest_multiwallet --test regtest_restore --test regtest_watchonly --test regtest_zebra
-          - suite: tparty
-            tests: --test regtest_tparty
     name: regtest (${{ matrix.suite }}, ${{ matrix.image }})
     steps:
       - uses: actions/checkout@v4
@@ -94,9 +90,8 @@ jobs:
             zcash-devtool
 
       # Release build: debug Orchard/Sapling proving is >20s; release keeps the harness snappy.
-      # Builds both binaries: zecd (the funded e2e) and tparty (the auto-shield e2e).
-      - name: Build zecd + tparty (release)
-        run: cargo build --release --bins
+      - name: Build zecd (release)
+        run: cargo build --release --bin zecd
 
       # The funding wallet: zcash-devtool with regtest support (PR zecrocks/zcash-devtool#1).
       # It shields a mined transparent coinbase into Orchard and sends it to zecd, since regtest
@@ -173,7 +168,6 @@ jobs:
       - name: Run regtest end-to-end harness
         env:
           ZECD_BIN: ${{ github.workspace }}/target/release/zecd
-          TPARTY_BIN: ${{ github.workspace }}/target/release/tparty
           DEVTOOL_BIN: ${{ github.workspace }}/zcash-devtool/target/release/zcash-devtool
           # Capture zebrad's logs so a startup failure is diagnosable from the CI run.
           ZEBRAD_STDERR: ${{ runner.temp }}/zebrad.log

@@ -12,8 +12,8 @@ use zcash_protocol::consensus::BlockHeight;
 use zcash_protocol::{ShieldedProtocol, TxId};
 
 use super::{
-    AddressUtxo, BroadcastOutcome, ChainSource, ChainTip, CompactBlockStream, FetchedTx,
-    MempoolStream, ServerInfo, SubtreeRootInfo,
+    BroadcastOutcome, ChainSource, ChainTip, CompactBlockStream, FetchedTx, MempoolStream,
+    ServerInfo, SubtreeRootInfo,
 };
 
 /// A connected lightwalletd client.
@@ -149,65 +149,6 @@ impl ChainSource for LwdSource {
             .await?
             .into_inner();
         Ok(MempoolStream::Lwd(stream))
-    }
-
-    async fn address_utxos(&mut self, addresses: Vec<String>) -> anyhow::Result<Vec<AddressUtxo>> {
-        let request = service::GetAddressUtxosArg {
-            addresses,
-            start_height: 0,
-            max_entries: 0,
-        };
-        let mut stream = self
-            .client
-            .get_address_utxos_stream(request)
-            .await?
-            .into_inner();
-        let mut utxos = Vec::new();
-        while let Some(reply) = stream.message().await? {
-            utxos.push(AddressUtxo {
-                // The reply's txid is already in internal (protocol) byte order.
-                txid: reply.txid,
-                index: u32::try_from(reply.index)
-                    .map_err(|_| anyhow!("utxo output index out of range"))?,
-                script: reply.script,
-                value_zat: reply.value_zat,
-                height: u32::try_from(reply.height)
-                    .map_err(|_| anyhow!("utxo height out of range"))?,
-            });
-        }
-        Ok(utxos)
-    }
-
-    async fn taddress_txs(
-        &mut self,
-        address: String,
-        start: BlockHeight,
-        end: BlockHeight,
-    ) -> anyhow::Result<Vec<FetchedTx>> {
-        let filter = service::TransparentAddressBlockFilter {
-            address,
-            range: Some(service::BlockRange {
-                start: Some(service::BlockId {
-                    height: u32::from(start).into(),
-                    hash: vec![],
-                }),
-                end: Some(service::BlockId {
-                    height: u32::from(end).into(),
-                    hash: vec![],
-                }),
-                pool_types: Default::default(),
-            }),
-        };
-        let mut stream = self.client.get_taddress_txids(filter).await?.into_inner();
-        let mut txs = Vec::new();
-        while let Some(raw) = stream.message().await? {
-            let mined_height = u32::try_from(raw.height).ok().filter(|h| *h > 0);
-            txs.push(FetchedTx {
-                data: raw.data,
-                mined_height,
-            });
-        }
-        Ok(txs)
     }
 }
 

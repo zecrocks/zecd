@@ -4,7 +4,6 @@ pub mod blockchain;
 pub mod control;
 pub mod network;
 pub mod rawtx;
-pub mod tparty_methods;
 pub mod util;
 pub mod wallet_methods;
 
@@ -12,15 +11,11 @@ use serde_json::Value;
 
 use crate::error::RpcError;
 use crate::server::jsonrpc::RpcRequest;
-use crate::state::{AppState, Dispatcher};
+use crate::state::AppState;
 
-/// Every RPC method name implemented by either binary, used to validate the
-/// `[rpc] allowed_methods` safelist at startup. This is the *union* of both dispatch tables:
-/// a name served by only one binary (tparty's `getshieldinginfo`/`shieldfunds`, or zecd's
-/// `sendtoaddress`/`sendmany`) is still a valid safelist entry - it is simply inert for the
-/// binary that does not serve it, which lets one shared config file lock down a paired
-/// zecd+tparty deployment. Keep this in lockstep with `dispatch_zecd` and
-/// `tparty_methods::dispatch`; the `all_methods_matches_dispatch_tables` test enforces it.
+/// Every RPC method name zecd implements, used to validate the `[rpc] allowed_methods`
+/// safelist at startup. Keep this in lockstep with the `dispatch` table; the
+/// `all_methods_matches_dispatch_tables` test enforces it.
 pub const ALL_METHODS: &[&str] = &[
     // Control
     "stop",
@@ -74,19 +69,15 @@ pub const ALL_METHODS: &[&str] = &[
     "walletpassphrase",
     "walletpassphrasechange",
     "walletlock",
-    // tparty only
-    "getshieldinginfo",
-    "shieldfunds",
 ];
 
-/// Whether `name` is an RPC method implemented by either binary (see [`ALL_METHODS`]).
+/// Whether `name` is an RPC method zecd implements (see [`ALL_METHODS`]).
 pub fn is_known_method(name: &str) -> bool {
     ALL_METHODS.contains(&name)
 }
 
-/// Route a parsed request to the method table of the binary being served (`zecd` or
-/// `tparty`). `wallet` is the wallet name from a `/wallet/<name>` path (or `None` for the
-/// default wallet).
+/// Route a parsed request to zecd's method table. `wallet` is the wallet name from a
+/// `/wallet/<name>` path (or `None` for the default wallet).
 pub(crate) async fn dispatch(
     state: &AppState,
     wallet: Option<&str>,
@@ -95,16 +86,12 @@ pub(crate) async fn dispatch(
     // RPC method safelist: when `[rpc] allowed_methods` is non-empty, ONLY those methods are
     // served. A blocked method is rejected exactly like one that does not exist (-32601 →
     // HTTP 404), so a locked-down server discloses nothing about the surface it has disabled.
-    // An empty safelist (the default) imposes no restriction. The gate runs ahead of the
-    // per-binary table so it applies uniformly to zecd and tparty.
+    // An empty safelist (the default) imposes no restriction.
     let safelist = &state.config.rpc.allowed_methods;
     if !safelist.is_empty() && !safelist.iter().any(|m| m == &req.method) {
         return Err(RpcError::method_not_found(&req.method));
     }
-    match state.dispatcher {
-        Dispatcher::Zecd => dispatch_zecd(state, wallet, req).await,
-        Dispatcher::Tparty => tparty_methods::dispatch(state, wallet, req).await,
-    }
+    dispatch_zecd(state, wallet, req).await
 }
 
 /// zecd's method table.
@@ -201,18 +188,17 @@ mod tests {
         out
     }
 
-    /// `ALL_METHODS` must be exactly the union of the two dispatch tables - no stale entries
-    /// (a safelist would reject a real method) and nothing missing (a real method couldn't be
-    /// safelisted). This pins the list to the source of truth without probing dispatch (which
-    /// has side effects, e.g. `stop`).
+    /// `ALL_METHODS` must be exactly the set of methods in the dispatch table - no stale
+    /// entries (a safelist would reject a real method) and nothing missing (a real method
+    /// couldn't be safelisted). This pins the list to the source of truth without probing
+    /// dispatch (which has side effects, e.g. `stop`).
     #[test]
     fn all_methods_matches_dispatch_tables() {
-        let mut from_tables = dispatch_arms(include_str!("mod.rs"));
-        from_tables.extend(dispatch_arms(include_str!("tparty_methods.rs")));
+        let from_tables = dispatch_arms(include_str!("mod.rs"));
         let declared: BTreeSet<String> = super::ALL_METHODS.iter().map(|s| s.to_string()).collect();
         assert_eq!(
             from_tables, declared,
-            "ALL_METHODS is out of sync with the dispatch tables (zecd + tparty union)"
+            "ALL_METHODS is out of sync with the dispatch table"
         );
         // No duplicates in the declared slice (the set would silently absorb them otherwise).
         assert_eq!(

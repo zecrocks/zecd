@@ -90,8 +90,7 @@ fn minconf_policy(
 }
 
 /// Validate `getbalance`'s legacy first argument, which Bitcoin Core requires to be
-/// excluded or `"*"` (anything else is `-32 RPC_METHOD_DEPRECATED`). Shared with tparty's
-/// `getbalance`.
+/// excluded or `"*"` (anything else is `-32 RPC_METHOD_DEPRECATED`).
 pub(crate) fn check_balance_dummy(v: Option<&Value>) -> Result<(), RpcError> {
     match v {
         None | Some(Value::Null) => Ok(()),

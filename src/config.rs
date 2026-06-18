@@ -21,10 +21,9 @@ use crate::network::ZNetwork;
 /// or a public preset (`zecrocks`).
 pub const DEFAULT_SERVER: &str = "zebra";
 
-/// Per-binary configuration defaults, so `zecd` and `tparty` running side by side on one
-/// host never collide on config files, datadirs, or ports.
+/// Binary configuration defaults (config file, datadir, ports).
 pub struct BinaryDefaults {
-    /// Config file name looked up inside the datadir (`zecd.toml` / `tparty.toml`).
+    /// Config file name looked up inside the datadir (`zecd.toml`).
     pub conf_file: &'static str,
     /// Default datadir when neither CLI nor env supplies one.
     pub datadir: &'static str,
@@ -44,15 +43,6 @@ pub const ZECD_DEFAULTS: BinaryDefaults = BinaryDefaults {
     rpc_port_main: 8232,
     rpc_port_test: 18232,
     health_port: 9233,
-};
-
-pub const TPARTY_DEFAULTS: BinaryDefaults = BinaryDefaults {
-    conf_file: "tparty.toml",
-    datadir: "./tparty-data",
-    datadir_env: "TPARTY_DATADIR",
-    rpc_port_main: 8237,
-    rpc_port_test: 18237,
-    health_port: 9237,
 };
 
 /// Resolve the ordered list of upstream server tokens by precedence:
@@ -89,72 +79,6 @@ pub struct AppConfig {
     pub spend: SpendConfig,
     pub health: HealthConfig,
     pub log: LogConfig,
-    /// tparty-only knobs (auto-shield policy, gap limit). Parsed for both binaries so one
-    /// config file can serve a paired deployment; `zecd` ignores it.
-    pub tparty: TpartyConfig,
-}
-
-/// The shielded pool `tparty` auto-shields into. Only Orchard today; the type exists so a
-/// future Sapling option is a parse arm plus a `ShieldedProtocol` mapping, not a refactor.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum ShieldPool {
-    #[default]
-    Orchard,
-}
-
-impl ShieldPool {
-    pub fn parse(s: &str) -> anyhow::Result<ShieldPool> {
-        match s.trim().to_ascii_lowercase().as_str() {
-            "orchard" => Ok(ShieldPool::Orchard),
-            "sapling" => Err(anyhow::anyhow!(
-                "[tparty] pool = \"sapling\" is not supported yet; only \"orchard\" is available"
-            )),
-            other => Err(anyhow::anyhow!(
-                "invalid [tparty] pool: {other:?} (expected \"orchard\")"
-            )),
-        }
-    }
-
-    pub fn name(self) -> &'static str {
-        match self {
-            ShieldPool::Orchard => "orchard",
-        }
-    }
-
-    pub fn protocol(self) -> zcash_protocol::ShieldedProtocol {
-        match self {
-            ShieldPool::Orchard => zcash_protocol::ShieldedProtocol::Orchard,
-        }
-    }
-}
-
-/// `[tparty]` - auto-shield policy for the tparty binary.
-#[derive(Debug, Clone)]
-pub struct TpartyConfig {
-    /// Destination pool for auto-shielding (the account's *internal* receiver in that pool).
-    pub pool: ShieldPool,
-    /// Confirmations a transparent deposit needs before it is shielded. `0` shields straight
-    /// out of the mempool (maximum "ASAP", but a double-spent deposit can strand the shield).
-    pub min_conf: u32,
-    /// Do not shield while the spendable transparent total is below this many zatoshis
-    /// (avoids burning the ZIP-317 fee on dust).
-    pub threshold_zat: u64,
-    /// External transparent-address gap limit: how many consecutive *unused* deposit
-    /// addresses `getnewaddress` may hand out before returning -12 (keypool ran out).
-    /// Larger values weaken seed-restore discovery of unshielded funds; auto-shielding
-    /// makes that window small in practice.
-    pub gap_limit: u32,
-}
-
-impl Default for TpartyConfig {
-    fn default() -> Self {
-        TpartyConfig {
-            pool: ShieldPool::Orchard,
-            min_conf: 1,
-            threshold_zat: 100_000, // 0.001 ZEC; ~10x the minimum ZIP-317 fee
-            gap_limit: 100,
-        }
-    }
 }
 
 #[derive(Debug, Clone)]
@@ -350,10 +274,10 @@ impl SpendConfig {
     pub fn confirmations_policy(&self) -> anyhow::Result<ConfirmationsPolicy> {
         let trusted = NonZeroU32::new(self.trusted_confirmations.max(1)).expect("clamped");
         let untrusted = NonZeroU32::new(self.untrusted_confirmations.max(1)).expect("clamped");
-        // The third argument exists because this crate enables `transparent-inputs` (for
-        // tparty): allow 0-conf shielding of transparent UTXOs, matching the ZIP-315
-        // default policy. It is inert for zecd (shielded-only) and unused by tparty's
-        // auto-shield, which builds its own policy from `[tparty] min_conf`.
+        // The third argument exists because this crate enables `transparent-inputs` (so
+        // transparent receivers surface in getrawtransaction/getaddressinfo): it allows
+        // 0-conf spends of transparent UTXOs, matching the ZIP-315 default policy. It is
+        // inert for zecd, whose wallets never expose transparent receivers.
         ConfirmationsPolicy::new(trusted, untrusted, true).map_err(|_| {
             anyhow::anyhow!(
                 "[spend] trusted_confirmations ({}) must not exceed untrusted_confirmations ({})",
@@ -395,16 +319,6 @@ struct ConfigFile {
     spend: Option<SpendFile>,
     health: Option<HealthFile>,
     log: Option<LogFile>,
-    tparty: Option<TpartyFile>,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct TpartyFile {
-    pool: Option<String>,
-    min_conf: Option<u32>,
-    threshold_zat: Option<u64>,
-    gap_limit: Option<u32>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -634,9 +548,9 @@ impl AppConfig {
         Self::resolve_with(cli, &ZECD_DEFAULTS)
     }
 
-    /// Resolve the effective configuration with binary-specific defaults (`zecd`/`tparty`).
+    /// Resolve the effective configuration with the binary's defaults (`zecd`).
     pub fn resolve_with(cli: &Cli, defaults: &BinaryDefaults) -> anyhow::Result<AppConfig> {
-        // Datadir precedence: CLI > env (ZECD_DATADIR/TPARTY_DATADIR) > config file > default.
+        // Datadir precedence: CLI > env (ZECD_DATADIR) > config file > default.
         // The config file is located *before* its own `datadir` can apply (like bitcoind:
         // `-conf` resolution never depends on a datadir set inside the file), so the file
         // lookup uses only CLI/env.
@@ -882,22 +796,6 @@ impl AppConfig {
             format: log_file.format.unwrap_or_else(|| "text".to_string()),
         };
 
-        let tparty_defaults = TpartyConfig::default();
-        let tparty = match file.tparty {
-            None => tparty_defaults,
-            Some(t) => TpartyConfig {
-                pool: t
-                    .pool
-                    .as_deref()
-                    .map(ShieldPool::parse)
-                    .transpose()?
-                    .unwrap_or_default(),
-                min_conf: t.min_conf.unwrap_or(tparty_defaults.min_conf),
-                threshold_zat: t.threshold_zat.unwrap_or(tparty_defaults.threshold_zat),
-                gap_limit: t.gap_limit.unwrap_or(tparty_defaults.gap_limit).max(1),
-            },
-        };
-
         Ok(AppConfig {
             network,
             datadir,
@@ -912,7 +810,6 @@ impl AppConfig {
             spend,
             health,
             log,
-            tparty,
         })
     }
 }
@@ -1140,58 +1037,6 @@ mod tests {
     }
 
     #[test]
-    fn tparty_section_parses_and_pool_is_validated() {
-        use clap::Parser as _;
-        let dir = tempfile::tempdir().unwrap();
-        let conf = dir.path().join("tparty.toml");
-
-        // Defaults when the section is absent.
-        std::fs::write(&conf, "network = \"regtest\"\n").unwrap();
-        let cli = Cli::parse_from(["tparty", "--conf", conf.to_str().unwrap()]);
-        let cfg = AppConfig::resolve_with(&cli, &TPARTY_DEFAULTS).unwrap();
-        assert_eq!(cfg.tparty.pool, ShieldPool::Orchard);
-        assert_eq!(cfg.tparty.min_conf, 1);
-        assert_eq!(cfg.tparty.threshold_zat, 100_000);
-        assert_eq!(cfg.tparty.gap_limit, 100);
-        // tparty's defaults keep it off zecd's ports.
-        assert_eq!(cfg.rpc.port, 18237);
-        assert_eq!(cfg.health.port, 9237);
-
-        // Explicit values are honored.
-        std::fs::write(
-            &conf,
-            "[tparty]\npool = \"orchard\"\nmin_conf = 0\nthreshold_zat = 50000\ngap_limit = 500\n",
-        )
-        .unwrap();
-        let cli = Cli::parse_from(["tparty", "--conf", conf.to_str().unwrap()]);
-        let cfg = AppConfig::resolve_with(&cli, &TPARTY_DEFAULTS).unwrap();
-        assert_eq!(cfg.tparty.min_conf, 0);
-        assert_eq!(cfg.tparty.threshold_zat, 50_000);
-        assert_eq!(cfg.tparty.gap_limit, 500);
-
-        // Sapling is recognized but explicitly not-yet-supported; garbage is rejected.
-        std::fs::write(&conf, "[tparty]\npool = \"sapling\"\n").unwrap();
-        let cli = Cli::parse_from(["tparty", "--conf", conf.to_str().unwrap()]);
-        let err = AppConfig::resolve_with(&cli, &TPARTY_DEFAULTS)
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("not supported yet"), "got: {err}");
-        std::fs::write(&conf, "[tparty]\npool = \"sprout\"\n").unwrap();
-        let cli = Cli::parse_from(["tparty", "--conf", conf.to_str().unwrap()]);
-        let err = AppConfig::resolve_with(&cli, &TPARTY_DEFAULTS)
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("invalid [tparty] pool"), "got: {err}");
-
-        // The section is legal (and inert) under zecd's resolution too, so a paired
-        // deployment can share one config file.
-        std::fs::write(&conf, "[tparty]\nmin_conf = 2\n").unwrap();
-        let cli = Cli::parse_from(["zecd", "--conf", conf.to_str().unwrap()]);
-        let cfg = AppConfig::resolve(&cli).unwrap();
-        assert_eq!(cfg.tparty.min_conf, 2);
-    }
-
-    #[test]
     fn rpc_allowed_methods_parses_and_validates() {
         use clap::Parser as _;
         let dir = tempfile::tempdir().unwrap();
@@ -1203,11 +1048,10 @@ mod tests {
         let cfg = AppConfig::resolve(&cli).unwrap();
         assert!(cfg.rpc.allowed_methods.is_empty());
 
-        // A valid list is preserved verbatim - including a method only the *other* binary
-        // serves (`shieldfunds`), so a shared config can lock down a paired deployment.
+        // A valid list is preserved verbatim.
         std::fs::write(
             &conf,
-            "[rpc]\nallowed_methods = [\"getbalance\", \"getnewaddress\", \"shieldfunds\"]\n",
+            "[rpc]\nallowed_methods = [\"getbalance\", \"getnewaddress\", \"sendtoaddress\"]\n",
         )
         .unwrap();
         let cli = Cli::parse_from(["zecd", "--conf", conf.to_str().unwrap()]);
@@ -1217,7 +1061,7 @@ mod tests {
             vec![
                 "getbalance".to_string(),
                 "getnewaddress".to_string(),
-                "shieldfunds".to_string()
+                "sendtoaddress".to_string()
             ]
         );
 
@@ -1244,8 +1088,6 @@ mod tests {
         // drift as the schema evolves).
         toml::from_str::<ConfigFile>(include_str!("../zecd.example.toml"))
             .expect("zecd.example.toml");
-        toml::from_str::<ConfigFile>(include_str!("../tparty.example.toml"))
-            .expect("tparty.example.toml");
         toml::from_str::<ConfigFile>(include_str!("../deploy/zecd.toml"))
             .expect("deploy/zecd.toml");
         toml::from_str::<ConfigFile>(include_str!("../deploy/zecd.mainnet.toml"))

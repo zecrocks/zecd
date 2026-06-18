@@ -3,7 +3,7 @@
 use clap::Parser;
 
 use zecd::config::{AppConfig, Cli, Command};
-use zecd::daemon::{self, DaemonOptions};
+use zecd::daemon;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -17,6 +17,6 @@ async fn main() -> anyhow::Result<()> {
         Some(Command::Init(args)) => zecd::init::run(&config, args).await,
         Some(Command::Rewrap(args)) => zecd::rewrap::run(&config, args).await,
         Some(Command::ExportUfvk(args)) => zecd::init::export_ufvk(&config, args),
-        _ => daemon::run(config, DaemonOptions::zecd()).await,
+        _ => daemon::run(config).await,
     }
 }

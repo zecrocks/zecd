@@ -15,8 +15,6 @@
 //! | `subscribe_mempool`   | `getrawmempool` + `getrawtransaction`, polled; the stream  |
 //! |                       | closes when `getbestblockhash` changes (lightwalletd       |
 //! |                       | parity: stream-close is the actor's sync-now signal)       |
-//! | `address_utxos`       | `getaddressutxos`                                          |
-//! | `taddress_txs`        | `getaddresstxids` + `getrawtransaction` per txid           |
 //!
 //! The full-block→CompactBlock conversion ([`block_to_compact`]) is the part lightwalletd
 //! otherwise does for us: parse the raw block (`zcash_primitives::block::Block`), then per
@@ -51,8 +49,8 @@ use zcash_protocol::consensus::BlockHeight;
 use zcash_protocol::{ShieldedProtocol, TxId};
 
 use super::{
-    AddressUtxo, BroadcastOutcome, ChainSource, ChainTip, CompactBlockStream, FetchedTx,
-    MempoolStream, ServerInfo, SubtreeRootInfo,
+    BroadcastOutcome, ChainSource, ChainTip, CompactBlockStream, FetchedTx, MempoolStream,
+    ServerInfo, SubtreeRootInfo,
 };
 use crate::network::ZNetwork;
 
@@ -339,16 +337,6 @@ struct VerboseTx {
     height: Option<i64>,
 }
 
-#[derive(Debug, Deserialize)]
-struct AddressUtxoReply {
-    txid: String,
-    #[serde(rename = "outputIndex")]
-    output_index: u32,
-    script: String,
-    satoshis: i64,
-    height: u32,
-}
-
 /// A connected zebrad backend.
 pub struct ZebraSource {
     client: ZebraClient,
@@ -524,81 +512,6 @@ impl ChainSource for ZebraSource {
             rx,
             _task: AbortOnDrop(task),
         }))
-    }
-
-    async fn address_utxos(&mut self, addresses: Vec<String>) -> anyhow::Result<Vec<AddressUtxo>> {
-        let replies: Vec<AddressUtxoReply> = self
-            .client
-            .call_as("getaddressutxos", json!([{ "addresses": addresses }]))
-            .await?;
-        replies
-            .into_iter()
-            .map(|r| {
-                // The RPC reports txids as display hex; the trait (like lightwalletd's
-                // GetAddressUtxos) carries internal byte order.
-                let mut txid = hex::decode(&r.txid).context("decoding utxo txid hex")?;
-                txid.reverse();
-                Ok(AddressUtxo {
-                    txid,
-                    index: r.output_index,
-                    script: hex::decode(&r.script).context("decoding utxo script hex")?,
-                    value_zat: r.satoshis,
-                    height: r.height,
-                })
-            })
-            .collect()
-    }
-
-    async fn taddress_txs(
-        &mut self,
-        address: String,
-        start: BlockHeight,
-        end: BlockHeight,
-    ) -> anyhow::Result<Vec<FetchedTx>> {
-        let txids: Vec<String> = self
-            .client
-            .call_as(
-                "getaddresstxids",
-                json!([{
-                    "addresses": [address],
-                    "start": u32::from(start),
-                    "end": u32::from(end),
-                }]),
-            )
-            .await?;
-        let mut txs = Vec::with_capacity(txids.len());
-        for txid in txids {
-            match self
-                .client
-                .call("getrawtransaction", json!([txid, 1]))
-                .await
-            {
-                Ok(v) => {
-                    let verbose: VerboseTx =
-                        serde_json::from_value(v).context("decoding getrawtransaction response")?;
-                    let data =
-                        hex::decode(verbose.hex.trim()).context("decoding raw transaction hex")?;
-                    let mined_height = verbose
-                        .height
-                        .filter(|h| *h > 0)
-                        .and_then(|h| u32::try_from(h).ok());
-                    txs.push(FetchedTx { data, mined_height });
-                }
-                // The tx vanished between the two calls (reorged out / evicted): skip it; the
-                // next address-check pass sees the replacement chain's view. Only a genuine
-                // "no such transaction" is a miss - any other RPC error is surfaced rather than
-                // silently dropping the tx (which for tparty would be a missed deposit/spend),
-                // mirroring `fetch_tx`'s classification.
-                Err(CallError::Rpc { code: -5, .. }) => continue,
-                Err(CallError::Rpc { message, .. })
-                    if message.to_lowercase().contains("no such mempool") =>
-                {
-                    continue
-                }
-                Err(e) => return Err(e.into_anyhow("getrawtransaction")),
-            }
-        }
-        Ok(txs)
     }
 }
 
@@ -828,8 +741,6 @@ mod tests {
         subtrees: Value,
         mempool: Vec<String>,
         raw_txs: HashMap<String, Value>,
-        address_utxos: Value,
-        address_txids: Value,
         /// `Err((code, message))` makes `sendrawtransaction` reject.
         send: Result<String, (i64, String)>,
         /// Authorization header values observed, in order.
@@ -848,8 +759,6 @@ mod tests {
                 subtrees: Value::Null,
                 mempool: Vec::new(),
                 raw_txs: HashMap::new(),
-                address_utxos: json!([]),
-                address_txids: json!([]),
                 send: Ok("00".repeat(32)),
                 seen_auth: Vec::new(),
             }
@@ -903,8 +812,6 @@ mod tests {
             }
             "z_gettreestate" => reply(fake.treestate.clone()),
             "z_getsubtreesbyindex" => reply(fake.subtrees.clone()),
-            "getaddressutxos" => reply(fake.address_utxos.clone()),
-            "getaddresstxids" => reply(fake.address_txids.clone()),
             "getrawmempool" => reply(json!(fake.mempool)),
             "getrawtransaction" => {
                 let txid = params[0].as_str().unwrap_or_default();
@@ -1237,59 +1144,6 @@ mod tests {
             stream.next().await.is_err(),
             "unparseable block bytes must error"
         );
-    }
-
-    /// The transparent-address operations (tparty's deposit discovery and spend detection)
-    /// map `getaddressutxos`/`getaddresstxids` onto the same shapes lightwalletd serves -
-    /// including the display-hex → internal txid byte-order flip on UTXOs.
-    #[tokio::test]
-    async fn address_utxos_and_taddress_txs_map_the_transparent_rpcs() {
-        let fake = Arc::new(Mutex::new(Fake::new()));
-        let txid_display = "aa".repeat(31) + "bb"; // asymmetric so a missed reversal fails
-        {
-            let mut f = fake.lock().unwrap();
-            f.address_utxos = json!([{
-                "address": "tmTestAddr",
-                "txid": txid_display,
-                "outputIndex": 3,
-                "script": "76a914ff88ac",
-                "satoshis": 12345,
-                "height": 7,
-            }]);
-            f.address_txids = json!(["11".repeat(32), "22".repeat(32)]);
-            f.raw_txs
-                .insert("11".repeat(32), json!({ "hex": "0a0b", "height": 5 }));
-            // The second txid is gone by the time it is fetched (reorged out): skipped.
-        }
-        let mut src = source_for(fake).await;
-
-        let utxos = src.address_utxos(vec!["tmTestAddr".into()]).await.unwrap();
-        assert_eq!(utxos.len(), 1);
-        let expected_txid = {
-            let mut b = hex::decode(&("aa".repeat(31) + "bb")).unwrap();
-            b.reverse();
-            b
-        };
-        assert_eq!(
-            utxos[0].txid, expected_txid,
-            "utxo txid flipped to internal order"
-        );
-        assert_eq!(utxos[0].index, 3);
-        assert_eq!(utxos[0].script, hex::decode("76a914ff88ac").unwrap());
-        assert_eq!(utxos[0].value_zat, 12345);
-        assert_eq!(utxos[0].height, 7);
-
-        let txs = src
-            .taddress_txs(
-                "tmTestAddr".into(),
-                BlockHeight::from_u32(1),
-                BlockHeight::from_u32(10),
-            )
-            .await
-            .unwrap();
-        assert_eq!(txs.len(), 1, "the vanished txid is skipped, not fatal");
-        assert_eq!(txs[0].data, vec![0x0a, 0x0b]);
-        assert_eq!(txs[0].mined_height, Some(5));
     }
 
     /// The synthesized mempool stream preserves lightwalletd's semantics: every current and

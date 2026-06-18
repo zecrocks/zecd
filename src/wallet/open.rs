@@ -4,7 +4,6 @@
 use std::path::{Path, PathBuf};
 
 use rand::rngs::OsRng;
-use zcash_keys::keys::transparent::gap_limits::GapLimits;
 
 use zcash_client_sqlite::chain::init::init_blockmeta_db;
 use zcash_client_sqlite::chain::BlockMeta;
@@ -32,25 +31,12 @@ pub fn block_path(wallet_dir: &Path, meta: &BlockMeta) -> PathBuf {
 
 /// Open the wallet DB for writing (sync, sends, address generation).
 pub fn open_write(network: ZNetwork, wallet_dir: &Path) -> anyhow::Result<WriteDb> {
-    open_write_with(network, wallet_dir, None)
-}
-
-/// Open the wallet DB for writing with an optional external transparent-address gap limit
-/// (tparty hands out many unused deposit addresses, so it raises this above librustzcash's
-/// default of 10; internal/ephemeral limits keep their defaults).
-pub fn open_write_with(
-    network: ZNetwork,
-    wallet_dir: &Path,
-    external_gap_limit: Option<u32>,
-) -> anyhow::Result<WriteDb> {
-    let db = WalletDb::for_path(data_db_path(wallet_dir), network, SystemClock, OsRng)?;
-    Ok(match external_gap_limit {
-        Some(external) => {
-            let d = GapLimits::default();
-            db.with_gap_limits(GapLimits::new(external, d.internal(), d.ephemeral()))
-        }
-        None => db,
-    })
+    Ok(WalletDb::for_path(
+        data_db_path(wallet_dir),
+        network,
+        SystemClock,
+        OsRng,
+    )?)
 }
 
 /// Open the wallet DB read-only (balances, history); short-lived per request.
@@ -70,19 +56,10 @@ pub fn open_fsblockdb(wallet_dir: &Path) -> anyhow::Result<FsBlockDb> {
 
 /// Initialize both the wallet DB and the block-cache DB (idempotent migrations).
 pub fn init_dbs(network: ZNetwork, wallet_dir: &Path) -> anyhow::Result<WriteDb> {
-    init_dbs_with(network, wallet_dir, None)
-}
-
-/// [`init_dbs`] with an optional external transparent gap limit (see [`open_write_with`]).
-pub fn init_dbs_with(
-    network: ZNetwork,
-    wallet_dir: &Path,
-    external_gap_limit: Option<u32>,
-) -> anyhow::Result<WriteDb> {
     std::fs::create_dir_all(wallet_dir)?;
     enable_wal(wallet_dir)?;
     let mut db_cache = open_fsblockdb(wallet_dir)?;
-    let mut db_data = open_write_with(network, wallet_dir, external_gap_limit)?;
+    let mut db_data = open_write(network, wallet_dir)?;
     init_blockmeta_db(&mut db_cache)
         .map_err(|e| anyhow::anyhow!("initializing block-cache db: {e}"))?;
     init_wallet_db(&mut db_data, None)?;

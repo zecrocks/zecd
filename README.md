@@ -281,14 +281,14 @@ load, so cover the brief prover-init at boot with a `startupProbe` / `initialDel
 zecd talks straight to zebra's JSON-RPC). An optional `lightwalletd` compose profile adds a
 lightwalletd in front of the same zebra for serving other light clients. `Dockerfile` builds
 the zecd image as a **reproducible [StageX](https://stagex.tools) build**: every base image is
-full-source-bootstrapped and pinned by digest, and `zecd` + `tparty` are statically linked musl
-binaries in a from-scratch runtime image, so independent builders can reproduce the binaries
+full-source-bootstrapped and pinned by digest, and `zecd` is a statically linked musl
+binary in a from-scratch runtime image, so independent builders can reproduce the binary
 bit-for-bit. (`vendor/i18n-embed-fl` carries a two-line upstream-merged determinism fix that
 this depends on - see the comment on `[patch.crates-io]` in `Cargo.toml`.) The `export` stage
 extracts the static binaries without running a container:
 
 ```sh
-docker build --target export -o ./out .     # ./out/zecd, ./out/tparty
+docker build --target export -o ./out .     # ./out/zecd
 ```
 
 **ARM (arm64) hosts:** StageX publishes amd64 base images only, so the full-source-
@@ -441,7 +441,7 @@ whole wallet, never of individual addresses):
   instances do not hand out literally identical address *sequences*: librustzcash picks
   shielded diversifier indexes from the clock - the same is true of two same-seed zecd
   instances.)
-- `sendtoaddress`/`sendmany` (and tparty's `shieldfunds`) fail with `-4`
+- `sendtoaddress`/`sendmany` fail with `-4`
   `Error: Private keys are disabled for this wallet`; `encryptwallet` is `-16`
   `Error: wallet does not contain private keys, nothing to encrypt.`; the passphrase RPCs
   are `-15`, as for any unencrypted wallet - all three byte-identical to Core.
@@ -546,17 +546,6 @@ python3 scripts/rpc_send_smoke.py --send-timeout 180
 All wallet RPCs have been exercised against the live public testnet (zecrocks): balances,
 addresses/labels, history (`listtransactions`/`gettransaction` incl. `hex`), `listunspent`, the
 `walletlock`/`walletpassphrase` gate, and real Orchard `sendtoaddress`/`sendmany` broadcasts.
-
-## tparty: transparent deposit addresses
-
-zecd never hands out transparent addresses. If an integration requires t-addresses (legacy
-exchange/payment flows that parse the address format), run the companion binary `tparty`
-from this repository instead of weakening zecd: it serves the same Bitcoin RPC dialect,
-returns a fresh t-address from `getnewaddress`, and auto-shields every confirmed deposit
-into the wallet seed's shielded pool. Restore the same mnemonic into a zecd instance
-(separate datadirs) and the shielded deposits appear in zecd's balance; the two daemons'
-addresses can never collide.
-
 
 ## Operations
 

@@ -79,17 +79,6 @@ pub struct SubtreeRootInfo {
     pub completing_height: u32,
 }
 
-/// One unspent transparent output of a watched address (the tparty deposit-discovery path).
-/// `txid` is in internal (protocol) byte order.
-#[derive(Clone, Debug)]
-pub struct AddressUtxo {
-    pub txid: Vec<u8>,
-    pub index: u32,
-    pub script: Vec<u8>,
-    pub value_zat: i64,
-    pub height: u32,
-}
-
 /// A connected chain-data backend. All methods take `&mut self` (the lightwalletd client
 /// requires it) and return `Send` futures so the wallet actor task stays spawnable.
 ///
@@ -146,23 +135,6 @@ pub trait ChainSource: Send {
     /// **closes (yields `None`) when a new block arrives** - the actor relies on that as its
     /// sync-now signal, so both backends must preserve it.
     fn subscribe_mempool(&mut self) -> impl Future<Output = anyhow::Result<MempoolStream>> + Send;
-
-    /// The current UTXO set of the given transparent addresses (lightwalletd
-    /// `GetAddressUtxos`; zebra `getaddressutxos`). tparty's deposit discovery.
-    fn address_utxos(
-        &mut self,
-        addresses: Vec<String>,
-    ) -> impl Future<Output = anyhow::Result<Vec<AddressUtxo>>> + Send;
-
-    /// The mined transactions involving `address` within `start..=end`, as raw bytes plus
-    /// mined heights (lightwalletd `GetTaddressTxids`; zebra `getaddresstxids` +
-    /// `getrawtransaction`). tparty's transparent spend detection/enhancement.
-    fn taddress_txs(
-        &mut self,
-        address: String,
-        start: BlockHeight,
-        end: BlockHeight,
-    ) -> impl Future<Output = anyhow::Result<Vec<FetchedTx>>> + Send;
 }
 
 /// A connected backend of either kind: what the actor and `init` actually hold. Delegates
@@ -235,25 +207,6 @@ impl ChainSource for AnySource {
         match self {
             AnySource::Lwd(s) => s.subscribe_mempool().await,
             AnySource::Zebra(s) => s.subscribe_mempool().await,
-        }
-    }
-
-    async fn address_utxos(&mut self, addresses: Vec<String>) -> anyhow::Result<Vec<AddressUtxo>> {
-        match self {
-            AnySource::Lwd(s) => s.address_utxos(addresses).await,
-            AnySource::Zebra(s) => s.address_utxos(addresses).await,
-        }
-    }
-
-    async fn taddress_txs(
-        &mut self,
-        address: String,
-        start: BlockHeight,
-        end: BlockHeight,
-    ) -> anyhow::Result<Vec<FetchedTx>> {
-        match self {
-            AnySource::Lwd(s) => s.taddress_txs(address, start, end).await,
-            AnySource::Zebra(s) => s.taddress_txs(address, start, end).await,
         }
     }
 }

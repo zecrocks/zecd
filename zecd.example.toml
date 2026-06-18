@@ -135,10 +135,6 @@ password = "change-me"
 #   "walletlock",              # re-lock
 #   "walletpassphrasechange",  # ⚠ rotate the passphrase
 #   "encryptwallet",           # ⚠ re-wraps the seed at rest; can lock the owner out
-#
-#   # --- tparty only (inert under zecd; listed so one file can serve a paired deployment) ---
-#   "getshieldinginfo",
-#   "shieldfunds",             # ⚠ forces a shield immediately
 # ]
 
 [keys]

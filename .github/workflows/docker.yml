@@ -66,17 +66,14 @@ jobs:
       - name: Run zecd inside the container
         run: docker run --rm zecd --version
 
-      - name: Run tparty inside the container
-        run: docker run --rm --entrypoint tparty zecd --version
-
       - name: Extract static binaries via the export stage
         run: |
           docker build -f ${{ matrix.dockerfile }} --target export -o ./out .
-          test -x out/zecd && test -x out/tparty
-          file out/zecd out/tparty
+          test -x out/zecd
+          file out/zecd
 
       # Logged so any two runs of the same commit can be diffed by hand - they should
       # be bit-for-bit identical (the i18n-embed-fl nondeterminism is patched in
       # vendor/; see the project docs "Gotchas").
       - name: Print binary hashes
-        run: sha256sum out/zecd out/tparty
+        run: sha256sum out/zecd

@@ -8,7 +8,7 @@ use anyhow::anyhow;
 use rusqlite::{named_params, Connection, OptionalExtension};
 use uuid::Uuid;
 use zcash_client_backend::data_api::wallet::ConfirmationsPolicy;
-use zcash_client_backend::data_api::{InputSource, TransparentOutputFilter, WalletRead};
+use zcash_client_backend::data_api::{InputSource, WalletRead};
 use zcash_keys::encoding::AddressCodec as _;
 use zcash_protocol::ShieldedProtocol;
 
@@ -157,8 +157,8 @@ fn txid_internal(display_hex: &str) -> Option<Vec<u8>> {
 /// its transparent receiver, for the wallet's transparent-capable addresses. Used to report
 /// received transparent outputs under the t-address the payer actually paid: the
 /// `v_tx_outputs.to_address` column carries the *unified* encoding of the receiving address
-/// row, but tparty hands out (and its callers query by) the bare t-address. Empty for zecd
-/// wallets (whose addresses have no transparent receiver), making the rewrite a no-op there.
+/// row, but callers may query by the bare t-address. Empty for wallets whose addresses have
+/// no transparent receiver (zecd's), making the rewrite a no-op there.
 fn transparent_receiver_map(conn: &Connection) -> anyhow::Result<HashMap<String, String>> {
     let mut stmt = conn.prepare(
         "SELECT address, cached_transparent_receiver_address
@@ -340,15 +340,15 @@ pub fn list_transactions(wallet_dir: &Path) -> anyhow::Result<Vec<TxRecord>> {
 /// `address_filter` (display encoding) is pushed into SQL for `getreceivedbyaddress`, which
 /// asks about a single address: only its outputs are loaded. The transparent-receiver rewrite
 /// (a no-op for zecd, which exposes no transparent receivers) matches [`load_outputs`] so a
-/// tparty caller's bare t-address aggregates the same as through the full path.
+/// bare t-address filter aggregates the same as through the full path.
 pub fn received_tx_records(
     wallet_dir: &Path,
     address_filter: Option<&str>,
 ) -> anyhow::Result<Vec<TxRecord>> {
     let conn = open_conn(wallet_dir)?;
     let taddr_map = transparent_receiver_map(&conn)?;
-    // The filter may be a bare t-address (tparty); map it back to the unified encoding stored
-    // in `v_tx_outputs.to_address` so the pushed-down predicate matches the stored rows.
+    // The filter may be a bare t-address; map it back to the unified encoding stored in
+    // `v_tx_outputs.to_address` so the pushed-down predicate matches the stored rows.
     let ua_for_taddr: HashMap<&str, &str> = taddr_map
         .iter()
         .map(|(ua, t)| (t.as_str(), ua.as_str()))
@@ -476,10 +476,9 @@ pub fn tx_exists(wallet_dir: &Path, txid_hex: &str) -> bool {
 /// wallet created or has enhanced. An expiry height of 0 means "never expires".
 ///
 /// Only transactions that spend this wallet's notes or transparent outputs qualify (nobody
-/// else can spend them, so such a tx was necessarily authored here - for tparty that
-/// includes its auto-shielding txs, which spend the wallet's transparent UTXOs). The actor's
-/// mempool stream also stores *foreign* incoming txs as unmined rows with raw bytes, and
-/// those are the sender's to retransmit, not ours.
+/// else can spend them, so such a tx was necessarily authored here). The actor's mempool
+/// stream also stores *foreign* incoming txs as unmined rows with raw bytes, and those are
+/// the sender's to retransmit, not ours.
 pub fn unmined_raw_txs(wallet_dir: &Path, tip: u32) -> anyhow::Result<Vec<(String, Vec<u8>)>> {
     let conn = open_conn(wallet_dir)?;
     let mut stmt = conn.prepare(
@@ -724,27 +723,6 @@ pub fn all_addresses(network: ZNetwork, wallet_dir: &Path) -> Vec<String> {
     out
 }
 
-/// The wallet's exposed transparent receivers as base58 t-addresses, sorted (tparty's
-/// deposit-address universe). Test-only: tparty's RPCs surface unspent UTXOs and balances,
-/// not the raw address list, so this exists only to assert deposit-address derivation.
-#[cfg(test)]
-pub fn transparent_addresses(network: ZNetwork, wallet_dir: &Path) -> Vec<String> {
-    let Ok(db) = open_read(network, wallet_dir) else {
-        return Vec::new();
-    };
-    let Ok(ids) = db.get_account_ids() else {
-        return Vec::new();
-    };
-    let mut out = Vec::new();
-    for account in ids {
-        if let Ok(receivers) = db.get_transparent_receivers(account, false, false) {
-            out.extend(receivers.keys().map(|t| t.encode(&network)));
-        }
-    }
-    out.sort();
-    out
-}
-
 /// Whether `addr` is one of the wallet's own generated addresses (for `getaddressinfo.ismine`).
 /// Matches both unified addresses and the wallet's transparent receivers.
 pub fn is_mine(network: ZNetwork, wallet_dir: &Path, addr: &str) -> bool {
@@ -770,84 +748,6 @@ pub fn is_mine(network: ZNetwork, wallet_dir: &Path, addr: &str) -> bool {
         }
     }
     false
-}
-
-/// Transparent (not-yet-shielded) balances, for tparty's `getbalance`/`getunconfirmedbalance`:
-/// `spendable` is confirmed to `min_conf` and ready to shield; `pending` is everything the
-/// wallet has seen (including mempool deposits) that hasn't reached spendability yet.
-pub fn transparent_balance(
-    network: ZNetwork,
-    wallet_dir: &Path,
-    min_conf: u32,
-) -> anyhow::Result<(u64, u64)> {
-    let db = open_read(network, wallet_dir)?;
-    let Some(chain_height) = db.chain_height()? else {
-        return Ok((0, 0));
-    };
-    let policy = match std::num::NonZeroU32::new(min_conf) {
-        None => ConfirmationsPolicy::MIN,
-        Some(n) => ConfirmationsPolicy::new_symmetrical(n, false),
-    };
-    let (mut spendable, mut pending) = (0u64, 0u64);
-    for account in db.get_account_ids()? {
-        let balances = db.get_transparent_balances(account, (chain_height + 1).into(), policy)?;
-        for (_addr, (_origin, balance)) in balances {
-            spendable += balance.spendable_value().into_u64();
-            pending += balance.value_pending_spendability().into_u64();
-        }
-    }
-    Ok((spendable, pending))
-}
-
-/// An unspent transparent output, for tparty's `listunspent`.
-#[derive(Debug, Clone)]
-pub struct TransparentUtxo {
-    pub txid: String,
-    pub vout: u32,
-    pub address: String,
-    pub script_pubkey: Vec<u8>,
-    pub value: u64,
-    pub mined_height: Option<u32>,
-}
-
-/// List the wallet's unspent (not-yet-shielded) transparent outputs, including unconfirmed
-/// ones; the caller applies minconf/maxconf filtering from `mined_height`.
-pub fn list_transparent_unspent(
-    network: ZNetwork,
-    wallet_dir: &Path,
-) -> anyhow::Result<Vec<TransparentUtxo>> {
-    let db = open_read(network, wallet_dir)?;
-    let Some(chain_height) = db.chain_height()? else {
-        return Ok(vec![]);
-    };
-    let target_height = (chain_height + 1).into();
-    let mut out = Vec::new();
-    for account in db.get_account_ids()? {
-        let receivers = db.get_transparent_receivers(account, true, true)?;
-        for taddr in receivers.keys() {
-            let utxos = db.get_spendable_transparent_outputs(
-                taddr,
-                target_height,
-                // Include 0-conf outputs; the RPC layer filters on confirmations.
-                ConfirmationsPolicy::MIN,
-                TransparentOutputFilter::All,
-            )?;
-            for utxo in utxos {
-                let outpoint = utxo.outpoint();
-                let mut txid_bytes = outpoint.hash().to_vec();
-                txid_bytes.reverse();
-                out.push(TransparentUtxo {
-                    txid: hex::encode(txid_bytes),
-                    vout: outpoint.n(),
-                    address: taddr.encode(&network),
-                    script_pubkey: utxo.txout().script_pubkey().0 .0.clone(),
-                    value: utxo.txout().value().into_u64(),
-                    mined_height: utxo.mined_height().map(u32::from),
-                });
-            }
-        }
-    }
-    Ok(out)
 }
 
 #[cfg(test)]
