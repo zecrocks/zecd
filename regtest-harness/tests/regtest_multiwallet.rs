@@ -150,20 +150,14 @@ async fn regtest_multiwallet_routing_and_isolation() {
         "labels do not leak across wallets: {labels}"
     );
 
-    // The watch-only replicas refuse spending and wallet-encryption RPCs with Bitcoin Core's
-    // codes (-4 private keys disabled, -16 nothing to encrypt, -15 passphrase RPC unsupported),
-    // independently per wallet.
+    // The watch-only replicas refuse spending and passphrase RPCs with Bitcoin Core's codes
+    // (-4 private keys disabled, -15 passphrase RPC unsupported), independently per wallet.
     for w in ["w2", "w3"] {
         let err = zecd
             .call_wallet(w, "sendtoaddress", json!([addr_default, 0.1]))
             .await
             .expect_err("a watch-only wallet must refuse to send");
         assert_eq!(err.code(), Some(-4), "expected -4 on {w}, got: {err}");
-        let err = zecd
-            .call_wallet(w, "encryptwallet", json!(["pw"]))
-            .await
-            .expect_err("a watch-only wallet has nothing to encrypt");
-        assert_eq!(err.code(), Some(-16), "expected -16 on {w}, got: {err}");
         let err = zecd
             .call_wallet(w, "walletpassphrase", json!(["pw", 60]))
             .await

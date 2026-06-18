@@ -140,8 +140,7 @@ async fn regtest_watch_only_ufvk() {
     }
 
     // 5. Spending refuses with Bitcoin Core's -4 (Private keys are disabled), before any
-    //    balance check; encryptwallet is Core's -16 (nothing to encrypt) and the passphrase
-    //    RPCs -15.
+    //    balance check; the passphrase RPCs are -15.
     let err = zecd_b
         .call("sendtoaddress", json!([addr_b, 0.1]))
         .await
@@ -151,12 +150,6 @@ async fn regtest_watch_only_ufvk() {
         err.to_string().contains("Private keys are disabled"),
         "{err}"
     );
-    let err = zecd_b
-        .call("encryptwallet", json!(["pw"]))
-        .await
-        .expect_err("encryptwallet on a watch-only wallet must fail");
-    assert_eq!(err.code(), Some(-16), "{err}");
-    assert!(err.to_string().contains("nothing to encrypt"), "{err}");
     let err = zecd_b
         .call("walletpassphrase", json!(["pw", 60]))
         .await

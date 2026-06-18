@@ -94,7 +94,7 @@ pub fn decrypt_seed_with_identity(
 }
 
 /// Load age identities and decrypt the stored mnemonic to its raw phrase bytes (not the seed).
-/// Used by `encryptwallet` to re-wrap an identity-encrypted mnemonic under a passphrase.
+/// Used by `zecd rewrap` to re-wrap an identity-encrypted mnemonic under a passphrase or KMS key.
 pub fn decrypt_mnemonic_with_identity(
     store: &WalletStore,
     identity_path: &Path,
@@ -132,8 +132,7 @@ pub async fn decrypt_seed_with_keystore(
 }
 
 /// Unwrap a KMS wallet's age identity and decrypt the stored mnemonic to its raw phrase
-/// bytes. Used by `encryptwallet` (migration off KMS onto a passphrase) and `zecd rewrap`
-/// (KMS key rotation).
+/// bytes. Used by `zecd rewrap` (migration off KMS onto a passphrase, or KMS key rotation).
 pub async fn decrypt_mnemonic_with_keystore(
     store: &WalletStore,
     endpoint: Option<&str>,
@@ -375,11 +374,10 @@ mod kms_tests {
         );
     }
 
-    /// The `encryptwallet` KMS->passphrase migration, exercised offline at the keys/store
-    /// layer (the actor's `do_encrypt_wallet` runs exactly this sequence for a KMS wallet):
-    /// unwrap the mnemonic via one KMS Decrypt, re-wrap it under a passphrase, and confirm the
-    /// wallet is now Bitcoin-Core-encrypted, opens with the passphrase to the same seed, and
-    /// no longer has any cloud path.
+    /// The `zecd rewrap` KMS->passphrase migration, exercised offline at the keys/store
+    /// layer: unwrap the mnemonic via one KMS Decrypt, re-wrap it under a passphrase, and
+    /// confirm the wallet is now Bitcoin-Core-encrypted, opens with the passphrase to the same
+    /// seed, and no longer has any cloud path.
     #[tokio::test(flavor = "multi_thread")]
     async fn kms_to_passphrase_migration_roundtrips() {
         const PASS: &str = "correct horse battery staple";
@@ -388,7 +386,7 @@ mod kms_tests {
         let dir = tempfile::tempdir().unwrap();
         init_kms_wallet(dir.path(), &endpoint, "default", "default").await;
 
-        // Step 1 - read the mnemonic back via KMS (do_encrypt_wallet's KMS branch).
+        // Step 1 - read the mnemonic back via KMS (rewrap's KMS branch).
         let st = WalletStore::read(dir.path()).unwrap();
         let mnemonic = decrypt_mnemonic_with_keystore(&st, Some(&endpoint))
             .await

@@ -135,18 +135,6 @@ pub enum WalletCommand {
     Lock {
         reply: oneshot::Sender<Result<(), RpcError>>,
     },
-    /// Encrypt a previously-unencrypted wallet with `passphrase` (`encryptwallet`): re-wrap the
-    /// mnemonic under scrypt and leave the wallet locked.
-    EncryptWallet {
-        passphrase: Passphrase,
-        reply: oneshot::Sender<Result<(), RpcError>>,
-    },
-    /// Change an encrypted wallet's passphrase (`walletpassphrasechange`).
-    ChangePassphrase {
-        old: Passphrase,
-        new: Passphrase,
-        reply: oneshot::Sender<Result<(), RpcError>>,
-    },
 }
 
 /// A clonable, `Send + Sync` handle to one wallet. RPC handlers use it to issue writer
@@ -248,20 +236,6 @@ impl WalletHandle {
 
     pub async fn lock(&self) -> Result<(), RpcError> {
         self.dispatch(|reply| WalletCommand::Lock { reply }).await
-    }
-
-    pub async fn encrypt_wallet(&self, passphrase: Passphrase) -> Result<(), RpcError> {
-        self.dispatch(|reply| WalletCommand::EncryptWallet { passphrase, reply })
-            .await
-    }
-
-    pub async fn change_passphrase(
-        &self,
-        old: Passphrase,
-        new: Passphrase,
-    ) -> Result<(), RpcError> {
-        self.dispatch(|reply| WalletCommand::ChangePassphrase { old, new, reply })
-            .await
     }
 }
 

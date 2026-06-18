@@ -282,8 +282,8 @@ impl WalletStore {
 
     /// Atomically re-wrap the mnemonic `phrase` under `passphrase` (age scrypt) and rewrite
     /// `keys.toml` with the `encryption = "passphrase"` marker, preserving network/birthday.
-    /// Used by `encryptwallet` and `walletpassphrasechange`. Drops any `[kms]` table - this
-    /// is also the migration path *off* a cloud keystore.
+    /// Used by `zecd rewrap` (the offline at-rest re-wrap / KMS-rotation CLI). Drops any
+    /// `[kms]` table - this is also the migration path *off* a cloud keystore.
     pub fn rewrite_with_passphrase(
         &self,
         wallet_dir: &Path,
@@ -553,7 +553,7 @@ mod tests {
             .to_seed("");
         assert_eq!(seed.expose_secret().as_slice(), &expected[..]);
 
-        // Migration off KMS (encryptwallet) drops the [kms] table.
+        // Migration off KMS (`zecd rewrap` onto a passphrase) drops the [kms] table.
         st.rewrite_with_passphrase(dir.path(), Passphrase::from("new pass".to_string()), PHRASE)
             .unwrap();
         let st2 = WalletStore::read(dir.path()).unwrap();
@@ -561,9 +561,9 @@ mod tests {
         assert!(st2.kms().is_none());
     }
 
-    /// `walletpassphrasechange` core: re-wrapping the mnemonic from an old passphrase to a new
-    /// one (the sequence the actor's `do_change_passphrase` runs). The new passphrase opens
-    /// the wallet to the same seed, network/birthday survive, and the old passphrase is revoked.
+    /// Passphrase-rotation core (used by `zecd rewrap`): re-wrapping the mnemonic from an old
+    /// passphrase to a new one. The new passphrase opens the wallet to the same seed,
+    /// network/birthday survive, and the old passphrase is revoked.
     #[test]
     fn passphrase_rotation_roundtrips_and_revokes_the_old() {
         let dir = tempfile::tempdir().unwrap();

@@ -3,7 +3,7 @@
 # unchanged, so the same workflow applies - just add `-f docker-compose.mainnet.yml`:
 #
 #   docker compose -f docker-compose.yml -f docker-compose.mainnet.yml up -d zebra
-#   docker compose -f docker-compose.yml -f docker-compose.mainnet.yml run --rm zecd init --wallet default --account-name primary
+#   docker compose -f docker-compose.yml -f docker-compose.mainnet.yml run --rm zecd init --wallet default
 #   docker compose -f docker-compose.yml -f docker-compose.mainnet.yml up -d
 #
 # Compose v2 merges service `volumes` by container path, so each mount below replaces its testnet

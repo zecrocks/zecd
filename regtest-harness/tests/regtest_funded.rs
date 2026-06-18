@@ -57,6 +57,10 @@ const FUND_ZATOSHIS: u64 = 100_000_000;
 const RECEIVE_MEMO: &str = "hello from the funder";
 /// Generous: lightwalletd ingestion + zecd scan + Orchard proving.
 const FUND_TIMEOUT: Duration = Duration::from_secs(240);
+/// Passphrase the funded wallet is created with (`init --encrypt`). Drives the locked-send
+/// gate before Phase 2 and conformance.py's lock/unlock state machine at the end. ≥12 chars
+/// to satisfy the wallet-passphrase minimum.
+const ENCRYPT_PASSPHRASE: &str = "regtest-pass";
 
 #[tokio::test]
 async fn regtest_funded_orchard_receive() {
@@ -118,8 +122,11 @@ async fn regtest_funded_orchard_receive() {
     // so the watch-only wallet at the end (the enhancement guard) can reach it.
     let lwd_grpc_port = lwd.grpc_port;
 
-    // 5. zecd against the same lightwalletd; get its Orchard unified address.
-    let cfg = ZecdConfig::new(lwd.grpc_port, pick_port().expect("pick zecd rpc port"));
+    // 5. zecd against the same lightwalletd; get its Orchard unified address. The wallet is
+    // created passphrase-encrypted (`init --encrypt`), so it starts locked - Phase 1 receiving
+    // still works (scanning needs only viewing keys), and Phase 2 exercises the unlock gate.
+    let mut cfg = ZecdConfig::new(lwd.grpc_port, pick_port().expect("pick zecd rpc port"));
+    cfg.encrypt_passphrase = Some(ENCRYPT_PASSPHRASE.to_string());
     let zecd = Zecd::start(&cfg)
         .await
         .expect("start zecd against regtest lightwalletd");
@@ -323,13 +330,12 @@ async fn regtest_funded_orchard_receive() {
         .to_string();
     assert_eq!(cursor.len(), 64, "lastblock is a block hash: {lsb}");
 
-    // Encrypt the wallet (Bitcoin-Core style) and exercise the gate around a real spend:
-    // encryptwallet locks it (-13 on send), a wrong passphrase is rejected (-14), and the
-    // real one unlocks with a timeout long enough to cover the remaining phases.
     let funder_ua = funder.unified_address().expect("funder unified address");
-    zecd.call("encryptwallet", json!(["regtest-pass"]))
-        .await
-        .expect("encryptwallet on the funded wallet");
+
+    // The wallet was created encrypted (`init --encrypt`), so it starts locked: a real spend is
+    // refused (-13; the seed check precedes input selection, so the funds don't matter), a wrong
+    // passphrase is rejected (-14), and the configured passphrase unlocks it with a timeout long
+    // enough to cover the remaining phases.
     let err = zecd
         .call("sendtoaddress", json!([funder_ua, 0.4]))
         .await
@@ -344,7 +350,7 @@ async fn regtest_funded_orchard_receive() {
         Some(-14),
         "expected passphrase-incorrect (-14): {err}"
     );
-    zecd.call("walletpassphrase", json!(["regtest-pass", 3600]))
+    zecd.call("walletpassphrase", json!([ENCRYPT_PASSPHRASE, 3600]))
         .await
         .expect("the real passphrase unlocks");
     let wi = zecd
@@ -1076,13 +1082,14 @@ async fn regtest_funded_orchard_receive() {
     mine_until_confirmed(&zebrad, &zecd, &txid_raw, "manually rebroadcast send").await;
 
     // ---- conformance.py against the live, funded daemon ----
-    // The wallet arrives encrypted (Phase 2) and unlocked; passing the passphrase enables
-    // conformance's full encryption state machine (rotate/lock/unlock round-trips).
+    // The wallet was created encrypted (`init --encrypt`) and is unlocked by now; passing the
+    // passphrase enables conformance's lock/unlock state machine (unlock → walletlock → -13 →
+    // re-unlock). At-rest re-wrapping/rotation is an offline `zecd rewrap` operation, not an RPC.
     run_conformance(
         cfg.rpc_port,
         &cfg.rpc_user,
         &cfg.rpc_password,
-        "regtest-pass",
+        ENCRYPT_PASSPHRASE,
     );
 
     // ---- enhancement guard: a received memo is recovered from a scratch scan ----

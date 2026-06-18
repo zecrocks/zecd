@@ -543,10 +543,6 @@ pub struct InitArgs {
     #[arg(long, default_value = "default")]
     pub wallet: String,
 
-    /// Human-readable account name stored in the wallet.
-    #[arg(long, default_value = "primary")]
-    pub account_name: String,
-
     /// Restore from an existing mnemonic instead of generating a new one (read from stdin).
     #[arg(long)]
     pub restore: bool,

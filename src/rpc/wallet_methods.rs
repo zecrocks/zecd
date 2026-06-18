@@ -1659,52 +1659,6 @@ pub(crate) async fn walletlock(state: &AppState, wallet: Option<&str>) -> Result
     Ok(Value::Null)
 }
 
-/// `encryptwallet <passphrase>` - wrap the age-encrypted mnemonic under a passphrase; the
-/// wallet locks immediately afterwards.
-pub(crate) async fn encryptwallet(
-    state: &AppState,
-    wallet: Option<&str>,
-    req: &RpcRequest,
-) -> Result<Value, RpcError> {
-    let passphrase = req.require_str(0, "encryptwallet requires a passphrase")?;
-    if passphrase.is_empty() {
-        return Err(RpcError::invalid_parameter("passphrase cannot be empty"));
-    }
-    let handle = state.registry.get(wallet)?.clone();
-    handle
-        .encrypt_wallet(Passphrase::from(passphrase.to_owned()))
-        .await?;
-    // Unlike Bitcoin Core, the mnemonic/seed is unchanged (no new backup needed) - only the
-    // at-rest wrapping changed, so the wallet is now locked and needs walletpassphrase.
-    Ok(Value::String(
-        "wallet encrypted; the mnemonic is now passphrase-protected. \
-         Call walletpassphrase to unlock before sending."
-            .to_string(),
-    ))
-}
-
-/// `walletpassphrasechange <old> <new>` - re-wrap the seed under a new passphrase (the
-/// old one must verify; `-14` otherwise).
-pub(crate) async fn walletpassphrasechange(
-    state: &AppState,
-    wallet: Option<&str>,
-    req: &RpcRequest,
-) -> Result<Value, RpcError> {
-    let old = req.require_str(0, "walletpassphrasechange requires the old passphrase")?;
-    let new = req.require_str(1, "walletpassphrasechange requires the new passphrase")?;
-    if new.is_empty() {
-        return Err(RpcError::invalid_parameter("passphrase cannot be empty"));
-    }
-    let handle = state.registry.get(wallet)?.clone();
-    handle
-        .change_passphrase(
-            Passphrase::from(old.to_owned()),
-            Passphrase::from(new.to_owned()),
-        )
-        .await?;
-    Ok(Value::Null)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -623,7 +623,7 @@ async fn rewrap_migrates_passphrase_wallet_onto_kms_keystore() {
     zecd::keystore::fake::set_fake_credentials();
     let endpoint = zecd::keystore::fake::spawn_aws(KEY_ARN).await;
 
-    // Fabricate a passphrase-encrypted wallet (what `init` + `encryptwallet` would produce,
+    // Fabricate a passphrase-encrypted wallet (what `zecd init --encrypt` would produce,
     // minus chain I/O and the wallet DB - rewrap reads neither).
     let dir = tempfile::tempdir().unwrap();
     let datadir = dir.path();

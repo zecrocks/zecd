@@ -655,6 +655,10 @@ pub struct ZecdConfig {
     /// Optional `[pools]` section as `(enabled, default_receivers)`. `None` omits the section
     /// (the Orchard-only default). Used by the multi-pool (Sapling) e2e.
     pub pools: Option<(Vec<String>, Vec<String>)>,
+    /// When `Some`, the spending `default` wallet is created passphrase-encrypted
+    /// (`zecd init --encrypt`, passphrase supplied via `ZECD_WALLET_PASSPHRASE`): it starts
+    /// locked and needs `walletpassphrase` before sending. `None` = unencrypted (identity model).
+    pub encrypt_passphrase: Option<String>,
 }
 
 impl ZecdConfig {
@@ -676,6 +680,7 @@ impl ZecdConfig {
             ufvk: None,
             birthday: None,
             pools: None,
+            encrypt_passphrase: None,
         }
     }
 
@@ -698,6 +703,7 @@ impl ZecdConfig {
             ufvk: None,
             birthday: None,
             pools: None,
+            encrypt_passphrase: None,
         }
     }
 
@@ -1055,7 +1061,17 @@ fn run_zecd_init(
             args.push(b.to_string());
         }
     }
-    let mut child = Command::new(bin)
+    // The spending `default` wallet may be created passphrase-encrypted; the passphrase is
+    // passed out-of-band via `ZECD_WALLET_PASSPHRASE` (never on the command line). `--encrypt`
+    // is incompatible with `--ufvk`, so it only applies to the seed-bearing default wallet.
+    let encrypt = (wallet == "default" && ufvk.is_none())
+        .then(|| cfg.encrypt_passphrase.clone())
+        .flatten();
+    if encrypt.is_some() {
+        args.push("--encrypt".into());
+    }
+    let mut command = Command::new(bin);
+    command
         .args(&args)
         .stdin(if restore.is_some() {
             Stdio::piped()
@@ -1063,9 +1079,11 @@ fn run_zecd_init(
             Stdio::null()
         })
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .context("spawn zecd init")?;
+        .stderr(Stdio::piped());
+    if let Some(pass) = &encrypt {
+        command.env("ZECD_WALLET_PASSPHRASE", pass);
+    }
+    let mut child = command.spawn().context("spawn zecd init")?;
     if let Some(phrase) = &restore {
         use std::io::Write as _;
         child

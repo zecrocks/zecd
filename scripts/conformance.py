@@ -648,28 +648,13 @@ def main() -> int:
             ck("wrong passphrase raises", False)
         except JSONRPCException as e:
             ck("wrong passphrase -> -14", e.code == -14, e.code)
-        try:
-            rpc.call("walletpassphrasechange", "definitely-not-the-passphrase", "tmp")
-            ck("passphrasechange wrong old raises", False)
-        except JSONRPCException as e:
-            ck("passphrasechange wrong old -> -14", e.code == -14, e.code)
         if args.passphrase:
-            # The full state machine, with the real passphrase: rotate it (old one stops
-            # working, the new one unlocks), rotate back, lock (send -> -13), re-unlock.
-            # The wallet ends as it was found: same passphrase, unlocked.
-            rotated = args.passphrase + "-rotated"
-            ck("walletpassphrasechange returns null",
-               rpc.call("walletpassphrasechange", args.passphrase, rotated) is None)
-            try:
-                rpc.call("walletpassphrase", args.passphrase, 60)
-                ck("old passphrase rejected after change", False)
-            except JSONRPCException as e:
-                ck("old passphrase after change -> -14", e.code == -14, e.code)
-            ck("new passphrase unlocks",
-               rpc.call("walletpassphrase", rotated, 600) is None)
+            # The lock/unlock state machine with the real passphrase: unlock (unlocked_until
+            # advances), lock (send -> -13), re-unlock. The wallet ends as found: unlocked.
+            ck("passphrase unlocks",
+               rpc.call("walletpassphrase", args.passphrase, 600) is None)
             ck("unlocked_until > 0 while unlocked",
                rpc.call("getwalletinfo")["unlocked_until"] > 0)
-            rpc.call("walletpassphrasechange", rotated, args.passphrase)
             ck("walletlock returns null", rpc.call("walletlock") is None)
             ck("locked wallet reports unlocked_until 0",
                rpc.call("getwalletinfo")["unlocked_until"] == 0)
@@ -693,11 +678,6 @@ def main() -> int:
             ck("walletlock on unencrypted raises", False)
         except JSONRPCException as e:
             ck("walletlock unencrypted -> -15", e.code == -15, e.code)
-        try:
-            rpc.call("walletpassphrasechange", "old", "new")
-            ck("walletpassphrasechange on unencrypted raises", False)
-        except JSONRPCException as e:
-            ck("walletpassphrasechange unencrypted -> -15", e.code == -15, e.code)
     # Argument validation happens before the encryption-state check: a negative timeout is -8
     # in both wallet states.
     try:

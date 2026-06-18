@@ -6,7 +6,6 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::anyhow;
-use secrecy::ExposeSecret;
 use tokio::sync::{mpsc, watch};
 use tracing::{error, info, warn};
 
@@ -169,7 +168,6 @@ struct WalletActor {
     last_primary_probe: Instant,
     sync_interval: Duration,
     rebroadcast_interval: Duration,
-    age_identity: Option<PathBuf>,
     confirmations_policy: ConfirmationsPolicy,
     /// Shielded pools this wallet receives into and spends from.
     enabled_pools: PoolSet,
@@ -201,20 +199,16 @@ struct WalletActor {
     /// cheap liveness probe instead of re-streaming every root.
     subtree_roots_synced: bool,
     /// Whether the wallet is passphrase-encrypted (read from `keys.toml` at spawn). Gates the
-    /// Bitcoin-Core-style `walletpassphrase`/`walletlock`/`encryptwallet` behavior.
+    /// Bitcoin-Core-style `walletpassphrase`/`walletlock` behavior.
     encrypted: bool,
-    /// Whether the wallet's age identity is cloud-KMS-wrapped (`encryption = "kms"`). Such a
-    /// wallet auto-unlocks at startup like the identity model ("unencrypted" to the RPCs);
-    /// `encryptwallet` migrates it onto a passphrase.
-    kms_wallet: bool,
     /// `[keystore] endpoint` override for KMS unlock calls.
     keystore_endpoint: Option<String>,
     /// `Some` while a KMS wallet's startup unlock is failing (e.g. a KMS/IAM outage at
     /// boot): the actor keeps retrying with backoff so a transient outage doesn't require a
-    /// human restart. Cleared on success, `encryptwallet`, or a non-retryable condition.
+    /// human restart. Cleared on success or a non-retryable condition.
     kms_unlock_retry: Option<KmsUnlockRetry>,
     /// Whether the wallet is watch-only (its account is an imported UFVK with no spending
-    /// material). Spend and encryption commands refuse with Bitcoin Core's -4.
+    /// material). Spend commands refuse with Bitcoin Core's -4.
     watch_only: bool,
     /// For an encrypted wallet that's currently unlocked: when the seed auto-relocks. Re-running
     /// `walletpassphrase` overwrites it (resetting the timer); `walletlock` clears it.
@@ -297,7 +291,7 @@ pub async fn spawn(
             warn!(
                 "[{}] auto_unlock=false on a KMS-wrapped wallet: sends will fail (-13) and \
                  walletpassphrase cannot unlock it (-15). Enable auto_unlock, or migrate to a \
-                 passphrase with encryptwallet.",
+                 passphrase with `zecd rewrap` (offline).",
                 cfg.name
             );
         }
@@ -326,8 +320,8 @@ pub async fn spawn(
         // work, so don't refuse to start; warn loudly instead.
         warn!(
             "[{}] auto_unlock=false on an identity-encrypted wallet: sends will fail (-13) and \
-             walletpassphrase cannot unlock it (-15). Enable auto_unlock, or set a real \
-             passphrase with encryptwallet (then restart unlocks via walletpassphrase).",
+             walletpassphrase cannot unlock it (-15). Enable auto_unlock, or re-create the wallet \
+             passphrase-encrypted with `zecd init --encrypt` (then walletpassphrase unlocks).",
             cfg.name
         );
     }
@@ -362,7 +356,6 @@ pub async fn spawn(
         last_primary_probe: Instant::now(),
         sync_interval: cfg.sync_interval,
         rebroadcast_interval: cfg.rebroadcast_interval,
-        age_identity: cfg.age_identity,
         confirmations_policy: cfg.confirmations_policy,
         enabled_pools: cfg.enabled_pools.clone(),
         default_receivers: cfg.default_receivers.clone(),
@@ -381,7 +374,6 @@ pub async fn spawn(
         last_rebroadcast: None,
         subtree_roots_synced: false,
         encrypted,
-        kms_wallet,
         keystore_endpoint: cfg.keystore_endpoint,
         kms_unlock_retry,
         watch_only,
@@ -1154,14 +1146,6 @@ impl WalletActor {
                 let res = self.do_lock();
                 let _ = reply.send(res);
             }
-            WalletCommand::EncryptWallet { passphrase, reply } => {
-                let res = self.do_encrypt_wallet(passphrase).await;
-                let _ = reply.send(res);
-            }
-            WalletCommand::ChangePassphrase { old, new, reply } => {
-                let res = self.do_change_passphrase(old, new);
-                let _ = reply.send(res);
-            }
         }
         false
     }
@@ -1590,102 +1574,6 @@ impl WalletActor {
         self.seed.lock();
         self.unlock_until = None;
         self.update_status();
-        Ok(())
-    }
-
-    /// `encryptwallet`: re-wrap the (currently identity-encrypted or KMS-wrapped) mnemonic
-    /// under `passphrase` and leave the wallet locked. -15 if already encrypted. Unlike
-    /// Bitcoin Core, the seed is NOT regenerated - the same mnemonic is preserved, only its
-    /// at-rest wrapping changes. For a KMS wallet this is the migration path *off* the
-    /// cloud keystore (the `[kms]` table is dropped from `keys.toml`).
-    async fn do_encrypt_wallet(&mut self, passphrase: store::Passphrase) -> Result<(), RpcError> {
-        // A watch-only wallet stores no mnemonic at all; there is nothing to wrap under a
-        // passphrase (the UFVK must stay readable for scanning). Bitcoin Core's exact refusal
-        // for wallets without private keys is -16, not the generic -4 (wallet/rpc/encrypt.cpp).
-        if self.watch_only {
-            return Err(RpcError::new(
-                codes::RPC_WALLET_ENCRYPTION_FAILED,
-                "Error: wallet does not contain private keys, nothing to encrypt.",
-            ));
-        }
-        if self.encrypted {
-            return Err(RpcError::new(
-                codes::RPC_WALLET_WRONG_ENC_STATE,
-                "Error: running with an encrypted wallet, but encryptwallet was called.",
-            ));
-        }
-        let st = store::WalletStore::read(&self.wallet_dir)
-            .map_err(|e| RpcError::wallet(format!("reading keys.toml: {e}")))?;
-        let mnemonic = if self.kms_wallet {
-            keys::decrypt_mnemonic_with_keystore(&st, self.keystore_endpoint.as_deref())
-                .await
-                .map_err(|e| RpcError::wallet(format!("decrypting mnemonic via KMS: {e:#}")))?
-        } else {
-            let identity = self.age_identity.as_ref().ok_or_else(|| {
-                RpcError::wallet("no age identity configured; cannot read the mnemonic to encrypt")
-            })?;
-            keys::decrypt_mnemonic_with_identity(&st, identity)
-                .map_err(|e| RpcError::wallet(format!("decrypting mnemonic: {e}")))?
-        };
-        let mnemonic = mnemonic.ok_or_else(|| RpcError::wallet("wallet has no stored mnemonic"))?;
-        let phrase = std::str::from_utf8(mnemonic.expose_secret().as_slice())
-            .map_err(|_| RpcError::wallet("stored mnemonic is not valid UTF-8"))?;
-        // scrypt key derivation for the new wrapping is deliberately slow; keep it off the
-        // async runtime (the proving pattern).
-        tokio::task::block_in_place(|| {
-            st.rewrite_with_passphrase(&self.wallet_dir, passphrase, phrase)
-        })
-        .map_err(|e| {
-            RpcError::new(
-                codes::RPC_WALLET_ENCRYPTION_FAILED,
-                format!("failed to encrypt wallet: {e}"),
-            )
-        })?;
-        // Now Bitcoin-Core "encrypted": lock and require walletpassphrase from here on.
-        // A former KMS wallet stops being one (keys.toml no longer carries the [kms] table).
-        self.encrypted = true;
-        self.kms_wallet = false;
-        self.kms_unlock_retry = None;
-        self.seed.lock();
-        self.unlock_until = None;
-        self.update_status();
-        Ok(())
-    }
-
-    /// `walletpassphrasechange`: re-wrap the mnemonic from `old` to `new`. -15 if unencrypted,
-    /// -14 if `old` is wrong. Does not change the current lock state.
-    fn do_change_passphrase(
-        &mut self,
-        old: store::Passphrase,
-        new: store::Passphrase,
-    ) -> Result<(), RpcError> {
-        if !self.encrypted {
-            return Err(RpcError::new(
-                codes::RPC_WALLET_WRONG_ENC_STATE,
-                "Error: running with an unencrypted wallet, but walletpassphrasechange was called.",
-            ));
-        }
-        let st = store::WalletStore::read(&self.wallet_dir)
-            .map_err(|e| RpcError::wallet(format!("reading keys.toml: {e}")))?;
-        // Both the old-passphrase verification and the new wrapping run scrypt (deliberately
-        // slow); keep them off the async runtime (the proving pattern).
-        let mnemonic = tokio::task::block_in_place(|| st.decrypt_mnemonic_with_passphrase(old))
-            .map_err(|_| {
-                RpcError::new(
-                    codes::RPC_WALLET_PASSPHRASE_INCORRECT,
-                    "Error: The wallet passphrase entered was incorrect.",
-                )
-            })?
-            .ok_or_else(|| RpcError::wallet("wallet has no stored mnemonic"))?;
-        let phrase = std::str::from_utf8(mnemonic.expose_secret().as_slice())
-            .map_err(|_| RpcError::wallet("stored mnemonic is not valid UTF-8"))?;
-        tokio::task::block_in_place(|| st.rewrite_with_passphrase(&self.wallet_dir, new, phrase))
-            .map_err(|e| {
-            RpcError::new(
-                codes::RPC_WALLET_ENCRYPTION_FAILED,
-                format!("failed to change passphrase: {e}"),
-            )
-        })?;
         Ok(())
     }
 }

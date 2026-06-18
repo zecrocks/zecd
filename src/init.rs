@@ -22,6 +22,18 @@ use crate::config::{AppConfig, ExportUfvkArgs, InitArgs, WalletEntry};
 use crate::wallet::open;
 use crate::wallet::store::{KmsInfo, Passphrase, WalletStore};
 
+/// Minimum length (in characters) for a wallet-encryption passphrase.
+pub const MIN_PASSPHRASE_CHARS: usize = 12;
+
+/// Reject a too-short passphrase before it wraps the mnemonic.
+fn validate_passphrase(p: &str) -> anyhow::Result<()> {
+    let n = p.chars().count();
+    if n < MIN_PASSPHRASE_CHARS {
+        bail!("passphrase must be at least {MIN_PASSPHRASE_CHARS} characters (got {n})");
+    }
+    Ok(())
+}
+
 /// Read the encryption passphrase for `init --encrypt`. Prefers the `ZECD_WALLET_PASSPHRASE`
 /// environment variable (for non-interactive/automated init); otherwise prompts on stderr and
 /// reads it twice from stdin to confirm. Only the trailing newline is stripped, so a passphrase
@@ -29,9 +41,7 @@ use crate::wallet::store::{KmsInfo, Passphrase, WalletStore};
 fn read_encryption_passphrase() -> anyhow::Result<Passphrase> {
     if let Some(p) = std::env::var_os("ZECD_WALLET_PASSPHRASE") {
         let s = p.to_string_lossy().into_owned();
-        if s.is_empty() {
-            bail!("ZECD_WALLET_PASSPHRASE is set but empty");
-        }
+        validate_passphrase(&s)?;
         return Ok(Passphrase::from(s));
     }
     let read_line = |prompt: &str| -> anyhow::Result<String> {
@@ -45,9 +55,7 @@ fn read_encryption_passphrase() -> anyhow::Result<Passphrase> {
     if p1 != p2 {
         bail!("passphrases do not match");
     }
-    if p1.is_empty() {
-        bail!("passphrase cannot be empty");
-    }
+    validate_passphrase(&p1)?;
     Ok(Passphrase::from(p1))
 }
 
@@ -293,10 +301,13 @@ pub async fn run(config: &AppConfig, args: &InitArgs) -> anyhow::Result<()> {
     }
 
     let mut db = open::init_dbs(network, &wallet_dir)?;
+    // zecd surfaces a single account per wallet, so the account label is a fixed constant
+    // (the name is stored by librustzcash but zecd never reads it back).
+    let account_name = "primary";
     match (&ufvk, &mnemonic) {
         (Some(ufvk), _) => {
             db.import_account_ufvk(
-                &args.account_name,
+                account_name,
                 ufvk,
                 &birthday,
                 AccountPurpose::ViewOnly,
@@ -310,7 +321,7 @@ pub async fn run(config: &AppConfig, args: &InitArgs) -> anyhow::Result<()> {
                 s.zeroize();
                 secret
             };
-            db.create_account(&args.account_name, &seed, &birthday, None)?;
+            db.create_account(account_name, &seed, &birthday, None)?;
         }
         (None, None) => unreachable!("init either imports a UFVK or has a mnemonic"),
     }
@@ -486,6 +497,16 @@ async fn ensure_identity(path: &Path) -> anyhow::Result<Vec<Box<dyn age::Recipie
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn passphrase_min_length_is_enforced() {
+        // Too short (and empty) are rejected; exactly the minimum and longer pass.
+        assert!(validate_passphrase("").is_err());
+        assert!(validate_passphrase("short").is_err());
+        assert!(validate_passphrase("eleven chrs").is_err()); // 11 chars
+        assert!(validate_passphrase("twelve chars").is_ok()); // 12 chars
+        assert!(validate_passphrase("a much longer passphrase").is_ok());
+    }
 
     use std::collections::BTreeMap;
 

@@ -11,7 +11,7 @@
 #
 # First run (zebra must sync enough before zecd can init):
 #   docker compose up -d zebra                     # let it sync
-#   docker compose run --rm zecd init --wallet default --account-name primary
+#   docker compose run --rm zecd init --wallet default
 #   docker compose up -d                           # start zecd (and the rest)
 # With the lightwalletd profile: docker compose --profile lightwalletd up -d
 #

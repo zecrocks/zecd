@@ -131,48 +131,6 @@ async fn regtest_end_to_end() {
         .await
         .expect_err("walletpassphrase on an unencrypted wallet must fail");
     assert_eq!(err.code(), Some(-15), "expected -15, got: {err}");
-    let err = zecd
-        .call("walletpassphrasechange", json!(["x", "y"]))
-        .await
-        .expect_err("walletpassphrasechange on an unencrypted wallet must fail");
-    assert_eq!(err.code(), Some(-15), "expected -15, got: {err}");
-
-    // encryptwallet flips it to the Bitcoin-Core encrypted state: the wallet locks (send ->
-    // -13; the seed check precedes input selection so no funds are needed), a wrong
-    // passphrase is rejected (-14), and the real one unlocks - back to failing on funds (-6).
-    zecd.call("encryptwallet", json!(["regtest-pass"]))
-        .await
-        .expect("encryptwallet");
-    let err = zecd
-        .call("sendtoaddress", json!([addr, 1.0]))
-        .await
-        .expect_err("a locked wallet must refuse to send");
-    assert_eq!(
-        err.code(),
-        Some(-13),
-        "expected unlock-needed (-13), got: {err}"
-    );
-    let err = zecd
-        .call("walletpassphrase", json!(["wrong-pass", 60]))
-        .await
-        .expect_err("a wrong passphrase must be rejected");
-    assert_eq!(
-        err.code(),
-        Some(-14),
-        "expected passphrase-incorrect (-14), got: {err}"
-    );
-    zecd.call("walletpassphrase", json!(["regtest-pass", 60]))
-        .await
-        .expect("the real passphrase unlocks");
-    let err = zecd
-        .call("sendtoaddress", json!([addr, 1.0]))
-        .await
-        .expect_err("still no funds after unlocking");
-    assert_eq!(
-        err.code(),
-        Some(-6),
-        "after unlock the send fails on funds again (-6), got: {err}"
-    );
 
     // Mining more blocks advances zecd's view by exactly that many.
     zebrad.generate_blocks(5).await.expect("mine 5 more");

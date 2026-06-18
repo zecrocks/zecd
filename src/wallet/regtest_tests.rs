@@ -475,15 +475,7 @@ async fn watch_only_wallet_disables_spending_rpcs() {
         "Bitcoin Core's watch-only refusal: {e}"
     );
 
-    // The encryption state machine is unavailable: encryptwallet is Bitcoin Core's -16
-    // ("nothing to encrypt", wallet/rpc/encrypt.cpp), and the passphrase RPCs see an
-    // unencrypted wallet (-15), like bitcoind without privkeys.
-    let e = handle
-        .encrypt_wallet(Passphrase::from("pw".to_string()))
-        .await
-        .unwrap_err();
-    assert_eq!(e.code, codes::RPC_WALLET_ENCRYPTION_FAILED, "{e}");
-    assert!(e.message.contains("nothing to encrypt"), "{e}");
+    // The passphrase RPCs see an unencrypted wallet (-15), like bitcoind without privkeys.
     let e = handle
         .unlock(Passphrase::from("pw".to_string()), 60)
         .await

@@ -36,12 +36,13 @@ attributable per wallet. The wallet label is fixed at wrap time and stored in
 ### RPC semantics
 
 In Bitcoin Core terms a keystore wallet is **unencrypted**: it auto-unlocks at startup,
-`walletpassphrase`/`walletlock`/`walletpassphrasechange` return `-15`, and
-`getwalletinfo` reports no `unlocked_until`. Two transitions exist:
+`walletpassphrase`/`walletlock` return `-15`, and `getwalletinfo` reports no
+`unlocked_until`. Both at-rest transitions are offline CLI operations (no RPC handles the
+passphrase):
 
-- `encryptwallet "<pass>"` migrates the wallet **off** KMS onto a passphrase (the
-  `[kms]` table is dropped; from then on it behaves like any encrypted wallet).
-- `zecd rewrap` migrates **onto** the configured keystore from any model (identity
+- `zecd rewrap` migrates the wallet **off** KMS onto a passphrase (the `[kms]` table is
+  dropped; from then on it behaves like any encrypted wallet).
+- `zecd rewrap` also migrates **onto** the configured keystore from any model (identity
   file, passphrase, or an older KMS key - i.e. it is also the **key rotation** tool).
 
 ### Failure behavior

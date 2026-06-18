@@ -118,8 +118,8 @@ need a rollback path (stop the daemon before copying).
       README → Security).
 - [ ] Key custody chosen deliberately: for unattended sending, the age identity stored
       outside the datadir (secrets manager / separate mount / `ZECD_AGE_IDENTITY`); for
-      human-operated wallets, `zecd init --encrypt` (or `encryptwallet`) so spending
-      requires a verified `walletpassphrase` with an enforced timeout.
+      human-operated wallets, `zecd init --encrypt` so spending requires a verified
+      `walletpassphrase` with an enforced timeout.
 - [ ] Mnemonic + birthday recorded offline; restore procedure tested on testnet.
 - [ ] Own node as primary - `server = "zebra"` (or your own lightwalletd) - with public
       endpoints only as fallback (`[backend] servers`); Docker images pinned to

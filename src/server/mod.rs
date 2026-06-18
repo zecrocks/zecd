@@ -533,7 +533,6 @@ mod tests {
             r#"{"method":"getbalances","id":1,"params":[]}"#,
             r#"{"method":"getreceivedbylabel","id":1,"params":["l"]}"#,
             r#"{"method":"listreceivedbylabel","id":1,"params":[]}"#,
-            r#"{"method":"walletpassphrasechange","id":1,"params":["a","b"]}"#,
             r#"{"method":"getrawtransaction","id":1,"params":["00"]}"#,
             r#"{"method":"sendrawtransaction","id":1,"params":["00"]}"#,
         ] {

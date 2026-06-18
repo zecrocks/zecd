@@ -105,7 +105,7 @@ testnet). For a no-node test drive, point it at the public lightwalletd infrastr
 ```sh
 # 1. Initialize a testnet wallet (generates an age identity + 24-word mnemonic, creates an account).
 cargo run --release -- --datadir ./data --testnet --server zecrocks \
-    init --wallet default --account-name primary
+    init --wallet default
 
 # 2. Run the daemon (syncs in the background, serves JSON-RPC).
 cargo run --release -- --datadir ./data --testnet --server zecrocks \
@@ -337,7 +337,7 @@ sudo systemctl enable --now zecd                 # optional: run as a service
 ```sh
 cd deploy
 docker compose up -d zebra                  # let it sync first
-docker compose run --rm zecd init --wallet default --account-name primary
+docker compose run --rm zecd init --wallet default
 docker compose up -d
 curl localhost:9233/readyz
 curl --user zec:CHANGE-ME --data-binary '{"method":"getblockchaininfo","id":1}' localhost:18232/
@@ -349,7 +349,7 @@ local node primary with `zec.rocks:443` / `eu.zec.rocks:443` failover):
 
 ```sh
 docker compose -f docker-compose.yml -f docker-compose.mainnet.yml up -d zebra
-docker compose -f docker-compose.yml -f docker-compose.mainnet.yml run --rm zecd init --wallet default --account-name primary
+docker compose -f docker-compose.yml -f docker-compose.mainnet.yml run --rm zecd init --wallet default
 docker compose -f docker-compose.yml -f docker-compose.mainnet.yml up -d
 ```
 
@@ -388,9 +388,7 @@ the validator's job there - so those rows are all - .
 | `z_getoperationstatus` | ✓ | ✓ | Status objects for the wallet's operations, non-destructive; per-wallet scoped; unknown opid omitted, malformed opid → `-8` |
 | `z_getoperationresult` | ✓ | ✓ | Like `z_getoperationstatus`, but returns only finished operations and removes them from memory |
 | `z_listoperationids` | ✓ | ✓ | The wallet's operation ids; optional status filter (`queued`/`executing`/`success`/`failed`/`cancelled`) |
-| `encryptwallet` | ✓ | - (encrypted at init) | Encrypts the age keystore in place; mnemonic and addresses unchanged (Core re-seeds and demands a new backup) |
 | `walletpassphrase` | ✓ | ✓ | Unlock with a timeout in seconds (capped at 100,000,000 - about 3 years, same cap as Bitcoin Core), auto-relock when it expires; locked send → `-13`, wrong passphrase `-14`, unencrypted wallet `-15` |
-| `walletpassphrasechange` | ✓ | - | Core semantics |
 | `walletlock` | ✓ | ✓ | Core semantics |
 | `listwallets` | ✓ | - (one wallet per instance) | Names from `[wallets.<name>]` config |
 | **Raw transactions** | | | |
@@ -510,9 +508,8 @@ whole wallet, never of individual addresses):
   shielded diversifier indexes from the clock - the same is true of two same-seed zecd
   instances.)
 - `sendtoaddress`/`sendmany` fail with `-4`
-  `Error: Private keys are disabled for this wallet`; `encryptwallet` is `-16`
-  `Error: wallet does not contain private keys, nothing to encrypt.`; the passphrase RPCs
-  are `-15`, as for any unencrypted wallet - all three byte-identical to Core.
+  `Error: Private keys are disabled for this wallet`; the passphrase RPCs
+  are `-15`, as for any unencrypted wallet - both byte-identical to Core.
 - The UFVK grants **full view access** (all amounts, addresses, and history - ZIP-316 keys
   carry no per-pool trimming here): share it only with hosts that may see your transaction
   graph, and remember a watch-only datadir still deserves protection for privacy.
@@ -644,12 +641,13 @@ the third is cloud-native key wrapping for ops teams:
   of `keys.toml` alone: anyone who can read the whole datadir has the seed. For unattended
   mainnet wallets, store the identity outside the datadir (secrets manager, separate mount, or
   `ZECD_AGE_IDENTITY`).
-- Encrypted (`zecd init --encrypt`, or `encryptwallet` on a running wallet): the mnemonic is
-  wrapped with a passphrase (age scrypt) instead; no identity file can decrypt it. The wallet
-  starts locked (sends return `-13`); `walletpassphrase "<pass>" <timeout>` unlocks (`-14` if
-  wrong) and auto-relocks at the timeout; `walletpassphrasechange` rotates it;
-  `getwalletinfo.unlocked_until` reports the relock time. Unlike Bitcoin Core, `encryptwallet`
-  does not regenerate the seed, only its at-rest wrapping, so existing backups stay valid.
+- Encrypted (`zecd init --encrypt`): the mnemonic is wrapped with a passphrase (age scrypt)
+  instead; no identity file can decrypt it. The wallet starts locked (sends return `-13`);
+  `walletpassphrase "<pass>" <timeout>` unlocks (`-14` if wrong) and auto-relocks at the timeout;
+  `getwalletinfo.unlocked_until` reports the relock time. Encrypting an existing wallet and
+  rotating its passphrase are **offline CLI operations** (`zecd rewrap`), not RPCs - the
+  passphrase never crosses the network. Unlike Bitcoin Core, wrapping does not regenerate the
+  seed, only its at-rest wrapping, so existing backups stay valid.
 - Cloud keystore (`zecd init --keystore`, or `zecd rewrap` to migrate an existing wallet): the
   mnemonic is age-encrypted to a dedicated x25519 identity whose secret is wrapped by an
   **AWS KMS or Google Cloud KMS key** (`[keystore]`). The daemon unlocks at startup with one
@@ -657,8 +655,8 @@ the third is cloud-native key wrapping for ops teams:
   is an attributable CloudTrail / Cloud Audit Logs entry. The cloud provider never sees the
   mnemonic or seed, only the wrap key (envelope encryption); `keys.toml` alone (backups,
   snapshots, stolen disks) is useless without the cloud credentials. To the RPCs the wallet is
-  "unencrypted" (passphrase RPCs return `-15`); `encryptwallet` migrates it off KMS onto a
-  passphrase, `zecd rewrap` rotates to a new KMS key. A KMS outage at startup degrades to a
+  "unencrypted" (passphrase RPCs return `-15`); `zecd rewrap` migrates it off KMS onto a
+  passphrase or rotates to a new KMS key. A KMS outage at startup degrades to a
   locked wallet (reads fine, sends `-13`) and the daemon retries with backoff. Keystore
   support is compiled in by default; build with `--no-default-features` to exclude the cloud
   SDKs entirely (the `keystore` cargo feature). Full operator guide - IAM policies, rotation,
@@ -697,7 +695,7 @@ RPC surface:
   empty means every method is served (the default); entries are validated at startup, so a typo
   fails fast. It is *not* per-user (RPC credentials are already spend authority), but it lets you
   shrink the blast radius of a leaked credential or buggy client - e.g. a receive-only invoicer
-  can disable `sendtoaddress`/`sendmany`/`encryptwallet`/`stop` and everything else it never
+  can disable `sendtoaddress`/`sendmany`/`stop` and everything else it never
   calls. The example config lists every method, annotated and commented, ready to uncomment.
 - Do not expose the RPC port to untrusted networks. Bind to `127.0.0.1` and/or front it with TLS
   or a reverse proxy. On mainnet, zecd refuses to start while the password is the example

@@ -65,9 +65,7 @@ pub const ALL_METHODS: &[&str] = &[
     "getnewaddress",
     "sendtoaddress",
     "sendmany",
-    "encryptwallet",
     "walletpassphrase",
-    "walletpassphrasechange",
     "walletlock",
     // Wallet - async operations (zcashd-style)
     "z_sendmany",
@@ -160,11 +158,7 @@ async fn dispatch_zecd(
         "getnewaddress" => wallet_methods::getnewaddress(state, wallet, req).await,
         "sendtoaddress" => wallet_methods::sendtoaddress(state, wallet, req).await,
         "sendmany" => wallet_methods::sendmany(state, wallet, req).await,
-        "encryptwallet" => wallet_methods::encryptwallet(state, wallet, req).await,
         "walletpassphrase" => wallet_methods::walletpassphrase(state, wallet, req).await,
-        "walletpassphrasechange" => {
-            wallet_methods::walletpassphrasechange(state, wallet, req).await
-        }
         "walletlock" => wallet_methods::walletlock(state, wallet).await,
 
         // Wallet - async operations (zcashd-style; the send itself runs on a background task)
