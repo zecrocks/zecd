@@ -202,6 +202,61 @@ fn malformed_rpcauth_fails_startup() {
     );
 }
 
+/// `zecd rpcauth <user> [password]` generates a salted `[rpc] auth` line with no external
+/// `rpcauth.py`. With an explicit password it emits just the line; without one it also prints
+/// the minted password. The emitted line must be a well-formed `<user>:<salt>$<64 hex>` entry.
+#[test]
+fn rpcauth_generates_credential_line() {
+    fn auth_line(stdout: &str) -> &str {
+        stdout
+            .lines()
+            .find_map(|l| l.trim().strip_prefix("auth = [\""))
+            .and_then(|l| l.strip_suffix("\"]"))
+            .expect("an auth = [\"...\"] line")
+    }
+
+    // Explicit password: line only, no secret printed back.
+    let out = run_with_timeout(
+        {
+            let mut c = zecd();
+            c.args(["rpcauth", "alice", "hunter2"]);
+            c
+        },
+        Duration::from_secs(10),
+    );
+    assert!(out.status.success());
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let entry = auth_line(&stdout);
+    let (user, pwhash) = entry.split_once(':').expect("user:hash");
+    assert_eq!(user, "alice");
+    let (salt, hash) = pwhash.split_once('$').expect("salt$hash");
+    assert!(!salt.is_empty() && salt.chars().all(|c| c.is_ascii_hexdigit()));
+    assert_eq!(hash.len(), 64);
+    assert!(hash.chars().all(|c| c.is_ascii_hexdigit()));
+    assert!(
+        !stdout.contains("password"),
+        "explicit password must not print a generated secret: {stdout}"
+    );
+
+    // No password: a secret is generated and printed alongside the line.
+    let out = run_with_timeout(
+        {
+            let mut c = zecd();
+            c.args(["rpcauth", "bob"]);
+            c
+        },
+        Duration::from_secs(10),
+    );
+    assert!(out.status.success());
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let entry = auth_line(&stdout);
+    assert!(entry.starts_with("bob:"));
+    assert!(
+        stdout.to_lowercase().contains("password"),
+        "a generated password must be surfaced: {stdout}"
+    );
+}
+
 /// A typo'd method in the `[rpc] allowed_methods` safelist must fail at startup, not silently
 /// disable a method the operator believed they had enabled.
 #[test]

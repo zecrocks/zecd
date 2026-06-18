@@ -685,8 +685,8 @@ RPC surface:
 
 - Credentials follow bitcoind: `rpcuser`/`rpcpassword`, bitcoind-style `rpcauth` entries
   (`[rpc] auth = ["<user>:<salt>$<hmac-sha256>"]` or repeated `--rpcauth` flags, generated with
-  bitcoin's `share/rpcauth/rpcauth.py`), and a generated cookie file (`<datadir>/.cookie`, mode
-  0600) when no user/password pair is set.
+  the built-in `zecd rpcauth <user> [password]` - no external `rpcauth.py` needed), and a generated
+  cookie file (`<datadir>/.cookie`, mode 0600) when no user/password pair is set.
 - Optional **RPC method safelist** (`[rpc] allowed_methods`): a coarse, server-wide allow-list
   that restricts the surface to a chosen subset of methods. When the list is non-empty, any
   method not on it is rejected with `-32601` (HTTP 404) - indistinguishable from a method that

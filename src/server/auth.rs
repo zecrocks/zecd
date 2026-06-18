@@ -23,6 +23,46 @@ pub struct PasswordHash {
     hash: [u8; 32],
 }
 
+/// Generate a bitcoind-style `rpcauth` credential line for `username` under a fresh random
+/// salt, mirroring bitcoin's `share/rpcauth/rpcauth.py` (so operators need no external tool).
+/// Returns `(line, generated_password)`: `line` is the `<user>:<salt>$<hmac-sha256 hex>` value
+/// to drop into `[rpc] auth`; `generated_password` is `Some` only when `password` was `None`
+/// and a random one was minted, so the caller can show the operator the secret to keep.
+pub fn generate_rpcauth(username: &str, password: Option<&str>) -> (String, Option<String>) {
+    let salt = random_hex(16);
+    let (password, generated) = match password {
+        Some(p) => (p.to_string(), None),
+        None => {
+            // 32 random bytes, URL-safe base64 - the same shape rpcauth.py mints.
+            let mut buf = [0u8; 32];
+            rand::thread_rng().fill_bytes(&mut buf);
+            let p = base64::engine::general_purpose::URL_SAFE.encode(buf);
+            (p.clone(), Some(p))
+        }
+    };
+    let hash = PasswordHash::compute(&password, &salt);
+    let line = format!("{username}:{salt}${}", hex::encode(hash));
+    (line, generated)
+}
+
+/// `zecd rpcauth <user> [password]`: print a salted credential line for `[rpc] auth`, plus the
+/// password to keep when one is generated. No daemon, config, or external script needed.
+pub fn run_rpcauth(args: &crate::config::RpcauthArgs) -> anyhow::Result<()> {
+    let (line, generated) = generate_rpcauth(&args.username, args.password.as_deref());
+
+    println!("Add this line to your zecd config under [rpc]:");
+    println!();
+    println!("auth = [\"{line}\"]");
+    println!();
+    if let Some(password) = generated {
+        println!("Your RPC password (store it now - it is not recoverable):");
+        println!();
+        println!("{password}");
+        println!();
+    }
+    Ok(())
+}
+
 impl PasswordHash {
     fn compute(password: &str, salt: &str) -> [u8; 32] {
         let mut mac =
@@ -225,6 +265,32 @@ mod tests {
         assert_eq!(user, "alice");
         assert!(pwhash.check("zecd-test-password"));
         assert!(!pwhash.check("wrong-password"));
+    }
+
+    #[test]
+    fn generated_rpcauth_round_trips() {
+        // Explicit password: no secret is minted, and the line parses + verifies.
+        let (line, generated) = generate_rpcauth("alice", Some("hunter2"));
+        assert!(generated.is_none());
+        let (user, pwhash) = line.split_once(':').unwrap();
+        assert_eq!(user, "alice");
+        let pwhash: PasswordHash = pwhash.parse().unwrap();
+        assert!(pwhash.check("hunter2"));
+        assert!(!pwhash.check("wrong"));
+
+        // Generated password: the minted secret verifies against the line, and an
+        // Authenticator built from the entry accepts it over the full Basic-auth path.
+        let (line, generated) = generate_rpcauth("bob", None);
+        let password = generated.expect("a password is minted when none is supplied");
+        let (user, pwhash) = line.split_once(':').unwrap();
+        assert_eq!(user, "bob");
+        assert!(pwhash.parse::<PasswordHash>().unwrap().check(&password));
+
+        let auth = Authenticator {
+            users: vec![(user.to_string(), pwhash.parse().unwrap())],
+        };
+        assert!(auth.check(Some(&basic("bob", &password))));
+        assert!(!auth.check(Some(&basic("bob", "nope"))));
     }
 
     #[test]

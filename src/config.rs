@@ -186,7 +186,7 @@ pub struct RpcConfig {
     pub user: Option<String>,
     pub password: Option<String>,
     /// Bitcoin-Core-style `rpcauth` entries (`<user>:<salt>$<hmac-sha256 hex>`), each an
-    /// additional accepted credential; generate them with bitcoind's `rpcauth.py`.
+    /// additional accepted credential; generate them with `zecd rpcauth <user> [password]`.
     pub auth: Vec<String>,
     /// Path to a bitcoind-style cookie file; generated at startup when no user/password set.
     pub cookiefile: Option<PathBuf>,
@@ -528,6 +528,9 @@ pub enum Command {
     /// Print a wallet's Unified Full Viewing Key (for pairing a watch-only instance via
     /// `init --ufvk`), then exit.
     ExportUfvk(ExportUfvkArgs),
+    /// Generate a salted bitcoind-style `[rpc] auth` credential line (no external
+    /// `rpcauth.py` needed), then exit.
+    Rpcauth(RpcauthArgs),
     /// Run the JSON-RPC daemon (default).
     Run,
 }
@@ -575,6 +578,15 @@ pub struct RewrapArgs {
     /// Wallet name (selects <datadir>/<name>).
     #[arg(long, default_value = "default")]
     pub wallet: String,
+}
+
+#[derive(Debug, clap::Args)]
+pub struct RpcauthArgs {
+    /// RPC username the credential is for.
+    pub username: String,
+
+    /// Password to hash. If omitted, a strong random password is generated and printed once.
+    pub password: Option<String>,
 }
 
 #[derive(Debug, clap::Args)]

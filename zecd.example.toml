@@ -64,8 +64,14 @@ port = 18232
 user = "zec"
 password = "change-me"
 # Additional bitcoind-style rpcauth credentials (salted - no plaintext in the config).
-# Generate entries with bitcoin's share/rpcauth/rpcauth.py: `rpcauth.py <user> [password]`.
+# Generate entries with the built-in tool: `zecd rpcauth <user> [password]`
+# (omit the password to have a strong random one generated and printed once).
 # auth = ["alice:<salt>$<hmac-sha256 hex>"]
+#
+# Cookie auth: with no user/password pair set, zecd mints a random secret at startup and
+# writes __cookie__:<random> to this file (mode 0600). Any local process that can read the
+# file authenticates with it - no shared secret to configure, regenerated each startup
+# (how bitcoin-cli auths to a local node by default).
 # cookiefile = "./data/.cookie"
 #
 # RPC method safelist. By default (this key absent or empty) every method below is served.

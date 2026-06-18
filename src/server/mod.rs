@@ -195,6 +195,12 @@ mod tests {
             work_queue: 16,
             allowed_methods: vec![],
         };
+        test_state_with_rpc(rpc)
+    }
+
+    /// Like `test_state`, but with caller-supplied RPC auth config so tests can exercise the
+    /// full HTTP auth gate against specific credentials (e.g. generated `rpcauth` entries).
+    fn test_state_with_rpc(rpc: RpcConfig) -> AppState {
         let config = AppConfig {
             network: crate::network::ZNetwork::Test,
             datadir: std::path::PathBuf::from("/tmp"),
@@ -280,6 +286,66 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(r.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    /// End-to-end auth flow over the full HTTP stack using a credential minted by
+    /// `zecd rpcauth`: build the server from a generated `[rpc] auth` entry, then drive a real
+    /// request through the router. Covers passwords with characters that could break Basic-auth
+    /// parsing or hashing - including `:` (the Basic-auth field separator), `$` (the salt/hash
+    /// delimiter in the entry), quotes/backslashes, whitespace, and non-ASCII - to prove the
+    /// generator and the auth gate agree on every byte.
+    #[tokio::test]
+    async fn generated_rpcauth_authenticates_over_http() {
+        for password in [
+            "p@ss:word$with$delims",
+            "has spaces and \"quotes\" and \\back\\slashes",
+            "ünïcödë - 🔐",
+            "trailing=padding==",
+            "",
+        ] {
+            let (entry, _) = crate::server::auth::generate_rpcauth("operator", Some(password));
+            let rpc = RpcConfig {
+                bind: "127.0.0.1".parse().unwrap(),
+                port: 1,
+                // No user/password pair, so a cookie would be required - provide a cookiefile.
+                user: None,
+                password: None,
+                auth: vec![entry],
+                cookiefile: Some(
+                    std::env::temp_dir().join(format!("zecd-test-cookie-{}", std::process::id())),
+                ),
+                work_queue: 16,
+                allowed_methods: vec![],
+            };
+
+            // Correct credential → 200 through the real dispatch path.
+            let r = router(test_state_with_rpc(rpc.clone()))
+                .oneshot(req(
+                    r#"{"method":"getnetworkinfo","id":1,"params":[]}"#,
+                    Some(("operator", password)),
+                ))
+                .await
+                .unwrap();
+            assert_eq!(
+                r.status(),
+                StatusCode::OK,
+                "password {password:?} should auth"
+            );
+
+            // Same user, tweaked password → 401.
+            let r = router(test_state_with_rpc(rpc))
+                .oneshot(req(
+                    r#"{"method":"getnetworkinfo","id":1,"params":[]}"#,
+                    Some(("operator", &format!("{password}x"))),
+                ))
+                .await
+                .unwrap();
+            assert_eq!(
+                r.status(),
+                StatusCode::UNAUTHORIZED,
+                "wrong password for {password:?} must be rejected"
+            );
+        }
     }
 
     #[tokio::test]
