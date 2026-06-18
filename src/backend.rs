@@ -1,7 +1,9 @@
 //! Upstream-endpoint management: parsing/resolving the `[backend] servers` list and
-//! dialing its entries. Ported from `zcash-devtool/src/remote.rs`. TLS is used for remote
-//! hosts and skipped for localhost (and `.onion`), but can be forced on/off explicitly
-//! (e.g. a co-located plaintext lightwalletd reached by service name in docker-compose).
+//! dialing its entries. Ported from `zcash-devtool/src/remote.rs`. TLS is used for public
+//! hosts and skipped for loopback, `.onion` (Tor-encrypted), and private-network addresses
+//! (RFC1918 / link-local / IPv6 ULA - the docker/kubernetes/LAN service IPs where a public
+//! CA cert is impossible); it can still be forced on/off explicitly (e.g. a co-located
+//! plaintext lightwalletd reached by service name in docker-compose).
 //!
 //! Two endpoint kinds share the one ordered failover list (see [`ServerKind`]):
 //! local zebrad JSON-RPC endpoints (`zebra://host:port`, or the `zebra` preset - the
@@ -17,7 +19,7 @@
 //! (see [`resolve_all`]).
 
 use std::borrow::Cow;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::time::Duration;
 
 use anyhow::anyhow;
@@ -127,6 +129,34 @@ pub struct Server {
     zebra_auth: ZebraAuth,
 }
 
+/// Hosts the `auto` TLS heuristic treats as not needing TLS: the loopback names/addresses,
+/// `.onion` (already encrypted by Tor), and private-network IPs. The private-network case
+/// covers RFC 1918 (`10/8`, `172.16/12`, `192.168/16`), IPv4 link-local (`169.254/16`), and
+/// the IPv6 equivalents (unique-local `fc00::/7`, link-local `fe80::/10`) - the
+/// docker/kubernetes/LAN service addresses where a public CA-signed cert is impossible, so
+/// requiring TLS there would just break local deployments. Public hostnames/IPs still get TLS.
+fn host_skips_tls_by_default(host: &str) -> bool {
+    if host == "localhost" || host.ends_with(".onion") {
+        return true;
+    }
+    match host.parse::<IpAddr>() {
+        Ok(ip) => ip.is_loopback() || ip_is_private(ip),
+        Err(_) => false,
+    }
+}
+
+/// Whether `ip` sits in a private-network range (RFC 1918 / IPv4 link-local / IPv6 ULA /
+/// IPv6 link-local) - i.e. an address only reachable on a local/container/cluster network.
+/// Loopback is intentionally excluded here (handled separately by the caller).
+fn ip_is_private(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => v4.is_private() || v4.is_link_local(),
+        // fc00::/7 (unique local) and fe80::/10 (link-local), computed by hand because
+        // Ipv6Addr::is_unique_local / is_unicast_link_local were unstable when this was written.
+        IpAddr::V6(v6) => (v6.octets()[0] & 0xfe) == 0xfc || (v6.segments()[0] & 0xffc0) == 0xfe80,
+    }
+}
+
 impl Server {
     #[allow(clippy::too_many_arguments)]
     fn new(
@@ -151,12 +181,8 @@ impl Server {
     }
 
     fn use_tls(&self) -> bool {
-        self.force_tls.unwrap_or_else(|| {
-            // localhost never has a cert; `.onion` is encrypted by Tor itself. Everything else
-            // is treated as a remote host that needs TLS.
-            !matches!(self.host.as_ref(), "localhost" | "127.0.0.1" | "::1")
-                && !self.host.ends_with(".onion")
-        })
+        self.force_tls
+            .unwrap_or_else(|| !host_skips_tls_by_default(&self.host))
     }
 
     fn endpoint(&self) -> String {
@@ -216,6 +242,21 @@ impl Server {
         // critical unary calls. TCP keepalive complements it below the HTTP/2 layer: it
         // detects a dead L4 path (host suspend, NAT rebind, silently dropped conntrack
         // entries) and keeps idle NAT/firewall mappings alive between syncs.
+        // Surface the auto-plaintext decision for private-network endpoints (docker/k8s/LAN):
+        // the operator didn't force `tls`, the host is an RFC1918/link-local/ULA address, so we
+        // dial without TLS. One info line so this isn't silent; `tls = "yes"` opts back in.
+        if self.force_tls.is_none() {
+            if let Ok(ip) = self.host.parse::<IpAddr>() {
+                if ip_is_private(ip) {
+                    tracing::info!(
+                        "connecting to {}:{} without TLS: private-network address \
+                         (RFC1918/link-local/ULA); set [backend] tls = \"yes\" to require TLS",
+                        self.host,
+                        self.port
+                    );
+                }
+            }
+        }
         let endpoint = Channel::from_shared(self.endpoint())?
             .tcp_keepalive(Some(Duration::from_secs(15)))
             .http2_keep_alive_interval(Duration::from_secs(15))
@@ -675,6 +716,89 @@ mod tests {
         )
         .unwrap();
         assert!(s[0].use_tls());
+    }
+
+    #[test]
+    fn private_network_addresses_skip_tls_by_default() {
+        // RFC1918 / link-local / IPv6 private ranges: reachable only on a local/container/cluster
+        // network, so the auto heuristic must dial them plaintext (docker, kubernetes, LAN).
+        for host in [
+            "10.0.0.5",          // 10/8
+            "10.255.255.255",    // 10/8 upper bound
+            "172.16.0.1",        // 172.16/12 lower bound
+            "172.31.255.254",    // 172.16/12 upper bound
+            "172.17.0.2",        // typical docker bridge address
+            "192.168.1.10",      // 192.168/16
+            "169.254.10.1",      // IPv4 link-local
+            "127.0.0.1",         // loopback (also covered)
+            "fc00::1",           // IPv6 unique-local
+            "fd12:3456:789a::1", // IPv6 ULA (fd00::/8 ⊂ fc00::/7)
+            "fe80::1",           // IPv6 link-local
+            "::1",               // IPv6 loopback
+        ] {
+            let s = resolve(
+                &format!("{host}:9067"),
+                ZNetwork::Main,
+                TlsRoots::Native,
+                None,
+                None,
+            )
+            .unwrap();
+            assert!(!s[0].use_tls(), "{host} should skip TLS by default");
+        }
+
+        // Public / non-private addresses (incl. the 172.32+ range just outside RFC1918) still
+        // require TLS under the auto heuristic.
+        for host in [
+            "8.8.8.8",
+            "172.32.0.1",
+            "203.0.113.1",
+            "2606:4700:4700::1111",
+        ] {
+            let s = resolve(
+                &format!("{host}:443"),
+                ZNetwork::Main,
+                TlsRoots::Native,
+                None,
+                None,
+            )
+            .unwrap();
+            assert!(s[0].use_tls(), "{host} should require TLS by default");
+        }
+    }
+
+    #[test]
+    fn force_tls_overrides_private_network_heuristic() {
+        // tls="yes" forces TLS even for an RFC1918 address…
+        let s = resolve(
+            "10.0.0.5:443",
+            ZNetwork::Main,
+            TlsRoots::Native,
+            Some(true),
+            None,
+        )
+        .unwrap();
+        assert!(s[0].use_tls());
+        // …and an explicit https:// scheme does the same per-endpoint.
+        let s = resolve(
+            "https://192.168.1.10:443",
+            ZNetwork::Main,
+            TlsRoots::Native,
+            None,
+            None,
+        )
+        .unwrap();
+        assert!(s[0].use_tls());
+        // tls="no" keeps a public host plaintext (the existing co-located override).
+        let s = resolve(
+            "8.8.8.8:9067",
+            ZNetwork::Main,
+            TlsRoots::Native,
+            Some(false),
+            None,
+        )
+        .unwrap();
+        assert!(!s[0].use_tls());
     }
 
     /// A `.onion` endpoint without a SOCKS proxy must be refused at resolve time: the direct
