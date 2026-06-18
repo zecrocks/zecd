@@ -11,7 +11,7 @@ use secrecy::{SecretVec, Zeroize};
 use tokio::io::AsyncWriteExt as _;
 
 use zcash_client_backend::data_api::{
-    Account as _, AccountBirthday, AccountPurpose, WalletRead, WalletWrite,
+    Account as _, AccountBirthday, AccountPurpose, AccountSource, WalletRead, WalletWrite,
 };
 use zcash_keys::keys::UnifiedFullViewingKey;
 use zcash_protocol::consensus::{BlockHeight, NetworkUpgrade, Parameters};
@@ -69,10 +69,11 @@ pub async fn run(config: &AppConfig, args: &InitArgs) -> anyhow::Result<()> {
             wallet_dir.display()
         ));
     }
-    std::fs::create_dir_all(&wallet_dir)?;
 
-    // Watch-only init: parse the UFVK up front (before any network I/O) so a malformed key
-    // fails fast. `--ufvk` conflicts with `--restore`/`--encrypt` at the clap level.
+    // Watch-only init: parse the UFVK up front (before any directory or network I/O) so a
+    // malformed key fails fast. `--ufvk` conflicts with `--restore`/`--encrypt` at the clap
+    // level. A `Some` UFVK means this is a watch-only wallet; `None` means it will hold
+    // spending keys.
     let ufvk = args
         .ufvk
         .as_deref()
@@ -81,6 +82,27 @@ pub async fn run(config: &AppConfig, args: &InitArgs) -> anyhow::Result<()> {
                 .map_err(|e| anyhow!("invalid unified full viewing key: {e}"))
         })
         .transpose()?;
+
+    // zecd permits at most one spending wallet (any number of watch-only UFVK wallets may be
+    // added alongside it). When creating a spending wallet, refuse up front if another
+    // configured wallet already holds spending keys - the same invariant the daemon enforces at
+    // startup, surfaced here so the operator finds out at `init` time rather than at the next
+    // boot. Watch-only inits (`--ufvk`) are exempt: any number are allowed. Done before any
+    // directory or network I/O so it fails fast and leaves nothing behind.
+    if ufvk.is_none() {
+        if let Some(existing) = existing_spending_wallet(network, &config.wallets, &args.wallet) {
+            return Err(anyhow!(
+                "cannot create spending wallet '{}': wallet '{}' already holds spending keys, \
+                 and zecd allows at most one spending wallet (any number of watch-only UFVK \
+                 wallets may be added alongside it). Create this wallet watch-only with `--ufvk` \
+                 (see `zecd export-ufvk`), or remove/convert the existing spending wallet.",
+                args.wallet,
+                existing
+            ));
+        }
+    }
+
+    std::fs::create_dir_all(&wallet_dir)?;
 
     let identity_path = config
         .keys
@@ -374,6 +396,50 @@ pub fn export_ufvk(config: &AppConfig, args: &ExportUfvkArgs) -> anyhow::Result<
     Ok(())
 }
 
+/// Scan the configured `wallets` (other than `exclude`) for one that is already initialized and
+/// holds spending keys, returning its name. Used by the `init` guard so a second spending
+/// wallet is refused before any work is done. The scope is `config.wallets` - exactly the set
+/// the daemon would load - so the two guards agree.
+fn existing_spending_wallet(
+    network: crate::network::ZNetwork,
+    wallets: &std::collections::BTreeMap<String, WalletEntry>,
+    exclude: &str,
+) -> Option<String> {
+    wallets
+        .iter()
+        .filter(|(name, _)| name.as_str() != exclude)
+        .filter(|(_, entry)| WalletStore::exists(&entry.dir))
+        .find(|(_, entry)| wallet_has_spending_keys(network, &entry.dir))
+        .map(|(name, _)| name.clone())
+}
+
+/// Whether an initialized wallet at `wallet_dir` holds spending keys (i.e. its account is not a
+/// watch-only UFVK import - the same `AccountSource::Imported { ViewOnly }` test the actor uses
+/// for `watch_only`). Best-effort: a wallet whose DB can't be read or has no account is treated
+/// as non-spending, so a single unreadable sibling never blocks `init` - the daemon's startup
+/// guard is the backstop.
+fn wallet_has_spending_keys(network: crate::network::ZNetwork, wallet_dir: &Path) -> bool {
+    let Ok(db) = open::open_read(network, wallet_dir) else {
+        return false;
+    };
+    let Ok(ids) = db.get_account_ids() else {
+        return false;
+    };
+    let Some(id) = ids.first().copied() else {
+        return false;
+    };
+    match db.get_account(id) {
+        Ok(Some(account)) => !matches!(
+            account.source(),
+            AccountSource::Imported {
+                purpose: AccountPurpose::ViewOnly,
+                ..
+            }
+        ),
+        _ => false,
+    }
+}
+
 async fn ensure_identity(path: &Path) -> anyhow::Result<Vec<Box<dyn age::Recipient + Send>>> {
     if tokio::fs::try_exists(path).await.unwrap_or(false) {
         let recipients =
@@ -416,6 +482,177 @@ async fn ensure_identity(path: &Path) -> anyhow::Result<Vec<Box<dyn age::Recipie
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use std::collections::BTreeMap;
+
+    use bip0039::{English, Mnemonic};
+    use zcash_client_backend::data_api::chain::ChainState;
+    use zcash_keys::keys::UnifiedSpendingKey;
+    use zcash_primitives::block::BlockHash;
+    use zcash_protocol::consensus::BlockHeight;
+
+    use crate::network;
+
+    /// The committed testnet test mnemonic (valueless), reused here purely as a deterministic
+    /// seed source for throwaway regtest wallets.
+    const TEST_PHRASE: &str = "mechanic vehicle helmet decide plug gorilla frost dial october \
+        midnight culture idea mountain fame park social drip bid doctor scatter glance defy \
+        moment stage";
+
+    fn test_seed() -> SecretVec<u8> {
+        let mut seed = <Mnemonic<English>>::from_phrase(TEST_PHRASE)
+            .unwrap()
+            .to_seed("");
+        let secret = SecretVec::new(seed.to_vec());
+        seed.zeroize();
+        secret
+    }
+
+    fn genesis_birthday() -> AccountBirthday {
+        AccountBirthday::from_parts(
+            ChainState::empty(BlockHeight::from_u32(0), BlockHash([0u8; 32])),
+            None,
+        )
+    }
+
+    /// Build a fully-initialized spending wallet (keys.toml with a seed + a seed-derived
+    /// account) at `dir`, so both the `WalletStore::exists` gate and the DB account match a
+    /// real `zecd init`.
+    fn make_spending_wallet(dir: &Path) {
+        let net = network::regtest();
+        let mnemonic = <Mnemonic<English>>::from_phrase(TEST_PHRASE).unwrap();
+        WalletStore::init_with_passphrase(
+            dir,
+            Passphrase::from("test-pass".to_string()),
+            &mnemonic,
+            BlockHeight::from_u32(1),
+            net,
+        )
+        .expect("write spending keys.toml");
+        let mut db = open::init_dbs(net, dir).expect("init spending dbs");
+        db.create_account("primary", &test_seed(), &genesis_birthday(), None)
+            .expect("create spending account");
+    }
+
+    /// Build a fully-initialized watch-only wallet (seedless keys.toml + a ViewOnly UFVK
+    /// import) at `dir`.
+    fn make_watch_only_wallet(dir: &Path) {
+        let net = network::regtest();
+        WalletStore::init_view_only(dir, BlockHeight::from_u32(1), net)
+            .expect("write watch-only keys.toml");
+        let ufvk = {
+            use secrecy::ExposeSecret as _;
+            let seed = test_seed();
+            UnifiedSpendingKey::from_seed(
+                &net,
+                seed.expose_secret(),
+                zip32::AccountId::try_from(0u32).unwrap(),
+            )
+            .expect("derive USK")
+            .to_unified_full_viewing_key()
+        };
+        let mut db = open::init_dbs(net, dir).expect("init watch-only dbs");
+        db.import_account_ufvk(
+            "watch",
+            &ufvk,
+            &genesis_birthday(),
+            AccountPurpose::ViewOnly,
+            None,
+        )
+        .expect("import the UFVK view-only");
+    }
+
+    #[test]
+    fn spending_keys_detected_for_seed_wallet_not_watch_only() {
+        let net = network::regtest();
+        let spend = tempfile::tempdir().unwrap();
+        let watch = tempfile::tempdir().unwrap();
+        let empty = tempfile::tempdir().unwrap();
+        make_spending_wallet(spend.path());
+        make_watch_only_wallet(watch.path());
+
+        assert!(
+            wallet_has_spending_keys(net, spend.path()),
+            "a seed-derived wallet holds spending keys"
+        );
+        assert!(
+            !wallet_has_spending_keys(net, watch.path()),
+            "a view-only UFVK import does not hold spending keys"
+        );
+        // An uninitialized directory has no account, so it is treated as non-spending (the guard
+        // is best-effort and never blocks on an unreadable sibling).
+        assert!(
+            !wallet_has_spending_keys(net, empty.path()),
+            "an empty wallet dir is not a spending wallet"
+        );
+    }
+
+    #[test]
+    fn existing_spending_wallet_finds_the_other_spender() {
+        let net = network::regtest();
+        let default_dir = tempfile::tempdir().unwrap();
+        let w2_dir = tempfile::tempdir().unwrap();
+        make_spending_wallet(default_dir.path());
+
+        let mut wallets = BTreeMap::new();
+        wallets.insert(
+            "default".to_string(),
+            WalletEntry {
+                dir: default_dir.path().to_path_buf(),
+            },
+        );
+        wallets.insert(
+            "w2".to_string(),
+            WalletEntry {
+                dir: w2_dir.path().to_path_buf(),
+            },
+        );
+
+        // Creating spending wallet 'w2' must see the existing spending 'default'.
+        assert_eq!(
+            existing_spending_wallet(net, &wallets, "w2").as_deref(),
+            Some("default"),
+            "the existing spending wallet is detected"
+        );
+        // Re-initializing 'default' itself excludes it, so no conflict is reported.
+        assert_eq!(
+            existing_spending_wallet(net, &wallets, "default"),
+            None,
+            "the wallet being created is excluded from the scan"
+        );
+    }
+
+    #[test]
+    fn watch_only_siblings_do_not_count_as_spenders() {
+        let net = network::regtest();
+        let view_a = tempfile::tempdir().unwrap();
+        let view_b = tempfile::tempdir().unwrap();
+        let default_dir = tempfile::tempdir().unwrap();
+        make_watch_only_wallet(view_a.path());
+        make_watch_only_wallet(view_b.path());
+
+        let mut wallets = BTreeMap::new();
+        for (name, dir) in [
+            ("default", &default_dir),
+            ("view-a", &view_a),
+            ("view-b", &view_b),
+        ] {
+            wallets.insert(
+                name.to_string(),
+                WalletEntry {
+                    dir: dir.path().to_path_buf(),
+                },
+            );
+        }
+
+        // Creating the (first) spending 'default' alongside any number of watch-only wallets is
+        // allowed: none of the existing siblings hold spending keys.
+        assert_eq!(
+            existing_spending_wallet(net, &wallets, "default"),
+            None,
+            "watch-only siblings never trip the single-spending-wallet guard"
+        );
+    }
 
     /// The age identity holds the secret key that decrypts the mnemonic, so it must be created
     /// private. Asserts the end-state mode; atomicity (never world-readable mid-write) comes from

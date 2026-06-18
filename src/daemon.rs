@@ -54,6 +54,11 @@ pub async fn run(config: AppConfig) -> anyhow::Result<()> {
 
     let mut registry = WalletRegistry::new(config.default_wallet.clone());
     let mut actor_tasks = Vec::new();
+    // zecd permits at most one wallet with spending keys; watch-only (UFVK) wallets may be
+    // loaded without limit. Record each opened wallet's watch-only flag so the invariant can
+    // be enforced once every wallet has been spawned (the flag is only known after the actor
+    // reads the account from the wallet DB).
+    let mut loaded: Vec<(String, bool)> = Vec::new();
     for (name, entry) in &config.wallets {
         if !WalletStore::exists(&entry.dir) {
             warn!(
@@ -92,7 +97,13 @@ pub async fn run(config: AppConfig) -> anyhow::Result<()> {
         };
         match actor::spawn(actor_cfg).await {
             Ok((handle, task)) => {
-                info!("loaded wallet '{}'", name);
+                let watch_only = handle.status().watch_only;
+                info!(
+                    "loaded wallet '{}'{}",
+                    name,
+                    if watch_only { " (watch-only)" } else { "" }
+                );
+                loaded.push((name.clone(), watch_only));
                 registry.insert(handle);
                 actor_tasks.push((name.clone(), task));
             }
@@ -105,6 +116,15 @@ pub async fn run(config: AppConfig) -> anyhow::Result<()> {
             "no usable wallets; run `{prog} init` (datadir: {})",
             config.datadir.display()
         );
+    }
+
+    // Enforce the single-spending-wallet invariant before serving any RPC. A second spending
+    // wallet is a misconfiguration the operator must resolve (zecd won't silently pick which
+    // one is "the" spender), so this is fatal - the actors spawned above are torn down by the
+    // shutdown signal sent on the early return.
+    if let Err(e) = ensure_single_spending_wallet(&loaded) {
+        shutdown_tx.send_replace(true);
+        return Err(e);
     }
 
     let state = AppState {
@@ -159,4 +179,97 @@ pub async fn run(config: AppConfig) -> anyhow::Result<()> {
         }
     }
     result
+}
+
+/// Enforce zecd's single-spending-wallet rule: at most one loaded wallet may hold spending
+/// keys, while any number of watch-only (UFVK) wallets may be loaded alongside it. `loaded`
+/// pairs each successfully-opened wallet name with its watch-only flag (`true` = watch-only),
+/// in a stable order so the error names the offending wallets deterministically. Returns an
+/// error naming the two spending wallets when more than one is present.
+fn ensure_single_spending_wallet(loaded: &[(String, bool)]) -> anyhow::Result<()> {
+    let mut spenders = loaded
+        .iter()
+        .filter(|(_, watch_only)| !watch_only)
+        .map(|(name, _)| name.as_str());
+    if let (Some(first), Some(second)) = (spenders.next(), spenders.next()) {
+        anyhow::bail!(
+            "multiple spending wallets configured ('{first}' and '{second}'); zecd allows at \
+             most one wallet with spending keys (any number of watch-only UFVK wallets may be \
+             loaded alongside it). Convert one to watch-only (`zecd export-ufvk` + \
+             `zecd init --ufvk`) or remove it from the configuration."
+        );
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ensure_single_spending_wallet;
+
+    fn wallets(entries: &[(&str, bool)]) -> Vec<(String, bool)> {
+        entries
+            .iter()
+            .map(|(name, watch_only)| (name.to_string(), *watch_only))
+            .collect()
+    }
+
+    #[test]
+    fn no_wallets_is_allowed() {
+        // The empty case is guarded separately (registry.is_empty bail); the invariant check
+        // itself must not error on it.
+        assert!(ensure_single_spending_wallet(&[]).is_ok());
+    }
+
+    #[test]
+    fn single_spending_wallet_is_allowed() {
+        assert!(ensure_single_spending_wallet(&wallets(&[("default", false)])).is_ok());
+    }
+
+    #[test]
+    fn only_watch_only_wallets_is_allowed() {
+        // No spending wallet at all is fine (every wallet is a watch-only UFVK import).
+        assert!(ensure_single_spending_wallet(&wallets(&[
+            ("view-a", true),
+            ("view-b", true),
+            ("view-c", true),
+        ]))
+        .is_ok());
+    }
+
+    #[test]
+    fn one_spending_plus_many_watch_only_is_allowed() {
+        assert!(ensure_single_spending_wallet(&wallets(&[
+            ("default", false),
+            ("view-a", true),
+            ("view-b", true),
+        ]))
+        .is_ok());
+    }
+
+    #[test]
+    fn two_spending_wallets_are_rejected() {
+        let err = ensure_single_spending_wallet(&wallets(&[("default", false), ("second", false)]))
+            .expect_err("two spending wallets must be rejected");
+        let msg = err.to_string();
+        // The error names both offenders so the operator knows which to convert/remove.
+        assert!(msg.contains("'default'"), "{msg}");
+        assert!(msg.contains("'second'"), "{msg}");
+        assert!(msg.contains("at most one"), "{msg}");
+    }
+
+    #[test]
+    fn two_spending_wallets_mixed_with_watch_only_are_rejected() {
+        // Watch-only wallets interleaved with the spenders don't mask the violation; the first
+        // two spenders in order are named.
+        let err = ensure_single_spending_wallet(&wallets(&[
+            ("view-a", true),
+            ("spend-a", false),
+            ("view-b", true),
+            ("spend-b", false),
+        ]))
+        .expect_err("two spending wallets must be rejected");
+        let msg = err.to_string();
+        assert!(msg.contains("'spend-a'"), "{msg}");
+        assert!(msg.contains("'spend-b'"), "{msg}");
+    }
 }

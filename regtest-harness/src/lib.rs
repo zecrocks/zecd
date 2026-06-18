@@ -634,9 +634,15 @@ pub struct ZecdConfig {
     pub rebroadcast_secs: u64,
     /// `[backend] primary_recheck_secs` - how fast a recovered primary is re-adopted.
     pub primary_recheck_secs: u64,
-    /// Additional `[wallets.<name>]` entries beyond `default` (multiwallet tests); each gets
-    /// its own `zecd init --wallet <name>` before the daemon starts.
+    /// Additional **spending** `[wallets.<name>]` entries beyond `default` (each gets its own
+    /// `zecd init --wallet <name>` before the daemon starts). NB: zecd permits only ONE
+    /// spending wallet, so configuring any of these alongside the spending `default` makes the
+    /// daemon refuse to start - that refusal is what [`Zecd::start_expect_refusal`] asserts.
     pub extra_wallets: Vec<String>,
+    /// Additional **watch-only** `[wallets.<name>]` entries, each created `--ufvk` from the
+    /// `default` wallet's exported UFVK (a watch-only replica of the single spending wallet).
+    /// Any number are allowed alongside the spending `default`.
+    pub extra_watch_only_wallets: Vec<String>,
     /// Restore the default wallet from this mnemonic (`zecd init --restore`, phrase on stdin)
     /// instead of generating a fresh one.
     pub restore_mnemonic: Option<String>,
@@ -662,6 +668,7 @@ impl ZecdConfig {
             rebroadcast_secs: 2,
             primary_recheck_secs: 3,
             extra_wallets: Vec::new(),
+            extra_watch_only_wallets: Vec::new(),
             restore_mnemonic: None,
             ufvk: None,
             birthday: None,
@@ -682,6 +689,7 @@ impl ZecdConfig {
             rebroadcast_secs: 2,
             primary_recheck_secs: 3,
             extra_wallets: Vec::new(),
+            extra_watch_only_wallets: Vec::new(),
             restore_mnemonic: None,
             ufvk: None,
             birthday: None,
@@ -700,41 +708,9 @@ impl Zecd {
     /// chain tip), then spawn the daemon. Returns once the RPC is up; call
     /// [`Zecd::wait_until_synced`] to wait for the scan to reach the tip.
     pub async fn start(cfg: &ZecdConfig) -> Result<Zecd> {
-        let datadir = tempfile::tempdir().context("create zecd datadir")?;
-        let bin = zecd_bin();
-        if !bin.exists() {
-            bail!(
-                "zecd binary not found at {} - build it first (cargo build --release --bin zecd) \
-                 or set $ZECD_BIN",
-                bin.display()
-            );
-        }
+        let (datadir, mnemonic) = Self::prepare_datadir(cfg).await?;
 
-        write_zecd_toml(datadir.path(), cfg).context("write zecd.toml")?;
-
-        // `zecd init` contacts lightwalletd (get_latest_block + get_tree_state). Just after launch
-        // lightwalletd may still be ingesting from zebrad, so retry, resetting the datadir between
-        // attempts so a partial init can't wedge the next one. The default wallet's init is the
-        // retry gate; extra wallets are initialised once lightwalletd has proven warm.
-        let deadline = Instant::now() + Duration::from_secs(90);
-        let mnemonic = loop {
-            match run_zecd_init(&bin, datadir.path(), "default", cfg) {
-                Ok(mnemonic) => break mnemonic,
-                Err(e) => {
-                    if Instant::now() >= deadline {
-                        return Err(e.context("zecd init failed after retries"));
-                    }
-                    reset_datadir(datadir.path(), cfg)?;
-                    tokio::time::sleep(Duration::from_secs(2)).await;
-                }
-            }
-        };
-        for name in &cfg.extra_wallets {
-            run_zecd_init(&bin, datadir.path(), name, cfg)
-                .with_context(|| format!("init extra wallet '{name}'"))?;
-        }
-
-        let child = Command::new(&bin)
+        let child = Command::new(zecd_bin())
             .args([
                 "--datadir",
                 datadir.path().to_str().unwrap(),
@@ -760,36 +736,86 @@ impl Zecd {
         Ok(zecd)
     }
 
+    /// Set up a datadir with the spending `default` wallet, then attempt `zecd init --wallet
+    /// <name>` for a **second spending** wallet, expecting zecd's init-time guard to refuse it
+    /// (zecd allows only one spending wallet). `cfg.extra_wallets` must list `name` so the
+    /// config the guard scans contains both wallets. Returns the refusal's stderr; errors if
+    /// the second init unexpectedly succeeded.
+    pub async fn init_second_spending_expect_refusal(
+        cfg: &ZecdConfig,
+        name: &str,
+    ) -> Result<String> {
+        let datadir = tempfile::tempdir().context("create zecd datadir")?;
+        let bin = zecd_bin();
+        if !bin.exists() {
+            bail!(
+                "zecd binary not found at {} - build it first (cargo build --release --bin zecd) \
+                 or set $ZECD_BIN",
+                bin.display()
+            );
+        }
+        write_zecd_toml(datadir.path(), cfg).context("write zecd.toml")?;
+        init_default_with_retry(&bin, datadir.path(), cfg).await?;
+
+        // The guard runs before any network I/O, so this fails fast offline.
+        let out = Command::new(&bin)
+            .args([
+                "--datadir",
+                datadir.path().to_str().unwrap(),
+                "--regtest",
+                "init",
+                "--wallet",
+                name,
+            ])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .output()
+            .context("spawn second zecd init")?;
+        anyhow::ensure!(
+            !out.status.success(),
+            "zecd init of a second spending wallet was expected to fail but succeeded"
+        );
+        Ok(String::from_utf8_lossy(&out.stderr).into_owned())
+    }
+
+    /// Prepare a datadir: write `zecd.toml`, init the `default` wallet (retried while
+    /// lightwalletd warms up), then init any watch-only replicas. (Only one spending wallet is
+    /// permitted, so extra *spending* wallets are never initialised here.)
+    async fn prepare_datadir(cfg: &ZecdConfig) -> Result<(tempfile::TempDir, Option<String>)> {
+        let datadir = tempfile::tempdir().context("create zecd datadir")?;
+        let bin = zecd_bin();
+        if !bin.exists() {
+            bail!(
+                "zecd binary not found at {} - build it first (cargo build --release --bin zecd) \
+                 or set $ZECD_BIN",
+                bin.display()
+            );
+        }
+
+        write_zecd_toml(datadir.path(), cfg).context("write zecd.toml")?;
+        let mnemonic = init_default_with_retry(&bin, datadir.path(), cfg).await?;
+
+        // Watch-only replicas derive from the default wallet's exported UFVK (read straight from
+        // the on-disk DB; no running daemon needed). `init --ufvk` fetches GetTreeState(birthday-1),
+        // so use the lowest height with a real block (2) when no birthday is configured.
+        if !cfg.extra_watch_only_wallets.is_empty() {
+            let ufvk = export_ufvk_from_datadir(datadir.path(), "default")
+                .context("export default UFVK for watch-only replicas")?;
+            let birthday = cfg.birthday.unwrap_or(2);
+            for name in &cfg.extra_watch_only_wallets {
+                run_zecd_init_watch_only(&bin, datadir.path(), name, &ufvk, Some(birthday))
+                    .with_context(|| format!("init watch-only wallet '{name}'"))?;
+            }
+        }
+
+        Ok((datadir, mnemonic))
+    }
+
     /// Run `zecd export-ufvk` against this daemon's datadir and return the printed Unified
     /// Full Viewing Key (the last stdout line). Safe while the daemon runs: the command only
     /// reads the wallet DB.
     pub fn export_ufvk(&self, wallet: &str) -> Result<String> {
-        let out = Command::new(zecd_bin())
-            .args([
-                "--datadir",
-                self._datadir.path().to_str().unwrap(),
-                "--regtest",
-                "export-ufvk",
-                "--wallet",
-                wallet,
-            ])
-            .output()
-            .context("spawn zecd export-ufvk")?;
-        if !out.status.success() {
-            bail!(
-                "zecd export-ufvk failed ({}):\n{}",
-                out.status,
-                String::from_utf8_lossy(&out.stderr)
-            );
-        }
-        let stdout = String::from_utf8_lossy(&out.stdout);
-        stdout
-            .lines()
-            .rev()
-            .map(str::trim)
-            .find(|l| !l.is_empty())
-            .map(str::to_string)
-            .ok_or_else(|| anyhow!("export-ufvk printed nothing on stdout"))
+        export_ufvk_from_datadir(self._datadir.path(), wallet)
     }
 
     /// Graceful shutdown via the `stop` RPC: asserts bitcoind's reply shape ("zecd stopping"),
@@ -1056,6 +1082,104 @@ fn run_zecd_init(
     Ok((!phrase.is_empty()).then_some(phrase))
 }
 
+/// Init the `default` wallet, retried while lightwalletd catches up to the chain tip. Just
+/// after launch lightwalletd may still be ingesting from zebrad, so `zecd init` (which contacts
+/// it for `get_latest_block` + `get_tree_state`) is retried, resetting the datadir between
+/// attempts so a partial init can't wedge the next one. Returns the generated mnemonic.
+async fn init_default_with_retry(
+    bin: &Path,
+    datadir: &Path,
+    cfg: &ZecdConfig,
+) -> Result<Option<String>> {
+    let deadline = Instant::now() + Duration::from_secs(90);
+    loop {
+        match run_zecd_init(bin, datadir, "default", cfg) {
+            Ok(mnemonic) => return Ok(mnemonic),
+            Err(e) => {
+                if Instant::now() >= deadline {
+                    return Err(e.context("zecd init failed after retries"));
+                }
+                reset_datadir(datadir, cfg)?;
+                tokio::time::sleep(Duration::from_secs(2)).await;
+            }
+        }
+    }
+}
+
+/// Run `zecd init --wallet <wallet> --ufvk <ufvk>` to create a watch-only wallet (no spending
+/// material). `birthday` sets the scan start (`init --ufvk` fetches GetTreeState(birthday-1),
+/// so genesis/height-1 are rejected - pass ≥ 2).
+fn run_zecd_init_watch_only(
+    bin: &Path,
+    datadir: &Path,
+    wallet: &str,
+    ufvk: &str,
+    birthday: Option<u32>,
+) -> Result<()> {
+    let mut args: Vec<String> = vec![
+        "--datadir".into(),
+        datadir.to_str().unwrap().into(),
+        "--regtest".into(),
+        "init".into(),
+        "--wallet".into(),
+        wallet.into(),
+        "--ufvk".into(),
+        ufvk.into(),
+    ];
+    if let Some(b) = birthday {
+        args.push("--birthday".into());
+        args.push(b.to_string());
+    }
+    let out = Command::new(bin)
+        .args(&args)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .context("spawn zecd init --ufvk")?
+        .wait_with_output()
+        .context("wait for zecd init --ufvk")?;
+    if !out.status.success() {
+        bail!(
+            "zecd init --wallet {wallet} --ufvk failed ({}):\n{}",
+            out.status,
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+    Ok(())
+}
+
+/// Run `zecd export-ufvk --wallet <wallet>` against a datadir (reads the wallet DB directly; no
+/// running daemon required) and return the printed Unified Full Viewing Key (the last non-empty
+/// stdout line).
+fn export_ufvk_from_datadir(datadir: &Path, wallet: &str) -> Result<String> {
+    let out = Command::new(zecd_bin())
+        .args([
+            "--datadir",
+            datadir.to_str().unwrap(),
+            "--regtest",
+            "export-ufvk",
+            "--wallet",
+            wallet,
+        ])
+        .output()
+        .context("spawn zecd export-ufvk")?;
+    if !out.status.success() {
+        bail!(
+            "zecd export-ufvk failed ({}):\n{}",
+            out.status,
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    stdout
+        .lines()
+        .rev()
+        .map(str::trim)
+        .find(|l| !l.is_empty())
+        .map(str::to_string)
+        .ok_or_else(|| anyhow!("export-ufvk printed nothing on stdout"))
+}
+
 fn write_zecd_toml(datadir: &Path, cfg: &ZecdConfig) -> Result<()> {
     let mut tokens = Vec::new();
     if let Some(z) = cfg.zebra_rpc_port {
@@ -1074,7 +1198,11 @@ fn write_zecd_toml(datadir: &Path, cfg: &ZecdConfig) -> Result<()> {
         "[wallets.default]\ndir = \"{}/default\"\n",
         datadir.display()
     );
-    for name in &cfg.extra_wallets {
+    for name in cfg
+        .extra_wallets
+        .iter()
+        .chain(&cfg.extra_watch_only_wallets)
+    {
         wallets.push_str(&format!(
             "\n[wallets.{name}]\ndir = \"{}/{name}\"\n",
             datadir.display()

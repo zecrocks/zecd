@@ -477,6 +477,13 @@ whole wallet, never of individual addresses):
   carry no per-pool trimming here): share it only with hosts that may see your transaction
   graph, and remember a watch-only datadir still deserves protection for privacy.
 
+One daemon may load **at most one spending wallet**, plus **any number of watch-only wallets**
+alongside it (each its own `[wallets.<name>]`, addressed at `/wallet/<name>`). This keeps spend
+authority unambiguous - there is never a question of which key signs. `zecd init` refuses to
+create a second spending wallet when one already exists (use `--ufvk` for a watch-only wallet
+instead), and the daemon re-checks at startup and refuses to run with two spenders - naming
+both - as a backstop. Convert one to watch-only (`export-ufvk` + `init --ufvk`) or remove it.
+
 ## Compatibility boundary
 
 zecd targets generic Bitcoin-RPC compatibility: any integration that drives a coin purely through
