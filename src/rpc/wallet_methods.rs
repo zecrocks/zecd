@@ -38,27 +38,65 @@ pub(crate) fn listwallets(state: &AppState) -> Result<Value, RpcError> {
     Ok(json!(state.registry.names()))
 }
 
-/// `getnewaddress [label] [address_type]` - a fresh diversified Orchard unified address for
-/// the wallet's account (new diversifier, not a new derivation path).
+/// `getnewaddress [label] [address_type]` - a fresh diversified unified address for the wallet's
+/// account (new diversifier, not a new derivation path).
+///
+/// `address_type` doubles as a per-call receiver override (zallet's `receiver_types`, expressed as
+/// a single string for Bitcoin-RPC conformance):
+/// - empty / `"unified"` / `"default"` → the wallet's configured `default_receivers`,
+/// - a single pool name (`"orchard"`, `"sapling"`),
+/// - a comma-separated list (`"sapling,orchard"`).
+///
+/// Every requested receiver must be a pool enabled on the wallet, else `-8`.
 pub(crate) async fn getnewaddress(
     state: &AppState,
     wallet: Option<&str>,
     req: &RpcRequest,
 ) -> Result<Value, RpcError> {
     let label = opt_str(req, 0).filter(|s| !s.is_empty());
-    // Param 1 (address_type): every zecd address is an Orchard unified address. Accept the
-    // matching names but reject Bitcoin types, so a caller asking for e.g. "bech32" isn't
-    // silently handed a different kind of address than it asked for.
-    if let Some(t) = opt_str(req, 1).filter(|s| !s.is_empty()) {
-        if !t.eq_ignore_ascii_case("orchard") && !t.eq_ignore_ascii_case("unified") {
-            return Err(RpcError::invalid_address_or_key(format!(
-                "Unknown address type '{t}'"
+    // Param 1 (address_type): parse the receiver-override *syntax* before resolving the wallet,
+    // so an unknown type is a `-5` regardless of which wallet is targeted (and even when no
+    // wallet exists). Enablement is wallet-specific and checked once the handle is in hand.
+    let raw_type = opt_str(req, 1);
+    let requested = parse_receiver_tokens(raw_type.as_deref())?;
+    let handle = state.registry.get(wallet)?.clone();
+    if let Some(set) = &requested {
+        if !set.is_subset_of(&handle.enabled_pools) {
+            return Err(RpcError::invalid_parameter(format!(
+                "address type requests a receiver not enabled on this wallet; enabled pools: {}",
+                handle.enabled_pools.display_names()
             )));
         }
     }
-    let handle = state.registry.get(wallet)?.clone();
-    let addr = handle.get_new_address(label).await?;
+    let addr = handle.get_new_address(label, requested).await?;
     Ok(Value::String(addr))
+}
+
+/// Parse the `getnewaddress` `address_type` argument into an optional receiver set, validating
+/// only its syntax (wallet-independent). Returns `Ok(None)` for the default (empty / `unified` /
+/// `default`), `Ok(Some(set))` for an explicit single pool or comma-separated list, or a `-5` for
+/// an unknown token. Whether the wallet actually enables those pools is checked by the caller.
+fn parse_receiver_tokens(
+    address_type: Option<&str>,
+) -> Result<Option<crate::pools::PoolSet>, RpcError> {
+    use crate::pools::{Pool, PoolSet};
+    let Some(raw) = address_type.map(str::trim).filter(|s| !s.is_empty()) else {
+        return Ok(None);
+    };
+    if raw.eq_ignore_ascii_case("unified") || raw.eq_ignore_ascii_case("default") {
+        return Ok(None);
+    }
+    let mut pools = Vec::new();
+    for token in raw.split(',') {
+        let token = token.trim();
+        let pool = Pool::from_config_str(token).map_err(|_| {
+            RpcError::invalid_address_or_key(format!("Unknown address type '{token}'"))
+        })?;
+        pools.push(pool);
+    }
+    let set = PoolSet::new(pools)
+        .map_err(|e| RpcError::invalid_address_or_key(format!("Invalid address type: {e}")))?;
+    Ok(Some(set))
 }
 
 /// Map `getbalance`'s optional `minconf` argument onto a [`ConfirmationsPolicy`]. Omitted
@@ -232,6 +270,11 @@ fn addressinfo_json(
         "iswatchonly": false,
         "isscript": v.is_script,
         "iswitness": false,
+        // Extension fields (a deliberate divergence from bitcoind): which pools this address can
+        // receive into. Mirrors validateaddress - `isvalid_orchard` plus the full `receiver_types`
+        // list (`transparent`/`sapling`/`orchard`), so a client sees what a `u1...` carries.
+        "isvalid_orchard": v.is_orchard,
+        "receiver_types": v.receiver_types,
         "labels": label.map(|l| vec![l]).unwrap_or_default(),
     }))
 }
@@ -1658,7 +1701,55 @@ pub(crate) async fn walletpassphrasechange(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::pools::Pool;
     use crate::wallet::read::{TxOutputRecord, TxRecord};
+
+    #[test]
+    fn receiver_tokens_default_to_none() {
+        // Empty / unified / default all mean "use the wallet's configured default_receivers".
+        assert!(parse_receiver_tokens(None).unwrap().is_none());
+        assert!(parse_receiver_tokens(Some("")).unwrap().is_none());
+        assert!(parse_receiver_tokens(Some("  ")).unwrap().is_none());
+        assert!(parse_receiver_tokens(Some("unified")).unwrap().is_none());
+        assert!(parse_receiver_tokens(Some("UNIFIED")).unwrap().is_none());
+        assert!(parse_receiver_tokens(Some("default")).unwrap().is_none());
+    }
+
+    #[test]
+    fn receiver_tokens_single_and_list() {
+        let one = parse_receiver_tokens(Some("sapling")).unwrap().unwrap();
+        assert!(one.contains(Pool::Sapling) && !one.contains(Pool::Orchard));
+
+        let both = parse_receiver_tokens(Some("sapling,orchard"))
+            .unwrap()
+            .unwrap();
+        assert!(both.contains(Pool::Sapling) && both.contains(Pool::Orchard));
+
+        // Whitespace around list members is tolerated.
+        let spaced = parse_receiver_tokens(Some(" orchard , sapling "))
+            .unwrap()
+            .unwrap();
+        assert!(spaced.contains(Pool::Sapling) && spaced.contains(Pool::Orchard));
+    }
+
+    #[test]
+    fn receiver_tokens_unknown_is_invalid_address_or_key() {
+        let err = parse_receiver_tokens(Some("bech32")).unwrap_err();
+        assert_eq!(err.code, crate::error::codes::RPC_INVALID_ADDRESS_OR_KEY);
+        // A list with one bad member is rejected too.
+        let err = parse_receiver_tokens(Some("orchard,bogus")).unwrap_err();
+        assert_eq!(err.code, crate::error::codes::RPC_INVALID_ADDRESS_OR_KEY);
+    }
+
+    #[test]
+    fn requested_receivers_must_be_subset_of_enabled() {
+        // The enablement check (a `-8`) is what getnewaddress applies once it has the handle.
+        let enabled = crate::pools::PoolSet::single(Pool::Orchard);
+        let requested = parse_receiver_tokens(Some("sapling")).unwrap().unwrap();
+        assert!(!requested.is_subset_of(&enabled));
+        let ok = parse_receiver_tokens(Some("orchard")).unwrap().unwrap();
+        assert!(ok.is_subset_of(&enabled));
+    }
 
     #[test]
     fn privacy_from_policy_maps_every_case() {
@@ -2006,6 +2097,9 @@ mod tests {
         assert_eq!(o["iswatchonly"], json!(false));
         assert_eq!(o["iswitness"], json!(false));
         assert_eq!(o["scriptPubKey"], json!(""));
+        // Extension fields: the address's receiver verdicts.
+        assert_eq!(o["isvalid_orchard"], json!(true));
+        assert_eq!(o["receiver_types"], json!(["orchard"]));
         assert_eq!(o["labels"], json!(["hot"]));
     }
 

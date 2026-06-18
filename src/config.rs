@@ -14,6 +14,7 @@ use serde::Deserialize;
 use zcash_client_backend::data_api::wallet::ConfirmationsPolicy;
 
 use crate::network::ZNetwork;
+use crate::pools::{Pool, PoolSet};
 
 /// Default chain upstream: a local zebrad's JSON-RPC (`zebra://127.0.0.1:8234` on mainnet,
 /// `zebra://127.0.0.1:18234` on testnet/regtest - see `backend::ZEBRA_RPC_PORT_*`).
@@ -77,8 +78,34 @@ pub struct AppConfig {
     pub keystore: KeystoreConfig,
     pub sync: SyncConfig,
     pub spend: SpendConfig,
+    /// Global default enabled pools / UA receivers, applied to wallets that don't override them
+    /// (including the implicit default wallet that has no `[wallets.<name>]` entry).
+    pub pools: PoolsConfig,
     pub health: HealthConfig,
     pub log: LogConfig,
+}
+
+/// `[pools]` - the wallet's shielded pool configuration: which pools are enabled and which
+/// receivers the Unified Addresses it hands out include by default. A default receiver may never
+/// name a pool that isn't enabled (validated at startup). Per-wallet `[wallets.<name>]` entries
+/// can override either field; this is the global default.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PoolsConfig {
+    /// Shielded pools the wallet receives into and spends from.
+    pub enabled: PoolSet,
+    /// Receivers included in the UAs handed out by `getnewaddress` when no per-call override is
+    /// given. Always a subset of `enabled`.
+    pub default_receivers: PoolSet,
+}
+
+impl Default for PoolsConfig {
+    fn default() -> Self {
+        // Preserves zecd's historical behaviour: Orchard-only receiving.
+        Self {
+            enabled: PoolSet::single(Pool::Orchard),
+            default_receivers: PoolSet::single(Pool::Orchard),
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -102,6 +129,10 @@ pub struct LogConfig {
 #[derive(Debug, Clone)]
 pub struct WalletEntry {
     pub dir: PathBuf,
+    /// Shielded pools this wallet receives into and spends from (resolved per wallet).
+    pub pools: PoolSet,
+    /// Receivers included by default in this wallet's Unified Addresses (a subset of `pools`).
+    pub default_receivers: PoolSet,
 }
 
 #[derive(Debug, Clone)]
@@ -317,6 +348,7 @@ struct ConfigFile {
     keystore: Option<KeystoreFile>,
     sync: Option<SyncFile>,
     spend: Option<SpendFile>,
+    pools: Option<PoolsFile>,
     health: Option<HealthFile>,
     log: Option<LogFile>,
 }
@@ -341,6 +373,10 @@ struct LogFile {
 #[serde(deny_unknown_fields)]
 struct WalletFile {
     dir: Option<PathBuf>,
+    /// Override the global `[pools] enabled` for this wallet.
+    pools: Option<Vec<String>>,
+    /// Override the global `[pools] default_receivers` for this wallet.
+    default_receivers: Option<Vec<String>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -406,6 +442,13 @@ struct SpendFile {
     trusted_confirmations: Option<u32>,
     untrusted_confirmations: Option<u32>,
     privacy_policy: Option<String>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PoolsFile {
+    enabled: Option<Vec<String>>,
+    default_receivers: Option<Vec<String>>,
 }
 
 // ---------------------------------------------------------------------------
@@ -597,16 +640,36 @@ impl AppConfig {
             .clone()
             .unwrap_or_else(|| "default".to_string());
 
-        // Wallets: from file, plus an implicit default if none declared.
+        // Global pool defaults (`[pools]`), validated before any per-wallet override.
+        let pools = resolve_global_pools(file.pools.as_ref())?;
+
+        // Wallets: from file, plus an implicit default if none declared. Each wallet's pools and
+        // default receivers are resolved against the global `[pools]` defaults, with the same
+        // subset validation applied per wallet.
         let mut wallets = BTreeMap::new();
         for (name, w) in &file.wallets {
             let dir = w.dir.clone().unwrap_or_else(|| datadir.join(name));
-            wallets.insert(name.clone(), WalletEntry { dir });
+            let (enabled, default_receivers) = resolve_wallet_pools(
+                name,
+                w.pools.as_deref(),
+                w.default_receivers.as_deref(),
+                &pools,
+            )?;
+            wallets.insert(
+                name.clone(),
+                WalletEntry {
+                    dir,
+                    pools: enabled,
+                    default_receivers,
+                },
+            );
         }
         wallets
             .entry(default_wallet.clone())
             .or_insert_with(|| WalletEntry {
                 dir: datadir.join(&default_wallet),
+                pools: pools.enabled.clone(),
+                default_receivers: pools.default_receivers.clone(),
             });
 
         let backend_file = file.backend.unwrap_or(BackendFile {
@@ -812,15 +875,170 @@ impl AppConfig {
             keystore,
             sync,
             spend,
+            pools,
             health,
             log,
         })
     }
 }
 
+/// Resolve and validate the global `[pools]` section. `enabled` defaults to Orchard-only;
+/// `default_receivers` defaults to the enabled set. The receivers must be a subset of the
+/// enabled pools.
+fn resolve_global_pools(file: Option<&PoolsFile>) -> anyhow::Result<PoolsConfig> {
+    let enabled = match file.and_then(|f| f.enabled.as_deref()) {
+        Some(tokens) => PoolSet::parse(tokens).context("[pools] enabled")?,
+        None => PoolSet::single(Pool::Orchard),
+    };
+    let default_receivers = match file.and_then(|f| f.default_receivers.as_deref()) {
+        Some(tokens) => PoolSet::parse(tokens).context("[pools] default_receivers")?,
+        None => enabled.clone(),
+    };
+    if !default_receivers.is_subset_of(&enabled) {
+        anyhow::bail!(
+            "[pools] default_receivers ({}) must be a subset of enabled pools ({})",
+            default_receivers.display_names(),
+            enabled.display_names()
+        );
+    }
+    Ok(PoolsConfig {
+        enabled,
+        default_receivers,
+    })
+}
+
+/// Resolve and validate one wallet's pools/receivers against the global defaults. A wallet that
+/// overrides `pools` but not `default_receivers` receives into all of its enabled pools by
+/// default; a wallet that overrides neither inherits the global defaults.
+fn resolve_wallet_pools(
+    name: &str,
+    pools: Option<&[String]>,
+    default_receivers: Option<&[String]>,
+    global: &PoolsConfig,
+) -> anyhow::Result<(PoolSet, PoolSet)> {
+    let enabled = match pools {
+        Some(tokens) => {
+            PoolSet::parse(tokens).with_context(|| format!("[wallets.{name}] pools"))?
+        }
+        None => global.enabled.clone(),
+    };
+    let receivers = match (default_receivers, pools) {
+        (Some(tokens), _) => {
+            PoolSet::parse(tokens).with_context(|| format!("[wallets.{name}] default_receivers"))?
+        }
+        // Wallet customized its pools but not its receivers: receive into everything it enabled.
+        (None, Some(_)) => enabled.clone(),
+        // Wallet customized neither: inherit the global default receivers.
+        (None, None) => global.default_receivers.clone(),
+    };
+    if !receivers.is_subset_of(&enabled) {
+        anyhow::bail!(
+            "[wallets.{name}] default_receivers ({}) must be a subset of enabled pools ({})",
+            receivers.display_names(),
+            enabled.display_names()
+        );
+    }
+    Ok((enabled, receivers))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn s(v: &[&str]) -> Vec<String> {
+        v.iter().map(|x| x.to_string()).collect()
+    }
+
+    #[test]
+    fn global_pools_default_to_orchard_only() {
+        let p = resolve_global_pools(None).unwrap();
+        assert_eq!(p, PoolsConfig::default());
+        assert!(p.enabled.contains(Pool::Orchard));
+        assert!(!p.enabled.contains(Pool::Sapling));
+        assert_eq!(p.default_receivers, p.enabled);
+    }
+
+    #[test]
+    fn global_default_receivers_default_to_enabled() {
+        let f = PoolsFile {
+            enabled: Some(s(&["sapling", "orchard"])),
+            default_receivers: None,
+        };
+        let p = resolve_global_pools(Some(&f)).unwrap();
+        assert!(p.enabled.contains(Pool::Sapling) && p.enabled.contains(Pool::Orchard));
+        // Receivers fall back to the full enabled set.
+        assert_eq!(p.default_receivers, p.enabled);
+    }
+
+    #[test]
+    fn global_receivers_must_be_subset_of_enabled() {
+        let f = PoolsFile {
+            enabled: Some(s(&["orchard"])),
+            default_receivers: Some(s(&["sapling"])),
+        };
+        let err = resolve_global_pools(Some(&f)).unwrap_err().to_string();
+        assert!(err.contains("subset"), "{err}");
+        assert!(err.contains("sapling"), "{err}");
+    }
+
+    #[test]
+    fn global_unknown_pool_is_rejected() {
+        let f = PoolsFile {
+            enabled: Some(s(&["ironwood"])),
+            default_receivers: None,
+        };
+        let err = format!("{:#}", resolve_global_pools(Some(&f)).unwrap_err());
+        assert!(
+            err.contains("ironwood") || err.contains("unknown pool"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn global_empty_enabled_is_rejected() {
+        let f = PoolsFile {
+            enabled: Some(vec![]),
+            default_receivers: None,
+        };
+        assert!(resolve_global_pools(Some(&f)).is_err());
+    }
+
+    #[test]
+    fn wallet_inherits_global_when_unset() {
+        let global = PoolsConfig {
+            enabled: PoolSet::parse(&s(&["sapling", "orchard"])).unwrap(),
+            default_receivers: PoolSet::single(Pool::Orchard),
+        };
+        let (enabled, receivers) = resolve_wallet_pools("w", None, None, &global).unwrap();
+        assert_eq!(enabled, global.enabled);
+        assert_eq!(receivers, global.default_receivers);
+    }
+
+    #[test]
+    fn wallet_overriding_pools_defaults_receivers_to_its_enabled() {
+        // A wallet that narrows its pools but doesn't set receivers must not inherit the global
+        // receivers (which could name a now-disabled pool) - it receives into all it enabled.
+        let global = PoolsConfig::default(); // orchard-only
+        let (enabled, receivers) =
+            resolve_wallet_pools("w", Some(&s(&["sapling"])), None, &global).unwrap();
+        assert!(enabled.contains(Pool::Sapling) && !enabled.contains(Pool::Orchard));
+        assert_eq!(receivers, enabled);
+    }
+
+    #[test]
+    fn wallet_receivers_not_subset_of_enabled_is_rejected() {
+        let global = PoolsConfig::default();
+        let err = resolve_wallet_pools(
+            "hot",
+            Some(&s(&["orchard"])),
+            Some(&s(&["sapling"])),
+            &global,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("wallets.hot"), "{err}");
+        assert!(err.contains("subset"), "{err}");
+    }
 
     #[test]
     fn spend_section_builds_policy_and_validates() {

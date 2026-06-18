@@ -583,8 +583,9 @@ pub fn list_unspent(network: ZNetwork, wallet_dir: &Path) -> anyhow::Result<Vec<
     // Map txid (display hex) -> (mined height, authored-by-us) for confirmations and trust.
     // A negative balance delta means the wallet spent notes in the tx, i.e. it authored it.
     let mut tx_meta: HashMap<String, (Option<u32>, bool)> = HashMap::new();
-    // Map (txid, action index) -> receiving address for the Orchard outputs the wallet
-    // recorded one for (change/internal notes have none).
+    // Map (txid, output index) -> receiving address for the shielded outputs the wallet recorded
+    // one for (change/internal notes have none). Spans every shielded pool (2 = Sapling,
+    // 3 = Orchard).
     let mut out_addr: HashMap<(String, u32), String> = HashMap::new();
     {
         let conn = open_conn(wallet_dir)?;
@@ -603,7 +604,7 @@ pub fn list_unspent(network: ZNetwork, wallet_dir: &Path) -> anyhow::Result<Vec<
         }
         let mut stmt = conn.prepare(
             "SELECT txid, output_index, to_address FROM v_tx_outputs
-             WHERE output_pool = 3 AND to_address IS NOT NULL",
+             WHERE output_pool IN (2, 3) AND to_address IS NOT NULL",
         )?;
         let rows = stmt.query_map([], |r| {
             Ok((
@@ -619,16 +620,17 @@ pub fn list_unspent(network: ZNetwork, wallet_dir: &Path) -> anyhow::Result<Vec<
     }
 
     let mut out = Vec::new();
+    // All shielded pools zecd supports; a note only exists if the wallet received it, so querying
+    // every pool is safe regardless of which pools are enabled in config.
+    let protocols: Vec<ShieldedProtocol> = crate::pools::Pool::SUPPORTED
+        .iter()
+        .map(|p| p.shielded_protocol())
+        .collect();
     for account in db.get_account_ids()? {
-        let notes =
-            db.select_unspent_notes(account, &[ShieldedProtocol::Orchard], target_height, &[])?;
-        for note in notes.orchard() {
-            let txid = note.txid().to_string();
-            let vout = note.output_index() as u32;
-            let value = note
-                .note_value()
-                .map_err(|e| anyhow!("note value: {e:?}"))?
-                .into_u64();
+        let notes = db.select_unspent_notes(account, &protocols, target_height, &[])?;
+        // Both `notes.sapling()` and `notes.orchard()` yield `ReceivedNote`s with the same
+        // `txid`/`output_index`/`note_value` surface; collect each into the shared output list.
+        let mut push = |txid: String, vout: u32, value: u64| {
             let (mined_height, trusted) = tx_meta.get(&txid).copied().unwrap_or((None, false));
             let address = out_addr.get(&(txid.clone(), vout)).cloned();
             out.push(UnspentNote {
@@ -639,63 +641,94 @@ pub fn list_unspent(network: ZNetwork, wallet_dir: &Path) -> anyhow::Result<Vec<
                 trusted,
                 address,
             });
+        };
+        for note in notes.sapling() {
+            let value = note
+                .note_value()
+                .map_err(|e| anyhow!("note value: {e:?}"))?
+                .into_u64();
+            push(note.txid().to_string(), note.output_index() as u32, value);
+        }
+        for note in notes.orchard() {
+            let value = note
+                .note_value()
+                .map_err(|e| anyhow!("note value: {e:?}"))?
+                .into_u64();
+            push(note.txid().to_string(), note.output_index() as u32, value);
         }
     }
 
     // Mempool-received notes are invisible to `select_unspent_notes`: a note stored by
     // trial-decrypting an *unmined* transaction carries no nullifier (upstream's
-    // `DecryptedOutput<orchard::Note>::nullifier()` is `None`; nf/position are filled in
-    // when the tx is later scanned in a block) and the selector requires `nf IS NOT NULL`.
-    // bitcoind's `listunspent minconf=0` lists unconfirmed wallet outputs, so supplement
-    // with a direct query for unmined, unexpired, unspent Orchard notes. A spend only
-    // suppresses a note while its spending tx is mined or unexpired - mirroring
-    // `spent_notes_clause` - so an expired spend releases the note again.
+    // `DecryptedOutput::nullifier()` is `None`; nf/position are filled in when the tx is later
+    // scanned in a block) and the selector requires `nf IS NOT NULL`. bitcoind's
+    // `listunspent minconf=0` lists unconfirmed wallet outputs, so supplement with a direct
+    // query per shielded pool for unmined, unexpired, unspent notes. A spend only suppresses a
+    // note while its spending tx is mined or unexpired - mirroring `spent_notes_clause` - so an
+    // expired spend releases the note again.
     {
         let conn = open_conn(wallet_dir)?;
         let seen: std::collections::HashSet<(String, u32)> =
             out.iter().map(|u| (u.txid.clone(), u.vout)).collect();
-        let mut stmt = conn.prepare(
-            "SELECT t.txid, rn.action_index, rn.value
-             FROM orchard_received_notes rn
-             JOIN transactions t ON t.id_tx = rn.transaction_id
-             WHERE t.mined_height IS NULL
-               AND (t.expiry_height IS NULL OR t.expiry_height = 0
-                    OR t.expiry_height >= :target)
-               AND rn.id NOT IN (
-                   SELECT rns.orchard_received_note_id
-                   FROM orchard_received_note_spends rns
-                   JOIN transactions stx ON stx.id_tx = rns.transaction_id
-                   WHERE stx.mined_height IS NOT NULL
-                      OR stx.expiry_height IS NULL OR stx.expiry_height = 0
-                      OR stx.expiry_height >= :target
-               )",
-        )?;
-        let rows = stmt.query_map(
-            named_params! { ":target": u32::from(chain_height) + 1 },
-            |r| {
+        let target = u32::from(chain_height) + 1;
+        // Per-pool table/column names differ only in three identifiers (note table, spend table,
+        // FK column, and the output-index column), so run the same query shape for each pool.
+        let pools: &[(&str, &str, &str, &str)] = &[
+            (
+                "sapling_received_notes",
+                "sapling_received_note_spends",
+                "sapling_received_note_id",
+                "output_index",
+            ),
+            (
+                "orchard_received_notes",
+                "orchard_received_note_spends",
+                "orchard_received_note_id",
+                "action_index",
+            ),
+        ];
+        for (note_table, spend_table, fk_col, index_col) in pools {
+            let sql = format!(
+                "SELECT t.txid, rn.{index_col}, rn.value
+                 FROM {note_table} rn
+                 JOIN transactions t ON t.id_tx = rn.transaction_id
+                 WHERE t.mined_height IS NULL
+                   AND (t.expiry_height IS NULL OR t.expiry_height = 0
+                        OR t.expiry_height >= :target)
+                   AND rn.id NOT IN (
+                       SELECT rns.{fk_col}
+                       FROM {spend_table} rns
+                       JOIN transactions stx ON stx.id_tx = rns.transaction_id
+                       WHERE stx.mined_height IS NOT NULL
+                          OR stx.expiry_height IS NULL OR stx.expiry_height = 0
+                          OR stx.expiry_height >= :target
+                   )"
+            );
+            let mut stmt = conn.prepare(&sql)?;
+            let rows = stmt.query_map(named_params! { ":target": target }, |r| {
                 Ok((
                     r.get::<_, Vec<u8>>(0)?,
                     r.get::<_, u32>(1)?,
                     r.get::<_, i64>(2)?,
                 ))
-            },
-        )?;
-        for row in rows {
-            let (txid, vout, value) = row?;
-            let txid = txid_display(&txid);
-            if seen.contains(&(txid.clone(), vout)) {
-                continue;
+            })?;
+            for row in rows {
+                let (txid, vout, value) = row?;
+                let txid = txid_display(&txid);
+                if seen.contains(&(txid.clone(), vout)) {
+                    continue;
+                }
+                let (mined_height, trusted) = tx_meta.get(&txid).copied().unwrap_or((None, false));
+                let address = out_addr.get(&(txid.clone(), vout)).cloned();
+                out.push(UnspentNote {
+                    vout,
+                    txid,
+                    value: u64::try_from(value).unwrap_or(0),
+                    mined_height,
+                    trusted,
+                    address,
+                });
             }
-            let (mined_height, trusted) = tx_meta.get(&txid).copied().unwrap_or((None, false));
-            let address = out_addr.get(&(txid.clone(), vout)).cloned();
-            out.push(UnspentNote {
-                vout,
-                txid,
-                value: u64::try_from(value).unwrap_or(0),
-                mined_height,
-                trusted,
-                address,
-            });
         }
     }
     Ok(out)

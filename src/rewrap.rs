@@ -36,8 +36,10 @@ pub async fn run(config: &AppConfig, args: &RewrapArgs) -> anyhow::Result<()> {
         .wallets
         .get(&args.wallet)
         .cloned()
-        .unwrap_or(WalletEntry {
+        .unwrap_or_else(|| WalletEntry {
             dir: config.datadir.join(&args.wallet),
+            pools: config.pools.enabled.clone(),
+            default_receivers: config.pools.default_receivers.clone(),
         });
     let wallet_dir = entry.dir;
 

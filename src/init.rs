@@ -56,8 +56,10 @@ pub async fn run(config: &AppConfig, args: &InitArgs) -> anyhow::Result<()> {
         .wallets
         .get(&args.wallet)
         .cloned()
-        .unwrap_or(WalletEntry {
+        .unwrap_or_else(|| WalletEntry {
             dir: config.datadir.join(&args.wallet),
+            pools: config.pools.enabled.clone(),
+            default_receivers: config.pools.default_receivers.clone(),
         });
     let wallet_dir = entry.dir;
     let network = config.network;
@@ -351,8 +353,10 @@ pub fn export_ufvk(config: &AppConfig, args: &ExportUfvkArgs) -> anyhow::Result<
         .wallets
         .get(&args.wallet)
         .cloned()
-        .unwrap_or(WalletEntry {
+        .unwrap_or_else(|| WalletEntry {
             dir: config.datadir.join(&args.wallet),
+            pools: config.pools.enabled.clone(),
+            default_receivers: config.pools.default_receivers.clone(),
         });
     let wallet_dir = entry.dir;
 
@@ -493,6 +497,11 @@ mod tests {
 
     use crate::network;
 
+    /// The Orchard-only pool set these tests use (pool config is irrelevant to them).
+    fn orchard_pools() -> crate::pools::PoolSet {
+        crate::pools::PoolSet::single(crate::pools::Pool::Orchard)
+    }
+
     /// The committed testnet test mnemonic (valueless), reused here purely as a deterministic
     /// seed source for throwaway regtest wallets.
     const TEST_PHRASE: &str = "mechanic vehicle helmet decide plug gorilla frost dial october \
@@ -599,12 +608,16 @@ mod tests {
             "default".to_string(),
             WalletEntry {
                 dir: default_dir.path().to_path_buf(),
+                pools: orchard_pools(),
+                default_receivers: orchard_pools(),
             },
         );
         wallets.insert(
             "w2".to_string(),
             WalletEntry {
                 dir: w2_dir.path().to_path_buf(),
+                pools: orchard_pools(),
+                default_receivers: orchard_pools(),
             },
         );
 
@@ -641,6 +654,8 @@ mod tests {
                 name.to_string(),
                 WalletEntry {
                     dir: dir.path().to_path_buf(),
+                    pools: orchard_pools(),
+                    default_receivers: orchard_pools(),
                 },
             );
         }

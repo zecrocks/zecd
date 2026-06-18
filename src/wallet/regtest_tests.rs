@@ -292,6 +292,8 @@ fn offline_actor_cfg(
         auto_unlock: true,
         keystore_endpoint: None,
         confirmations_policy: Default::default(),
+        enabled_pools: crate::pools::PoolSet::single(crate::pools::Pool::Orchard),
+        default_receivers: crate::pools::PoolSet::single(crate::pools::Pool::Orchard),
         shutdown,
     };
     (cfg, shutdown_tx)
@@ -440,7 +442,7 @@ async fn watch_only_wallet_disables_spending_rpcs() {
     // Address generation works from the viewing key alone. (Round-tripping a command also
     // guarantees the actor has published its first status snapshot, which `spawn` itself
     // does not wait for.)
-    let addr = handle.get_new_address(None).await.unwrap();
+    let addr = handle.get_new_address(None, None).await.unwrap();
     assert!(addr.starts_with("uregtest1"), "{addr}");
 
     // The status feed marks the wallet watch-only (not encrypted - there is nothing to lock).

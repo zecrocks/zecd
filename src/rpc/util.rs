@@ -29,7 +29,7 @@ pub(crate) fn validateaddress(state: &AppState, req: &RpcRequest) -> Result<Valu
         "scriptPubKey": v.script_pub_key.unwrap_or_default(),
         "isscript": v.is_script,
         "iswitness": false,
-        // Extension field: whether this address can receive Orchard funds.
+        // Extension field: whether this address can receive into the Orchard pool.
         "isvalid_orchard": v.is_orchard,
         // Extension field: the pools this address can receive into, in canonical order
         // (`transparent`/`sapling`/`orchard`). For a unified address this enumerates its

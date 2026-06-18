@@ -222,6 +222,7 @@ mod tests {
                 rebroadcast_secs: 60,
             },
             spend: crate::config::SpendConfig::default(),
+            pools: crate::config::PoolsConfig::default(),
             health: crate::config::HealthConfig {
                 enabled: false,
                 bind: "127.0.0.1".parse().unwrap(),

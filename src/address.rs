@@ -25,7 +25,8 @@ pub fn decode_on_network<P: Parameters>(params: &P, s: &str) -> Option<Address> 
     Address::decode(params, s)
 }
 
-/// Whether a (network-checked) address can receive into the Orchard pool.
+/// Whether a (network-checked) address can receive into the Orchard pool (used by the
+/// `FullPrivacy` recipient check).
 pub fn has_orchard_receiver(addr: &Address) -> bool {
     addr.can_receive_as(PoolType::ORCHARD)
 }
@@ -172,6 +173,7 @@ mod tests {
         assert!(v.is_valid);
         assert!(v.script_pub_key.is_none());
         assert!(!v.is_script);
+        // A bare Sapling address exposes a Sapling receiver but not an Orchard one.
         assert!(!v.is_orchard);
         assert_eq!(v.receiver_types, ["sapling"]);
     }

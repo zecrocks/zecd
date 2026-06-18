@@ -233,6 +233,67 @@ fn unknown_allowed_method_fails_startup() {
     );
 }
 
+/// A default receiver that names a pool the wallet doesn't enable is a startup error, caught at
+/// config parse before any network/wallet I/O.
+#[test]
+fn default_receivers_not_subset_of_pools_fails_startup() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("zecd.toml"),
+        "[pools]\nenabled = [\"orchard\"]\ndefault_receivers = [\"sapling\"]\n",
+    )
+    .unwrap();
+    let out = run_with_timeout(
+        {
+            let mut c = zecd();
+            c.args([
+                "--datadir",
+                dir.path().to_str().unwrap(),
+                "--network",
+                "test",
+            ]);
+            c
+        },
+        Duration::from_secs(10),
+    );
+    assert_eq!(out.status.code(), Some(1));
+    assert!(
+        stderr_of(&out).contains("subset") && stderr_of(&out).contains("sapling"),
+        "stderr: {}",
+        stderr_of(&out)
+    );
+}
+
+/// An unknown pool name in `[pools]` is rejected at startup.
+#[test]
+fn unknown_pool_name_fails_startup() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("zecd.toml"),
+        "[pools]\nenabled = [\"ironwood\"]\n",
+    )
+    .unwrap();
+    let out = run_with_timeout(
+        {
+            let mut c = zecd();
+            c.args([
+                "--datadir",
+                dir.path().to_str().unwrap(),
+                "--network",
+                "test",
+            ]);
+            c
+        },
+        Duration::from_secs(10),
+    );
+    assert_eq!(out.status.code(), Some(1));
+    assert!(
+        stderr_of(&out).contains("ironwood"),
+        "stderr: {}",
+        stderr_of(&out)
+    );
+}
+
 /// A malformed `--ufvk` fails fast and offline: the key is parsed before any upstream
 /// connection (so no server is contacted for a key that can never import).
 #[test]

@@ -16,6 +16,7 @@ pub mod keystore;
 pub mod metrics;
 pub mod network;
 pub mod operations;
+pub mod pools;
 pub mod rewrap;
 pub mod rpc;
 pub mod server;

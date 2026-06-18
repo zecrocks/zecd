@@ -652,6 +652,9 @@ pub struct ZecdConfig {
     /// `--birthday` for the restore/watch-only paths (a fresh init defaults near the tip on
     /// its own).
     pub birthday: Option<u32>,
+    /// Optional `[pools]` section as `(enabled, default_receivers)`. `None` omits the section
+    /// (the Orchard-only default). Used by the multi-pool (Sapling) e2e.
+    pub pools: Option<(Vec<String>, Vec<String>)>,
 }
 
 impl ZecdConfig {
@@ -672,6 +675,7 @@ impl ZecdConfig {
             restore_mnemonic: None,
             ufvk: None,
             birthday: None,
+            pools: None,
         }
     }
 
@@ -693,6 +697,7 @@ impl ZecdConfig {
             restore_mnemonic: None,
             ufvk: None,
             birthday: None,
+            pools: None,
         }
     }
 
@@ -1208,6 +1213,24 @@ fn write_zecd_toml(datadir: &Path, cfg: &ZecdConfig) -> Result<()> {
             datadir.display()
         ));
     }
+    // Optional [pools] section (multi-pool / Sapling e2e); omitted → Orchard-only default.
+    let pools = match &cfg.pools {
+        Some((enabled, receivers)) => {
+            let list = |v: &[String]| {
+                v.iter()
+                    .map(|p| format!("\"{p}\""))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            };
+            format!(
+                "\n[pools]\nenabled = [{}]\ndefault_receivers = [{}]\n",
+                list(enabled),
+                list(receivers)
+            )
+        }
+        None => String::new(),
+    };
+    wallets.push_str(&pools);
     // Fast reconnect backoff (1..2s) so outage-recovery tests converge quickly.
     let toml = format!(
         r#"network = "regtest"

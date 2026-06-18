@@ -368,12 +368,12 @@ the validator's job there - so those rows are all - .
 | Method | Bitcoin Core | Zallet | What to expect from zecd |
 |---|---|---|---|
 | **Wallet** | | | |
-| `getnewaddress` | ✓ | - (`z_getaddressforaccount`) | Fresh diversified Orchard UA of the wallet's single account; `label` honored; Bitcoin `address_type` values rejected `-5` |
+| `getnewaddress` | ✓ | - (`z_getaddressforaccount`) | Fresh diversified UA of the wallet's single account; `label` honored; `address_type` is a per-call receiver override (`unified`/`sapling`/`orchard`/`sapling,orchard`), constrained to the wallet's enabled pools; Bitcoin types rejected `-5` |
 | `getbalance` | ✓ | - (`z_gettotalbalance`) | Spendable balance under the ZIP-315 confirmations policy; explicit `minconf` overrides it per call (`minconf=0` is treated as 1 - a shielded note is never spendable unmined) |
 | `getbalances` | ✓ | - (`z_getbalances`, per-account) | `mine.trusted/untrusted_pending/immature` + `lastprocessedblock`; no `watchonly` object |
 | `getunconfirmedbalance` | *removed* | - | Incoming funds below the confirmation policy (incl. 0-conf via mempool stream) |
 | `getwalletinfo` | ✓ | ✓ (several fields stubbed) | bitcoind shape; `keypoolsize:1`, `descriptors:false`, `scanning` progress, `unlocked_until` when encrypted, `private_keys_enabled:false` when watch-only |
-| `getaddressinfo` | ✓ | - | `ismine`/`solvable`/`labels`; `scriptPubKey` empty (shielded); `iswatchonly` always false (deprecated in Core; the watch-only signal is `getwalletinfo.private_keys_enabled`) |
+| `getaddressinfo` | ✓ | - | `ismine`/`solvable`/`labels`; `scriptPubKey` empty (shielded); `iswatchonly` always false (deprecated in Core; the watch-only signal is `getwalletinfo.private_keys_enabled`); `isvalid_orchard` + `receiver_types` extension fields report the address's receivers |
 | `setlabel` | ✓ | - (accounts replace labels) | Full address book incl. foreign addresses (purpose `"send"`) |
 | `getaddressesbylabel`, `listlabels` | ✓ | - | Core shapes and error codes (`-11` for unknown label) |
 | `listtransactions` | ✓ | - (`z_listtransactions`, different shape) | Core categories/fields (`fee` on sends, label filter, count/skip); adds `memo`/`memoStr` |
@@ -433,12 +433,44 @@ Multiwallet is addressed bitcoind-style via `POST /wallet/<name>`; the default w
 
 ## Addresses
 
-`getnewaddress` returns a fresh Orchard-only Unified Address (`u1...` / `utest1...`) on every call.
-These are diversified addresses of a single account, not new derivation paths: the wallet has one
-ZIP-32 account (`m/32'/coin_type'/account'`), and each address is a different diversifier index of
-that account's Orchard key. librustzcash advances to the next unused diversifier and persists it,
-so each call yields a new, unused address. All of them receive into the same account and are
-spendable by the same key (ZIP-316 + ZIP-32 diversification).
+`getnewaddress` returns a fresh Unified Address (`u1...` / `utest1...`) on every call. These are
+diversified addresses of a single account, not new derivation paths: the wallet has one ZIP-32
+account (`m/32'/coin_type'/account'`), and each address is a different diversifier index of that
+account's keys. librustzcash advances to the next unused diversifier and persists it, so each call
+yields a new, unused address. All of them receive into the same account and are spendable by the
+same key (ZIP-316 + ZIP-32 diversification).
+
+### Configurable shielded pools
+
+zecd is shielded-only. Each wallet declares which shielded pools it uses and which receivers its
+Unified Addresses include, via the `[pools]` config section (global default) and/or a per-wallet
+`[wallets.<name>]` override:
+
+```toml
+[pools]
+enabled = ["sapling", "orchard"]            # pools the wallet receives into and spends from
+default_receivers = ["sapling", "orchard"]  # receivers in the UAs getnewaddress hands out
+```
+
+Supported pools are `sapling` and `orchard` (a future **ironwood** pool will slot in here). The
+default - `[pools]` omitted - is **Orchard-only**, preserving zecd's historical behaviour.
+`default_receivers` must be a subset of `enabled`; naming a disabled pool is a startup error.
+Change is sent to the strongest enabled pool (Orchard if enabled); inputs are spent from any pool.
+
+`getnewaddress`'s `address_type` argument is a per-call receiver override, constrained to the
+wallet's enabled pools (else `-8`):
+
+```
+getnewaddress ""                    # the wallet's configured default_receivers
+getnewaddress "" "unified"          # same (alias: "default")
+getnewaddress "" "sapling"          # a UA with a Sapling receiver only
+getnewaddress "" "sapling,orchard"  # a UA with both shielded receivers
+```
+
+Balances, `listtransactions`, `listunspent`, `getreceivedbyaddress`, and friends report notes
+across **all** enabled pools. `validateaddress`/`getaddressinfo` report each address's receivers
+via the `isvalid_orchard` boolean and the `receiver_types` array
+(`transparent`/`sapling`/`orchard`).
 
 ## Watch-only wallets (UFVK)
 

@@ -21,6 +21,7 @@ use zip321::TransactionRequest;
 
 use crate::error::RpcError;
 use crate::network::ZNetwork;
+use crate::pools::PoolSet;
 use crate::wallet::store::Passphrase;
 
 /// Connection state to lightwalletd, surfaced for monitoring (e.g. to distinguish "all
@@ -97,6 +98,9 @@ pub struct RawTx {
 pub enum WalletCommand {
     GetNewAddress {
         label: Option<String>,
+        /// Per-call override of the UA receivers to include. `None` uses the wallet's configured
+        /// `default_receivers`; `Some` must be a subset of the wallet's enabled pools.
+        receivers: Option<PoolSet>,
         reply: oneshot::Sender<Result<String, RpcError>>,
     },
     Send {
@@ -152,6 +156,11 @@ pub struct WalletHandle {
     /// The wallet-wide confirmations policy (`[spend]` config; ZIP-315 3/10 by default),
     /// used wherever an RPC doesn't override depth with an explicit `minconf`.
     pub confirmations: ConfirmationsPolicy,
+    /// Shielded pools enabled on this wallet - used to validate a `getnewaddress` per-call
+    /// receiver override before dispatching it to the actor.
+    pub enabled_pools: PoolSet,
+    /// Receivers this wallet's Unified Addresses include by default (a subset of `enabled_pools`).
+    pub default_receivers: PoolSet,
     cmd_tx: mpsc::Sender<WalletCommand>,
     status_rx: watch::Receiver<SyncStatus>,
 }
@@ -182,9 +191,17 @@ impl WalletHandle {
             .map_err(|_| RpcError::misc("wallet actor dropped the reply"))?
     }
 
-    pub async fn get_new_address(&self, label: Option<String>) -> Result<String, RpcError> {
-        self.dispatch(|reply| WalletCommand::GetNewAddress { label, reply })
-            .await
+    pub async fn get_new_address(
+        &self,
+        label: Option<String>,
+        receivers: Option<PoolSet>,
+    ) -> Result<String, RpcError> {
+        self.dispatch(|reply| WalletCommand::GetNewAddress {
+            label,
+            receivers,
+            reply,
+        })
+        .await
     }
 
     /// Build, prove, and broadcast a send. `confirmations` overrides the wallet-wide
@@ -281,11 +298,14 @@ impl WalletRegistry {
 }
 
 /// Construct a handle from its parts (used by the actor's `spawn`).
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn make_handle(
     name: String,
     dir: PathBuf,
     network: ZNetwork,
     confirmations: ConfirmationsPolicy,
+    enabled_pools: PoolSet,
+    default_receivers: PoolSet,
     cmd_tx: mpsc::Sender<WalletCommand>,
     status_rx: watch::Receiver<SyncStatus>,
 ) -> WalletHandle {
@@ -294,6 +314,8 @@ pub(crate) fn make_handle(
         dir,
         network,
         confirmations,
+        enabled_pools,
+        default_receivers,
         cmd_tx,
         status_rx,
     }

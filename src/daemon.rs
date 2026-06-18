@@ -96,6 +96,8 @@ pub async fn run(config: AppConfig) -> anyhow::Result<()> {
             keystore_endpoint: config.keystore.endpoint.clone(),
             // Validated at config load; re-derive here rather than carrying a second copy.
             confirmations_policy: config.spend.confirmations_policy()?,
+            enabled_pools: entry.pools.clone(),
+            default_receivers: entry.default_receivers.clone(),
             shutdown: shutdown_tx.subscribe(),
         };
         match actor::spawn(actor_cfg).await {

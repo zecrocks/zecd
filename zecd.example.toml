@@ -157,6 +157,28 @@ auto_unlock = true
 # endpoints. Omit for the provider default.
 # endpoint = "http://localhost:8080"
 
+[pools]
+# Shielded value pools this wallet uses. zecd is shielded-only; supported pools are "sapling"
+# and "orchard" (a future "ironwood" pool will slot in here). These are the GLOBAL defaults;
+# any [wallets.<name>] section can override `pools`/`default_receivers` independently.
+#
+# `enabled` - pools the wallet receives into and spends from. Change is sent to the
+#                       strongest enabled pool (Orchard if enabled).
+# `default_receivers` - receivers included in the Unified Addresses getnewaddress hands out
+#                       when no per-call override is given. Must be a SUBSET of `enabled`
+#                       (naming a disabled pool is a startup error). Defaults to `enabled`.
+#
+# The default (this section omitted) is Orchard-only, preserving zecd's historical behaviour.
+# To enable Sapling receiving as well:
+#   enabled = ["sapling", "orchard"]
+#   default_receivers = ["sapling", "orchard"]
+# getnewaddress accepts a per-call override in its address_type argument, e.g.
+#   getnewaddress "" "sapling"          (Sapling receiver only)
+#   getnewaddress "" "sapling,orchard"  (both)
+# constrained to the enabled pools (else -8).
+enabled = ["orchard"]
+default_receivers = ["orchard"]
+
 [sync]
 # How often to poll lightwalletd for new blocks (seconds).
 interval_secs = 20

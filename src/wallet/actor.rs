@@ -24,12 +24,11 @@ use zcash_client_backend::fees::{
 use zcash_client_backend::proto::service;
 use zcash_client_backend::wallet::OvkPolicy;
 use zcash_client_sqlite::{AccountUuid, FsBlockDb};
-use zcash_keys::keys::UnifiedAddressRequest;
 use zcash_primitives::transaction::Transaction;
 use zcash_proofs::prover::LocalTxProver;
 use zcash_protocol::consensus::{BlockHeight, BranchId};
 use zcash_protocol::value::Zatoshis;
-use zcash_protocol::{ShieldedProtocol, TxId};
+use zcash_protocol::TxId;
 use zip321::TransactionRequest;
 
 use crate::backend::Server;
@@ -37,6 +36,7 @@ use crate::backoff::Backoff;
 use crate::chain::{AnySource, BroadcastOutcome, ChainSource, MempoolStream};
 use crate::error::{codes, RpcError};
 use crate::network::ZNetwork;
+use crate::pools::PoolSet;
 use crate::sync::engine;
 use crate::wallet::keys::{self, SeedKeeper};
 use crate::wallet::open::{self, WriteDb};
@@ -142,6 +142,10 @@ pub struct ActorConfig {
     /// The wallet-wide confirmations policy (`[spend]` config; ZIP-315 3/10 by default),
     /// anchoring balances, spend proposals, and the `-6` enrichment.
     pub confirmations_policy: ConfirmationsPolicy,
+    /// Shielded pools this wallet receives into and spends from (change pool selection).
+    pub enabled_pools: PoolSet,
+    /// Receivers included by default in this wallet's Unified Addresses.
+    pub default_receivers: PoolSet,
     /// Flips to `true` on Ctrl-C/`stop`; the actor exits its loop (between sync batches)
     /// so the `WalletDb` is dropped cleanly before the process ends.
     pub shutdown: watch::Receiver<bool>,
@@ -165,6 +169,10 @@ struct WalletActor {
     rebroadcast_interval: Duration,
     age_identity: Option<PathBuf>,
     confirmations_policy: ConfirmationsPolicy,
+    /// Shielded pools this wallet receives into and spends from.
+    enabled_pools: PoolSet,
+    /// Receivers included by default in this wallet's Unified Addresses.
+    default_receivers: PoolSet,
     account_id: AccountUuid,
     account_index: Option<zip32::AccountId>,
     db_data: WriteDb,
@@ -354,6 +362,8 @@ pub async fn spawn(
         rebroadcast_interval: cfg.rebroadcast_interval,
         age_identity: cfg.age_identity,
         confirmations_policy: cfg.confirmations_policy,
+        enabled_pools: cfg.enabled_pools.clone(),
+        default_receivers: cfg.default_receivers.clone(),
         account_id,
         account_index,
         db_data,
@@ -385,6 +395,8 @@ pub async fn spawn(
             cfg.wallet_dir,
             cfg.network,
             cfg.confirmations_policy,
+            cfg.enabled_pools,
+            cfg.default_receivers,
             cmd_tx,
             status_rx,
         ),
@@ -1103,8 +1115,12 @@ impl WalletActor {
     /// Returns `true` if the actor should stop.
     async fn handle_command(&mut self, cmd: WalletCommand) -> bool {
         match cmd {
-            WalletCommand::GetNewAddress { label, reply } => {
-                let res = self.get_new_address(label);
+            WalletCommand::GetNewAddress {
+                label,
+                receivers,
+                reply,
+            } => {
+                let res = self.get_new_address(label, receivers);
                 let _ = reply.send(res);
             }
             WalletCommand::Send {
@@ -1208,12 +1224,39 @@ impl WalletActor {
         }
     }
 
-    fn get_new_address(&mut self, label: Option<String>) -> Result<String, RpcError> {
+    fn get_new_address(
+        &mut self,
+        label: Option<String>,
+        receivers: Option<PoolSet>,
+    ) -> Result<String, RpcError> {
+        // No override → the wallet's configured default receivers. An override must be a subset
+        // of the wallet's enabled pools (the RPC layer also validates this, but the actor is the
+        // authority on the wallet's configuration, so re-check here).
+        let receivers = match receivers {
+            Some(set) => {
+                if !set.is_subset_of(&self.enabled_pools) {
+                    return Err(RpcError::invalid_parameter(format!(
+                        "requested receivers ({}) include a pool not enabled on this wallet ({})",
+                        set.display_names(),
+                        self.enabled_pools.display_names()
+                    )));
+                }
+                set
+            }
+            None => self.default_receivers.clone(),
+        };
+        let request = receivers.to_unified_address_request();
         let (ua, _) = self
             .db_data
-            .get_next_available_address(self.account_id, UnifiedAddressRequest::ORCHARD)
+            .get_next_available_address(self.account_id, request)
             .map_err(|e| RpcError::wallet(format!("address generation failed: {e}")))?
-            .ok_or_else(|| RpcError::wallet("no address available for account"))?;
+            .ok_or_else(|| {
+                RpcError::wallet(format!(
+                    "no address available for account with receivers ({}); the account's viewing \
+                     key may not support all requested pools",
+                    receivers.display_names()
+                ))
+            })?;
         let encoded = ua.encode(&self.network);
         if let Some(label) = label {
             if let Err(e) = labels::set_label(&self.wallet_dir, &encoded, &label) {
@@ -1243,6 +1286,7 @@ impl WalletActor {
         // A per-call `minconf` (z_sendmany) overrides the wallet-wide policy for this send's
         // note selection; the synchronous sends pass `None` and use the configured policy.
         let policy = confirmations.unwrap_or(self.confirmations_policy);
+        let change_pool = self.enabled_pools.change_pool();
         let prover = &self.prover;
         let db = &mut self.db_data;
         let proposal_start = Instant::now();
@@ -1251,7 +1295,10 @@ impl WalletActor {
                 let change_strategy = MultiOutputChangeStrategy::new(
                     StandardFeeRule::Zip317,
                     None,
-                    ShieldedProtocol::Orchard,
+                    // Change goes to the strongest enabled pool (Orchard if enabled, else the
+                    // first enabled pool); inputs are still selected from any pool by the
+                    // greedy selector.
+                    change_pool,
                     DustOutputPolicy::default(),
                     SplitPolicy::with_min_output_value(
                         NonZeroUsize::new(TARGET_NOTE_COUNT).expect("nonzero"),

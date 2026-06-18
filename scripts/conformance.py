@@ -223,11 +223,27 @@ def main() -> int:
     va = rpc.call("validateaddress", addr)
     ck("validateaddress.isvalid", va["isvalid"] is True)
     ck("validateaddress echoes address", va.get("address") == addr)
-    # Extension: receiver_types enumerates the pools an address can receive into. zecd hands
-    # out Orchard-only unified addresses, so its own getnewaddress address carries "orchard".
+    # Extension fields: the address's receiver verdicts (a default getnewaddress UA always
+    # exposes an Orchard receiver in the default Orchard-only config).
+    ck("validateaddress has isvalid_orchard", "isvalid_orchard" in va)
+    ck("validateaddress.isvalid_orchard on Orchard UA", va["isvalid_orchard"] is True)
+    # receiver_types enumerates the pools an address can receive into; an Orchard-only UA
+    # carries "orchard".
     ck("validateaddress.receiver_types lists orchard",
        isinstance(va.get("receiver_types"), list) and "orchard" in va["receiver_types"],
        va.get("receiver_types"))
+    # A per-call receiver override (constrained to enabled pools) still yields a UA. "unified"
+    # and "orchard" are always valid against the default config; an unknown type is -5.
+    a2 = rpc.call("getnewaddress", "", "orchard")
+    ck("getnewaddress orchard override",
+       isinstance(a2, str) and a2.startswith(("u1", "utest1", "uregtest1")))
+    ck("getnewaddress orchard override isvalid_orchard",
+       rpc.call("validateaddress", a2)["isvalid_orchard"] is True)
+    try:
+        rpc.call("getnewaddress", "", "boguspool")
+        ck("getnewaddress unknown receiver raises", False)
+    except JSONRPCException as e:
+        ck("getnewaddress unknown receiver -> -5", e.code == -5, e.code)
     # Bitcoin Core returns only the verdict + error details for invalid input.
     bad = rpc.call("validateaddress", "not-an-address")
     ck("invalid validateaddress.isvalid False", bad["isvalid"] is False)
@@ -238,7 +254,8 @@ def main() -> int:
     ai = rpc.call("getaddressinfo", addr)
     ck("getaddressinfo.ismine", ai["ismine"] is True)
     ck("getaddressinfo has no isvalid", "isvalid" not in ai)
-    for f in ("scriptPubKey", "solvable", "iswatchonly", "isscript", "iswitness", "labels"):
+    for f in ("scriptPubKey", "solvable", "iswatchonly", "isscript", "iswitness", "labels",
+              "isvalid_orchard", "receiver_types"):
         ck(f"getaddressinfo has {f}", f in ai)
     # Own addresses are solvable; iswatchonly is deprecated/always false in Core master
     # (these hold on watch-only wallets too - the signal is private_keys_enabled).
