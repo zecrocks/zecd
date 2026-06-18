@@ -15,7 +15,8 @@ use zcash_client_backend::data_api::wallet::{
     input_selection::GreedyInputSelector, propose_transfer, ConfirmationsPolicy, SpendingKeys,
 };
 use zcash_client_backend::data_api::{
-    Account, AccountPurpose, AccountSource, WalletRead, WalletWrite,
+    Account, AccountPurpose, AccountSource, TransactionDataRequest, TransactionStatus, WalletRead,
+    WalletWrite,
 };
 use zcash_client_backend::fees::{
     standard::MultiOutputChangeStrategy, DustOutputPolicy, SplitPolicy, StandardFeeRule,
@@ -464,8 +465,10 @@ impl WalletActor {
                         more_work = worked;
                         if !worked {
                             // Caught up: give any unmined wallet txs another shot at the mempool,
-                            // and (re)subscribe to incoming mempool txs for 0-conf visibility.
+                            // pull the full data (memos, …) for transactions seen only as compact
+                            // blocks, and (re)subscribe to incoming mempool txs for 0-conf visibility.
                             self.maybe_rebroadcast().await;
+                            self.enhance_transactions().await;
                             self.ensure_mempool_stream().await;
                         }
                     }
@@ -757,6 +760,135 @@ impl WalletActor {
                 );
             }
         }
+    }
+
+    /// Service the wallet's pending transaction-data requests - the "enhancement" step.
+    /// `scan_cached_blocks` records these (`WalletRead::transaction_data_requests`) while
+    /// scanning compact blocks, which carry no memos and no full transparent data: for each
+    /// request, fetch the full transaction from the upstream and either decrypt+store it
+    /// (which fills in `v_tx_outputs.memo` on received shielded outputs) or record its chain
+    /// status. Called only when caught up to the tip.
+    ///
+    /// Without this, a memo on a transaction the wallet only ever saw as a compact block -
+    /// every receive picked up during initial sync or a `--restore`, and any live receive the
+    /// mempool stream missed - never appears in `gettransaction`/`listtransactions`, because
+    /// the compact-block scan records the tx as mined with a NULL memo and nothing ever
+    /// backfills it. (A receive the mempool stream *does* catch is already enhanced: that path
+    /// stores the full tx via `decrypt_and_store_transaction`.)
+    ///
+    /// Mirrors zcash-devtool's `enhance` command and zkv's `enhance`. Best-effort: a transport
+    /// failure drops the client (so the next loop reconnects/fails over) and aborts the pass;
+    /// the still-pending requests are retried on the next caught-up pass. librustzcash removes
+    /// each request once it is satisfied, so a clean pass converges and stops re-fetching.
+    async fn enhance_transactions(&mut self) {
+        let Some(tip) = self.tip_height else { return };
+        if self.client.is_none() {
+            return;
+        }
+        let chain_tip = BlockHeight::from_u32(tip);
+        // Requests are removed from the wallet as they're satisfied; track those handled in
+        // this pass so a request the upstream can't satisfy (left in place) can't spin the
+        // re-query loop. Mirrors zcash-devtool/zkv's `satisfied` set.
+        let mut satisfied = std::collections::BTreeSet::new();
+        loop {
+            let requests = match self.db_data.transaction_data_requests() {
+                Ok(r) => r,
+                Err(e) => {
+                    warn!("[{}] reading transaction data requests: {e}", self.name);
+                    return;
+                }
+            };
+            let mut any_new = false;
+            for req in requests {
+                if satisfied.contains(&req) {
+                    continue;
+                }
+                any_new = true;
+                if let Err(e) = self.service_data_request(&req, chain_tip).await {
+                    // A transport failure has already dropped the client (a DB-write error just
+                    // aborts the pass); either way, stop here and retry the remaining requests
+                    // on the next caught-up pass rather than spinning on a persistent failure.
+                    tracing::debug!("[{}] transaction enhancement aborted: {e}", self.name);
+                    return;
+                }
+                satisfied.insert(req);
+            }
+            if !any_new {
+                break;
+            }
+        }
+    }
+
+    /// Handle one [`TransactionDataRequest`] for [`enhance_transactions`]. Returns `Err` only
+    /// for failures worth aborting the whole pass (transport, or a wallet-write error).
+    async fn service_data_request(
+        &mut self,
+        req: &TransactionDataRequest,
+        chain_tip: BlockHeight,
+    ) -> anyhow::Result<()> {
+        match req {
+            TransactionDataRequest::GetStatus(txid) => {
+                let status = self.fetch_full_tx(*txid, chain_tip).await?.map_or(
+                    TransactionStatus::TxidNotRecognized,
+                    |(_, mined)| {
+                        mined.map_or(TransactionStatus::NotInMainChain, TransactionStatus::Mined)
+                    },
+                );
+                self.db_data.set_transaction_status(*txid, status)?;
+            }
+            TransactionDataRequest::Enhancement(txid) => {
+                match self.fetch_full_tx(*txid, chain_tip).await? {
+                    None => self
+                        .db_data
+                        .set_transaction_status(*txid, TransactionStatus::TxidNotRecognized)?,
+                    Some((tx, mined)) => {
+                        decrypt_and_store_transaction(
+                            &self.network,
+                            &mut self.db_data,
+                            &tx,
+                            mined,
+                        )?;
+                    }
+                }
+            }
+            // `TransactionsInvolvingAddress` scans a transparent address's on-chain history.
+            // zecd hands out Orchard-only receivers and the `ChainSource` trait exposes no
+            // transparent-txid query, so there's nothing to fetch here; skip it (best-effort).
+            // Marking it satisfied for the pass keeps the re-query loop from spinning.
+            other => {
+                tracing::debug!(
+                    "[{}] skipping unsupported transaction data request: {other:?}",
+                    self.name
+                );
+            }
+        }
+        Ok(())
+    }
+
+    /// Fetch a full transaction from the upstream and parse it for enhancement, returning the
+    /// decoded [`Transaction`] and its mined height (`None` for an unmined tx), or `None` when
+    /// the upstream doesn't know the txid. Transport failures surface as `Err` (the client has
+    /// already been dropped by [`Self::fetch_tx_from_upstream`]).
+    async fn fetch_full_tx(
+        &mut self,
+        txid: TxId,
+        chain_tip: BlockHeight,
+    ) -> anyhow::Result<Option<(Transaction, Option<BlockHeight>)>> {
+        let Some(raw) = self
+            .fetch_tx_from_upstream(txid)
+            .await
+            .map_err(|e| anyhow!("{e}"))?
+        else {
+            return Ok(None);
+        };
+        let mined_height = raw.mined_height.map(BlockHeight::from_u32);
+        // An unmined tx is assumed created under the current tip's consensus branch (matches
+        // zcash-devtool/zkv's enhance and `store_mempool_tx`).
+        let tx = Transaction::read(
+            &raw.data[..],
+            BranchId::for_height(&self.network, mined_height.unwrap_or(chain_tip)),
+        )?;
+        Ok(Some((tx, mined_height)))
     }
 
     /// Trial-decrypt one mempool transaction against the wallet's keys and store it (as an

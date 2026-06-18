@@ -521,21 +521,34 @@ impl Funder {
 
     /// Send `zatoshis` to `to_address` (an Orchard/unified address).
     pub fn send(&self, lwd_port: u16, to_address: &str, zatoshis: u64) -> Result<()> {
+        self.send_with_memo(lwd_port, to_address, zatoshis, None)
+    }
+
+    /// Send `zatoshis` to `to_address`, optionally attaching a ZIP-302 text `memo` (devtool's
+    /// `--memo`, parsed as a text memo). Used to exercise zecd's *receive*-memo path: the
+    /// recipient must surface the memo on the received output.
+    pub fn send_with_memo(
+        &self,
+        lwd_port: u16,
+        to_address: &str,
+        zatoshis: u64,
+        memo: Option<&str>,
+    ) -> Result<()> {
         let identity = self.identity();
         let value = zatoshis.to_string();
-        self.run(
-            "send",
-            &[
-                "--identity",
-                &identity,
-                "--address",
-                to_address,
-                "--value",
-                &value,
-            ],
-            Some(lwd_port),
-        )
-        .map(|_| ())
+        let mut extra = vec![
+            "--identity",
+            &identity,
+            "--address",
+            to_address,
+            "--value",
+            &value,
+        ];
+        if let Some(memo) = memo {
+            extra.push("--memo");
+            extra.push(memo);
+        }
+        self.run("send", &extra, Some(lwd_port)).map(|_| ())
     }
 
     /// Run `zcash-devtool wallet -w <dir> <subcommand> <extra...> [--server .. --connection direct]`.

@@ -52,6 +52,9 @@ const MATURITY_TAIL: u32 = 130;
 const TAIL_MINER_ADDRESS: &str = "t27eWDgjFYJGVXmzrXeVjnb5J3uXDM9xH9v";
 /// 1 ZEC, in zatoshis.
 const FUND_ZATOSHIS: u64 = 100_000_000;
+/// ZIP-302 text memo the funder attaches to the funding send, so zecd's receive-memo path is
+/// exercised. Decoded text is asserted against `memoStr`; hex against `memo`.
+const RECEIVE_MEMO: &str = "hello from the funder";
 /// Generous: lightwalletd ingestion + zecd scan + Orchard proving.
 const FUND_TIMEOUT: Duration = Duration::from_secs(240);
 
@@ -111,6 +114,10 @@ async fn regtest_funded_orchard_receive() {
     zebrad.generate_blocks(6).await.expect("confirm shield");
     funder.sync(lwd.grpc_port).expect("funder sync (shielded)");
 
+    // lightwalletd keeps the same gRPC port across the outage restarts below; capture it now
+    // so the watch-only wallet at the end (the enhancement guard) can reach it.
+    let lwd_grpc_port = lwd.grpc_port;
+
     // 5. zecd against the same lightwalletd; get its Orchard unified address.
     let cfg = ZecdConfig::new(lwd.grpc_port, pick_port().expect("pick zecd rpc port"));
     let zecd = Zecd::start(&cfg)
@@ -150,9 +157,12 @@ async fn regtest_funded_orchard_receive() {
     }
     // One sync interval of slack so the caught-up pass has opened the mempool stream.
     tokio::time::sleep(Duration::from_secs(3)).await;
+    // The funding send carries a ZIP-302 text memo so the *receive*-memo path is exercised
+    // end to end: zecd must surface this memo on the received output (`memoStr`). This is the
+    // complement to the send-memo coverage in Phase 2 (zecd → funder).
     funder
-        .send(lwd.grpc_port, &zecd_ua, FUND_ZATOSHIS)
-        .expect("send Orchard funds to zecd");
+        .send_with_memo(lwd.grpc_port, &zecd_ua, FUND_ZATOSHIS, Some(RECEIVE_MEMO))
+        .expect("send Orchard funds (with a memo) to zecd");
 
     // 0-conf visibility via the mempool stream: before any block confirms the funding tx,
     // zecd trial-decrypts it out of the mempool and reports it bitcoind-style in
@@ -238,10 +248,43 @@ async fn regtest_funded_orchard_receive() {
         !txs.is_empty(),
         "expected at least one transaction in zecd history"
     );
-    assert!(
-        txs.iter()
-            .any(|t| t.get("category").and_then(|c| c.as_str()) == Some("receive")),
-        "expected a receive in zecd history: {txs:?}"
+    let receive = txs
+        .iter()
+        .find(|t| t.get("category").and_then(|c| c.as_str()) == Some("receive"))
+        .unwrap_or_else(|| panic!("expected a receive in zecd history: {txs:?}"));
+    // Receiving a memo: the funder attached RECEIVE_MEMO, so the received output carries it
+    // (decoded text in memoStr, raw ZIP-302 bytes in memo) - zcashd's z_viewtransaction names.
+    assert_eq!(
+        receive["memoStr"].as_str(),
+        Some(RECEIVE_MEMO),
+        "the received output decodes the funder's text memo: {receive}"
+    );
+    let memo_hex: String = RECEIVE_MEMO.bytes().map(|b| format!("{b:02x}")).collect();
+    assert_eq!(
+        receive["memo"].as_str(),
+        Some(memo_hex.as_str()),
+        "the received output carries the memo hex: {receive}"
+    );
+    let recv_txid = receive["txid"]
+        .as_str()
+        .expect("the receive carries a txid")
+        .to_string();
+    // gettransaction on the receive surfaces the same memo on its receive detail.
+    let gt_recv = zecd
+        .call("gettransaction", json!([recv_txid]))
+        .await
+        .expect("gettransaction on the funded receive");
+    let recv_detail = gt_recv["details"]
+        .as_array()
+        .expect("details")
+        .iter()
+        .find(|d| d["category"] == "receive")
+        .cloned()
+        .unwrap_or_else(|| panic!("gettransaction details carry the receive: {gt_recv}"));
+    assert_eq!(
+        recv_detail["memoStr"].as_str(),
+        Some(RECEIVE_MEMO),
+        "gettransaction's receive detail decodes the memo: {recv_detail}"
     );
 
     // ---- Phase 2: zecd spends ----
@@ -1041,6 +1084,60 @@ async fn regtest_funded_orchard_receive() {
         &cfg.rpc_password,
         "regtest-pass",
     );
+
+    // ---- enhancement guard: a received memo is recovered from a scratch scan ----
+    //
+    // The live receive above got its memo from the mempool stream (the full tx was
+    // trial-decrypted and stored before it mined), so it alone can't prove the transaction-
+    // *enhancement* path. A from-scratch scan can: a fresh wallet rebuilds purely from compact
+    // blocks (which carry no memos), so the only way a received memo can reappear is the
+    // enhancement step fetching the full transaction and decrypting it. We use a watch-only
+    // wallet built from the funded wallet's UFVK - same account, so it scans the same received
+    // note, and the viewing key is enough to decrypt the incoming memo. (Watch-only over a
+    // mnemonic restore because the UFVK is passed as a CLI arg, sidestepping stdin.)
+    let ufvk = zecd
+        .export_ufvk("default")
+        .expect("export the funded wallet's UFVK");
+    let mut watch_cfg = ZecdConfig::new(
+        lwd_grpc_port,
+        pick_port().expect("pick watch-only rpc port"),
+    );
+    watch_cfg.ufvk = Some(ufvk);
+    watch_cfg.birthday = Some(2);
+    let watch_only = Zecd::start(&watch_cfg)
+        .await
+        .expect("start the watch-only wallet");
+    let tip = zecd
+        .block_count()
+        .await
+        .expect("getblockcount before the watch-only sync");
+    watch_only
+        .wait_until_synced(tip, FUND_TIMEOUT)
+        .await
+        .expect("the watch-only wallet scans from birthday to the tip");
+
+    // The received memo is recovered, but only after enhancement runs - which happens on a
+    // caught-up pass, a beat after the block scan reaches the tip. Poll for it.
+    let deadline = Instant::now() + FUND_TIMEOUT;
+    loop {
+        let txs = watch_only
+            .call("listtransactions", json!(["*", 100]))
+            .await
+            .expect("listtransactions on the watch-only wallet");
+        let recovered = txs
+            .as_array()
+            .expect("array")
+            .iter()
+            .any(|t| t["category"] == "receive" && t["memoStr"].as_str() == Some(RECEIVE_MEMO));
+        if recovered {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the watch-only wallet never recovered the received memo via enhancement: {txs}"
+        );
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
 }
 
 /// Mine one block at a time (giving the rebroadcast/scan loop time between blocks) until
