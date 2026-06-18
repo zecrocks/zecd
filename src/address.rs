@@ -30,11 +30,32 @@ pub fn has_orchard_receiver(addr: &Address) -> bool {
     addr.can_receive_as(PoolType::ORCHARD)
 }
 
+/// The pools a (network-checked) address can receive into, in canonical order. For a unified
+/// address this enumerates its receivers - so a `u1...` reveals whether it carries transparent,
+/// Sapling, and/or Orchard receivers; a bare t-addr is `["transparent"]`, a bare Sapling
+/// address `["sapling"]`.
+pub fn receiver_types_of(addr: &Address) -> Vec<&'static str> {
+    let mut types = Vec::new();
+    if addr.can_receive_as(PoolType::Transparent) {
+        types.push("transparent");
+    }
+    if addr.can_receive_as(PoolType::SAPLING) {
+        types.push("sapling");
+    }
+    if addr.can_receive_as(PoolType::ORCHARD) {
+        types.push("orchard");
+    }
+    types
+}
+
 /// Result of `validateaddress`, used to build the JSON response.
 pub struct Validation {
     pub is_valid: bool,
     /// Present and `true` when the (valid, on-network) address exposes an Orchard receiver.
     pub is_orchard: bool,
+    /// The pools this address can receive into (`transparent`/`sapling`/`orchard`), in
+    /// canonical order; for a unified address this enumerates its receivers. Empty if invalid.
+    pub receiver_types: Vec<&'static str>,
     /// Hex scriptPubKey for transparent addresses; shielded addresses have no script form.
     pub script_pub_key: Option<String>,
     /// `true` for P2SH transparent addresses, matching bitcoind's `isscript`.
@@ -58,6 +79,7 @@ pub fn validate<P: Parameters>(params: &P, s: &str) -> Validation {
             Validation {
                 is_valid: true,
                 is_orchard: has_orchard_receiver(&addr),
+                receiver_types: receiver_types_of(&addr),
                 script_pub_key,
                 is_script,
             }
@@ -65,6 +87,7 @@ pub fn validate<P: Parameters>(params: &P, s: &str) -> Validation {
         None => Validation {
             is_valid: false,
             is_orchard: false,
+            receiver_types: Vec::new(),
             script_pub_key: None,
             is_script: false,
         },
@@ -106,6 +129,7 @@ mod tests {
         assert!(v.is_valid);
         assert!(!v.is_script);
         assert!(!v.is_orchard);
+        assert_eq!(v.receiver_types, ["transparent"]);
         let spk = v.script_pub_key.unwrap();
         // OP_DUP OP_HASH160 <20-byte hash> OP_EQUALVERIFY OP_CHECKSIG = 25 bytes
         assert_eq!(spk.len(), 50);
@@ -118,6 +142,7 @@ mod tests {
         let v = validate(&ZNetwork::Main, MAINNET_P2SH);
         assert!(v.is_valid);
         assert!(v.is_script);
+        assert_eq!(v.receiver_types, ["transparent"]);
         let spk = v.script_pub_key.unwrap();
         // OP_HASH160 <20-byte hash> OP_EQUAL = 23 bytes
         assert_eq!(spk.len(), 46);
@@ -148,6 +173,7 @@ mod tests {
         assert!(v.script_pub_key.is_none());
         assert!(!v.is_script);
         assert!(!v.is_orchard);
+        assert_eq!(v.receiver_types, ["sapling"]);
     }
 
     #[test]

@@ -619,7 +619,7 @@ pub struct ZecdConfig {
     pub rpc_password: String,
     /// `[sync] rebroadcast_secs` - tight by default so outage tests don't idle a minute.
     pub rebroadcast_secs: u64,
-    /// `[lightwalletd] primary_recheck_secs` - how fast a recovered primary is re-adopted.
+    /// `[backend] primary_recheck_secs` - how fast a recovered primary is re-adopted.
     pub primary_recheck_secs: u64,
     /// Additional `[wallets.<name>]` entries beyond `default` (multiwallet tests); each gets
     /// its own `zecd init --wallet <name>` before the daemon starts.
@@ -1074,7 +1074,7 @@ datadir = "{datadir}"
 default_wallet = "default"
 
 {wallets}
-[lightwalletd]
+[backend]
 servers = [{servers}]
 connection = "direct"
 tls = "no"

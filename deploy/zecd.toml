@@ -8,7 +8,7 @@ default_wallet = "default"
 [wallets.default]
 dir = "/var/lib/zecd/default"
 
-[lightwalletd]
+[backend]
 # Failover, tried in order, always preferring the first (the daemon snaps back to it when it
 # recovers). Here: the co-located zebra full node first (zebra:// = its JSON-RPC, no
 # lightwalletd in between), then the public testnet endpoint if the local node is down.

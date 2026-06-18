@@ -32,7 +32,11 @@ pub mod codes {
     pub const RPC_VERIFY_ALREADY_IN_UTXO_SET: i32 = -27;
     pub const RPC_METHOD_DEPRECATED: i32 = -32;
 
-    // Wallet errors.
+    // Wallet errors. NB: these are Bitcoin Core's `protocol.h` numbers; `-11` (invalid label)
+    // and `-18` (wallet not found) differ in *meaning* from zcashd's `protocol.h` (where they are
+    // "accounts unsupported" / "backup required"), and `-19` is unused by zcashd. The collision is
+    // harmless - those codes are only emitted by the label/multiwallet methods zcashd lacks - so
+    // don't "reconcile" the numbers: the Bitcoin Core values are the conformance target.
     pub const RPC_WALLET_ERROR: i32 = -4;
     pub const RPC_WALLET_INSUFFICIENT_FUNDS: i32 = -6;
     pub const RPC_WALLET_INVALID_LABEL_NAME: i32 = -11;

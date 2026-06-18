@@ -25,7 +25,7 @@
 //!
 //! Scope: a zebra endpoint is for a **local node** - connections are plaintext HTTP with
 //! optional cookie/basic auth, and SOCKS proxying is refused at resolve time (see
-//! `lightwalletd::resolve_all`). Genesis is never requested (no scan range starts there and
+//! `backend::resolve_all`). Genesis is never requested (no scan range starts there and
 //! tree-state requests are clamped to height ≥ 1), which matches `Block::read`'s genesis
 //! limitation.
 

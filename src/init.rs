@@ -16,9 +16,9 @@ use zcash_client_backend::data_api::{
 use zcash_keys::keys::UnifiedFullViewingKey;
 use zcash_protocol::consensus::{BlockHeight, NetworkUpgrade, Parameters};
 
+use crate::backend;
 use crate::chain::ChainSource as _;
 use crate::config::{AppConfig, ExportUfvkArgs, InitArgs, WalletEntry};
-use crate::lightwalletd;
 use crate::wallet::open;
 use crate::wallet::store::{KmsInfo, Passphrase, WalletStore};
 
@@ -147,22 +147,20 @@ pub async fn run(config: &AppConfig, args: &InitArgs) -> anyhow::Result<()> {
 
     // init is a one-shot interactive command; it uses only the first configured endpoint (no
     // failover) - the daemon's actor does the multi-server failover at runtime.
-    let mut servers = lightwalletd::resolve_all(
-        &config.lightwalletd.servers,
+    let mut servers = backend::resolve_all(
+        &config.backend.servers,
         network,
-        config.lightwalletd.tls_roots,
-        config.lightwalletd.force_tls,
-        config.lightwalletd.proxy,
+        config.backend.tls_roots,
+        config.backend.force_tls,
+        config.backend.proxy,
     )?;
-    lightwalletd::apply_zebra_auth(&mut servers, &config.zebra.auth());
+    backend::apply_zebra_auth(&mut servers, &config.zebra.auth());
     let server = servers
         .into_iter()
         .next()
         .ok_or_else(|| anyhow!("no upstream servers configured"))?;
     let mut client = server
-        .connect_timeout(Duration::from_secs(
-            config.lightwalletd.connect_timeout_secs,
-        ))
+        .connect_timeout(Duration::from_secs(config.backend.connect_timeout_secs))
         .await
         .with_context(|| format!("connecting to {}", server.describe()))?;
 

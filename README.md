@@ -35,14 +35,14 @@ flowchart LR
 Two ways to reach the chain, sharing one ordered failover list:
 
 - **zebra (default):** point zecd straight at a **local** zebrad's JSON-RPC. The default
-  `[lightwalletd] server = "zebra"` is shorthand for `zebra://127.0.0.1:8234` on mainnet /
+  `[backend] server = "zebra"` is shorthand for `zebra://127.0.0.1:8234` on mainnet /
   `zebra://127.0.0.1:18234` on testnet (set zebrad's `rpc.listen_addr` to that port - zebra
   ships with RPC disabled, and 8232/18232 are zecd's own RPC ports); any explicit
   `zebra://host:port` works too. zecd derives compact blocks, tree state, and mempool
   visibility from the node RPCs itself (the same ones lightwalletd uses), so there is no
   lightwalletd to operate.
 - **lightwalletd:** point zecd at your own lightwalletd with
-  `[lightwalletd] server = "127.0.0.1:9067"`, or use the public zecrocks infrastructure
+  `[backend] server = "127.0.0.1:9067"`, or use the public zecrocks infrastructure
   (`server = "zecrocks"` → `zec.rocks:443` mainnet, `testnet.zec.rocks:443` testnet) - no
   node to stand up. This is the only mode that works with remote/public endpoints (and Tor).
 
@@ -144,7 +144,7 @@ default_wallet = "default"
 [wallets.default]
 dir = "./data/default"
 
-[lightwalletd]
+[backend]
 server = "zebra"                 # default: a local zebrad's JSON-RPC, no lightwalletd
                                  #   ("zebra" = zebra://127.0.0.1:8234 main / :18234 test -
                                  #   point zebrad's rpc.listen_addr there). Other tokens:
@@ -254,6 +254,15 @@ HTTP status and error codes match Bitcoin Core (`rpc/protocol.h`, `httprpc.cpp`)
 | over work-queue / shutting down | n/a | 503 |
 
 Batches always return HTTP 200 with per-item errors in the array.
+
+**Numbering is Bitcoin Core's, not zcashd's.** These integers are Bitcoin Core's `rpc/protocol.h`
+values. Two collide *numerically* with `zcashd`/Zallet (which use Zcash's own `protocol.h`):
+zecd's `-11` is "invalid label name" (`getaddressesbylabel`) and `-18` is "wallet not found"
+(an unknown `/wallet/<name>`), where zcashd means "accounts unsupported" and "backup required"
+respectively (zecd's `-19`, "wallet not specified", is unused by zcashd). Both colliding codes are
+only returned by methods zcashd lacks - labels and multiwallet - so a zcashd client never observes
+the mismatch, but tooling that hard-codes Zcash's numbering should be aware. The codes integrations
+branch on for the money path (`-4`/`-5`/`-6`/`-8`/`-13`–`-17`/`-20`/`-26`) are identical across all three.
 
 For visibility under load, `getrpcinfo` returns `active_commands`: one entry per executing call
 with `method` and `duration` (microseconds). Combine with `getwalletinfo` (`txcount`, balances, `scanning`),
@@ -391,13 +400,13 @@ the validator's job there - so those rows are all - .
 | `getpeerinfo` | ✓ | - | At most one entry, describing the active upstream (lightwalletd or zebra), plus `conn_state`/`syncing` extensions |
 | `ping` | ✓ | - | No-op success (no P2P ping to measure) |
 | **Utility** | | | |
-| `validateaddress` | ✓ | ✓ (transparent-only: a valid UA gets `isvalid:false`) | Validates every Zcash address kind; valid UA → `isvalid:true`, `scriptPubKey` empty |
+| `validateaddress` | ✓ | ✓ (transparent-only: a valid UA gets `isvalid:false`) | Validates every Zcash address kind; valid UA → `isvalid:true`, `scriptPubKey` empty, plus extension fields `isvalid_orchard` and a `receiver_types` array (`transparent`/`sapling`/`orchard`) enumerating what the address can receive |
 | `estimatesmartfee` | ✓ | - | Inert stub: conventional ZIP-317 rate (0.00001) + `blocks` echo |
 | `estimatefee` | *removed* | - | Same stub rate, for old clients |
 | `getmempoolinfo` | ✓ | - | Fixed shape with empty-mempool numbers (a light client holds no mempool) |
 | `settxfee` | *removed* | - | Always `-8`: fees are ZIP-317, never client-settable |
 | **Control** | | | |
-| `stop` | ✓ | ✓ (regtest-only) | Graceful shutdown; returns `"zecd stopping"` |
+| `stop` | ✓ | ✓ (regtest-only) | Graceful shutdown, **regtest only** (mainnet/testnet → `-32601`, matching Zallet); returns `"zecd stopping"`. Stop a live node with a signal (SIGINT/SIGTERM) |
 | `uptime` | ✓ | - | Seconds since start |
 | `help` | ✓ | ✓ | Static one-line summary only; the optional `command` argument is ignored (see below) |
 | `getrpcinfo` | ✓ | - | `active_commands` (each in-flight method with its elapsed time in microseconds); `logpath` empty (logs go to stderr) |

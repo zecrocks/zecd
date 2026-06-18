@@ -16,8 +16,8 @@ use zcash_client_backend::data_api::wallet::ConfirmationsPolicy;
 use crate::network::ZNetwork;
 
 /// Default chain upstream: a local zebrad's JSON-RPC (`zebra://127.0.0.1:8234` on mainnet,
-/// `zebra://127.0.0.1:18234` on testnet/regtest - see `lightwalletd::ZEBRA_RPC_PORT_*`).
-/// Deployments without a local node set `[lightwalletd] server` to their own lightwalletd
+/// `zebra://127.0.0.1:18234` on testnet/regtest - see `backend::ZEBRA_RPC_PORT_*`).
+/// Deployments without a local node set `[backend] server` to their own lightwalletd
 /// or a public preset (`zecrocks`).
 pub const DEFAULT_SERVER: &str = "zebra";
 
@@ -70,7 +70,7 @@ pub struct AppConfig {
     pub datadir: PathBuf,
     pub default_wallet: String,
     pub wallets: BTreeMap<String, WalletEntry>,
-    pub lightwalletd: LightwalletdConfig,
+    pub backend: BackendConfig,
     pub zebra: ZebraConfig,
     pub rpc: RpcConfig,
     pub keys: KeysConfig,
@@ -105,19 +105,19 @@ pub struct WalletEntry {
 }
 
 #[derive(Debug, Clone)]
-pub struct LightwalletdConfig {
+pub struct BackendConfig {
     /// Ordered list of server tokens; each is `zebra` (a local zebrad, the default) |
     /// `zebra://host:port` | `ecc` | `ywallet` | `zecrocks` or a `host:port` (or a
     /// comma-separated `host:port` list). Tried in order, always preferring the first.
     pub servers: Vec<String>,
-    /// Optional SOCKS5 proxy to route every lightwalletd connection through, parsed from the
+    /// Optional SOCKS5 proxy to route every backend connection through, parsed from the
     /// `connection` setting (`direct` | `tor` | `socks5://host:port`). `None` = direct.
     pub proxy: Option<SocketAddr>,
     /// TLS root certificates to trust (`native` or `webpki`).
-    pub tls_roots: crate::lightwalletd::TlsRoots,
+    pub tls_roots: crate::backend::TlsRoots,
     /// Force TLS on/off; `None` = auto (TLS for remote hosts, plaintext for localhost).
     pub force_tls: Option<bool>,
-    /// Per-attempt dial timeout (seconds) for connecting to a lightwalletd endpoint.
+    /// Per-attempt dial timeout (seconds) for connecting to a backend endpoint.
     pub connect_timeout_secs: u64,
     /// Reconnect backoff base delay (seconds).
     pub reconnect_base_secs: u64,
@@ -127,7 +127,7 @@ pub struct LightwalletdConfig {
     pub primary_recheck_secs: u64,
 }
 
-/// `[zebra]` - credentials for `zebra://host:port` endpoints in the `[lightwalletd]`
+/// `[zebra]` - credentials for `zebra://host:port` endpoints in the `[backend]`
 /// server list (direct-to-zebrad mode). All `zebra://` endpoints share these; a cookie
 /// file wins over user/password, and nothing set means no auth (zebrad with
 /// `enable_cookie_auth = false`).
@@ -310,7 +310,7 @@ struct ConfigFile {
     default_wallet: Option<String>,
     #[serde(default)]
     wallets: BTreeMap<String, WalletFile>,
-    lightwalletd: Option<LightwalletdFile>,
+    backend: Option<BackendFile>,
     zebra: Option<ZebraFile>,
     rpc: Option<RpcFile>,
     keys: Option<KeysFile>,
@@ -345,7 +345,7 @@ struct WalletFile {
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct LightwalletdFile {
+struct BackendFile {
     server: Option<String>,
     servers: Option<Vec<String>>,
     connection: Option<String>,
@@ -461,7 +461,7 @@ pub struct Cli {
     #[arg(long, value_name = "SERVER")]
     pub server: Option<String>,
 
-    /// How to reach lightwalletd: direct | tor | socks5://host:port (routes all traffic through
+    /// How to reach the backend: direct | tor | socks5://host:port (routes all traffic through
     /// the SOCKS5 proxy).
     #[arg(long, value_name = "MODE")]
     pub connection: Option<String>,
@@ -609,7 +609,7 @@ impl AppConfig {
                 dir: datadir.join(&default_wallet),
             });
 
-        let lwd_file = file.lightwalletd.unwrap_or(LightwalletdFile {
+        let backend_file = file.backend.unwrap_or(BackendFile {
             server: None,
             servers: None,
             connection: None,
@@ -620,36 +620,40 @@ impl AppConfig {
             reconnect_max_secs: None,
             primary_recheck_secs: None,
         });
-        let tls_roots = match lwd_file.tls_roots {
-            Some(s) => crate::lightwalletd::TlsRoots::parse(&s)?,
-            None => crate::lightwalletd::TlsRoots::default(),
+        let tls_roots = match backend_file.tls_roots {
+            Some(s) => crate::backend::TlsRoots::parse(&s)?,
+            None => crate::backend::TlsRoots::default(),
         };
-        let force_tls = match lwd_file.tls {
-            Some(s) => crate::lightwalletd::parse_tls_mode(&s)?,
+        let force_tls = match backend_file.tls {
+            Some(s) => crate::backend::parse_tls_mode(&s)?,
             None => None,
         };
-        let servers = select_server_tokens(cli.server.clone(), lwd_file.servers, lwd_file.server);
+        let servers = select_server_tokens(
+            cli.server.clone(),
+            backend_file.servers,
+            backend_file.server,
+        );
         // CLI `--connection` wins over the file `connection`; both parse to an optional SOCKS5
         // proxy. Validated here so a typo fails at startup, before any wallet/network I/O.
         let connection = cli
             .connection
             .clone()
-            .or(lwd_file.connection)
+            .or(backend_file.connection)
             .unwrap_or_else(|| "direct".to_string());
-        let proxy = crate::lightwalletd::parse_connection_mode(&connection)?;
-        let reconnect_base_secs = lwd_file.reconnect_base_secs.unwrap_or(1).max(1);
-        let lightwalletd = LightwalletdConfig {
+        let proxy = crate::backend::parse_connection_mode(&connection)?;
+        let reconnect_base_secs = backend_file.reconnect_base_secs.unwrap_or(1).max(1);
+        let backend = BackendConfig {
             servers,
             proxy,
             tls_roots,
             force_tls,
-            connect_timeout_secs: lwd_file.connect_timeout_secs.unwrap_or(10).max(1),
+            connect_timeout_secs: backend_file.connect_timeout_secs.unwrap_or(10).max(1),
             reconnect_base_secs,
-            reconnect_max_secs: lwd_file
+            reconnect_max_secs: backend_file
                 .reconnect_max_secs
                 .unwrap_or(60)
                 .max(reconnect_base_secs),
-            primary_recheck_secs: lwd_file.primary_recheck_secs.unwrap_or(60).max(1),
+            primary_recheck_secs: backend_file.primary_recheck_secs.unwrap_or(60).max(1),
         };
 
         let zebra_file = file.zebra.unwrap_or_default();
@@ -801,7 +805,7 @@ impl AppConfig {
             datadir,
             default_wallet,
             wallets,
-            lightwalletd,
+            backend,
             zebra,
             rpc,
             keys,
@@ -929,8 +933,8 @@ mod tests {
     }
 
     #[test]
-    fn lightwalletd_file_parses_array_and_backoff() {
-        let f: LightwalletdFile = toml::from_str(
+    fn backend_file_parses_array_and_backoff() {
+        let f: BackendFile = toml::from_str(
             r#"
             servers = ["127.0.0.1:9067", "zec.rocks:443"]
             connect_timeout_secs = 5
@@ -948,9 +952,9 @@ mod tests {
     }
 
     #[test]
-    fn lightwalletd_file_rejects_unknown_field() {
+    fn backend_file_rejects_unknown_field() {
         // `deny_unknown_fields` must still reject typos/unsupported keys.
-        assert!(toml::from_str::<LightwalletdFile>("bogus_key = 1").is_err());
+        assert!(toml::from_str::<BackendFile>("bogus_key = 1").is_err());
     }
 
     #[test]
@@ -1010,19 +1014,16 @@ mod tests {
 
         // An unrecognized connection mode must fail at startup, never silently fall back to
         // direct connections (that would defeat the privacy property the operator configured).
-        std::fs::write(&conf, "[lightwalletd]\nconnection = \"torr\"\n").unwrap();
+        std::fs::write(&conf, "[backend]\nconnection = \"torr\"\n").unwrap();
         let cli = Cli::parse_from(["zecd", "--conf", conf.to_str().unwrap()]);
         let err = AppConfig::resolve(&cli).unwrap_err().to_string();
         assert!(err.contains("invalid connection"), "got: {err}");
 
         // "tor" resolves to Tor's conventional local SOCKS port…
-        std::fs::write(&conf, "[lightwalletd]\nconnection = \"tor\"\n").unwrap();
+        std::fs::write(&conf, "[backend]\nconnection = \"tor\"\n").unwrap();
         let cli = Cli::parse_from(["zecd", "--conf", conf.to_str().unwrap()]);
         let cfg = AppConfig::resolve(&cli).unwrap();
-        assert_eq!(
-            cfg.lightwalletd.proxy,
-            Some("127.0.0.1:9050".parse().unwrap())
-        );
+        assert_eq!(cfg.backend.proxy, Some("127.0.0.1:9050".parse().unwrap()));
 
         // …"direct" to no proxy, and the CLI --connection flag wins over the file.
         let cli = Cli::parse_from([
@@ -1033,7 +1034,7 @@ mod tests {
             "direct",
         ]);
         let cfg = AppConfig::resolve(&cli).unwrap();
-        assert_eq!(cfg.lightwalletd.proxy, None);
+        assert_eq!(cfg.backend.proxy, None);
     }
 
     #[test]

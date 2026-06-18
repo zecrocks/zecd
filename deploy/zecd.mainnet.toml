@@ -9,7 +9,7 @@ default_wallet = "default"
 [wallets.default]
 dir = "/var/lib/zecd/default"
 
-[lightwalletd]
+[backend]
 # Failover, tried in order, always preferring the first: the co-located zebra full node
 # (zebra:// = its JSON-RPC, no lightwalletd in between), then the public zecrocks mainnet
 # endpoints if the local node is down. With the optional lightwalletd profile enabled, slot

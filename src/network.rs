@@ -45,6 +45,12 @@ impl ZNetwork {
             other => Err(anyhow!("unsupported network: {other}")),
         }
     }
+
+    /// Whether this is a regtest network. Used to gate developer-only RPCs (e.g. `stop`) so
+    /// they can't be invoked against a live mainnet/testnet daemon over RPC.
+    pub fn is_regtest(&self) -> bool {
+        matches!(self, ZNetwork::Regtest(_))
+    }
 }
 
 impl Parameters for ZNetwork {

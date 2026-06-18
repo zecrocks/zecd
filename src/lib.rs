@@ -3,6 +3,7 @@
 
 pub mod address;
 pub mod amount;
+pub mod backend;
 pub mod backoff;
 pub mod chain;
 pub mod config;
@@ -12,7 +13,6 @@ pub mod hardening;
 pub mod health;
 pub mod init;
 pub mod keystore;
-pub mod lightwalletd;
 pub mod network;
 pub mod operations;
 pub mod rewrap;

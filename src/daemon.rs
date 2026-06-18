@@ -6,9 +6,9 @@ use std::time::{Duration, Instant};
 
 use tracing::{error, info, warn};
 
+use crate::backend;
 use crate::config::{self, AppConfig};
 use crate::health;
-use crate::lightwalletd;
 use crate::server;
 use crate::state::AppState;
 use crate::wallet::actor::{self, ActorConfig};
@@ -64,14 +64,14 @@ pub async fn run(config: AppConfig) -> anyhow::Result<()> {
             );
             continue;
         }
-        let mut servers = lightwalletd::resolve_all(
-            &config.lightwalletd.servers,
+        let mut servers = backend::resolve_all(
+            &config.backend.servers,
             config.network,
-            config.lightwalletd.tls_roots,
-            config.lightwalletd.force_tls,
-            config.lightwalletd.proxy,
+            config.backend.tls_roots,
+            config.backend.force_tls,
+            config.backend.proxy,
         )?;
-        lightwalletd::apply_zebra_auth(&mut servers, &config.zebra.auth());
+        backend::apply_zebra_auth(&mut servers, &config.zebra.auth());
         let actor_cfg = ActorConfig {
             name: name.clone(),
             network: config.network,
@@ -79,10 +79,10 @@ pub async fn run(config: AppConfig) -> anyhow::Result<()> {
             servers,
             sync_interval: Duration::from_secs(config.sync.interval_secs),
             rebroadcast_interval: Duration::from_secs(config.sync.rebroadcast_secs),
-            connect_timeout: Duration::from_secs(config.lightwalletd.connect_timeout_secs),
-            reconnect_base: Duration::from_secs(config.lightwalletd.reconnect_base_secs),
-            reconnect_max: Duration::from_secs(config.lightwalletd.reconnect_max_secs),
-            primary_recheck: Duration::from_secs(config.lightwalletd.primary_recheck_secs),
+            connect_timeout: Duration::from_secs(config.backend.connect_timeout_secs),
+            reconnect_base: Duration::from_secs(config.backend.reconnect_base_secs),
+            reconnect_max: Duration::from_secs(config.backend.reconnect_max_secs),
+            primary_recheck: Duration::from_secs(config.backend.primary_recheck_secs),
             age_identity: config.keys.age_identity.clone(),
             auto_unlock: config.keys.auto_unlock,
             keystore_endpoint: config.keystore.endpoint.clone(),

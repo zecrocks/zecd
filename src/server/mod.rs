@@ -175,7 +175,7 @@ mod tests {
     use serde_json::Value;
     use tower::ServiceExt;
 
-    use crate::config::{AppConfig, KeysConfig, LightwalletdConfig, RpcConfig, SyncConfig};
+    use crate::config::{AppConfig, BackendConfig, KeysConfig, RpcConfig, SyncConfig};
     use crate::server::auth::Authenticator;
     use crate::wallet::WalletRegistry;
 
@@ -195,10 +195,10 @@ mod tests {
             datadir: std::path::PathBuf::from("/tmp"),
             default_wallet: "default".into(),
             wallets: BTreeMap::new(),
-            lightwalletd: LightwalletdConfig {
+            backend: BackendConfig {
                 servers: vec!["zecrocks".into()],
                 proxy: None,
-                tls_roots: crate::lightwalletd::TlsRoots::Native,
+                tls_roots: crate::backend::TlsRoots::Native,
                 force_tls: None,
                 connect_timeout_secs: 10,
                 reconnect_base_secs: 1,

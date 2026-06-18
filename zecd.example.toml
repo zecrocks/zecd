@@ -15,7 +15,7 @@ default_wallet = "default"
 [wallets.default]
 dir = "./data/default"
 
-[lightwalletd]
+[backend]
 # The chain upstream. The default is "zebra": a LOCAL zebrad's JSON-RPC, no lightwalletd
 # needed - shorthand for "zebra://127.0.0.1:8234" on mainnet / "zebra://127.0.0.1:18234" on
 # testnet (zebrad ships with RPC disabled, so set its `rpc.listen_addr` to that port; the

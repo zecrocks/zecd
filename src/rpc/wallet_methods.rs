@@ -1980,6 +1980,7 @@ mod tests {
         let invalid = Validation {
             is_valid: false,
             is_orchard: false,
+            receiver_types: Vec::new(),
             script_pub_key: None,
             is_script: false,
         };
@@ -1993,6 +1994,7 @@ mod tests {
         let valid = Validation {
             is_valid: true,
             is_orchard: true,
+            receiver_types: vec!["orchard"],
             script_pub_key: None,
             is_script: false,
         };

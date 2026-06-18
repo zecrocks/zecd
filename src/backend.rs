@@ -1,4 +1,4 @@
-//! Upstream-endpoint management: parsing/resolving the `[lightwalletd] servers` list and
+//! Upstream-endpoint management: parsing/resolving the `[backend] servers` list and
 //! dialing its entries. Ported from `zcash-devtool/src/remote.rs`. TLS is used for remote
 //! hosts and skipped for localhost (and `.onion`), but can be forced on/off explicitly
 //! (e.g. a co-located plaintext lightwalletd reached by service name in docker-compose).
@@ -10,7 +10,7 @@
 //! a public lightwalletd fallback. Connecting yields an [`AnySource`] either way; everything
 //! above this module is backend-agnostic.
 //!
-//! Connections can optionally be routed through a SOCKS5 proxy (`[lightwalletd] connection`),
+//! Connections can optionally be routed through a SOCKS5 proxy (`[backend] connection`),
 //! which covers Tor, Nym, and any other SOCKS5 proxy - see [`parse_connection_mode`]. The proxy,
 //! like the TLS settings, is attached to every resolved [`Server`] so no connection can silently
 //! bypass it. `zebra://` endpoints are for local nodes and refuse to combine with a proxy
@@ -54,7 +54,7 @@ impl TlsRoots {
     }
 }
 
-/// Parse a `[lightwalletd] tls` setting into a force-TLS override: `auto` (None) uses the
+/// Parse a `[backend] tls` setting into a force-TLS override: `auto` (None) uses the
 /// localhost heuristic; `yes`/`no` force it.
 pub fn parse_tls_mode(s: &str) -> anyhow::Result<Option<bool>> {
     match s.trim().to_ascii_lowercase().as_str() {
@@ -70,7 +70,7 @@ pub fn parse_tls_mode(s: &str) -> anyhow::Result<Option<bool>> {
 /// Tor's conventional local SOCKS5 listener, used as the proxy when `connection = "tor"`.
 const TOR_SOCKS_DEFAULT: &str = "127.0.0.1:9050";
 
-/// Parse a `[lightwalletd] connection` setting into an optional SOCKS5 proxy address that every
+/// Parse a `[backend] connection` setting into an optional SOCKS5 proxy address that every
 /// lightwalletd connection should be dialed through. Recognised forms:
 ///
 /// - `direct` - no proxy; dial endpoints directly (the default).
@@ -382,7 +382,7 @@ pub fn resolve_all(
         if let Some(s) = out.iter().find(|s| s.host.ends_with(".onion")) {
             return Err(anyhow!(
                 "lightwalletd endpoint {}:{} is a .onion address but connection = \"direct\"; \
-                 set [lightwalletd] connection = \"tor\" (or \"socks5://<host>:<port>\")",
+                 set [backend] connection = \"tor\" (or \"socks5://<host>:<port>\")",
                 s.host,
                 s.port
             ));
@@ -395,7 +395,7 @@ pub fn resolve_all(
         if let Some(s) = out.iter().find(|s| s.kind == ServerKind::ZebraRpc) {
             return Err(anyhow!(
                 "zebra endpoint {}:{} cannot be combined with a SOCKS5 proxy; zebra:// \
-                 endpoints are for local nodes - set [lightwalletd] connection = \"direct\" \
+                 endpoints are for local nodes - set [backend] connection = \"direct\" \
                  or remove the zebra endpoint",
                 s.host,
                 s.port

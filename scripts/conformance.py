@@ -223,6 +223,11 @@ def main() -> int:
     va = rpc.call("validateaddress", addr)
     ck("validateaddress.isvalid", va["isvalid"] is True)
     ck("validateaddress echoes address", va.get("address") == addr)
+    # Extension: receiver_types enumerates the pools an address can receive into. zecd hands
+    # out Orchard-only unified addresses, so its own getnewaddress address carries "orchard".
+    ck("validateaddress.receiver_types lists orchard",
+       isinstance(va.get("receiver_types"), list) and "orchard" in va["receiver_types"],
+       va.get("receiver_types"))
     # Bitcoin Core returns only the verdict + error details for invalid input.
     bad = rpc.call("validateaddress", "not-an-address")
     ck("invalid validateaddress.isvalid False", bad["isvalid"] is False)

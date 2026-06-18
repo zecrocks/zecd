@@ -6,7 +6,14 @@ use crate::error::RpcError;
 use crate::state::AppState;
 
 /// `stop` - request graceful shutdown (in-flight requests finish; new ones get 503).
+///
+/// Gated to regtest (matching Zallet): on mainnet/testnet it reports method-not-found so a
+/// stray `stop` can't take down a production daemon over RPC. Stop a live node with a signal
+/// (SIGINT/SIGTERM) instead.
 pub(crate) fn stop(state: &AppState) -> Result<Value, RpcError> {
+    if !state.config.network.is_regtest() {
+        return Err(RpcError::method_not_found("stop"));
+    }
     state.trigger_shutdown();
     Ok(Value::String("zecd stopping".to_string()))
 }

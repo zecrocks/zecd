@@ -31,10 +31,10 @@ use zcash_protocol::value::Zatoshis;
 use zcash_protocol::{ShieldedProtocol, TxId};
 use zip321::TransactionRequest;
 
+use crate::backend::Server;
 use crate::backoff::Backoff;
 use crate::chain::{AnySource, BroadcastOutcome, ChainSource, MempoolStream};
 use crate::error::{codes, RpcError};
-use crate::lightwalletd::Server;
 use crate::network::ZNetwork;
 use crate::sync::engine;
 use crate::wallet::keys::{self, SeedKeeper};

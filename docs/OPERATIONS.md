@@ -114,7 +114,7 @@ need a rollback path (stop the daemon before copying).
       requires a verified `walletpassphrase` with an enforced timeout.
 - [ ] Mnemonic + birthday recorded offline; restore procedure tested on testnet.
 - [ ] Own node as primary - `server = "zebra"` (or your own lightwalletd) - with public
-      endpoints only as fallback (`[lightwalletd] servers`); Docker images pinned to
+      endpoints only as fallback (`[backend] servers`); Docker images pinned to
       verified releases.
 - [ ] `/readyz` wired into your orchestrator with a `startupProbe` covering initial
       sync; alerts on `upstream_down`.

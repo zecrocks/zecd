@@ -31,6 +31,10 @@ pub(crate) fn validateaddress(state: &AppState, req: &RpcRequest) -> Result<Valu
         "iswitness": false,
         // Extension field: whether this address can receive Orchard funds.
         "isvalid_orchard": v.is_orchard,
+        // Extension field: the pools this address can receive into, in canonical order
+        // (`transparent`/`sapling`/`orchard`). For a unified address this enumerates its
+        // receivers, so a client can see what a `u1...` actually carries.
+        "receiver_types": v.receiver_types,
     }))
 }
 
