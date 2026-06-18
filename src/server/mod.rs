@@ -237,6 +237,7 @@ mod tests {
             shutting_down: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             work_queue: Arc::new(tokio::sync::Semaphore::new(16)),
             active: crate::state::ActiveCommands::default(),
+            operations: Arc::new(crate::operations::OperationRegistry::new()),
         }
     }
 

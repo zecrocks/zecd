@@ -116,6 +116,7 @@ pub async fn run(config: AppConfig) -> anyhow::Result<()> {
         shutting_down: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         work_queue: Arc::new(tokio::sync::Semaphore::new(config.rpc.work_queue)),
         active: crate::state::ActiveCommands::default(),
+        operations: Arc::new(crate::operations::OperationRegistry::new()),
     };
 
     // Translate Ctrl-C into a graceful shutdown (flag first, so in-flight new requests 503).

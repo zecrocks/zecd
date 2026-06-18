@@ -69,6 +69,11 @@ pub const ALL_METHODS: &[&str] = &[
     "walletpassphrase",
     "walletpassphrasechange",
     "walletlock",
+    // Wallet - async operations (zcashd-style)
+    "z_sendmany",
+    "z_getoperationstatus",
+    "z_getoperationresult",
+    "z_listoperationids",
 ];
 
 /// Whether `name` is an RPC method zecd implements (see [`ALL_METHODS`]).
@@ -161,6 +166,12 @@ async fn dispatch_zecd(
             wallet_methods::walletpassphrasechange(state, wallet, req).await
         }
         "walletlock" => wallet_methods::walletlock(state, wallet).await,
+
+        // Wallet - async operations (zcashd-style; the send itself runs on a background task)
+        "z_sendmany" => wallet_methods::z_sendmany(state, wallet, req),
+        "z_getoperationstatus" => wallet_methods::z_getoperationstatus(state, wallet, req),
+        "z_getoperationresult" => wallet_methods::z_getoperationresult(state, wallet, req),
+        "z_listoperationids" => wallet_methods::z_listoperationids(state, wallet, req),
 
         other => Err(RpcError::method_not_found(other)),
     }

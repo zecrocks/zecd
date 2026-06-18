@@ -12,6 +12,7 @@ use zip321::{Payment, TransactionRequest};
 use crate::amount::{signed_zats_to_value, value_to_zats, zats_to_value};
 use crate::config::SendPrivacy;
 use crate::error::RpcError;
+use crate::operations::{AsyncOperation, ContextInfo, OperationId};
 use crate::server::jsonrpc::RpcRequest;
 use crate::state::AppState;
 use crate::wallet::store::Passphrase;
@@ -1306,7 +1307,7 @@ pub(crate) async fn sendtoaddress(
     )?;
     let request = TransactionRequest::new(vec![payment])
         .map_err(|e| RpcError::wallet(format!("invalid payment request: {e}")))?;
-    let txid = handle.send(request).await?;
+    let txid = handle.send(request, None).await?;
     Ok(send_result(txid.to_string(), verbose))
 }
 
@@ -1356,8 +1357,218 @@ pub(crate) async fn sendmany(
     }
     let request = TransactionRequest::new(payments)
         .map_err(|e| RpcError::wallet(format!("invalid payment request: {e}")))?;
-    let txid = handle.send(request).await?;
+    let txid = handle.send(request, None).await?;
     Ok(send_result(txid.to_string(), verbose))
+}
+
+// ---- Asynchronous operations (zcashd-style `z_sendmany` + `z_getoperation*`) ----
+
+/// Map a zcashd `privacyPolicy` string onto zecd's two-variant [`SendPrivacy`]. zecd only ever
+/// spends shielded Orchard notes, so the one privacy axis it can act on is whether a recipient
+/// *without* an Orchard receiver (transparent / Sapling-only) is permitted - zcashd's other
+/// policies differ only in sender-side leakage, which has no analog here. Omitted or
+/// `LegacyCompat` fall back to the wallet's configured `[spend] privacy_policy`; an unknown
+/// value is `-8`.
+fn privacy_from_policy(s: Option<&str>, default: SendPrivacy) -> Result<SendPrivacy, RpcError> {
+    match s {
+        None | Some("LegacyCompat") => Ok(default),
+        Some("FullPrivacy") => Ok(SendPrivacy::FullPrivacy),
+        Some("AllowRevealedAmounts")
+        | Some("AllowRevealedRecipients")
+        | Some("AllowRevealedSenders")
+        | Some("AllowFullyTransparent")
+        | Some("AllowLinkingAccountAddresses")
+        | Some("NoPrivacy") => Ok(SendPrivacy::AllowRevealedRecipients),
+        Some(other) => Err(RpcError::invalid_parameter(format!(
+            "Unknown privacy policy: {other}"
+        ))),
+    }
+}
+
+/// Parse the optional `["opid-...", ...]` argument shared by `z_getoperationstatus` and
+/// `z_getoperationresult`. Absent/null → `None` (all of the wallet's operations); otherwise an
+/// array of opid strings - a malformed opid or non-string element is `-8`.
+fn parse_opid_filter(req: &RpcRequest, i: usize) -> Result<Option<Vec<OperationId>>, RpcError> {
+    match req.param(i) {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::Array(arr)) => {
+            let mut ids = Vec::with_capacity(arr.len());
+            for v in arr {
+                let s = v.as_str().ok_or_else(|| {
+                    RpcError::invalid_parameter("Invalid operation ID, expected a string")
+                })?;
+                ids.push(s.parse::<OperationId>()?);
+            }
+            Ok(Some(ids))
+        }
+        Some(_) => Err(RpcError::invalid_parameter(
+            "Invalid parameter, expected an array of operation ids",
+        )),
+    }
+}
+
+/// `z_sendmany "<fromaddress>" [{"address":..,"amount":..,"memo":..}, ..] (minconf) (fee) (privacyPolicy)`
+/// zcashd's asynchronous shielded send. Returns an operation id (`opid-...`) immediately; the
+/// transaction is proposed, proved, and broadcast on a background task whose status/result are
+/// fetched with `z_getoperationstatus`/`z_getoperationresult`. zecd spends from its single
+/// Orchard account, so `fromaddress` must be one of this wallet's own addresses. Fees are
+/// ZIP-317 (an explicit `fee` is `-8`); `minconf` overrides note-selection depth for this send.
+pub(crate) fn z_sendmany(
+    state: &AppState,
+    wallet: Option<&str>,
+    req: &RpcRequest,
+) -> Result<Value, RpcError> {
+    let handle = state.registry.get(wallet)?.clone();
+
+    // fromaddress (arg 0): reject ANY_TADDR (zecd has no transparent source to select) and
+    // validate that the address belongs to this wallet's account, mirroring Zallet's
+    // `get_account_for_address`.
+    let fromaddress = req.require_str(0, "z_sendmany requires a fromaddress")?;
+    if fromaddress == "ANY_TADDR" {
+        return Err(RpcError::invalid_address_or_key(
+            "Invalid from address: ANY_TADDR is not supported (zecd spends from its Orchard \
+             account)",
+        ));
+    }
+    if crate::address::decode_on_network(&handle.network, fromaddress).is_none() {
+        return Err(RpcError::invalid_address_or_key(
+            "Invalid from address: should be a taddr, zaddr, or unified address",
+        ));
+    }
+    if !read::is_mine(handle.network, &handle.dir, fromaddress) {
+        return Err(RpcError::invalid_address_or_key(
+            "Invalid from address, no payment source found for address.",
+        ));
+    }
+
+    // amounts (arg 1): a non-empty array of {address, amount, memo?} objects (zcashd's shape,
+    // not Bitcoin Core's `{addr: amount}` map).
+    let outputs = req
+        .param(1)
+        .and_then(|v| v.as_array())
+        .ok_or_else(|| RpcError::invalid_parameter("Invalid parameter, expected amounts array"))?;
+    if outputs.is_empty() {
+        return Err(RpcError::invalid_parameter(
+            "Invalid parameter, amounts array is empty.",
+        ));
+    }
+
+    // fee (arg 3): ZIP-317 only - an explicit fee is rejected, never silently applied.
+    if req.param(3).is_some_and(param_engaged) {
+        return Err(RpcError::invalid_parameter(
+            "fee is not supported (fees are ZIP-317, computed by the wallet)",
+        ));
+    }
+
+    // privacyPolicy (arg 4): per-call override of `[spend] privacy_policy`.
+    let privacy = privacy_from_policy(
+        req.param(4).and_then(|v| v.as_str()),
+        state.config.spend.privacy,
+    )?;
+
+    // minconf (arg 2): honored - mapped onto a per-call symmetric confirmations policy
+    // (default = the wallet's configured policy when omitted).
+    let policy = minconf_policy(req.param(2), handle.confirmations)?;
+
+    // Build the payments, rejecting unknown keys and duplicate recipients (zcashd does both).
+    let mut seen = BTreeSet::new();
+    let mut payments = Vec::with_capacity(outputs.len());
+    for out in outputs {
+        let obj = out
+            .as_object()
+            .ok_or_else(|| RpcError::invalid_parameter("amounts entry must be an object"))?;
+        for key in obj.keys() {
+            if !matches!(key.as_str(), "address" | "amount" | "memo") {
+                return Err(RpcError::invalid_parameter(format!(
+                    "Invalid parameter, unrecognized key: {key}"
+                )));
+            }
+        }
+        let addr = obj
+            .get("address")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| RpcError::invalid_parameter("amounts entry requires an address"))?;
+        let amount = obj
+            .get("amount")
+            .ok_or_else(|| RpcError::invalid_parameter("amounts entry requires an amount"))?;
+        let memo = match obj.get("memo") {
+            None | Some(Value::Null) => None,
+            Some(Value::String(s)) if s.is_empty() => None,
+            Some(Value::String(s)) => Some(s.as_str()),
+            Some(_) => return Err(RpcError::type_error("memo must be a hex string")),
+        };
+        if !seen.insert(addr.to_string()) {
+            return Err(RpcError::invalid_parameter(format!(
+                "Invalid parameter, duplicated recipient address: {addr}"
+            )));
+        }
+        payments.push(build_payment(&handle.network, privacy, addr, amount, memo)?);
+    }
+
+    let request = TransactionRequest::new(payments)
+        .map_err(|e| RpcError::wallet(format!("invalid payment request: {e}")))?;
+
+    // Echo the call context (zcashd's `method`/`params` on the status object).
+    let context = ContextInfo::new(
+        "z_sendmany",
+        json!({
+            "fromaddress": fromaddress,
+            "amounts": Value::Array(outputs.clone()),
+            "minconf": req.param(2).cloned().unwrap_or_else(|| json!(1)),
+        }),
+    );
+
+    // Spawn the send on a background task and return the opid immediately. Every send error
+    // (including `-6` insufficient funds) surfaces later via the operation's `error`, never as
+    // a synchronous error here. The send still funnels through the single-writer actor, so the
+    // no-double-spend invariant holds exactly as for the synchronous sends.
+    let send_handle = handle.clone();
+    let op = AsyncOperation::new(Some(context), async move {
+        let txid = send_handle.send(request, Some(policy)).await?;
+        Ok::<Value, RpcError>(json!({ "txid": txid.to_string() }))
+    });
+    let opid = state.operations.insert(&handle.name, op);
+    Ok(Value::String(opid))
+}
+
+/// `z_getoperationstatus ([opid, ...])` - status objects for the wallet's async operations
+/// (all of them when no array is given). Non-destructive; well-formed-but-unknown ids are
+/// silently omitted, a malformed id is `-8`.
+pub(crate) fn z_getoperationstatus(
+    state: &AppState,
+    wallet: Option<&str>,
+    req: &RpcRequest,
+) -> Result<Value, RpcError> {
+    let handle = state.registry.get(wallet)?;
+    let ids = parse_opid_filter(req, 0)?;
+    let statuses = state.operations.status(&handle.name, ids.as_deref());
+    serde_json::to_value(statuses).map_err(|e| RpcError::misc(e.to_string()))
+}
+
+/// `z_getoperationresult ([opid, ...])` - like `z_getoperationstatus`, but returns only
+/// *finished* operations (success/failed/cancelled) and removes them from memory.
+pub(crate) fn z_getoperationresult(
+    state: &AppState,
+    wallet: Option<&str>,
+    req: &RpcRequest,
+) -> Result<Value, RpcError> {
+    let handle = state.registry.get(wallet)?;
+    let ids = parse_opid_filter(req, 0)?;
+    let statuses = state.operations.take_results(&handle.name, ids.as_deref());
+    serde_json::to_value(statuses).map_err(|e| RpcError::misc(e.to_string()))
+}
+
+/// `z_listoperationids (["status"])` - the opid strings of the wallet's operations, optionally
+/// filtered by status string (`queued`/`executing`/`success`/`failed`/`cancelled`); an
+/// unrecognized filter returns an empty list.
+pub(crate) fn z_listoperationids(
+    state: &AppState,
+    wallet: Option<&str>,
+    req: &RpcRequest,
+) -> Result<Value, RpcError> {
+    let handle = state.registry.get(wallet)?;
+    let filter = req.param(0).and_then(|v| v.as_str());
+    Ok(json!(state.operations.list_ids(&handle.name, filter)))
 }
 
 /// Bitcoin Core clamps the unlock timeout to this many seconds (~3.17 years); larger values
@@ -1448,6 +1659,72 @@ pub(crate) async fn walletpassphrasechange(
 mod tests {
     use super::*;
     use crate::wallet::read::{TxOutputRecord, TxRecord};
+
+    #[test]
+    fn privacy_from_policy_maps_every_case() {
+        use SendPrivacy::*;
+        // Omitted and LegacyCompat fall back to the configured default (both directions).
+        assert_eq!(privacy_from_policy(None, FullPrivacy).unwrap(), FullPrivacy);
+        assert_eq!(
+            privacy_from_policy(None, AllowRevealedRecipients).unwrap(),
+            AllowRevealedRecipients
+        );
+        assert_eq!(
+            privacy_from_policy(Some("LegacyCompat"), FullPrivacy).unwrap(),
+            FullPrivacy
+        );
+        // Explicit FullPrivacy.
+        assert_eq!(
+            privacy_from_policy(Some("FullPrivacy"), AllowRevealedRecipients).unwrap(),
+            FullPrivacy
+        );
+        // Every weaker-or-equal zcashd policy maps onto AllowRevealedRecipients.
+        for p in [
+            "AllowRevealedAmounts",
+            "AllowRevealedRecipients",
+            "AllowRevealedSenders",
+            "AllowFullyTransparent",
+            "AllowLinkingAccountAddresses",
+            "NoPrivacy",
+        ] {
+            assert_eq!(
+                privacy_from_policy(Some(p), FullPrivacy).unwrap(),
+                AllowRevealedRecipients,
+                "{p}"
+            );
+        }
+        // An unknown policy is -8.
+        let err = privacy_from_policy(Some("nope"), FullPrivacy).unwrap_err();
+        assert_eq!(err.code, crate::error::codes::RPC_INVALID_PARAMETER);
+    }
+
+    #[test]
+    fn parse_opid_filter_handles_all_shapes() {
+        use crate::error::codes;
+        let req = |params: Vec<Value>| RpcRequest {
+            id: Value::Null,
+            method: "z_getoperationstatus".into(),
+            params,
+        };
+        // Absent or null -> no filter (all of the wallet's ops).
+        assert!(parse_opid_filter(&req(vec![]), 0).unwrap().is_none());
+        assert!(parse_opid_filter(&req(vec![Value::Null]), 0)
+            .unwrap()
+            .is_none());
+        // A well-formed array parses.
+        let ids = parse_opid_filter(
+            &req(vec![json!(["opid-00000000-0000-0000-0000-000000000000"])]),
+            0,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(ids.len(), 1);
+        // A malformed opid, a non-string element, and a non-array param are all -8.
+        for bad in [json!(["not-an-opid"]), json!([123]), json!("notarray")] {
+            let err = parse_opid_filter(&req(vec![bad]), 0).unwrap_err();
+            assert_eq!(err.code, codes::RPC_INVALID_PARAMETER);
+        }
+    }
 
     fn status(fully_scanned: u32) -> SyncStatus {
         SyncStatus {

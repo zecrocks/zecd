@@ -493,6 +493,107 @@ def main() -> int:
         ck("sendmany fee_rate raises", False)
     except JSONRPCException as e:
         ck("sendmany fee_rate -> code -8", e.code == -8, e.code)
+    # z_sendmany is zcashd's async send: it returns an opid; the trio z_getoperationstatus /
+    # z_getoperationresult / z_listoperationids track it. These checks all reject (or query
+    # empty) *before* any send is spawned, so they move no money. addr is the wallet's own
+    # address, so the fromaddress ownership check passes and later validation fires.
+    try:
+        # An explicit fee is ZIP-317 -8, like the synchronous sends.
+        rpc.call("z_sendmany", addr, [{"address": addr, "amount": "0.1"}], 1, 0.0001)
+        ck("z_sendmany fee raises", False)
+    except JSONRPCException as e:
+        ck("z_sendmany fee -> code -8", e.code == -8, e.code)
+    try:
+        rpc.call("z_sendmany", addr, [])
+        ck("z_sendmany empty amounts raises", False)
+    except JSONRPCException as e:
+        ck("z_sendmany empty amounts -> code -8", e.code == -8, e.code)
+    try:
+        rpc.call("z_sendmany", addr, [{"address": addr, "amount": "0.1"}], 1, None, "Bogus")
+        ck("z_sendmany unknown privacyPolicy raises", False)
+    except JSONRPCException as e:
+        ck("z_sendmany unknown privacyPolicy -> code -8", e.code == -8, e.code)
+    try:
+        # An unparseable fromaddress is -5 before any send logic.
+        rpc.call("z_sendmany", "not-an-address", [{"address": addr, "amount": "0.1"}])
+        ck("z_sendmany bad fromaddress raises", False)
+    except JSONRPCException as e:
+        ck("z_sendmany bad fromaddress -> code -5", e.code == -5, e.code)
+    try:
+        # A missing fromaddress is the invalid-params -32602 (require_str).
+        rpc.call("z_sendmany")
+        ck("z_sendmany no args raises", False)
+    except JSONRPCException as e:
+        ck("z_sendmany no args -> code -32602", e.code == -32602, e.code)
+    try:
+        # ANY_TADDR is unsupported (zecd has no transparent source) -> -5.
+        rpc.call("z_sendmany", "ANY_TADDR", [{"address": addr, "amount": "0.1"}])
+        ck("z_sendmany ANY_TADDR raises", False)
+    except JSONRPCException as e:
+        ck("z_sendmany ANY_TADDR -> code -5", e.code == -5, e.code)
+    try:
+        rpc.call("z_sendmany", addr, "notarray")
+        ck("z_sendmany non-array amounts raises", False)
+    except JSONRPCException as e:
+        ck("z_sendmany non-array amounts -> code -8", e.code == -8, e.code)
+    try:
+        rpc.call("z_sendmany", addr, ["notanobject"])
+        ck("z_sendmany non-object entry raises", False)
+    except JSONRPCException as e:
+        ck("z_sendmany non-object entry -> code -8", e.code == -8, e.code)
+    try:
+        rpc.call("z_sendmany", addr, [{"address": addr, "amount": "0.1", "bogus": 1}])
+        ck("z_sendmany unknown key raises", False)
+    except JSONRPCException as e:
+        ck("z_sendmany unknown key -> code -8", e.code == -8, e.code)
+    try:
+        rpc.call("z_sendmany", addr, [{"amount": "0.1"}])
+        ck("z_sendmany missing address raises", False)
+    except JSONRPCException as e:
+        ck("z_sendmany missing address -> code -8", e.code == -8, e.code)
+    try:
+        rpc.call("z_sendmany", addr, [{"address": addr}])
+        ck("z_sendmany missing amount raises", False)
+    except JSONRPCException as e:
+        ck("z_sendmany missing amount -> code -8", e.code == -8, e.code)
+    try:
+        rpc.call("z_sendmany", addr, [{"address": addr, "amount": "0.1", "memo": 123}])
+        ck("z_sendmany non-string memo raises", False)
+    except JSONRPCException as e:
+        ck("z_sendmany non-string memo -> code -3", e.code == -3, e.code)
+    try:
+        rpc.call("z_sendmany", addr,
+                 [{"address": addr, "amount": "0.1"}, {"address": addr, "amount": "0.2"}])
+        ck("z_sendmany duplicate recipient raises", False)
+    except JSONRPCException as e:
+        ck("z_sendmany duplicate recipient -> code -8", e.code == -8, e.code)
+    try:
+        rpc.call("z_sendmany", addr, [{"address": addr, "amount": "0.1"}], "six")
+        ck("z_sendmany non-integer minconf raises", False)
+    except JSONRPCException as e:
+        ck("z_sendmany non-integer minconf -> code -3", e.code == -3, e.code)
+    try:
+        # A malformed opid is -8; a well-formed-but-unknown one is silently omitted (below).
+        rpc.call("z_getoperationstatus", ["not-an-opid"])
+        ck("z_getoperationstatus bad opid raises", False)
+    except JSONRPCException as e:
+        ck("z_getoperationstatus bad opid -> code -8", e.code == -8, e.code)
+    try:
+        rpc.call("z_getoperationstatus", "notarray")
+        ck("z_getoperationstatus non-array raises", False)
+    except JSONRPCException as e:
+        ck("z_getoperationstatus non-array -> code -8", e.code == -8, e.code)
+    try:
+        rpc.call("z_getoperationstatus", [123])
+        ck("z_getoperationstatus non-string opid raises", False)
+    except JSONRPCException as e:
+        ck("z_getoperationstatus non-string opid -> code -8", e.code == -8, e.code)
+    ck("z_listoperationids returns a list", isinstance(rpc.call("z_listoperationids"), list))
+    _unknown_opid = "opid-00000000-0000-0000-0000-000000000000"
+    ck("z_getoperationstatus unknown opid omitted",
+       rpc.call("z_getoperationstatus", [_unknown_opid]) == [])
+    ck("z_getoperationresult unknown opid omitted",
+       rpc.call("z_getoperationresult", [_unknown_opid]) == [])
     try:
         rpc.call("getrawtransaction", "00" * 32)
         ck("getrawtransaction unknown raises", False)

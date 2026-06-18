@@ -352,6 +352,10 @@ the validator's job there - so those rows are all - .
 | `getreceivedbyaddress`, `listreceivedbyaddress`, `getreceivedbylabel`, `listreceivedbylabel` | ✓ | - | Core shapes over diversified receiving addresses; change never counted |
 | `sendtoaddress` | ✓ | - (`z_sendmany` is async, returns an operation id) | Synchronous: builds, proves, broadcasts, returns txid; ZIP-317 fee; `subtractfeefromamount`/`fee_rate` → `-8`; extra trailing `memo` hex param |
 | `sendmany` | ✓ | - (`z_sendmany`) | Same; dummy `""` first arg as in Core |
+| `z_sendmany` | ✓ (Orchard-only) | ✓ | **Async**: returns an `opid`, proves/broadcasts on a background task; spends from the wallet's Orchard account (`fromaddress` must be one of its own addresses; `ANY_TADDR`/foreign → `-5`); zcashd `amounts` array with per-recipient `memo`; ZIP-317 fee (explicit `fee` → `-8`); `minconf` honored; `privacyPolicy` mapped onto `[spend] privacy_policy` (unknown → `-8`) |
+| `z_getoperationstatus` | ✓ | ✓ | Status objects for the wallet's operations, non-destructive; per-wallet scoped; unknown opid omitted, malformed opid → `-8` |
+| `z_getoperationresult` | ✓ | ✓ | Like `z_getoperationstatus`, but returns only finished operations and removes them from memory |
+| `z_listoperationids` | ✓ | ✓ | The wallet's operation ids; optional status filter (`queued`/`executing`/`success`/`failed`/`cancelled`) |
 | `encryptwallet` | ✓ | - (encrypted at init) | Encrypts the age keystore in place; mnemonic and addresses unchanged (Core re-seeds and demands a new backup) |
 | `walletpassphrase` | ✓ | ✓ | Unlock with a timeout in seconds (capped at 100,000,000 - about 3 years, same cap as Bitcoin Core), auto-relock when it expires; locked send → `-13`, wrong passphrase `-14`, unencrypted wallet `-15` |
 | `walletpassphrasechange` | ✓ | - | Core semantics |

@@ -970,8 +970,12 @@ impl WalletActor {
                 let res = self.get_new_address(label);
                 let _ = reply.send(res);
             }
-            WalletCommand::Send { request, reply } => {
-                let res = self.do_send(request).await;
+            WalletCommand::Send {
+                request,
+                confirmations,
+                reply,
+            } => {
+                let res = self.do_send(request, confirmations).await;
                 let _ = reply.send(res);
             }
             WalletCommand::GetRawTx { txid, reply } => {
@@ -1082,7 +1086,11 @@ impl WalletActor {
         Ok(encoded)
     }
 
-    async fn do_send(&mut self, request: TransactionRequest) -> Result<TxId, RpcError> {
+    async fn do_send(
+        &mut self,
+        request: TransactionRequest,
+        confirmations: Option<ConfirmationsPolicy>,
+    ) -> Result<TxId, RpcError> {
         // Hard backstop: if an encrypted wallet's unlock has expired but proactive relock
         // hasn't fired yet (e.g. a long sync batch was in progress), lock now so the spend
         // can't slip through past its timeout. `derive_usk` then returns -13 as expected.
@@ -1095,7 +1103,9 @@ impl WalletActor {
         // single send doesn't block the actor thread from being cooperatively yielded.
         let net = self.network;
         let account_id = self.account_id;
-        let policy = self.confirmations_policy;
+        // A per-call `minconf` (z_sendmany) overrides the wallet-wide policy for this send's
+        // note selection; the synchronous sends pass `None` and use the configured policy.
+        let policy = confirmations.unwrap_or(self.confirmations_policy);
         let prover = &self.prover;
         let db = &mut self.db_data;
         let (txid, raw): (TxId, Vec<u8>) =

@@ -101,6 +101,9 @@ pub enum WalletCommand {
     },
     Send {
         request: TransactionRequest,
+        /// Per-call confirmations override (`z_sendmany`'s `minconf`). `None` uses the
+        /// wallet-wide policy; `Some` overrides note selection for this send only.
+        confirmations: Option<ConfirmationsPolicy>,
         reply: oneshot::Sender<Result<TxId, RpcError>>,
     },
     /// Fetch the raw bytes of a transaction (from the wallet, else lightwalletd).
@@ -184,9 +187,20 @@ impl WalletHandle {
             .await
     }
 
-    pub async fn send(&self, request: TransactionRequest) -> Result<TxId, RpcError> {
-        self.dispatch(|reply| WalletCommand::Send { request, reply })
-            .await
+    /// Build, prove, and broadcast a send. `confirmations` overrides the wallet-wide
+    /// confirmations policy for this send's note selection (`z_sendmany`'s `minconf`); `None`
+    /// uses the configured policy, as the synchronous `sendtoaddress`/`sendmany` do.
+    pub async fn send(
+        &self,
+        request: TransactionRequest,
+        confirmations: Option<ConfirmationsPolicy>,
+    ) -> Result<TxId, RpcError> {
+        self.dispatch(|reply| WalletCommand::Send {
+            request,
+            confirmations,
+            reply,
+        })
+        .await
     }
 
     pub async fn get_raw_tx(&self, txid: TxId) -> Result<Option<RawTx>, RpcError> {

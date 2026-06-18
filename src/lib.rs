@@ -14,6 +14,7 @@ pub mod init;
 pub mod keystore;
 pub mod lightwalletd;
 pub mod network;
+pub mod operations;
 pub mod rewrap;
 pub mod rpc;
 pub mod server;

@@ -791,6 +791,192 @@ async fn regtest_funded_orchard_receive() {
     );
     mine_until_confirmed(&zebrad, &zecd, &txid_many, "2-output sendmany").await;
 
+    // ---- Phase 6b: z_sendmany - the asynchronous send + operation tracking ----
+    //
+    // zcashd's async send: z_sendmany returns an opid immediately and proves/broadcasts the
+    // transaction on a background task, tracked by z_getoperationstatus / z_getoperationresult
+    // / z_listoperationids. First age the 2-output-sendmany change to spendability so the async
+    // send has notes to spend.
+    let tip = zecd.block_count().await.expect("getblockcount");
+    zebrad
+        .generate_blocks(4)
+        .await
+        .expect("age the sendmany change");
+    zecd.wait_until_synced(tip + 4, FUND_TIMEOUT)
+        .await
+        .expect("scan the change-aging blocks");
+
+    // fromaddress is zecd's own account address (zcashd requires one; zecd validates ownership).
+    let opid = zecd
+        .call(
+            "z_sendmany",
+            json!([zecd_ua, [{ "address": funder_ua, "amount": 0.01 }]]),
+        )
+        .await
+        .expect("z_sendmany returns an operation id");
+    let opid = opid.as_str().expect("opid is a string").to_string();
+    assert!(opid.starts_with("opid-"), "opid shape: {opid}");
+
+    // The operation is immediately visible in z_listoperationids for this wallet.
+    let ids = zecd
+        .call("z_listoperationids", json!([]))
+        .await
+        .expect("z_listoperationids");
+    assert!(
+        ids.as_array()
+            .expect("array")
+            .iter()
+            .any(|v| v == &json!(opid)),
+        "new opid appears in z_listoperationids: {ids}"
+    );
+
+    // Poll z_getoperationstatus until the background send finishes (60s budget covers a debug
+    // build's slow proving); a failed operation fails the test.
+    let mut op_txid = None;
+    for _ in 0..120 {
+        let st = zecd
+            .call("z_getoperationstatus", json!([[opid]]))
+            .await
+            .expect("z_getoperationstatus");
+        let obj = st
+            .as_array()
+            .expect("status array")
+            .first()
+            .expect("our operation is present")
+            .clone();
+        assert_eq!(obj["id"], json!(opid), "status carries our opid: {obj}");
+        match obj["status"].as_str().expect("status string") {
+            "success" => {
+                assert!(
+                    !obj["execution_secs"].is_null(),
+                    "a successful op reports execution_secs: {obj}"
+                );
+                op_txid = Some(
+                    obj["result"]["txid"]
+                        .as_str()
+                        .expect("a successful op carries result.txid")
+                        .to_string(),
+                );
+                break;
+            }
+            "failed" => panic!("z_sendmany operation failed: {obj}"),
+            _ => tokio::time::sleep(Duration::from_millis(500)).await,
+        }
+    }
+    let op_txid = op_txid.expect("z_sendmany operation reached success");
+    assert_eq!(op_txid.len(), 64, "operation result txid is display hex");
+
+    // z_getoperationresult returns the finished op exactly once and removes it from memory.
+    let res = zecd
+        .call("z_getoperationresult", json!([[opid]]))
+        .await
+        .expect("z_getoperationresult");
+    let res = res.as_array().expect("result array");
+    assert_eq!(res.len(), 1, "one finished op is returned: {res:?}");
+    assert_eq!(res[0]["result"]["txid"], json!(op_txid));
+    let after = zecd
+        .call("z_getoperationstatus", json!([[opid]]))
+        .await
+        .expect("z_getoperationstatus after result");
+    assert!(
+        after.as_array().expect("array").is_empty(),
+        "operation removed after z_getoperationresult: {after}"
+    );
+
+    mine_until_confirmed(&zebrad, &zecd, &op_txid, "z_sendmany async operation").await;
+
+    // ---- Phase 6c: z_sendmany failure + tracking edge cases ----
+    //
+    // These exercise branches that need real chain state / foreign addresses: fromaddress
+    // ownership, the FullPrivacy per-call policy, a *failed* async operation (and that minconf
+    // is honored), and multiwallet scoping of the tracking RPCs.
+
+    // A syntactically valid but foreign fromaddress is rejected by the ownership check (-5),
+    // distinct from the undecodable-address case the conformance suite covers.
+    let err = zecd
+        .call(
+            "z_sendmany",
+            json!([funder_ua, [{ "address": funder_ua, "amount": 0.001 }]]),
+        )
+        .await
+        .expect_err("a fromaddress that isn't the wallet's own must be rejected");
+    assert_eq!(err.code(), Some(-5), "foreign fromaddress -> -5: {err}");
+
+    // FullPrivacy (per-call) must reject a transparent recipient, mapping through to build_payment.
+    let err = zecd
+        .call(
+            "z_sendmany",
+            json!([zecd_ua, [{ "address": funder_taddr, "amount": 0.001 }], null, null, "FullPrivacy"]),
+        )
+        .await
+        .expect_err("FullPrivacy must reject a transparent recipient");
+    assert_eq!(
+        err.code(),
+        Some(-8),
+        "FullPrivacy + transparent recipient -> -8: {err}"
+    );
+
+    // minconf is honored: an absurd minconf makes the send unsatisfiable, so the async op
+    // reaches `failed` (whereas the default-minconf send in Phase 6b succeeded - that A/B is
+    // the proof minconf threads through). The concrete error is librustzcash's
+    // `-4 "Must scan blocks first"` (the requested anchor depth is unreachable), so assert the
+    // failed-op *shape* - a negative code + a message, no result - not one exact error code.
+    let opid = zecd
+        .call(
+            "z_sendmany",
+            json!([zecd_ua, [{ "address": funder_ua, "amount": 0.001 }], 9_999_999]),
+        )
+        .await
+        .expect("z_sendmany with a high minconf still returns an opid")
+        .as_str()
+        .expect("opid string")
+        .to_string();
+    let mut saw_failed = false;
+    for _ in 0..120 {
+        let st = zecd
+            .call("z_getoperationstatus", json!([[opid]]))
+            .await
+            .expect("z_getoperationstatus");
+        let obj = st
+            .as_array()
+            .expect("status array")
+            .first()
+            .expect("our operation is present")
+            .clone();
+        match obj["status"].as_str().expect("status string") {
+            "failed" => {
+                let err = &obj["error"];
+                assert!(
+                    err["code"].as_i64().is_some_and(|c| c < 0),
+                    "the failed op carries a negative JSON-RPC error code: {obj}"
+                );
+                assert!(
+                    err["message"].as_str().is_some_and(|m| !m.is_empty()),
+                    "the failed op carries an error message: {obj}"
+                );
+                assert!(
+                    obj.get("result").is_none(),
+                    "no result on a failed op: {obj}"
+                );
+                saw_failed = true;
+                break;
+            }
+            "success" => panic!("z_sendmany with minconf=9999999 must not succeed: {obj}"),
+            _ => tokio::time::sleep(Duration::from_millis(300)).await,
+        }
+    }
+    assert!(
+        saw_failed,
+        "the high-minconf operation reached the failed state"
+    );
+
+    // The tracking RPCs are wallet-routed: an unknown wallet is -18.
+    let err = zecd
+        .call_wallet("nope", "z_listoperationids", json!([]))
+        .await
+        .expect_err("an unknown wallet must be rejected");
+    assert_eq!(err.code(), Some(-18), "unknown wallet -> -18: {err}");
+
     // ---- Phase 7: sendrawtransaction - broadcasting committed raw bytes by hand ----
     //
     // Build a committed-but-unbroadcast send the same way Phase 3 does (upstream down),
