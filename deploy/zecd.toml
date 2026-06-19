@@ -9,18 +9,13 @@ default_wallet = "default"
 dir = "/var/lib/zecd/default"
 
 [backend]
-# Failover, tried in order, always preferring the first (the daemon snaps back to it when it
-# recovers). Here: the co-located zebra full node first (zebra:// = its JSON-RPC, no
-# lightwalletd in between), then the public testnet endpoint if the local node is down.
-servers = ["zebra://zebra:18234", "https://testnet.zec.rocks:443"]
-# For a MAINNET deployment, set network = "main" above and use the public zecrocks failover pair:
-# servers = ["zebra://zebra:18234", "https://zec.rocks:443", "https://eu.zec.rocks:443"]
-# Running the optional lightwalletd profile (e.g. to also serve mobile light clients)? Slot it
-# in as a fallback: servers = ["zebra://zebra:18234", "http://lightwalletd:9067", ...]
+# The co-located zebra full node's JSON-RPC (zebra:// = direct to zebrad, no lightwalletd).
+server = "zebra://zebra:18234"
+# For a MAINNET deployment, set network = "main" above and the mainnet RPC port:
+# server = "zebra://zebra:8234"
 connect_timeout_secs = 10
 reconnect_base_secs = 1
 reconnect_max_secs = 60
-primary_recheck_secs = 60
 
 [rpc]
 # Bind to all interfaces so the published container port is reachable; protect with auth and a

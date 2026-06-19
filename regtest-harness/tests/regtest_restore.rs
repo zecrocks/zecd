@@ -11,15 +11,13 @@
 //! `stop` RPC, asserting bitcoind's reply shape and a clean exit - the only live
 //! verification of `stop` semantics.
 //!
-//! Extended tier: set `ZECD_REGTEST_EXTENDED=1` (plus ZEBRAD_BIN / LIGHTWALLETD_BIN).
+//! Extended tier: set `ZECD_REGTEST_EXTENDED=1` (plus ZEBRAD_BIN).
 //! Skips cleanly otherwise.
 
 use std::time::Duration;
 
 use serde_json::json;
-use zecd_regtest_harness::{
-    extended_enabled, pick_port, resolve_bin, Lightwalletd, Zebrad, Zecd, ZecdConfig,
-};
+use zecd_regtest_harness::{extended_enabled, pick_port, resolve_bin, Zebrad, Zecd, ZecdConfig};
 
 const INITIAL_BLOCKS: u32 = 10;
 const SYNC_TIMEOUT: Duration = Duration::from_secs(120);
@@ -33,11 +31,9 @@ async fn regtest_stop_and_restore() {
         );
         return;
     }
-    let (Some(zebrad_bin), Some(lwd_bin)) =
-        (resolve_bin("ZEBRAD_BIN"), resolve_bin("LIGHTWALLETD_BIN"))
-    else {
+    let Some(zebrad_bin) = resolve_bin("ZEBRAD_BIN") else {
         eprintln!(
-            "SKIP regtest_stop_and_restore: set ZEBRAD_BIN and LIGHTWALLETD_BIN (see \
+            "SKIP regtest_stop_and_restore: set ZEBRAD_BIN (see \
              README.md). The harness still compiled and linked."
         );
         return;
@@ -48,14 +44,11 @@ async fn regtest_stop_and_restore() {
         .generate_blocks(INITIAL_BLOCKS)
         .await
         .expect("mine the initial chain");
-    let lwd = Lightwalletd::start(&lwd_bin, zebrad.rpc_port)
-        .await
-        .expect("launch lightwalletd");
 
     // 1. The original wallet: capture its generated mnemonic and its UFVK (the
     //    deterministic fingerprint of the seed's key material; exported before `stop`
     //    tears down the datadir).
-    let cfg_a = ZecdConfig::new(lwd.grpc_port, pick_port().expect("pick zecd rpc port"));
+    let cfg_a = ZecdConfig::new(zebrad.rpc_port, pick_port().expect("pick zecd rpc port"));
     let zecd_a = Zecd::start(&cfg_a)
         .await
         .expect("start the original wallet");
@@ -90,7 +83,7 @@ async fn regtest_stop_and_restore() {
 
     // 3. Restore from the captured mnemonic on a fresh datadir. Birthday 2 is the lowest
     //    height with a fetchable tree state (the funder uses the same convention).
-    let mut cfg_b = ZecdConfig::new(lwd.grpc_port, pick_port().expect("pick zecd rpc port"));
+    let mut cfg_b = ZecdConfig::new(zebrad.rpc_port, pick_port().expect("pick zecd rpc port"));
     cfg_b.restore_mnemonic = Some(mnemonic);
     cfg_b.birthday = Some(2);
     let zecd_b = Zecd::start(&cfg_b)

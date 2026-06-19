@@ -5,13 +5,11 @@ use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
 use anyhow::anyhow;
-use base64::Engine as _;
 use bip0039::{English, Mnemonic};
 use secrecy::{ExposeSecret, SecretVec, Zeroize};
 use serde::{Deserialize, Serialize};
 use zcash_protocol::consensus::{BlockHeight, NetworkUpgrade, Parameters};
 
-use crate::keystore::{KeystoreProvider, WrapContext};
 use crate::network::ZNetwork;
 
 /// A wallet passphrase, in `age`'s own `secrecy` version (the scrypt recipient/identity APIs
@@ -23,12 +21,6 @@ const KEYS_FILE: &str = "keys.toml";
 /// `keys.toml` `encryption` marker value: the mnemonic is wrapped with a passphrase (age
 /// scrypt). Absent (or any other value) means the legacy identity-file model (no passphrase).
 const ENC_PASSPHRASE: &str = "passphrase";
-
-/// `keys.toml` `encryption` marker value: the mnemonic is age-encrypted to a dedicated
-/// x25519 identity whose secret is itself wrapped by a cloud KMS key (the `[kms]` table).
-/// In Bitcoin Core terms the wallet is *unencrypted* (no user passphrase; it auto-unlocks
-/// at startup via cloud credentials), so `is_encrypted()` stays false.
-const ENC_KMS: &str = "kms";
 
 pub fn keys_path(wallet_dir: &Path) -> PathBuf {
     wallet_dir.join(KEYS_FILE)
@@ -42,23 +34,6 @@ pub struct WalletStore {
     /// True when the mnemonic is passphrase-encrypted (age scrypt) rather than wrapped to the
     /// age identity file. This is zecd's analog of Bitcoin Core's `HasEncryptionKeys()`.
     encrypted: bool,
-    /// `Some` when the mnemonic's age identity is wrapped by a cloud KMS key.
-    kms: Option<KmsInfo>,
-}
-
-/// Cloud-KMS wrapping metadata for a `encryption = "kms"` wallet, parsed from the `[kms]`
-/// table of `keys.toml`. Everything here is non-secret: the wrapped identity is useless
-/// without IAM permission to call Decrypt on the KMS key.
-#[derive(Debug, Clone)]
-pub struct KmsInfo {
-    pub provider: KeystoreProvider,
-    /// AWS key ARN/id/alias, or the GCP cryptoKey resource name.
-    pub key: String,
-    /// KMS ciphertext of the age x25519 identity (raw bytes; base64 in the file).
-    pub wrapped_identity: Vec<u8>,
-    /// Wallet label bound into the encryption context at wrap time. Stored (not derived
-    /// from the runtime wallet name) so renaming/moving the wallet can't break decryption.
-    pub context_wallet: String,
 }
 
 #[derive(Deserialize, Serialize)]
@@ -66,25 +41,10 @@ struct StoreEncoding {
     mnemonic: Option<String>,
     network: Option<String>,
     birthday: Option<u32>,
-    /// `"passphrase"` when the mnemonic is scrypt/passphrase-encrypted, `"kms"` when its
-    /// identity is cloud-KMS-wrapped; omitted for the legacy identity-file model so existing
-    /// `keys.toml` files round-trip unchanged.
+    /// `"passphrase"` when the mnemonic is scrypt/passphrase-encrypted; omitted for the legacy
+    /// identity-file model so existing `keys.toml` files round-trip unchanged.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     encryption: Option<String>,
-    /// Cloud-KMS wrapping metadata; present iff `encryption = "kms"`. Must stay the last
-    /// field: TOML requires tables to follow scalar values.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    kms: Option<KmsEncoding>,
-}
-
-#[derive(Deserialize, Serialize)]
-struct KmsEncoding {
-    provider: String,
-    key: String,
-    /// base64 of the KMS ciphertext wrapping the age x25519 identity.
-    wrapped_identity: String,
-    /// Wallet label fixed into the encryption context at wrap time.
-    wallet: String,
 }
 
 impl WalletStore {
@@ -107,32 +67,6 @@ impl WalletStore {
             network: Some(network.name().to_string()),
             birthday: Some(u32::from(birthday)),
             encryption: None,
-            kms: None,
-        };
-        write_keys_atomic(wallet_dir, &encoding, true)
-    }
-
-    /// Create a new `keys.toml` with the mnemonic age-encrypted to `recipient` and the
-    /// matching identity stored KMS-wrapped (`info`) - the cloud-keystore wallet model:
-    /// auto-unlocks at startup via one IAM-gated KMS Decrypt, "unencrypted" in Bitcoin Core
-    /// terms (no passphrase RPCs apply).
-    pub fn init_with_kms(
-        wallet_dir: &Path,
-        recipient: &age::x25519::Recipient,
-        info: &KmsInfo,
-        mnemonic: &Mnemonic,
-        birthday: BlockHeight,
-        network: ZNetwork,
-    ) -> anyhow::Result<()> {
-        let encoding = StoreEncoding {
-            mnemonic: Some(encrypt_mnemonic(
-                std::iter::once(recipient as &dyn age::Recipient),
-                mnemonic,
-            )?),
-            network: Some(network.name().to_string()),
-            birthday: Some(u32::from(birthday)),
-            encryption: Some(ENC_KMS.to_string()),
-            kms: Some(encode_kms(info)),
         };
         write_keys_atomic(wallet_dir, &encoding, true)
     }
@@ -154,7 +88,6 @@ impl WalletStore {
             network: Some(network.name().to_string()),
             birthday: Some(u32::from(birthday)),
             encryption: Some(ENC_PASSPHRASE.to_string()),
-            kms: None,
         };
         write_keys_atomic(wallet_dir, &encoding, true)
     }
@@ -172,7 +105,6 @@ impl WalletStore {
             network: Some(network.name().to_string()),
             birthday: Some(u32::from(birthday)),
             encryption: None,
-            kms: None,
         };
         write_keys_atomic(wallet_dir, &encoding, true)
     }
@@ -200,31 +132,11 @@ impl WalletStore {
 
         let encrypted = encoding.encryption.as_deref() == Some(ENC_PASSPHRASE);
 
-        // A "kms" wallet without (valid) wrapping metadata is unusable - fail loudly at
-        // open rather than surfacing a confusing decrypt error later.
-        let kms = if encoding.encryption.as_deref() == Some(ENC_KMS) {
-            let enc = encoding
-                .kms
-                .as_ref()
-                .ok_or_else(|| anyhow!("keys.toml: encryption = \"kms\" but no [kms] table"))?;
-            Some(KmsInfo {
-                provider: KeystoreProvider::parse(&enc.provider)?,
-                key: enc.key.clone(),
-                wrapped_identity: base64::engine::general_purpose::STANDARD
-                    .decode(&enc.wrapped_identity)
-                    .map_err(|e| anyhow!("keys.toml: [kms] wrapped_identity: {e}"))?,
-                context_wallet: enc.wallet.clone(),
-            })
-        } else {
-            None
-        };
-
         Ok(WalletStore {
             network,
             birthday,
             seed_ciphertext: encoding.mnemonic,
             encrypted,
-            kms,
         })
     }
 
@@ -280,82 +192,13 @@ impl WalletStore {
             .transpose()
     }
 
-    /// Atomically re-wrap the mnemonic `phrase` under `passphrase` (age scrypt) and rewrite
-    /// `keys.toml` with the `encryption = "passphrase"` marker, preserving network/birthday.
-    /// Used by `zecd rewrap` (the offline at-rest re-wrap / KMS-rotation CLI). Drops any
-    /// `[kms]` table - this is also the migration path *off* a cloud keystore.
-    pub fn rewrite_with_passphrase(
-        &self,
-        wallet_dir: &Path,
-        passphrase: Passphrase,
-        phrase: &str,
-    ) -> anyhow::Result<()> {
-        let encoding = StoreEncoding {
-            mnemonic: Some(encrypt_phrase_with_passphrase(passphrase, phrase)?),
-            network: Some(self.network.name().to_string()),
-            birthday: Some(u32::from(self.birthday)),
-            encryption: Some(ENC_PASSPHRASE.to_string()),
-            kms: None,
-        };
-        write_keys_atomic(wallet_dir, &encoding, false)
-    }
-
-    /// Atomically re-wrap the mnemonic `phrase` to `recipient` with KMS metadata `info` and
-    /// rewrite `keys.toml` with the `encryption = "kms"` marker, preserving network/birthday.
-    /// Used by `zecd rewrap` (migration onto a cloud keystore, or KMS key rotation).
-    pub fn rewrite_with_kms(
-        &self,
-        wallet_dir: &Path,
-        recipient: &age::x25519::Recipient,
-        info: &KmsInfo,
-        phrase: &str,
-    ) -> anyhow::Result<()> {
-        // Parsing validates the phrase before anything is overwritten.
-        let mnemonic = <Mnemonic<English>>::from_phrase(phrase)?;
-        let encoding = StoreEncoding {
-            mnemonic: Some(encrypt_mnemonic(
-                std::iter::once(recipient as &dyn age::Recipient),
-                &mnemonic,
-            )?),
-            network: Some(self.network.name().to_string()),
-            birthday: Some(u32::from(self.birthday)),
-            encryption: Some(ENC_KMS.to_string()),
-            kms: Some(encode_kms(info)),
-        };
-        write_keys_atomic(wallet_dir, &encoding, false)
-    }
-
     pub fn has_seed(&self) -> bool {
         self.seed_ciphertext.is_some()
     }
 
     /// Whether the mnemonic is passphrase-encrypted (Bitcoin Core's `HasEncryptionKeys()`).
-    /// A cloud-KMS wallet is *not* "encrypted" in this sense - it has no passphrase and
-    /// auto-unlocks at startup, like the identity-file model.
     pub fn is_encrypted(&self) -> bool {
         self.encrypted
-    }
-
-    /// Cloud-KMS wrapping metadata, when this is a `encryption = "kms"` wallet.
-    pub fn kms(&self) -> Option<&KmsInfo> {
-        self.kms.as_ref()
-    }
-
-    /// The encryption context the wallet's KMS ciphertext was bound to at wrap time.
-    pub fn kms_context(&self) -> Option<WrapContext> {
-        self.kms.as_ref().map(|info| WrapContext {
-            wallet: info.context_wallet.clone(),
-            network: self.network.name().to_string(),
-        })
-    }
-}
-
-fn encode_kms(info: &KmsInfo) -> KmsEncoding {
-    KmsEncoding {
-        provider: info.provider.name().to_string(),
-        key: info.key.clone(),
-        wrapped_identity: base64::engine::general_purpose::STANDARD.encode(&info.wrapped_identity),
-        wallet: info.context_wallet.clone(),
     }
 }
 
@@ -503,124 +346,6 @@ mod tests {
         assert!(st
             .decrypt_seed_with_passphrase(Passphrase::from("wrong".to_string()))
             .is_err());
-    }
-
-    /// The KMS wallet model: mnemonic age-encrypted to an x25519 identity, the identity
-    /// stored wrapped (here by stand-in bytes - the keystore providers have their own
-    /// round-trip tests against fake KMS servers). RPC-wise it must read as *unencrypted*.
-    #[test]
-    fn kms_wallet_roundtrips_metadata_and_is_not_marked_encrypted() {
-        let dir = tempfile::tempdir().unwrap();
-        let identity = age::x25519::Identity::generate();
-        let mnemonic = <Mnemonic<English>>::from_phrase(PHRASE).unwrap();
-        let info = KmsInfo {
-            provider: KeystoreProvider::AwsKms,
-            key: "arn:aws:kms:us-east-1:111122223333:key/abc".to_string(),
-            wrapped_identity: vec![1, 2, 3, 4],
-            context_wallet: "default".to_string(),
-        };
-        WalletStore::init_with_kms(
-            dir.path(),
-            &identity.to_public(),
-            &info,
-            &mnemonic,
-            BlockHeight::from_u32(7),
-            ZNetwork::Test,
-        )
-        .unwrap();
-
-        let st = WalletStore::read(dir.path()).unwrap();
-        assert!(
-            !st.is_encrypted(),
-            "KMS wallets are Bitcoin-Core-unencrypted"
-        );
-        assert!(st.has_seed());
-        let parsed = st.kms().expect("kms metadata");
-        assert_eq!(parsed.provider, KeystoreProvider::AwsKms);
-        assert_eq!(parsed.key, info.key);
-        assert_eq!(parsed.wrapped_identity, info.wrapped_identity);
-        let ctx = st.kms_context().unwrap();
-        assert_eq!(ctx.wallet, "default");
-        assert_eq!(ctx.network, "test");
-
-        // The (unwrapped) identity decrypts the seed, like the identity-file model.
-        let seed = st
-            .decrypt_seed(std::iter::once(&identity as &dyn age::Identity))
-            .unwrap()
-            .unwrap();
-        let expected = <Mnemonic<English>>::from_phrase(PHRASE)
-            .unwrap()
-            .to_seed("");
-        assert_eq!(seed.expose_secret().as_slice(), &expected[..]);
-
-        // Migration off KMS (`zecd rewrap` onto a passphrase) drops the [kms] table.
-        st.rewrite_with_passphrase(dir.path(), Passphrase::from("new pass".to_string()), PHRASE)
-            .unwrap();
-        let st2 = WalletStore::read(dir.path()).unwrap();
-        assert!(st2.is_encrypted());
-        assert!(st2.kms().is_none());
-    }
-
-    /// Passphrase-rotation core (used by `zecd rewrap`): re-wrapping the mnemonic from an old
-    /// passphrase to a new one. The new passphrase opens the wallet to the same seed,
-    /// network/birthday survive, and the old passphrase is revoked.
-    #[test]
-    fn passphrase_rotation_roundtrips_and_revokes_the_old() {
-        let dir = tempfile::tempdir().unwrap();
-        let mnemonic = <Mnemonic<English>>::from_phrase(PHRASE).unwrap();
-        WalletStore::init_with_passphrase(
-            dir.path(),
-            Passphrase::from("old pass".to_string()),
-            &mnemonic,
-            BlockHeight::from_u32(42),
-            ZNetwork::Test,
-        )
-        .unwrap();
-
-        // Decrypt with the old passphrase, then re-wrap under the new one.
-        let st = WalletStore::read(dir.path()).unwrap();
-        let phrase_bytes = st
-            .decrypt_mnemonic_with_passphrase(Passphrase::from("old pass".to_string()))
-            .unwrap()
-            .unwrap();
-        let phrase = std::str::from_utf8(phrase_bytes.expose_secret()).unwrap();
-        st.rewrite_with_passphrase(dir.path(), Passphrase::from("new pass".to_string()), phrase)
-            .unwrap();
-
-        let st = WalletStore::read(dir.path()).unwrap();
-        assert!(st.is_encrypted());
-        assert_eq!(u32::from(st.birthday), 42, "rotation preserves birthday");
-
-        // The new passphrase recovers the exact seed.
-        let seed = st
-            .decrypt_seed_with_passphrase(Passphrase::from("new pass".to_string()))
-            .unwrap()
-            .unwrap();
-        let expected = <Mnemonic<English>>::from_phrase(PHRASE)
-            .unwrap()
-            .to_seed("");
-        assert_eq!(seed.expose_secret().as_slice(), &expected[..]);
-
-        // The old passphrase is revoked.
-        assert!(st
-            .decrypt_seed_with_passphrase(Passphrase::from("old pass".to_string()))
-            .is_err());
-    }
-
-    /// A "kms" marker without usable metadata must fail at open, not at first send.
-    #[test]
-    fn kms_marker_without_table_is_rejected() {
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::write(
-            keys_path(dir.path()),
-            "mnemonic = \"x\"\nnetwork = \"test\"\nbirthday = 1\nencryption = \"kms\"\n",
-        )
-        .unwrap();
-        let err = WalletStore::read(dir.path())
-            .err()
-            .expect("kms marker without table must fail")
-            .to_string();
-        assert!(err.contains("[kms]"), "got: {err}");
     }
 
     #[test]

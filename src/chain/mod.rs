@@ -1,22 +1,14 @@
 //! The chain-data abstraction: everything the wallet needs from "upstream" (chain tip,
 //! compact blocks, tree state, subtree roots, tx broadcast/fetch, mempool visibility),
-//! expressed as the [`ChainSource`] trait with two backends:
+//! expressed as the [`ChainSource`] trait. The one backend is [`zebra::ZebraSource`] - a
+//! native zebrad JSON-RPC client that derives the data directly from a local full node
+//! (`getblock`, `z_gettreestate`, `z_getsubtreesbyindex`, `sendrawtransaction`,
+//! `getrawmempool`, …).
 //!
-//! - [`lwd::LwdSource`] - the lightwalletd gRPC client (`CompactTxStreamer`), for remote /
-//!   public endpoints (`zec.rocks`, a self-hosted lightwalletd, Tor, …).
-//! - [`zebra::ZebraSource`] - a native zebrad JSON-RPC client that derives the same data
-//!   directly from a local full node (`getblock`, `z_gettreestate`, `z_getsubtreesbyindex`,
-//!   `sendrawtransaction`, `getrawmempool`, …), removing the lightwalletd hop.
-//!
-//! The operations are exactly the lightwalletd calls the actor/sync engine were built
-//! on; the zebra backend reproduces each one's semantics (see `zebra.rs` for the mapping),
-//! so everything above this trait - the sync engine, reorg recovery, the rebroadcast loop,
-//! the mempool-driven 0-conf flow - is backend-agnostic and unchanged.
-//!
-//! [`AnySource`] is the enum the actor stores (both backends behind one concrete type); a
-//! future backend (e.g. an embedded Zaino service) is one more variant + impl.
+//! Everything above this trait - the sync engine, reorg recovery, the rebroadcast loop, the
+//! mempool-driven 0-conf flow - is backend-agnostic. [`AnySource`] is the enum the actor
+//! stores; a future backend (e.g. an embedded Zaino service) is one more variant + impl.
 
-pub mod lwd;
 pub mod zebra;
 
 use std::future::Future;
@@ -137,26 +129,21 @@ pub trait ChainSource: Send {
     fn subscribe_mempool(&mut self) -> impl Future<Output = anyhow::Result<MempoolStream>> + Send;
 }
 
-/// A connected backend of either kind: what the actor and `init` actually hold. Delegates
-/// every [`ChainSource`] method to the inner backend.
-// One instance exists per wallet actor, so the variant size gap is irrelevant.
-#[allow(clippy::large_enum_variant)]
+/// The connected backend the actor and `init` hold. Delegates every [`ChainSource`] method to
+/// the inner backend. (A single-variant enum today; a future backend is one more variant.)
 pub enum AnySource {
-    Lwd(lwd::LwdSource),
     Zebra(zebra::ZebraSource),
 }
 
 impl ChainSource for AnySource {
     async fn latest_block(&mut self) -> anyhow::Result<ChainTip> {
         match self {
-            AnySource::Lwd(s) => s.latest_block().await,
             AnySource::Zebra(s) => s.latest_block().await,
         }
     }
 
     async fn tree_state(&mut self, height: BlockHeight) -> anyhow::Result<service::TreeState> {
         match self {
-            AnySource::Lwd(s) => s.tree_state(height).await,
             AnySource::Zebra(s) => s.tree_state(height).await,
         }
     }
@@ -167,7 +154,6 @@ impl ChainSource for AnySource {
         end: BlockHeight,
     ) -> anyhow::Result<CompactBlockStream> {
         match self {
-            AnySource::Lwd(s) => s.compact_block_range(start, end).await,
             AnySource::Zebra(s) => s.compact_block_range(start, end).await,
         }
     }
@@ -177,45 +163,37 @@ impl ChainSource for AnySource {
         protocol: ShieldedProtocol,
     ) -> anyhow::Result<Vec<SubtreeRootInfo>> {
         match self {
-            AnySource::Lwd(s) => s.subtree_roots(protocol).await,
             AnySource::Zebra(s) => s.subtree_roots(protocol).await,
         }
     }
 
     async fn server_info(&mut self) -> anyhow::Result<ServerInfo> {
         match self {
-            AnySource::Lwd(s) => s.server_info().await,
             AnySource::Zebra(s) => s.server_info().await,
         }
     }
 
     async fn broadcast_tx(&mut self, data: Vec<u8>) -> anyhow::Result<BroadcastOutcome> {
         match self {
-            AnySource::Lwd(s) => s.broadcast_tx(data).await,
             AnySource::Zebra(s) => s.broadcast_tx(data).await,
         }
     }
 
     async fn fetch_tx(&mut self, txid: TxId) -> anyhow::Result<Option<FetchedTx>> {
         match self {
-            AnySource::Lwd(s) => s.fetch_tx(txid).await,
             AnySource::Zebra(s) => s.fetch_tx(txid).await,
         }
     }
 
     async fn subscribe_mempool(&mut self) -> anyhow::Result<MempoolStream> {
         match self {
-            AnySource::Lwd(s) => s.subscribe_mempool().await,
             AnySource::Zebra(s) => s.subscribe_mempool().await,
         }
     }
 }
 
 /// An in-order stream of compact blocks for one requested range.
-// At most one stream exists per sync batch, so the variant size gap is irrelevant.
-#[allow(clippy::large_enum_variant)]
 pub enum CompactBlockStream {
-    Lwd(tonic::Streaming<CompactBlock>),
     Zebra(zebra::ZebraBlockStream),
 }
 
@@ -223,7 +201,6 @@ impl CompactBlockStream {
     /// The next block, `Ok(None)` at end of range, or a transport-class error.
     pub async fn next(&mut self) -> anyhow::Result<Option<CompactBlock>> {
         match self {
-            CompactBlockStream::Lwd(s) => Ok(s.message().await?),
             CompactBlockStream::Zebra(s) => s.next().await,
         }
     }
@@ -232,17 +209,13 @@ impl CompactBlockStream {
 /// A live mempool subscription. Yields raw transactions; `Ok(None)` means the upstream
 /// closed the stream because a new block arrived (the actor's sync-now signal); `Err` is a
 /// transport-class failure (the actor just drops the subscription).
-// At most one subscription exists per wallet actor, so the variant size gap is irrelevant.
-#[allow(clippy::large_enum_variant)]
 pub enum MempoolStream {
-    Lwd(tonic::Streaming<service::RawTransaction>),
     Zebra(zebra::ZebraMempoolStream),
 }
 
 impl MempoolStream {
     pub async fn message(&mut self) -> anyhow::Result<Option<service::RawTransaction>> {
         match self {
-            MempoolStream::Lwd(s) => Ok(s.message().await?),
             MempoolStream::Zebra(s) => s.message().await,
         }
     }

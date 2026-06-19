@@ -27,9 +27,6 @@ pub struct AppState {
     pub work_queue: Arc<Semaphore>,
     /// Currently-executing commands, for `getrpcinfo.active_commands`.
     pub active: ActiveCommands,
-    /// Prometheus render handle when the `/metrics` recorder is installed; `None` disables the
-    /// `/metrics` route (e.g. in unit tests, or if the recorder failed to install).
-    pub metrics_handle: Option<metrics_exporter_prometheus::PrometheusHandle>,
     /// In-memory registry of async `z_*` operations (transient, like zcashd's), scoped per
     /// wallet. Shared across handlers; populated by `z_sendmany`, read by
     /// `z_getoperationstatus`/`z_getoperationresult`/`z_listoperationids`.

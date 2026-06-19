@@ -4,7 +4,7 @@
 //! where it helps operators, but the canonical source is the TOML config.
 
 use std::collections::BTreeMap;
-use std::net::{IpAddr, SocketAddr};
+use std::net::IpAddr;
 use std::num::NonZeroU32;
 use std::path::PathBuf;
 
@@ -17,9 +17,8 @@ use crate::network::ZNetwork;
 use crate::pools::{Pool, PoolSet};
 
 /// Default chain upstream: a local zebrad's JSON-RPC (`zebra://127.0.0.1:8234` on mainnet,
-/// `zebra://127.0.0.1:18234` on testnet/regtest - see `backend::ZEBRA_RPC_PORT_*`).
-/// Deployments without a local node set `[backend] server` to their own lightwalletd
-/// or a public preset (`zecrocks`).
+/// `zebra://127.0.0.1:18234` on testnet/regtest - see `backend::ZEBRA_RPC_PORT_*`). A zebrad
+/// on another host/port is set via `[backend] server = "zebra://host:port"`.
 pub const DEFAULT_SERVER: &str = "zebra";
 
 /// Binary configuration defaults (config file, datadir, ports).
@@ -46,23 +45,12 @@ pub const ZECD_DEFAULTS: BinaryDefaults = BinaryDefaults {
     health_port: 9233,
 };
 
-/// Resolve the ordered list of upstream server tokens by precedence:
-/// CLI `--server` > file `servers` array > file `server` string > built-in default
-/// (a local zebrad).
-fn select_server_tokens(
-    cli_server: Option<String>,
-    file_servers: Option<Vec<String>>,
-    file_server: Option<String>,
-) -> Vec<String> {
-    if let Some(s) = cli_server {
-        vec![s]
-    } else if let Some(list) = file_servers.filter(|l| !l.is_empty()) {
-        list
-    } else if let Some(s) = file_server {
-        vec![s]
-    } else {
-        vec![DEFAULT_SERVER.to_string()]
-    }
+/// Resolve the upstream `server` token by precedence: CLI `--server` > file `server` >
+/// built-in default (a local zebrad).
+fn select_server_token(cli_server: Option<String>, file_server: Option<String>) -> String {
+    cli_server
+        .or(file_server)
+        .unwrap_or_else(|| DEFAULT_SERVER.to_string())
 }
 
 #[derive(Debug, Clone)]
@@ -75,7 +63,6 @@ pub struct AppConfig {
     pub zebra: ZebraConfig,
     pub rpc: RpcConfig,
     pub keys: KeysConfig,
-    pub keystore: KeystoreConfig,
     pub sync: SyncConfig,
     pub spend: SpendConfig,
     /// Global default enabled pools / UA receivers, applied to wallets that don't override them
@@ -137,30 +124,19 @@ pub struct WalletEntry {
 
 #[derive(Debug, Clone)]
 pub struct BackendConfig {
-    /// Ordered list of server tokens; each is `zebra` (a local zebrad, the default) |
-    /// `zebra://host:port` | `ecc` | `ywallet` | `zecrocks` or a `host:port` (or a
-    /// comma-separated `host:port` list). Tried in order, always preferring the first.
-    pub servers: Vec<String>,
-    /// Optional SOCKS5 proxy to route every backend connection through, parsed from the
-    /// `connection` setting (`direct` | `tor` | `socks5://host:port`). `None` = direct.
-    pub proxy: Option<SocketAddr>,
-    /// TLS root certificates to trust (`native` or `webpki`).
-    pub tls_roots: crate::backend::TlsRoots,
-    /// Force TLS on/off; `None` = auto (TLS for remote hosts, plaintext for localhost).
-    pub force_tls: Option<bool>,
-    /// Per-attempt dial timeout (seconds) for connecting to a backend endpoint.
+    /// The upstream server token: `zebra` (a local zebrad, the default) or
+    /// `zebra://host:port` / `host:port`.
+    pub server: String,
+    /// Per-attempt dial timeout (seconds) for connecting to the backend endpoint.
     pub connect_timeout_secs: u64,
     /// Reconnect backoff base delay (seconds).
     pub reconnect_base_secs: u64,
     /// Reconnect backoff maximum delay (seconds).
     pub reconnect_max_secs: u64,
-    /// While running on a fallback, how often (seconds) to re-probe higher-priority servers.
-    pub primary_recheck_secs: u64,
 }
 
-/// `[zebra]` - credentials for `zebra://host:port` endpoints in the `[backend]`
-/// server list (direct-to-zebrad mode). All `zebra://` endpoints share these; a cookie
-/// file wins over user/password, and nothing set means no auth (zebrad with
+/// `[zebra]` - credentials for the `zebra://host:port` endpoint (direct-to-zebrad mode).
+/// A cookie file wins over user/password, and nothing set means no auth (zebrad with
 /// `enable_cookie_auth = false`).
 #[derive(Debug, Clone, Default)]
 pub struct ZebraConfig {
@@ -205,36 +181,6 @@ pub struct KeysConfig {
     pub age_identity: Option<PathBuf>,
     /// When true, decrypt the seed at startup so sends need no `walletpassphrase`.
     pub auto_unlock: bool,
-}
-
-/// `[keystore]` - a cloud KMS key that wraps the wallet's at-rest encryption key
-/// ("envelope encryption" / auto-unseal). `provider` + `key` are required to *create* a
-/// KMS wallet (`init --keystore`, `rewrap`); a daemon unlocking an existing KMS wallet
-/// reads provider/key from the wallet's own `keys.toml` and uses only `endpoint` from here.
-#[derive(Debug, Clone, Default)]
-pub struct KeystoreConfig {
-    pub provider: Option<crate::keystore::KeystoreProvider>,
-    /// AWS key ARN/id/alias, or GCP cryptoKey resource name.
-    pub key: Option<String>,
-    /// API endpoint override (emulators, VPC/private endpoints).
-    pub endpoint: Option<String>,
-}
-
-impl KeystoreConfig {
-    /// The configured keystore, required (for `init --keystore` / `rewrap`).
-    pub fn required(&self) -> anyhow::Result<crate::keystore::Keystore> {
-        match (self.provider, &self.key) {
-            (Some(provider), Some(key)) => Ok(crate::keystore::Keystore {
-                provider,
-                key: key.clone(),
-                endpoint: self.endpoint.clone(),
-            }),
-            _ => Err(anyhow::anyhow!(
-                "no cloud keystore configured: set [keystore] provider (\"aws-kms\" or \
-                 \"gcp-kms\") and key in the config file"
-            )),
-        }
-    }
 }
 
 #[derive(Debug, Clone)]
@@ -347,7 +293,6 @@ struct ConfigFile {
     zebra: Option<ZebraFile>,
     rpc: Option<RpcFile>,
     keys: Option<KeysFile>,
-    keystore: Option<KeystoreFile>,
     sync: Option<SyncFile>,
     spend: Option<SpendFile>,
     pools: Option<PoolsFile>,
@@ -385,14 +330,9 @@ struct WalletFile {
 #[serde(deny_unknown_fields)]
 struct BackendFile {
     server: Option<String>,
-    servers: Option<Vec<String>>,
-    connection: Option<String>,
-    tls_roots: Option<String>,
-    tls: Option<String>,
     connect_timeout_secs: Option<u64>,
     reconnect_base_secs: Option<u64>,
     reconnect_max_secs: Option<u64>,
-    primary_recheck_secs: Option<u64>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -421,14 +361,6 @@ struct RpcFile {
 struct KeysFile {
     age_identity: Option<PathBuf>,
     auto_unlock: Option<bool>,
-}
-
-#[derive(Debug, Default, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct KeystoreFile {
-    provider: Option<String>,
-    key: Option<String>,
-    endpoint: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -501,15 +433,9 @@ pub struct Cli {
     #[arg(long = "rpcauth", value_name = "USER:SALT$HASH")]
     pub rpc_auth: Vec<String>,
 
-    /// Chain upstream: zebra (local zebrad, default) | zebra://host:port | ecc | ywallet |
-    /// zecrocks | host:port[,host:port] (lightwalletd).
+    /// Chain upstream: `zebra` (local zebrad, the default) or `zebra://host:port`.
     #[arg(long, value_name = "SERVER")]
     pub server: Option<String>,
-
-    /// How to reach the backend: direct | tor | socks5://host:port (routes all traffic through
-    /// the SOCKS5 proxy).
-    #[arg(long, value_name = "MODE")]
-    pub connection: Option<String>,
 
     /// age identity file used to decrypt the wallet seed for sending.
     #[arg(long, value_name = "FILE", env = "ZECD_AGE_IDENTITY")]
@@ -524,9 +450,6 @@ pub struct Cli {
 pub enum Command {
     /// Create and initialize a new wallet (mnemonic + accounts), then exit.
     Init(InitArgs),
-    /// Re-wrap an existing wallet's mnemonic under the configured [keystore] cloud KMS key
-    /// (migrate at-rest custody onto AWS/GCP KMS, or rotate to a new KMS key), then exit.
-    Rewrap(RewrapArgs),
     /// Print a wallet's Unified Full Viewing Key (for pairing a watch-only instance via
     /// `init --ufvk`), then exit.
     ExportUfvk(ExportUfvkArgs),
@@ -553,29 +476,16 @@ pub struct InitArgs {
     #[arg(long)]
     pub encrypt: bool,
 
-    /// Wrap the wallet's at-rest encryption key with the cloud KMS key configured under
-    /// [keystore] (AWS KMS or Google Cloud KMS). The wallet auto-unlocks at startup via one
-    /// IAM-gated KMS Decrypt - no identity file, no passphrase.
-    #[arg(long, conflicts_with = "encrypt")]
-    pub keystore: bool,
-
     /// Create a watch-only wallet from this Unified Full Viewing Key instead of a mnemonic
     /// (export it from the spending wallet with `export-ufvk`). The wallet sees balances,
     /// history, and addresses, but holds no spending material - spend and encryption RPCs
-    /// are disabled. A watch-only wallet has no key to wrap, so this excludes `--keystore`.
-    #[arg(long, value_name = "UFVK", conflicts_with_all = ["restore", "encrypt", "keystore"])]
+    /// are disabled.
+    #[arg(long, value_name = "UFVK", conflicts_with_all = ["restore", "encrypt"])]
     pub ufvk: Option<String>,
 
     /// Optional birthday height; defaults to the current chain tip for new wallets.
     #[arg(long)]
     pub birthday: Option<u32>,
-}
-
-#[derive(Debug, clap::Args)]
-pub struct RewrapArgs {
-    /// Wallet name (selects <datadir>/<name>).
-    #[arg(long, default_value = "default")]
-    pub wallet: String,
 }
 
 #[derive(Debug, clap::Args)]
@@ -684,49 +594,20 @@ impl AppConfig {
 
         let backend_file = file.backend.unwrap_or(BackendFile {
             server: None,
-            servers: None,
-            connection: None,
-            tls_roots: None,
-            tls: None,
             connect_timeout_secs: None,
             reconnect_base_secs: None,
             reconnect_max_secs: None,
-            primary_recheck_secs: None,
         });
-        let tls_roots = match backend_file.tls_roots {
-            Some(s) => crate::backend::TlsRoots::parse(&s)?,
-            None => crate::backend::TlsRoots::default(),
-        };
-        let force_tls = match backend_file.tls {
-            Some(s) => crate::backend::parse_tls_mode(&s)?,
-            None => None,
-        };
-        let servers = select_server_tokens(
-            cli.server.clone(),
-            backend_file.servers,
-            backend_file.server,
-        );
-        // CLI `--connection` wins over the file `connection`; both parse to an optional SOCKS5
-        // proxy. Validated here so a typo fails at startup, before any wallet/network I/O.
-        let connection = cli
-            .connection
-            .clone()
-            .or(backend_file.connection)
-            .unwrap_or_else(|| "direct".to_string());
-        let proxy = crate::backend::parse_connection_mode(&connection)?;
+        let server = select_server_token(cli.server.clone(), backend_file.server);
         let reconnect_base_secs = backend_file.reconnect_base_secs.unwrap_or(1).max(1);
         let backend = BackendConfig {
-            servers,
-            proxy,
-            tls_roots,
-            force_tls,
+            server,
             connect_timeout_secs: backend_file.connect_timeout_secs.unwrap_or(10).max(1),
             reconnect_base_secs,
             reconnect_max_secs: backend_file
                 .reconnect_max_secs
                 .unwrap_or(60)
                 .max(reconnect_base_secs),
-            primary_recheck_secs: backend_file.primary_recheck_secs.unwrap_or(60).max(1),
         };
 
         let zebra_file = file.zebra.unwrap_or_default();
@@ -805,25 +686,6 @@ impl AppConfig {
             auto_unlock: keys_file.auto_unlock.unwrap_or(true),
         };
 
-        let keystore_file = file.keystore.unwrap_or_default();
-        let keystore = KeystoreConfig {
-            provider: keystore_file
-                .provider
-                .as_deref()
-                .map(crate::keystore::KeystoreProvider::parse)
-                .transpose()
-                .context("parsing [keystore] provider")?,
-            key: keystore_file.key,
-            endpoint: keystore_file.endpoint,
-        };
-        // Half-configured keystores fail at startup, not at the first init/rewrap/unlock.
-        if keystore.provider.is_some() && keystore.key.is_none() {
-            anyhow::bail!("[keystore] provider is set but key is missing");
-        }
-        if keystore.provider.is_none() && keystore.key.is_some() {
-            anyhow::bail!("[keystore] key is set but provider is missing");
-        }
-
         let sync_file = file.sync.unwrap_or(SyncFile {
             interval_secs: None,
             rebroadcast_secs: None,
@@ -882,7 +744,6 @@ impl AppConfig {
             zebra,
             rpc,
             keys,
-            keystore,
             sync,
             spend,
             pools,
@@ -1093,26 +954,6 @@ mod tests {
     }
 
     #[test]
-    fn keystore_section_parses_and_validates() {
-        let f: KeystoreFile = toml::from_str(
-            "provider = \"aws-kms\"\nkey = \"arn:aws:kms:us-east-1:1:key/k\"\nendpoint = \"http://localhost:4566\"",
-        )
-        .unwrap();
-        assert_eq!(f.provider.as_deref(), Some("aws-kms"));
-        // Unknown keys in the section are rejected like everywhere else.
-        assert!(toml::from_str::<KeystoreFile>("region = \"us-east-1\"").is_err());
-
-        // `required()` needs both provider and key (init --keystore / rewrap).
-        let cfg = KeystoreConfig {
-            provider: Some(crate::keystore::KeystoreProvider::GcpKms),
-            key: Some("projects/p/locations/l/keyRings/r/cryptoKeys/k".to_string()),
-            endpoint: None,
-        };
-        assert_eq!(cfg.required().unwrap().key, cfg.key.clone().unwrap());
-        assert!(KeystoreConfig::default().required().is_err());
-    }
-
-    #[test]
     fn privacy_policy_parses_known_values_only() {
         assert_eq!(
             SendPrivacy::parse("FullPrivacy").unwrap(),
@@ -1130,53 +971,35 @@ mod tests {
 
     #[test]
     fn server_token_precedence() {
-        // CLI wins over everything.
+        // CLI wins over the file `server`.
         assert_eq!(
-            select_server_tokens(
-                Some("cli:1".into()),
-                Some(vec!["arr:1".into()]),
-                Some("str:1".into())
-            ),
-            vec!["cli:1".to_string()]
+            select_server_token(Some("cli:1".into()), Some("str:1".into())),
+            "cli:1".to_string()
         );
-        // The `servers` array beats the legacy `server` string.
+        // The file `server` is used when there's no CLI flag.
         assert_eq!(
-            select_server_tokens(
-                None,
-                Some(vec!["a:1".into(), "b:2".into()]),
-                Some("str:1".into())
-            ),
-            vec!["a:1".to_string(), "b:2".to_string()]
-        );
-        // An empty array falls through to the string.
-        assert_eq!(
-            select_server_tokens(None, Some(vec![]), Some("str:1".into())),
-            vec!["str:1".to_string()]
+            select_server_token(None, Some("str:1".into())),
+            "str:1".to_string()
         );
         // Nothing configured -> built-in default (a local zebrad).
-        assert_eq!(
-            select_server_tokens(None, None, None),
-            vec![DEFAULT_SERVER.to_string()]
-        );
+        assert_eq!(select_server_token(None, None), DEFAULT_SERVER.to_string());
     }
 
     #[test]
-    fn backend_file_parses_array_and_backoff() {
+    fn backend_file_parses_server_and_backoff() {
         let f: BackendFile = toml::from_str(
             r#"
-            servers = ["127.0.0.1:9067", "zec.rocks:443"]
+            server = "zebra://127.0.0.1:18234"
             connect_timeout_secs = 5
             reconnect_base_secs = 2
             reconnect_max_secs = 30
-            primary_recheck_secs = 90
             "#,
         )
         .unwrap();
-        assert_eq!(f.servers.unwrap().len(), 2);
+        assert_eq!(f.server.as_deref(), Some("zebra://127.0.0.1:18234"));
         assert_eq!(f.connect_timeout_secs, Some(5));
         assert_eq!(f.reconnect_base_secs, Some(2));
         assert_eq!(f.reconnect_max_secs, Some(30));
-        assert_eq!(f.primary_recheck_secs, Some(90));
     }
 
     #[test]
@@ -1232,37 +1055,6 @@ mod tests {
         ]);
         let cfg = AppConfig::resolve(&cli).unwrap();
         assert_eq!(cfg.datadir, PathBuf::from("/tmp/zecd-from-cli"));
-    }
-
-    #[test]
-    fn connection_mode_resolves_to_proxy_and_rejects_garbage() {
-        use clap::Parser as _;
-        let dir = tempfile::tempdir().unwrap();
-        let conf = dir.path().join("zecd.toml");
-
-        // An unrecognized connection mode must fail at startup, never silently fall back to
-        // direct connections (that would defeat the privacy property the operator configured).
-        std::fs::write(&conf, "[backend]\nconnection = \"torr\"\n").unwrap();
-        let cli = Cli::parse_from(["zecd", "--conf", conf.to_str().unwrap()]);
-        let err = AppConfig::resolve(&cli).unwrap_err().to_string();
-        assert!(err.contains("invalid connection"), "got: {err}");
-
-        // "tor" resolves to Tor's conventional local SOCKS port…
-        std::fs::write(&conf, "[backend]\nconnection = \"tor\"\n").unwrap();
-        let cli = Cli::parse_from(["zecd", "--conf", conf.to_str().unwrap()]);
-        let cfg = AppConfig::resolve(&cli).unwrap();
-        assert_eq!(cfg.backend.proxy, Some("127.0.0.1:9050".parse().unwrap()));
-
-        // …"direct" to no proxy, and the CLI --connection flag wins over the file.
-        let cli = Cli::parse_from([
-            "zecd",
-            "--conf",
-            conf.to_str().unwrap(),
-            "--connection",
-            "direct",
-        ]);
-        let cfg = AppConfig::resolve(&cli).unwrap();
-        assert_eq!(cfg.backend.proxy, None);
     }
 
     #[test]

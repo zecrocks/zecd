@@ -1,9 +1,8 @@
 # zecd operations runbook
 
 How to run `zecd` in production (mainnet) without losing funds or sleep. Read the
-README first for the architecture (`zebra → zecd` by default, optionally with your own
-lightwalletd in between) and configuration reference; this document covers
-backup/restore, monitoring, upgrades, and the mainnet checklist.
+README first for the architecture (`zebra → zecd`) and configuration reference; this
+document covers backup/restore, monitoring, upgrades, and the mainnet checklist.
 
 ## What to back up
 
@@ -54,23 +53,16 @@ it reveals the wallet's entire transaction graph, though it cannot spend.
 - `GET /healthz` (health port, default 9233) - liveness.
 - `GET /readyz` - readiness: 200 once connected and scanned past `[health]
   ready_progress`. When 503, the body's `reason` distinguishes `upstream_down`
-  (zebra/lightwalletd unreachable - page someone) from `syncing` (normal catch-up).
+  (zebra unreachable - page someone) from `syncing` (normal catch-up).
 - `GET /status` - per-wallet sync state, active upstream endpoint, `conn_state`
   (`down` | `syncing` | `ready`). Alert if `conn_state` stays `down`.
-- `GET /metrics` - Prometheus text exposition (unauthenticated, like `/status`).
-  Key series: `zecd_chain_tip_height` − `zecd_wallet_scanned_height` is the sync
-  lag (per `wallet`); `zecd_conn_state{state="down"}` for upstream health;
-  `zecd_rpc_requests_total{outcome="error"}` and `zecd_rpc_request_duration_seconds`
-  for the request error rate / latency; `zecd_rpc_overload_total` for work-queue
-  503s; `zecd_sends_total{outcome=...}` and `zecd_reorgs_total` for wallet activity.
-- `getrpcinfo.active_commands` - what's executing right now (also
-  `zecd_rpc_active_commands`).
+- `getrpcinfo.active_commands` - what's executing right now.
 - Logs: set `[log] format = "json"` for aggregation. Every RPC call logs method,
   wallet, elapsed_ms (errors add code/message); connection failover logs at warn.
 
-Suggested alerts: `/readyz` 503 with `reason=upstream_down` for >5 min; sync lag
-(`zecd_chain_tip_height` − `zecd_wallet_scanned_height`) not shrinking for >30 min;
-sustained `zecd_rpc_overload_total` rate; daemon restarts.
+Suggested alerts: `/readyz` 503 with `reason=upstream_down` for >5 min; `/status`
+sync lag (`chain_tip` − scanned height) not shrinking for >30 min; sustained
+work-queue 503s; daemon restarts.
 
 ## Send semantics worth knowing
 
@@ -121,8 +113,7 @@ need a rollback path (stop the daemon before copying).
       human-operated wallets, `zecd init --encrypt` so spending requires a verified
       `walletpassphrase` with an enforced timeout.
 - [ ] Mnemonic + birthday recorded offline; restore procedure tested on testnet.
-- [ ] Own node as primary - `server = "zebra"` (or your own lightwalletd) - with public
-      endpoints only as fallback (`[backend] servers`); Docker images pinned to
-      verified releases.
+- [ ] Local zebra full node configured (`server = "zebra"` or `zebra://host:port`);
+      Docker images pinned to verified releases.
 - [ ] `/readyz` wired into your orchestrator with a `startupProbe` covering initial
       sync; alerts on `upstream_down`.

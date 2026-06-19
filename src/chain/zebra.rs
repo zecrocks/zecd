@@ -24,8 +24,7 @@
 //! from the `trees` field of `getblock verbosity=1`, exactly as lightwalletd obtains them.
 //!
 //! Scope: a zebra endpoint is for a **local node** - connections are plaintext HTTP with
-//! optional cookie/basic auth, and SOCKS proxying is refused at resolve time (see
-//! `backend::resolve_all`). Genesis is never requested (no scan range starts there and
+//! optional cookie/basic auth. Genesis is never requested (no scan range starts there and
 //! tree-state requests are clamped to height ≥ 1), which matches `Block::read`'s genesis
 //! limitation.
 
@@ -1161,10 +1160,7 @@ mod tests {
         let mut src = source_for(fake.clone())
             .await
             .with_mempool_poll(Duration::from_millis(20));
-        let mut stream = match src.subscribe_mempool().await.unwrap() {
-            MempoolStream::Zebra(s) => s,
-            MempoolStream::Lwd(_) => unreachable!(),
-        };
+        let MempoolStream::Zebra(mut stream) = src.subscribe_mempool().await.unwrap();
 
         // The current mempool is streamed first.
         let first = stream.message().await.unwrap().expect("first mempool tx");

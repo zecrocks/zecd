@@ -52,7 +52,7 @@ impl ConnState {
 #[derive(Clone, Debug, Default)]
 pub struct SyncStatus {
     pub connected: bool,
-    /// Active lightwalletd endpoint, e.g. `"zec.rocks:443 (tls=true)"`.
+    /// The zebra endpoint, e.g. `"zebra-rpc 127.0.0.1:18234"`.
     pub server: Option<String>,
     pub conn_state: ConnState,
     pub chain_tip: Option<u32>,

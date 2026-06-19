@@ -239,9 +239,6 @@ fn scan_blocks(
             // valid checkpoint when the requested height has none; the cache is then
             // truncated to the height actually rewound to.
             let rewind_height = perform_rewind(db_data, err.at_height(), requested)?;
-            crate::metrics::record_reorg(
-                u32::from(err.at_height()).saturating_sub(u32::from(rewind_height)),
-            );
             db_cache
                 .with_blocks(Some(rewind_height + 1), None, |block| {
                     let meta = BlockMeta {
@@ -281,6 +278,20 @@ pub async fn sync_one_batch<C: ChainSource>(
     db_data: &mut WriteDb,
 ) -> anyhow::Result<bool> {
     let scan_ranges = db_data.suggest_scan_ranges()?;
+    tracing::debug!(
+        "suggest_scan_ranges -> {} range(s): {:?}",
+        scan_ranges.len(),
+        scan_ranges
+            .iter()
+            .map(|r| {
+                (
+                    u32::from(r.block_range().start),
+                    u32::from(r.block_range().end),
+                    r.priority(),
+                )
+            })
+            .collect::<Vec<_>>()
+    );
     let Some(first) = scan_ranges.first() else {
         return Ok(false);
     };

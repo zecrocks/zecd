@@ -16,37 +16,17 @@ default_wallet = "default"
 dir = "./data/default"
 
 [backend]
-# The chain upstream. The default is "zebra": a LOCAL zebrad's JSON-RPC, no lightwalletd
-# needed - shorthand for "zebra://127.0.0.1:8234" on mainnet / "zebra://127.0.0.1:18234" on
-# testnet (zebrad ships with RPC disabled, so set its `rpc.listen_addr` to that port; the
-# zcashd-convention ports 8232/18232 belong to zecd's own RPC). See [zebra] below for
-# credentials. Alternatives: "zebra://host:port" (a zebrad on another port) | a "host:port"
-# lightwalletd (your own, e.g. "127.0.0.1:9067") | the public lightwalletd presets
-# "zecrocks" | "ecc" | "ywallet" (fine for getting started; for production, run your own node).
+# The chain upstream is a LOCAL zebrad's JSON-RPC. The default is "zebra": shorthand for
+# "zebra://127.0.0.1:8234" on mainnet / "zebra://127.0.0.1:18234" on testnet (zebrad ships
+# with RPC disabled, so set its `rpc.listen_addr` to that port; the zcashd-convention ports
+# 8232/18232 belong to zecd's own RPC). See [zebra] below for credentials. Use
+# "zebra://host:port" for a zebrad on another host/port.
 server = "zebra"
-# Or list multiple endpoints for failover, tried in order and always preferring the first (the
-# daemon snaps back to the primary when it recovers). `servers` takes precedence over `server`.
-# A scheme prefix sets the endpoint kind / TLS (zebra:// = local zebrad; http:// = plaintext
-# lightwalletd; https:// = TLS lightwalletd); without a prefix TLS is auto (on for remote
-# hosts, off for localhost).
-#   testnet:  servers = ["zebra://127.0.0.1:18234", "https://testnet.zec.rocks:443"]
-#   mainnet:  servers = ["zebra://127.0.0.1:8234", "https://zec.rocks:443", "https://eu.zec.rocks:443"]
-# How to reach lightwalletd:
-#   "direct" - connect directly (TLS for remote hosts, plaintext for localhost).
-#   "tor" - route all traffic through Tor's default SOCKS port (127.0.0.1:9050);
-#                            run a tor daemon alongside zecd. Use ".onion" endpoints for full
-#                            privacy (they skip TLS - Tor encrypts the hop).
-#   "socks5://host:port" - route through any SOCKS5 proxy (Tor on a custom port, Nym, etc.).
-# The proxy applies to every configured endpoint; TLS is still layered on top for remote hosts so
-# the proxy only ever sees ciphertext.
-connection = "direct"
 # Per-attempt dial timeout (seconds) so a hung/black-holed endpoint can't stall sync.
 connect_timeout_secs = 10
 # Reconnect backoff (seconds): start at base, double up to max, with full jitter.
 reconnect_base_secs = 1
 reconnect_max_secs = 60
-# While running on a fallback, how often (seconds) to re-probe higher-priority servers.
-primary_recheck_secs = 60
 
 # Credentials for the "zebra" / "zebra://host:port" endpoints above. Omit the whole section
 # when zebrad runs with `enable_cookie_auth = false`. A cookie file wins over user/password
@@ -149,20 +129,6 @@ age_identity = "./data/identity.txt"
 # Decrypt the seed at startup so sendtoaddress/sendmany work without walletpassphrase.
 auto_unlock = true
 
-# Cloud-KMS keystore ("envelope encryption" / auto-unseal): the wallet's at-rest encryption
-# key is wrapped by a key held in AWS KMS or Google Cloud KMS, and the daemon unlocks it at
-# startup with one IAM-gated KMS Decrypt - no identity file, no passphrase, and every unlock
-# is a CloudTrail / Cloud Audit Logs entry. Create such a wallet with `zecd init --keystore`,
-# or migrate an existing one with `zecd rewrap`.
-# [keystore]
-# provider = "aws-kms"                # or "gcp-kms"
-# AWS: a key ARN (preferred - its region wins), key id, or alias. GCP: the full resource
-# name projects/<p>/locations/<l>/keyRings/<r>/cryptoKeys/<k>.
-# key = "arn:aws:kms:us-east-1:111122223333:key/<uuid>"
-# API endpoint override - for KMS emulators in tests (moto/local-kms) or VPC/private
-# endpoints. Omit for the provider default.
-# endpoint = "http://localhost:8080"
-
 [pools]
 # Shielded value pools this wallet uses. zecd is shielded-only; supported pools are "sapling"
 # and "orchard" (a future "ironwood" pool will slot in here). These are the GLOBAL defaults;
@@ -186,7 +152,7 @@ enabled = ["orchard"]
 default_receivers = ["orchard"]
 
 [sync]
-# How often to poll lightwalletd for new blocks (seconds).
+# How often to poll zebra for new blocks (seconds).
 interval_secs = 20
 # How often (at most) to re-broadcast wallet txs that are unmined and unexpired (seconds).
 # Covers sends whose initial broadcast failed and mempool drops across upstream restarts.

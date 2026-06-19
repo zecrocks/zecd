@@ -20,7 +20,11 @@ use crate::wallet::WalletRegistry;
 pub fn init_tracing(log: &config::LogConfig) {
     let filter = tracing_subscriber::EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(&log.level));
-    let builder = tracing_subscriber::fmt().with_env_filter(filter);
+    // Log to stderr, not stdout: the `init`/`export-ufvk` CLI subcommands print machine-readable
+    // output (the mnemonic, a UFVK) to stdout, and a log line on stdout would corrupt it.
+    let builder = tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .with_writer(std::io::stderr);
     if log.format.eq_ignore_ascii_case("json") {
         builder.json().init();
     } else {
@@ -45,9 +49,6 @@ pub async fn run(config: AppConfig) -> anyhow::Result<()> {
         );
     }
     actor::install_panic_hook();
-    // Install the Prometheus recorder before any actor/RPC work so early emissions are captured.
-    // Best-effort: `None` simply means no `/metrics` endpoint (non-fatal).
-    let metrics_handle = crate::metrics::install();
     let config = Arc::new(config);
     let auth = server::auth::Authenticator::from_config(&config.rpc)?;
 
@@ -72,28 +73,20 @@ pub async fn run(config: AppConfig) -> anyhow::Result<()> {
             );
             continue;
         }
-        let mut servers = backend::resolve_all(
-            &config.backend.servers,
-            config.network,
-            config.backend.tls_roots,
-            config.backend.force_tls,
-            config.backend.proxy,
-        )?;
-        backend::apply_zebra_auth(&mut servers, &config.zebra.auth());
+        let mut server = backend::resolve(&config.backend.server, config.network)?;
+        backend::apply_zebra_auth(&mut server, &config.zebra.auth());
         let actor_cfg = ActorConfig {
             name: name.clone(),
             network: config.network,
             wallet_dir: entry.dir.clone(),
-            servers,
+            server,
             sync_interval: Duration::from_secs(config.sync.interval_secs),
             rebroadcast_interval: Duration::from_secs(config.sync.rebroadcast_secs),
             connect_timeout: Duration::from_secs(config.backend.connect_timeout_secs),
             reconnect_base: Duration::from_secs(config.backend.reconnect_base_secs),
             reconnect_max: Duration::from_secs(config.backend.reconnect_max_secs),
-            primary_recheck: Duration::from_secs(config.backend.primary_recheck_secs),
             age_identity: config.keys.age_identity.clone(),
             auto_unlock: config.keys.auto_unlock,
-            keystore_endpoint: config.keystore.endpoint.clone(),
             // Validated at config load; re-derive here rather than carrying a second copy.
             confirmations_policy: config.spend.confirmations_policy()?,
             enabled_pools: entry.pools.clone(),
@@ -141,7 +134,6 @@ pub async fn run(config: AppConfig) -> anyhow::Result<()> {
         shutting_down: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         work_queue: Arc::new(tokio::sync::Semaphore::new(config.rpc.work_queue)),
         active: crate::state::ActiveCommands::default(),
-        metrics_handle,
         operations: Arc::new(crate::operations::OperationRegistry::new()),
     };
 

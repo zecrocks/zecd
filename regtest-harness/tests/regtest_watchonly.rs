@@ -10,15 +10,13 @@
 //! Core's codes (-4/-16/-15) - while the read surface (balances, history, `getnewaddress`)
 //! stays fully available.
 //!
-//! Extended tier: set `ZECD_REGTEST_EXTENDED=1` (plus ZEBRAD_BIN / LIGHTWALLETD_BIN).
+//! Extended tier: set `ZECD_REGTEST_EXTENDED=1` (plus ZEBRAD_BIN).
 //! Skips cleanly otherwise.
 
 use std::time::Duration;
 
 use serde_json::json;
-use zecd_regtest_harness::{
-    extended_enabled, pick_port, resolve_bin, Lightwalletd, Zebrad, Zecd, ZecdConfig,
-};
+use zecd_regtest_harness::{extended_enabled, pick_port, resolve_bin, Zebrad, Zecd, ZecdConfig};
 
 const INITIAL_BLOCKS: u32 = 10;
 const SYNC_TIMEOUT: Duration = Duration::from_secs(120);
@@ -32,11 +30,9 @@ async fn regtest_watch_only_ufvk() {
         );
         return;
     }
-    let (Some(zebrad_bin), Some(lwd_bin)) =
-        (resolve_bin("ZEBRAD_BIN"), resolve_bin("LIGHTWALLETD_BIN"))
-    else {
+    let Some(zebrad_bin) = resolve_bin("ZEBRAD_BIN") else {
         eprintln!(
-            "SKIP regtest_watch_only_ufvk: set ZEBRAD_BIN and LIGHTWALLETD_BIN (see \
+            "SKIP regtest_watch_only_ufvk: set ZEBRAD_BIN (see \
              README.md). The harness still compiled and linked."
         );
         return;
@@ -47,12 +43,9 @@ async fn regtest_watch_only_ufvk() {
         .generate_blocks(INITIAL_BLOCKS)
         .await
         .expect("mine the initial chain");
-    let lwd = Lightwalletd::start(&lwd_bin, zebrad.rpc_port)
-        .await
-        .expect("launch lightwalletd");
 
     // 1. The spending wallet (its address is used later for per-address flag checks).
-    let cfg_a = ZecdConfig::new(lwd.grpc_port, pick_port().expect("pick zecd rpc port"));
+    let cfg_a = ZecdConfig::new(zebrad.rpc_port, pick_port().expect("pick zecd rpc port"));
     let zecd_a = Zecd::start(&cfg_a)
         .await
         .expect("start the spending wallet");
@@ -78,7 +71,7 @@ async fn regtest_watch_only_ufvk() {
 
     // 3. The watch-only wallet: init --ufvk on a fresh datadir, against the same chain.
     //    Birthday 2 is the lowest height with a fetchable tree state (restore convention).
-    let mut cfg_b = ZecdConfig::new(lwd.grpc_port, pick_port().expect("pick zecd rpc port"));
+    let mut cfg_b = ZecdConfig::new(zebrad.rpc_port, pick_port().expect("pick zecd rpc port"));
     cfg_b.ufvk = Some(ufvk);
     cfg_b.birthday = Some(2);
     let zecd_b = Zecd::start(&cfg_b)

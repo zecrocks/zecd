@@ -50,11 +50,6 @@ use crate::wallet::{
 const TARGET_NOTE_COUNT: usize = 4;
 const MIN_SPLIT_OUTPUT_VALUE: u64 = 10_000_000; // 0.1 ZEC
 
-/// Upper bound on the per-attempt dial timeout used when re-probing higher-priority servers,
-/// so a black-holed primary can't stall the command loop for the full `connect_timeout` on
-/// each `primary_recheck`. A recovered primary connects near-instantly; a dead one fails fast.
-const REPROBE_CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
-
 /// Deadlines for RPCs issued on an already-connected channel. The dial timeout covers only
 /// the TCP/TLS connect, so a peer that hangs *after* accepting would otherwise stall the
 /// actor's command loop indefinitely (HTTP/2 keepalive on the channel is the systemic
@@ -63,11 +58,11 @@ const REPROBE_CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
 /// The post-connect health check may include the one-time subtree-root stream (hundreds of
 /// roots on mainnet), so it gets a generous budget...
 const PREPARE_TIMEOUT: Duration = Duration::from_secs(60);
-/// ...while a primary re-probe runs from the idle loop with a healthy fallback active, so it
-/// must stay tight (roots are already synced by then; this is a cheap liveness ping).
-const REPROBE_PREPARE_TIMEOUT: Duration = Duration::from_secs(10);
 /// Unary calls (broadcast, tip refresh, tx fetch) on the live channel.
 const UNARY_RPC_TIMEOUT: Duration = Duration::from_secs(30);
+/// Minimum spacing between retries after a sync error, so a persistent failure (e.g. an
+/// unrecoverable reorg) can't spin the actor loop at full speed reconnecting and re-failing.
+const SYNC_ERROR_RETRY_INTERVAL: Duration = Duration::from_secs(2);
 
 // NB: the unmined-tx rebroadcast interval is configurable (`[sync] rebroadcast_secs`,
 // default 60) and arrives via `ActorConfig::rebroadcast_interval`. It covers sends whose
@@ -93,38 +88,13 @@ pub fn install_panic_hook() {
     }));
 }
 
-/// Retry state for a KMS wallet whose startup unlock failed: exponential backoff between
-/// cloud Decrypt attempts, checked opportunistically as the actor loop turns over.
-struct KmsUnlockRetry {
-    backoff: Backoff,
-    retry_at: Instant,
-}
-
-impl KmsUnlockRetry {
-    fn new() -> Self {
-        let mut backoff = Backoff::new(Duration::from_secs(5), Duration::from_secs(300));
-        // Full jitter can return ~0; floor the wait so a hard-down KMS isn't hammered.
-        let delay = backoff.next_delay().max(Duration::from_secs(2));
-        KmsUnlockRetry {
-            backoff,
-            retry_at: Instant::now() + delay,
-        }
-    }
-
-    fn reschedule(&mut self) {
-        let delay = self.backoff.next_delay().max(Duration::from_secs(2));
-        self.retry_at = Instant::now() + delay;
-    }
-}
-
 /// Parameters needed to launch a wallet actor.
 pub struct ActorConfig {
     pub name: String,
     pub network: ZNetwork,
     pub wallet_dir: PathBuf,
-    /// Ordered upstream endpoints (lightwalletd or zebra; non-empty); tried in order,
-    /// preferring the first.
-    pub servers: Vec<Server>,
+    /// The upstream zebrad endpoint.
+    pub server: Server,
     pub sync_interval: Duration,
     /// Minimum spacing between unmined-tx rebroadcast passes.
     pub rebroadcast_interval: Duration,
@@ -133,13 +103,8 @@ pub struct ActorConfig {
     /// Reconnect backoff base/max delays.
     pub reconnect_base: Duration,
     pub reconnect_max: Duration,
-    /// While on a fallback, how often to re-probe higher-priority servers.
-    pub primary_recheck: Duration,
     pub age_identity: Option<PathBuf>,
     pub auto_unlock: bool,
-    /// `[keystore] endpoint` override for cloud-KMS unlock calls (emulators/VPC endpoints).
-    /// The provider and key come from the wallet's own `keys.toml`.
-    pub keystore_endpoint: Option<String>,
     /// The wallet-wide confirmations policy (`[spend]` config; ZIP-315 3/10 by default),
     /// anchoring balances, spend proposals, and the `-6` enrichment.
     pub confirmations_policy: ConfirmationsPolicy,
@@ -156,16 +121,13 @@ struct WalletActor {
     name: String,
     network: ZNetwork,
     wallet_dir: PathBuf,
-    /// Ordered upstream endpoints (non-empty); `active` indexes the connected one.
-    servers: Vec<Server>,
-    active: usize,
+    /// The upstream zebrad endpoint.
+    server: Server,
     connect_timeout: Duration,
     backoff: Backoff,
     /// When the next reconnect attempt is allowed (a backoff deadline, not a fixed tick), so
     /// commands interrupting the idle wait don't advance the backoff.
     reconnect_at: Instant,
-    primary_recheck: Duration,
-    last_primary_probe: Instant,
     sync_interval: Duration,
     rebroadcast_interval: Duration,
     confirmations_policy: ConfirmationsPolicy,
@@ -201,12 +163,6 @@ struct WalletActor {
     /// Whether the wallet is passphrase-encrypted (read from `keys.toml` at spawn). Gates the
     /// Bitcoin-Core-style `walletpassphrase`/`walletlock` behavior.
     encrypted: bool,
-    /// `[keystore] endpoint` override for KMS unlock calls.
-    keystore_endpoint: Option<String>,
-    /// `Some` while a KMS wallet's startup unlock is failing (e.g. a KMS/IAM outage at
-    /// boot): the actor keeps retrying with backoff so a transient outage doesn't require a
-    /// human restart. Cleared on success or a non-retryable condition.
-    kms_unlock_retry: Option<KmsUnlockRetry>,
     /// Whether the wallet is watch-only (its account is an imported UFVK with no spending
     /// material). Spend commands refuse with Bitcoin Core's -4.
     watch_only: bool,
@@ -223,12 +179,6 @@ struct WalletActor {
 pub async fn spawn(
     cfg: ActorConfig,
 ) -> anyhow::Result<(WalletHandle, tokio::task::JoinHandle<()>)> {
-    if cfg.servers.is_empty() {
-        return Err(anyhow!(
-            "no upstream servers configured for wallet '{}'",
-            cfg.name
-        ));
-    }
     if !store::WalletStore::exists(&cfg.wallet_dir) {
         return Err(anyhow!(
             "wallet '{}' is not initialized ({} missing); run `zecd init --wallet {}`",
@@ -245,15 +195,11 @@ pub async fn spawn(
     // Determine the wallet's encryption mode, and for unencrypted wallets optionally decrypt
     // the seed up-front for unattended sending. An encrypted wallet has no passphrase at rest,
     // so it cannot auto-unlock - it starts locked and requires `walletpassphrase` (matching
-    // Bitcoin Core's encrypted-wallet behavior). A cloud-KMS wallet auto-unlocks via one
-    // IAM-gated KMS Decrypt; a failure there (KMS/IAM outage at boot) is retried with
-    // backoff by the actor loop rather than requiring a human restart. A watch-only wallet
-    // has no seed anywhere, so the whole unlock machinery is moot for it.
+    // Bitcoin Core's encrypted-wallet behavior). A watch-only wallet has no seed anywhere, so
+    // the whole unlock machinery is moot for it.
     let st = store::WalletStore::read(&cfg.wallet_dir)?;
     let encrypted = st.is_encrypted();
-    let kms_wallet = st.kms().is_some();
     let mut seed = SeedKeeper::locked();
-    let mut kms_unlock_retry = None;
     if watch_only {
         info!(
             "[{}] watch-only wallet (imported UFVK): balances, history, and addresses are \
@@ -265,36 +211,6 @@ pub async fn spawn(
             "[{}] wallet is passphrase-encrypted; it starts locked - call walletpassphrase to unlock for sending",
             cfg.name
         );
-    } else if kms_wallet {
-        if cfg.auto_unlock {
-            match keys::decrypt_seed_with_keystore(&st, cfg.keystore_endpoint.as_deref()).await {
-                Ok(Some(s)) => {
-                    seed.set(s);
-                    info!(
-                        "[{}] seed unlocked via {} for unattended sending",
-                        cfg.name,
-                        st.kms().expect("kms wallet").provider.name()
-                    );
-                }
-                Ok(None) => {}
-                Err(e) => {
-                    warn!(
-                        "[{}] KMS unlock failed at startup: {e:#}; sends will fail (-13) until it succeeds - retrying with backoff",
-                        cfg.name
-                    );
-                    kms_unlock_retry = Some(KmsUnlockRetry::new());
-                }
-            }
-        } else {
-            // Mirrors the identity-model dead end below: nothing can unlock a KMS wallet
-            // at runtime (walletpassphrase is -15 on it), so warn loudly.
-            warn!(
-                "[{}] auto_unlock=false on a KMS-wrapped wallet: sends will fail (-13) and \
-                 walletpassphrase cannot unlock it (-15). Enable auto_unlock, or migrate to a \
-                 passphrase with `zecd rewrap` (offline).",
-                cfg.name
-            );
-        }
     } else if cfg.auto_unlock {
         if let Some(identity) = &cfg.age_identity {
             if st.has_seed() {
@@ -347,13 +263,10 @@ pub async fn spawn(
         name: cfg.name.clone(),
         network: cfg.network,
         wallet_dir: cfg.wallet_dir.clone(),
-        servers: cfg.servers,
-        active: 0,
+        server: cfg.server,
         connect_timeout: cfg.connect_timeout,
         backoff: Backoff::new(cfg.reconnect_base, cfg.reconnect_max),
         reconnect_at: Instant::now(),
-        primary_recheck: cfg.primary_recheck,
-        last_primary_probe: Instant::now(),
         sync_interval: cfg.sync_interval,
         rebroadcast_interval: cfg.rebroadcast_interval,
         confirmations_policy: cfg.confirmations_policy,
@@ -374,8 +287,6 @@ pub async fn spawn(
         last_rebroadcast: None,
         subtree_roots_synced: false,
         encrypted,
-        keystore_endpoint: cfg.keystore_endpoint,
-        kms_unlock_retry,
         watch_only,
         unlock_until: None,
         shutdown: cfg.shutdown,
@@ -451,8 +362,6 @@ impl WalletActor {
             // iteration (between sync batches) so the seed doesn't linger long past expiry; the
             // `select!` branch below handles the idle case, and `do_send` has a hard backstop.
             self.relock_if_expired();
-            // A KMS wallet whose startup unlock failed retries here (cheap deadline check).
-            self.maybe_retry_kms_unlock().await;
             if more_work {
                 // Service any queued commands first so writers aren't starved by sync.
                 loop {
@@ -481,6 +390,15 @@ impl WalletActor {
                     Err(e) => {
                         warn!("[{}] sync error: {e}", self.name);
                         self.client = None;
+                        // Pace retries after a sync error. A *persistent* sync error (e.g. an
+                        // unrecoverable reorg whose rewind target has no checkpoint) would
+                        // otherwise spin: dropping the client makes the idle loop reconnect
+                        // immediately, the reconnect succeeds (the upstream is healthy, so the
+                        // connect backoff never engages and is reset on success), and the very
+                        // next batch re-hits the same error - hundreds of times a second, pegging
+                        // a core and flooding the log. A fixed floor caps that to one attempt per
+                        // interval; a transient error just costs this small delay.
+                        self.reconnect_at = Instant::now() + SYNC_ERROR_RETRY_INTERVAL;
                         self.update_status();
                         more_work = false;
                     }
@@ -546,9 +464,6 @@ impl WalletActor {
                                 );
                                 self.update_status();
                             }
-                        } else {
-                            // Connected, possibly to a fallback - try to move back to the primary.
-                            self.reprobe_primary().await;
                         }
                         if self.client.is_some() {
                             match self.refresh_tip().await {
@@ -626,119 +541,36 @@ impl WalletActor {
         }
     }
 
-    /// Connect to an upstream, always preferring the primary: try the configured endpoints in
-    /// order from the top and use the first that connects (and passes the subtree-root sync). On
-    /// success, store the client, record the active server, and reset the reconnect backoff. On
-    /// total failure, leave `self.client` as `None` and return the last error.
+    /// Connect to the upstream zebrad endpoint. On success, store the client (after the
+    /// subtree-root health check) and reset the reconnect backoff. On failure, leave
+    /// `self.client` as `None` and return the error.
     async fn connect(&mut self) -> anyhow::Result<()> {
         // Any open mempool stream belongs to the channel being replaced; drop it so it can't
         // pin the old connection alive. It is reopened on the next caught-up sync pass.
         self.mempool = None;
-        let n = self.servers.len();
-        let mut last_err = None;
-        for idx in 0..n {
-            let describe = self.servers[idx].describe();
-            info!("[{}] connecting to {}", self.name, describe);
-            match self.servers[idx]
-                .connect_timeout(self.connect_timeout)
-                .await
-            {
-                Ok(client) => {
-                    self.client = Some(client);
-                    let client = self.client.as_mut().expect("just set");
-                    // A reachable-but-unhealthy upstream can still fail here; treat that as this
-                    // server failing and fall through to the next candidate.
-                    if let Err(e) = prepare_client(
-                        client,
-                        &mut self.db_data,
-                        self.network,
-                        &mut self.subtree_roots_synced,
-                        PREPARE_TIMEOUT,
-                    )
-                    .await
-                    {
-                        warn!("[{}] health check failed on {}: {e}", self.name, describe);
-                        crate::metrics::inc_connection_failure(&self.name);
-                        self.client = None;
-                        last_err = Some(e);
-                        continue;
-                    }
-                    if idx != self.active {
-                        warn!(
-                            "[{}] now using {} (was {})",
-                            self.name,
-                            describe,
-                            self.servers[self.active].describe()
-                        );
-                        crate::metrics::inc_server_switch(&self.name);
-                        self.active = idx;
-                    }
-                    self.backoff.reset();
-                    self.last_primary_probe = Instant::now();
-                    // NB: do not call `update_status()` here - `get_wallet_summary`'s progress
-                    // estimator underflows if invoked before the chain tip is set (see `refresh_tip`).
-                    return Ok(());
-                }
-                Err(e) => {
-                    warn!("[{}] connect to {} failed: {e}", self.name, describe);
-                    crate::metrics::inc_connection_failure(&self.name);
-                    last_err = Some(e);
-                }
-            }
-        }
-        Err(last_err.unwrap_or_else(|| anyhow!("no lightwalletd servers available")))
-    }
-
-    /// While connected to a fallback, periodically try to move back to a higher-priority server
-    /// (prefer-primary). No-op when already on the primary, disconnected, or probed too recently.
-    /// On success, swaps in the better client and resets backoff.
-    async fn reprobe_primary(&mut self) {
-        if self.active == 0
-            || self.client.is_none()
-            || self.last_primary_probe.elapsed() < self.primary_recheck
+        let describe = self.server.describe();
+        info!("[{}] connecting to {}", self.name, describe);
+        let client = self.server.connect_timeout(self.connect_timeout).await?;
+        self.client = Some(client);
+        let client = self.client.as_mut().expect("just set");
+        // A reachable-but-unhealthy upstream can still fail here; treat that as a failed connect.
+        if let Err(e) = prepare_client(
+            client,
+            &mut self.db_data,
+            self.network,
+            &mut self.subtree_roots_synced,
+            PREPARE_TIMEOUT,
+        )
+        .await
         {
-            return;
+            warn!("[{}] health check failed on {}: {e}", self.name, describe);
+            self.client = None;
+            return Err(e);
         }
-        self.last_primary_probe = Instant::now();
-        // Cap the probe dial so a black-holed primary can't stall command processing.
-        let probe_timeout = self.connect_timeout.min(REPROBE_CONNECT_TIMEOUT);
-        for idx in 0..self.active {
-            let describe = self.servers[idx].describe();
-            let Ok(mut client) = self.servers[idx].connect_timeout(probe_timeout).await else {
-                continue;
-            };
-            // Health check: full subtree-root sync only if not yet done this process, else a
-            // cheap `get_latest_block` - so a recovered primary isn't re-streamed all its roots
-            // on every recheck (default 60s while on a fallback).
-            if let Err(e) = prepare_client(
-                &mut client,
-                &mut self.db_data,
-                self.network,
-                &mut self.subtree_roots_synced,
-                REPROBE_PREPARE_TIMEOUT,
-            )
-            .await
-            {
-                warn!(
-                    "[{}] primary re-probe {} not healthy: {e}",
-                    self.name, describe
-                );
-                continue;
-            }
-            info!(
-                "[{}] preferred upstream {} recovered; switching back from {}",
-                self.name,
-                describe,
-                self.servers[self.active].describe()
-            );
-            self.client = Some(client);
-            self.mempool = None; // belonged to the fallback's channel; reopened on next pass
-            crate::metrics::inc_server_switch(&self.name);
-            self.active = idx;
-            self.backoff.reset();
-            self.update_status();
-            return;
-        }
+        self.backoff.reset();
+        // NB: do not call `update_status()` here - `get_wallet_summary`'s progress
+        // estimator underflows if invoked before the chain tip is set (see `refresh_tip`).
+        Ok(())
     }
 
     /// Subscribe to the upstream's mempool stream if not already subscribed. Called only when
@@ -933,7 +765,6 @@ impl WalletActor {
                 // `nTimeReceived`. Best-effort, idempotent (INSERT OR IGNORE).
                 let txid_hex = txid.to_string();
                 if super::read::tx_exists(&self.wallet_dir, &txid_hex) {
-                    crate::metrics::inc_mempool_decrypt(&self.name);
                     let now = std::time::SystemTime::now()
                         .duration_since(std::time::UNIX_EPOCH)
                         .map(|d| d.as_secs() as i64)
@@ -961,8 +792,15 @@ impl WalletActor {
         };
         let tip = BlockHeight::try_from(chain_tip.height)
             .map_err(|_| anyhow!("chain tip height out of range"))?;
+        let prev = self.tip_height;
         self.db_data.update_chain_tip(tip)?;
         self.tip_height = Some(u32::from(tip));
+        tracing::debug!(
+            "[{}] tip refreshed: {:?} -> {} (suggest_scan_ranges drives the rescan/rewind)",
+            self.name,
+            prev,
+            u32::from(tip)
+        );
         if chain_tip.hash.len() == 32 {
             let mut h = chain_tip.hash.clone();
             h.reverse();
@@ -1039,7 +877,7 @@ impl WalletActor {
         });
         let status = SyncStatus {
             connected: self.client.is_some(),
-            server: Some(self.servers[self.active].describe()),
+            server: Some(self.server.describe()),
             conn_state,
             chain_tip: self.tip_height,
             fully_scanned,
@@ -1164,53 +1002,6 @@ impl WalletActor {
         }
     }
 
-    /// Retry a KMS wallet's failed startup unlock once its backoff deadline passes, so a
-    /// transient KMS/IAM outage at boot heals without a restart. No-op (one `Option` check)
-    /// unless a retry is pending and due.
-    async fn maybe_retry_kms_unlock(&mut self) {
-        let due = self
-            .kms_unlock_retry
-            .as_ref()
-            .is_some_and(|r| Instant::now() >= r.retry_at);
-        if !due {
-            return;
-        }
-        let result = match store::WalletStore::read(&self.wallet_dir) {
-            Ok(st) => {
-                keys::decrypt_seed_with_keystore(&st, self.keystore_endpoint.as_deref()).await
-            }
-            Err(e) => Err(e),
-        };
-        match result {
-            Ok(Some(seed)) => {
-                self.seed.set(seed);
-                self.kms_unlock_retry = None;
-                info!(
-                    "[{}] KMS unlock succeeded; seed unlocked for sending",
-                    self.name
-                );
-                self.update_status();
-            }
-            Ok(None) => {
-                // No stored mnemonic - retrying can't help.
-                warn!(
-                    "[{}] KMS wallet has no stored mnemonic; giving up unlock",
-                    self.name
-                );
-                self.kms_unlock_retry = None;
-            }
-            Err(e) => {
-                let retry = self.kms_unlock_retry.as_mut().expect("checked due above");
-                retry.reschedule();
-                warn!(
-                    "[{}] KMS unlock retry failed: {e:#}; next attempt in ~{:?}",
-                    self.name,
-                    retry.retry_at.saturating_duration_since(Instant::now())
-                );
-            }
-        }
-    }
-
     fn get_new_address(
         &mut self,
         label: Option<String>,
@@ -1277,7 +1068,6 @@ impl WalletActor {
         let change_pool = self.enabled_pools.change_pool();
         let prover = &self.prover;
         let db = &mut self.db_data;
-        let proposal_start = Instant::now();
         let (txid, raw): (TxId, Vec<u8>) =
             tokio::task::block_in_place(move || -> Result<_, RpcError> {
                 let change_strategy = MultiOutputChangeStrategy::new(
@@ -1345,7 +1135,6 @@ impl WalletActor {
                     .map_err(|e| RpcError::misc(format!("failed to serialize transaction: {e}")))?;
                 Ok((txid, raw_tx))
             })?;
-        crate::metrics::record_send_proposal(proposal_start.elapsed());
 
         self.broadcast_committed(txid, raw).await?;
         self.update_status();
@@ -1370,7 +1159,6 @@ impl WalletActor {
                      re-broadcast once a connection recovers",
                     self.name
                 );
-                crate::metrics::record_send("deferred");
                 return Ok(());
             }
         }
@@ -1394,7 +1182,6 @@ impl WalletActor {
                     "[{}] broadcast of {txid} failed in transport ({e}); it will be re-broadcast",
                     self.name
                 );
-                crate::metrics::record_send("transport_fail");
                 return Ok(());
             }
         };
@@ -1407,7 +1194,6 @@ impl WalletActor {
                     "[{}] upstream already has {txid}; treating broadcast as delivered",
                     self.name
                 );
-                crate::metrics::record_send("accepted");
                 return Ok(());
             }
             // An explicit upstream rejection (the node examined the tx and refused it) is a
@@ -1419,7 +1205,6 @@ impl WalletActor {
                 "[{}] upstream rejected {txid} (code {}): {reason}",
                 self.name, outcome.error_code
             );
-            crate::metrics::record_send("rejected");
             return Err(RpcError::new(
                 codes::RPC_VERIFY_REJECTED,
                 format!(
@@ -1428,7 +1213,6 @@ impl WalletActor {
                 ),
             ));
         }
-        crate::metrics::record_send("accepted");
         Ok(())
     }
 
@@ -2044,37 +1828,6 @@ mod tests {
             !e.message.contains('\n') && !e.message.contains('\u{1b}'),
             "control chars leaked: {:?}",
             e.message
-        );
-    }
-
-    /// The KMS startup-unlock retry must always schedule a *future* attempt and never busy-loop:
-    /// the first wait is floored above zero and bounded by the backoff base, and rescheduling
-    /// stays within the configured ceiling - so a hard-down KMS is retried forever, gently.
-    #[test]
-    fn kms_unlock_retry_schedules_bounded_future_attempts() {
-        use super::KmsUnlockRetry;
-        use std::time::{Duration, Instant};
-
-        let mut retry = KmsUnlockRetry::new();
-        let wait = retry.retry_at.saturating_duration_since(Instant::now());
-        assert!(
-            wait >= Duration::from_secs(1),
-            "first retry too soon: {wait:?}"
-        );
-        assert!(
-            wait <= Duration::from_secs(6),
-            "first retry past the base: {wait:?}"
-        );
-
-        retry.reschedule();
-        let wait = retry.retry_at.saturating_duration_since(Instant::now());
-        assert!(
-            wait >= Duration::from_secs(1),
-            "rescheduled retry too soon: {wait:?}"
-        );
-        assert!(
-            wait <= Duration::from_secs(301),
-            "rescheduled retry exceeds the 300s ceiling: {wait:?}"
         );
     }
 }

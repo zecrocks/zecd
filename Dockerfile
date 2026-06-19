@@ -17,7 +17,6 @@ FROM stagex/pallet-rust:1.91.1@sha256:4062550919db682ebaeea07661551b5b89b3921e3f
 # protoc (+ the abseil it links) is needed by zcash_client_backend's build script.
 FROM stagex/user-protobuf:26.1@sha256:b399bb058216a55130d83abcba4e5271d8630fff55abbb02ed40818b0d96ced1 AS protobuf
 FROM stagex/user-abseil-cpp:20240116.2@sha256:183e8aff7b3e8b37ab8e89a20a364a21d99ce506ae624028b92d3bed747d2c06 AS abseil-cpp
-FROM stagex/core-ca-certificates:sx2026.05.0@sha256:f5b60a5f79003c039d4994269d7a646cc039d657d5c1503104467381b476f6fa AS ca-certificates
 
 # --- Stage 1: Build with Rust --- (amd64)
 FROM pallet-rust AS builder
@@ -73,9 +72,6 @@ COPY --from=builder /usr/local/cargo/bin/zecd /zecd
 # --- Stage 3: Minimal runtime with stagex ---
 FROM scratch AS runtime
 COPY --from=export /zecd /usr/local/bin/zecd
-# CA bundle so native TLS roots can validate public lightwalletd endpoints (e.g. zec.rocks).
-COPY --from=ca-certificates /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
-ENV SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt
 COPY --from=builder --chown=10001:10001 /rootfs/ /
 USER 10001:10001
 WORKDIR /var/lib/zecd

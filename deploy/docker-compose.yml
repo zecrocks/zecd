@@ -1,19 +1,15 @@
 # Example self-hosted Zcash stack:  zebra (full node) -> zecd.
 #
-# zecd talks straight to zebra's JSON-RPC (zebra:// mode, the default backend). The optional
-# `lightwalletd` profile adds a lightwalletd in front of the same zebra - enable it when this
-# stack should also serve other light clients (mobile wallets) over gRPC, and add
-# "http://lightwalletd:9067" to the failover list in zecd.toml.
+# zecd talks straight to zebra's JSON-RPC (the only backend).
 #
 # Testnet by default. For mainnet, add `-f docker-compose.mainnet.yml` to each command below (it
 # swaps in the *.mainnet.* config files). The image tags are EXAMPLES - pin them to releases you
-# have verified; the zebra/lightwalletd flags can vary between versions.
+# have verified; the zebra flags can vary between versions.
 #
 # First run (zebra must sync enough before zecd can init):
 #   docker compose up -d zebra                     # let it sync
 #   docker compose run --rm zecd init --wallet default
 #   docker compose up -d                           # start zecd (and the rest)
-# With the lightwalletd profile: docker compose --profile lightwalletd up -d
 #
 # Probes:   curl localhost:9233/healthz ; curl localhost:9233/readyz
 # RPC:      curl --user zec:CHANGE-ME --data-binary '{"method":"getblockchaininfo","id":1}' localhost:18232/
@@ -27,25 +23,7 @@ services:
       - ./zebrad.toml:/etc/zebra/zebrad.toml:ro
       - zebra-state:/var/cache/zebra
     expose:
-      - "18234"   # JSON-RPC, reached by zecd (and lightwalletd, if enabled) over the compose network
-
-  lightwalletd:
-    image: electriccoinco/lightwalletd:v0.4.19   # pin to a verified release
-    profiles: ["lightwalletd"]                   # optional: serve other light clients over gRPC
-    restart: unless-stopped
-    depends_on:
-      - zebra
-    command:
-      - "--grpc-bind-addr=0.0.0.0:9067"
-      - "--no-tls-very-insecure"               # plaintext gRPC on the internal network
-      - "--log-file=/dev/stdout"
-      - "--zcash-conf-path=/etc/lightwalletd/zcash.conf"
-      - "--data-dir=/var/lib/lightwalletd"
-    volumes:
-      - ./lightwalletd-zcash.conf:/etc/lightwalletd/zcash.conf:ro
-      - lwd-data:/var/lib/lightwalletd
-    expose:
-      - "9067"
+      - "18234"   # JSON-RPC, reached by zecd over the compose network
 
   zecd:
     build:
@@ -70,5 +48,4 @@ services:
 
 volumes:
   zebra-state:
-  lwd-data:
   zecd-data:

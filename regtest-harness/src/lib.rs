@@ -1,15 +1,18 @@
 //! End-to-end regtest harness for `zecd`.
 //!
-//! Orchestrates the **Zcash Foundation** regtest stack directly - `zebrad` (Regtest, PoW
-//! disabled) + `lightwalletd` - and drives the real `zecd` daemon over its Bitcoin-Core-style
-//! JSON-RPC. There is intentionally **no `zingo-infra`/`zcash_local_net` dependency**, and no
-//! compile-time zebra dependency either: blocks are mined with zebrad's own Regtest-only
-//! `generate` RPC (zebra ≥ 2.0.0), which runs the template→assemble→submit flow server-side
-//! against the node's own network parameters. The harness is a pure black-box JSON-RPC driver,
-//! so it works unmodified against any zebrad release.
+//! Orchestrates a `zebrad` (Regtest, PoW disabled) node and drives the real `zecd` daemon over
+//! its Bitcoin-Core-style JSON-RPC - `zecd` talks straight to zebrad. There is intentionally
+//! **no `zingo-infra`/`zcash_local_net` dependency**, and no compile-time zebra dependency
+//! either: blocks are mined with zebrad's own Regtest-only `generate` RPC (zebra ≥ 2.0.0),
+//! which runs the template→assemble→submit flow server-side against the node's own network
+//! parameters. The harness is a pure black-box JSON-RPC driver, so it works unmodified against
+//! any zebrad release.
 //!
-//! Binaries are supplied by the caller via `$ZEBRAD_BIN` / `$LIGHTWALLETD_BIN` (see
-//! [`resolve_bin`]); in CI they're extracted from the official `zfnd/zebra` and
+//! The funded tests also run a `lightwalletd` in front of zebra - not for `zecd` (which uses
+//! zebra), but for the `zcash-devtool` funding wallet, which only speaks lightwalletd's gRPC.
+//!
+//! Binaries are supplied by the caller via `$ZEBRAD_BIN` / `$LIGHTWALLETD_BIN` / `$DEVTOOL_BIN`
+//! (see [`resolve_bin`]); in CI they're extracted from the official `zfnd/zebra` and
 //! `electriccoinco/lightwalletd` images. `zecd` itself is the built release binary.
 
 use std::net::TcpListener;
@@ -55,7 +58,7 @@ const DEFAULT_MINER_ADDRESS: &str = "t27eWDgjFYJGVXmzrXeVjnb5J3uXDM9xH9v";
 /// A running `zebrad` Regtest node.
 pub struct Zebrad {
     child: Child,
-    /// JSON-RPC port (cookie auth disabled so lightwalletd can connect).
+    /// JSON-RPC port (cookie auth disabled so zecd can connect).
     pub rpc_port: u16,
     net_port: u16,
     bin: PathBuf,
@@ -221,6 +224,20 @@ impl Zebrad {
             bail!("generate mined {mined} of {n} requested blocks: {hashes}");
         }
         Ok(())
+    }
+
+    /// Pause the process with SIGSTOP, simulating a *hung* upstream: the kernel keeps its
+    /// sockets alive - TCP connects succeed and segments are ACKed - but no JSON-RPC request is
+    /// ever answered. This is the failure mode a kill can't reproduce (a dead process refuses
+    /// connections immediately) and the one only the client's per-RPC deadlines can detect.
+    /// Resume with [`Zebrad::resume`].
+    pub fn pause(&self) -> Result<()> {
+        signal_process(self.child.id(), "STOP")
+    }
+
+    /// Resume a [`Zebrad::pause`]d process (SIGCONT); it picks up where it stopped.
+    pub fn resume(&self) -> Result<()> {
+        signal_process(self.child.id(), "CONT")
     }
 }
 
@@ -618,22 +635,16 @@ pub struct Zecd {
     _datadir: tempfile::TempDir,
 }
 
-/// How `zecd` should reach the regtest chain (lightwalletd gRPC and/or zebrad JSON-RPC
-/// directly), and what RPC port/creds to expose.
+/// How `zecd` should reach the regtest chain (a local zebrad's JSON-RPC) and what RPC
+/// port/creds to expose.
 pub struct ZecdConfig {
-    /// Primary lightwalletd gRPC port (`None` for zebra mode).
-    pub lightwalletd_port: Option<u16>,
-    /// zebrad JSON-RPC port for zebra (`zebra://`) mode; listed before any lightwalletd.
-    pub zebra_rpc_port: Option<u16>,
-    /// Optional fallback lightwalletd (for the failover tests); listed after the primary.
-    pub fallback_lightwalletd_port: Option<u16>,
+    /// zebrad JSON-RPC port zecd connects to (`zebra://127.0.0.1:<port>`).
+    pub zebra_rpc_port: u16,
     pub rpc_port: u16,
     pub rpc_user: String,
     pub rpc_password: String,
     /// `[sync] rebroadcast_secs` - tight by default so outage tests don't idle a minute.
     pub rebroadcast_secs: u64,
-    /// `[backend] primary_recheck_secs` - how fast a recovered primary is re-adopted.
-    pub primary_recheck_secs: u64,
     /// Additional **spending** `[wallets.<name>]` entries beyond `default` (each gets its own
     /// `zecd init --wallet <name>` before the daemon starts). NB: zecd permits only ONE
     /// spending wallet, so configuring any of these alongside the spending `default` makes the
@@ -662,41 +673,15 @@ pub struct ZecdConfig {
 }
 
 impl ZecdConfig {
-    /// Test-friendly defaults: `user`/`pass` credentials, no fallback, 2s rebroadcast,
-    /// 3s primary re-check, fast reconnect backoff (written by [`write_zecd_toml`]).
-    pub fn new(lightwalletd_port: u16, rpc_port: u16) -> ZecdConfig {
+    /// Test-friendly defaults: zecd points at the given zebrad JSON-RPC port, `user`/`pass`
+    /// credentials, 2s rebroadcast, fast reconnect backoff (written by [`write_zecd_toml`]).
+    pub fn new(zebra_rpc_port: u16, rpc_port: u16) -> ZecdConfig {
         ZecdConfig {
-            lightwalletd_port: Some(lightwalletd_port),
-            zebra_rpc_port: None,
-            fallback_lightwalletd_port: None,
+            zebra_rpc_port,
             rpc_port,
             rpc_user: "user".to_string(),
             rpc_password: "pass".to_string(),
             rebroadcast_secs: 2,
-            primary_recheck_secs: 3,
-            extra_wallets: Vec::new(),
-            extra_watch_only_wallets: Vec::new(),
-            restore_mnemonic: None,
-            ufvk: None,
-            birthday: None,
-            pools: None,
-            encrypt_passphrase: None,
-        }
-    }
-
-    /// Zebra mode: zecd talks straight to zebrad's JSON-RPC (`zebra://`), with no
-    /// lightwalletd anywhere in its server list - so a bug in the zebra backend can't be
-    /// silently rescued by failover.
-    pub fn new_zebra(zebra_rpc_port: u16, rpc_port: u16) -> ZecdConfig {
-        ZecdConfig {
-            lightwalletd_port: None,
-            zebra_rpc_port: Some(zebra_rpc_port),
-            fallback_lightwalletd_port: None,
-            rpc_port,
-            rpc_user: "user".to_string(),
-            rpc_password: "pass".to_string(),
-            rebroadcast_secs: 2,
-            primary_recheck_secs: 3,
             extra_wallets: Vec::new(),
             extra_watch_only_wallets: Vec::new(),
             restore_mnemonic: None,
@@ -721,6 +706,15 @@ impl Zecd {
     pub async fn start(cfg: &ZecdConfig) -> Result<Zecd> {
         let (datadir, mnemonic) = Self::prepare_datadir(cfg).await?;
 
+        // Set ZECD_STDERR (to any value) to stream the daemon's logs into the test output
+        // (use with `--nocapture`); otherwise discard them. The daemon inherits RUST_LOG from
+        // the environment, so `RUST_LOG=zecd=debug,info ZECD_STDERR=1` gives a full sync/rewind
+        // trace in CI. Mirrors the ZEBRAD_STDERR hook above.
+        let (out, err) = if std::env::var_os("ZECD_STDERR").is_some() {
+            (Stdio::inherit(), Stdio::inherit())
+        } else {
+            (Stdio::null(), Stdio::null())
+        };
         let child = Command::new(zecd_bin())
             .args([
                 "--datadir",
@@ -728,8 +722,8 @@ impl Zecd {
                 "--regtest",
                 "run",
             ])
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
+            .stdout(out)
+            .stderr(err)
             .spawn()
             .context("spawn zecd daemon")?;
 
@@ -1204,18 +1198,8 @@ fn export_ufvk_from_datadir(datadir: &Path, wallet: &str) -> Result<String> {
 }
 
 fn write_zecd_toml(datadir: &Path, cfg: &ZecdConfig) -> Result<()> {
-    let mut tokens = Vec::new();
-    if let Some(z) = cfg.zebra_rpc_port {
-        tokens.push(format!(r#""zebra://127.0.0.1:{z}""#));
-    }
-    if let Some(lwd) = cfg.lightwalletd_port {
-        tokens.push(format!(r#""127.0.0.1:{lwd}""#));
-    }
-    if let Some(fb) = cfg.fallback_lightwalletd_port {
-        tokens.push(format!(r#""127.0.0.1:{fb}""#));
-    }
-    anyhow::ensure!(!tokens.is_empty(), "ZecdConfig has no upstream endpoint");
-    let servers = tokens.join(", ");
+    // zecd is zebra-only: the single upstream is a local zebrad JSON-RPC endpoint.
+    let server = format!("zebra://127.0.0.1:{}", cfg.zebra_rpc_port);
     // The default wallet plus any extra `[wallets.<name>]` entries (multiwallet tests).
     let mut wallets = format!(
         "[wallets.default]\ndir = \"{}/default\"\n",
@@ -1257,13 +1241,10 @@ default_wallet = "default"
 
 {wallets}
 [backend]
-servers = [{servers}]
-connection = "direct"
-tls = "no"
+server = "{server}"
 connect_timeout_secs = 5
 reconnect_base_secs = 1
 reconnect_max_secs = 2
-primary_recheck_secs = {primary_recheck}
 
 [rpc]
 bind = "127.0.0.1"
@@ -1285,7 +1266,7 @@ port = {health_port}
 "#,
         datadir = datadir.display(),
         wallets = wallets,
-        primary_recheck = cfg.primary_recheck_secs,
+        server = server,
         rpc_port = cfg.rpc_port,
         user = cfg.rpc_user,
         password = cfg.rpc_password,

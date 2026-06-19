@@ -20,7 +20,7 @@ use crate::backend;
 use crate::chain::ChainSource as _;
 use crate::config::{AppConfig, ExportUfvkArgs, InitArgs, WalletEntry};
 use crate::wallet::open;
-use crate::wallet::store::{KmsInfo, Passphrase, WalletStore};
+use crate::wallet::store::{Passphrase, WalletStore};
 
 /// Minimum length (in characters) for a wallet-encryption passphrase.
 pub const MIN_PASSPHRASE_CHARS: usize = 12;
@@ -120,77 +120,26 @@ pub async fn run(config: &AppConfig, args: &InitArgs) -> anyhow::Result<()> {
         .clone()
         .unwrap_or_else(|| config.datadir.join("identity.txt"));
     // How the mnemonic is protected at rest. All settled *before* any network I/O so a bad
-    // passphrase / missing identity / misconfigured KMS fails fast:
+    // passphrase / missing identity fails fast:
     // - view-only (imported UFVK): no mnemonic at all, so there is no at-rest secret;
-    // - keystore: age-encrypt to a fresh x25519 identity and wrap that identity with the
-    //   configured cloud KMS key (auto-unlocks at startup via IAM-gated Decrypt);
     // - encrypt: wrap with a passphrase (age scrypt) - starts locked, `walletpassphrase`;
     // - default: wrap to the age identity file for unattended unlock.
     enum AtRest {
         ViewOnly,
-        Kms {
-            keystore: crate::keystore::Keystore,
-            identity: age::x25519::Identity,
-            wrapped: Vec<u8>,
-        },
         Passphrase(Passphrase),
         Identity(Vec<Box<dyn age::Recipient + Send>>),
     }
     let at_rest = if ufvk.is_some() {
         AtRest::ViewOnly
-    } else if args.keystore {
-        let keystore = config.keystore.required()?;
-        let identity = age::x25519::Identity::generate();
-        let ctx = crate::keystore::WrapContext {
-            wallet: args.wallet.clone(),
-            network: network.name().to_string(),
-        };
-        eprintln!(
-            "Wrapping the wallet key with {} key {}",
-            keystore.provider.name(),
-            keystore.key
-        );
-        let identity_str = identity.to_string();
-        let wrapped = keystore
-            .wrap(identity_str.expose_secret().as_bytes(), &ctx)
-            .await
-            .context("wrapping the wallet key (the credentials must allow KMS Encrypt)")?;
-        // Prove the same credentials can unlock before committing anything to disk - an
-        // Encrypt-only policy would otherwise brick sending until IAM is fixed.
-        let back = keystore
-            .unwrap(&wrapped, &ctx)
-            .await
-            .context("verifying KMS unwrap (the credentials must also allow KMS Decrypt)")?;
-        if secrecy::ExposeSecret::expose_secret(&back).as_slice()
-            != identity_str.expose_secret().as_bytes()
-        {
-            bail!("KMS unwrap verification returned different bytes");
-        }
-        AtRest::Kms {
-            keystore,
-            identity,
-            wrapped,
-        }
     } else if args.encrypt {
         AtRest::Passphrase(read_encryption_passphrase()?)
     } else {
         AtRest::Identity(ensure_identity(&identity_path).await?)
     };
 
-    // init is a one-shot interactive command; it uses only the first configured endpoint (no
-    // failover) - the daemon's actor does the multi-server failover at runtime.
-    let mut servers = backend::resolve_all(
-        &config.backend.servers,
-        network,
-        config.backend.tls_roots,
-        config.backend.force_tls,
-        config.backend.proxy,
-    )?;
-    backend::apply_zebra_auth(&mut servers, &config.zebra.auth());
-    let server = servers
-        .into_iter()
-        .next()
-        .ok_or_else(|| anyhow!("no upstream servers configured"))?;
+    // init is a one-shot interactive command that dials the configured zebra endpoint once.
+    let mut server = backend::resolve(&config.backend.server, network)?;
+    backend::apply_zebra_auth(&mut server, &config.zebra.auth());
     let mut client = server
         .connect_timeout(Duration::from_secs(config.backend.connect_timeout_secs))
         .await
@@ -267,23 +216,6 @@ pub async fn run(config: &AppConfig, args: &InitArgs) -> anyhow::Result<()> {
     };
     match &at_rest {
         AtRest::ViewOnly => WalletStore::init_view_only(&wallet_dir, birthday.height(), network)?,
-        AtRest::Kms {
-            keystore,
-            identity,
-            wrapped,
-        } => WalletStore::init_with_kms(
-            &wallet_dir,
-            &identity.to_public(),
-            &KmsInfo {
-                provider: keystore.provider,
-                key: keystore.key.clone(),
-                wrapped_identity: wrapped.clone(),
-                context_wallet: args.wallet.clone(),
-            },
-            require_mnemonic(),
-            birthday.height(),
-            network,
-        )?,
         AtRest::Passphrase(passphrase) => WalletStore::init_with_passphrase(
             &wallet_dir,
             passphrase.clone(),
@@ -335,12 +267,6 @@ pub async fn run(config: &AppConfig, args: &InitArgs) -> anyhow::Result<()> {
         AtRest::ViewOnly => eprintln!(
             "Watch-only wallet (imported UFVK): balances, history, and addresses are \
              available; spending and wallet-encryption RPCs are disabled."
-        ),
-        AtRest::Kms { keystore, .. } => eprintln!(
-            "Wallet key is wrapped by {} key {}; the daemon auto-unlocks it at startup via \
-             the cloud credentials (no identity file, no passphrase).",
-            keystore.provider.name(),
-            keystore.key
         ),
         AtRest::Passphrase(_) => eprintln!(
             "Wallet is passphrase-encrypted; it starts locked. Call walletpassphrase \"<pass>\" <timeout> to unlock for sending."

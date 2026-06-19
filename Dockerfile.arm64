@@ -46,11 +46,7 @@ COPY --from=builder /usr/local/bin/zecd /zecd
 # --- runtime ---
 # debian:bookworm-slim (multi-arch index digest)
 FROM debian:bookworm-slim@sha256:96e378d7e6531ac9a15ad505478fcc2e69f371b10f5cdf87857c4b8188404716 AS runtime
-# ca-certificates lets native TLS roots validate public lightwalletd (e.g. zec.rocks).
-RUN apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates \
-    && rm -rf /var/lib/apt/lists/* \
-    && groupadd -g 10001 zecd \
+RUN groupadd -g 10001 zecd \
     && useradd -r -u 10001 -g zecd -m -d /var/lib/zecd zecd
 COPY --from=builder /usr/local/bin/zecd /usr/local/bin/zecd
 USER zecd

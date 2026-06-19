@@ -16,7 +16,7 @@
 //!   included - under `RLIMIT_MEMLOCK` and typically fails in containers).
 //!
 //! Honest limits: this defends passive capture, not an attacker with code execution inside
-//! zecd (who can read the seed directly, or - for a KMS wallet - just call Decrypt). And the
+//! zecd (who can read the seed directly). And the
 //! `mlock` is targeted at the seed buffer; transient key copies made deeper in librustzcash
 //! during derivation/proving are not individually locked (raising `RLIMIT_MEMLOCK` and using
 //! an encrypted swap device covers that residue).

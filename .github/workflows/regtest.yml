@@ -1,12 +1,10 @@
 name: Regtest E2E
 
-# Live tier: brings up the Zcash-Foundation regtest stack - zebra (Regtest) + lightwalletd - and
-# drives the real zecd binary over its JSON-RPC (see regtest-harness/). It also builds
-# zcash-devtool (regtest-enabled) as a funding wallet, used to shield a mined transparent coinbase
-# into Orchard and fund zecd (the funded e2e). The suite covers both chain backends: the funded
-# e2e runs zecd through lightwalletd (a supported backend), and regtest_zebra.rs runs it straight
-# against zebrad's JSON-RPC ("zebra://", the default backend) with a lightwalletd-backed twin
-# asserting chain-view equality.
+# Live tier: brings up a zebra (Regtest) node and drives the real zecd binary over its JSON-RPC
+# (zecd talks straight to zebrad - see regtest-harness/). It also builds zcash-devtool
+# (regtest-enabled) as a funding wallet, used to shield a mined transparent coinbase into Orchard
+# and fund zecd (the funded e2e). The funder speaks lightwalletd's gRPC, so the funded tests also
+# run a lightwalletd in front of the same zebra - but the zecd under test always uses zebra.
 # No zingo-infra: the harness mines via zebrad's
 # Regtest-only `generate` RPC, so it has no zebra crate dependency and works against any zebrad
 # release. zebrad + lightwalletd are extracted from their official Docker images.
@@ -78,7 +76,7 @@ jobs:
         image: ${{ github.event_name == 'schedule' && fromJSON('["pinned", "latest"]') || fromJSON('["event"]') }}
         include:
           - suite: zecd
-            tests: --test regtest_e2e --test regtest_funded --test regtest_failover --test regtest_hang --test regtest_reorg --test regtest_multiwallet --test regtest_restore --test regtest_watchonly --test regtest_zebra
+            tests: --test regtest_e2e --test regtest_funded --test regtest_hang --test regtest_reorg --test regtest_multiwallet --test regtest_restore --test regtest_watchonly
     name: regtest (${{ matrix.suite }}, ${{ matrix.image }})
     steps:
       - uses: actions/checkout@v4
@@ -183,7 +181,9 @@ jobs:
           # ZEBRAD_BIN / LIGHTWALLETD_BIN are exported by the provisioning step above.
         # --locked: build against the committed lock. Single-threaded: two zebrad+lightwalletd
         # stacks plus Orchard proving would contend badly on a 2-core runner.
-        run: cargo test --locked --manifest-path regtest-harness/Cargo.toml ${{ matrix.tests }} -- --nocapture --test-threads=1
+        # --no-fail-fast: run every test binary even if an earlier one fails, so a single flaky
+        # test can't mask the results of all the tests ordered after it.
+        run: cargo test --locked --manifest-path regtest-harness/Cargo.toml ${{ matrix.tests }} --no-fail-fast -- --nocapture --test-threads=1
 
       - name: Dump diagnostics on failure
         if: failure()

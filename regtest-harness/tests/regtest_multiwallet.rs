@@ -4,15 +4,13 @@
 //! invariant** (zecd loads at most one wallet with spending keys; a second one makes the daemon
 //! refuse to start) - none of which the single-wallet suites can reach.
 //!
-//! Extended tier: set `ZECD_REGTEST_EXTENDED=1` (plus ZEBRAD_BIN / LIGHTWALLETD_BIN).
+//! Extended tier: set `ZECD_REGTEST_EXTENDED=1` (plus ZEBRAD_BIN).
 //! Skips cleanly otherwise.
 
 use std::time::Duration;
 
 use serde_json::json;
-use zecd_regtest_harness::{
-    extended_enabled, pick_port, resolve_bin, Lightwalletd, Zebrad, Zecd, ZecdConfig,
-};
+use zecd_regtest_harness::{extended_enabled, pick_port, resolve_bin, Zebrad, Zecd, ZecdConfig};
 
 const INITIAL_BLOCKS: u32 = 10;
 const SYNC_TIMEOUT: Duration = Duration::from_secs(120);
@@ -29,12 +27,10 @@ async fn regtest_multiwallet_routing_and_isolation() {
         );
         return;
     }
-    let (Some(zebrad_bin), Some(lwd_bin)) =
-        (resolve_bin("ZEBRAD_BIN"), resolve_bin("LIGHTWALLETD_BIN"))
-    else {
+    let Some(zebrad_bin) = resolve_bin("ZEBRAD_BIN") else {
         eprintln!(
-            "SKIP regtest_multiwallet_routing_and_isolation: set ZEBRAD_BIN and \
-             LIGHTWALLETD_BIN (see README.md). The harness still compiled and linked."
+            "SKIP regtest_multiwallet_routing_and_isolation: set ZEBRAD_BIN \
+             (see README.md). The harness still compiled and linked."
         );
         return;
     };
@@ -44,13 +40,10 @@ async fn regtest_multiwallet_routing_and_isolation() {
         .generate_blocks(INITIAL_BLOCKS)
         .await
         .expect("mine the initial chain");
-    let lwd = Lightwalletd::start(&lwd_bin, zebrad.rpc_port)
-        .await
-        .expect("launch lightwalletd");
 
     // `default` spends; `w2` and `w3` are watch-only replicas of it (any number are allowed
     // alongside the single spender).
-    let mut cfg = ZecdConfig::new(lwd.grpc_port, pick_port().expect("pick zecd rpc port"));
+    let mut cfg = ZecdConfig::new(zebrad.rpc_port, pick_port().expect("pick zecd rpc port"));
     cfg.extra_watch_only_wallets = vec!["w2".to_string(), "w3".to_string()];
     let zecd = Zecd::start(&cfg)
         .await
@@ -192,12 +185,10 @@ async fn regtest_second_spending_wallet_refused_at_init() {
         );
         return;
     }
-    let (Some(zebrad_bin), Some(lwd_bin)) =
-        (resolve_bin("ZEBRAD_BIN"), resolve_bin("LIGHTWALLETD_BIN"))
-    else {
+    let Some(zebrad_bin) = resolve_bin("ZEBRAD_BIN") else {
         eprintln!(
-            "SKIP regtest_second_spending_wallet_refused_at_init: set ZEBRAD_BIN and \
-             LIGHTWALLETD_BIN (see README.md). The harness still compiled and linked."
+            "SKIP regtest_second_spending_wallet_refused_at_init: set ZEBRAD_BIN \
+             (see README.md). The harness still compiled and linked."
         );
         return;
     };
@@ -207,13 +198,10 @@ async fn regtest_second_spending_wallet_refused_at_init() {
         .generate_blocks(INITIAL_BLOCKS)
         .await
         .expect("mine the initial chain");
-    let lwd = Lightwalletd::start(&lwd_bin, zebrad.rpc_port)
-        .await
-        .expect("launch lightwalletd");
 
     // Config lists both `default` and `w2` as spending wallets; init `default`, then attempt to
     // init `w2` - the guard sees the existing spender and refuses.
-    let mut cfg = ZecdConfig::new(lwd.grpc_port, pick_port().expect("pick zecd rpc port"));
+    let mut cfg = ZecdConfig::new(zebrad.rpc_port, pick_port().expect("pick zecd rpc port"));
     cfg.extra_wallets = vec!["w2".to_string()];
     let stderr = Zecd::init_second_spending_expect_refusal(&cfg, "w2")
         .await

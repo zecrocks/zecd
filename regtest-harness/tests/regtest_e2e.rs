@@ -1,27 +1,25 @@
-//! End-to-end regtest test: zebra (Regtest) + lightwalletd + the real `zecd` daemon.
+//! End-to-end regtest test: zebra (Regtest) + the real `zecd` daemon.
 //!
-//! Skips cleanly when the node binaries aren't provisioned (so plain `cargo test` and the
-//! build-only CI path still validate that the harness compiles). Provide `ZEBRAD_BIN` and
-//! `LIGHTWALLETD_BIN` to run the full flow - see README.md.
+//! Skips cleanly when the node binary isn't provisioned (so plain `cargo test` and the
+//! build-only CI path still validate that the harness compiles). Provide `ZEBRAD_BIN` to run
+//! the full flow - see README.md.
 
 use std::time::Duration;
 
 use serde_json::json;
-use zecd_regtest_harness::{pick_port, resolve_bin, Lightwalletd, Zebrad, Zecd, ZecdConfig};
+use zecd_regtest_harness::{pick_port, resolve_bin, Zebrad, Zecd, ZecdConfig};
 
 /// Blocks mined before launching zecd. Regtest mining is cheap (PoW disabled).
 const INITIAL_BLOCKS: u32 = 10;
-/// Generous: lightwalletd ingestion + zecd scan over a fresh regtest chain.
+/// Generous: zecd scan over a fresh regtest chain.
 const SYNC_TIMEOUT: Duration = Duration::from_secs(120);
 
 #[tokio::test]
 async fn regtest_end_to_end() {
-    let (Some(zebrad_bin), Some(lightwalletd_bin)) =
-        (resolve_bin("ZEBRAD_BIN"), resolve_bin("LIGHTWALLETD_BIN"))
-    else {
+    let Some(zebrad_bin) = resolve_bin("ZEBRAD_BIN") else {
         eprintln!(
-            "SKIP regtest_end_to_end: set ZEBRAD_BIN and LIGHTWALLETD_BIN to run the live e2e \
-             (see README.md). The harness still compiled and linked."
+            "SKIP regtest_end_to_end: set ZEBRAD_BIN to run the live e2e (see README.md). \
+             The harness still compiled and linked."
         );
         return;
     };
@@ -35,19 +33,11 @@ async fn regtest_end_to_end() {
         .await
         .expect("mine initial regtest blocks");
 
-    // 2. lightwalletd in front of zebra (ingests the mined chain).
-    let lightwalletd = Lightwalletd::start(&lightwalletd_bin, zebrad.rpc_port)
-        .await
-        .expect("launch lightwalletd");
-
-    // 3. zecd against lightwalletd (init retries until lightwalletd has caught up).
-    let cfg = ZecdConfig::new(
-        lightwalletd.grpc_port,
-        pick_port().expect("pick zecd rpc port"),
-    );
+    // 2. zecd against zebra's JSON-RPC.
+    let cfg = ZecdConfig::new(zebrad.rpc_port, pick_port().expect("pick zecd rpc port"));
     let zecd = Zecd::start(&cfg)
         .await
-        .expect("start zecd against regtest lightwalletd");
+        .expect("start zecd against regtest zebra");
     zecd.wait_until_synced(INITIAL_BLOCKS as u64, SYNC_TIMEOUT)
         .await
         .expect("zecd scans to the regtest tip");

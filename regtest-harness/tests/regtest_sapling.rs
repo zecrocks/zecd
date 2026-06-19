@@ -73,7 +73,7 @@ async fn regtest_sapling_and_orchard_balances() {
     funder.sync(lwd.grpc_port).expect("funder sync (shielded)");
 
     // 5. zecd with BOTH shielded pools enabled.
-    let mut cfg = ZecdConfig::new(lwd.grpc_port, pick_port().expect("pick zecd rpc port"));
+    let mut cfg = ZecdConfig::new(zebrad.rpc_port, pick_port().expect("pick zecd rpc port"));
     cfg.pools = Some((
         vec!["sapling".into(), "orchard".into()],
         vec!["sapling".into(), "orchard".into()],

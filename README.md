@@ -16,9 +16,8 @@ goes badly wrong with zecd, its seed phrases can be entered into any other libru
 to access funds.
 
 zecd is a light client, for quick scalability. It syncs compact blocks in the background and
-never speaks P2P or indexes the chain itself. Production deployments should connect to a
-self-hosted Zcash full node - directly (`zebra://`, the default) or through your own
-lightwalletd - see [Choosing a chain backend](#choosing-a-chain-backend).
+never speaks P2P or indexes the chain itself. It connects to a **self-hosted Zcash full
+node** - a local [zebra](https://github.com/ZcashFoundation/zebra) over its JSON-RPC.
 
 All zecd funds are recoverable by a seed phrase. Importing private keys per-address is not
 supported, all addresses are dervied from wallet seeds.
@@ -28,87 +27,37 @@ supported, all addresses are dervied from wallet seeds.
 ```mermaid
 flowchart LR
     app["your app /<br>Bitcoin RPC client"] -->|JSON-RPC| zecd
-    zecd -->|"JSON-RPC (default)"| zebra["zebra<br>(full node)"]
-    zecd -.->|gRPC| lwd[lightwalletd] -.-> zebra
+    zecd -->|JSON-RPC| zebra["zebra<br>(full node)"]
 ```
 
-Two ways to reach the chain, sharing one ordered failover list:
+zecd points straight at a **local** zebrad's JSON-RPC. The default `[backend] server =
+"zebra"` is shorthand for `zebra://127.0.0.1:8234` on mainnet / `zebra://127.0.0.1:18234` on
+testnet (set zebrad's `rpc.listen_addr` to that port - zebra ships with RPC disabled, and
+8232/18232 are zecd's own RPC ports); any explicit `zebra://host:port` works too. zecd
+derives compact blocks, tree state, and mempool visibility from the node RPCs itself, so
+there is no lightwalletd to operate.
 
-- **zebra (default):** point zecd straight at a **local** zebrad's JSON-RPC. The default
-  `[backend] server = "zebra"` is shorthand for `zebra://127.0.0.1:8234` on mainnet /
-  `zebra://127.0.0.1:18234` on testnet (set zebrad's `rpc.listen_addr` to that port - zebra
-  ships with RPC disabled, and 8232/18232 are zecd's own RPC ports); any explicit
-  `zebra://host:port` works too. zecd derives compact blocks, tree state, and mempool
-  visibility from the node RPCs itself (the same ones lightwalletd uses), so there is no
-  lightwalletd to operate.
-- **lightwalletd:** point zecd at your own lightwalletd with
-  `[backend] server = "127.0.0.1:9067"`, or use the public zecrocks infrastructure
-  (`server = "zecrocks"` → `zec.rocks:443` mainnet, `testnet.zec.rocks:443` testnet) - no
-  node to stand up. This is the only mode that works with remote/public endpoints (and Tor).
-
-Both can share the list: `servers = ["zebra", "zec.rocks:443"]` is a local node with a
-public fallback.
-
-The [Docker stack](#docker--self-hosted-stack) below runs the full self-hosted pipeline with
-one compose file.
-
-### Choosing a chain backend
-
-**Run the full stack yourself in production.** Whichever backend you choose, a production
-deployment should sit on a **self-hosted zebra full node** (with or without your own
-lightwalletd in front). zecd holds spend authority over real funds; its entire view of the
-chain - balances, confirmations, incoming payments - is whatever the upstream serves it. A
-public endpoint you don't operate can observe your wallet's sync pattern and broadcasts
-(a privacy leak even though it can never steal funds: all data is validated locally and keys
-never leave zecd), can go down or rate-limit you at the worst moment, and is one more party
-in your threat model. Public infrastructure like `zec.rocks` is great for getting started,
-development, and as an emergency *fallback* - not as the primary for a treasury or a
-payment processor.
-
-| | zebra (default, `zebra://`) | local lightwalletd | public lightwalletd (`zec.rocks`, …) |
-|---|---|---|---|
-| Trust/privacy | best - only your own node | best - only your own infra | sync pattern + broadcasts visible to the operator |
-| Daemons to run | zebra | zebra + lightwalletd | none |
-| Transport | plaintext HTTP, localhost only | gRPC, plaintext or TLS | gRPC over TLS; Tor/SOCKS supported |
-| Initial sync speed | slower (two `getblock` RPCs per block, sequential) | fast (pre-built CompactBlock cache) | fast |
-| 0-conf latency | ~2 s (`getrawmempool` poll) | push (mempool stream) | push (mempool stream) |
-| Serves other light clients too | no (zecd-internal) | yes (any CompactTxStreamer client) | n/a |
-| Remote / Tor reachable | no - refused by design | yes | yes |
-
-Rules of thumb:
-
-- **Simplest production setup (the default):** `server = "zebra"` - one node, one wallet
-  daemon, no lightwalletd to operate. Prefer this when zecd is the only light client you run
-  and a slower first sync (and ~2 s of 0-conf latency) is acceptable.
-- **Run lightwalletd in front of your zebra** when you also serve mobile/other light
-  wallets from the same node, want the fastest initial sync, or want push-based mempool
-  delivery. `deploy/docker-compose.yml` ships this as an opt-in profile.
-- **Mix them for resilience:** `servers = ["zebra", "https://zec.rocks:443"]`
-  keeps your own node as the primary and only ever touches the public fallback while your
-  node is down (zecd snaps back automatically; see failover below).
-- **Tor/remote endpoints require lightwalletd mode:** `zebra://` is deliberately
-  local-only (plaintext, no SOCKS) - never expose a zebra RPC port to the network.
-
-The two backends are interchangeable and equivalence-tested in CI: the regtest suite runs a
-zebra-backed zecd and a lightwalletd-backed zecd against the same chain and requires
-identical chain views at every checkpoint.
+**Run the node yourself.** zecd holds spend authority over real funds; its entire view of the
+chain - balances, confirmations, incoming payments - is whatever zebra serves it. The
+endpoint is deliberately local-only (plaintext HTTP) - never expose a zebra RPC port to the
+network. The [Docker stack](#docker--self-hosted-stack) below runs the full `zebra → zecd`
+pipeline with one compose file.
 
 ## Quick start
 
 zecd is not yet published on crates.io - build from source (or use the
 [Docker stack](#docker--self-hosted-stack) / release tarballs).
 
-By default zecd expects a local zebrad (`server = "zebra"` → `zebra://127.0.0.1:18234` on
-testnet). For a no-node test drive, point it at the public lightwalletd infrastructure with
-`--server zecrocks`, as below; drop that flag once you run your own node:
+zecd expects a local zebrad (`server = "zebra"` → `zebra://127.0.0.1:18234` on testnet; point
+zebrad's `rpc.listen_addr` at that port). Then:
 
 ```sh
 # 1. Initialize a testnet wallet (generates an age identity + 24-word mnemonic, creates an account).
-cargo run --release -- --datadir ./data --testnet --server zecrocks \
-    init --wallet default
+cargo run --release -- --datadir ./data --testnet \
+    init --wallet default --account-name primary
 
 # 2. Run the daemon (syncs in the background, serves JSON-RPC).
-cargo run --release -- --datadir ./data --testnet --server zecrocks \
+cargo run --release -- --datadir ./data --testnet \
     --rpcuser zec --rpcpassword secret --rpcbind 127.0.0.1 --rpcport 18232
 ```
 
@@ -145,29 +94,14 @@ default_wallet = "default"
 dir = "./data/default"
 
 [backend]
-server = "zebra"                 # default: a local zebrad's JSON-RPC, no lightwalletd
-                                 #   ("zebra" = zebra://127.0.0.1:8234 main / :18234 test -
-                                 #   point zebrad's rpc.listen_addr there). Other tokens:
-                                 #   "zebra://host:port" | "ecc" | "ywallet" | "zecrocks"
-                                 #   | "host:port" (or "h:p,h:p") for lightwalletd
-# Or list multiple endpoints for failover, tried in order and always preferring the first; the
-# daemon snaps back to the primary when it recovers. `servers` takes precedence over `server`.
-# A scheme prefix sets the kind/TLS per endpoint (zebra:// local full node; http:// plaintext
-# lightwalletd; https:// TLS lightwalletd), so a local node and public fallbacks share one list:
-#   mainnet:  servers = ["zebra", "https://zec.rocks:443", "https://eu.zec.rocks:443"]
-#   testnet:  servers = ["zebra", "https://testnet.zec.rocks:443"]
-connection = "direct"           # "direct" | "tor" | "socks5://host:port" - route all lightwalletd
-                                #   traffic through a SOCKS5 proxy ("tor" = 127.0.0.1:9050). TLS is
-                                #   still layered on top, so the proxy only sees ciphertext.
-                                #   (zebra:// endpoints are local-only and refuse to combine with a proxy.)
-tls_roots = "native"            # "native" (OS store, honors SSL_CERT_FILE) | "webpki"
-tls = "auto"                    # "auto" (TLS for remote, plaintext for localhost) | "yes" | "no"
+server = "zebra"                 # a local zebrad's JSON-RPC ("zebra" = zebra://127.0.0.1:8234
+                                 #   main / :18234 test - point zebrad's rpc.listen_addr there).
+                                 #   Or an explicit "zebra://host:port".
 connect_timeout_secs = 10       # per-attempt dial timeout (so a hung endpoint can't stall sync)
 reconnect_base_secs = 1         # reconnect backoff: base delay (doubles, full jitter)
 reconnect_max_secs = 60         # reconnect backoff: ceiling
-primary_recheck_secs = 60       # while on a fallback, how often to re-probe higher-priority servers
 
-[zebra]                          # credentials for zebra:// endpoints (omit when zebrad has
+[zebra]                          # credentials for the zebra:// endpoint (omit when zebrad has
 # rpc_cookie = "/path/.cookie"   #   `enable_cookie_auth = false`); a cookie wins over user/password
 # rpc_user = "user"
 # rpc_password = "pass"
@@ -183,11 +117,6 @@ work_queue = 100                 # max in-flight requests before HTTP 503 (= bit
 [keys]
 age_identity = "./data/identity.txt"
 auto_unlock = true               # decrypt the seed at startup so sends need no walletpassphrase
-
-# [keystore]                     # cloud-KMS key custody (auto-unseal)
-# provider = "aws-kms"           # "aws-kms" | "gcp-kms"
-# key = "arn:aws:kms:us-east-1:111122223333:key/<uuid>"   # or a GCP cryptoKey resource name
-# endpoint = "http://localhost:8080"   # optional: KMS emulators / VPC endpoints
 
 [sync]
 interval_secs = 20
@@ -277,17 +206,9 @@ With `[health] enabled` (default), zecd serves unauthenticated probes on a separ
 - `GET /readyz`: readiness. `200` once every wallet is connected to its upstream and synced to
   `[health] ready_progress`, otherwise `503`. Body is JSON with per-wallet detail; when not ready
   it carries a `reason` (`"upstream_down"` vs `"syncing"`) so alerting can tell an unreachable
-  lightwalletd apart from normal catch-up.
+  zebra apart from normal catch-up.
 - `GET /status`: JSON snapshot of per-wallet sync state, including the active `server` endpoint
   and `conn_state` (`down` | `syncing` | `ready`). `getpeerinfo` reflects the same active upstream.
-- `GET /metrics`: Prometheus text exposition for scraping (same unauthenticated trust model as
-  `/status`). Per-wallet gauges - `zecd_chain_tip_height`, `zecd_wallet_scanned_height` (tip minus
-  this is the sync lag), `zecd_scan_progress_ratio`, `zecd_connected`, `zecd_conn_state` - plus
-  counters/histograms for RPC traffic (`zecd_rpc_requests_total`,
-  `zecd_rpc_request_duration_seconds`, `zecd_rpc_overload_total`, `zecd_rpc_auth_failures_total`),
-  upstream failover (`zecd_connection_failures_total`, `zecd_server_switches_total`), sends
-  (`zecd_sends_total`, `zecd_send_proposal_duration_seconds`), 0-conf deposits
-  (`zecd_mempool_txs_decrypted_total`), and reorgs (`zecd_reorgs_total`).
 
 Set `[health] bind = "0.0.0.0"` for Kubernetes/LB probes. The health server starts after wallets
 load, so cover the brief prover-init at boot with a `startupProbe` / `initialDelaySeconds`.
@@ -295,8 +216,7 @@ load, so cover the brief prover-init at boot with a `startupProbe` / `initialDel
 ## Docker / self-hosted stack
 
 `deploy/docker-compose.yml` runs the self-hosted stack (zebra → zecd, testnet by default;
-zecd talks straight to zebra's JSON-RPC). An optional `lightwalletd` compose profile adds a
-lightwalletd in front of the same zebra for serving other light clients. `Dockerfile` builds
+zecd talks straight to zebra's JSON-RPC). `Dockerfile` builds
 the zecd image as a **reproducible [StageX](https://stagex.tools) build**: every base image is
 full-source-bootstrapped and pinned by digest, and `zecd` is a statically linked musl
 binary in a from-scratch runtime image, so independent builders can reproduce the binary
@@ -344,8 +264,7 @@ curl --user zec:CHANGE-ME --data-binary '{"method":"getblockchaininfo","id":1}' 
 ```
 
 Mainnet: add `-f docker-compose.mainnet.yml` to every command to swap each service onto its
-mainnet config (`zebrad.mainnet.toml`, `lightwalletd-zcash.mainnet.conf`, `zecd.mainnet.toml`;
-local node primary with `zec.rocks:443` / `eu.zec.rocks:443` failover):
+mainnet config (`zebrad.mainnet.toml`, `zecd.mainnet.toml`):
 
 ```sh
 docker compose -f docker-compose.yml -f docker-compose.mainnet.yml up -d zebra
@@ -353,7 +272,7 @@ docker compose -f docker-compose.yml -f docker-compose.mainnet.yml run --rm zecd
 docker compose -f docker-compose.yml -f docker-compose.mainnet.yml up -d
 ```
 
-Image tags in the compose are examples; pin zebra/lightwalletd to releases you've verified. Set a
+Image tags in the compose are examples; pin zebra to a release you've verified. Set a
 real RPC password in `zecd.toml` / `zecd.mainnet.toml` before exposing the port.
 
 ## Supported RPC methods
@@ -379,7 +298,7 @@ the validator's job there - so those rows are all - .
 | `listtransactions` | ✓ | - (`z_listtransactions`, different shape) | Core categories/fields (`fee` on sends, label filter, count/skip); adds `memo`/`memoStr` |
 | `z_listtransactions` | *(extension)* | ✓ (zecd matches its shape, no `account` arg) | zcashd's per-output history vocabulary: `pool`/`category`/`amount`/`amountZat`/`address`/`outindex`/`outgoing`/`status`, `memo`/`memoStr`, `fee`/`feeZat` on sends; `[count] [from] [includeWatchonly]` paging like `listtransactions` |
 | `listsinceblock` | ✓ | - | Cursor pattern; `removed` always `[]`; reorged/unknown cursor → `-5`, re-baseline (no fork-point walk-back) |
-| `gettransaction` | ✓ | - (`z_viewtransaction`, different shape) | `amount`/`fee`/`confirmations`/`details`/`hex`; foreign tx hex fetched from the upstream (lightwalletd or zebra) |
+| `gettransaction` | ✓ | - (`z_viewtransaction`, different shape) | `amount`/`fee`/`confirmations`/`details`/`hex`; foreign tx hex fetched from zebra on demand |
 | `listunspent` | ✓ | - (`z_listunspent`, different shape) | One entry per unspent Orchard note; synthesized `txid`/`vout`; `address` empty for change |
 | `getreceivedbyaddress`, `listreceivedbyaddress`, `getreceivedbylabel`, `listreceivedbylabel` | ✓ | - | Core shapes over diversified receiving addresses; change never counted |
 | `sendtoaddress` | ✓ | - (`z_sendmany` is async, returns an operation id) | Synchronous: builds, proves, broadcasts, returns txid; ZIP-317 fee; `subtractfeefromamount`/`fee_rate` → `-8`; extra trailing `memo` hex param |
@@ -403,7 +322,7 @@ the validator's job there - so those rows are all - .
 | **Network** | | | |
 | `getnetworkinfo` | ✓ | - | zecd version/subversion; `connections` is 0 or 1 (the chain upstream is the only "peer") |
 | `getconnectioncount` | ✓ | - | 0 or 1 |
-| `getpeerinfo` | ✓ | - | At most one entry, describing the active upstream (lightwalletd or zebra), plus `conn_state`/`syncing` extensions |
+| `getpeerinfo` | ✓ | - | At most one entry, describing the zebra upstream, plus `conn_state`/`syncing` extensions |
 | `ping` | ✓ | - | No-op success (no P2P ping to measure) |
 | **Utility** | | | |
 | `validateaddress` | ✓ | ✓ (transparent-only: a valid UA gets `isvalid:false`) | Validates every Zcash address kind; valid UA → `isvalid:true`, `scriptPubKey` empty, plus extension fields `isvalid_orchard` and a `receiver_types` array (`transparent`/`sapling`/`orchard`) enumerating what the address can receive |
@@ -488,7 +407,7 @@ zecd --datadir ./data --testnet export-ufvk --wallet default
 # On the watch-only host: initialize from that key. Like a restore, pass --birthday (a height
 # at or before the wallet's first transaction) to avoid the safe-but-slow default scan from
 # Sapling activation.
-zecd --datadir ./watch --testnet --server zecrocks \
+zecd --datadir ./watch --testnet \
     init --ufvk "uviewtest1..." --birthday 2500000
 ```
 
@@ -530,15 +449,15 @@ Bitcoin-Core RPC (request an address with `getnewaddress`, poll
 Out of scope by design:
 
 - BTCPayServer via NBXplorer. NBXplorer indexes the chain over Bitcoin P2P / full blocks and
-  tracks xpub derivation schemes over transparent UTXOs. The zebra/lightwalletd/zecd stack
+  tracks xpub derivation schemes over transparent UTXOs. The zebra/zecd stack
   exposes no P2P surface and the wallet is shielded-only.
 
 Edges to be aware of (consequences of being a shielded light wallet):
 
 - Spending needs confirmations: an incoming mempool payment is visible immediately
-  (`getunconfirmedbalance` / `listtransactions` at 0 conf, via the zebra backend's
-  `getrawmempool` poller or lightwalletd's mempool stream),
-  but received notes must mine and reach the confirmation minimum before they are spendable.
+  (`getunconfirmedbalance` / `listtransactions` at 0 conf, via zebra's `getrawmempool`
+  poller), but received notes must mine and reach the confirmation minimum before they are
+  spendable.
   The default minimum is [ZIP 315](https://zips.z.cash/zip-0315)'s: 3 confirmations for the
   wallet's own change, 10 for third-party payments (~12.5 minutes at 75-second blocks);
   `[spend] trusted_confirmations`/`untrusted_confirmations` tune it wallet-wide.
@@ -599,8 +518,7 @@ error codes. Intentional divergences are listed under *Compatibility boundary* a
 # Unit + offline tests (amount conversion, auth, JSON-RPC framing, HTTP status codes):
 cargo test
 
-# Also run the network integration tests that hit the public zecrocks lightwalletd
-# (testnet.zec.rocks / zec.rocks): get_latest_block, get_lightd_info, tree state.
+# Also run the slower ignored tests (e.g. actor-spawn tests that load the bundled prover):
 cargo test -- --include-ignored
 
 # Conformance suite against a running daemon, using the same client logic python-bitcoinrpc's
@@ -618,7 +536,7 @@ python3 scripts/rpc_smoke.py --url http://127.0.0.1:18232/ --user u --password p
 python3 scripts/rpc_send_smoke.py --send-timeout 180
 ```
 
-All wallet RPCs have been exercised against the live public testnet (zecrocks): balances,
+All wallet RPCs have been exercised end-to-end on regtest and the live testnet: balances,
 addresses/labels, history (`listtransactions`/`gettransaction` incl. `hex`), `listunspent`, the
 `walletlock`/`walletpassphrase` gate, and real Orchard `sendtoaddress`/`sendmany` broadcasts.
 
@@ -644,25 +562,11 @@ the third is cloud-native key wrapping for ops teams:
 - Encrypted (`zecd init --encrypt`): the mnemonic is wrapped with a passphrase (age scrypt)
   instead; no identity file can decrypt it. The wallet starts locked (sends return `-13`);
   `walletpassphrase "<pass>" <timeout>` unlocks (`-14` if wrong) and auto-relocks at the timeout;
-  `getwalletinfo.unlocked_until` reports the relock time. Encrypting an existing wallet and
-  rotating its passphrase are **offline CLI operations** (`zecd rewrap`), not RPCs - the
-  passphrase never crosses the network. Unlike Bitcoin Core, wrapping does not regenerate the
-  seed, only its at-rest wrapping, so existing backups stay valid.
-- Cloud keystore (`zecd init --keystore`, or `zecd rewrap` to migrate an existing wallet): the
-  mnemonic is age-encrypted to a dedicated x25519 identity whose secret is wrapped by an
-  **AWS KMS or Google Cloud KMS key** (`[keystore]`). The daemon unlocks at startup with one
-  IAM-gated KMS `Decrypt` - no identity file on disk, no passphrase to type - and every unlock
-  is an attributable CloudTrail / Cloud Audit Logs entry. The cloud provider never sees the
-  mnemonic or seed, only the wrap key (envelope encryption); `keys.toml` alone (backups,
-  snapshots, stolen disks) is useless without the cloud credentials. To the RPCs the wallet is
-  "unencrypted" (passphrase RPCs return `-15`); `zecd rewrap` migrates it off KMS onto a
-  passphrase or rotates to a new KMS key. A KMS outage at startup degrades to a
-  locked wallet (reads fine, sends `-13`) and the daemon retries with backoff. Keystore
-  support is compiled in by default; build with `--no-default-features` to exclude the cloud
-  SDKs entirely (the `keystore` cargo feature). Full operator guide - IAM policies, rotation,
-  break-glass recovery, emulator testing: **docs/KEYSTORE.md**.
+  `getwalletinfo.unlocked_until` reports the relock time. At-rest encryption is set once at
+  init - there is no passphrase-mutating RPC, so the passphrase never crosses the network; to
+  change it, re-init from the mnemonic.
 
-In all models, anyone with RPC access to an unlocked wallet can spend: treat RPC credentials as
+In both models, anyone with RPC access to an unlocked wallet can spend: treat RPC credentials as
 spend authority.
 
 Memory hardening (in-memory seed): once unlocked, the seed lives in process memory regardless of

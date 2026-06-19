@@ -263,7 +263,7 @@ fn watch_only_ufvk_wallet_pairs_with_spending_wallet() {
 
 use std::time::Duration;
 
-use crate::backend::{self, TlsRoots};
+use crate::backend;
 use crate::error::codes;
 use crate::wallet::actor::{self, ActorConfig};
 use crate::wallet::store::{Passphrase, WalletStore};
@@ -281,16 +281,14 @@ fn offline_actor_cfg(
         name: name.to_string(),
         network: net,
         wallet_dir,
-        servers: backend::resolve("127.0.0.1:1", net, TlsRoots::Native, Some(false), None).unwrap(),
+        server: backend::resolve("127.0.0.1:1", net).unwrap(),
         sync_interval: Duration::from_secs(60),
         rebroadcast_interval: Duration::from_secs(60),
         connect_timeout: Duration::from_millis(150),
         reconnect_base: Duration::from_secs(30),
         reconnect_max: Duration::from_secs(60),
-        primary_recheck: Duration::from_secs(60),
         age_identity: None,
         auto_unlock: true,
-        keystore_endpoint: None,
         confirmations_policy: Default::default(),
         enabled_pools: crate::pools::PoolSet::single(crate::pools::Pool::Orchard),
         default_receivers: crate::pools::PoolSet::single(crate::pools::Pool::Orchard),

@@ -3,7 +3,7 @@ name = "zecd-regtest-harness"
 version = "0.0.0"
 edition = "2021"
 publish = false
-description = "End-to-end regtest integration harness for zecd (zebra + lightwalletd, Zcash-Foundation-standard)"
+description = "End-to-end regtest integration harness for zecd (zebra, Zcash-Foundation-standard)"
 
 # Standalone workspace on purpose: keeps the harness's e2e-only dependency tree (reqwest etc.)
 # fully isolated from zecd's hard-pinned librustzcash lockfile - `cargo build` in the parent

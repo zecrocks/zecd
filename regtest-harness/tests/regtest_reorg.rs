@@ -21,7 +21,7 @@ use std::time::{Duration, Instant};
 
 use serde_json::json;
 use zecd_regtest_harness::{
-    extended_enabled, pick_port, resolve_bin, Funder, Lightwalletd, Zebrad, Zecd, ZecdConfig,
+    extended_enabled, pick_port, resolve_bin, Funder, Zebrad, Zecd, ZecdConfig,
 };
 
 /// The original chain. Must exceed zebra's finality depth (99) so a finalized prefix
@@ -33,6 +33,11 @@ const REPLACEMENT_TAIL: u32 = 130;
 /// Generous: the rewind walks back through the orphaned range two blocks per truncation
 /// retry before the rescan starts.
 const SYNC_TIMEOUT: Duration = Duration::from_secs(300);
+/// Blocks live-synced one at a time after the initial batch, so the wallet records
+/// note-commitment-tree checkpoints at real scanned heights (the birthday-anchor checkpoint a
+/// single-batch sync leaves behind has no `blocks` row and can't be a rewind target). A handful
+/// covers the shallow reorg below with margin.
+const LIVE_SYNC_BLOCKS: u32 = 5;
 
 #[tokio::test]
 async fn regtest_reorg_rewinds_and_follows() {
@@ -43,14 +48,12 @@ async fn regtest_reorg_rewinds_and_follows() {
         );
         return;
     }
-    let (Some(zebrad_bin), Some(lwd_bin), Some(devtool_bin)) = (
-        resolve_bin("ZEBRAD_BIN"),
-        resolve_bin("LIGHTWALLETD_BIN"),
-        resolve_bin("DEVTOOL_BIN"),
-    ) else {
+    let (Some(zebrad_bin), Some(devtool_bin)) =
+        (resolve_bin("ZEBRAD_BIN"), resolve_bin("DEVTOOL_BIN"))
+    else {
         eprintln!(
-            "SKIP regtest_reorg_rewinds_and_follows: set ZEBRAD_BIN, LIGHTWALLETD_BIN and \
-             DEVTOOL_BIN (see README.md). The harness still compiled and linked."
+            "SKIP regtest_reorg_rewinds_and_follows: set ZEBRAD_BIN and DEVTOOL_BIN \
+             (see README.md). The harness still compiled and linked."
         );
         return;
     };
@@ -67,16 +70,30 @@ async fn regtest_reorg_rewinds_and_follows() {
         .generate_blocks(INITIAL_BLOCKS)
         .await
         .expect("mine the original chain");
-    let lwd = Lightwalletd::start(&lwd_bin, zebrad.rpc_port)
-        .await
-        .expect("launch lightwalletd");
 
     // 2. zecd scans the original chain to its tip.
-    let cfg = ZecdConfig::new(lwd.grpc_port, pick_port().expect("pick zecd rpc port"));
+    let cfg = ZecdConfig::new(zebrad.rpc_port, pick_port().expect("pick zecd rpc port"));
     let zecd = Zecd::start(&cfg).await.expect("start zecd");
     zecd.wait_until_synced(INITIAL_BLOCKS as u64, SYNC_TIMEOUT)
         .await
         .expect("zecd scans the original chain");
+
+    // Seed recent note-commitment-tree checkpoints by live-syncing a few blocks one at a time.
+    // A wallet that caught up in a single batch holds only the birthday-anchor checkpoint, which
+    // has no `blocks` row and is therefore not a valid `truncate_to_height` rewind target - so a
+    // reorg would be unrecoverable. librustzcash writes a checkpoint at each scan batch's start
+    // height, so scanning block-by-block records checkpoints at real scanned heights, exactly as
+    // a real wallet accrues them from continuous sync. Without this, the rewind below has nothing
+    // to rewind to. (The reorg is shallow - it replaces the tip block - so a checkpoint a few
+    // blocks back is a valid target.)
+    for _ in 0..LIVE_SYNC_BLOCKS {
+        let next = zecd.block_count().await.expect("getblockcount") + 1;
+        zebrad.generate_blocks(1).await.expect("mine a live block");
+        zecd.wait_until_synced(next, SYNC_TIMEOUT)
+            .await
+            .expect("zecd live-syncs the block (records a checkpoint at a real height)");
+    }
+
     let old_tip = zecd.block_count().await.expect("getblockcount");
     let old_hash_at_tip = zecd
         .call("getblockhash", json!([old_tip]))
@@ -86,10 +103,9 @@ async fn regtest_reorg_rewinds_and_follows() {
         .expect("hash is a string")
         .to_string();
 
-    // 3. Replace the chain above zebra's finalized height. Stop lightwalletd first so its
-    //    cache can never serve stale blocks; a fresh instance re-ingests the new chain.
-    let lwd_port = lwd.grpc_port;
-    lwd.stop();
+    // 3. Replace the chain above zebra's finalized height: restart zebra onto a different
+    //    miner address so it drops the non-finalized tail and mines a divergent one. zecd
+    //    talks straight to zebra, so there is no indexer cache to invalidate.
     zebrad
         .restart_with_miner(&replacement_miner)
         .await
@@ -98,9 +114,6 @@ async fn regtest_reorg_rewinds_and_follows() {
         .generate_blocks(REPLACEMENT_TAIL)
         .await
         .expect("mine the replacement tail");
-    let _lwd = Lightwalletd::start_on(&lwd_bin, zebrad.rpc_port, lwd_port)
-        .await
-        .expect("restart lightwalletd on the same port");
 
     // 4. zecd reconnects, hits the prev-hash mismatch above the finalized height, rewinds
     //    (perform_rewind), and rescans to the replacement tip - which is above the old one.

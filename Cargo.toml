@@ -1,6 +1,6 @@
 [package]
 name = "zecd"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 rust-version = "1.88"
 license = "MIT OR Apache-2.0"
@@ -26,13 +26,6 @@ futures-util = "0.3"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = { version = "1.0", features = ["arbitrary_precision"] }
 
-# Prometheus `/metrics`: the lightweight `metrics` facade (global recorder, like `tracing`) plus
-# the Prometheus text exporter. `default-features = false` drops the exporter's built-in HTTP
-# listener / push-gateway (and their hyper/tokio extras) - we render through the existing axum
-# health router instead, keeping the dependency surface (and TLS providers) untouched.
-metrics = "0.24"
-metrics-exporter-prometheus = { version = "0.16", default-features = false }
-
 # CLI / config / logging
 clap = { version = "4.5", features = ["derive", "string", "env"] }
 toml = "0.8"
@@ -57,17 +50,11 @@ age = { version = "0.11", features = ["armor"] }
 bip0039 = { version = "0.12", features = ["std", "all-languages"] }
 secrecy = "0.8"
 
-# lightwalletd transport. `tls-ring` makes tonic select the `ring` rustls crypto provider for
-# its own ClientConfig (tonic 0.14 does this internally - no CryptoProvider::install_default
-# needed); keep it the *only* rustls provider feature, or tonic's auto-selection breaks (see the
-# the project docs crypto-provider gotcha). `tls-native-roots` lets us trust the OS store (and
-# SSL_CERT_FILE), which `tls-webpki-roots` alone does not.
-tonic = { version = "0.14", features = ["gzip", "tls-ring", "tls-native-roots", "tls-webpki-roots"] }
+# `prost` deserializes the compact-block / treestate / mempool protobuf types that
+# `zcash_client_backend::proto` exposes and the zebra backend constructs (and that
+# `sync/engine.rs` serializes to the on-disk block cache). `hyper-util`'s legacy client is the
+# HTTP/1.1 client behind the zebra JSON-RPC backend.
 prost = "0.14"
-# SOCKS5 proxy support for routing lightwalletd connections through Tor/Nym/any SOCKS5 proxy.
-# `hyper-util`'s `TokioIo` adapts the proxied TCP stream to tonic's connector interface; its
-# legacy client is the HTTP/1.1 client behind the zebra JSON-RPC backend.
-tokio-socks = "0.5"
 hyper-util = { version = "0.1", features = ["tokio", "client-legacy", "http1"] }
 rusqlite = { version = "0.37", features = ["time"] }
 time = "0.3"
@@ -79,7 +66,7 @@ orchard = { version = "0.14", default-features = false }
 zcash_address = "0.12"
 # `transparent-inputs` lets transparent receivers surface in getrawtransaction/getaddressinfo
 # and the received-by-address read paths; zecd's own wallets never expose transparent receivers.
-zcash_client_backend = { version = "0.23", features = ["lightwalletd-tonic-tls-webpki-roots", "orchard", "transparent-inputs"] }
+zcash_client_backend = { version = "0.23", features = ["orchard", "transparent-inputs"] }
 zcash_client_sqlite = { version = "0.21", features = ["unstable", "orchard", "serde", "transparent-inputs"] }
 zcash_keys = { version = "0.14", features = ["unstable", "orchard"] }
 zcash_primitives = "0.28"
@@ -92,23 +79,7 @@ zcash_script = "0.4.5"
 sapling = { package = "sapling-crypto", version = "0.7" }
 zip32 = "0.2"
 zip321 = "0.8"
-# Cloud-KMS keystore providers (the `keystore` feature; on by default, excludable with
-# --no-default-features for a leaner dependency tree). aws-sdk-kms's default `rustls`
-# feature would pull the *legacy* rustls 0.21 TLS stack (RUSTSEC-flagged webpki 0.101);
-# default-https-client is the maintained rustls 0.23 client aws-config's defaults also use.
-aws-config = { version = "1.8.13", optional = true }
-aws-sdk-kms = { version = "1.99.0", default-features = false, features = ["default-https-client", "rt-tokio"], optional = true }
-gcp_auth = { version = "0.12.6", optional = true }
-hyper-rustls = { version = "0.27", features = ["http1", "native-tokio"], optional = true }
-rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"], optional = true }
 libc = "0.2.186"
-
-[features]
-default = ["keystore"]
-# Cloud-KMS key custody ([keystore] config, `init --keystore`, `rewrap`): wrap the wallet's
-# at-rest encryption key with AWS KMS / Google Cloud KMS. Without it, KMS-related config and
-# keys.toml markers still parse, but any wrap/unwrap reports that support isn't compiled in.
-keystore = ["dep:aws-config", "dep:aws-sdk-kms", "dep:gcp_auth", "dep:hyper-rustls", "dep:rustls"]
 
 [dev-dependencies]
 tempfile = "3"

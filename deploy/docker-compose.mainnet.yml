@@ -14,11 +14,6 @@ services:
     volumes:
       - ./zebrad.mainnet.toml:/etc/zebra/zebrad.toml:ro
 
-  # Only used with the optional `--profile lightwalletd` (see docker-compose.yml).
-  lightwalletd:
-    volumes:
-      - ./lightwalletd-zcash.mainnet.conf:/etc/lightwalletd/zcash.conf:ro
-
   zecd:
     volumes:
       - ./zecd.mainnet.toml:/etc/zecd/zecd.toml:ro
