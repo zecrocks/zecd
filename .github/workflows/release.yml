@@ -10,8 +10,9 @@ name: Release
 #   * x86_64 (amd64): the StageX `Dockerfile` - full-source-bootstrapped, static musl,
 #     bit-for-bit reproducible.
 #   * aarch64 (arm64): the pinned `Dockerfile.arm64` - deterministic (digest-pinned base,
-#     fixed toolchain, SOURCE_DATE_EPOCH, --build-id=none), glibc-dynamic, built natively
-#     on an arm64 runner.
+#     version-pinned apk toolchain, SOURCE_DATE_EPOCH, --build-id=none), static musl, built
+#     natively on an arm64 runner. Not StageX-grade trust (upstream binaries, not
+#     full-source-bootstrapped), but bit-for-bit reproducible.
 # Each target ships a `.tar.gz` (reproducible tar: sorted, fixed mtime, root-owned) and a
 # reproducible `.deb` (see scripts/build-deb.sh), each with a `.sha256` sidecar.
 #
@@ -71,7 +72,7 @@ jobs:
             deb_arch: amd64
           - runner: ubuntu-24.04-arm
             dockerfile: Dockerfile.arm64
-            target_triple: aarch64-unknown-linux-gnu
+            target_triple: aarch64-unknown-linux-musl
             deb_arch: arm64
     runs-on: ${{ matrix.runner }}
     env:
@@ -190,9 +191,10 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
-  # arm64: the conventional Debian image (`-arm64` suffixed tags), built natively on a
-  # GitHub arm64 runner. StageX publishes no arm64 images yet, so only the amd64 builds
-  # above are reproducible right now - see Dockerfile.arm64.
+  # arm64: the static-musl Alpine image (`-arm64` suffixed tags), built natively on a GitHub
+  # arm64 runner. StageX publishes no arm64 images yet, so this isn't full-source-bootstrapped
+  # like amd64 - but it is bit-for-bit reproducible (pinned base + apk toolchain). See
+  # Dockerfile.arm64.
   docker-arm64:
     needs: setup
     # Always on a tag push; on manual dispatch only when push_images was requested.

@@ -79,6 +79,23 @@ zip32 = "0.2"
 zip321 = "0.8"
 libc = "0.2.186"
 
+# Optional drop-in allocator, enabled by both musl release images (`Dockerfile` and
+# `Dockerfile.arm64`). musl's default `malloc-ng` serializes badly under Orchard proving's
+# multi-threaded (rayon) allocation churn, making a shielded send ~5-6x slower than glibc;
+# mimalloc restores glibc parity. Native glibc builds (dev, tests) leave it off - glibc's own
+# allocator already scales, so the dependency is pure overhead there.
+mimalloc = { version = "0.1", optional = true }
+
+[features]
+# Use mimalloc as the global allocator. Off by default; the musl release images opt in.
+mimalloc = ["dep:mimalloc"]
+# Hardened mimalloc (MI_SECURE): guard pages, encrypted/canary free-lists, randomized
+# allocation. The shipped musl images build with this - it costs <4% on the proving path
+# (compute-bound, so allocator hardening barely registers) while restoring the heap-exploitation
+# mitigations that swapping out musl's `malloc-ng` would otherwise drop. `mimalloc` (non-secure)
+# remains available for anyone who wants the last few percent. See FINDINGS.md.
+mimalloc-secure = ["mimalloc", "mimalloc/secure"]
+
 [dev-dependencies]
 tempfile = "3"
 # Frontier bookkeeping for the fabricated-chain reorg test (matches librustzcash's version).

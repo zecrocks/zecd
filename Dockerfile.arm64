@@ -1,20 +1,27 @@
-# Conventional pinned build - for ARM hosts (StageX, used by the primary `Dockerfile`,
-# publishes amd64 base images only).
+# Reproducible static-musl build for arm64 - mirrors the amd64 StageX `Dockerfile`'s output
+# shape (a fully static musl binary in a bare `scratch` runtime). StageX publishes amd64 base
+# images only, so arm64 uses the official musl-native `rust:alpine` image instead.
 #
 # Everything is pinned so the binaries are deterministic and independently rebuildable:
-# base images by digest, the Rust toolchain by version (RUSTUP_TOOLCHAIN overrides
-# rust-toolchain.toml's floating `channel = "stable"`), dependencies by Cargo.lock, and
-# the usual determinism knobs (SOURCE_DATE_EPOCH, CARGO_INCREMENTAL=0, codegen-units=1,
-# --build-id=none; the build path is fixed by WORKDIR). What this still is NOT is
-# StageX-grade *trust*: the toolchain and base images are upstream binary artifacts
-# (Docker official images / static.rust-lang.org), not full-source-bootstrapped.
+# the base image by digest, the C/C++/protoc toolchain to exact apk versions, the Rust
+# toolchain by RUSTUP_TOOLCHAIN (overrides rust-toolchain.toml's floating `channel =
+# "stable"`), dependencies by Cargo.lock, and the usual determinism knobs (SOURCE_DATE_EPOCH,
+# CARGO_INCREMENTAL=0, codegen-units=1, +crt-static, --build-id=none; the build path is fixed
+# by WORKDIR). What this still is NOT is StageX-grade *trust*: the toolchain and base image
+# are upstream binary artifacts (Docker official images / Alpine repos), not
+# full-source-bootstrapped.
 #
-# Bit-for-bit reproducibility additionally requires the vendored i18n-embed-fl patch
-# (see [patch.crates-io] in Cargo.toml and the project docs "Gotchas") - without it, `age`'s
-# fl! macro flips two fluent args' order per build.
+# Bit-for-bit reproducibility additionally requires the vendored i18n-embed-fl patch (see
+# [patch.crates-io] in Cargo.toml and the project docs "Gotchas") - without it, `age`'s fl! macro
+# flips two fluent args' order per build.
 #
-# Keep the runtime contract (binaries, user 10001:10001, datadirs, ports, entrypoint)
-# in lockstep with the StageX runtime stage so the two images are interchangeable.
+# MAINTENANCE: the exact apk pins (gcc/g++/musl-dev/binutils/protoc/…) are Alpine 3.24
+# versions; Alpine garbage-collects superseded versions from the CDN, so when a build starts
+# failing on "package not found", bump the base-image digest and refresh these pins together
+# (and keep RUSTUP_TOOLCHAIN in lockstep with the image tag).
+#
+# Keep the runtime contract (binary path, user 10001:10001, datadirs, ports, entrypoint) in
+# lockstep with the StageX runtime stage so the two images are interchangeable.
 #
 #   docker build -f Dockerfile.arm64 -t zecd .
 #   docker build -f Dockerfile.arm64 --target export -o ./out .   # extract the binaries
@@ -22,34 +29,62 @@
 # Dependencies are released librustzcash crates from crates.io (versions pinned by the
 # committed Cargo.lock), so the build needs network access to fetch them.
 
-# rust:1.96.0-bookworm (multi-arch index digest; keep RUSTUP_TOOLCHAIN below in lockstep)
-FROM rust:1.96.0-bookworm@sha256:19817ead3289c8c631c73df281e18b59b172f6a31f4f563290f69cddd06c30e9 AS builder
-# protoc is needed by zcash_client_backend's build script.
-RUN apt-get update \
-    && apt-get install -y --no-install-recommends protobuf-compiler \
-    && rm -rf /var/lib/apt/lists/*
+# rust:1.96.0-alpine3.24 (multi-arch index digest; keep RUSTUP_TOOLCHAIN below in lockstep)
+FROM rust:1.96.0-alpine3.24@sha256:f87aa870663e2b57ec8c69de82c7eedf7383bee987eef7612c0359635eaadb41 AS builder
+
+# musl-native C/C++ toolchain (rusqlite's bundled SQLite is C; zcash_script is C++) + protoc
+# (zcash_client_backend's build script). Versions pinned for reproducibility - see the
+# MAINTENANCE note above. build-base pulls make/binutils; the compilers are pinned explicitly
+# so apk can't silently resolve a newer gcc that would change the emitted machine code.
+RUN apk add --no-cache \
+        build-base=0.5-r4 \
+        gcc=15.2.0-r5 \
+        g++=15.2.0-r5 \
+        musl-dev=1.2.6-r2 \
+        binutils=2.45.1-r1 \
+        make=4.4.1-r4 \
+        protoc=31.1-r1 \
+        protobuf-dev=31.1-r1
+
 # Pin the toolchain to the image's preinstalled one; without this, rustup honors
 # rust-toolchain.toml's `channel = "stable"` and downloads whatever stable is today.
 ENV RUSTUP_TOOLCHAIN=1.96.0
 ENV SOURCE_DATE_EPOCH=1
 ENV CARGO_INCREMENTAL=0
-ENV RUSTFLAGS="-C codegen-units=1 -C link-arg=-Wl,--build-id=none"
+# Resilience against transient crates.io fetch flakes in CI (seen as curl "[16] Error in the
+# HTTP2 framing layer"). Such HTTP/2 errors are classified spurious/retryable by cargo since
+# rust-lang/cargo#6861, so a higher retry count is the right lever - no protocol downgrade
+# needed. Network-only knob - it doesn't affect the emitted binary, so the build stays
+# reproducible.
+ENV CARGO_NET_RETRY=10
+ENV TARGET_ARCH=aarch64-unknown-linux-musl
+# Static musl + a reproducible link. gcc is the native musl driver on Alpine, so unlike the
+# amd64 StageX stage there is no clang/lld override to do here. +crt-static is the default for
+# musl targets but set explicitly for clarity.
+ENV RUSTFLAGS="-C codegen-units=1 -C target-feature=+crt-static -C link-arg=-Wl,--build-id=none"
 WORKDIR /usr/src/zecd
 COPY . .
-# Build the zecd binary
-RUN cargo install --locked --path . --bin zecd --root /usr/local
+
+# Build the zecd binary (the aarch64-musl rust-std ships in the base image as the host target).
+# --features mimalloc-secure: like the amd64 musl image, swap in mimalloc - musl's default
+# allocator is ~5-6x slower than glibc under Orchard proving's multi-threaded allocation churn. The `-secure` variant adds heap hardening (guard pages,
+# canary free-lists) for <4% on the proving path. mimalloc-sys compiles C via the same gcc/cc-rs
+# path that already builds bundled libsqlite3-sys here.
+RUN cargo install --locked --path . --bin zecd --target ${TARGET_ARCH} --features mimalloc-secure --root /usr/local \
+    # Skeleton dirs for the scratch runtime, COPY'd below with --chown so the unprivileged
+    # runtime user can write its datadirs (and SQLite its temp files).
+    && install -d -m 0755 /rootfs/var/lib/zecd \
+    && install -d -m 1777 /rootfs/tmp
 
 # --- layer for local binary extraction ---
 FROM scratch AS export
 COPY --from=builder /usr/local/bin/zecd /zecd
 
-# --- runtime ---
-# debian:bookworm-slim (multi-arch index digest)
-FROM debian:bookworm-slim@sha256:96e378d7e6531ac9a15ad505478fcc2e69f371b10f5cdf87857c4b8188404716 AS runtime
-RUN groupadd -g 10001 zecd \
-    && useradd -r -u 10001 -g zecd -m -d /var/lib/zecd zecd
-COPY --from=builder /usr/local/bin/zecd /usr/local/bin/zecd
-USER zecd
+# --- runtime (bare scratch, matching the StageX image) ---
+FROM scratch AS runtime
+COPY --from=export /zecd /usr/local/bin/zecd
+COPY --from=builder --chown=10001:10001 /rootfs/ /
+USER 10001:10001
 WORKDIR /var/lib/zecd
 # zecd JSON-RPC (mainnet 8232 / testnet 18232) + health (9233).
 EXPOSE 8232 18232 9233

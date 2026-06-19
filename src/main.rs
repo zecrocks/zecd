@@ -5,6 +5,16 @@ use clap::Parser;
 use zecd::config::{AppConfig, Cli, Command};
 use zecd::daemon;
 
+// musl's default allocator is ~5-6x slower than glibc's under Orchard proving's multi-threaded
+// allocation churn. Both musl release images
+// build with `--features mimalloc-secure` to close that gap (the `mimalloc` feature, plus
+// MI_SECURE heap hardening); native glibc builds leave it off (parity either way, so it would be
+// pure dependency weight). The hardening is a compile-time flag of the mimalloc crate, so the
+// global allocator declaration is identical for both `mimalloc` and `mimalloc-secure`.
+#[cfg(feature = "mimalloc")]
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();

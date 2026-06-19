@@ -4,8 +4,9 @@ name: Docker
 # test-docker-container workflow:
 #   - Dockerfile - the reproducible StageX build (amd64 only; StageX publishes
 #                         no arm64 images yet)
-#   - Dockerfile.arm64 - the conventional Debian build for ARM hosts (NOT reproducible),
-#                         run natively on a GitHub arm64 runner
+#   - Dockerfile.arm64 - the reproducible static-musl Alpine build for ARM hosts (pinned
+#                         base + apk toolchain; not StageX-grade trust), run natively on a
+#                         GitHub arm64 runner
 # The full static release builds are slow, so this only runs when the image inputs
 # change (the crate itself is built and tested by CI on every PR).
 
@@ -50,7 +51,7 @@ jobs:
           - name: stagex-amd64
             runner: ubuntu-latest
             dockerfile: Dockerfile
-          - name: conventional-arm64
+          - name: alpine-musl-arm64
             runner: ubuntu-24.04-arm
             dockerfile: Dockerfile.arm64
     runs-on: ${{ matrix.runner }}

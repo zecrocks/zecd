@@ -30,6 +30,12 @@ ENV CARGO_HOME=/usr/local/cargo
 ENV CARGO_TARGET_DIR="/usr/src/zecd/target"
 ENV CARGO_INCREMENTAL=0
 ENV RUST_BACKTRACE=1
+# Resilience against transient crates.io fetch flakes in CI (seen as curl "[16] Error in the
+# HTTP2 framing layer"). Such HTTP/2 errors are classified spurious/retryable by cargo since
+# rust-lang/cargo#6861, so a higher retry count is the right lever - no protocol downgrade
+# needed. Network-only knob - it doesn't affect the emitted binary, so the build stays
+# bit-for-bit reproducible.
+ENV CARGO_NET_RETRY=10
 ENV RUSTFLAGS="\
 -C codegen-units=1 \
 -C target-feature=+crt-static \
@@ -58,6 +64,12 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
         --path . \
         --bin zecd \
         --target ${TARGET_ARCH} \
+        # musl's default allocator is ~5-6x slower than glibc under Orchard proving's
+        # multi-threaded allocation churn; mimalloc closes the gap. The `-secure` variant adds
+        # heap hardening (guard pages, canary free-lists) for <4% on the proving path, recovering
+        # the mitigations dropped by replacing musl's malloc-ng. glibc dev/test builds skip this.
+        # (mimalloc-sys compiles C the same way libsqlite3-sys already does here.)
+        --features mimalloc-secure \
     # Skeleton dirs for the scratch runtime, COPY'd below with --chown so the
     # unprivileged runtime user can write its datadirs (and SQLite its temp files).
     && install -d -m 0755 /rootfs/var/lib/zecd \

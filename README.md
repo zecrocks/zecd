@@ -230,10 +230,12 @@ docker build --target export -o ./out .     # ./out/zecd
 
 **ARM (arm64) hosts:** StageX publishes amd64 base images only, so the full-source-
 bootstrapped reproducible build is **amd64-only right now**. For ARM, `Dockerfile.arm64`
-builds the same two binaries with the same runtime contract (user, datadirs, ports,
-entrypoint) from a conventional but fully *pinned* toolchain (base images by digest, Rust
-by version, determinism flags) - deterministic and independently rebuildable, just without
-StageX's bootstrapped-toolchain trust story. Released images carry `-arm64` suffixed tags:
+builds the same binary with the same output shape - a statically linked musl binary in a
+from-scratch runtime - and the same runtime contract (user, datadirs, ports, entrypoint),
+from the musl-native `rust:alpine` image with a fully *pinned* toolchain (base image by
+digest, the C/C++/protoc toolchain to exact apk versions, Rust by version, determinism
+flags). It is deterministic and independently rebuildable bit-for-bit, just without StageX's
+bootstrapped-toolchain trust story. Released images carry `-arm64` suffixed tags:
 
 ```sh
 docker build -f Dockerfile.arm64 -t zecd .
@@ -244,7 +246,7 @@ the binary from each Dockerfile's `export` stage - so the published binaries inh
 reproducible pipeline as the images - and attaches them to a draft GitHub release. The same
 workflow can be run manually (Actions → Release → Run workflow) with a `version` input to
 dry-run the packaging without cutting a tag; the GHCR image push is opt-in for those runs. Each Linux
-target (`x86_64-unknown-linux-musl`, static; `aarch64-unknown-linux-gnu`, glibc-dynamic) ships
+target (`x86_64-unknown-linux-musl` and `aarch64-unknown-linux-musl`, both static) ships
 a reproducible `.tar.gz` and a reproducible `.deb` (`scripts/build-deb.sh`: fixed-mtime,
 root-owned, `SOURCE_DATE_EPOCH`-anchored; verified bit-for-bit), each with a `.sha256` sidecar.
 The `.deb` installs `zecd` to `/usr/bin` plus a (not-enabled) `zecd.service` systemd unit:
