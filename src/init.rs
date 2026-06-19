@@ -60,6 +60,11 @@ fn read_encryption_passphrase() -> anyhow::Result<Passphrase> {
 }
 
 pub async fn run(config: &AppConfig, args: &InitArgs) -> anyhow::Result<()> {
+    // Single-instance guard: take the exclusive datadir lock before creating any wallet, held
+    // until `init` returns. This refuses an `init` against a datadir a running daemon (or another
+    // `init`) already owns, rather than racing it. See `crate::lock`.
+    let _datadir_lock = crate::lock::lock_datadir(&config.datadir)?;
+
     let entry: WalletEntry = config
         .wallets
         .get(&args.wallet)

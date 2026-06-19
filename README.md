@@ -548,6 +548,15 @@ addresses/labels, history (`listtransactions`/`gettransaction` incl. `hex`), `li
 identity, birthday height), restore procedures, monitoring/alerting, send semantics under failure,
 upgrades, and the mainnet checklist.
 
+**Single instance per datadir.** Like bitcoind/zcashd/zallet, zecd takes an exclusive advisory
+lock on `<datadir>/.lock` while it owns the data directory, so only one daemon can run against a
+given datadir at a time. A second `zecd run` (or a `zecd init`) on the same datadir fails fast
+with `Cannot lock data directory …`. The lock is an OS advisory lock that the kernel releases
+automatically when the daemon exits (including a crash or kill), so there is never a stale
+lockfile to delete: if the error appears and no zecd is running, just retry. The read-only
+`zecd export-ufvk` is exempt (it only reads the wallet DB), so you can export a UFVK while the
+daemon is running.
+
 ## Security
 
 Three key-custody models - the first two mirror bitcoind's unencrypted/encrypted wallet states,

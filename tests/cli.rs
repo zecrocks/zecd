@@ -439,3 +439,71 @@ fn export_ufvk_requires_an_initialized_wallet() {
         stderr_of(&out)
     );
 }
+
+/// Single-instance guard: a datadir-writing command (`init`) refuses to start when the datadir
+/// is already locked by another zecd. The test process holds the lock (standing in for a running
+/// daemon); the spawned `zecd init` must bail fast with the "already running" message - the lock
+/// is taken before any network or filesystem work, so this is offline.
+#[test]
+fn init_refuses_when_datadir_is_already_locked() {
+    let dir = tempfile::tempdir().unwrap();
+    let _held = zecd::lock::lock_datadir(dir.path()).expect("acquire the datadir lock");
+
+    let out = run_with_timeout(
+        {
+            let mut c = zecd();
+            c.args([
+                "--datadir",
+                dir.path().to_str().unwrap(),
+                "--regtest",
+                "init",
+            ]);
+            c
+        },
+        Duration::from_secs(10),
+    );
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "init against a locked datadir should refuse; stderr: {}",
+        stderr_of(&out)
+    );
+    assert!(
+        stderr_of(&out).contains("already running"),
+        "stderr: {}",
+        stderr_of(&out)
+    );
+}
+
+/// The read-only `export-ufvk` is deliberately exempt from the datadir lock (it only reads the
+/// wallet DB, so it is safe to run alongside a live daemon). Even with the lock held, it must get
+/// past the guard and fail on its own "not initialized" check - never on "already running".
+#[test]
+fn export_ufvk_is_not_blocked_by_the_datadir_lock() {
+    let dir = tempfile::tempdir().unwrap();
+    let _held = zecd::lock::lock_datadir(dir.path()).expect("acquire the datadir lock");
+
+    let out = run_with_timeout(
+        {
+            let mut c = zecd();
+            c.args([
+                "--datadir",
+                dir.path().to_str().unwrap(),
+                "--regtest",
+                "export-ufvk",
+            ]);
+            c
+        },
+        Duration::from_secs(10),
+    );
+    let stderr = stderr_of(&out);
+    assert_eq!(out.status.code(), Some(1), "stderr: {stderr}");
+    assert!(
+        stderr.contains("not initialized"),
+        "export-ufvk should reach its own check, not the lock guard; stderr: {stderr}"
+    );
+    assert!(
+        !stderr.contains("already running"),
+        "export-ufvk must not be blocked by the datadir lock; stderr: {stderr}"
+    );
+}

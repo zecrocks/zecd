@@ -78,6 +78,10 @@ sapling = { package = "sapling-crypto", version = "0.7" }
 zip32 = "0.2"
 zip321 = "0.8"
 libc = "0.2.186"
+# Single-instance guard: an advisory exclusive lock on `<datadir>/.lock` so two zecd processes
+# can't operate on the same data directory at once (mirrors zallet / zcashd). Linux only needs
+# libc (already in-tree); windows-sys is pulled in transitively on Windows.
+fmutex = "0.3"
 
 # Optional drop-in allocator, enabled by both musl release images (`Dockerfile` and
 # `Dockerfile.arm64`). musl's default `malloc-ng` serializes badly under Orchard proving's

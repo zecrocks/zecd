@@ -12,6 +12,7 @@ pub mod error;
 pub mod hardening;
 pub mod health;
 pub mod init;
+pub mod lock;
 pub mod network;
 pub mod operations;
 pub mod pools;

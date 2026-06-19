@@ -34,6 +34,10 @@ pub fn init_tracing(log: &config::LogConfig) {
 
 pub async fn run(config: AppConfig) -> anyhow::Result<()> {
     let prog = "zecd";
+    // Single-instance guard: take the exclusive datadir lock before opening any wallet, and hold
+    // it for the whole daemon lifetime (until `run` returns). A second zecd on the same datadir
+    // would corrupt the wallet DB; this makes it refuse to start instead. See `crate::lock`.
+    let _datadir_lock = crate::lock::lock_datadir(&config.datadir)?;
     // The example/deploy configs ship with a placeholder RPC password; on mainnet that is
     // spend authority, so refuse to start until it has been changed.
     if matches!(config.network, crate::network::ZNetwork::Main)
