@@ -8,15 +8,13 @@ use std::fmt;
 /// Standard JSON-RPC 2.0 / Bitcoin Core error codes.
 ///
 /// We reuse the exact integer values Bitcoin Core uses; clients such as
-/// `python-bitcoinrpc` and `bitcoincore-rpc` match on these. Some are kept for completeness
-/// even if not yet emitted.
+/// `python-bitcoinrpc` and `bitcoincore-rpc` match on these.
 #[allow(dead_code)]
 pub mod codes {
     // JSON-RPC 2.0 transport-level errors.
     pub const RPC_INVALID_REQUEST: i32 = -32600;
     pub const RPC_METHOD_NOT_FOUND: i32 = -32601;
     pub const RPC_INVALID_PARAMS: i32 = -32602;
-    pub const RPC_INTERNAL_ERROR: i32 = -32603;
     pub const RPC_PARSE_ERROR: i32 = -32700;
 
     // General application errors. (Bitcoin Core's `protocol.h` defines more - including a P2P
@@ -34,20 +32,16 @@ pub mod codes {
 
     // Wallet errors. NB: these are Bitcoin Core's `protocol.h` numbers; `-11` (invalid label)
     // and `-18` (wallet not found) differ in *meaning* from zcashd's `protocol.h` (where they are
-    // "accounts unsupported" / "backup required"), and `-19` is unused by zcashd. The collision is
-    // harmless - those codes are only emitted by the label/multiwallet methods zcashd lacks - so
-    // don't "reconcile" the numbers: the Bitcoin Core values are the conformance target.
+    // "accounts unsupported" / "backup required"). The collision is harmless - those codes are only
+    // emitted by the label/multiwallet methods zcashd lacks - so don't "reconcile" the numbers: the
+    // Bitcoin Core values are the conformance target.
     pub const RPC_WALLET_ERROR: i32 = -4;
     pub const RPC_WALLET_INSUFFICIENT_FUNDS: i32 = -6;
     pub const RPC_WALLET_INVALID_LABEL_NAME: i32 = -11;
-    pub const RPC_WALLET_KEYPOOL_RAN_OUT: i32 = -12;
     pub const RPC_WALLET_UNLOCK_NEEDED: i32 = -13;
     pub const RPC_WALLET_PASSPHRASE_INCORRECT: i32 = -14;
     pub const RPC_WALLET_WRONG_ENC_STATE: i32 = -15;
-    pub const RPC_WALLET_ENCRYPTION_FAILED: i32 = -16;
-    pub const RPC_WALLET_ALREADY_UNLOCKED: i32 = -17;
     pub const RPC_WALLET_NOT_FOUND: i32 = -18;
-    pub const RPC_WALLET_NOT_SPECIFIED: i32 = -19;
 }
 
 /// Map an RPC error code to the HTTP status Bitcoin Core uses (`httprpc.cpp` `JSONErrorReply`):

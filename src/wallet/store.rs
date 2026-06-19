@@ -151,18 +151,6 @@ impl WalletStore {
             .transpose()
     }
 
-    /// Decrypt the stored mnemonic to its raw UTF-8 bytes (the phrase), without deriving the
-    /// seed - used when re-wrapping the mnemonic under a new key (encrypt/change-passphrase).
-    pub fn decrypt_mnemonic<'a>(
-        &self,
-        identities: impl Iterator<Item = &'a dyn age::Identity>,
-    ) -> anyhow::Result<Option<SecretVec<u8>>> {
-        self.seed_ciphertext
-            .as_ref()
-            .map(|ct| decrypt_mnemonic(identities, ct))
-            .transpose()
-    }
-
     /// Derive the BIP-39 seed from a passphrase-encrypted (age scrypt) mnemonic. A wrong
     /// passphrase surfaces as an `Err` (age `DecryptError`); the caller maps that to -14.
     pub fn decrypt_seed_with_passphrase(
@@ -174,20 +162,6 @@ impl WalletStore {
             .map(|ct| {
                 let id = age::scrypt::Identity::new(passphrase);
                 decrypt_seed(std::iter::once(&id as &dyn age::Identity), ct)
-            })
-            .transpose()
-    }
-
-    /// Decrypt a passphrase-encrypted mnemonic to its raw phrase bytes (for change-passphrase).
-    pub fn decrypt_mnemonic_with_passphrase(
-        &self,
-        passphrase: Passphrase,
-    ) -> anyhow::Result<Option<SecretVec<u8>>> {
-        self.seed_ciphertext
-            .as_ref()
-            .map(|ct| {
-                let id = age::scrypt::Identity::new(passphrase);
-                decrypt_mnemonic(std::iter::once(&id as &dyn age::Identity), ct)
             })
             .transpose()
     }

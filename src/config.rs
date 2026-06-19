@@ -267,15 +267,6 @@ impl SpendConfig {
     }
 }
 
-impl AppConfig {
-    /// Default RPC port for a network when none is configured (zcashd convention).
-    pub fn default_rpc_port(network: ZNetwork) -> u16 {
-        match network {
-            ZNetwork::Main => 8232,
-            ZNetwork::Test | ZNetwork::Regtest(_) => 18232,
-        }
-    }
-}
 
 // ---------------------------------------------------------------------------
 // On-disk TOML representation

@@ -92,17 +92,6 @@ pub fn decrypt_seed_with_identity(
     store.decrypt_seed(identities.iter().map(|i| i.as_ref() as _))
 }
 
-/// Load age identities and decrypt the stored mnemonic to its raw phrase bytes (not the seed).
-/// Used by `zecd rewrap` to re-wrap an identity-encrypted mnemonic under a passphrase or KMS key.
-pub fn decrypt_mnemonic_with_identity(
-    store: &WalletStore,
-    identity_path: &Path,
-) -> anyhow::Result<Option<SecretVec<u8>>> {
-    let identities = age::IdentityFile::from_file(identity_path.to_string_lossy().into_owned())?
-        .into_identities()?;
-    store.decrypt_mnemonic(identities.iter().map(|i| i.as_ref() as _))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

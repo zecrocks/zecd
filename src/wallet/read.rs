@@ -92,14 +92,9 @@ pub struct TxOutputRecord {
 pub struct TxRecord {
     pub mined_height: Option<u32>,
     pub txid_hex: String,
-    #[allow(dead_code)] // part of the row shape; not yet surfaced by an RPC
     pub expiry_height: Option<u32>,
     pub account_balance_delta: i64,
     pub fee_paid: Option<u64>,
-    #[allow(dead_code)] // part of the row shape; not yet surfaced by an RPC
-    pub sent_note_count: i64,
-    #[allow(dead_code)] // part of the row shape; not yet surfaced by an RPC
-    pub received_note_count: i64,
     pub block_time: Option<i64>,
     pub expired_unmined: bool,
     /// Position of the transaction within its block, when known (`blockindex`).
@@ -219,7 +214,7 @@ fn load_outputs(
 /// (set only for wallet-authored sends; stored as `yyyy-MM-dd HH:mm:ss.fffffffzzz`, which
 /// SQLite's date parser understands).
 const TX_COLS: &str = "v.mined_height, v.txid, v.expiry_height, v.account_balance_delta,
-            v.fee_paid, v.sent_note_count, v.received_note_count, v.block_time,
+            v.fee_paid, v.block_time,
             v.expired_unmined, v.tx_index,
             b.hash AS block_hash,
             CAST(strftime('%s', t.created) AS INTEGER) AS created_time";
@@ -240,8 +235,6 @@ fn tx_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<(Vec<u8>, TxRecord)>
             expiry_height: row.get("expiry_height")?,
             account_balance_delta: row.get("account_balance_delta")?,
             fee_paid: row.get::<_, Option<i64>>("fee_paid")?.map(|v| v as u64),
-            sent_note_count: row.get("sent_note_count")?,
-            received_note_count: row.get("received_note_count")?,
             block_time: row.get("block_time")?,
             expired_unmined: row.get("expired_unmined")?,
             tx_index: row.get("tx_index")?,
@@ -406,8 +399,6 @@ pub fn received_tx_records(
                 expiry_height: None,
                 account_balance_delta: 0,
                 fee_paid: None,
-                sent_note_count: 0,
-                received_note_count: 0,
                 block_time: None,
                 expired_unmined,
                 tx_index: None,

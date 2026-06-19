@@ -143,11 +143,6 @@ impl PoolSet {
         self.pools.iter().all(|p| other.contains(*p))
     }
 
-    /// The shielded protocols for the pools in this set, for librustzcash note selection.
-    pub fn shielded_protocols(&self) -> Vec<ShieldedProtocol> {
-        self.pools.iter().map(|p| p.shielded_protocol()).collect()
-    }
-
     /// Comma-separated canonical names, e.g. `"sapling, orchard"`.
     pub fn display_names(&self) -> String {
         self.pools
