@@ -106,10 +106,13 @@ it reveals the wallet's entire transaction graph, though it cannot spend.
 ## Monitoring
 
 - `GET /healthz` (health port, default 9233) - liveness.
-- `GET /readyz` - readiness: 200 once connected and scanned past `[health]
-  ready_progress`. When 503, the body's `reason` distinguishes `upstream_down`
-  (zebra unreachable - page someone) from `syncing` (normal catch-up) and
-  `actor_down` (a dead writer - restart the process).
+- `GET /readyz` - readiness, gated by `[health] readiness`. In `"connected"` mode
+  (default) it's 200 as soon as zebra is connected and its tip is past the wallet's
+  birthday - it does NOT wait for the scan to finish, so it stays ready (no flapping)
+  while the wallet catches up. In `"synced"` mode it's 200 only once connected and
+  within `[health] max_scan_lag` blocks of the tip. When 503, the body's `reason`
+  distinguishes `upstream_down` (zebra unreachable - page someone) from `syncing`
+  (normal catch-up) and `actor_down` (a dead writer - restart the process).
 - `GET /status` - per-wallet sync state, active upstream endpoint, `conn_state`
   (`down` | `syncing` | `ready`). Alert if `conn_state` stays `down`.
 - `locked` (top-level on both `/readyz` and `/status`, plus per-wallet `locked`/`encrypted`)

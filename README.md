@@ -138,7 +138,9 @@ format = "text"                  # "text" | "json" (structured, for log aggregat
 enabled = true
 bind = "127.0.0.1"               # set 0.0.0.0 for Kubernetes/LB probes
 port = 9233
-ready_progress = 0.999           # /readyz is 200 once scan progress reaches this
+readiness = "connected"          # "connected" (ready when the backend is live, past birthday)
+                                 # or "synced" (ready only once scanned to near the tip)
+max_scan_lag = 4                 # "synced" mode: max chain_tip - fully_scanned block gap
 ```
 
 ## Logging
@@ -205,10 +207,17 @@ With `[health] enabled` (default), zecd serves unauthenticated probes on a separ
 (default 9233):
 
 - `GET /healthz`: liveness. `200 ok` while the process is running.
-- `GET /readyz`: readiness. `200` once every wallet is connected to its upstream and synced to
-  `[health] ready_progress`, otherwise `503`. Body is JSON with per-wallet detail; when not ready
-  it carries a `reason` (`"upstream_down"` vs `"syncing"`) so alerting can tell an unreachable
-  zebra apart from normal catch-up.
+- `GET /readyz`: readiness. `200`/`503`, gated by `[health] readiness`:
+  - `"connected"` (default): ready as soon as the backend is connected and its chain tip is past
+    the wallet's birthday height (a sanity check that we're on the right, live network). It does
+    **not** wait for the wallet to finish scanning, so RPC clients can reach zecd while it catches
+    up and readiness doesn't flap during a long sync - reads may lag the tip until caught up.
+  - `"synced"`: ready only once every wallet is connected **and** within `[health] max_scan_lag`
+    blocks of the chain tip. Strict - a from-birthday restore stays not-ready until it has scanned
+    to its own funds.
+
+  Body is JSON with per-wallet detail; when not ready it carries a `reason` (`"upstream_down"` vs
+  `"syncing"`) so alerting can tell an unreachable zebra apart from normal catch-up.
 - `GET /status`: JSON snapshot of per-wallet sync state, including the active `server` endpoint
   and `conn_state` (`down` | `syncing` | `ready`). `getpeerinfo` reflects the same active upstream.
 

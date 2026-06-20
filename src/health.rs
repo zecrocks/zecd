@@ -2,8 +2,9 @@
 //! deployment (Kubernetes probes, load balancers).
 //!
 //! - `GET /healthz` - liveness: always 200 while the process is running.
-//! - `GET /readyz` - readiness: 200 when every wallet is connected to its upstream and
-//!   synced to at least `[health] ready_progress`; otherwise 503.
+//! - `GET /readyz` - readiness: 200/503, gated by the configured [`ReadinessMode`] (see
+//!   `[health] readiness`): either "the wallet has scanned to near the tip" or "the backend is
+//!   connected and live".
 //! - `GET /status` - JSON snapshot of per-wallet sync state (for humans/ops).
 
 use std::net::SocketAddr;
@@ -16,7 +17,39 @@ use axum::{Json, Router};
 use serde_json::{json, Map, Value};
 use tracing::{info, warn};
 
+use crate::config::{HealthConfig, ReadinessMode};
 use crate::state::AppState;
+use crate::wallet::SyncStatus;
+
+/// Whether one wallet is ready to serve, per the configured readiness mode. The actor-liveness
+/// check is applied by the caller.
+fn wallet_ready(st: &SyncStatus, cfg: &HealthConfig) -> bool {
+    if !st.connected {
+        return false;
+    }
+    match cfg.readiness {
+        // Strict: the wallet has actually scanned to (near) the tip, measured by the height gap.
+        // We deliberately do NOT gate on librustzcash's note-weighted `progress().scan()` ratio:
+        // it's computed over the tip-priority range and hits 1.0 while lower-priority historical
+        // ranges keep climbing `fully_scanned` (e.g. a from-birthday restore), so progress alone
+        // would report ready with the wallet hundreds of thousands of blocks short of its own
+        // funds. The height gap is the meaningful signal.
+        ReadinessMode::Synced => match (st.chain_tip, st.fully_scanned) {
+            (Some(tip), Some(scanned)) => tip.saturating_sub(scanned) <= cfg.max_scan_lag,
+            // Until both heights are known the wallet hasn't demonstrably caught up.
+            _ => false,
+        },
+        // Lenient: ready as soon as the backend is connected and its tip is past our birthday - a
+        // cheap sanity check that we're talking to the right, live network. Does NOT wait for the
+        // scan to finish, so RPC clients can reach zecd while it catches up, and readiness doesn't
+        // flap during a long sync.
+        ReadinessMode::Connected => match (st.chain_tip, st.birthday) {
+            (Some(tip), Some(birthday)) => tip > birthday,
+            // No tip yet (or, defensively, no birthday) means we can't sanity-check the upstream.
+            _ => false,
+        },
+    }
+}
 
 /// Run the health server until graceful shutdown. Binding failures are non-fatal (logged).
 pub async fn run(state: AppState) {
@@ -82,9 +115,7 @@ fn snapshot(state: &AppState) -> Snapshot {
             // A dead writer actor means sends/address-generation are broken even though reads
             // still answer from the DB - so it must fail readiness, not silently report ready.
             let actor_alive = h.actor_alive();
-            let w_ready = actor_alive
-                && st.connected
-                && st.scan_progress >= state.config.health.ready_progress;
+            let w_ready = actor_alive && wallet_ready(&st, &state.config.health);
             ready = ready && w_ready;
             if matches!(st.conn_state, crate::wallet::ConnState::Down) {
                 any_down = true;
@@ -109,6 +140,7 @@ fn snapshot(state: &AppState) -> Snapshot {
                     "conn_state": st.conn_state.as_str(),
                     "chain_tip": st.chain_tip,
                     "fully_scanned": st.fully_scanned,
+                    "birthday": st.birthday,
                     "scan_progress": st.scan_progress,
                     "scanning": st.scanning,
                     "encrypted": st.encrypted,
@@ -169,8 +201,77 @@ async fn status(State(state): State<AppState>) -> Response {
 
 #[cfg(test)]
 mod tests {
-    use super::is_locked;
+    use super::{is_locked, wallet_ready};
+    use crate::config::{HealthConfig, ReadinessMode};
     use crate::wallet::SyncStatus;
+
+    fn st(connected: bool, tip: Option<u32>, scanned: Option<u32>) -> SyncStatus {
+        SyncStatus {
+            connected,
+            chain_tip: tip,
+            fully_scanned: scanned,
+            birthday: Some(50),
+            ..SyncStatus::default()
+        }
+    }
+
+    fn cfg(readiness: ReadinessMode) -> HealthConfig {
+        HealthConfig {
+            enabled: true,
+            bind: "127.0.0.1".parse().unwrap(),
+            port: 9333,
+            readiness,
+            max_scan_lag: 4,
+        }
+    }
+
+    #[test]
+    fn synced_mode_requires_a_small_height_gap() {
+        let synced = cfg(ReadinessMode::Synced);
+        // The regression: the wallet is 357k blocks behind the tip (a from-birthday restore).
+        // That must NOT report ready, even though note-weighted progress would read 1.0.
+        assert!(!wallet_ready(
+            &st(true, Some(4_080_983), Some(3_724_064)),
+            &synced
+        ));
+
+        // Caught up to the tip (gap 0): ready.
+        assert!(wallet_ready(
+            &st(true, Some(4_080_983), Some(4_080_983)),
+            &synced
+        ));
+
+        // Within the lag budget (gap 4 <= 4): ready; just over it (gap 5): not ready.
+        assert!(wallet_ready(&st(true, Some(100), Some(96)), &synced));
+        assert!(!wallet_ready(&st(true, Some(100), Some(95)), &synced));
+
+        // Disconnected, or heights unknown: never ready.
+        assert!(!wallet_ready(&st(false, Some(100), Some(100)), &synced));
+        assert!(!wallet_ready(&st(true, None, Some(100)), &synced));
+        assert!(!wallet_ready(&st(true, Some(100), None), &synced));
+    }
+
+    #[test]
+    fn connected_mode_only_requires_a_live_upstream_past_the_birthday() {
+        let connected = cfg(ReadinessMode::Connected);
+        // Far behind on the scan (gap 357k) but connected and the tip is past birthday 50: ready.
+        // This is the whole point - RPC clients can reach zecd while it catches up.
+        assert!(wallet_ready(
+            &st(true, Some(4_080_983), Some(3_724_064)),
+            &connected
+        ));
+        // Tip just past birthday: ready, regardless of scan state.
+        assert!(wallet_ready(&st(true, Some(51), None), &connected));
+
+        // Tip at or below birthday (wrong/dead network, or upstream not yet caught up to our
+        // birthday): not ready.
+        assert!(!wallet_ready(&st(true, Some(50), None), &connected));
+        assert!(!wallet_ready(&st(true, Some(49), None), &connected));
+
+        // Disconnected, or no tip yet: never ready.
+        assert!(!wallet_ready(&st(false, Some(4_080_983), None), &connected));
+        assert!(!wallet_ready(&st(true, None, None), &connected));
+    }
 
     #[test]
     fn locked_signal_tracks_encryption_and_unlock_state() {

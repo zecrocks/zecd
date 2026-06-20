@@ -224,7 +224,8 @@ mod tests {
                 enabled: false,
                 bind: "127.0.0.1".parse().unwrap(),
                 port: 9233,
-                ready_progress: 0.999,
+                readiness: crate::config::ReadinessMode::Connected,
+                max_scan_lag: 4,
             },
             log: crate::config::LogConfig {
                 level: "info".into(),

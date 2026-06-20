@@ -177,6 +177,9 @@ struct WalletActor {
     /// process. After the first fetch they persist in the wallet DB, so later (re)connects do a
     /// cheap liveness probe instead of re-streaming every root.
     subtree_roots_synced: bool,
+    /// The wallet's birthday height (read from `keys.toml` at spawn). Published on
+    /// `SyncStatus` for the health server's "connected" readiness sanity check.
+    birthday: u32,
     /// Whether the wallet is passphrase-encrypted (read from `keys.toml` at spawn). Gates the
     /// Bitcoin-Core-style `walletpassphrase`/`walletlock` behavior.
     encrypted: bool,
@@ -264,6 +267,7 @@ pub async fn spawn(
     // so it cannot auto-unlock - it starts locked and requires `walletpassphrase` (matching
     // Bitcoin Core's encrypted-wallet behavior). A watch-only wallet has no seed anywhere, so
     // the whole unlock machinery is moot for it.
+    let birthday = u32::from(st.birthday);
     let mut seed = SeedKeeper::locked();
     if watch_only {
         info!(
@@ -320,6 +324,7 @@ pub async fn spawn(
     let (status_tx, status_rx) = watch::channel(SyncStatus {
         encrypted,
         watch_only,
+        birthday: Some(birthday),
         unlocked_until: encrypted.then_some(0),
         ..SyncStatus::default()
     });
@@ -354,6 +359,7 @@ pub async fn spawn(
         mempool: None,
         last_rebroadcast: None,
         subtree_roots_synced: false,
+        birthday,
         encrypted,
         watch_only,
         unlock_until: None,
@@ -1116,6 +1122,7 @@ impl WalletActor {
             conn_state,
             chain_tip: self.tip_height,
             fully_scanned,
+            birthday: Some(self.birthday),
             best_block_hash: self.tip_hash.clone(),
             scan_progress,
             scanning,

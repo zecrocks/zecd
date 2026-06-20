@@ -57,6 +57,10 @@ pub struct SyncStatus {
     pub conn_state: ConnState,
     pub chain_tip: Option<u32>,
     pub fully_scanned: Option<u32>,
+    /// The wallet's birthday height (from `keys.toml`). Static for the life of the wallet;
+    /// published on `SyncStatus` so the health server's "connected" readiness mode can
+    /// sanity-check the upstream's tip against it without a DB read.
+    pub birthday: Option<u32>,
     pub best_block_hash: Option<String>,
     /// Scan progress in `[0, 1]`.
     pub scan_progress: f64,

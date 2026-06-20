@@ -211,3 +211,22 @@ privacy_policy = "AllowRevealedRecipients"
 # deep builder error when a send has too many recipients. Raise it for large batched payouts;
 # set it to 0 to disable the cap entirely.
 orchard_action_limit = 50
+
+[health]
+# Unauthenticated liveness/readiness probes on a separate port (for Kubernetes/load balancers).
+enabled = true
+bind = "127.0.0.1"               # set 0.0.0.0 to expose probes off-host
+port = 9233
+# What /readyz means:
+#   "connected" (default) - ready as soon as the backend is connected and its chain tip is past
+#       this wallet's birthday height (a sanity check that we're on the right, live network). It
+#       does NOT wait for the wallet to finish scanning, so RPC clients can reach zecd while it
+#       catches up, and readiness doesn't flap during a long sync. Reads may lag the tip until
+#       the wallet is caught up.
+#   "synced" - ready only once connected AND `fully_scanned` is within `max_scan_lag` blocks of
+#       the chain tip. Strict: a from-birthday restore stays not-ready until it has scanned to its
+#       own funds. (The height gap is used rather than librustzcash's note-weighted scan progress,
+#       which reaches 100% long before the wallet has actually caught up to the tip.)
+readiness = "connected"
+# Only consulted in "synced" mode:
+max_scan_lag = 4

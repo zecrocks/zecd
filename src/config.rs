@@ -104,14 +104,55 @@ impl Default for PoolsConfig {
     }
 }
 
+/// What `/readyz` means - chosen to fit a deployment's priorities.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReadinessMode {
+    /// Ready only once the wallet has actually scanned to (near) the chain tip: connected and
+    /// within `max_scan_lag` blocks of the tip. Strict - a from-birthday restore stays "not
+    /// ready" until it catches up. Use when a client must not see stale balances/history.
+    Synced,
+    /// Ready as soon as the backend is connected and its chain tip is past the wallet's birthday
+    /// (a cheap sanity check that we're talking to the right, live network). Does NOT wait for
+    /// the wallet to finish scanning, so RPC clients can reach zecd while it catches up - at the
+    /// cost of reads possibly lagging the tip. Avoids readiness flapping during long scans.
+    Connected,
+}
+
+impl ReadinessMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ReadinessMode::Synced => "synced",
+            ReadinessMode::Connected => "connected",
+        }
+    }
+
+    fn parse(s: &str) -> anyhow::Result<Self> {
+        match s {
+            "synced" => Ok(ReadinessMode::Synced),
+            "connected" => Ok(ReadinessMode::Connected),
+            other => Err(anyhow::anyhow!(
+                "invalid [health] readiness {other:?}: expected \"synced\" or \"connected\""
+            )),
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct HealthConfig {
     /// Serve liveness/readiness probes on a separate, unauthenticated HTTP port.
     pub enabled: bool,
     pub bind: IpAddr,
     pub port: u16,
-    /// Scan progress at/above which `/readyz` reports ready (0..=1).
-    pub ready_progress: f64,
+    /// What `/readyz` gates on (see [`ReadinessMode`]).
+    pub readiness: ReadinessMode,
+    /// Maximum `chain_tip - fully_scanned` block gap at which `/readyz` reports ready, in
+    /// [`ReadinessMode::Synced`]. This height gap is the meaningful "caught up" signal:
+    /// librustzcash's note-weighted progress ratio is over the *tip-priority* range and reaches
+    /// 1.0 while lower-priority historical ranges are still being scanned, so a wallet can look
+    /// "100% scanned" with `fully_scanned` far below the tip (e.g. a from-birthday restore).
+    /// Gating on the height gap instead means `/readyz` only goes ready once the wallet has
+    /// actually scanned to (near) the tip.
+    pub max_scan_lag: u32,
 }
 
 #[derive(Debug, Clone)]
@@ -336,7 +377,8 @@ struct HealthFile {
     enabled: Option<bool>,
     bind: Option<String>,
     port: Option<u16>,
-    ready_progress: Option<f64>,
+    readiness: Option<String>,
+    max_scan_lag: Option<u32>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -806,7 +848,8 @@ impl AppConfig {
             enabled: None,
             bind: None,
             port: None,
-            ready_progress: None,
+            readiness: None,
+            max_scan_lag: None,
         });
         let health = HealthConfig {
             enabled: health_file.enabled.unwrap_or(true),
@@ -816,7 +859,15 @@ impl AppConfig {
                 .parse()
                 .context("parsing health bind address")?,
             port: health_file.port.unwrap_or(defaults.health_port),
-            ready_progress: health_file.ready_progress.unwrap_or(0.999),
+            // Default to "connected": be generous about how synced we are so RPC clients can
+            // reach zecd in most situations, and avoid readiness flapping during long scans.
+            readiness: health_file
+                .readiness
+                .as_deref()
+                .map(ReadinessMode::parse)
+                .transpose()?
+                .unwrap_or(ReadinessMode::Connected),
+            max_scan_lag: health_file.max_scan_lag.unwrap_or(4),
         };
 
         let log_file = file.log.unwrap_or(LogFile {
