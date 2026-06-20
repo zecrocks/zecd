@@ -362,6 +362,7 @@ fn offline_actor_cfg(
         auto_unlock: true,
         bootstrap: true,
         confirmations_policy: Default::default(),
+        orchard_action_limit: crate::config::DEFAULT_ORCHARD_ACTION_LIMIT,
         enabled_pools: crate::pools::PoolSet::single(crate::pools::Pool::Orchard),
         default_receivers: crate::pools::PoolSet::single(crate::pools::Pool::Orchard),
         shutdown,

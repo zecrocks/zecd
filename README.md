@@ -127,6 +127,8 @@ trusted_confirmations = 3        # depth before the wallet's own change is spend
 untrusted_confirmations = 10     # depth before third-party payments are spendable (>= trusted)
 privacy_policy = "AllowRevealedRecipients"  # or "FullPrivacy": only single-shielded-pool sends
                                  #   (no transparent recipients, no Sapling<->Orchard crossing)
+orchard_action_limit = 50        # cap on Orchard actions per send (0 disables); like Zallet's
+                                 #   builder.limits.orchard_actions - too many recipients -> -8
 
 [log]
 level = "info"                   # tracing filter; RUST_LOG overrides
@@ -305,7 +307,7 @@ the validator's job there - so those rows are all - .
 | `getreceivedbyaddress`, `listreceivedbyaddress`, `getreceivedbylabel`, `listreceivedbylabel` | ✓ | - | Core shapes over diversified receiving addresses; change never counted. There is no `listaddresses` (Core has none either) - `listreceivedbyaddress 0 true` is the enumeration: `include_empty` unions every address the wallet has generated (used or not), each with its label and received total. `include_watchonly` is accepted but ignored (watch-only is wallet-level) |
 | `sendtoaddress` | ✓ | - (`z_sendmany` is async, returns an operation id) | Synchronous: builds, proves, broadcasts, returns txid; ZIP-317 fee; `subtractfeefromamount`/`fee_rate` → `-8`; extra trailing `memo` hex param |
 | `sendmany` | ✓ | - (`z_sendmany`) | Same; dummy `""` first arg as in Core |
-| `z_sendmany` | ✓ (Orchard-only) | ✓ | **Async**: returns an `opid`, proves/broadcasts on a background task; spends from the wallet's Orchard account (`fromaddress` must be one of its own addresses; `ANY_TADDR`/foreign → `-5`); zcashd `amounts` array with per-recipient `memo`; ZIP-317 fee (explicit `fee` → `-8`); `minconf` honored; `privacyPolicy` mapped onto `[spend] privacy_policy` (unknown → `-8`) |
+| `z_sendmany` | ✓ (Orchard-only) | ✓ | **Async**: returns an `opid`, proves/broadcasts on a background task; spends from the wallet's Orchard account (`fromaddress` must be one of its own addresses; `ANY_TADDR`/foreign → `-5`); zcashd `amounts` array with per-recipient `memo`; ZIP-317 fee (explicit `fee` → `-8`); `minconf` honored; `privacyPolicy` mapped onto `[spend] privacy_policy` (unknown → `-8`); too many recipients (Orchard actions over `[spend] orchard_action_limit`, default 50) → `-8` |
 | `z_getoperationstatus` | ✓ | ✓ | Status objects for the wallet's operations, non-destructive; per-wallet scoped; unknown opid omitted, malformed opid → `-8` |
 | `z_getoperationresult` | ✓ | ✓ | Like `z_getoperationstatus`, but returns only finished operations and removes them from memory |
 | `z_listoperationids` | ✓ | ✓ | The wallet's operation ids; optional status filter (`queued`/`executing`/`success`/`failed`/`cancelled`) |

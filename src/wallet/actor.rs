@@ -28,7 +28,7 @@ use zcash_primitives::transaction::Transaction;
 use zcash_proofs::prover::LocalTxProver;
 use zcash_protocol::consensus::{BlockHeight, BranchId};
 use zcash_protocol::value::Zatoshis;
-use zcash_protocol::{PoolType, TxId};
+use zcash_protocol::{PoolType, ShieldedProtocol, TxId};
 use zip321::TransactionRequest;
 
 use crate::backend::Server;
@@ -113,6 +113,8 @@ pub struct ActorConfig {
     /// The wallet-wide confirmations policy (`[spend]` config; ZIP-315 3/10 by default),
     /// anchoring balances, spend proposals, and the `-6` enrichment.
     pub confirmations_policy: ConfirmationsPolicy,
+    /// Cap on Orchard actions per send (`[spend] orchard_action_limit`; 0 disables it).
+    pub orchard_action_limit: usize,
     /// Shielded pools this wallet receives into and spends from (change pool selection).
     pub enabled_pools: PoolSet,
     /// Receivers included by default in this wallet's Unified Addresses.
@@ -138,6 +140,8 @@ struct WalletActor {
     sync_interval: Duration,
     rebroadcast_interval: Duration,
     confirmations_policy: ConfirmationsPolicy,
+    /// Cap on Orchard actions per send (`[spend] orchard_action_limit`; 0 disables it).
+    orchard_action_limit: usize,
     /// Shielded pools this wallet receives into and spends from.
     enabled_pools: PoolSet,
     /// Receivers included by default in this wallet's Unified Addresses.
@@ -332,6 +336,7 @@ pub async fn spawn(
         sync_interval: cfg.sync_interval,
         rebroadcast_interval: cfg.rebroadcast_interval,
         confirmations_policy: cfg.confirmations_policy,
+        orchard_action_limit: cfg.orchard_action_limit,
         enabled_pools: cfg.enabled_pools.clone(),
         default_receivers: cfg.default_receivers.clone(),
         account_id,
@@ -1301,6 +1306,7 @@ impl WalletActor {
         // A per-call `minconf` (z_sendmany) overrides the wallet-wide policy for this send's
         // note selection; the synchronous sends pass `None` and use the configured policy.
         let policy = confirmations.unwrap_or(self.confirmations_policy);
+        let orchard_action_limit = self.orchard_action_limit;
         let change_pool = self.enabled_pools.change_pool();
         let prover = &self.prover;
         let db = &mut self.db_data;
@@ -1342,6 +1348,11 @@ impl WalletActor {
                 if privacy == SendPrivacy::FullPrivacy {
                     enforce_full_privacy(&proposal)?;
                 }
+
+                // Cap the Orchard actions before the (expensive) proving step, so a send with
+                // too many recipients fails fast with a clear `-8` instead of exhausting memory
+                // or surfacing a deep librustzcash error (mirrors Zallet's `orchard_actions`).
+                enforce_orchard_action_limit(&proposal, orchard_action_limit)?;
 
                 let txids = create_proposed_transactions(
                     db,
@@ -1808,6 +1819,82 @@ fn enforce_full_privacy<FeeRuleT, NoteRef>(
     Ok(())
 }
 
+/// Orchard actions a single proposal step contributes: `max(orchard inputs, orchard outputs)`,
+/// since each Orchard action carries one spend and one output (a dummy filling whichever side is
+/// short). Mirrors the count Zallet's `orchard_actions` limit checks. `orchard_outputs` counts
+/// both payment outputs landing in the Orchard pool and Orchard change notes.
+fn step_orchard_actions<NoteRef>(
+    step: &zcash_client_backend::proposal::Step<NoteRef>,
+) -> (usize, usize) {
+    let orchard_spends = step
+        .shielded_inputs()
+        .iter()
+        .flat_map(|inputs| inputs.notes().iter())
+        .filter(|note| note.note().protocol() == ShieldedProtocol::Orchard)
+        .count();
+
+    let orchard_outputs = step
+        .payment_pools()
+        .values()
+        .filter(|&&pool| pool == PoolType::ORCHARD)
+        .count()
+        + step
+            .balance()
+            .proposed_change()
+            .iter()
+            .filter(|change| change.output_pool() == PoolType::ORCHARD)
+            .count();
+
+    (orchard_spends, orchard_outputs)
+}
+
+/// Enforce `[spend] orchard_action_limit` on a built proposal: no step may exceed `limit` Orchard
+/// actions. `limit == 0` disables the cap. Returns `-8` naming whether inputs or outputs (or both)
+/// overflow, like Zallet's error, so an over-large `z_sendmany` is self-diagnosing rather than
+/// failing deep in proving. The check sits on the proposal because the input (spend) count is only
+/// known once note selection has run.
+fn enforce_orchard_action_limit<FeeRuleT, NoteRef>(
+    proposal: &Proposal<FeeRuleT, NoteRef>,
+    limit: usize,
+) -> Result<(), RpcError> {
+    if limit == 0 {
+        return Ok(());
+    }
+    for step in proposal.steps() {
+        let (orchard_spends, orchard_outputs) = step_orchard_actions(step);
+        if let Some((count, kind)) = orchard_action_overflow(orchard_spends, orchard_outputs, limit)
+        {
+            return Err(RpcError::invalid_parameter(format!(
+                "Including {count} Orchard {kind} would exceed the current limit of {limit} \
+                 actions, which exists to bound this send's memory and proving cost. Raise \
+                 [spend] orchard_action_limit (or set it to 0 to disable the cap) to allow this \
+                 transaction."
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Decide whether an Orchard-action count overflows `limit` (assumed non-zero), and if so report
+/// the offending `(count, kind)` for the error message: blame `inputs` or `outputs` when only one
+/// side overflows, else `actions` (the `max`). Returns `None` when within the cap.
+fn orchard_action_overflow(
+    spends: usize,
+    outputs: usize,
+    limit: usize,
+) -> Option<(usize, &'static str)> {
+    if spends.max(outputs) <= limit {
+        return None;
+    }
+    Some(if outputs <= limit {
+        (spends, "inputs")
+    } else if spends <= limit {
+        (outputs, "outputs")
+    } else {
+        (spends.max(outputs), "actions")
+    })
+}
+
 fn classify_err(e: crate::error::ProposalError) -> RpcError {
     use zcash_client_backend::data_api::error::Error;
     match &e {
@@ -1920,6 +2007,25 @@ mod tests {
         assert!(single_pool_violated(true, false, true));
         assert!(single_pool_violated(true, true, false));
         assert!(single_pool_violated(true, false, false));
+    }
+
+    /// The Orchard-action cap: `max(spends, outputs)` must not exceed the limit; the error blames
+    /// whichever side overflows (or `actions` when both do).
+    #[test]
+    fn orchard_action_overflow_decision() {
+        use super::orchard_action_overflow;
+        // Within the cap - no overflow regardless of which side is larger.
+        assert_eq!(orchard_action_overflow(50, 50, 50), None);
+        assert_eq!(orchard_action_overflow(10, 50, 50), None);
+        assert_eq!(orchard_action_overflow(0, 0, 50), None);
+        // Only outputs overflow → blame outputs.
+        assert_eq!(orchard_action_overflow(3, 51, 50), Some((51, "outputs")));
+        // Only inputs overflow → blame inputs.
+        assert_eq!(orchard_action_overflow(80, 2, 50), Some((80, "inputs")));
+        // Both overflow → blame actions (the max).
+        assert_eq!(orchard_action_overflow(60, 70, 50), Some((70, "actions")));
+        // A tight cap of 1: a single extra output trips it.
+        assert_eq!(orchard_action_overflow(1, 2, 1), Some((2, "outputs")));
     }
 
     /// Resubmitting a tx the node already has must follow Bitcoin Core's idempotent

@@ -205,3 +205,9 @@ untrusted_confirmations = 10
 #       recipients, and no Sapling<->Orchard crossing. Anything that would reveal an amount or a
 #       recipient is rejected with -8.
 privacy_policy = "AllowRevealedRecipients"
+# Cap on the number of Orchard actions (max of Orchard inputs vs. Orchard outputs) a single
+# send may build, mirroring Zallet's [builder.limits] orchard_actions. It bounds the memory and
+# proving cost of one z_sendmany and gives a clear -8 ("too many Orchard actions") instead of a
+# deep builder error when a send has too many recipients. Raise it for large batched payouts;
+# set it to 0 to disable the cap entirely.
+orchard_action_limit = 50

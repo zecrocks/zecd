@@ -96,6 +96,7 @@ pub async fn run(config: AppConfig) -> anyhow::Result<()> {
             bootstrap: config.keys.bootstrap_from_keys,
             // Validated at config load; re-derive here rather than carrying a second copy.
             confirmations_policy: config.spend.confirmations_policy()?,
+            orchard_action_limit: config.spend.orchard_action_limit,
             enabled_pools: entry.pools.clone(),
             default_receivers: entry.default_receivers.clone(),
             shutdown: shutdown_tx.subscribe(),

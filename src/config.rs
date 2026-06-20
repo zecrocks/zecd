@@ -234,6 +234,11 @@ pub struct SpendConfig {
     pub untrusted_confirmations: u32,
     /// What sends are allowed to reveal on-chain. Default `AllowRevealedRecipients`.
     pub privacy: SendPrivacy,
+    /// Cap on the number of Orchard actions (`max(orchard inputs, orchard outputs)`) a single
+    /// send may build, mirroring Zallet's `[builder.limits] orchard_actions` (default 50). It
+    /// bounds memory/proving cost and gives a clean `-8` instead of a deep librustzcash error
+    /// when a `z_sendmany` has too many recipients. `0` disables the cap. Default 50.
+    pub orchard_action_limit: usize,
 }
 
 impl Default for SpendConfig {
@@ -242,9 +247,13 @@ impl Default for SpendConfig {
             trusted_confirmations: 3,
             untrusted_confirmations: 10,
             privacy: SendPrivacy::AllowRevealedRecipients,
+            orchard_action_limit: DEFAULT_ORCHARD_ACTION_LIMIT,
         }
     }
 }
+
+/// Default Orchard-action cap, matching Zallet's `orchard_actions` default.
+pub const DEFAULT_ORCHARD_ACTION_LIMIT: usize = 50;
 
 /// `[spend] privacy_policy` - Zallet/zcashd's privacy-policy idea (zcash/zcash#6240) reduced to
 /// the two points that matter for a shielded-only wallet that can hold both Sapling and Orchard
@@ -410,6 +419,7 @@ struct SpendFile {
     trusted_confirmations: Option<u32>,
     untrusted_confirmations: Option<u32>,
     privacy_policy: Option<String>,
+    orchard_action_limit: Option<usize>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -785,6 +795,9 @@ impl AppConfig {
                 .map(SendPrivacy::parse)
                 .transpose()?
                 .unwrap_or(SendPrivacy::AllowRevealedRecipients),
+            orchard_action_limit: spend_file
+                .orchard_action_limit
+                .unwrap_or(DEFAULT_ORCHARD_ACTION_LIMIT),
         };
         // Fail at startup, not on the first balance/send call.
         spend.confirmations_policy()?;
@@ -1031,6 +1044,18 @@ mod tests {
         .is_err());
         // Unknown keys in the section are rejected like everywhere else.
         assert!(toml::from_str::<SpendFile>("min_conf = 1").is_err());
+    }
+
+    #[test]
+    fn orchard_action_limit_defaults_and_parses() {
+        // Absent → the Zallet-matching default of 50.
+        assert_eq!(SpendConfig::default().orchard_action_limit, 50);
+        assert_eq!(DEFAULT_ORCHARD_ACTION_LIMIT, 50);
+        // Explicit value (including 0, which disables the cap) round-trips.
+        let f: SpendFile = toml::from_str("orchard_action_limit = 200").unwrap();
+        assert_eq!(f.orchard_action_limit, Some(200));
+        let f: SpendFile = toml::from_str("orchard_action_limit = 0").unwrap();
+        assert_eq!(f.orchard_action_limit, Some(0));
     }
 
     #[test]
