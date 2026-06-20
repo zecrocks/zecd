@@ -273,7 +273,14 @@ def main() -> int:
     ck("fresh address received 0", recv == 0)
     lra = rpc.call("listreceivedbyaddress", 1, True)
     ck("listreceivedbyaddress is list", isinstance(lra, list))
-    ck("fresh address listed with include_empty", any(e.get("address") == addr for e in lra))
+    fresh = next((e for e in lra if e.get("address") == addr), None)
+    ck("fresh address listed with include_empty", fresh is not None)
+    # include_empty surfaces every generated address (this is zecd's `listaddresses`
+    # equivalent), and an unused one reports zeros: no amount, no confirmations, no txids.
+    if fresh is not None:
+        ck("fresh entry amount 0", fresh.get("amount") == 0, repr(fresh.get("amount")))
+        ck("fresh entry confirmations 0", fresh.get("confirmations") == 0, repr(fresh.get("confirmations")))
+        ck("fresh entry no txids", fresh.get("txids") == [], repr(fresh.get("txids")))
     try:
         rpc.call("getreceivedbyaddress", "not-an-address")
         ck("invalid address raises", False)
