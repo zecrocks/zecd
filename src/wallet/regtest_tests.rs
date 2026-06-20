@@ -37,6 +37,21 @@ fn test_seed() -> SecretVec<u8> {
     secret
 }
 
+/// A second, unrelated seed (standard BIP-39 "abandon…art" test vector) for "foreign wallet"
+/// negative cases - its addresses must never be attributed to [`test_seed`]'s account.
+const FOREIGN_PHRASE: &str = "abandon abandon abandon abandon abandon abandon abandon abandon \
+    abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon \
+    abandon abandon abandon abandon art";
+
+fn foreign_seed() -> SecretVec<u8> {
+    let mut seed = <Mnemonic<English>>::from_phrase(FOREIGN_PHRASE)
+        .unwrap()
+        .to_seed("");
+    let secret = SecretVec::new(seed.to_vec());
+    seed.zeroize();
+    secret
+}
+
 /// A regtest birthday at genesis (Sapling activates at height 1 on our regtest), with an
 /// empty prior chain state - needs no lightwalletd.
 fn genesis_birthday() -> AccountBirthday {
@@ -195,6 +210,107 @@ fn regtest_wallet_lifecycle() {
     SeedKeeper::unlocked(test_seed())
         .derive_usk(net, account_index)
         .expect("derive USK on regtest");
+}
+
+/// `is_mine` must recognize an address the wallet's account *can derive* even when that address
+/// was never recorded in the `addresses` table - the case a stateless (or any) from-seed restore
+/// leaves behind for an address that was issued but never funded (so the chain scan never re-added
+/// it). This exercises the cryptographic-attribution path (`UnifiedIncomingViewingKey::
+/// decrypt_diversifiers`) across **both** shielded pools, and confirms a foreign wallet's
+/// addresses are rejected.
+#[test]
+fn is_mine_attributes_unrecorded_addresses_via_viewing_key() {
+    use zcash_client_backend::data_api::Account as _;
+    use zcash_keys::address::Address;
+    use zip32::DiversifierIndex;
+
+    let net = network::regtest();
+    let dir = tempfile::tempdir().unwrap();
+    let wallet_dir = dir.path();
+
+    let mut db = open::init_dbs(net, wallet_dir).expect("init dbs");
+    let (account_id, _usk) = db
+        .create_account("primary", &test_seed(), &genesis_birthday(), None)
+        .expect("create account");
+    db.update_chain_tip(BlockHeight::from_u32(1)).unwrap();
+
+    // The account's UFVK -> UIVK. Deriving addresses straight from the key never touches the
+    // `addresses` table, so they stay unrecorded - exactly the post-restore "forgotten address"
+    // shape. (`to_unified_incoming_viewing_key` returns an owned key, so the borrow of `account`
+    // ends here, leaving `db` free for the writer call below.)
+    let account = db.get_account(account_id).unwrap().unwrap();
+    let uivk = account.ufvk().unwrap().to_unified_incoming_viewing_key();
+
+    // A recorded address (writer path), to prove the cheap exact-match layer still works.
+    let (recorded_ua, _) = db
+        .get_next_available_address(account_id, UnifiedAddressRequest::ORCHARD)
+        .unwrap()
+        .unwrap();
+    let recorded = recorded_ua.encode(&net);
+    drop(db);
+
+    // A far diversifier index: `getnewaddress` picks clock-derived indices (~unix time), so a
+    // small fixed index is one the wallet would never have auto-recorded.
+    let far = DiversifierIndex::from(1_000_007u32);
+
+    // --- Orchard pool: an Orchard-only UA at the far index ---
+    let orchard_addr = uivk
+        .address(far, UnifiedAddressRequest::ORCHARD)
+        .expect("derive Orchard UA")
+        .encode(&net);
+    assert!(
+        !read::all_addresses(net, wallet_dir).contains(&orchard_addr),
+        "the far-index address must not be pre-recorded, so only the crypto path can match"
+    );
+    assert!(
+        read::is_mine(net, wallet_dir, &orchard_addr),
+        "own Orchard UA must be ismine via viewing-key attribution"
+    );
+
+    // --- Sapling pool: take an all-pools UA's Sapling receiver and test it as a bare address,
+    //     so the match can only come from the Sapling ivk path ---
+    let all_ua = uivk
+        .address(far, UnifiedAddressRequest::ALLOW_ALL)
+        .expect("derive all-pools UA");
+    let sapling_addr =
+        Address::Sapling(*all_ua.sapling().expect("UFVK has a Sapling receiver")).encode(&net);
+    assert!(
+        read::is_mine(net, wallet_dir, &sapling_addr),
+        "own bare Sapling address must be ismine via viewing-key attribution"
+    );
+
+    // --- Recorded-address fast path still resolves ---
+    assert!(
+        read::is_mine(net, wallet_dir, &recorded),
+        "a recorded address stays ismine"
+    );
+
+    // --- A foreign wallet's addresses are NOT ismine (both pools) ---
+    let fdir = tempfile::tempdir().unwrap();
+    let mut fdb = open::init_dbs(net, fdir.path()).unwrap();
+    let (faccount_id, _) = fdb
+        .create_account("foreign", &foreign_seed(), &genesis_birthday(), None)
+        .unwrap();
+    let faccount = fdb.get_account(faccount_id).unwrap().unwrap();
+    let fuivk = faccount.ufvk().unwrap().to_unified_incoming_viewing_key();
+    drop(fdb);
+
+    let foreign_orchard = fuivk
+        .address(far, UnifiedAddressRequest::ORCHARD)
+        .unwrap()
+        .encode(&net);
+    assert!(
+        !read::is_mine(net, wallet_dir, &foreign_orchard),
+        "a foreign Orchard UA must not be ismine"
+    );
+    let foreign_all = fuivk
+        .address(far, UnifiedAddressRequest::ALLOW_ALL)
+        .unwrap();
+    let foreign_sapling = Address::Sapling(*foreign_all.sapling().unwrap()).encode(&net);
+    assert!(
+        !read::is_mine(net, wallet_dir, &foreign_sapling),
+        "a foreign bare Sapling address must not be ismine"
+    );
 }
 
 /// The watch-only (UFVK) pairing guarantee, offline on regtest:

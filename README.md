@@ -296,7 +296,7 @@ the validator's job there - so those rows are all - .
 | `getbalances` | ✓ | - (`z_getbalances`, per-account) | `mine.trusted/untrusted_pending/immature` + `lastprocessedblock`; no `watchonly` object |
 | `getunconfirmedbalance` | *removed* | - | Incoming funds below the confirmation policy (incl. 0-conf via mempool stream) |
 | `getwalletinfo` | ✓ | ✓ (several fields stubbed) | bitcoind shape; `keypoolsize:1`, `descriptors:false`, `scanning` progress, `unlocked_until` when encrypted, `private_keys_enabled:false` when watch-only |
-| `getaddressinfo` | ✓ | - | `ismine`/`solvable`/`labels`; `scriptPubKey` empty (shielded); `iswatchonly` always false (deprecated in Core; the watch-only signal is `getwalletinfo.private_keys_enabled`); `isvalid_orchard` + `receiver_types` extension fields report the address's receivers |
+| `getaddressinfo` | ✓ | - | `ismine` is cryptographic (viewing-key attribution across both shielded pools, so an unrecorded/unfunded own address still resolves after a restore)/`solvable`/`labels`; `scriptPubKey` empty (shielded); `iswatchonly` always false (deprecated in Core; the watch-only signal is `getwalletinfo.private_keys_enabled`); `isvalid_orchard` + `receiver_types` extension fields report the address's receivers |
 | `setlabel` | ✓ | - (accounts replace labels) | Full address book incl. foreign addresses (purpose `"send"`) |
 | `getaddressesbylabel`, `listlabels` | ✓ | - | Core shapes and error codes (`-11` for unknown label) |
 | `listtransactions` | ✓ | - (`z_listtransactions`, different shape) | Core categories/fields (`fee` on sends, label filter, count/skip); adds `memo`/`memoStr` |

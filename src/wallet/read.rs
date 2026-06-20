@@ -8,7 +8,8 @@ use anyhow::anyhow;
 use rusqlite::{named_params, Connection, OptionalExtension};
 use uuid::Uuid;
 use zcash_client_backend::data_api::wallet::ConfirmationsPolicy;
-use zcash_client_backend::data_api::{InputSource, WalletRead};
+use zcash_client_backend::data_api::{Account as _, InputSource, WalletRead};
+use zcash_keys::address::Address;
 use zcash_keys::encoding::AddressCodec as _;
 use zcash_protocol::ShieldedProtocol;
 
@@ -776,8 +777,28 @@ pub fn all_addresses(network: ZNetwork, wallet_dir: &Path) -> Vec<String> {
     out
 }
 
-/// Whether `addr` is one of the wallet's own generated addresses (for `getaddressinfo.ismine`).
-/// Matches both unified addresses and the wallet's transparent receivers.
+/// Whether `addr` is an address one of this wallet's accounts can produce - for
+/// `getaddressinfo.ismine`.
+///
+/// Two layers, cheapest first:
+///
+/// 1. **Recorded-address match.** An exact hit against `list_addresses`: addresses the wallet
+///    handed out and persisted, plus any recovered from a received note during a scan. No crypto,
+///    no decode.
+/// 2. **Cryptographic attribution.** Failing that, decode the address and ask the account's
+///    Unified Incoming Viewing Key whether it derived any *shielded* receiver, via
+///    [`UnifiedIncomingViewingKey::decrypt_diversifiers`]. For each receiver that recovers a
+///    diversifier index it is one FF1 decrypt of the diversifier plus one address
+///    re-derivation/`pk_d` comparison - O(1) per receiver, never an index search. This is what
+///    recognizes an address the wallet *generated but never recorded*: e.g. one issued before a
+///    stateless (or any) from-seed restore that was never funded, so the scan never re-added it
+///    to the `addresses` table.
+///
+/// Both shielded pools zecd supports - Sapling and Orchard - are covered (a Unified Address is
+/// attributed if *any* of its shielded receivers is ours; a bare Sapling address is tested
+/// directly). Transparent receivers are intentionally not considered: zecd never receives into
+/// the transparent pool, and a transparent receiver can't be attributed to a viewing key without
+/// a gap-limit derivation scan.
 pub fn is_mine(network: ZNetwork, wallet_dir: &Path, addr: &str) -> bool {
     let Ok(db) = open_read(network, wallet_dir) else {
         return false;
@@ -785,7 +806,10 @@ pub fn is_mine(network: ZNetwork, wallet_dir: &Path, addr: &str) -> bool {
     let Ok(ids) = db.get_account_ids() else {
         return false;
     };
+    // Decode once for the crypto path; `None` (unparseable / wrong network) just skips it.
+    let decoded = crate::address::decode_on_network(&network, addr);
     for account in ids {
+        // (1) Recorded-address fast path.
         if let Ok(list) = db.list_addresses(account) {
             if list
                 .iter()
@@ -794,10 +818,31 @@ pub fn is_mine(network: ZNetwork, wallet_dir: &Path, addr: &str) -> bool {
                 return true;
             }
         }
-        if let Ok(receivers) = db.get_transparent_receivers(account, false, false) {
-            if receivers.keys().any(|t| t.encode(&network) == addr) {
-                return true;
-            }
+        // (2) Cryptographic attribution against the account's viewing key.
+        let Some(decoded) = decoded.as_ref() else {
+            continue;
+        };
+        let Ok(Some(acct)) = db.get_account(account) else {
+            continue;
+        };
+        let Some(uivk) = acct.ufvk().map(|k| k.to_unified_incoming_viewing_key()) else {
+            continue;
+        };
+        let mine = match decoded {
+            // decrypt_diversifiers runs Sapling decrypt_diversifier + Orchard diversifier_index
+            // and returns the recovered indices; non-empty ⇒ a shielded receiver is ours.
+            Address::Unified(ua) => !uivk.decrypt_diversifiers(ua).is_empty(),
+            // A bare Sapling address: the same membership test on the Sapling receiver alone.
+            Address::Sapling(pa) => uivk
+                .sapling()
+                .as_ref()
+                .and_then(|ivk| ivk.decrypt_diversifier(pa))
+                .is_some(),
+            // Transparent / TEX: intentionally unsupported (see the doc comment).
+            Address::Transparent(_) | Address::Tex(_) => false,
+        };
+        if mine {
+            return true;
         }
     }
     false
