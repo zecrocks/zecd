@@ -286,10 +286,17 @@ def main() -> int:
     # The next auto-selected address differs (a fresh, unused diversifier).
     b = rpc.call("z_getaddressforaccount", 0)
     ck("z_getaddressforaccount auto-index advances", b["address"] != a["address"])
-    # Index 0 is always a valid Orchard diversifier, so an explicit orchard request at 0 succeeds.
-    z0 = rpc.call("z_getaddressforaccount", 0, ["orchard"], 0)
-    ck("z_getaddressforaccount at index 0 (orchard)", z0["diversifier_index"] == 0)
-    ck("z_getaddressforaccount index 0 receiver_types", z0["receiver_types"] == ["orchard"])
+    # An explicit diversifier index re-derives the exact orchard-only UA at that index. We use a
+    # high, fixed index rather than 0: zcash_client_sqlite parks each account's default address at
+    # the first index with a valid Sapling diversifier (index 0 about half the time, seed-
+    # dependent), and librustzcash refuses to expose a second UA with different receivers at an
+    # already-used index (DiversifierIndexReuse -> -4). A large index can't collide with that
+    # low-index default (nor with the clock-derived auto indices above), and Orchard diversifiers
+    # are valid at every index.
+    jx = 1_000_000
+    zx = rpc.call("z_getaddressforaccount", 0, ["orchard"], jx)
+    ck("z_getaddressforaccount at a fixed index (orchard)", zx["diversifier_index"] == jx)
+    ck("z_getaddressforaccount fixed index receiver_types", zx["receiver_types"] == ["orchard"])
     # Transparent receivers are never exposed: "p2pkh" is rejected -8 (zecd is shielded-only).
     try:
         rpc.call("z_getaddressforaccount", 0, ["p2pkh"])

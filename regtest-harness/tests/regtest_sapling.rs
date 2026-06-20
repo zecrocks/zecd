@@ -164,15 +164,20 @@ async fn regtest_sapling_and_orchard_balances() {
         .await
         .expect("z_getaddressforaccount sapling");
     assert_eq!(s["receiver_types"], json!(["sapling"]), "{s}");
+    // A high, fixed diversifier index (not 0): zcash_client_sqlite parks the account's default
+    // address at the first index with a valid Sapling diversifier - index 0 about half the time,
+    // seed-dependent - and librustzcash rejects a second UA with different receivers at an
+    // already-used index (DiversifierIndexReuse -> -4). A large index can't collide with that
+    // low-index default, and Orchard diversifiers are valid at every index.
     let o = zecd
-        .call("z_getaddressforaccount", json!([0, ["orchard"], 0]))
+        .call("z_getaddressforaccount", json!([0, ["orchard"], 1_000_000]))
         .await
-        .expect("z_getaddressforaccount orchard at index 0");
+        .expect("z_getaddressforaccount orchard at a fixed index");
     assert_eq!(o["receiver_types"], json!(["orchard"]), "{o}");
     assert_eq!(
         o["diversifier_index"],
-        json!(0),
-        "explicit index 0 honored: {o}"
+        json!(1_000_000),
+        "explicit diversifier index honored: {o}"
     );
     // Transparent is never exposed, even though the wallet enables two pools: -8.
     let err = zecd
