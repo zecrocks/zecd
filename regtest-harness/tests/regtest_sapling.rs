@@ -133,6 +133,54 @@ async fn regtest_sapling_and_orchard_balances() {
         .expect_err("unknown address type must fail");
     assert_eq!(err.code(), Some(-5), "unknown address type -> -5: {err}");
 
+    // z_getaddressforaccount (zcashd syntax) on a sapling+orchard wallet: the default and the
+    // explicit single-/dual-pool receiver sets all derive shielded-only UAs, and re-deriving at
+    // a fixed diversifier index is idempotent. (Deterministic - no funding needed.)
+    let a = zecd
+        .call("z_getaddressforaccount", json!([0]))
+        .await
+        .expect("z_getaddressforaccount");
+    assert_eq!(a["account"], json!(0), "account echoed: {a}");
+    let a_recv = a["receiver_types"].as_array().expect("receiver_types");
+    assert!(
+        a_recv.iter().any(|x| x == "sapling") && a_recv.iter().any(|x| x == "orchard"),
+        "default UA receiver_types are sapling+orchard: {a}"
+    );
+    let av = zecd
+        .call("validateaddress", json!([a["address"].as_str().unwrap()]))
+        .await
+        .expect("validateaddress");
+    assert!(has_recv(&av, "sapling") && has_recv(&av, "orchard"), "{av}");
+    // Idempotent re-derivation at the chosen diversifier index returns the identical object.
+    let j = a["diversifier_index"].clone();
+    let a_again = zecd
+        .call("z_getaddressforaccount", json!([0, [], j]))
+        .await
+        .expect("z_getaddressforaccount idempotent");
+    assert_eq!(a_again, a, "re-derivation at a fixed index is idempotent");
+    // Explicit single-pool receiver sets.
+    let s = zecd
+        .call("z_getaddressforaccount", json!([0, ["sapling"]]))
+        .await
+        .expect("z_getaddressforaccount sapling");
+    assert_eq!(s["receiver_types"], json!(["sapling"]), "{s}");
+    let o = zecd
+        .call("z_getaddressforaccount", json!([0, ["orchard"], 0]))
+        .await
+        .expect("z_getaddressforaccount orchard at index 0");
+    assert_eq!(o["receiver_types"], json!(["orchard"]), "{o}");
+    assert_eq!(
+        o["diversifier_index"],
+        json!(0),
+        "explicit index 0 honored: {o}"
+    );
+    // Transparent is never exposed, even though the wallet enables two pools: -8.
+    let err = zecd
+        .call("z_getaddressforaccount", json!([0, ["p2pkh"]]))
+        .await
+        .expect_err("p2pkh must be rejected");
+    assert_eq!(err.code(), Some(-8), "p2pkh -> -8: {err}");
+
     // 6. Wait until zecd is caught up (so the mempool stream is open) before funding.
     let deadline = Instant::now() + FUND_TIMEOUT;
     loop {

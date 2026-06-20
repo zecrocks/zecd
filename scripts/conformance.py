@@ -267,6 +267,78 @@ def main() -> int:
     except JSONRPCException as e:
         ck("getaddressinfo invalid -> code -5", e.code == -5, e.code)
 
+    print("== z_getaddressforaccount ==")
+    # zcashd-syntax derivation of a Unified Address for the wallet's single account (0). zecd is
+    # shielded-only: the default config is Orchard-only, so a default UA carries just "orchard".
+    a = rpc.call("z_getaddressforaccount", 0)
+    ck("z_getaddressforaccount.account is 0", a["account"] == 0)
+    ck("z_getaddressforaccount returns a UA",
+       isinstance(a["address"], str) and a["address"].startswith(("u1", "utest1", "uregtest1")))
+    ck("z_getaddressforaccount.receiver_types is orchard",
+       a["receiver_types"] == ["orchard"], a["receiver_types"])
+    ck("z_getaddressforaccount.diversifier_index is an int",
+       isinstance(a["diversifier_index"], int), repr(a["diversifier_index"]))
+    # Re-deriving at the SAME diversifier index with the same receivers is idempotent: it returns
+    # the exact same object (the key zcashd invariant, wallet_accounts.py:93).
+    j = a["diversifier_index"]
+    a_again = rpc.call("z_getaddressforaccount", 0, [], j)
+    ck("z_getaddressforaccount is idempotent at a fixed index", a_again == a, (a_again, a))
+    # The next auto-selected address differs (a fresh, unused diversifier).
+    b = rpc.call("z_getaddressforaccount", 0)
+    ck("z_getaddressforaccount auto-index advances", b["address"] != a["address"])
+    # Index 0 is always a valid Orchard diversifier, so an explicit orchard request at 0 succeeds.
+    z0 = rpc.call("z_getaddressforaccount", 0, ["orchard"], 0)
+    ck("z_getaddressforaccount at index 0 (orchard)", z0["diversifier_index"] == 0)
+    ck("z_getaddressforaccount index 0 receiver_types", z0["receiver_types"] == ["orchard"])
+    # Transparent receivers are never exposed: "p2pkh" is rejected -8 (zecd is shielded-only).
+    try:
+        rpc.call("z_getaddressforaccount", 0, ["p2pkh"])
+        ck("z_getaddressforaccount p2pkh raises", False)
+    except JSONRPCException as e:
+        ck("z_getaddressforaccount p2pkh -> -8", e.code == -8, e.code)
+    # A pool not enabled on this wallet (Sapling, in the Orchard-only default) is also -8.
+    try:
+        rpc.call("z_getaddressforaccount", 0, ["sapling"])
+        ck("z_getaddressforaccount disabled pool raises", False)
+    except JSONRPCException as e:
+        ck("z_getaddressforaccount disabled pool -> -8", e.code == -8, e.code)
+    # An unknown receiver token is -8.
+    try:
+        rpc.call("z_getaddressforaccount", 0, ["bogus"])
+        ck("z_getaddressforaccount unknown receiver raises", False)
+    except JSONRPCException as e:
+        ck("z_getaddressforaccount unknown receiver -> -8", e.code == -8, e.code)
+    # Only account 0 exists (one account per wallet): a different in-range account is -4.
+    try:
+        rpc.call("z_getaddressforaccount", 1)
+        ck("z_getaddressforaccount account 1 raises", False)
+    except JSONRPCException as e:
+        ck("z_getaddressforaccount account 1 -> -4", e.code == -4, e.code)
+    # An out-of-range account number is -8.
+    try:
+        rpc.call("z_getaddressforaccount", -1)
+        ck("z_getaddressforaccount account -1 raises", False)
+    except JSONRPCException as e:
+        ck("z_getaddressforaccount account -1 -> -8", e.code == -8, e.code)
+    # A diversifier index beyond the 11-byte space is -8.
+    try:
+        rpc.call("z_getaddressforaccount", 0, [], 2 ** 88)
+        ck("z_getaddressforaccount huge diversifier raises", False)
+    except JSONRPCException as e:
+        ck("z_getaddressforaccount huge diversifier -> -8", e.code == -8, e.code)
+    # A negative diversifier index is -8.
+    try:
+        rpc.call("z_getaddressforaccount", 0, [], -1)
+        ck("z_getaddressforaccount negative diversifier raises", False)
+    except JSONRPCException as e:
+        ck("z_getaddressforaccount negative diversifier -> -8", e.code == -8, e.code)
+    # No arguments at all is the standard invalid-params error.
+    try:
+        rpc.call("z_getaddressforaccount")
+        ck("z_getaddressforaccount no args raises", False)
+    except JSONRPCException as e:
+        ck("z_getaddressforaccount no args -> -32602", e.code == -32602, e.code)
+
     print("== received-by-address ==")
     recv = rpc.call("getreceivedbyaddress", addr)
     ck("getreceivedbyaddress is Decimal", isinstance(recv, decimal.Decimal), repr(recv))

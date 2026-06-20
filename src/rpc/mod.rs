@@ -72,6 +72,8 @@ pub const ALL_METHODS: &[&str] = &[
     "z_getoperationstatus",
     "z_getoperationresult",
     "z_listoperationids",
+    // Wallet - address derivation (zcashd-style)
+    "z_getaddressforaccount",
 ];
 
 /// Whether `name` is an RPC method zecd implements (see [`ALL_METHODS`]).
@@ -166,6 +168,11 @@ async fn dispatch_zecd(
         "z_getoperationstatus" => wallet_methods::z_getoperationstatus(state, wallet, req),
         "z_getoperationresult" => wallet_methods::z_getoperationresult(state, wallet, req),
         "z_listoperationids" => wallet_methods::z_listoperationids(state, wallet, req),
+
+        // Wallet - address derivation (zcashd-style; exact-or-next diversified UA)
+        "z_getaddressforaccount" => {
+            wallet_methods::z_getaddressforaccount(state, wallet, req).await
+        }
 
         other => Err(RpcError::method_not_found(other)),
     }

@@ -23,12 +23,14 @@ use zcash_client_backend::fees::{
 use zcash_client_backend::proposal::Proposal;
 use zcash_client_backend::proto::service;
 use zcash_client_backend::wallet::OvkPolicy;
+use zcash_client_sqlite::error::SqliteClientError;
 use zcash_client_sqlite::{AccountUuid, FsBlockDb};
 use zcash_primitives::transaction::Transaction;
 use zcash_proofs::prover::LocalTxProver;
 use zcash_protocol::consensus::{BlockHeight, BranchId};
 use zcash_protocol::value::Zatoshis;
 use zcash_protocol::{PoolType, ShieldedProtocol, TxId};
+use zip32::DiversifierIndex;
 use zip321::TransactionRequest;
 
 use crate::backend::Server;
@@ -450,6 +452,20 @@ fn account_not_ready() -> RpcError {
 /// (`-4`, wallet.cpp); zecd's watch-only (UFVK) wallets surface it for the same calls.
 fn private_keys_disabled() -> RpcError {
     RpcError::wallet("Error: Private keys are disabled for this wallet")
+}
+
+/// Map a `get_address_for_index` failure onto an `RpcError`. The reuse case (an exact
+/// diversifier index previously exposed with a *different* receiver set) gets zcashd's exact
+/// `z_getaddressforaccount` wording; everything else is a generic wallet error.
+fn map_address_for_index_error(e: SqliteClientError) -> RpcError {
+    match e {
+        SqliteClientError::DiversifierIndexReuse(j, _) => RpcError::wallet(format!(
+            "Error: address at diversifier index {} was already generated with different \
+             receiver types.",
+            u128::from(j)
+        )),
+        other => RpcError::wallet(format!("address generation failed: {other}")),
+    }
 }
 
 /// Render a tree-state frontier (the hex-encoded `final_state` from a `tree_state` reply) for
@@ -1300,6 +1316,14 @@ impl WalletActor {
                 let res = self.get_new_address(label, receivers);
                 let _ = reply.send(res);
             }
+            WalletCommand::GetAddressForAccount {
+                receivers,
+                diversifier_index,
+                reply,
+            } => {
+                let res = self.get_address_for_account(receivers, diversifier_index);
+                let _ = reply.send(res);
+            }
             WalletCommand::Send {
                 request,
                 confirmations,
@@ -1393,6 +1417,50 @@ impl WalletActor {
             }
         }
         Ok(encoded)
+    }
+
+    /// Derive a Unified Address for this wallet's account, backing `z_getaddressforaccount`.
+    /// With `diversifier_index = Some(j)` it derives at exactly that index (re-deriving an
+    /// already-exposed index returns the same address; requesting a different receiver set at an
+    /// exposed index is a reuse error); with `None` it picks the next unused index, exactly like
+    /// `get_new_address`. `receivers` has already been validated against the enabled pools.
+    /// Returns the encoded UA plus the diversifier index actually used (as a `u128`).
+    fn get_address_for_account(
+        &mut self,
+        receivers: PoolSet,
+        diversifier_index: Option<DiversifierIndex>,
+    ) -> Result<(String, u128), RpcError> {
+        let account_id = self.require_account()?;
+        let request = receivers.to_unified_address_request();
+        let (ua, j) = match diversifier_index {
+            None => self
+                .db_data
+                .get_next_available_address(account_id, request)
+                .map_err(|e| RpcError::wallet(format!("address generation failed: {e}")))?
+                .ok_or_else(|| {
+                    RpcError::wallet(format!(
+                        "no address available for account with receivers ({}); the account's \
+                         viewing key may not support all requested pools",
+                        receivers.display_names()
+                    ))
+                })?,
+            Some(j) => {
+                let ua = self
+                    .db_data
+                    .get_address_for_index(account_id, j, request)
+                    .map_err(map_address_for_index_error)?
+                    // librustzcash returns `Ok(None)` when no address can be derived at this
+                    // index for the requested receivers (e.g. an invalid Sapling diversifier).
+                    .ok_or_else(|| {
+                        RpcError::wallet(format!(
+                            "Error: no address at diversifier index {}.",
+                            u128::from(j)
+                        ))
+                    })?;
+                (ua, j)
+            }
+        };
+        Ok((ua.encode(&self.network), u128::from(j)))
     }
 
     async fn do_send(

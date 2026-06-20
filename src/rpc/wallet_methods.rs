@@ -7,6 +7,7 @@ use serde_json::{json, Map, Value};
 use zcash_client_backend::data_api::wallet::ConfirmationsPolicy;
 use zcash_protocol::memo::{Memo, MemoBytes};
 use zcash_protocol::TxId;
+use zip32::DiversifierIndex;
 use zip321::{Payment, TransactionRequest};
 
 use crate::amount::{signed_zats_to_value, value_to_zats, zats_to_value};
@@ -16,7 +17,7 @@ use crate::operations::{AsyncOperation, ContextInfo, OperationId};
 use crate::server::jsonrpc::RpcRequest;
 use crate::state::AppState;
 use crate::wallet::store::Passphrase;
-use crate::wallet::{labels, read, SyncStatus};
+use crate::wallet::{labels, read, SyncStatus, WalletHandle};
 
 pub(crate) fn opt_str(req: &RpcRequest, i: usize) -> Option<String> {
     req.param(i).and_then(|v| v.as_str()).map(|s| s.to_string())
@@ -97,6 +98,151 @@ fn parse_receiver_tokens(
     let set = PoolSet::new(pools)
         .map_err(|e| RpcError::invalid_address_or_key(format!("Invalid address type: {e}")))?;
     Ok(Some(set))
+}
+
+/// `z_getaddressforaccount account ( ["receiver_type", ...] diversifier_index )` - derive a
+/// Unified Address for the wallet's account, in zcashd's syntax.
+///
+/// zecd differs from zcashd in two deliberate ways:
+/// - **One account per wallet:** `account` must be `0` (the wallet's only account). A different
+///   in-range account is `-4`; an out-of-range value is `-8`. Select a different wallet via the
+///   `/wallet/<name>` path instead.
+/// - **Shielded-only:** zecd never exposes a transparent receiver, so the only valid
+///   `receiver_type`s are this wallet's enabled shielded pools (`sapling`/`orchard`). `p2pkh`
+///   and any other token are rejected `-8`, and the result is always a shielded-only UA.
+///
+/// `receiver_types` empty/omitted uses the wallet's configured `default_receivers` (as
+/// `getnewaddress` does). `diversifier_index` omitted picks the next unused index; given, it
+/// re-derives the exact address at that index (idempotent for the same receiver set).
+pub(crate) async fn z_getaddressforaccount(
+    state: &AppState,
+    wallet: Option<&str>,
+    req: &RpcRequest,
+) -> Result<Value, RpcError> {
+    let handle = state.registry.get(wallet)?.clone();
+
+    let account = parse_account_arg(req.param(0))?;
+    let receivers = parse_receiver_types_array(req.param(1), &handle)?;
+    let diversifier_index = parse_diversifier_index_arg(req.param(2))?;
+
+    let (address, j) = handle
+        .get_address_for_account(receivers.clone(), diversifier_index)
+        .await?;
+
+    let receiver_types: Vec<&str> = receivers.iter().map(|p| p.as_str()).collect();
+    Ok(json!({
+        "account": account,
+        "diversifier_index": j,
+        "receiver_types": receiver_types,
+        "address": address,
+    }))
+}
+
+/// Parse `z_getaddressforaccount`'s `account` argument. zecd has a single account per wallet, so
+/// only `0` is valid: a different but in-range account is a `-4` (it "has not been generated"),
+/// while a value outside zcashd's `0..=(2^31)-2` range - or a non-integer - is a `-8`.
+fn parse_account_arg(v: Option<&Value>) -> Result<u64, RpcError> {
+    let v = v.ok_or_else(|| {
+        RpcError::invalid_params("z_getaddressforaccount requires an account number")
+    })?;
+    // `as_i64` yields `None` for non-integers (strings, floats, oversized), all of which fail
+    // the range check identically.
+    let n = v.as_i64().ok_or_else(|| {
+        RpcError::invalid_parameter("Invalid account number, must be 0 <= account <= (2^31)-2.")
+    })?;
+    if !(0..=((1i64 << 31) - 2)).contains(&n) {
+        return Err(RpcError::invalid_parameter(
+            "Invalid account number, must be 0 <= account <= (2^31)-2.",
+        ));
+    }
+    if n != 0 {
+        return Err(RpcError::wallet(format!(
+            "Error: account {n} has not been generated; \
+             zecd wallets have a single account (account 0)."
+        )));
+    }
+    Ok(0)
+}
+
+/// Parse `z_getaddressforaccount`'s `receiver_types` array into a validated [`PoolSet`]. An
+/// omitted/empty array uses the wallet's `default_receivers`. Each element must name a shielded
+/// pool enabled on this wallet; `p2pkh`/`p2sh`/any unknown token is rejected `-8` (zecd is
+/// shielded-only and never exposes a transparent receiver).
+fn parse_receiver_types_array(
+    v: Option<&Value>,
+    handle: &WalletHandle,
+) -> Result<crate::pools::PoolSet, RpcError> {
+    use crate::pools::{Pool, PoolSet};
+    let arr = match v {
+        None | Some(Value::Null) => return Ok(handle.default_receivers.clone()),
+        Some(Value::Array(a)) => a,
+        Some(_) => {
+            return Err(RpcError::invalid_parameter(
+                "Invalid parameter, expected receiver_types to be an array of strings",
+            ))
+        }
+    };
+    if arr.is_empty() {
+        return Ok(handle.default_receivers.clone());
+    }
+    let mut pools = Vec::with_capacity(arr.len());
+    let mut invalid = Vec::new();
+    for item in arr {
+        let s = item
+            .as_str()
+            .ok_or_else(|| RpcError::type_error("receiver type must be a string"))?;
+        match Pool::from_config_str(s) {
+            Ok(p) => pools.push(p),
+            Err(_) => invalid.push(s.to_string()),
+        }
+    }
+    if !invalid.is_empty() {
+        // "p2pkh"/"p2sh"/"transparent" and any unknown token land here. zcashd accepts p2pkh;
+        // zecd never exposes a transparent receiver, so the only valid types are shielded.
+        let verb = if invalid.len() == 1 {
+            "is an invalid receiver type"
+        } else {
+            "are invalid receiver types"
+        };
+        return Err(RpcError::invalid_parameter(format!(
+            "{} {verb}. zecd addresses are shielded-only; arguments must be \"sapling\" or \
+             \"orchard\".",
+            invalid.join(", ")
+        )));
+    }
+    let set = PoolSet::new(pools)
+        .map_err(|e| RpcError::invalid_parameter(format!("invalid receiver_types: {e}")))?;
+    if !set.is_subset_of(&handle.enabled_pools) {
+        return Err(RpcError::invalid_parameter(format!(
+            "receiver_types requests a pool not enabled on this wallet; enabled pools: {}",
+            handle.enabled_pools.display_names()
+        )));
+    }
+    Ok(set)
+}
+
+/// Parse `z_getaddressforaccount`'s optional `diversifier_index` argument. `None`/null means
+/// "next available". A present value must be a non-negative integer within the 11-byte
+/// diversifier space; a fractional/negative/non-numeric value is `-8`, and one that exceeds the
+/// space is `-8` "too large" (mirroring zcashd/zallet).
+fn parse_diversifier_index_arg(v: Option<&Value>) -> Result<Option<DiversifierIndex>, RpcError> {
+    let num = match v {
+        None | Some(Value::Null) => return Ok(None),
+        Some(Value::Number(n)) => n,
+        Some(_) => {
+            return Err(RpcError::invalid_parameter(
+                "Invalid diversifier index, must be an unsigned integer.",
+            ))
+        }
+    };
+    // Parse the integer literal directly so the full diversifier range (~2^88) is representable,
+    // not just u64. A fractional or negative literal fails this parse.
+    let parsed: u128 = num.to_string().parse().map_err(|_| {
+        RpcError::invalid_parameter("Invalid diversifier index, must be an unsigned integer.")
+    })?;
+    DiversifierIndex::try_from(parsed)
+        .map(Some)
+        .map_err(|_| RpcError::invalid_parameter("diversifier index is too large."))
 }
 
 /// Map `getbalance`'s optional `minconf` argument onto a [`ConfirmationsPolicy`]. Omitted
@@ -1710,6 +1856,68 @@ mod tests {
         assert!(!requested.is_subset_of(&enabled));
         let ok = parse_receiver_tokens(Some("orchard")).unwrap().unwrap();
         assert!(ok.is_subset_of(&enabled));
+    }
+
+    #[test]
+    fn account_arg_only_zero_is_valid() {
+        use crate::error::codes::{RPC_INVALID_PARAMETER, RPC_WALLET_ERROR};
+
+        // The single account is 0.
+        assert_eq!(parse_account_arg(Some(&json!(0))).unwrap(), 0);
+
+        // Missing -> -32602 (invalid params), as for any required argument.
+        assert_eq!(
+            parse_account_arg(None).unwrap_err().code,
+            crate::error::codes::RPC_INVALID_PARAMS
+        );
+
+        // In-range but not the wallet's only account -> -4 "has not been generated".
+        let err = parse_account_arg(Some(&json!(1))).unwrap_err();
+        assert_eq!(err.code, RPC_WALLET_ERROR);
+        assert!(err.message.contains("single account"), "{}", err.message);
+
+        // Out of range / negative / non-integer -> -8.
+        for bad in [json!(-1), json!((1i64 << 31) - 1), json!(1.5), json!("0")] {
+            assert_eq!(
+                parse_account_arg(Some(&bad)).unwrap_err().code,
+                RPC_INVALID_PARAMETER,
+                "{bad} should be -8"
+            );
+        }
+    }
+
+    #[test]
+    fn diversifier_index_arg_parsing() {
+        use crate::error::codes::RPC_INVALID_PARAMETER;
+
+        // Omitted / null -> next-available (None).
+        assert!(parse_diversifier_index_arg(None).unwrap().is_none());
+        assert!(parse_diversifier_index_arg(Some(&Value::Null))
+            .unwrap()
+            .is_none());
+
+        // A plain non-negative integer round-trips through DiversifierIndex back to the same u128.
+        for n in [0u128, 1, 42, 4_500_000_000] {
+            let di = parse_diversifier_index_arg(Some(&json!(n)))
+                .unwrap()
+                .expect("a value");
+            assert_eq!(u128::from(di), n);
+        }
+
+        // Fractional, negative, and non-numeric are all -8 "unsigned integer".
+        for bad in [json!(1.5), json!(-1), json!("3"), json!([])] {
+            assert_eq!(
+                parse_diversifier_index_arg(Some(&bad)).unwrap_err().code,
+                RPC_INVALID_PARAMETER,
+                "{bad} should be -8"
+            );
+        }
+
+        // Beyond the 11-byte (~2^88) diversifier space -> -8 "too large".
+        let too_large = json!(1u128 << 100);
+        let err = parse_diversifier_index_arg(Some(&too_large)).unwrap_err();
+        assert_eq!(err.code, RPC_INVALID_PARAMETER);
+        assert!(err.message.contains("too large"), "{}", err.message);
     }
 
     #[test]

@@ -29,8 +29,9 @@ pub(crate) fn help() -> Result<Value, RpcError> {
     Ok(Value::String(
         "zecd: a Bitcoin-Core-style JSON-RPC server for Orchard-only Zcash. \
          Supported methods include getblockchaininfo, getnetworkinfo, getwalletinfo, \
-         getnewaddress, getbalance, sendtoaddress, sendmany, listtransactions, \
-         gettransaction, validateaddress. See the README for the full list and limits."
+         getnewaddress, z_getaddressforaccount, getbalance, sendtoaddress, sendmany, \
+         listtransactions, gettransaction, validateaddress. See the README for the full list \
+         and limits."
             .to_string(),
     ))
 }

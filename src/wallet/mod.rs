@@ -17,6 +17,7 @@ use std::path::PathBuf;
 use tokio::sync::{mpsc, oneshot, watch};
 use zcash_client_backend::data_api::wallet::ConfirmationsPolicy;
 use zcash_protocol::TxId;
+use zip32::DiversifierIndex;
 use zip321::TransactionRequest;
 
 use crate::config::SendPrivacy;
@@ -108,6 +109,15 @@ pub enum WalletCommand {
         receivers: Option<PoolSet>,
         reply: oneshot::Sender<Result<String, RpcError>>,
     },
+    /// Derive a Unified Address for the wallet's (single) account, backing `z_getaddressforaccount`.
+    /// `diversifier_index` selects an exact index (re-deriving the same address idempotently);
+    /// `None` picks the next unused index, like `getnewaddress`. `receivers` is the already-resolved,
+    /// already-validated receiver set. Returns the encoded UA and the diversifier index used.
+    GetAddressForAccount {
+        receivers: PoolSet,
+        diversifier_index: Option<DiversifierIndex>,
+        reply: oneshot::Sender<Result<(String, u128), RpcError>>,
+    },
     Send {
         request: TransactionRequest,
         /// Per-call confirmations override (`z_sendmany`'s `minconf`). `None` uses the
@@ -195,6 +205,22 @@ impl WalletHandle {
         self.dispatch(|reply| WalletCommand::GetNewAddress {
             label,
             receivers,
+            reply,
+        })
+        .await
+    }
+
+    /// Derive a Unified Address for the wallet's single account (`z_getaddressforaccount`).
+    /// `diversifier_index` selects an exact index; `None` picks the next unused one. `receivers`
+    /// must already have been validated against the wallet's enabled pools by the caller.
+    pub async fn get_address_for_account(
+        &self,
+        receivers: PoolSet,
+        diversifier_index: Option<DiversifierIndex>,
+    ) -> Result<(String, u128), RpcError> {
+        self.dispatch(|reply| WalletCommand::GetAddressForAccount {
+            receivers,
+            diversifier_index,
             reply,
         })
         .await
