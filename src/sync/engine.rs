@@ -88,12 +88,13 @@ pub async fn update_subtree_roots<C: ChainSource>(
 }
 
 async fn download_blocks<C: ChainSource>(
+    name: &str,
     client: &mut C,
     wallet_dir: &Path,
     db_cache: &mut FsBlockDb,
     scan_range: &ScanRange,
 ) -> anyhow::Result<Vec<BlockMeta>> {
-    info!("Fetching {}", scan_range);
+    info!("[{name}] Fetching {scan_range}");
     let mut stream = client
         .compact_block_range(
             scan_range.block_range().start,
@@ -137,10 +138,10 @@ async fn download_chain_state<C: ChainSource>(
     Ok(tree_state.to_chain_state()?)
 }
 
-fn delete_cached_blocks(wallet_dir: &Path, block_meta: Vec<BlockMeta>) {
+fn delete_cached_blocks(name: &str, wallet_dir: &Path, block_meta: Vec<BlockMeta>) {
     for meta in block_meta {
         if let Err(e) = std::fs::remove_file(block_path(wallet_dir, &meta)) {
-            warn!("Failed to remove cached block {:?}: {}", meta, e);
+            warn!("[{name}] Failed to remove cached block {:?}: {}", meta, e);
         }
     }
 }
@@ -176,6 +177,7 @@ fn delete_cached_blocks(wallet_dir: &Path, block_meta: Vec<BlockMeta>) {
 /// (PostgreSQL), propose upstream a trait-level error (or a `truncate_to_height` variant
 /// that reports "no valid target at or below" portably) and switch this match to it.
 fn perform_rewind(
+    name: &str,
     db_data: &mut WriteDb,
     at_height: BlockHeight,
     requested: BlockHeight,
@@ -186,7 +188,9 @@ fn perform_rewind(
             let bound = BlockHeight::from(u32::from(at_height).saturating_sub(2));
             match db_data.truncate_to_height(bound) {
                 Ok(h) => {
-                    info!("Shallow rewind to {h} (no valid target at or below {requested})");
+                    info!(
+                        "[{name}] Shallow rewind to {h} (no valid target at or below {requested})"
+                    );
                     Ok(h)
                 }
                 // No scanned block below the conflict can be rewound to: the reorg is
@@ -208,6 +212,7 @@ fn perform_rewind(
 /// Scan a downloaded range; handle continuity (reorg) errors by rewinding. Returns whether
 /// the suggested scan ranges changed materially.
 fn scan_blocks(
+    name: &str,
     params: &ZNetwork,
     wallet_dir: &Path,
     db_cache: &mut FsBlockDb,
@@ -215,7 +220,7 @@ fn scan_blocks(
     initial_chain_state: &ChainState,
     scan_range: &ScanRange,
 ) -> anyhow::Result<bool> {
-    info!("Scanning {}", scan_range);
+    info!("[{name}] Scanning {scan_range}");
     let scan_result = scan_cached_blocks(
         params,
         db_cache,
@@ -229,7 +234,7 @@ fn scan_blocks(
         Err(ChainError::Scan(err)) if err.is_continuity_error() => {
             let requested = err.at_height().saturating_sub(10);
             info!(
-                "Chain reorg detected at {}, rewinding to {}",
+                "[{name}] Chain reorg detected at {}, rewinding to {}",
                 err.at_height(),
                 requested
             );
@@ -238,7 +243,7 @@ fn scan_blocks(
             // (virtually all real blocks). `perform_rewind` falls back to the nearest
             // valid checkpoint when the requested height has none; the cache is then
             // truncated to the height actually rewound to.
-            let rewind_height = perform_rewind(db_data, err.at_height(), requested)?;
+            let rewind_height = perform_rewind(name, db_data, err.at_height(), requested)?;
             db_cache
                 .with_blocks(Some(rewind_height + 1), None, |block| {
                     let meta = BlockMeta {
@@ -271,6 +276,7 @@ fn scan_blocks(
 /// Process at most one batch of work. Returns `true` if a batch was scanned (caller should
 /// call again), `false` if there are no pending scan ranges (wallet is caught up).
 pub async fn sync_one_batch<C: ChainSource>(
+    name: &str,
     client: &mut C,
     params: &ZNetwork,
     wallet_dir: &Path,
@@ -279,7 +285,7 @@ pub async fn sync_one_batch<C: ChainSource>(
 ) -> anyhow::Result<bool> {
     let scan_ranges = db_data.suggest_scan_ranges()?;
     tracing::debug!(
-        "suggest_scan_ranges -> {} range(s): {:?}",
+        "[{name}] suggest_scan_ranges -> {} range(s): {:?}",
         scan_ranges.len(),
         scan_ranges
             .iter()
@@ -307,7 +313,7 @@ pub async fn sync_one_batch<C: ChainSource>(
         }
     };
 
-    let block_meta = download_blocks(client, wallet_dir, db_cache, &scan_range).await?;
+    let block_meta = download_blocks(name, client, wallet_dir, db_cache, &scan_range).await?;
 
     // Fetch the prior block's chain state and scan. Anything that fails here must still clean up
     // the just-downloaded cache files, so the result is captured and the delete runs regardless.
@@ -322,6 +328,7 @@ pub async fn sync_one_batch<C: ChainSource>(
         // `scan_cached_blocks` is CPU-bound; keep the async runtime healthy.
         tokio::task::block_in_place(|| {
             scan_blocks(
+                name,
                 params,
                 wallet_dir,
                 db_cache,
@@ -336,7 +343,7 @@ pub async fn sync_one_batch<C: ChainSource>(
 
     // Remove the downloaded compact blocks whether the scan succeeded or failed, so a transient
     // error (or a reorg-shifted range) can't strand cache files on disk.
-    delete_cached_blocks(wallet_dir, block_meta);
+    delete_cached_blocks(name, wallet_dir, block_meta);
     result?;
     Ok(true)
 }
@@ -487,6 +494,7 @@ mod tests {
             let cmx = cmx_bytes(0x0A, h);
             metas_a.push(write_block(wd, &mut db_cache, h, hash, prev, cmx, h));
             scan_blocks(
+                "test",
                 &net,
                 wd,
                 &mut db_cache,
@@ -518,6 +526,7 @@ mod tests {
             11,
         );
         let worked = scan_blocks(
+            "test",
             &net,
             wd,
             &mut db_cache,
@@ -566,6 +575,7 @@ mod tests {
             .update_chain_tip(BlockHeight::from_u32(12))
             .expect("advance tip");
         scan_blocks(
+            "test",
             &net,
             wd,
             &mut db_cache,
@@ -609,6 +619,7 @@ mod tests {
             let cmx = cmx_bytes(0x0A, h);
             write_block(wd, &mut db_cache, h, hash, prev, cmx, h);
             scan_blocks(
+                "test",
                 &net,
                 wd,
                 &mut db_cache,
@@ -639,6 +650,7 @@ mod tests {
         let mut db_data = short_chain_wallet(wd, 5);
 
         let rewound = perform_rewind(
+            "test",
             &mut db_data,
             BlockHeight::from_u32(6),
             BlockHeight::from_u32(0),
@@ -666,6 +678,7 @@ mod tests {
         let mut db_data = short_chain_wallet(wd, 1);
 
         let err = perform_rewind(
+            "test",
             &mut db_data,
             BlockHeight::from_u32(2),
             BlockHeight::from_u32(0),

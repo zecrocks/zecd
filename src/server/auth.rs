@@ -189,6 +189,23 @@ impl Authenticator {
     }
 }
 
+/// Recover the claimed username from a Basic `Authorization` header, for log attribution.
+/// Returns `None` when the header is absent or not well-formed Basic auth. This performs **no**
+/// credential verification - it only parses out the username so an auth success/failure can name
+/// who attempted it. (The password is never returned or logged.)
+pub fn basic_auth_username(header: Option<&str>) -> Option<String> {
+    let header = header?;
+    let b64 = header
+        .strip_prefix("Basic ")
+        .or_else(|| header.strip_prefix("basic "))?;
+    let decoded = base64::engine::general_purpose::STANDARD
+        .decode(b64.trim())
+        .ok()?;
+    let creds = std::str::from_utf8(&decoded).ok()?;
+    let (user, _password) = creds.split_once(':')?;
+    Some(user.to_string())
+}
+
 fn random_hex(bytes: usize) -> String {
     let mut buf = vec![0u8; bytes];
     rand::thread_rng().fill_bytes(&mut buf);

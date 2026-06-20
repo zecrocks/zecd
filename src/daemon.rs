@@ -20,6 +20,16 @@ use crate::wallet::WalletRegistry;
 pub fn init_tracing(log: &config::LogConfig) {
     let filter = tracing_subscriber::EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(&log.level));
+    // `zcash_client_sqlite` runs its schema migrations through `schemerz`, which logs each one at
+    // INFO via the `log` crate (bridged into tracing). On a fresh datadir that's ~60 lines of
+    // "Applying migration <uuid>" noise at startup. Quiet that target to WARN by default so the
+    // migration chatter stays out of the way - unless the operator explicitly scoped `schemerz`
+    // in `RUST_LOG`, in which case their directive wins.
+    let filter = if std::env::var("RUST_LOG").is_ok_and(|v| v.contains("schemerz")) {
+        filter
+    } else {
+        filter.add_directive("schemerz=warn".parse().expect("static directive parses"))
+    };
     // Log to stderr, not stdout: the `init`/`export-ufvk` CLI subcommands print machine-readable
     // output (the mnemonic, a UFVK) to stdout, and a log line on stdout would corrupt it.
     let builder = tracing_subscriber::fmt()
@@ -55,6 +65,7 @@ pub async fn run(config: AppConfig) -> anyhow::Result<()> {
     actor::install_panic_hook();
     let config = Arc::new(config);
     let auth = server::auth::Authenticator::from_config(&config.rpc)?;
+    log_auth_mode(&config.rpc);
 
     // Shutdown broadcast: `true` is sent on Ctrl-C / `stop`. Created before the actors so
     // each one carries a receiver and can stop its sync loop between batches.
@@ -185,6 +196,30 @@ pub async fn run(config: AppConfig) -> anyhow::Result<()> {
         }
     }
     result
+}
+
+/// Log the configured RPC authentication method(s) at startup, mirroring the credential union
+/// `Authenticator::from_config` accepts: salted `rpcauth` entries, a bare `rpcuser`/`rpcpassword`
+/// pair, and/or a generated cookie file (used whenever no bare pair is set). A bare password on a
+/// non-loopback bind is called out at WARN: zecd serves plaintext HTTP, so the credential would
+/// cross the network in the clear.
+fn log_auth_mode(rpc: &config::RpcConfig) {
+    if !rpc.auth.is_empty() {
+        info!("RPC auth: {} salted rpcauth credential(s)", rpc.auth.len());
+    }
+    if rpc.user.is_some() && rpc.password.is_some() {
+        info!("RPC auth: rpcuser/rpcpassword (bare password)");
+        if !rpc.bind.is_loopback() {
+            warn!(
+                "RPC is bound to non-loopback {} with a bare rpcpassword; credentials cross the \
+                 network in plaintext (zecd serves plaintext HTTP). Bind to localhost, or place \
+                 zecd behind a TLS-terminating proxy.",
+                rpc.bind
+            );
+        }
+    } else if let Some(cookie) = &rpc.cookiefile {
+        info!("RPC auth: cookie file {}", cookie.display());
+    }
 }
 
 /// Enforce zecd's single-spending-wallet rule: at most one loaded wallet may hold spending

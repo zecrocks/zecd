@@ -21,7 +21,7 @@
 //! during derivation/proving are not individually locked (raising `RLIMIT_MEMLOCK` and using
 //! an encrypted swap device covers that residue).
 
-use tracing::{info, warn};
+use tracing::warn;
 
 /// Environment variable that opts out of the core-dump / non-dumpable hardening (for
 /// debugging a crash). `mlock` of the seed is unaffected.
@@ -31,7 +31,7 @@ pub const ALLOW_CORE_DUMPS_ENV: &str = "ZECD_ALLOW_CORE_DUMPS";
 /// call from every subcommand; best-effort, so failures are logged and never fatal.
 pub fn harden_process() {
     if std::env::var_os(ALLOW_CORE_DUMPS_ENV).is_some() {
-        info!("{ALLOW_CORE_DUMPS_ENV} set; leaving core dumps and ptrace enabled");
+        warn!("{ALLOW_CORE_DUMPS_ENV} set; leaving core dumps and ptrace enabled");
         return;
     }
     disable_core_dumps();
@@ -47,9 +47,7 @@ fn disable_core_dumps() {
     };
     // SAFETY: `setrlimit` reads one valid `rlimit` for a known resource id; no aliasing.
     let rc = unsafe { libc::setrlimit(libc::RLIMIT_CORE, &limit) };
-    if rc == 0 {
-        info!("core dumps disabled (RLIMIT_CORE=0)");
-    } else {
+    if rc != 0 {
         warn!(
             "could not disable core dumps: {}",
             std::io::Error::last_os_error()
@@ -63,11 +61,7 @@ fn set_non_dumpable() {
     // this one or read /proc/<pid>/mem to scrape the seed.
     // SAFETY: a plain prctl with constant scalar args and no pointers.
     let rc = unsafe { libc::prctl(libc::PR_SET_DUMPABLE, 0, 0, 0, 0) };
-    if rc == 0 {
-        info!(
-            "process marked non-dumpable (PR_SET_DUMPABLE=0): no ptrace / /proc/pid/mem scraping"
-        );
-    } else {
+    if rc != 0 {
         warn!(
             "could not mark process non-dumpable: {}",
             std::io::Error::last_os_error()

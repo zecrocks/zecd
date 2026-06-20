@@ -12,7 +12,7 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::post;
 use axum::Router;
 use serde_json::Value;
-use tracing::info;
+use tracing::{info, warn};
 
 use crate::rpc;
 use crate::server::jsonrpc::{Body, RpcRequest};
@@ -78,11 +78,26 @@ async fn handle(
     let auth_header = headers
         .get(header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok());
+    let wallet_label = wallet.as_deref().unwrap_or("default");
     if !state.auth.check(auth_header) {
         // Bitcoin Core inserts a small delay on auth failure to deter brute-forcing.
         tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+        warn!(
+            user = auth::basic_auth_username(auth_header)
+                .as_deref()
+                .unwrap_or("<none>"),
+            wallet = wallet_label,
+            "RPC authentication failed"
+        );
         return unauthorized();
     }
+    info!(
+        user = auth::basic_auth_username(auth_header)
+            .as_deref()
+            .unwrap_or("<none>"),
+        wallet = wallet_label,
+        "RPC authentication succeeded"
+    );
 
     // Bound concurrent in-flight requests like bitcoind's work queue; excess → 503.
     let _permit = match state.work_queue.clone().try_acquire_owned() {

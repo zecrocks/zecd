@@ -64,6 +64,12 @@ const UNARY_RPC_TIMEOUT: Duration = Duration::from_secs(30);
 /// unrecoverable reorg) can't spin the actor loop at full speed reconnecting and re-failing.
 const SYNC_ERROR_RETRY_INTERVAL: Duration = Duration::from_secs(2);
 
+/// At bootstrap, warn when the derived scan floor lands more than one note-commitment-tree
+/// shard (2^16 blocks) below the wallet birthday - the symptom of the scan queue flooring at
+/// an in-progress subtree boundary instead of the birthday (the failure `maybe_bootstrap_account`
+/// guards against by setting the chain tip only after the account, with its birthday, exists).
+const BOOTSTRAP_SCAN_FLOOR_WARN_GAP: u32 = 1 << 16;
+
 // NB: the unmined-tx rebroadcast interval is configurable (`[sync] rebroadcast_secs`,
 // default 60) and arrives via `ActorConfig::rebroadcast_interval`. It covers sends whose
 // original broadcast failed (their notes are already locked in the DB until expiry) and
@@ -157,6 +163,11 @@ struct WalletActor {
     db_data: WriteDb,
     db_cache: FsBlockDb,
     client: Option<AnySource>,
+    /// Whether the current connection has emitted its "connected ... chain tip N" log line.
+    /// Set once per connection (on the first successful tip refresh, when the tip is known)
+    /// and reset on disconnect, so connect/disconnect are logged as matched transitions
+    /// rather than once per tip refresh or per dropped client.
+    connected_logged: bool,
     /// Live mempool subscription, open only while caught up to the tip. Both backends
     /// stream current + newly-arriving mempool txs and close the stream when a new block
     /// is mined (lightwalletd does this natively; the zebra backend synthesizes it from a
@@ -350,6 +361,7 @@ pub async fn spawn(
         db_data,
         db_cache,
         client: None,
+        connected_logged: false,
         prover,
         seed,
         status_tx,
@@ -440,6 +452,17 @@ fn private_keys_disabled() -> RpcError {
     RpcError::wallet("Error: Private keys are disabled for this wallet")
 }
 
+/// Render a tree-state frontier (the hex-encoded `final_state` from a `tree_state` reply) for
+/// the bootstrap log: its size in bytes when present, or `absent` when the upstream served no
+/// frontier for that pool. Hex is two characters per byte.
+fn describe_frontier(hex_final_state: &str) -> String {
+    if hex_final_state.is_empty() {
+        "absent".to_string()
+    } else {
+        format!("present({}B)", hex_final_state.len() / 2)
+    }
+}
+
 impl WalletActor {
     async fn run(mut self) {
         if let Err(e) = self.connect().await {
@@ -491,8 +514,7 @@ impl WalletActor {
                         }
                     }
                     Err(e) => {
-                        warn!("[{}] sync error: {e}", self.name);
-                        self.client = None;
+                        self.mark_disconnected(format!("sync error: {e}"));
                         // Pace retries after a sync error. A *persistent* sync error (e.g. an
                         // unrecoverable reorg whose rewind target has no checkpoint) would
                         // otherwise spin: dropping the client makes the idle loop reconnect
@@ -572,8 +594,7 @@ impl WalletActor {
                             match self.refresh_tip().await {
                                 Ok(()) => more_work = true,
                                 Err(e) => {
-                                    warn!("[{}] tip refresh failed: {e}", self.name);
-                                    self.client = None;
+                                    self.mark_disconnected(format!("tip refresh failed: {e}"));
                                     self.update_status();
                                 }
                             }
@@ -602,8 +623,7 @@ impl WalletActor {
                         match self.refresh_tip().await {
                             Ok(()) => more_work = true,
                             Err(e) => {
-                                warn!("[{}] tip refresh failed: {e}", self.name);
-                                self.client = None;
+                                self.mark_disconnected(format!("tip refresh failed: {e}"));
                                 self.update_status();
                             }
                         }
@@ -641,6 +661,21 @@ impl WalletActor {
                 );
                 false
             }
+        }
+    }
+
+    /// Drop the upstream client and, if the connection had been announced (its "connected"
+    /// line was logged), warn that it was lost with the reason. Gating on `connected_logged`
+    /// keeps disconnects matched to connects: a client dropped before it ever came up (a
+    /// failed dial / health check) is reported by the connect path instead, not here.
+    fn mark_disconnected(&mut self, reason: impl std::fmt::Display) {
+        self.client = None;
+        if std::mem::take(&mut self.connected_logged) {
+            warn!(
+                "[{}] disconnected from {}: {reason}",
+                self.name,
+                self.server.describe()
+            );
         }
     }
 
@@ -913,6 +948,17 @@ impl WalletActor {
             self.db_data.update_chain_tip(tip)?;
         }
         self.tip_height = Some(u32::from(tip));
+        // Announce a freshly established connection now that we know the upstream's tip. Logged
+        // once per connection (reset by `mark_disconnected`), so connect/disconnect pair up.
+        if !self.connected_logged {
+            self.connected_logged = true;
+            info!(
+                "[{}] connected to {}; chain tip {}",
+                self.name,
+                self.server.describe(),
+                u32::from(tip)
+            );
+        }
         tracing::debug!(
             "[{}] tip refreshed: {:?} -> {} (suggest_scan_ranges drives the rescan/rewind)",
             self.name,
@@ -944,6 +990,7 @@ impl WalletActor {
                 .as_mut()
                 .ok_or_else(|| anyhow!("not connected"))?;
             engine::sync_one_batch(
+                &self.name,
                 client,
                 &self.network,
                 &self.wallet_dir,
@@ -1009,6 +1056,20 @@ impl WalletActor {
                 }
             }
         };
+        // Summarize the birthday tree state for the bootstrap log *before* `from_treestate`
+        // consumes it. Every field here is already in hand - no extra upstream calls. The
+        // requested height (`prior`) must come back unchanged; a mismatch means the upstream
+        // served a different height than asked (a zebra/indexer bug), so flag it loudly.
+        let treestate_returned = u32::try_from(treestate.height).unwrap_or(u32::MAX);
+        let sapling_frontier = describe_frontier(&treestate.sapling_tree);
+        let orchard_frontier = describe_frontier(&treestate.orchard_tree);
+        if prior != treestate_returned {
+            warn!(
+                "[{}] bootstrap: treestate height mismatch - requested {prior}, upstream \
+                 returned {treestate_returned}",
+                self.name
+            );
+        }
         let birthday =
             match AccountBirthday::from_treestate(treestate, Some(BlockHeight::from_u32(tip))) {
                 Ok(b) => b,
@@ -1055,11 +1116,54 @@ impl WalletActor {
                         self.name
                     );
                 }
+                // The scan floor: the lowest height the queue will scan, derived from the now
+                // birthday-anchored scan ranges (a local sqlite read zecd runs every sync - no
+                // upstream call). Its gap below the birthday is the actionable signal for the
+                // "scanning far below birthday" pathology this bootstrap path exists to avoid.
+                let scan_floor = match self.db_data.suggest_scan_ranges() {
+                    Ok(ranges) => ranges
+                        .iter()
+                        .map(|r| u32::from(r.block_range().start))
+                        .min(),
+                    Err(e) => {
+                        tracing::debug!(
+                            "[{}] bootstrap: suggest_scan_ranges for log failed: {e}",
+                            self.name
+                        );
+                        None
+                    }
+                };
+                let birthday = u32::from(birthday_height);
+                let blocks_below_birthday = scan_floor.map(|f| birthday.saturating_sub(f));
+                // One structured INFO summarizing the bootstrap, all from data already in hand:
+                // requested-vs-returned treestate height, per-pool frontier presence/size (a
+                // Sapling frontier on an Orchard-only wallet is the tell for a wasted Sapling
+                // scan), the active pool set, and the scan floor vs birthday.
                 info!(
-                    "[{}] rebuilt account from keys.toml; rescanning from birthday {}",
-                    self.name,
-                    u32::from(birthday_height)
+                    wallet = %self.name,
+                    keys_birthday = birthday,
+                    treestate_requested = prior,
+                    treestate_returned,
+                    sapling_frontier = %sapling_frontier,
+                    orchard_frontier = %orchard_frontier,
+                    pools = %self.enabled_pools.display_names(),
+                    first_scan_height = scan_floor,
+                    blocks_below_birthday,
+                    "bootstrap: rebuilt account from keys.toml"
                 );
+                if let Some(gap) = blocks_below_birthday {
+                    if gap > BOOTSTRAP_SCAN_FLOOR_WARN_GAP {
+                        warn!(
+                            "[{}] bootstrap: scan floor {} is {} blocks below birthday {} - far \
+                             below the wallet birthday; the rescan will scan history it need not \
+                             (check shard alignment / wallet_birthday)",
+                            self.name,
+                            scan_floor.unwrap_or(0),
+                            gap,
+                            birthday
+                        );
+                    }
+                }
                 self.update_status();
             }
             Ok(None) => warn!(
@@ -1177,8 +1281,7 @@ impl WalletActor {
                     }
                 }
                 Err(e) => {
-                    warn!("[{}] rebroadcast transport error: {e}", self.name);
-                    self.client = None;
+                    self.mark_disconnected(format!("rebroadcast transport error: {e}"));
                     self.update_status();
                     return;
                 }
@@ -1430,12 +1533,10 @@ impl WalletActor {
             Err(e) => {
                 // Transport failure: drop the dead client so the next op reconnects/fails over.
                 // The committed tx rides on the rebroadcast loop.
-                self.client = None;
+                self.mark_disconnected(format!(
+                    "broadcast of {txid} failed in transport ({e}); it will be re-broadcast"
+                ));
                 self.update_status();
-                warn!(
-                    "[{}] broadcast of {txid} failed in transport ({e}); it will be re-broadcast",
-                    self.name
-                );
                 return Ok(());
             }
         };
@@ -1513,7 +1614,7 @@ impl WalletActor {
             })),
             Err(e) => {
                 // Transport failure: drop the dead client so the next op reconnects/fails over.
-                self.client = None;
+                self.mark_disconnected(format!("transaction fetch failed: {e}"));
                 self.update_status();
                 Err(RpcError::misc(format!("transaction fetch failed: {e}")))
             }
@@ -1544,7 +1645,7 @@ impl WalletActor {
             Ok(outcome) => outcome,
             Err(e) => {
                 // Transport/deadline failure: drop the client so the next op reconnects/fails over.
-                self.client = None;
+                self.mark_disconnected(format!("transaction broadcast failed: {e}"));
                 self.update_status();
                 return Err(RpcError::misc(format!("transaction broadcast failed: {e}")));
             }
