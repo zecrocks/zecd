@@ -366,6 +366,22 @@ async fn regtest_sapling_and_orchard_balances() {
         .count();
     assert!(receives >= 2, "both receives show in history: {txs}");
 
+    // 8. Spend across pools back to the funder. First the wallet must have *scanned* to the chain
+    //    tip - note witnesses plus full confirmations - not merely observed the notes at the tip.
+    //    `getbalance` reports spendability relative to the chain tip and can run ahead of the scan
+    //    on a slow runner, so wait for the scan to catch up before any spend (the other funded
+    //    tests do this before every send); otherwise the proposal's note selection finds the notes
+    //    not-yet-spendable and fails -6 instead of reaching the privacy check / completing.
+    let chain_tip = zebrad
+        .rpc("getblockcount", json!([]))
+        .await
+        .expect("zebra getblockcount")
+        .as_u64()
+        .expect("tip height");
+    zecd.wait_until_synced(chain_tip, FUND_TIMEOUT)
+        .await
+        .expect("zecd scans to the chain tip before spending");
+
     // 8a. FullPrivacy rejects a cross-pool (turnstile) send. Paying 1.5 ZEC to a Sapling-only
     //     recipient forces Orchard inputs (the Sapling note is only 1 ZEC), so the proposal spans
     //     both pools - which reveals the crossed amount and FullPrivacy forbids. This rejection

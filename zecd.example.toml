@@ -211,6 +211,11 @@ privacy_policy = "AllowRevealedRecipients"
 # deep builder error when a send has too many recipients. Raise it for large batched payouts;
 # set it to 0 to disable the cap entirely.
 orchard_action_limit = 50
+# Build the Orchard proving key once at startup and reuse it for every send (via the PCZT
+# prove path), instead of librustzcash's fused path which rebuilds it (~seconds of keygen) on
+# every transaction. On by default. Set false to fall back to the fused path (e.g. to
+# benchmark, or if a PCZT issue is suspected); both paths produce identical transactions.
+cache_proving_key = true
 
 [health]
 # Unauthenticated liveness/readiness probes on a separate port (for Kubernetes/load balancers).

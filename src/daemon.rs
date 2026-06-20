@@ -73,6 +73,19 @@ pub async fn run(config: AppConfig) -> anyhow::Result<()> {
 
     let mut registry = WalletRegistry::new(config.default_wallet.clone());
     let mut actor_tasks = Vec::new();
+    // Build the Orchard proving/verifying keys once (they're wallet-independent) and share them
+    // across every actor, so each send reuses the cached key instead of rebuilding it per
+    // transaction. Built off the async runtime; on by default (`[spend] cache_proving_key`).
+    let orchard_keys = if config.spend.cache_proving_key {
+        info!("building Orchard proving key (cached for all sends)");
+        Some(Arc::new(
+            tokio::task::spawn_blocking(actor::ProvingKeyCache::build)
+                .await
+                .map_err(|e| anyhow::anyhow!("failed to build Orchard proving key: {e}"))?,
+        ))
+    } else {
+        None
+    };
     // zecd permits at most one wallet with spending keys; watch-only (UFVK) wallets may be
     // loaded without limit. Record each opened wallet's watch-only flag so the invariant can
     // be enforced once every wallet has been spawned (the flag is only known after the actor
@@ -108,6 +121,7 @@ pub async fn run(config: AppConfig) -> anyhow::Result<()> {
             // Validated at config load; re-derive here rather than carrying a second copy.
             confirmations_policy: config.spend.confirmations_policy()?,
             orchard_action_limit: config.spend.orchard_action_limit,
+            orchard_keys: orchard_keys.clone(),
             enabled_pools: entry.pools.clone(),
             default_receivers: entry.default_receivers.clone(),
             shutdown: shutdown_tx.subscribe(),

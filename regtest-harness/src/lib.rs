@@ -663,6 +663,10 @@ pub struct ZecdConfig {
     /// `--birthday` for the restore/watch-only paths (a fresh init defaults near the tip on
     /// its own).
     pub birthday: Option<u32>,
+    /// `[spend] cache_proving_key`: `Some(true/false)` writes the knob explicitly, `None`
+    /// omits it (zecd defaults to `true`). The proving-key-cache benchmark runs one instance
+    /// each way.
+    pub cache_proving_key: Option<bool>,
     /// Optional `[pools]` section as `(enabled, default_receivers)`. `None` omits the section
     /// (the Orchard-only default). Used by the multi-pool (Sapling) e2e.
     pub pools: Option<(Vec<String>, Vec<String>)>,
@@ -687,6 +691,7 @@ impl ZecdConfig {
             restore_mnemonic: None,
             ufvk: None,
             birthday: None,
+            cache_proving_key: None,
             pools: None,
             encrypt_passphrase: None,
         }
@@ -893,6 +898,46 @@ impl Zecd {
                 Err(e) => return Err(anyhow!("waiting for zecd to exit: {e}")),
             }
         }
+    }
+
+    /// Gracefully stop the daemon (via the `stop` RPC) and relaunch it against the *same*
+    /// datadir/wallet with a (possibly different) config - e.g. flipping
+    /// `[spend] cache_proving_key`. The wallet DB, keys, and funds persist across the restart;
+    /// `cfg` must keep the same RPC port so this handle's `base_url` stays valid. Used by the
+    /// proving-key-cache benchmark to measure both paths on one funded wallet.
+    pub async fn restart(&mut self, cfg: &ZecdConfig) -> Result<()> {
+        let _ = self.call("stop", json!([])).await;
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            match self.child.try_wait() {
+                Ok(Some(_)) => break,
+                Ok(None) if Instant::now() < deadline => {
+                    tokio::time::sleep(Duration::from_millis(200)).await;
+                }
+                _ => {
+                    let _ = self.child.kill();
+                    let _ = self.child.wait();
+                    break;
+                }
+            }
+        }
+        write_zecd_toml(self._datadir.path(), cfg).context("rewrite zecd.toml for restart")?;
+        self.child = Command::new(zecd_bin())
+            .args([
+                "--datadir",
+                self._datadir.path().to_str().unwrap(),
+                "--regtest",
+                "run",
+            ])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .context("respawn zecd")?;
+        self.base_url = format!("http://127.0.0.1:{}/", cfg.rpc_port);
+        self.user = cfg.rpc_user.clone();
+        self.password = cfg.rpc_password.clone();
+        self.wait_until_rpc_up().await?;
+        Ok(())
     }
 
     /// Issue a JSON-RPC call, returning the `result` on success or an error carrying the
@@ -1242,6 +1287,11 @@ fn export_ufvk_from_datadir(datadir: &Path, wallet: &str) -> Result<String> {
 fn write_zecd_toml(datadir: &Path, cfg: &ZecdConfig) -> Result<()> {
     // zecd is zebra-only: the single upstream is a local zebrad JSON-RPC endpoint.
     let server = format!("zebra://127.0.0.1:{}", cfg.zebra_rpc_port);
+    // Optional `[spend] cache_proving_key` knob (the proving-key-cache benchmark sets it).
+    let spend_section = match cfg.cache_proving_key {
+        Some(b) => format!("\n[spend]\ncache_proving_key = {b}\n"),
+        None => String::new(),
+    };
     // The default wallet plus any extra `[wallets.<name>]` entries (multiwallet tests).
     let mut wallets = format!(
         "[wallets.default]\ndir = \"{}/default\"\n",
@@ -1305,7 +1355,7 @@ rebroadcast_secs = {rebroadcast}
 enabled = true
 bind = "127.0.0.1"
 port = {health_port}
-"#,
+{spend_section}"#,
         datadir = datadir.display(),
         wallets = wallets,
         server = server,
@@ -1314,6 +1364,7 @@ port = {health_port}
         password = cfg.rpc_password,
         rebroadcast = cfg.rebroadcast_secs,
         health_port = cfg.health_port(),
+        spend_section = spend_section,
     );
     std::fs::write(datadir.join("zecd.toml"), toml)?;
     Ok(())

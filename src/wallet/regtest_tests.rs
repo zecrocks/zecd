@@ -479,6 +479,8 @@ fn offline_actor_cfg(
         bootstrap: true,
         confirmations_policy: Default::default(),
         orchard_action_limit: crate::config::DEFAULT_ORCHARD_ACTION_LIMIT,
+        // Offline test: the actor never sends, so skip building the (expensive) proving key.
+        orchard_keys: None,
         enabled_pools: crate::pools::PoolSet::single(crate::pools::Pool::Orchard),
         default_receivers: crate::pools::PoolSet::single(crate::pools::Pool::Orchard),
         shutdown,

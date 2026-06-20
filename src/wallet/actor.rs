@@ -1,8 +1,10 @@
 //! The per-wallet actor: the single owner/writer of the `WalletDb`, running the sync loop
 //! and serving writer commands (address generation, sends, lock/unlock) from RPC handlers.
 
+use std::convert::Infallible;
 use std::num::NonZeroUsize;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{anyhow, Context};
@@ -10,8 +12,9 @@ use tokio::sync::{mpsc, watch};
 use tracing::{error, info, warn};
 
 use zcash_client_backend::data_api::wallet::{
-    create_proposed_transactions, decrypt_and_store_transaction,
-    input_selection::GreedyInputSelector, propose_transfer, ConfirmationsPolicy, SpendingKeys,
+    create_pczt_from_proposal, create_proposed_transactions, decrypt_and_store_transaction,
+    extract_and_store_transaction_from_pczt, input_selection::GreedyInputSelector,
+    propose_transfer, ConfirmationsPolicy, SpendingKeys,
 };
 use zcash_client_backend::data_api::{
     Account, AccountBirthday, AccountPurpose, AccountSource, TransactionDataRequest,
@@ -39,7 +42,7 @@ use crate::chain::{AnySource, BroadcastOutcome, ChainSource, MempoolStream};
 use crate::config::SendPrivacy;
 use crate::error::{codes, RpcError};
 use crate::network::ZNetwork;
-use crate::pools::PoolSet;
+use crate::pools::{Pool, PoolSet};
 use crate::sync::engine;
 use crate::wallet::keys::{self, SeedKeeper};
 use crate::wallet::open::{self, WriteDb};
@@ -51,6 +54,29 @@ use crate::wallet::{
 /// Note-management defaults for change splitting (match zcash-devtool's send defaults).
 const TARGET_NOTE_COUNT: usize = 4;
 const MIN_SPLIT_OUTPUT_VALUE: u64 = 10_000_000; // 0.1 ZEC
+
+/// The Orchard proving + verifying keys, built once and shared (read-only) across every wallet
+/// actor via `Arc`. These are wallet-independent (they're the Orchard circuit's keys), and
+/// `ProvingKey::build()` is a full `keygen_vk`+`keygen_pk` - seconds of work - so the fused
+/// librustzcash send path (which rebuilds the proving key on *every* transaction) pays that
+/// cost per send. Building it here once and feeding it to the PCZT prove path eliminates that
+/// per-send overhead (the `[spend] cache_proving_key` knob, default on). The verifying key is
+/// kept too so the PCZT extract step doesn't regenerate it each send.
+pub struct ProvingKeyCache {
+    orchard_pk: orchard::circuit::ProvingKey,
+    orchard_vk: orchard::circuit::VerifyingKey,
+}
+
+impl ProvingKeyCache {
+    /// Build the Orchard proving + verifying keys. Expensive (full key generation); call once
+    /// at startup, off the async runtime (e.g. under `spawn_blocking`).
+    pub fn build() -> Self {
+        ProvingKeyCache {
+            orchard_pk: orchard::circuit::ProvingKey::build(),
+            orchard_vk: orchard::circuit::VerifyingKey::build(),
+        }
+    }
+}
 
 /// Deadlines for RPCs issued on an already-connected channel. The dial timeout covers only
 /// the TCP/TLS connect, so a peer that hangs *after* accepting would otherwise stall the
@@ -123,6 +149,13 @@ pub struct ActorConfig {
     pub confirmations_policy: ConfirmationsPolicy,
     /// Cap on Orchard actions per send (`[spend] orchard_action_limit`; 0 disables it).
     pub orchard_action_limit: usize,
+    /// Shared cached Orchard proving/verifying keys (`[spend] cache_proving_key`). `Some`
+    /// selects the PCZT prove path with the cached key; `None` selects the legacy fused path
+    /// (`create_proposed_transactions`), which rebuilds the proving key per send. Built once in
+    /// `daemon::run` and cloned into every actor (the key is wallet-independent). NB: the PCZT
+    /// path here signs only Orchard spends, so a wallet that can spend Sapling notes
+    /// (`enabled_pools` includes Sapling) falls back to the fused path regardless - see `do_send`.
+    pub orchard_keys: Option<Arc<ProvingKeyCache>>,
     /// Shielded pools this wallet receives into and spends from (change pool selection).
     pub enabled_pools: PoolSet,
     /// Receivers included by default in this wallet's Unified Addresses.
@@ -179,6 +212,9 @@ struct WalletActor {
     /// any stream error just drops it and the next caught-up pass reopens.
     mempool: Option<MempoolStream>,
     prover: LocalTxProver,
+    /// Cached Orchard keys for the PCZT send path (`None` = legacy fused path). See
+    /// [`ProvingKeyCache`].
+    orchard_keys: Option<Arc<ProvingKeyCache>>,
     seed: SeedKeeper,
     status_tx: watch::Sender<SyncStatus>,
     cmd_rx: mpsc::Receiver<WalletCommand>,
@@ -365,6 +401,7 @@ pub async fn spawn(
         client: None,
         connected_logged: false,
         prover,
+        orchard_keys: cfg.orchard_keys,
         seed,
         status_tx,
         cmd_rx,
@@ -1487,6 +1524,17 @@ impl WalletActor {
         let orchard_action_limit = self.orchard_action_limit;
         let change_pool = self.enabled_pools.change_pool();
         let prover = &self.prover;
+        // `Some` => prove via PCZT with the cached Orchard key; `None` => legacy fused path.
+        // The PCZT path here signs only Orchard spends; a wallet that can hold (and therefore
+        // spend) Sapling notes must use the fused path, which signs every pool. Orchard-only
+        // wallets - the default - keep the cache. (A Sapling *output*, e.g. a Sapling recipient,
+        // is fine on the PCZT path; only Sapling *spends* are the issue, and only a
+        // Sapling-enabled wallet can have Sapling notes to spend.)
+        let orchard_keys = if self.enabled_pools.contains(Pool::Sapling) {
+            None
+        } else {
+            self.orchard_keys.clone()
+        };
         let db = &mut self.db_data;
         let (txid, raw): (TxId, Vec<u8>) =
             tokio::task::block_in_place(move || -> Result<_, RpcError> {
@@ -1532,24 +1580,42 @@ impl WalletActor {
                 // or surfacing a deep librustzcash error (mirrors Zallet's `orchard_actions`).
                 enforce_orchard_action_limit(&proposal, orchard_action_limit)?;
 
-                let txids = create_proposed_transactions(
-                    db,
-                    &net,
-                    prover,
-                    prover,
-                    &SpendingKeys::from_unified_spending_key(usk),
-                    OvkPolicy::Sender,
-                    &proposal,
-                    None,
-                )
-                .map_err(|e| enrich_insufficient_funds(db, policy, classify_err(e)))?;
-
-                if txids.len() > 1 {
-                    return Err(RpcError::wallet(
-                        "multi-transaction proposals are not supported",
-                    ));
-                }
-                let txid = *txids.first();
+                let txid = match orchard_keys.as_deref() {
+                    // PCZT prove path: build the PCZT, then prove with the cached Orchard
+                    // proving key and store - the same transaction the fused path produces,
+                    // without rebuilding the proving key on every send.
+                    Some(keys) => {
+                        let pczt = create_pczt_from_proposal::<_, _, Infallible, _, Infallible, _>(
+                            db,
+                            &net,
+                            account_id,
+                            OvkPolicy::Sender,
+                            &proposal,
+                        )
+                        .map_err(|e| enrich_insufficient_funds(db, policy, classify_pczt_err(e)))?;
+                        prove_sign_store_pczt(db, pczt, &usk, prover, keys)?
+                    }
+                    // Legacy fused path: librustzcash rebuilds the Orchard proving key per send.
+                    None => {
+                        let txids = create_proposed_transactions(
+                            db,
+                            &net,
+                            prover,
+                            prover,
+                            &SpendingKeys::from_unified_spending_key(usk),
+                            OvkPolicy::Sender,
+                            &proposal,
+                            None,
+                        )
+                        .map_err(|e| enrich_insufficient_funds(db, policy, classify_err(e)))?;
+                        if txids.len() > 1 {
+                            return Err(RpcError::wallet(
+                                "multi-transaction proposals are not supported",
+                            ));
+                        }
+                        *txids.first()
+                    }
+                };
 
                 let tx = db
                     .get_transaction(txid)
@@ -1962,9 +2028,96 @@ fn now_unix() -> i64 {
         .as_secs() as i64
 }
 
-/// Classify a librustzcash spend/proposal error into a Bitcoin-Core RPC code. Insufficient
-/// funds maps to -6; everything else to the generic wallet error -4. Client-facing messages
-/// use `Display` (not `Debug`) so internal note/proposal structure isn't leaked.
+/// Prove (Orchard, plus Sapling outputs if any), sign the Orchard spends with the account's
+/// key, and persist the resulting transaction - the PCZT equivalent of the proving + storing
+/// `create_proposed_transactions` does, but with the *cached* Orchard proving key rather than
+/// rebuilding it per send. zecd wallets spend only Orchard notes (no transparent or Sapling
+/// spends), so the only spend authorizations required are the Orchard ones.
+fn prove_sign_store_pczt(
+    db: &mut WriteDb,
+    pczt: pczt::Pczt,
+    usk: &zcash_keys::keys::UnifiedSpendingKey,
+    sapling_prover: &LocalTxProver,
+    keys: &ProvingKeyCache,
+) -> Result<TxId, RpcError> {
+    use pczt::roles::prover::Prover;
+    use pczt::roles::signer::{Error as SignerError, Signer};
+
+    // Phase B - proofs. Every zecd send spends Orchard notes (Orchard proof always required); a
+    // Sapling output proof is only needed when a recipient is a Sapling address.
+    let prover = Prover::new(pczt);
+    let prover = if prover.requires_orchard_proof() {
+        prover
+            .create_orchard_proof(&keys.orchard_pk)
+            .map_err(|e| RpcError::wallet(format!("Orchard proof generation failed: {e:?}")))?
+    } else {
+        prover
+    };
+    let prover = if prover.requires_sapling_proofs() {
+        prover
+            .create_sapling_proofs(sapling_prover, sapling_prover)
+            .map_err(|e| RpcError::wallet(format!("Sapling proof generation failed: {e:?}")))?
+    } else {
+        prover
+    };
+    let pczt = prover.finish();
+
+    // Spend authorization - sign every Orchard spend. The wallet has a single account, so every
+    // spend is ours; `InvalidIndex` marks the end of the spend list, any other error is fatal.
+    let ask = orchard::keys::SpendAuthorizingKey::from(usk.orchard());
+    let mut signer = Signer::new(pczt)
+        .map_err(|e| RpcError::wallet(format!("PCZT signer init failed: {e:?}")))?;
+    let mut index = 0;
+    loop {
+        match signer.sign_orchard(index, &ask) {
+            // Signed one of our spends, or hit a spend whose authorizing key isn't ours -
+            // Orchard bundles pad with dummy spends carrying random keys, so
+            // `WrongSpendAuthorizingKey` is expected and skipped (exactly as librustzcash's
+            // own signer loop does). A genuinely-unsigned real spend is caught later by
+            // `extract_and_store_transaction_from_pczt`, which refuses an incomplete PCZT.
+            Ok(())
+            | Err(SignerError::OrchardSign(orchard::pczt::SignerError::WrongSpendAuthorizingKey)) => {
+                index += 1
+            }
+            // No more Orchard spends to sign.
+            Err(SignerError::InvalidIndex) => break,
+            Err(e) => {
+                return Err(RpcError::wallet(format!(
+                    "Orchard spend signing failed: {e:?}"
+                )))
+            }
+        }
+    }
+    let pczt = signer.finish();
+
+    // Phase C - finalize + persist (records spends/change like create_proposed_transactions).
+    // The cached verifying key avoids regenerating it per send; no Sapling verifying key is
+    // needed since zecd never produces Sapling spends.
+    // `N` (the note-ref type) is otherwise unconstrained here - it only appears in the error
+    // type - so pin it to our `WalletDb`'s note ref, as `error::ProposalError` does for the
+    // fused path.
+    extract_and_store_transaction_from_pczt::<_, zcash_client_sqlite::ReceivedNoteId>(
+        db,
+        pczt,
+        None,
+        Some(&keys.orchard_vk),
+    )
+    .map_err(|e| RpcError::wallet(format!("storing transaction failed: {e}")))
+}
+
+/// Map a PCZT create/extract error to an `RpcError`, surfacing insufficient-funds conditions as
+/// `-6` like [`classify_err`] does for the fused path (so `enrich_insufficient_funds` can add
+/// the pending-balance hint). PCZT errors are a different generic instantiation of the same
+/// librustzcash `Error`, so classify by message rather than re-matching variants.
+fn classify_pczt_err<E: std::fmt::Display>(e: E) -> RpcError {
+    let s = e.to_string();
+    if s.to_lowercase().contains("insufficient") {
+        RpcError::insufficient_funds(s)
+    } else {
+        RpcError::wallet(s)
+    }
+}
+
 /// The `FullPrivacy` single-pool rule, factored out for unit testing: a step violates it if it
 /// has any transparent component, or if it touches **both** shielded pools (a Sapling↔Orchard
 /// turnstile crossing, which reveals the crossed amount on-chain via `valueBalance`).
@@ -2071,6 +2224,9 @@ fn orchard_action_overflow(
     })
 }
 
+/// Classify a librustzcash spend/proposal error into a Bitcoin-Core RPC code. Insufficient
+/// funds maps to -6; everything else to the generic wallet error -4. Client-facing messages
+/// use `Display` (not `Debug`) so internal note/proposal structure isn't leaked.
 fn classify_err(e: crate::error::ProposalError) -> RpcError {
     use zcash_client_backend::data_api::error::Error;
     match &e {

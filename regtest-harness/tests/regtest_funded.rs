@@ -369,6 +369,19 @@ async fn regtest_funded_orchard_receive() {
     // memo via the trailing extension param (after Bitcoin Core's comment/fee-knob/verbose
     // slots): hex for "regtest memo".
     let memo_hex = "72656774657374206d656d6f";
+    // `getbalance` can report the funded note spendable (relative to the chain tip) before the
+    // wallet has scanned to that depth, so explicitly wait for the scan to reach the tip before
+    // this first spend - otherwise note selection finds it not-yet-spendable and the send fails
+    // -6. The later sends already wait_until_synced after their mining; this first one didn't.
+    let chain_tip = zebrad
+        .rpc("getblockcount", json!([]))
+        .await
+        .expect("zebra getblockcount")
+        .as_u64()
+        .expect("tip height");
+    zecd.wait_until_synced(chain_tip, FUND_TIMEOUT)
+        .await
+        .expect("zecd scans to the tip before the first send");
     let txid = zecd
         .call(
             "sendtoaddress",
