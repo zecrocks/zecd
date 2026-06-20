@@ -217,7 +217,9 @@ def main() -> int:
     ck("mine.trusted == getbalance", mine.get("trusted") == bal)
 
     print("== addresses ==")
-    addr = rpc.call("getnewaddress", "conformance")
+    # zecd is stateless: getnewaddress takes no label (a label would be off-chain state with no
+    # on-chain source). A non-empty label argument is rejected -8 (checked below).
+    addr = rpc.call("getnewaddress")
     ck("getnewaddress unified",
        isinstance(addr, str) and addr.startswith(("u1", "utest1", "uregtest1")))
     va = rpc.call("validateaddress", addr)
@@ -257,6 +259,8 @@ def main() -> int:
     for f in ("scriptPubKey", "solvable", "iswatchonly", "isscript", "iswitness", "labels",
               "isvalid_orchard", "receiver_types"):
         ck(f"getaddressinfo has {f}", f in ai)
+    # zecd is stateless: the labels field is retained for Core shape but is always empty.
+    ck("getaddressinfo.labels always empty (stateless)", ai["labels"] == [], repr(ai["labels"]))
     # Own addresses are solvable; iswatchonly is deprecated/always false in Core master
     # (these hold on watch-only wallets too - the signal is private_keys_enabled).
     ck("getaddressinfo.solvable on own address", ai["solvable"] is True)
@@ -366,30 +370,32 @@ def main() -> int:
     except JSONRPCException as e:
         ck("invalid address -> code -5", e.code == -5, e.code)
 
-    print("== received-by-label ==")
-    # `getnewaddress "conformance"` above created the label.
-    rbl = rpc.call("getreceivedbylabel", "conformance")
-    ck("getreceivedbylabel is Decimal", isinstance(rbl, decimal.Decimal), repr(rbl))
-    lrl = rpc.call("listreceivedbylabel", 1, True)
-    ck("listreceivedbylabel is list", isinstance(lrl, list))
-    ck("label listed with include_empty", any(e.get("label") == "conformance" for e in lrl))
-    if lrl:
-        for f in ("amount", "confirmations", "label"):
-            ck(f"label entry has {f}", f in lrl[0])
+    print("== stateless: label methods are removed ==")
+    # zecd keeps no off-chain label store, so the label-dedicated methods are not implemented at
+    # all - every one is method-not-found (-32601), like any unknown method.
+    for m, params in (
+        ("setlabel", [addr, "x"]),
+        ("getaddressesbylabel", ["x"]),
+        ("listlabels", []),
+        ("getreceivedbylabel", ["x"]),
+        ("listreceivedbylabel", []),
+    ):
+        try:
+            rpc.call(m, *params)
+            ck(f"{m} raises (removed in stateless mode)", False)
+        except JSONRPCException as e:
+            ck(f"{m} -> method not found (-32601)", e.code == -32601, e.code)
+    # A non-empty label argument to getnewaddress is rejected (-8); the address itself is fine.
     try:
-        rpc.call("getreceivedbylabel", "no-such-label-xyz")
-        ck("getreceivedbylabel unknown raises", False)
+        rpc.call("getnewaddress", "mylabel")
+        ck("getnewaddress label raises", False)
     except JSONRPCException as e:
-        ck("getreceivedbylabel unknown -> code -4", e.code == -4, e.code)
+        ck("getnewaddress label -> code -8", e.code == -8, e.code)
 
-    print("== wallets & labels ==")
+    print("== wallets ==")
     lw = rpc.call("listwallets")
     ck("listwallets is a non-empty list of strings",
        isinstance(lw, list) and bool(lw) and all(isinstance(w, str) for w in lw), lw)
-    ll = rpc.call("listlabels")
-    ck("listlabels is list", isinstance(ll, list))
-    # `getnewaddress "conformance"` above created the label.
-    ck("listlabels includes the conformance label", "conformance" in ll, ll)
 
     print("== listunspent ==")
     lu = rpc.call("listunspent")
@@ -522,16 +528,6 @@ def main() -> int:
     except JSONRPCException as e:
         ck("unknown method -> code -32601", e.code == -32601, e.code)
     try:
-        rpc.call("setlabel", "not-an-address", "x")
-        ck("setlabel invalid address raises", False)
-    except JSONRPCException as e:
-        ck("setlabel invalid address -> code -5", e.code == -5, e.code)
-    try:
-        rpc.call("getaddressesbylabel", "no-such-label-xyz")
-        ck("unknown label raises", False)
-    except JSONRPCException as e:
-        ck("unknown label -> code -11", e.code == -11, e.code)
-    try:
         rpc.call("listtransactions", "*", -1)
         ck("negative count raises", False)
     except JSONRPCException as e:
@@ -586,10 +582,6 @@ def main() -> int:
     ck("lastblock is 64 hex chars", len(lsb["lastblock"]) == 64, lsb["lastblock"])
     lsb = rpc.call("listsinceblock", "", 99999999)
     ck("deep target lastblock still 64 chars", len(lsb["lastblock"]) == 64, lsb["lastblock"])
-    # getaddressesbylabel reports purpose by ownership.
-    rpc.call("setlabel", addr, "conformance-purpose")
-    abl = rpc.call("getaddressesbylabel", "conformance-purpose")
-    ck("own labelled address purpose receive", abl[addr]["purpose"] == "receive")
     try:
         # fee_rate (param 9): an explicit fee instruction; fees are ZIP-317 and never settable.
         rpc.call("sendtoaddress", addr, "0.1", "", "", False, False, None, "", False, 25)

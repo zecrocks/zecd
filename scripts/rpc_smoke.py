@@ -72,12 +72,13 @@ def main() -> int:
     _, r = call("getwalletinfo")
     wi = r["result"]
     check("getwalletinfo.balance numeric", isinstance(wi["balance"], (int, float)))
-    _, r = call("getnewaddress", ["smoke-label"])
+    # zecd is stateless: getnewaddress takes no label.
+    _, r = call("getnewaddress", [])
     addr = r["result"]
     check("getnewaddress unified addr", isinstance(addr, str) and addr.startswith(("u1", "utest1")), addr[:16] + "...")
     _, r = call("getaddressinfo", [addr])
     check("getaddressinfo.ismine", r["result"]["ismine"] is True)
-    check("getaddressinfo.labels", "smoke-label" in r["result"]["labels"])
+    check("getaddressinfo.labels empty (stateless)", r["result"]["labels"] == [])
     _, r = call("validateaddress", [addr])
     check("validateaddress own addr", r["result"]["isvalid"] and r["result"]["isvalid_orchard"])
     _, r = call("validateaddress", ["not-an-address"])

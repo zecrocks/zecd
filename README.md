@@ -43,6 +43,46 @@ endpoint is deliberately local-only (plaintext HTTP) - never expose a zebra RPC 
 network. The [Docker stack](#docker--self-hosted-stack) below runs the full `zebra → zecd`
 pipeline with one compose file.
 
+## Stateless by design
+
+zecd keeps **no off-chain state that a seed-only restore couldn't rebuild**. Everything it needs
+to reconstruct a wallet's balance and history lives in the librustzcash DB (`data.sqlite`), and
+that DB is itself derivable from the seed: `zecd init --restore` (optionally `--birthday`) recovers
+all funds, notes, and history by decrypting the chain with the account's viewing key. The recovery
+is *functional*, not bit-for-bit - e.g. the exact *sequence* of addresses `getnewaddress` hands out
+isn't reproduced (the clock-derived diversifier cursor is a cache, not authoritative state), but any
+address that ever **received** funds is recovered from the note itself during the scan, so a payment
+to a previously-issued address is still detected after a restore.
+
+Statelessness is about **persistence** - zecd writes no off-chain data to disk that a restore
+couldn't rebuild. The one kind of data with **no on-chain source** is **address labels**: supplied
+out-of-band, never reconstructible, and persistent by nature. So zecd **does not keep labels at
+all** - there is no label store, no toggle, and no way to turn statefulness on:
+
+- The label-dedicated methods `setlabel`, `getaddressesbylabel`, `listlabels`, `getreceivedbylabel`,
+  and `listreceivedbylabel` are **not implemented** - calling them is method-not-found (`-32601`),
+  like any unknown method.
+- `getnewaddress` rejects a `label` argument (`-8`); the address itself derives from the seed and is
+  unaffected.
+- The embedded `label`/`labels` fields on the general history/address RPCs (`getaddressinfo`,
+  `listtransactions`, `z_listtransactions`, `listsinceblock`, `gettransaction`,
+  `listreceivedbyaddress`) are retained for Bitcoin Core shape conformance but are always empty.
+
+Transaction **first-seen times** are a different case. An *unmined* transaction has no block time
+yet - that's expected, not an off-chain gap - so zecd stamps the wall clock when the mempool stream
+first sees a pending tx and surfaces it as `gettransaction.timereceived` / `listtransactions.time`
+(Bitcoin Core's `nTimeReceived`) until a block time supersedes it. This is held **in memory only**
+and never persisted (exactly like the async-operation registry), so it doesn't break the stateless
+invariant: a restart rebuilds it as the mempool stream re-observes still-pending txs, and a tx that
+mines gets its recoverable block time. A foreign unmined tx seen before a restart (and not yet
+re-observed) simply reports `time` 0 until then.
+
+This makes a zecd data directory disposable: a container with no persistent volume, rebuilt from the
+seed on each start, loses nothing an operator depends on. **Track the addresses you hand out
+yourself** - zecd remembers an address only once it has *received funds* (recovered from the chain),
+so keep your own record of issued-but-unfunded addresses to avoid reusing one (a privacy/linkability
+leak, never a loss of funds).
+
 ## Quick start
 
 zecd is not yet published on crates.io - build from source (or use the
@@ -189,13 +229,14 @@ HTTP status and error codes match Bitcoin Core (`rpc/protocol.h`, `httprpc.cpp`)
 Batches always return HTTP 200 with per-item errors in the array.
 
 **Numbering is Bitcoin Core's, not zcashd's.** These integers are Bitcoin Core's `rpc/protocol.h`
-values. Two collide *numerically* with `zcashd`/Zallet (which use Zcash's own `protocol.h`):
-zecd's `-11` is "invalid label name" (`getaddressesbylabel`) and `-18` is "wallet not found"
-(an unknown `/wallet/<name>`), where zcashd means "accounts unsupported" and "backup required"
-respectively (zecd's `-19`, "wallet not specified", is unused by zcashd). Both colliding codes are
-only returned by methods zcashd lacks - labels and multiwallet - so a zcashd client never observes
-the mismatch, but tooling that hard-codes Zcash's numbering should be aware. The codes integrations
-branch on for the money path (`-4`/`-5`/`-6`/`-8`/`-13`–`-17`/`-20`/`-26`) are identical across all three.
+values. The one that collides *numerically* with `zcashd`/Zallet (which use Zcash's own
+`protocol.h`) and that zecd actually emits is `-18` "wallet not found" (an unknown
+`/wallet/<name>`), where zcashd means "backup required" (zecd's `-19`, "wallet not specified", is
+unused by zcashd). It is only returned by multiwallet, which zcashd lacks, so a zcashd client never
+observes the mismatch - but tooling that hard-codes Zcash's numbering should be aware. (zecd is
+stateless and has no labels, so the label-only `-11` "invalid label name" is never returned.) The
+codes integrations branch on for the money path (`-4`/`-5`/`-6`/`-8`/`-13`–`-17`/`-20`/`-26`) are
+identical across all three.
 
 For visibility under load, `getrpcinfo` returns `active_commands`: one entry per executing call
 with `method` and `duration` (microseconds). Combine with `getwalletinfo` (`txcount`, balances, `scanning`),
@@ -300,20 +341,19 @@ the validator's job there - so those rows are all - .
 | Method | Bitcoin Core | Zallet | What to expect from zecd |
 |---|---|---|---|
 | **Wallet** | | | |
-| `getnewaddress` | ✓ | - (`z_getaddressforaccount`) | Fresh diversified UA of the wallet's single account; `label` honored; `address_type` is a per-call receiver override (`unified`/`sapling`/`orchard`/`sapling,orchard`), constrained to the wallet's enabled pools; Bitcoin types rejected `-5` |
+| `getnewaddress` | ✓ | - (`z_getaddressforaccount`) | Fresh diversified UA of the wallet's single account; a `label` argument is **rejected** `-8` (zecd is stateless - see below); `address_type` is a per-call receiver override (`unified`/`sapling`/`orchard`/`sapling,orchard`), constrained to the wallet's enabled pools; Bitcoin types rejected `-5` |
 | `getbalance` | ✓ | - (`z_gettotalbalance`) | Spendable balance under the ZIP-315 confirmations policy; explicit `minconf` overrides it per call (`minconf=0` is treated as 1 - a shielded note is never spendable unmined) |
 | `getbalances` | ✓ | - (`z_getbalances`, per-account) | `mine.trusted/untrusted_pending/immature` + `lastprocessedblock`; no `watchonly` object |
 | `getunconfirmedbalance` | *removed* | - | Incoming funds below the confirmation policy (incl. 0-conf via mempool stream) |
 | `getwalletinfo` | ✓ | ✓ (several fields stubbed) | bitcoind shape; `keypoolsize:1`, `descriptors:false`, `scanning` progress, `unlocked_until` when encrypted, `private_keys_enabled:false` when watch-only |
-| `getaddressinfo` | ✓ | - | `ismine` is cryptographic (viewing-key attribution across both shielded pools, so an unrecorded/unfunded own address still resolves after a restore)/`solvable`/`labels`; `scriptPubKey` empty (shielded); `iswatchonly` always false (deprecated in Core; the watch-only signal is `getwalletinfo.private_keys_enabled`); `isvalid_orchard` + `receiver_types` extension fields report the address's receivers |
-| `setlabel` | ✓ | - (accounts replace labels) | Full address book incl. foreign addresses (purpose `"send"`) |
-| `getaddressesbylabel`, `listlabels` | ✓ | - | Core shapes and error codes (`-11` for unknown label) |
-| `listtransactions` | ✓ | - (`z_listtransactions`, different shape) | Core categories/fields (`fee` on sends, label filter, count/skip); adds `memo`/`memoStr` |
+| `getaddressinfo` | ✓ | - | `ismine` is cryptographic (viewing-key attribution across both shielded pools, so an unrecorded/unfunded own address still resolves after a restore)/`solvable`; `labels` always `[]` (zecd is stateless); `scriptPubKey` empty (shielded); `iswatchonly` always false (deprecated in Core; the watch-only signal is `getwalletinfo.private_keys_enabled`); `isvalid_orchard` + `receiver_types` extension fields report the address's receivers |
+| `setlabel`, `getaddressesbylabel`, `listlabels` | ✓ | - | **Not implemented** (method-not-found, `-32601`): zecd is stateless and keeps no off-chain label store |
+| `listtransactions` | ✓ | - (`z_listtransactions`, different shape) | Core categories/fields (`fee` on sends, count/skip); the `label` filter is accepted but matches only the empty label (no labels are kept); each entry's `label` is `""`; adds `memo`/`memoStr` |
 | `z_listtransactions` | *(extension)* | ✓ (zecd matches its shape, no `account` arg) | zcashd's per-output history vocabulary: `pool`/`category`/`amount`/`amountZat`/`address`/`outindex`/`outgoing`/`status`, `memo`/`memoStr`, `fee`/`feeZat` on sends; `[count] [from] [includeWatchonly]` paging like `listtransactions` |
 | `listsinceblock` | ✓ | - | Cursor pattern; `removed` always `[]`; reorged/unknown cursor → `-5`, re-baseline (no fork-point walk-back) |
 | `gettransaction` | ✓ | - (`z_viewtransaction`, different shape) | `amount`/`fee`/`confirmations`/`details`/`hex`; foreign tx hex fetched from zebra on demand |
 | `listunspent` | ✓ | - (`z_listunspent`, different shape) | One entry per unspent Orchard note; synthesized `txid`/`vout`; `address` empty for change |
-| `getreceivedbyaddress`, `listreceivedbyaddress`, `getreceivedbylabel`, `listreceivedbylabel` | ✓ | - | Core shapes over diversified receiving addresses; change never counted. There is no `listaddresses` (Core has none either) - `listreceivedbyaddress 0 true` is the enumeration: `include_empty` unions every address the wallet has generated (used or not), each with its label and received total. `include_watchonly` is accepted but ignored (watch-only is wallet-level) |
+| `getreceivedbyaddress`, `listreceivedbyaddress` | ✓ | - | Core shapes over diversified receiving addresses; change never counted; each entry's `label` is `""` (stateless). There is no `listaddresses` (Core has none either) - `listreceivedbyaddress 0 true` is the enumeration: `include_empty` unions every address the wallet has generated (used or not), each with its received total. `include_watchonly` is accepted but ignored (watch-only is wallet-level). The `*bylabel` pair is **not implemented** (`-32601`, stateless) |
 | `sendtoaddress` | ✓ | - (`z_sendmany` is async, returns an operation id) | Synchronous: builds, proves, broadcasts, returns txid; ZIP-317 fee; `subtractfeefromamount`/`fee_rate` → `-8`; extra trailing `memo` hex param |
 | `sendmany` | ✓ | - (`z_sendmany`) | Same; dummy `""` first arg as in Core |
 | `z_sendmany` | ✓ (Orchard-only) | ✓ | **Async**: returns an `opid`, proves/broadcasts on a background task; spends from the wallet's Orchard account (`fromaddress` must be one of its own addresses; `ANY_TADDR`/foreign → `-5`); zcashd `amounts` array with per-recipient `memo`; ZIP-317 fee (explicit `fee` → `-8`); `minconf` honored; `privacyPolicy` mapped onto `[spend] privacy_policy` (unknown → `-8`); too many recipients (Orchard actions over `[spend] orchard_action_limit`, default 50) → `-8` |
@@ -551,7 +591,7 @@ python3 scripts/rpc_send_smoke.py --send-timeout 180
 ```
 
 All wallet RPCs have been exercised end-to-end on regtest and the live testnet: balances,
-addresses/labels, history (`listtransactions`/`gettransaction` incl. `hex`), `listunspent`, the
+addresses, history (`listtransactions`/`gettransaction` incl. `hex`), `listunspent`, the
 `walletlock`/`walletpassphrase` gate, and real Orchard `sendtoaddress`/`sendmany` broadcasts.
 
 ## Operations

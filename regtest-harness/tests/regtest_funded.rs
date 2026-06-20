@@ -198,12 +198,23 @@ async fn regtest_funded_orchard_receive() {
         .call("listtransactions", json!([]))
         .await
         .expect("listtransactions");
+    let unconfirmed_receive = txs
+        .as_array()
+        .expect("array")
+        .iter()
+        .find(|t| t["category"] == "receive" && t["confirmations"].as_i64() == Some(0));
     assert!(
-        txs.as_array()
-            .expect("array")
-            .iter()
-            .any(|t| { t["category"] == "receive" && t["confirmations"].as_i64() == Some(0) }),
+        unconfirmed_receive.is_some(),
         "the unconfirmed receive rides in listtransactions: {txs}"
+    );
+    // This foreign receive has no block time and no librustzcash `created` time, so a non-zero
+    // `time`/`timereceived` can only come from the actor's transient in-memory first-seen stamp
+    // (set when the mempool stream stored the tx). Proves first-seen survives the move off the
+    // removed labels.sqlite into the in-memory map (zecd stays stateless: it's never persisted).
+    let rcv = unconfirmed_receive.unwrap();
+    assert!(
+        rcv["time"].as_i64().is_some_and(|t| t > 0) && rcv["time"] == rcv["timereceived"],
+        "the 0-conf receive carries an in-memory first-seen time: {rcv}"
     );
     let lu = zecd
         .call("listunspent", json!([0]))

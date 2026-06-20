@@ -15,9 +15,10 @@ Funds are recoverable from **the mnemonic alone**. Everything else is convenienc
 | `identity.txt` (age identity) | `[keys] age_identity`, default `<datadir>/identity.txt` | Decrypts `keys.toml`. **This is spend authority** - store the backup separately from `keys.toml` backups. |
 | Birthday height | inside `keys.toml`; also worth recording with the mnemonic | Makes a from-seed restore fast. Any height at/before the wallet's first transaction works. |
 
-The SQLite databases (`data.sqlite`, `blocks/`, `labels.sqlite`) are caches derived
-from the chain; they do not need backup (address labels excepted - back up
-`labels.sqlite` if labels matter to you).
+The SQLite databases (`data.sqlite`, `blocks/`) are caches derived from the chain; they do not
+need backup. zecd is **stateless** - it keeps no off-chain data the seed can't rebuild (there is
+no label store), so the whole data directory is disposable: with the mnemonic (and birthday) you
+can recreate everything via `zecd init --restore`.
 
 ### Minimal runtime file set (what's a secret, what's a cache)
 
@@ -29,7 +30,6 @@ A running wallet's data directory holds, per wallet `<dir>`:
 | `identity.txt` | **Secret** - decrypts the seed (spend authority). | Yes, if auto-unlocking - mount as a Secret (`ZECD_AGE_IDENTITY`). |
 | `<dir>/data.sqlite` (+ `-wal`/`-shm`) | Wallet state: the account plus scan progress, balances, and tx history. A **cache** - rebuilt from `keys.toml` + a rescan when absent (see bootstrap below). | No (disposable). |
 | `<dir>/blocks/` | **Cache** - downloaded compact blocks. **Never ship this** - it can grow large and is fully re-derivable. | No. |
-| `<dir>/labels.sqlite` | Convenience - address labels + first-seen times. Not on-chain; back up only if labels matter. | Optional. |
 | `<datadir>/.cookie` | Ephemeral RPC cookie, minted at startup and removed on clean shutdown. | No. |
 
 For a cloud deployment: put `keys.toml` (and `identity.txt`, if used) in a read-only Secret

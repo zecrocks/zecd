@@ -48,7 +48,7 @@ use crate::wallet::keys::{self, SeedKeeper};
 use crate::wallet::open::{self, WriteDb};
 use crate::wallet::read;
 use crate::wallet::{
-    labels, make_handle, store, ConnState, RawTx, SyncStatus, WalletCommand, WalletHandle,
+    make_handle, store, ConnState, FirstSeen, RawTx, SyncStatus, WalletCommand, WalletHandle,
 };
 
 /// Note-management defaults for change splitting (match zcash-devtool's send defaults).
@@ -187,6 +187,10 @@ struct WalletActor {
     enabled_pools: PoolSet,
     /// Receivers included by default in this wallet's Unified Addresses.
     default_receivers: PoolSet,
+    /// Transient first-seen times for unmined txs, shared with the read-path handle. Stamped when
+    /// the mempool stream first stores an unmined tx; pruned once the tx mines. Never persisted
+    /// (zecd is stateless). See [`crate::wallet::FirstSeen`].
+    first_seen: FirstSeen,
     /// The wallet's account, or `None` while a bootstrap is pending (empty data directory whose
     /// account hasn't been rebuilt from `keys.toml` yet - e.g. an encrypted wallet awaiting its
     /// first `walletpassphrase`).
@@ -257,8 +261,8 @@ pub async fn spawn(
         ));
     }
 
-    // The data directory must be writable: zecd creates/updates data.sqlite, blocks/ and
-    // labels.sqlite there. Probe it up front so a read-only mount fails with a clear error now,
+    // The data directory must be writable: zecd creates/updates data.sqlite and blocks/
+    // there. Probe it up front so a read-only mount fails with a clear error now,
     // not later at an awkward moment - e.g. when a `walletpassphrase` arrives and the bootstrap
     // tries to create the account.
     ensure_dir_writable(&cfg.wallet_dir)
@@ -378,6 +382,11 @@ pub async fn spawn(
         ..SyncStatus::default()
     });
 
+    // Shared, transient first-seen map: the actor stamps unmined txs into it and the read-path
+    // handle reads it. Never persisted (zecd is stateless).
+    let first_seen: FirstSeen =
+        std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
+
     let actor = WalletActor {
         name: cfg.name.clone(),
         network: cfg.network,
@@ -393,6 +402,7 @@ pub async fn spawn(
         orchard_action_limit: cfg.orchard_action_limit,
         enabled_pools: cfg.enabled_pools.clone(),
         default_receivers: cfg.default_receivers.clone(),
+        first_seen: first_seen.clone(),
         account_id,
         account_index,
         pending_bootstrap,
@@ -427,6 +437,7 @@ pub async fn spawn(
             cfg.confirmations_policy,
             cfg.enabled_pools,
             cfg.default_receivers,
+            first_seen,
             cmd_tx,
             status_rx,
         ),
@@ -467,8 +478,8 @@ fn ensure_dir_writable(dir: &std::path::Path) -> anyhow::Result<()> {
     let probe = dir.join(".zecd-write-test");
     std::fs::write(&probe, b"zecd").with_context(|| {
         format!(
-            "data directory {} is not writable (zecd must create and update data.sqlite, \
-             blocks/, and labels.sqlite there)",
+            "data directory {} is not writable (zecd must create and update data.sqlite \
+             and blocks/ there)",
             dir.display()
         )
     })?;
@@ -950,24 +961,42 @@ impl WalletActor {
         match decrypt_and_store_transaction(&self.network, &mut self.db_data, &tx, mined_height) {
             Ok(()) => {
                 tracing::debug!("[{}] processed mempool tx {txid}", self.name);
-                // If the tx turned out to be ours (decrypt stored a row), record when we
-                // first saw it: `gettransaction`/`listtransactions` report it as
-                // `time`/`timereceived` while the tx is unmined, like Bitcoin Core's
-                // `nTimeReceived`. Best-effort, idempotent (INSERT OR IGNORE).
+                // If the tx is ours and still unmined, stamp when we first saw it so
+                // `gettransaction`/`listtransactions` can report `time`/`timereceived` (Bitcoin
+                // Core's `nTimeReceived`) while it has no block time. This is held in memory only
+                // - zecd is stateless, so it is never persisted (a restart/restore rebuilds it as
+                // the mempool stream re-observes the tx, or it mines and the block time wins).
                 let txid_hex = txid.to_string();
-                if super::read::tx_exists(&self.wallet_dir, &txid_hex) {
+                if mined_height.is_none() && super::read::tx_exists(&self.wallet_dir, &txid_hex) {
                     let now = std::time::SystemTime::now()
                         .duration_since(std::time::UNIX_EPOCH)
                         .map(|d| d.as_secs() as i64)
                         .unwrap_or(0);
-                    if let Err(e) =
-                        super::labels::record_first_seen(&self.wallet_dir, &txid_hex, now)
-                    {
-                        tracing::debug!("[{}] failed to record first-seen time: {e}", self.name);
+                    if let Ok(mut map) = self.first_seen.lock() {
+                        map.entry(txid_hex).or_insert(now);
                     }
                 }
             }
             Err(e) => warn!("[{}] failed to store mempool tx {txid}: {e}", self.name),
+        }
+    }
+
+    /// Drop first-seen entries whose tx has since mined (or otherwise left the unmined set), so
+    /// the transient map stays bounded by the currently-unmined wallet txs. Best-effort and
+    /// cheap; runs on the caught-up rebroadcast cadence.
+    fn prune_first_seen(&self) {
+        let Ok(mut map) = self.first_seen.lock() else {
+            return;
+        };
+        if map.is_empty() {
+            return;
+        }
+        match super::read::unmined_txids(&self.wallet_dir) {
+            Ok(unmined) => {
+                let unmined: std::collections::HashSet<String> = unmined.into_iter().collect();
+                map.retain(|txid, _| unmined.contains(txid));
+            }
+            Err(e) => tracing::debug!("[{}] pruning first-seen map: {e}", self.name),
         }
     }
 
@@ -1305,6 +1334,8 @@ impl WalletActor {
             return;
         }
         self.last_rebroadcast = Some(Instant::now());
+        // Same caught-up cadence: drop first-seen entries for txs that have since mined.
+        self.prune_first_seen();
         let txs = match read::unmined_raw_txs(&self.wallet_dir, tip) {
             Ok(txs) => txs,
             Err(e) => {
@@ -1345,12 +1376,8 @@ impl WalletActor {
     /// Returns `true` if the actor should stop.
     async fn handle_command(&mut self, cmd: WalletCommand) -> bool {
         match cmd {
-            WalletCommand::GetNewAddress {
-                label,
-                receivers,
-                reply,
-            } => {
-                let res = self.get_new_address(label, receivers);
+            WalletCommand::GetNewAddress { receivers, reply } => {
+                let res = self.get_new_address(receivers);
                 let _ = reply.send(res);
             }
             WalletCommand::GetAddressForAccount {
@@ -1413,11 +1440,7 @@ impl WalletActor {
         self.account_id.ok_or_else(account_not_ready)
     }
 
-    fn get_new_address(
-        &mut self,
-        label: Option<String>,
-        receivers: Option<PoolSet>,
-    ) -> Result<String, RpcError> {
+    fn get_new_address(&mut self, receivers: Option<PoolSet>) -> Result<String, RpcError> {
         // No override → the wallet's configured default receivers. An override must be a subset
         // of the wallet's enabled pools (the RPC layer also validates this, but the actor is the
         // authority on the wallet's configuration, so re-check here).
@@ -1448,11 +1471,6 @@ impl WalletActor {
                 ))
             })?;
         let encoded = ua.encode(&self.network);
-        if let Some(label) = label {
-            if let Err(e) = labels::set_label(&self.wallet_dir, &encoded, &label) {
-                warn!("[{}] failed to store label: {e}", self.name);
-            }
-        }
         Ok(encoded)
     }
 

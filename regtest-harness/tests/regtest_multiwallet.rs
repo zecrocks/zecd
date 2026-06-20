@@ -1,8 +1,8 @@
 //! Multiwallet tests: one spending wallet plus any number of watch-only (UFVK) wallets, served
 //! by a single daemon. Exercises `/wallet/<name>` routing, `listwallets`, the `-18`
-//! unknown-wallet error, per-wallet label isolation, and the **single-spending-wallet
-//! invariant** (zecd loads at most one wallet with spending keys; a second one makes the daemon
-//! refuse to start) - none of which the single-wallet suites can reach.
+//! unknown-wallet error, and the **single-spending-wallet invariant** (zecd loads at most one
+//! wallet with spending keys; a second one makes the daemon refuse to start) - none of which the
+//! single-wallet suites can reach.
 //!
 //! Extended tier: set `ZECD_REGTEST_EXTENDED=1` (plus ZEBRAD_BIN).
 //! Skips cleanly otherwise.
@@ -16,8 +16,8 @@ const INITIAL_BLOCKS: u32 = 10;
 const SYNC_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// One spending wallet (`default`) plus two watch-only replicas (`w2`, `w3`): the supported
-/// multiwallet shape. Proves routing, `listwallets`, watch-only behavior, per-wallet label
-/// isolation, and that the lone spending wallet keeps its full spending surface.
+/// multiwallet shape. Proves routing, `listwallets`, watch-only behavior, the removal of the
+/// label methods (stateless), and that the lone spending wallet keeps its full spending surface.
 #[tokio::test]
 async fn regtest_multiwallet_routing_and_isolation() {
     if !extended_enabled() {
@@ -116,32 +116,23 @@ async fn regtest_multiwallet_routing_and_isolation() {
         .expect_err("an unknown wallet must fail");
     assert_eq!(err.code(), Some(-18), "expected -18, got: {err}");
 
-    // Labels are per-wallet side-state: a label set in w2 never shows in default.
-    zecd.call_wallet("w2", "setlabel", json!([addr_w2, "w2-label"]))
-        .await
-        .expect("setlabel in w2");
-    let labels = zecd
-        .call_wallet("w2", "listlabels", json!([]))
-        .await
-        .expect("listlabels (w2)");
-    assert!(
-        labels
-            .as_array()
-            .expect("array")
-            .contains(&json!("w2-label")),
-        "w2 sees its label: {labels}"
-    );
-    let labels = zecd
-        .call("listlabels", json!([]))
-        .await
-        .expect("listlabels (default)");
-    assert!(
-        !labels
-            .as_array()
-            .expect("array")
-            .contains(&json!("w2-label")),
-        "labels do not leak across wallets: {labels}"
-    );
+    // zecd is stateless: there is no off-chain label store, so the label methods are removed
+    // entirely (method-not-found, -32601) - on every wallet route, default and watch-only alike.
+    for w in ["w2", "default"] {
+        let err = match w {
+            "default" => zecd.call("setlabel", json!([addr_w2, "x"])).await,
+            other => {
+                zecd.call_wallet(other, "setlabel", json!([addr_w2, "x"]))
+                    .await
+            }
+        }
+        .expect_err("setlabel is removed in stateless mode");
+        assert_eq!(
+            err.code(),
+            Some(-32601),
+            "setlabel must be method-not-found on {w}: {err}"
+        );
+    }
 
     // The watch-only replicas refuse spending and passphrase RPCs with Bitcoin Core's codes
     // (-4 private keys disabled, -15 passphrase RPC unsupported), independently per wallet.

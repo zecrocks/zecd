@@ -3,7 +3,6 @@
 
 pub mod actor;
 pub mod keys;
-pub mod labels;
 pub mod open;
 pub mod read;
 pub mod store;
@@ -13,6 +12,7 @@ mod regtest_tests;
 
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
 
 use tokio::sync::{mpsc, oneshot, watch};
 use zcash_client_backend::data_api::wallet::ConfirmationsPolicy;
@@ -25,6 +25,15 @@ use crate::error::RpcError;
 use crate::network::ZNetwork;
 use crate::pools::PoolSet;
 use crate::wallet::store::Passphrase;
+
+/// Transient, in-memory first-seen wall-clock times for **unmined** wallet transactions, keyed
+/// by display-hex txid. zecd is stateless - this is never persisted (it is rebuilt naturally as
+/// the mempool stream re-observes pending txs, and lost on restart, exactly like the async-op
+/// registry). It exists only because an unmined tx has no on-chain time yet: the actor stamps the
+/// clock when it first stores a tx from the mempool stream, and the history RPCs surface it as
+/// `time`/`timereceived` (Bitcoin Core's `nTimeReceived`) until a block time supersedes it. The
+/// actor prunes entries once their tx mines, so the map stays bounded by the unmined set.
+pub type FirstSeen = Arc<Mutex<HashMap<String, i64>>>;
 
 /// Connection state to lightwalletd, surfaced for monitoring (e.g. to distinguish "all
 /// upstreams down" from "still syncing" on `/readyz`).
@@ -103,7 +112,6 @@ pub struct RawTx {
 /// Commands sent from RPC handlers to the per-wallet actor (the sole DB writer).
 pub enum WalletCommand {
     GetNewAddress {
-        label: Option<String>,
         /// Per-call override of the UA receivers to include. `None` uses the wallet's configured
         /// `default_receivers`; `Some` must be a subset of the wallet's enabled pools.
         receivers: Option<PoolSet>,
@@ -167,6 +175,9 @@ pub struct WalletHandle {
     pub enabled_pools: PoolSet,
     /// Receivers this wallet's Unified Addresses include by default (a subset of `enabled_pools`).
     pub default_receivers: PoolSet,
+    /// Transient first-seen times for unmined txs, shared with the actor (the writer). See
+    /// [`FirstSeen`].
+    first_seen: FirstSeen,
     cmd_tx: mpsc::Sender<WalletCommand>,
     status_rx: watch::Receiver<SyncStatus>,
 }
@@ -174,6 +185,21 @@ pub struct WalletHandle {
 impl WalletHandle {
     pub fn status(&self) -> SyncStatus {
         self.status_rx.borrow().clone()
+    }
+
+    /// Snapshot of the transient first-seen times for unmined txs (display-hex txid → unix time),
+    /// for joining into history responses. Empty after a restart until the mempool stream
+    /// re-observes still-pending txs (zecd is stateless; these times are never persisted).
+    pub fn first_seen(&self) -> HashMap<String, i64> {
+        self.first_seen
+            .lock()
+            .map(|m| m.clone())
+            .unwrap_or_default()
+    }
+
+    /// The transient first-seen time of one transaction, if the actor has observed it unmined.
+    pub fn first_seen_of(&self, txid_hex: &str) -> Option<i64> {
+        self.first_seen.lock().ok()?.get(txid_hex).copied()
     }
 
     /// Whether the wallet actor task is still running. Becomes false once the actor stops -
@@ -197,17 +223,9 @@ impl WalletHandle {
             .map_err(|_| RpcError::misc("wallet actor dropped the reply"))?
     }
 
-    pub async fn get_new_address(
-        &self,
-        label: Option<String>,
-        receivers: Option<PoolSet>,
-    ) -> Result<String, RpcError> {
-        self.dispatch(|reply| WalletCommand::GetNewAddress {
-            label,
-            receivers,
-            reply,
-        })
-        .await
+    pub async fn get_new_address(&self, receivers: Option<PoolSet>) -> Result<String, RpcError> {
+        self.dispatch(|reply| WalletCommand::GetNewAddress { receivers, reply })
+            .await
     }
 
     /// Derive a Unified Address for the wallet's single account (`z_getaddressforaccount`).
@@ -317,6 +335,7 @@ pub(crate) fn make_handle(
     confirmations: ConfirmationsPolicy,
     enabled_pools: PoolSet,
     default_receivers: PoolSet,
+    first_seen: FirstSeen,
     cmd_tx: mpsc::Sender<WalletCommand>,
     status_rx: watch::Receiver<SyncStatus>,
 ) -> WalletHandle {
@@ -327,6 +346,7 @@ pub(crate) fn make_handle(
         confirmations,
         enabled_pools,
         default_receivers,
+        first_seen,
         cmd_tx,
         status_rx,
     }

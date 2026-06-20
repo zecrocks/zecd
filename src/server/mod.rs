@@ -537,8 +537,6 @@ mod tests {
             r#"{"method":"getreceivedbyaddress","id":1,"params":["uaddr"]}"#,
             r#"{"method":"listreceivedbyaddress","id":1,"params":[]}"#,
             r#"{"method":"getbalances","id":1,"params":[]}"#,
-            r#"{"method":"getreceivedbylabel","id":1,"params":["l"]}"#,
-            r#"{"method":"listreceivedbylabel","id":1,"params":[]}"#,
             r#"{"method":"getrawtransaction","id":1,"params":["00"]}"#,
             r#"{"method":"sendrawtransaction","id":1,"params":["00"]}"#,
         ] {
@@ -553,6 +551,35 @@ mod tests {
                 "method must be dispatched: {body}"
             );
         }
+    }
+
+    /// zecd is stateless: the off-chain label store is gone entirely, so the label-dedicated
+    /// methods are not implemented at all and must surface as method-not-found (-32601), like any
+    /// other unknown method - never reach a handler.
+    #[tokio::test]
+    async fn label_methods_are_not_implemented() {
+        use crate::error::codes::RPC_METHOD_NOT_FOUND;
+        for body in [
+            r#"{"method":"setlabel","id":1,"params":["uaddr","x"]}"#,
+            r#"{"method":"getaddressesbylabel","id":1,"params":["x"]}"#,
+            r#"{"method":"listlabels","id":1,"params":[]}"#,
+            r#"{"method":"getreceivedbylabel","id":1,"params":["x"]}"#,
+            r#"{"method":"listreceivedbylabel","id":1,"params":[]}"#,
+        ] {
+            let code = call_err_code(body).await;
+            assert_eq!(
+                code,
+                Some(RPC_METHOD_NOT_FOUND as i64),
+                "label method must be unimplemented: {body}"
+            );
+        }
+        // getnewaddress stays available, but a non-empty label argument is rejected (-8): a label
+        // would be off-chain state zecd doesn't keep.
+        let code = call_err_code(r#"{"method":"getnewaddress","id":1,"params":["mylabel"]}"#).await;
+        assert_eq!(
+            code,
+            Some(crate::error::codes::RPC_INVALID_PARAMETER as i64)
+        );
     }
 
     #[tokio::test]

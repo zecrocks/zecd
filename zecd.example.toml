@@ -21,13 +21,14 @@ datadir = "./data"
 # Wallet selected when a request hits "/" rather than "/wallet/<name>".
 default_wallet = "default"
 
-# One section per wallet. The directory holds data.sqlite, keys.toml, blocks/, labels.sqlite.
+# One section per wallet. The directory holds data.sqlite, keys.toml, blocks/. zecd is stateless:
+# it keeps no off-chain data the seed can't rebuild, so there is no label store on disk.
 [wallets.default]
 dir = "./data/default"
 # Optional: put this wallet's keys.toml somewhere other than <dir>/keys.toml - e.g. a
 # Kubernetes Secret mounted read-only, separate from the (disposable, cache-only) data dir.
 # The global [keys] keys_file below sets this for the default wallet; ZECD_KEYS_FILE /
-# --keys-file override it. data.sqlite, blocks/ and labels.sqlite still live under `dir`.
+# --keys-file override it. data.sqlite and blocks/ still live under `dir`.
 # keys_file = "/secrets/keys.toml"
 
 [backend]
@@ -99,12 +100,7 @@ password = "change-me"
 #   "listunspent",
 #   "getreceivedbyaddress",
 #   "listreceivedbyaddress",
-#   "getreceivedbylabel",
-#   "listreceivedbylabel",
 #   "getaddressinfo",
-#   "getaddressesbylabel",
-#   "listlabels",
-#   "setlabel",
 #   "listwallets",
 #   "validateaddress",
 #

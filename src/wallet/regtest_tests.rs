@@ -20,7 +20,7 @@ use zcash_protocol::consensus::BlockHeight;
 
 use crate::network;
 use crate::wallet::keys::SeedKeeper;
-use crate::wallet::{labels, open, read};
+use crate::wallet::{open, read};
 
 /// The committed testnet test mnemonic (valueless TAZ wallet); reused here purely as a
 /// deterministic seed source for a throwaway regtest wallet.
@@ -180,19 +180,6 @@ fn regtest_wallet_lifecycle() {
     assert!(read::first_scanned_block(wallet_dir)
         .expect("first_scanned_block")
         .is_none());
-    // First-seen side table: record once, ignore duplicates, read back.
-    labels::record_first_seen(wallet_dir, &"cd".repeat(32), 1_700_000_000).expect("record");
-    labels::record_first_seen(wallet_dir, &"cd".repeat(32), 1_900_000_000).expect("record dup");
-    assert_eq!(
-        labels::first_seen(wallet_dir, &"cd".repeat(32)).expect("first_seen"),
-        Some(1_700_000_000)
-    );
-    assert_eq!(
-        labels::first_seen_all(wallet_dir)
-            .expect("first_seen_all")
-            .len(),
-        1
-    );
 
     // 4. is_mine is network-scoped: true for our own regtest address, false for a testnet UA.
     assert!(
@@ -636,7 +623,7 @@ async fn watch_only_wallet_disables_spending_rpcs() {
     // Address generation works from the viewing key alone. (Round-tripping a command also
     // guarantees the actor has published its first status snapshot, which `spawn` itself
     // does not wait for.)
-    let addr = handle.get_new_address(None, None).await.unwrap();
+    let addr = handle.get_new_address(None).await.unwrap();
     assert!(addr.starts_with("uregtest1"), "{addr}");
 
     // The status feed marks the wallet watch-only (not encrypted - there is nothing to lock).

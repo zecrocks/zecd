@@ -3,7 +3,7 @@
 use std::collections::{BTreeSet, HashMap};
 use std::num::NonZeroU32;
 
-use serde_json::{json, Map, Value};
+use serde_json::{json, Value};
 use zcash_client_backend::data_api::wallet::ConfirmationsPolicy;
 use zcash_protocol::memo::{Memo, MemoBytes};
 use zcash_protocol::TxId;
@@ -17,7 +17,7 @@ use crate::operations::{AsyncOperation, ContextInfo, OperationId};
 use crate::server::jsonrpc::RpcRequest;
 use crate::state::AppState;
 use crate::wallet::store::Passphrase;
-use crate::wallet::{labels, read, SyncStatus, WalletHandle};
+use crate::wallet::{read, SyncStatus, WalletHandle};
 
 pub(crate) fn opt_str(req: &RpcRequest, i: usize) -> Option<String> {
     req.param(i).and_then(|v| v.as_str()).map(|s| s.to_string())
@@ -42,6 +42,11 @@ pub(crate) fn listwallets(state: &AppState) -> Result<Value, RpcError> {
 /// `getnewaddress [label] [address_type]` - a fresh diversified unified address for the wallet's
 /// account (new diversifier, not a new derivation path).
 ///
+/// zecd is **stateless**: an address label would land in an off-chain side-table the seed can't
+/// rebuild, so the optional `label` argument (param 0) must be empty/omitted - a non-empty label
+/// is rejected `-8`. The address itself derives from the seed and is unaffected. Param 0 is kept
+/// in Bitcoin Core's position so `address_type` stays at param 1.
+///
 /// `address_type` doubles as a per-call receiver override (zallet's `receiver_types`, expressed as
 /// a single string for Bitcoin-RPC conformance):
 /// - empty / `"unified"` / `"default"` → the wallet's configured `default_receivers`,
@@ -54,7 +59,12 @@ pub(crate) async fn getnewaddress(
     wallet: Option<&str>,
     req: &RpcRequest,
 ) -> Result<Value, RpcError> {
-    let label = opt_str(req, 0).filter(|s| !s.is_empty());
+    // A label has no on-chain source, so zecd (which is stateless) never stores one.
+    if opt_str(req, 0).is_some_and(|s| !s.is_empty()) {
+        return Err(RpcError::invalid_parameter(
+            "labels are not supported (zecd is stateless); call getnewaddress without a label",
+        ));
+    }
     // Param 1 (address_type): parse the receiver-override *syntax* before resolving the wallet,
     // so an unknown type is a `-5` regardless of which wallet is targeted (and even when no
     // wallet exists). Enablement is wallet-specific and checked once the handle is in hand.
@@ -69,7 +79,7 @@ pub(crate) async fn getnewaddress(
             )));
         }
     }
-    let addr = handle.get_new_address(label, requested).await?;
+    let addr = handle.get_new_address(requested).await?;
     Ok(Value::String(addr))
 }
 
@@ -385,9 +395,8 @@ pub(crate) fn getaddressinfo(
     let addr = req.require_str(0, "getaddressinfo requires an address")?;
     let handle = state.registry.get(wallet)?;
     let v = crate::address::validate(&handle.network, addr);
-    let label = labels::get_label(&handle.dir, addr).ok().flatten();
     let ismine = v.is_valid && read::is_mine(handle.network, &handle.dir, addr);
-    addressinfo_json(v, addr, ismine, label)
+    addressinfo_json(v, addr, ismine)
 }
 
 /// Build the `getaddressinfo` response. Bitcoin Core throws `-5 Invalid address` for an
@@ -396,7 +405,6 @@ fn addressinfo_json(
     v: crate::address::Validation,
     addr: &str,
     ismine: bool,
-    label: Option<String>,
 ) -> Result<Value, RpcError> {
     if !v.is_valid {
         return Err(RpcError::invalid_address_or_key("Invalid address"));
@@ -421,68 +429,10 @@ fn addressinfo_json(
         // list (`transparent`/`sapling`/`orchard`), so a client sees what a `u1...` carries.
         "isvalid_orchard": v.is_orchard,
         "receiver_types": v.receiver_types,
-        "labels": label.map(|l| vec![l]).unwrap_or_default(),
+        // zecd is stateless and keeps no address labels; the field is retained empty for
+        // Bitcoin Core shape conformance.
+        "labels": Vec::<String>::new(),
     }))
-}
-
-/// `setlabel <address> <label>` - label any valid address (foreign addresses too, as
-/// Bitcoin Core's send-side address book allows). Labels live in the `labels.sqlite`
-/// side-table, not the wallet DB.
-pub(crate) fn setlabel(
-    state: &AppState,
-    wallet: Option<&str>,
-    req: &RpcRequest,
-) -> Result<Value, RpcError> {
-    let addr = req.require_str(0, "setlabel requires an address")?;
-    let label = opt_str(req, 1).unwrap_or_default();
-    let handle = state.registry.get(wallet)?;
-    if !crate::address::validate(&handle.network, addr).is_valid {
-        return Err(RpcError::invalid_address_or_key(format!(
-            "Invalid Zcash address: {addr}"
-        )));
-    }
-    labels::set_label(&handle.dir, addr, &label).map_err(RpcError::database_internal)?;
-    Ok(Value::Null)
-}
-
-/// `getaddressesbylabel <label>` - every address carrying `label`, each with its `purpose`
-/// (`receive` for the wallet's own addresses, `send` for labelled foreign ones).
-pub(crate) fn getaddressesbylabel(
-    state: &AppState,
-    wallet: Option<&str>,
-    req: &RpcRequest,
-) -> Result<Value, RpcError> {
-    let label = req.require_str(0, "getaddressesbylabel requires a label")?;
-    let handle = state.registry.get(wallet)?;
-    let addrs =
-        labels::addresses_for_label(&handle.dir, label).map_err(RpcError::database_internal)?;
-    if addrs.is_empty() {
-        // Bitcoin Core: -11 RPC_WALLET_INVALID_LABEL_NAME for a label with no addresses.
-        return Err(RpcError::new(
-            crate::error::codes::RPC_WALLET_INVALID_LABEL_NAME,
-            format!("No addresses with label {label}"),
-        ));
-    }
-    let mut map = Map::new();
-    for a in addrs {
-        // setlabel accepts foreign addresses too (Bitcoin Core's send-side address book);
-        // those carry purpose "send", the wallet's own addresses "receive".
-        let purpose = if read::is_mine(handle.network, &handle.dir, &a) {
-            "receive"
-        } else {
-            "send"
-        };
-        map.insert(a, json!({ "purpose": purpose }));
-    }
-    Ok(Value::Object(map))
-}
-
-/// `listlabels` - the sorted, de-duplicated set of labels in use.
-pub(crate) fn listlabels(state: &AppState, wallet: Option<&str>) -> Result<Value, RpcError> {
-    let handle = state.registry.get(wallet)?;
-    let all = labels::all(&handle.dir).unwrap_or_default();
-    let set: BTreeSet<String> = all.into_values().collect();
-    Ok(json!(set.into_iter().collect::<Vec<_>>()))
 }
 
 /// The per-output categories. A normal receive or send is one entry; a self-transfer (paid
@@ -509,10 +459,12 @@ fn tx_confirmations(st: &SyncStatus, tx: &read::TxRecord) -> i64 {
     }
 }
 
-/// The `time`/`timereceived` of a wallet transaction: the block time once mined, else when
-/// the wallet first saw it (recorded by the mempool stream) or created it (librustzcash's
-/// `created` column, set for wallet-authored sends). Bitcoin Core's `GetTxTime` /
-/// `nTimeReceived` analog.
+/// The `time`/`timereceived` of a wallet transaction: the block time once mined, else when the
+/// wallet first saw it (the actor's transient in-memory first-seen map, populated by the mempool
+/// stream) or created it (librustzcash's `created` column, set for wallet-authored sends). Bitcoin
+/// Core's `GetTxTime` / `nTimeReceived` analog. The first-seen time is never persisted (zecd is
+/// stateless); after a restart an unmined foreign tx falls back to 0 until the mempool stream
+/// re-observes it or it mines.
 fn tx_time(tx: &read::TxRecord, first_seen: Option<i64>) -> i64 {
     tx.block_time
         .or(first_seen)
@@ -575,11 +527,11 @@ fn push_memo_fields(entry: &mut Value, memo: Option<&[u8]>) {
 
 /// Build the `listtransactions`-shaped entries for one wallet transaction: one entry per
 /// non-change, non-internal output, sends negative (Bitcoin Core's sign convention).
-/// `label_filter` of `Some(l)` keeps only entries labelled exactly `l`. Shared by
-/// `listtransactions` and `listsinceblock`.
+/// `label_filter` of `Some(l)` keeps only entries whose (always-empty, since zecd is stateless)
+/// label equals `l` - so any non-`""` filter matches nothing. Shared by `listtransactions` and
+/// `listsinceblock`.
 fn tx_entries(
     tx: &read::TxRecord,
-    label_map: &HashMap<String, String>,
     confirmations: i64,
     time: i64,
     label_filter: Option<&str>,
@@ -591,12 +543,9 @@ fn tx_entries(
         }
         let categories = output_categories(out.from_account.is_some(), out.to_account.is_some());
         let address = out.to_address.clone().unwrap_or_default();
-        let label = out
-            .to_address
-            .as_ref()
-            .and_then(|a| label_map.get(a).cloned())
-            .unwrap_or_default();
-        if label_filter.is_some_and(|f| f != label) {
+        // zecd is stateless and keeps no address labels; the field stays empty for Core shape
+        // conformance, and a label filter for anything other than "" therefore matches nothing.
+        if label_filter.is_some_and(|f| !f.is_empty()) {
             continue;
         }
         for category in categories {
@@ -609,7 +558,7 @@ fn tx_entries(
                 "address": address,
                 "category": category,
                 "amount": signed_zats_to_value(amount),
-                "label": label,
+                "label": "",
                 "vout": out.output_index,
                 "confirmations": confirmations,
                 "txid": tx.txid_hex,
@@ -762,13 +711,12 @@ pub(crate) fn listtransactions(
     let (count, skip) = count_from_params(req, 1, 2)?;
     let handle = state.registry.get(wallet)?;
     let st = handle.status();
-    let label_map = labels::all(&handle.dir).unwrap_or_default();
-    let first_seen = labels::first_seen_all(&handle.dir).unwrap_or_default();
+    let first_seen = handle.first_seen();
 
     let entries = paginate_history(&handle.dir, skip, count, |tx| {
         let confirmations = tx_confirmations(&st, tx);
         let time = tx_time(tx, first_seen.get(&tx.txid_hex).copied());
-        tx_entries(tx, &label_map, confirmations, time, label_filter.as_deref())
+        tx_entries(tx, confirmations, time, label_filter.as_deref())
     })?;
     Ok(Value::Array(entries))
 }
@@ -880,7 +828,7 @@ pub(crate) fn z_listtransactions(
     }
     let handle = state.registry.get(wallet)?;
     let st = handle.status();
-    let first_seen = labels::first_seen_all(&handle.dir).unwrap_or_default();
+    let first_seen = handle.first_seen();
 
     let entries = paginate_history(&handle.dir, from, count, |tx| {
         let confirmations = tx_confirmations(&st, tx);
@@ -964,7 +912,6 @@ pub(crate) fn listreceivedbyaddress(
     let handle = state.registry.get(wallet)?;
     let st = handle.status();
     let txs = read::received_tx_records(&handle.dir, None)?;
-    let label_map = labels::all(&handle.dir).unwrap_or_default();
     let mut received = received_by_address(&txs, &st, minconf);
 
     // The address universe: everything that received, plus (with include_empty) every
@@ -985,95 +932,11 @@ pub(crate) fn listreceivedbyaddress(
             "address": addr,
             "amount": zats_to_value(amount),
             "confirmations": conf,
-            "label": label_map.get(&addr).cloned().unwrap_or_default(),
+            // zecd is stateless and keeps no address labels; retained empty for Core shape.
+            "label": "",
             "txids": txids,
         }));
     }
-    Ok(Value::Array(out))
-}
-
-/// Fold per-address received totals into per-label totals (addresses without an explicit
-/// label fall under the default label `""`, like Bitcoin Core's address book). The
-/// confirmation count for a label is the minimum across its addresses - Bitcoin Core's
-/// `ListReceived` aggregation.
-fn received_by_label(
-    received: &HashMap<String, (u64, i64, Vec<String>)>,
-    label_map: &HashMap<String, String>,
-) -> std::collections::BTreeMap<String, (u64, i64)> {
-    let mut by_label: std::collections::BTreeMap<String, (u64, i64)> = Default::default();
-    for (addr, (amount, conf, _)) in received {
-        let label = label_map.get(addr).cloned().unwrap_or_default();
-        let e = by_label.entry(label).or_insert((0, i64::MAX));
-        e.0 += amount;
-        e.1 = e.1.min(*conf);
-    }
-    by_label
-}
-
-/// `getreceivedbylabel <label> [minconf]` - total received across the addresses carrying
-/// `label`. An unknown label is `-4` like Bitcoin Core's `GetReceived`.
-pub(crate) fn getreceivedbylabel(
-    state: &AppState,
-    wallet: Option<&str>,
-    req: &RpcRequest,
-) -> Result<Value, RpcError> {
-    let label = req.require_str(0, "getreceivedbylabel requires a label")?;
-    let minconf = depth_param(req.param(1), "minconf", 1)?;
-    let handle = state.registry.get(wallet)?;
-    let addrs =
-        labels::addresses_for_label(&handle.dir, label).map_err(RpcError::database_internal)?;
-    if addrs.is_empty() {
-        return Err(RpcError::wallet("Label not found in wallet"));
-    }
-    let st = handle.status();
-    let txs = read::received_tx_records(&handle.dir, None)?;
-    let received = received_by_address(&txs, &st, minconf);
-    let total: u64 = addrs
-        .iter()
-        .filter_map(|a| received.get(a).map(|(amt, _, _)| *amt))
-        .sum();
-    Ok(zats_to_value(total))
-}
-
-/// `listreceivedbylabel [minconf] [include_empty] [include_watchonly]` - `listreceivedbyaddress`
-/// aggregated per label. `include_watchonly` is accepted and ignored (no watch-only support).
-pub(crate) fn listreceivedbylabel(
-    state: &AppState,
-    wallet: Option<&str>,
-    req: &RpcRequest,
-) -> Result<Value, RpcError> {
-    let minconf = depth_param(req.param(0), "minconf", 1)?;
-    let include_empty = req.param(1).and_then(|v| v.as_bool()).unwrap_or(false);
-    let handle = state.registry.get(wallet)?;
-    let st = handle.status();
-    let txs = read::received_tx_records(&handle.dir, None)?;
-    let label_map = labels::all(&handle.dir).unwrap_or_default();
-    let received = received_by_address(&txs, &st, minconf);
-    let mut by_label = received_by_label(&received, &label_map);
-
-    if include_empty {
-        // Every known label, plus the default label "" if any wallet address is unlabelled.
-        for label in label_map.values() {
-            by_label.entry(label.clone()).or_insert((0, i64::MAX));
-        }
-        if read::all_addresses(handle.network, &handle.dir)
-            .iter()
-            .any(|a| !label_map.contains_key(a))
-        {
-            by_label.entry(String::new()).or_insert((0, i64::MAX));
-        }
-    }
-
-    let out: Vec<Value> = by_label
-        .into_iter()
-        .map(|(label, (amount, conf))| {
-            json!({
-                "amount": zats_to_value(amount),
-                "confirmations": if conf == i64::MAX { 0 } else { conf },
-                "label": label,
-            })
-        })
-        .collect();
     Ok(Value::Array(out))
 }
 
@@ -1122,13 +985,12 @@ pub(crate) fn listsinceblock(
         newest_first: false,
     };
     let txs = read::query_transactions(&handle.dir, &query)?;
-    let label_map = labels::all(&handle.dir).unwrap_or_default();
-    let first_seen = labels::first_seen_all(&handle.dir).unwrap_or_default();
+    let first_seen = handle.first_seen();
     let mut transactions: Vec<Value> = Vec::new();
     for tx in &txs {
         let confirmations = tx_confirmations(&st, tx);
         let time = tx_time(tx, first_seen.get(&tx.txid_hex).copied());
-        transactions.extend(tx_entries(tx, &label_map, confirmations, time, None));
+        transactions.extend(tx_entries(tx, confirmations, time, None));
     }
 
     // `lastblock` is the hash of the block that currently has `target_confirmations`
@@ -1170,14 +1032,13 @@ pub(crate) async fn gettransaction(
     let st = handle.status();
     let rec = read::get_transaction(&handle.dir, txid)?
         .ok_or_else(|| RpcError::invalid_address_or_key("Invalid or non-wallet transaction id"))?;
-    let label_map = labels::all(&handle.dir).unwrap_or_default();
 
-    let details = gettransaction_details(&rec, &label_map);
+    let details = gettransaction_details(&rec);
     let hex_str = gettransaction_hex(&handle, &rec).await;
 
     let amount = gettransaction_amount(rec.account_balance_delta, rec.fee_paid);
     let confirmations = tx_confirmations(&st, &rec);
-    let time = tx_time(&rec, labels::first_seen(&handle.dir, txid).ok().flatten());
+    let time = tx_time(&rec, handle.first_seen_of(txid));
     let mut obj = json!({
         "amount": signed_zats_to_value(amount),
         "confirmations": confirmations,
@@ -1196,7 +1057,7 @@ pub(crate) async fn gettransaction(
 /// Build `gettransaction.details`: one entry per non-change output and category, sends
 /// negative - [`tx_entries`]'s conventions minus the per-tx fields (`confirmations`, `txid`,
 /// times), which `gettransaction` carries at the top level instead.
-fn gettransaction_details(rec: &read::TxRecord, label_map: &HashMap<String, String>) -> Vec<Value> {
+fn gettransaction_details(rec: &read::TxRecord) -> Vec<Value> {
     let mut details = Vec::new();
     for out in &rec.outputs {
         if out.is_internal_change() {
@@ -1209,17 +1070,13 @@ fn gettransaction_details(rec: &read::TxRecord, label_map: &HashMap<String, Stri
             } else {
                 out.value
             };
-            let label = out
-                .to_address
-                .as_ref()
-                .and_then(|a| label_map.get(a).cloned())
-                .unwrap_or_default();
             let mut d = json!({
                 "address": out.to_address.clone().unwrap_or_default(),
                 "category": category,
                 "amount": signed_zats_to_value(amount),
                 "vout": out.output_index,
-                "label": label,
+                // zecd is stateless and keeps no address labels; retained empty for Core shape.
+                "label": "",
             });
             if *category == "send" {
                 d["abandoned"] = json!(rec.expired_unmined);
@@ -2191,17 +2048,17 @@ mod tests {
             vec![out(false, true, 5, Some("ua"), false)],
         );
         t.outputs[0].memo = Some(b"invoice 42".to_vec());
-        let e = tx_entries(&t, &HashMap::new(), 1, 0, None);
+        let e = tx_entries(&t, 1, 0, None);
         assert_eq!(e[0]["memo"], json!(hex::encode(b"invoice 42")));
         assert_eq!(e[0]["memoStr"], json!("invoice 42"));
 
         // Empty (0xF6) and absent memos add nothing; an arbitrary-data memo (first byte
         // 0xFF) is hex-only.
         t.outputs[0].memo = Some(vec![0xF6]);
-        let e = tx_entries(&t, &HashMap::new(), 1, 0, None);
+        let e = tx_entries(&t, 1, 0, None);
         assert!(e[0].get("memo").is_none() && e[0].get("memoStr").is_none());
         t.outputs[0].memo = Some(vec![0xFF, 0x01, 0x02]);
-        let e = tx_entries(&t, &HashMap::new(), 1, 0, None);
+        let e = tx_entries(&t, 1, 0, None);
         assert_eq!(e[0]["memo"], json!("ff0102"));
         assert!(e[0].get("memoStr").is_none());
     }
@@ -2269,7 +2126,7 @@ mod tests {
             script_pub_key: None,
             is_script: false,
         };
-        let e = addressinfo_json(invalid, "nonsense", false, None).unwrap_err();
+        let e = addressinfo_json(invalid, "nonsense", false).unwrap_err();
         assert_eq!(e.code, crate::error::codes::RPC_INVALID_ADDRESS_OR_KEY);
 
         // Valid: Bitcoin Core's field set, without an isvalid field. The shape is identical
@@ -2283,7 +2140,7 @@ mod tests {
             script_pub_key: None,
             is_script: false,
         };
-        let o = addressinfo_json(valid, "utest1abc", true, Some("hot".into())).unwrap();
+        let o = addressinfo_json(valid, "utest1abc", true).unwrap();
         assert!(o.get("isvalid").is_none());
         assert_eq!(o["address"], json!("utest1abc"));
         assert_eq!(o["ismine"], json!(true));
@@ -2294,7 +2151,8 @@ mod tests {
         // Extension fields: the address's receiver verdicts.
         assert_eq!(o["isvalid_orchard"], json!(true));
         assert_eq!(o["receiver_types"], json!(["orchard"]));
-        assert_eq!(o["labels"], json!(["hot"]));
+        // zecd is stateless: the labels field is always empty.
+        assert_eq!(o["labels"], json!([]));
     }
 
     #[test]
@@ -2306,13 +2164,7 @@ mod tests {
             vec![out(false, true, 150_000_000, Some("ua"), false)],
         );
         let st = status(102);
-        let e = tx_entries(
-            &t,
-            &HashMap::new(),
-            tx_confirmations(&st, &t),
-            tx_time(&t, None),
-            None,
-        );
+        let e = tx_entries(&t, tx_confirmations(&st, &t), tx_time(&t, None), None);
         assert_eq!(e.len(), 1);
         assert_eq!(e[0]["category"], "receive");
         assert_eq!(e[0]["amount"].to_string(), "1.50000000");
@@ -2339,7 +2191,7 @@ mod tests {
             Some(10_000),
             vec![out(true, false, 150_000_000, Some("dest"), false)],
         );
-        let e = tx_entries(&t, &HashMap::new(), 1, tx_time(&t, None), None);
+        let e = tx_entries(&t, 1, tx_time(&t, None), None);
         assert_eq!(e[0]["category"], "send");
         assert_eq!(e[0]["amount"].to_string(), "-1.50000000");
         assert_eq!(e[0]["fee"].to_string(), "-0.00010000");
@@ -2355,7 +2207,7 @@ mod tests {
             None,
             vec![out(true, true, 1, Some("self"), true)],
         );
-        assert!(tx_entries(&t, &HashMap::new(), 1, 0, None).is_empty());
+        assert!(tx_entries(&t, 1, 0, None).is_empty());
 
         // A self-transfer (from us, to us, not change) is Bitcoin Core's send + receive
         // pair: same address/vout, debit then credit, abandoned/fee on the send only.
@@ -2365,7 +2217,7 @@ mod tests {
             Some(10_000),
             vec![out(true, true, 200, Some("self"), false)],
         );
-        let e = tx_entries(&t, &HashMap::new(), 1, 0, None);
+        let e = tx_entries(&t, 1, 0, None);
         assert_eq!(e.len(), 2);
         assert_eq!(e[0]["category"], "send");
         assert_eq!(e[0]["amount"].to_string(), "-0.00000200");
@@ -2391,7 +2243,7 @@ mod tests {
         let t = tx(Some(50), false, Some(10_000), vec![o]);
 
         // listtransactions / listsinceblock.
-        let e = tx_entries(&t, &HashMap::new(), 1, 0, None);
+        let e = tx_entries(&t, 1, 0, None);
         assert_eq!(e.len(), 2, "self-payment pairs send+receive: {e:?}");
         assert_eq!(e[0]["category"], "send");
         assert_eq!(e[0]["amount"].to_string(), "-0.00000200");
@@ -2402,7 +2254,7 @@ mod tests {
         assert_eq!(e[1]["memoStr"], json!("gm: self-send"));
 
         // gettransaction details agree.
-        let d = gettransaction_details(&t, &HashMap::new());
+        let d = gettransaction_details(&t);
         assert_eq!(d.len(), 2, "self-payment details pair send+receive: {d:?}");
         assert_eq!(d[0]["category"], "send");
         assert_eq!(d[1]["category"], "receive");
@@ -2423,7 +2275,7 @@ mod tests {
             vec![out(true, true, 200, Some("uchange"), true)],
         );
         assert!(
-            tx_entries(&change, &HashMap::new(), 1, 0, None).is_empty(),
+            tx_entries(&change, 1, 0, None).is_empty(),
             "internal change stays hidden"
         );
     }
@@ -2440,7 +2292,7 @@ mod tests {
         let st = status(100);
         let conf = tx_confirmations(&st, &t);
         assert_eq!(conf, -1);
-        let e = tx_entries(&t, &HashMap::new(), conf, tx_time(&t, None), None);
+        let e = tx_entries(&t, conf, tx_time(&t, None), None);
         assert_eq!(e[0]["confirmations"], json!(-1));
         assert_eq!(e[0]["abandoned"], json!(true));
         // Expired txs can never be mined, so they are not trusted even though we authored
@@ -2459,13 +2311,8 @@ mod tests {
             vec![out(true, false, 5, Some("dest"), false)],
         );
         t.account_balance_delta = -10_005;
-        let e = tx_entries(
-            &t,
-            &HashMap::new(),
-            0,
-            tx_time(&t, Some(1_700_000_123)),
-            None,
-        );
+        // The actor's transient first-seen time (mempool stream) is surfaced while unmined.
+        let e = tx_entries(&t, 0, tx_time(&t, Some(1_700_000_123)), None);
         assert_eq!(e[0]["trusted"], json!(true));
         assert_eq!(e[0]["time"], json!(1_700_000_123));
         assert_eq!(e[0]["timereceived"], json!(1_700_000_123));
@@ -2476,7 +2323,7 @@ mod tests {
             None,
             vec![out(false, true, 5, Some("ua"), false)],
         );
-        let e = tx_entries(&f, &HashMap::new(), 0, tx_time(&f, None), None);
+        let e = tx_entries(&f, 0, tx_time(&f, None), None);
         assert_eq!(e[0]["trusted"], json!(false));
     }
 
@@ -2487,24 +2334,26 @@ mod tests {
         let mut unmined = tx(None, false, None, vec![]);
         unmined.created_time = Some(42);
         assert_eq!(tx_time(&unmined, Some(7)), 7); // first-seen (mempool stream) next
-        assert_eq!(tx_time(&unmined, None), 42); // wallet-created timestamp last
+        assert_eq!(tx_time(&unmined, None), 42); // wallet-created timestamp after that
+                                                 // Foreign unmined tx with no first-seen yet (e.g. just after a restart): 0 until the
+                                                 // mempool stream re-observes it or it mines.
         unmined.created_time = None;
         assert_eq!(tx_time(&unmined, None), 0);
     }
 
     #[test]
-    fn label_filter_keeps_only_matches() {
-        let mut labels = HashMap::new();
-        labels.insert("dest".to_string(), "alice".to_string());
+    fn label_filter_matches_only_empty_label_since_zecd_is_stateless() {
         let t = tx(
             Some(50),
             false,
             None,
             vec![out(false, true, 5, Some("dest"), false)],
         );
-        assert_eq!(tx_entries(&t, &labels, 1, 0, Some("alice")).len(), 1);
-        assert!(tx_entries(&t, &labels, 1, 0, Some("bob")).is_empty());
-        assert_eq!(tx_entries(&t, &labels, 1, 0, None).len(), 1);
+        // zecd keeps no labels: every entry's label is "", so a non-empty filter matches nothing.
+        assert!(tx_entries(&t, 1, 0, Some("alice")).is_empty());
+        // The default/empty label and the no-filter ("*") case both keep the entry.
+        assert_eq!(tx_entries(&t, 1, 0, Some("")).len(), 1);
+        assert_eq!(tx_entries(&t, 1, 0, None).len(), 1);
     }
 
     #[test]
@@ -2549,40 +2398,6 @@ mod tests {
         assert_eq!(txids.len(), 2);
         // minconf 0 picks up the unmined receive but still never the expired/change outputs.
         assert_eq!(received_by_address(&txs, &st, 0).get("a").unwrap().0, 157);
-    }
-
-    #[test]
-    fn received_by_label_groups_and_defaults_to_empty_label() {
-        let st = status(100);
-        let txs = vec![
-            tx(
-                Some(91),
-                false,
-                None,
-                vec![out(false, true, 100, Some("a1"), false)],
-            ),
-            tx(
-                Some(95),
-                false,
-                None,
-                vec![out(false, true, 50, Some("a2"), false)],
-            ),
-            tx(
-                Some(100),
-                false,
-                None,
-                vec![out(false, true, 7, Some("b"), false)],
-            ),
-        ];
-        let mut labels = HashMap::new();
-        labels.insert("a1".to_string(), "alice".to_string());
-        labels.insert("a2".to_string(), "alice".to_string());
-        // "b" is unlabelled -> default label "".
-        let received = received_by_address(&txs, &st, 1);
-        let by_label = received_by_label(&received, &labels);
-        // Amounts sum per label; confirmations are the minimum across the label's addresses.
-        assert_eq!(by_label.get("alice"), Some(&(150, 6)));
-        assert_eq!(by_label.get(""), Some(&(7, 1)));
     }
 
     #[test]
@@ -2667,13 +2482,12 @@ mod tests {
             tx_with(0x08, Some(15), false, &[(false, true, 110, false, 0)]), // receive
         ];
         let st = status(20);
-        let labels = HashMap::new();
 
         // The shared expander, identical to what `listtransactions` feeds the windower.
         let expand = |tx: &TxRecord| {
             let confirmations = tx_confirmations(&st, tx);
             let time = tx_time(tx, None);
-            tx_entries(tx, &labels, confirmations, time, None)
+            tx_entries(tx, confirmations, time, None)
         };
 
         // OLD reference oracle: expand everything oldest-first, slice the `count`-long tail.

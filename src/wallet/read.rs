@@ -351,7 +351,7 @@ pub fn list_transactions(wallet_dir: &Path) -> anyhow::Result<Vec<TxRecord>> {
 }
 
 /// A lightweight data source for the received-by aggregations
-/// (`getreceivedbyaddress`/`listreceivedbyaddress`/`getreceivedbylabel`/`listreceivedbylabel`),
+/// (`getreceivedbyaddress`/`listreceivedbyaddress`),
 /// avoiding [`list_transactions`]'s N+1 [`load_outputs`] and its per-tx memo/raw/block-hash
 /// overhead. One flat query joins `v_transactions` to `v_tx_outputs`; the rows are grouped
 /// into [`TxRecord`]s carrying only the fields the aggregation reads (`mined_height`,
@@ -529,6 +529,20 @@ pub fn unmined_raw_txs(wallet_dir: &Path, tip: u32) -> anyhow::Result<Vec<(Strin
         if unexpired {
             out.push((txid_display(&txid), raw));
         }
+    }
+    Ok(out)
+}
+
+/// Display-hex txids of every wallet transaction that is still unmined (`mined_height` NULL),
+/// including foreign incoming txs the mempool stream stored. Used to prune the actor's transient
+/// in-memory first-seen map (which only ever matters for unmined txs).
+pub fn unmined_txids(wallet_dir: &Path) -> anyhow::Result<Vec<String>> {
+    let conn = open_conn(wallet_dir)?;
+    let mut stmt = conn.prepare("SELECT txid FROM transactions WHERE mined_height IS NULL")?;
+    let rows = stmt.query_map([], |row| row.get::<_, Vec<u8>>(0))?;
+    let mut out = Vec::new();
+    for r in rows {
+        out.push(txid_display(&r?));
     }
     Ok(out)
 }
