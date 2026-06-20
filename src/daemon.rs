@@ -68,11 +68,12 @@ pub async fn run(config: AppConfig) -> anyhow::Result<()> {
     // reads the account from the wallet DB).
     let mut loaded: Vec<(String, bool)> = Vec::new();
     for (name, entry) in &config.wallets {
-        if !WalletStore::exists(&entry.dir) {
+        let keys_path = entry.keys_path();
+        if !WalletStore::exists(&keys_path) {
             warn!(
-                "wallet '{}' is not initialized at {}; skipping (run `{prog} init --wallet {}`)",
+                "wallet '{}' is not initialized ({} missing); skipping (run `{prog} init --wallet {}`)",
                 name,
-                entry.dir.display(),
+                keys_path.display(),
                 name
             );
             continue;
@@ -83,6 +84,7 @@ pub async fn run(config: AppConfig) -> anyhow::Result<()> {
             name: name.clone(),
             network: config.network,
             wallet_dir: entry.dir.clone(),
+            keys_path: keys_path.clone(),
             server,
             sync_interval: Duration::from_secs(config.sync.interval_secs),
             rebroadcast_interval: Duration::from_secs(config.sync.rebroadcast_secs),
@@ -91,6 +93,7 @@ pub async fn run(config: AppConfig) -> anyhow::Result<()> {
             reconnect_max: Duration::from_secs(config.backend.reconnect_max_secs),
             age_identity: config.keys.age_identity.clone(),
             auto_unlock: config.keys.auto_unlock,
+            bootstrap: config.keys.bootstrap_from_keys,
             // Validated at config load; re-derive here rather than carrying a second copy.
             confirmations_policy: config.spend.confirmations_policy()?,
             enabled_pools: entry.pools.clone(),

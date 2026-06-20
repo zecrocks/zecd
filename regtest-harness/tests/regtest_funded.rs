@@ -130,7 +130,7 @@ async fn regtest_funded_orchard_receive() {
     // still works (scanning needs only viewing keys), and Phase 2 exercises the unlock gate.
     let mut cfg = ZecdConfig::new(zebrad.rpc_port, pick_port().expect("pick zecd rpc port"));
     cfg.encrypt_passphrase = Some(ENCRYPT_PASSPHRASE.to_string());
-    let zecd = Zecd::start(&cfg)
+    let mut zecd = Zecd::start(&cfg)
         .await
         .expect("start zecd against regtest zebra");
     let zecd_ua = zecd
@@ -1223,6 +1223,62 @@ async fn regtest_funded_orchard_receive() {
         );
         tokio::time::sleep(Duration::from_millis(500)).await;
     }
+
+    // ---- bootstrap: rebuild data.sqlite from keys.toml on an empty data directory ----
+    //
+    // The cloud-native Phase-1 guarantee end to end on a real chain: wipe the wallet's
+    // data.sqlite + block cache (leaving keys.toml), restart, and confirm the daemon rebuilds
+    // the account from keys.toml and the funds - and spendability - come back. The wallet is
+    // encrypted, so this also exercises the locked path: it comes back with no account, refuses
+    // address generation, and only rebuilds once `walletpassphrase` supplies the seed.
+    drop(watch_only);
+    let tip = zecd
+        .block_count()
+        .await
+        .expect("getblockcount before the data-dir wipe (wallet is synced)");
+    let balance_before = zecd
+        .call("getbalance", json!([]))
+        .await
+        .expect("getbalance before the data-dir wipe");
+
+    zecd.restart_wiping_data_db()
+        .await
+        .expect("restart zecd on an emptied data directory");
+
+    // Locked, encrypted, empty datadir: no account yet, so address generation is refused until
+    // the passphrase arrives.
+    let pre_unlock = zecd.call("getnewaddress", json!([])).await;
+    assert!(
+        pre_unlock.is_err(),
+        "a locked, not-yet-bootstrapped wallet must refuse getnewaddress, got {pre_unlock:?}"
+    );
+
+    // The first walletpassphrase supplies the seed; the actor rebuilds the account from
+    // keys.toml and rescans from the birthday.
+    zecd.call("walletpassphrase", json!([ENCRYPT_PASSPHRASE, 3600]))
+        .await
+        .expect("walletpassphrase unlocks and triggers the rebuild");
+    zecd.wait_until_synced(tip, FUND_TIMEOUT)
+        .await
+        .expect("the rebuilt wallet rescans back to the tip");
+
+    let balance_after = zecd
+        .call("getbalance", json!([]))
+        .await
+        .expect("getbalance after the rebuild");
+    assert_eq!(
+        balance_after, balance_before,
+        "the rebuilt wallet recovers the same balance"
+    );
+
+    // The rebuilt account can actually sign and broadcast: a real send back to the funder.
+    let funder_ua = funder.unified_address().expect("funder unified address");
+    let send = zecd
+        .call("sendtoaddress", json!([funder_ua, 0.01]))
+        .await
+        .expect("the rebuilt wallet signs and broadcasts a spend");
+    let send_txid = send.as_str().expect("sendtoaddress txid").to_string();
+    mine_until_confirmed(&zebrad, &zecd, &send_txid, "post-rebuild send").await;
 }
 
 /// Mine one block at a time (giving the rebroadcast/scan loop time between blocks) until

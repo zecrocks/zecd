@@ -5,7 +5,7 @@ use std::num::NonZeroUsize;
 use std::path::PathBuf;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use anyhow::anyhow;
+use anyhow::{anyhow, Context};
 use tokio::sync::{mpsc, watch};
 use tracing::{error, info, warn};
 
@@ -14,8 +14,8 @@ use zcash_client_backend::data_api::wallet::{
     input_selection::GreedyInputSelector, propose_transfer, ConfirmationsPolicy, SpendingKeys,
 };
 use zcash_client_backend::data_api::{
-    Account, AccountPurpose, AccountSource, TransactionDataRequest, TransactionStatus, WalletRead,
-    WalletWrite,
+    Account, AccountBirthday, AccountPurpose, AccountSource, TransactionDataRequest,
+    TransactionStatus, WalletRead, WalletWrite,
 };
 use zcash_client_backend::fees::{
     standard::MultiOutputChangeStrategy, DustOutputPolicy, SplitPolicy, StandardFeeRule,
@@ -93,6 +93,8 @@ pub struct ActorConfig {
     pub name: String,
     pub network: ZNetwork,
     pub wallet_dir: PathBuf,
+    /// Path to this wallet's `keys.toml` (may live outside `wallet_dir`, e.g. a mounted Secret).
+    pub keys_path: PathBuf,
     /// The upstream zebrad endpoint.
     pub server: Server,
     pub sync_interval: Duration,
@@ -105,6 +107,9 @@ pub struct ActorConfig {
     pub reconnect_max: Duration,
     pub age_identity: Option<PathBuf>,
     pub auto_unlock: bool,
+    /// Rebuild the account from `keys.toml` when the data directory is empty (`[keys]
+    /// bootstrap_from_keys`).
+    pub bootstrap: bool,
     /// The wallet-wide confirmations policy (`[spend]` config; ZIP-315 3/10 by default),
     /// anchoring balances, spend proposals, and the `-6` enrichment.
     pub confirmations_policy: ConfirmationsPolicy,
@@ -121,6 +126,8 @@ struct WalletActor {
     name: String,
     network: ZNetwork,
     wallet_dir: PathBuf,
+    /// Path to this wallet's `keys.toml` (may live outside `wallet_dir`).
+    keys_path: PathBuf,
     /// The upstream zebrad endpoint.
     server: Server,
     connect_timeout: Duration,
@@ -135,8 +142,14 @@ struct WalletActor {
     enabled_pools: PoolSet,
     /// Receivers included by default in this wallet's Unified Addresses.
     default_receivers: PoolSet,
-    account_id: AccountUuid,
+    /// The wallet's account, or `None` while a bootstrap is pending (empty data directory whose
+    /// account hasn't been rebuilt from `keys.toml` yet - e.g. an encrypted wallet awaiting its
+    /// first `walletpassphrase`).
+    account_id: Option<AccountUuid>,
     account_index: Option<zip32::AccountId>,
+    /// When `Some`, the account must be (re)created from `keys.toml` at this birthday height once
+    /// the seed is available and an upstream is connected. `None` once an account exists.
+    pending_bootstrap: Option<BlockHeight>,
     db_data: WriteDb,
     db_cache: FsBlockDb,
     client: Option<AnySource>,
@@ -179,26 +192,74 @@ struct WalletActor {
 pub async fn spawn(
     cfg: ActorConfig,
 ) -> anyhow::Result<(WalletHandle, tokio::task::JoinHandle<()>)> {
-    if !store::WalletStore::exists(&cfg.wallet_dir) {
+    if !store::WalletStore::exists(&cfg.keys_path) {
         return Err(anyhow!(
             "wallet '{}' is not initialized ({} missing); run `zecd init --wallet {}`",
             cfg.name,
-            cfg.wallet_dir.join("keys.toml").display(),
+            cfg.keys_path.display(),
             cfg.name
         ));
     }
 
+    // The data directory must be writable: zecd creates/updates data.sqlite, blocks/ and
+    // labels.sqlite there. Probe it up front so a read-only mount fails with a clear error now,
+    // not later at an awkward moment - e.g. when a `walletpassphrase` arrives and the bootstrap
+    // tries to create the account.
+    ensure_dir_writable(&cfg.wallet_dir)
+        .with_context(|| format!("wallet '{}' data directory is not usable", cfg.name))?;
+
     let db_data = open::init_dbs(cfg.network, &cfg.wallet_dir)?;
     let db_cache = open::open_fsblockdb(&cfg.wallet_dir)?;
-    let (account_id, account_index, watch_only) = select_account(&db_data)?;
+    let st = store::WalletStore::read(&cfg.keys_path)?;
+    let encrypted = st.is_encrypted();
+
+    // Resolve the account. A normal data directory already has one. An *empty* data directory
+    // (keys.toml present, but data.sqlite carries no account) is the bootstrap case: when
+    // enabled, rebuild the account from keys.toml once the seed is available - immediately for an
+    // identity/auto-unlock wallet, at the first `walletpassphrase` for an encrypted one.
+    let (account_id, account_index, watch_only, pending_bootstrap) =
+        match try_select_account(&db_data)? {
+            Some((id, index, wo)) => (Some(id), index, wo, None),
+            None => {
+                if !st.has_seed() {
+                    // Watch-only wallet (no seed, and the UFVK isn't cached in keys.toml):
+                    // nothing on disk can rebuild a viewable account.
+                    return Err(anyhow!(
+                        "wallet '{}' has an empty data directory and no spending seed in \
+                         keys.toml (watch-only): it cannot be rebuilt. Recreate it with \
+                         `zecd init --ufvk`.",
+                        cfg.name
+                    ));
+                }
+                if !cfg.bootstrap {
+                    return Err(anyhow!(
+                        "wallet '{}' has no account in {}; run `zecd init`, or enable \
+                         [keys] bootstrap_from_keys to rebuild the data directory from keys.toml.",
+                        cfg.name,
+                        open::data_db_path(&cfg.wallet_dir).display()
+                    ));
+                }
+                info!(
+                    "[{}] empty data directory with keys.toml present: rebuilding the account \
+                     from keys.toml (birthday {}) once the seed is available{}",
+                    cfg.name,
+                    u32::from(st.birthday),
+                    if encrypted {
+                        " (call walletpassphrase to unlock)"
+                    } else {
+                        ""
+                    }
+                );
+                // A seed wallet is never watch-only; the rebuilt account is a spending account.
+                (None, None, false, Some(st.birthday))
+            }
+        };
 
     // Determine the wallet's encryption mode, and for unencrypted wallets optionally decrypt
     // the seed up-front for unattended sending. An encrypted wallet has no passphrase at rest,
     // so it cannot auto-unlock - it starts locked and requires `walletpassphrase` (matching
     // Bitcoin Core's encrypted-wallet behavior). A watch-only wallet has no seed anywhere, so
     // the whole unlock machinery is moot for it.
-    let st = store::WalletStore::read(&cfg.wallet_dir)?;
-    let encrypted = st.is_encrypted();
     let mut seed = SeedKeeper::locked();
     if watch_only {
         info!(
@@ -263,6 +324,7 @@ pub async fn spawn(
         name: cfg.name.clone(),
         network: cfg.network,
         wallet_dir: cfg.wallet_dir.clone(),
+        keys_path: cfg.keys_path.clone(),
         server: cfg.server,
         connect_timeout: cfg.connect_timeout,
         backoff: Backoff::new(cfg.reconnect_base, cfg.reconnect_max),
@@ -274,6 +336,7 @@ pub async fn spawn(
         default_receivers: cfg.default_receivers.clone(),
         account_id,
         account_index,
+        pending_bootstrap,
         db_data,
         db_cache,
         client: None,
@@ -311,12 +374,15 @@ pub async fn spawn(
 
 /// The actor's view of the wallet's (single) account: its id, the ZIP-32 index spending keys
 /// derive at (`None` when no spending is possible), and whether the account is watch-only
-/// (imported UFVK - `init --ufvk`).
-fn select_account(db: &WriteDb) -> anyhow::Result<(AccountUuid, Option<zip32::AccountId>, bool)> {
+/// (imported UFVK - `init --ufvk`). `Ok(None)` means the data directory carries no account yet
+/// (a bootstrap candidate), as distinct from a genuine read error.
+fn try_select_account(
+    db: &WriteDb,
+) -> anyhow::Result<Option<(AccountUuid, Option<zip32::AccountId>, bool)>> {
     let ids = db.get_account_ids()?;
-    let id = *ids
-        .first()
-        .ok_or_else(|| anyhow!("wallet has no accounts; run `zecd init` first"))?;
+    let Some(id) = ids.first().copied() else {
+        return Ok(None);
+    };
     let account = db
         .get_account(id)?
         .ok_or_else(|| anyhow!("selected account not found"))?;
@@ -328,7 +394,33 @@ fn select_account(db: &WriteDb) -> anyhow::Result<(AccountUuid, Option<zip32::Ac
             ..
         }
     );
-    Ok((id, index, watch_only))
+    Ok(Some((id, index, watch_only)))
+}
+
+/// Probe that `dir` exists and is writable (create it if missing), so a read-only data
+/// directory is caught at launch with a clear message rather than at the first write.
+fn ensure_dir_writable(dir: &std::path::Path) -> anyhow::Result<()> {
+    std::fs::create_dir_all(dir)
+        .with_context(|| format!("creating data directory {}", dir.display()))?;
+    let probe = dir.join(".zecd-write-test");
+    std::fs::write(&probe, b"zecd").with_context(|| {
+        format!(
+            "data directory {} is not writable (zecd must create and update data.sqlite, \
+             blocks/, and labels.sqlite there)",
+            dir.display()
+        )
+    })?;
+    let _ = std::fs::remove_file(&probe);
+    Ok(())
+}
+
+/// Error returned by address/spend operations while the account is still being rebuilt from
+/// `keys.toml` on an empty data directory (no account exists yet).
+fn account_not_ready() -> RpcError {
+    RpcError::wallet(
+        "wallet account is not ready: it is being rebuilt from keys.toml on an empty data \
+         directory (an encrypted wallet must be unlocked with walletpassphrase first)",
+    )
 }
 
 /// Bitcoin Core's exact refusal for spend/key operations on a wallet without private keys
@@ -793,7 +885,22 @@ impl WalletActor {
         let tip = BlockHeight::try_from(chain_tip.height)
             .map_err(|_| anyhow!("chain tip height out of range"))?;
         let prev = self.tip_height;
-        self.db_data.update_chain_tip(tip)?;
+        // Only push the chain tip into the wallet DB once an account exists. `update_chain_tip`
+        // derives the scan queue, and with no account `wallet_birthday` (MIN over accounts) is
+        // NULL - in which case librustzcash floors the tip-priority scan range at the lowest
+        // note-commitment *subtree* boundary (the min over the Sapling and Orchard shard tips)
+        // instead of the account birthday (zcash_client_sqlite `scanning::update_chain_tip`'s
+        // `tip_shard_entry`). For a from-`keys.toml` rebuild on testnet that dragged the rescan
+        // ~350k blocks below the birthday (to the in-progress *Sapling* shard's start) for an
+        // Orchard-only wallet, a ~16-minute restore. The bootstrap creates the account only
+        // *after* the actor's first connect/refresh, so calling `update_chain_tip` here with no
+        // account would insert that low range, and a later call can't raise an existing range's
+        // floor. So defer it: `maybe_bootstrap_account` calls `update_chain_tip` itself right
+        // after creating the account (birthday now set → the scan floors at the birthday). We
+        // still record the tip height/hash below so the bootstrap can run.
+        if self.account_id.is_some() {
+            self.db_data.update_chain_tip(tip)?;
+        }
         self.tip_height = Some(u32::from(tip));
         tracing::debug!(
             "[{}] tip refreshed: {:?} -> {} (suggest_scan_ranges drives the rescan/rewind)",
@@ -814,6 +921,12 @@ impl WalletActor {
         if self.client.is_none() {
             self.connect().await?;
         }
+        // Rebuild the account from keys.toml if the data directory was empty. Until that
+        // succeeds there is nothing to scan, so don't run a batch.
+        self.maybe_bootstrap_account().await;
+        if self.account_id.is_none() {
+            return Ok(false);
+        }
         let worked = {
             let client = self
                 .client
@@ -830,6 +943,123 @@ impl WalletActor {
         };
         self.update_status();
         Ok(worked)
+    }
+
+    /// Rebuild the wallet account from `keys.toml` on an empty data directory (the bootstrap
+    /// path). Best-effort and idempotent: requires the seed to be loaded (so an encrypted wallet
+    /// waits for its first `walletpassphrase`), a live upstream, and a known tip; when any is
+    /// missing it returns and is retried on the next pass. The birthday's tree state is fetched
+    /// fresh from the upstream (never cached on disk), reusing the exact path `zecd init` takes.
+    async fn maybe_bootstrap_account(&mut self) {
+        let Some(birthday_height) = self.pending_bootstrap else {
+            return;
+        };
+        if self.account_id.is_some() {
+            self.pending_bootstrap = None;
+            return;
+        }
+        // A copy of the seed (zeroized on drop); absent means the wallet is still locked.
+        let Some(seed) = self.seed.clone_seed() else {
+            return;
+        };
+        let Some(tip) = self.tip_height else {
+            return;
+        };
+        if self.client.is_none() {
+            return;
+        }
+        // Fetch the tree state just before the birthday (mirrors `init`). Height 0 has no tree
+        // state and is rejected upstream; clamp to >= 1.
+        let prior = u32::from(birthday_height).saturating_sub(1).max(1);
+        let treestate = {
+            let client = self.client.as_mut().expect("checked above");
+            match tokio::time::timeout(
+                UNARY_RPC_TIMEOUT,
+                client.tree_state(BlockHeight::from_u32(prior)),
+            )
+            .await
+            {
+                Ok(Ok(ts)) => ts,
+                Ok(Err(e)) => {
+                    warn!(
+                        "[{}] bootstrap: fetching birthday tree state failed: {e}",
+                        self.name
+                    );
+                    self.client = None;
+                    return;
+                }
+                Err(_) => {
+                    warn!(
+                        "[{}] bootstrap: birthday tree-state fetch timed out",
+                        self.name
+                    );
+                    self.client = None;
+                    return;
+                }
+            }
+        };
+        let birthday =
+            match AccountBirthday::from_treestate(treestate, Some(BlockHeight::from_u32(tip))) {
+                Ok(b) => b,
+                Err(_) => {
+                    warn!(
+                        "[{}] bootstrap: could not derive account birthday from tree state",
+                        self.name
+                    );
+                    return;
+                }
+            };
+        if let Err(e) = self
+            .db_data
+            .create_account("primary", &seed, &birthday, None)
+        {
+            warn!(
+                "[{}] bootstrap: creating the account failed: {e}",
+                self.name
+            );
+            return;
+        }
+        match try_select_account(&self.db_data) {
+            Ok(Some((id, index, watch_only))) => {
+                // Invariant: a zecd wallet is the first (and only) account of its seed, so
+                // `create_account` on the freshly-wiped, account-less DB must derive at ZIP-32
+                // account index 0 - the same index `zecd init` used, so the rebuilt account is
+                // the *same* wallet. Anything else would silently rebuild a different account.
+                debug_assert_eq!(
+                    index,
+                    zip32::AccountId::try_from(0u32).ok(),
+                    "bootstrap must rebuild the account at ZIP-32 index 0"
+                );
+                self.account_id = Some(id);
+                self.account_index = index;
+                self.watch_only = watch_only;
+                self.pending_bootstrap = None;
+                // First `update_chain_tip` with the account (and its birthday) now present - see
+                // `refresh_tip`. This is what derives the scan queue with a non-NULL
+                // `wallet_birthday`, so the rescan floors at the birthday instead of an
+                // in-progress subtree boundary far below it.
+                if let Err(e) = self.db_data.update_chain_tip(BlockHeight::from_u32(tip)) {
+                    warn!(
+                        "[{}] bootstrap: update_chain_tip after account creation failed: {e}",
+                        self.name
+                    );
+                }
+                info!(
+                    "[{}] rebuilt account from keys.toml; rescanning from birthday {}",
+                    self.name,
+                    u32::from(birthday_height)
+                );
+                self.update_status();
+            }
+            Ok(None) => warn!(
+                "[{}] bootstrap: account missing immediately after creation",
+                self.name
+            ),
+            Err(e) => warn!(
+                "[{}] bootstrap: re-reading the new account failed: {e}",
+                self.name
+            ),
+        }
     }
 
     fn update_status(&self) {
@@ -977,7 +1207,7 @@ impl WalletActor {
                 timeout_secs,
                 reply,
             } => {
-                let res = self.do_unlock(passphrase, timeout_secs);
+                let res = self.do_unlock(passphrase, timeout_secs).await;
                 let _ = reply.send(res);
             }
             WalletCommand::Lock { reply } => {
@@ -1002,6 +1232,11 @@ impl WalletActor {
         }
     }
 
+    /// The wallet's account id, or [`account_not_ready`] while a bootstrap is still pending.
+    fn require_account(&self) -> Result<AccountUuid, RpcError> {
+        self.account_id.ok_or_else(account_not_ready)
+    }
+
     fn get_new_address(
         &mut self,
         label: Option<String>,
@@ -1023,10 +1258,11 @@ impl WalletActor {
             }
             None => self.default_receivers.clone(),
         };
+        let account_id = self.require_account()?;
         let request = receivers.to_unified_address_request();
         let (ua, _) = self
             .db_data
-            .get_next_available_address(self.account_id, request)
+            .get_next_available_address(account_id, request)
             .map_err(|e| RpcError::wallet(format!("address generation failed: {e}")))?
             .ok_or_else(|| {
                 RpcError::wallet(format!(
@@ -1054,6 +1290,7 @@ impl WalletActor {
         // hasn't fired yet (e.g. a long sync batch was in progress), lock now so the spend
         // can't slip through past its timeout. `derive_usk` then returns -13 as expected.
         self.relock_if_expired();
+        let account_id = self.require_account()?;
         let account_index = self.account_index.ok_or_else(private_keys_disabled)?;
         let usk = self.seed.derive_usk(self.network, account_index)?;
 
@@ -1061,7 +1298,6 @@ impl WalletActor {
         // Run it under `block_in_place` so it doesn't stall the async runtime, and so the
         // single send doesn't block the actor thread from being cooperatively yielded.
         let net = self.network;
-        let account_id = self.account_id;
         // A per-call `minconf` (z_sendmany) overrides the wallet-wide policy for this send's
         // note selection; the synchronous sends pass `None` and use the configured policy.
         let policy = confirmations.unwrap_or(self.confirmations_policy);
@@ -1314,7 +1550,7 @@ impl WalletActor {
     /// `walletpassphrase`: decrypt the seed with `passphrase` and hold it unlocked until
     /// `timeout_secs` from now (argument validation/clamping happens in the RPC layer). Only
     /// valid for an encrypted wallet; an unencrypted one returns -15 like Bitcoin Core.
-    fn do_unlock(
+    async fn do_unlock(
         &mut self,
         passphrase: store::Passphrase,
         timeout_secs: i64,
@@ -1325,7 +1561,7 @@ impl WalletActor {
                 "Error: running with an unencrypted wallet, but walletpassphrase was called.",
             ));
         }
-        let st = store::WalletStore::read(&self.wallet_dir)
+        let st = store::WalletStore::read(&self.keys_path)
             .map_err(|e| RpcError::wallet(format!("reading keys.toml: {e}")))?;
         // scrypt is deliberately slow (~1s at the default work factor); run it under
         // `block_in_place` so it doesn't stall the async runtime (the proving pattern).
@@ -1343,6 +1579,13 @@ impl WalletActor {
         // relocks ~immediately, which `relock_if_expired` then enforces.
         self.unlock_until = Some(Instant::now() + Duration::from_secs(timeout_secs.max(0) as u64));
         self.relock_if_expired();
+        // First unlock of an encrypted wallet on an empty data directory: now that the seed is
+        // available, rebuild the account from keys.toml right away (best-effort; if the upstream
+        // isn't connected yet the regular sync loop retries). Skipped if the timeout was 0 (the
+        // seed was just relocked) or no bootstrap is pending.
+        if self.pending_bootstrap.is_some() && self.seed.is_unlocked() {
+            self.maybe_bootstrap_account().await;
+        }
         self.update_status();
         Ok(())
     }
@@ -1635,6 +1878,32 @@ fn enrich_insufficient_funds(db: &WriteDb, policy: ConfirmationsPolicy, err: Rpc
 #[cfg(test)]
 mod tests {
     use super::sanitize_upstream_msg;
+
+    /// The launch-time data-directory writability probe: succeeds on a fresh writable dir
+    /// (creating it if needed) and fails clearly when the path can't be a writable directory.
+    #[test]
+    fn ensure_dir_writable_probes_the_data_directory() {
+        use super::ensure_dir_writable;
+        let dir = tempfile::tempdir().unwrap();
+
+        // A writable directory passes, and the probe file is cleaned up (not left behind).
+        let wd = dir.path().join("wallet");
+        ensure_dir_writable(&wd).expect("a fresh writable dir is usable");
+        assert!(wd.is_dir());
+        assert!(
+            !wd.join(".zecd-write-test").exists(),
+            "the probe file is removed"
+        );
+
+        // A path that cannot be a directory (its parent is a regular file) fails - portable
+        // across uids, unlike chmod-based read-only tests that root bypasses.
+        let file = dir.path().join("a-file");
+        std::fs::write(&file, b"x").unwrap();
+        assert!(
+            ensure_dir_writable(&file.join("sub")).is_err(),
+            "a non-directory parent must fail the writability probe"
+        );
+    }
 
     /// FullPrivacy's single-pool rule: violated by any transparent component, or by touching
     /// both shielded pools (a Sapling<->Orchard turnstile crossing). A transaction confined to

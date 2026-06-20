@@ -46,6 +46,75 @@ fn genesis_birthday() -> AccountBirthday {
     )
 }
 
+/// The Phase-1 bootstrap rebuild is deterministic: recreating the account from the same seed
+/// (what the actor does on an empty data directory) reproduces the *same* wallet - identical
+/// UFVK and identical addresses at every diversifier index. This is the offline proof that a
+/// rebuilt `data.sqlite` is the same wallet; the live funded-spend-after-rebuild is exercised
+/// by the regtest CI tier.
+#[test]
+fn bootstrap_rebuild_reproduces_the_same_account() {
+    use zcash_client_backend::data_api::Account as _;
+
+    let net = network::regtest();
+    let dir = tempfile::tempdir().unwrap();
+    let wd = dir.path();
+    let indexes = [1u32, 77, 4242];
+
+    // The original account, with its UFVK and a few diversified addresses recorded.
+    let mut db = open::init_dbs(net, wd).expect("init dbs");
+    let (account, _usk) = db
+        .create_account("primary", &test_seed(), &genesis_birthday(), None)
+        .expect("create account");
+    let ufvk_before = db
+        .get_account(account)
+        .unwrap()
+        .unwrap()
+        .ufvk()
+        .unwrap()
+        .encode(&net);
+    let addrs_before: Vec<String> = indexes
+        .iter()
+        .map(|&i| {
+            let j = zip32::DiversifierIndex::from(i);
+            db.get_address_for_index(account, j, UnifiedAddressRequest::ORCHARD)
+                .unwrap()
+                .unwrap()
+                .encode(&net)
+        })
+        .collect();
+    drop(db);
+
+    // Wipe data.sqlite and its WAL sidecars - the empty-data-directory bootstrap case.
+    let data = open::data_db_path(wd);
+    for suffix in ["", "-wal", "-shm"] {
+        let _ = std::fs::remove_file(format!("{}{}", data.display(), suffix));
+    }
+
+    // Rebuild from the same seed (what the actor's bootstrap does, minus the network-fetched
+    // birthday tree state) and confirm it is byte-for-byte the same wallet.
+    let mut db2 = open::init_dbs(net, wd).expect("re-init dbs");
+    let (account2, _) = db2
+        .create_account("primary", &test_seed(), &genesis_birthday(), None)
+        .expect("recreate account");
+    let ufvk_after = db2
+        .get_account(account2)
+        .unwrap()
+        .unwrap()
+        .ufvk()
+        .unwrap()
+        .encode(&net);
+    assert_eq!(ufvk_after, ufvk_before, "rebuilt account has the same UFVK");
+    for (&i, before) in indexes.iter().zip(&addrs_before) {
+        let j = zip32::DiversifierIndex::from(i);
+        let after = db2
+            .get_address_for_index(account2, j, UnifiedAddressRequest::ORCHARD)
+            .unwrap()
+            .unwrap()
+            .encode(&net);
+        assert_eq!(&after, before, "same address at index {i} after rebuild");
+    }
+}
+
 #[test]
 fn regtest_wallet_lifecycle() {
     let net = network::regtest();
@@ -277,10 +346,12 @@ fn offline_actor_cfg(
 ) -> (ActorConfig, tokio::sync::watch::Sender<bool>) {
     let (shutdown_tx, shutdown) = tokio::sync::watch::channel(false);
     let net = network::regtest();
+    let keys_path = crate::wallet::store::keys_path(&wallet_dir);
     let cfg = ActorConfig {
         name: name.to_string(),
         network: net,
         wallet_dir,
+        keys_path,
         server: backend::resolve("127.0.0.1:1", net).unwrap(),
         sync_interval: Duration::from_secs(60),
         rebroadcast_interval: Duration::from_secs(60),
@@ -289,6 +360,7 @@ fn offline_actor_cfg(
         reconnect_max: Duration::from_secs(60),
         age_identity: None,
         auto_unlock: true,
+        bootstrap: true,
         confirmations_policy: Default::default(),
         enabled_pools: crate::pools::PoolSet::single(crate::pools::Pool::Orchard),
         default_receivers: crate::pools::PoolSet::single(crate::pools::Pool::Orchard),
@@ -307,7 +379,7 @@ async fn encrypted_wallet_unlock_lock_cycle() {
     // Build a passphrase-encrypted, account-initialized regtest wallet offline.
     let mnemonic = <Mnemonic<English>>::from_phrase(TEST_PHRASE).unwrap();
     WalletStore::init_with_passphrase(
-        &wd,
+        &crate::wallet::store::keys_path(&wd),
         Passphrase::from("pw".to_string()),
         &mnemonic,
         BlockHeight::from_u32(1),
@@ -363,7 +435,7 @@ async fn unencrypted_wallet_rejects_passphrase_rpcs() {
     let recipient = identity.to_public();
     let mnemonic = <Mnemonic<English>>::from_phrase(TEST_PHRASE).unwrap();
     WalletStore::init_with_mnemonic(
-        &wd,
+        &crate::wallet::store::keys_path(&wd),
         std::iter::once(&recipient as &dyn age::Recipient),
         &mnemonic,
         BlockHeight::from_u32(1),
@@ -409,7 +481,12 @@ async fn watch_only_wallet_disables_spending_rpcs() {
 
     // Build the watch-only wallet exactly as `init --ufvk` does: a seedless keys.toml plus a
     // view-only UFVK import (the UFVK derived from the committed test seed).
-    WalletStore::init_view_only(&wd, BlockHeight::from_u32(1), net).unwrap();
+    WalletStore::init_view_only(
+        &crate::wallet::store::keys_path(&wd),
+        BlockHeight::from_u32(1),
+        net,
+    )
+    .unwrap();
     let ufvk = {
         let seed = test_seed();
         UnifiedSpendingKey::from_seed(

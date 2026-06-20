@@ -53,6 +53,15 @@ fn select_server_token(cli_server: Option<String>, file_server: Option<String>) 
         .unwrap_or_else(|| DEFAULT_SERVER.to_string())
 }
 
+/// Read a single secret (e.g. the RPC password) from a file, trimming a trailing newline/CR
+/// (the common `echo "secret" > file` gotcha) but preserving any other surrounding whitespace.
+/// Used for `[rpc] password_file` so the secret can live in a mounted Secret, not the TOML.
+fn read_secret_file(path: &std::path::Path) -> anyhow::Result<String> {
+    let raw = std::fs::read_to_string(path)
+        .with_context(|| format!("reading secret file {}", path.display()))?;
+    Ok(raw.trim_end_matches(['\n', '\r']).to_string())
+}
+
 #[derive(Debug, Clone)]
 pub struct AppConfig {
     pub network: ZNetwork,
@@ -116,10 +125,25 @@ pub struct LogConfig {
 #[derive(Debug, Clone)]
 pub struct WalletEntry {
     pub dir: PathBuf,
+    /// Where this wallet's `keys.toml` lives. `None` means the default location,
+    /// `<dir>/keys.toml`; an explicit path (per-wallet `keys_file`, or the global
+    /// `[keys] keys_file` / `ZECD_KEYS_FILE` for the default wallet) lets the encrypted seed
+    /// be mounted as a Kubernetes Secret separately from the (disposable) data directory.
+    pub keys_file: Option<PathBuf>,
     /// Shielded pools this wallet receives into and spends from (resolved per wallet).
     pub pools: PoolSet,
     /// Receivers included by default in this wallet's Unified Addresses (a subset of `pools`).
     pub default_receivers: PoolSet,
+}
+
+impl WalletEntry {
+    /// The effective path to this wallet's `keys.toml` (the explicit `keys_file` override, or
+    /// `<dir>/keys.toml` by default).
+    pub fn keys_path(&self) -> PathBuf {
+        self.keys_file
+            .clone()
+            .unwrap_or_else(|| self.dir.join("keys.toml"))
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -181,6 +205,13 @@ pub struct KeysConfig {
     pub age_identity: Option<PathBuf>,
     /// When true, decrypt the seed at startup so sends need no `walletpassphrase`.
     pub auto_unlock: bool,
+    /// When true (the default), a wallet whose `keys.toml` is present but whose `data.sqlite`
+    /// has no account is rebuilt from `keys.toml` on boot: the account is recreated from the
+    /// seed (once available - immediately for identity/auto-unlock wallets, at first
+    /// `walletpassphrase` for encrypted ones) and the wallet rescans from its birthday. Lets the
+    /// data directory be a disposable cache while the seed lives in a mounted Secret. Set false
+    /// to instead fail fast on an empty datadir.
+    pub bootstrap_from_keys: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -267,7 +298,6 @@ impl SpendConfig {
     }
 }
 
-
 // ---------------------------------------------------------------------------
 // On-disk TOML representation
 // ---------------------------------------------------------------------------
@@ -311,6 +341,8 @@ struct LogFile {
 #[serde(deny_unknown_fields)]
 struct WalletFile {
     dir: Option<PathBuf>,
+    /// Path to this wallet's `keys.toml`, independent of `dir` (mount it as a Secret).
+    keys_file: Option<PathBuf>,
     /// Override the global `[pools] enabled` for this wallet.
     pools: Option<Vec<String>>,
     /// Override the global `[pools] default_receivers` for this wallet.
@@ -341,6 +373,11 @@ struct RpcFile {
     port: Option<u16>,
     user: Option<String>,
     password: Option<String>,
+    /// Read the RPC password from this file (trailing newline trimmed) instead of inlining it.
+    /// Lets the password - which is spend-equivalent for clients - live in a Kubernetes Secret
+    /// rather than the ConfigMap the rest of the config lands in. Overrides `password`; the
+    /// `--rpcpassword` flag / `ZECD_RPC_PASSWORD` env still win over both.
+    password_file: Option<PathBuf>,
     auth: Option<Vec<String>>,
     cookiefile: Option<PathBuf>,
     work_queue: Option<usize>,
@@ -352,6 +389,12 @@ struct RpcFile {
 struct KeysFile {
     age_identity: Option<PathBuf>,
     auto_unlock: Option<bool>,
+    /// Path to the default wallet's `keys.toml`, independent of the datadir (mount as a Secret).
+    /// Equivalent to `[wallets.<default>] keys_file`; the `ZECD_KEYS_FILE` env / `--keys-file`
+    /// flag override it.
+    keys_file: Option<PathBuf>,
+    /// Rebuild `data.sqlite` from `keys.toml` on an empty datadir (default true).
+    bootstrap_from_keys: Option<bool>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -416,8 +459,9 @@ pub struct Cli {
     #[arg(long = "rpcuser", value_name = "USER")]
     pub rpc_user: Option<String>,
 
-    /// RPC password (HTTP Basic auth).
-    #[arg(long = "rpcpassword", value_name = "PASS")]
+    /// RPC password (HTTP Basic auth). May also be supplied via `ZECD_RPC_PASSWORD` or
+    /// `[rpc] password_file` so it need not live in the (ConfigMap-bound) TOML.
+    #[arg(long = "rpcpassword", value_name = "PASS", env = "ZECD_RPC_PASSWORD")]
     pub rpc_password: Option<String>,
 
     /// rpcauth credential (`<user>:<salt>$<hmac-sha256 hex>`); may be repeated.
@@ -431,6 +475,11 @@ pub struct Cli {
     /// age identity file used to decrypt the wallet seed for sending.
     #[arg(long, value_name = "FILE", env = "ZECD_AGE_IDENTITY")]
     pub age_identity: Option<PathBuf>,
+
+    /// Path to the default wallet's `keys.toml`, independent of the datadir (so the encrypted
+    /// seed can be a mounted Secret while the datadir stays a disposable cache).
+    #[arg(long, value_name = "FILE", env = "ZECD_KEYS_FILE")]
+    pub keys_file: Option<PathBuf>,
 
     /// Subcommand. When omitted, runs the daemon.
     #[command(subcommand)]
@@ -457,9 +506,15 @@ pub struct InitArgs {
     #[arg(long, default_value = "default")]
     pub wallet: String,
 
-    /// Restore from an existing mnemonic instead of generating a new one (read from stdin).
+    /// Restore from an existing mnemonic instead of generating a new one. The phrase is read
+    /// from `--mnemonic-file`, else the `ZECD_MNEMONIC` env var, else stdin.
     #[arg(long)]
     pub restore: bool,
+
+    /// For `--restore`: read the mnemonic phrase from this file (trailing newline trimmed)
+    /// instead of stdin, for non-interactive init. `ZECD_MNEMONIC` takes precedence.
+    #[arg(long, value_name = "FILE")]
+    pub mnemonic_file: Option<PathBuf>,
 
     /// Passphrase-encrypt the wallet (Bitcoin-Core style): the mnemonic is wrapped with a
     /// passphrase instead of the age identity, and the wallet starts locked - sending requires
@@ -551,6 +606,15 @@ impl AppConfig {
             .clone()
             .unwrap_or_else(|| "default".to_string());
 
+        // keys.toml location override (so the encrypted seed can be a mounted Secret, separate
+        // from the disposable datadir). The global `[keys] keys_file` / `ZECD_KEYS_FILE` /
+        // `--keys-file` applies to the default wallet; a per-wallet `[wallets.<name>] keys_file`
+        // overrides it for that wallet.
+        let keys_file_global = cli
+            .keys_file
+            .clone()
+            .or_else(|| file.keys.as_ref().and_then(|k| k.keys_file.clone()));
+
         // Global pool defaults (`[pools]`), validated before any per-wallet override.
         let pools = resolve_global_pools(file.pools.as_ref())?;
 
@@ -560,6 +624,13 @@ impl AppConfig {
         let mut wallets = BTreeMap::new();
         for (name, w) in &file.wallets {
             let dir = w.dir.clone().unwrap_or_else(|| datadir.join(name));
+            let keys_file = w.keys_file.clone().or_else(|| {
+                if name == &default_wallet {
+                    keys_file_global.clone()
+                } else {
+                    None
+                }
+            });
             let (enabled, default_receivers) = resolve_wallet_pools(
                 name,
                 w.pools.as_deref(),
@@ -570,6 +641,7 @@ impl AppConfig {
                 name.clone(),
                 WalletEntry {
                     dir,
+                    keys_file,
                     pools: enabled,
                     default_receivers,
                 },
@@ -579,6 +651,7 @@ impl AppConfig {
             .entry(default_wallet.clone())
             .or_insert_with(|| WalletEntry {
                 dir: datadir.join(&default_wallet),
+                keys_file: keys_file_global.clone(),
                 pools: pools.enabled.clone(),
                 default_receivers: pools.default_receivers.clone(),
             });
@@ -613,11 +686,20 @@ impl AppConfig {
             port: None,
             user: None,
             password: None,
+            password_file: None,
             auth: None,
             cookiefile: None,
             work_queue: None,
             allowed_methods: None,
         });
+        // RPC password precedence: `--rpcpassword` / `ZECD_RPC_PASSWORD` (clap) > `[rpc]
+        // password_file` > inline `[rpc] password`. A configured `password_file` that can't be
+        // read is fatal (fail fast rather than silently fall through to a weaker source).
+        let password_from_file = rpc_file
+            .password_file
+            .as_deref()
+            .map(read_secret_file)
+            .transpose()?;
         // RPC method safelist: validate every entry against the known method set so a typo
         // fails at startup rather than silently disabling a method the operator meant to keep
         // (or, worse, appearing to allow one it doesn't). An absent or empty list means "no
@@ -646,7 +728,11 @@ impl AppConfig {
                 ZNetwork::Test | ZNetwork::Regtest(_) => defaults.rpc_port_test,
             }),
             user: cli.rpc_user.clone().or(rpc_file.user),
-            password: cli.rpc_password.clone().or(rpc_file.password),
+            password: cli
+                .rpc_password
+                .clone()
+                .or(password_from_file)
+                .or(rpc_file.password),
             // rpcauth entries accumulate across CLI and file, matching bitcoind where
             // every -rpcauth/conf line is an accepted credential.
             auth: cli
@@ -665,6 +751,8 @@ impl AppConfig {
         let keys_file = file.keys.unwrap_or(KeysFile {
             age_identity: None,
             auto_unlock: None,
+            keys_file: None,
+            bootstrap_from_keys: None,
         });
         let keys = KeysConfig {
             // Default to <datadir>/identity.txt, matching where `zecd init` writes the
@@ -675,6 +763,7 @@ impl AppConfig {
                 .or(keys_file.age_identity)
                 .or_else(|| Some(datadir.join("identity.txt"))),
             auto_unlock: keys_file.auto_unlock.unwrap_or(true),
+            bootstrap_from_keys: keys_file.bootstrap_from_keys.unwrap_or(true),
         };
 
         let sync_file = file.sync.unwrap_or(SyncFile {
@@ -1092,6 +1181,110 @@ mod tests {
         let cli = Cli::parse_from(["zecd", "--conf", conf.to_str().unwrap()]);
         let err = AppConfig::resolve(&cli).unwrap_err().to_string();
         assert!(err.contains("getblance"), "got: {err}");
+    }
+
+    #[test]
+    fn read_secret_file_trims_trailing_newline_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("pw");
+        // The classic `echo "secret" > file` leaves a trailing newline; it must be stripped,
+        // but interior/leading whitespace is preserved (a password may legitimately contain it).
+        std::fs::write(&p, "  hunter2 spaces \n").unwrap();
+        assert_eq!(read_secret_file(&p).unwrap(), "  hunter2 spaces ");
+        // A missing file is an error (fail fast), not an empty password.
+        assert!(read_secret_file(&dir.path().join("nope")).is_err());
+    }
+
+    #[test]
+    fn rpc_password_file_is_read_and_overridden_by_cli() {
+        use clap::Parser as _;
+        let dir = tempfile::tempdir().unwrap();
+        let pw = dir.path().join("rpc.pw");
+        std::fs::write(&pw, "from-file\n").unwrap();
+        let conf = dir.path().join("zecd.toml");
+        std::fs::write(
+            &conf,
+            format!(
+                "network = \"test\"\n[rpc]\nuser = \"u\"\npassword = \"inline\"\npassword_file = \"{}\"\n",
+                pw.display()
+            ),
+        )
+        .unwrap();
+
+        // password_file overrides the inline [rpc] password...
+        let cli = Cli::parse_from(["zecd", "--conf", conf.to_str().unwrap()]);
+        let cfg = AppConfig::resolve(&cli).unwrap();
+        assert_eq!(cfg.rpc.password.as_deref(), Some("from-file"));
+
+        // ...but an explicit --rpcpassword still wins over the file.
+        let cli = Cli::parse_from([
+            "zecd",
+            "--conf",
+            conf.to_str().unwrap(),
+            "--rpcpassword",
+            "from-cli",
+        ]);
+        let cfg = AppConfig::resolve(&cli).unwrap();
+        assert_eq!(cfg.rpc.password.as_deref(), Some("from-cli"));
+
+        // A configured-but-missing password_file is a startup error.
+        std::fs::write(
+            &conf,
+            "network = \"test\"\n[rpc]\npassword_file = \"/no/such/rpc.pw\"\n",
+        )
+        .unwrap();
+        let cli = Cli::parse_from(["zecd", "--conf", conf.to_str().unwrap()]);
+        assert!(AppConfig::resolve(&cli).is_err());
+    }
+
+    #[test]
+    fn keys_file_override_resolves_per_wallet() {
+        use clap::Parser as _;
+        let dir = tempfile::tempdir().unwrap();
+        let conf = dir.path().join("zecd.toml");
+
+        // Default: keys.toml lives under the wallet's dir.
+        std::fs::write(&conf, "network = \"test\"\ndatadir = \"/d\"\n").unwrap();
+        let cli = Cli::parse_from(["zecd", "--conf", conf.to_str().unwrap()]);
+        let cfg = AppConfig::resolve(&cli).unwrap();
+        assert_eq!(
+            cfg.wallets["default"].keys_path(),
+            PathBuf::from("/d/default/keys.toml")
+        );
+
+        // Global [keys] keys_file applies to the default wallet; a per-wallet override wins for
+        // the named wallet and the global doesn't leak onto non-default wallets.
+        std::fs::write(
+            &conf,
+            "network = \"test\"\ndatadir = \"/d\"\n\
+             [keys]\nkeys_file = \"/secrets/keys.toml\"\n\
+             [wallets.other]\nkeys_file = \"/secrets/other.toml\"\n",
+        )
+        .unwrap();
+        let cli = Cli::parse_from(["zecd", "--conf", conf.to_str().unwrap()]);
+        let cfg = AppConfig::resolve(&cli).unwrap();
+        assert_eq!(
+            cfg.wallets["default"].keys_path(),
+            PathBuf::from("/secrets/keys.toml")
+        );
+        assert_eq!(
+            cfg.wallets["other"].keys_path(),
+            PathBuf::from("/secrets/other.toml")
+        );
+
+        // --keys-file overrides the file's global keys_file for the default wallet.
+        let cli = Cli::parse_from([
+            "zecd",
+            "--conf",
+            conf.to_str().unwrap(),
+            "--keys-file",
+            "/cli/keys.toml",
+        ]);
+        let cfg = AppConfig::resolve(&cli).unwrap();
+        assert_eq!(
+            cfg.wallets["default"].keys_path(),
+            PathBuf::from("/cli/keys.toml")
+        );
     }
 
     #[test]

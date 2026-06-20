@@ -580,6 +580,17 @@ the third is cloud-native key wrapping for ops teams:
 In both models, anyone with RPC access to an unlocked wallet can spend: treat RPC credentials as
 spend authority.
 
+**Keeping secrets out of the config file (12-factor / Kubernetes).** The RPC password, the
+`keys.toml` location, and the age identity can each be sourced from the environment or a mounted
+Secret file rather than the (ConfigMap-bound) TOML: `ZECD_RPC_PASSWORD` / `[rpc] password_file`
+for the RPC password (spend-equivalent for clients), `ZECD_KEYS_FILE` / `--keys-file` / `keys_file`
+for `keys.toml`, and `ZECD_AGE_IDENTITY` for the identity. `zecd init --restore` is non-interactive
+via `ZECD_MNEMONIC` / `--mnemonic-file` (and `ZECD_WALLET_PASSPHRASE` for `--encrypt`). With
+`[keys] bootstrap_from_keys` (default on), an empty data directory next to `keys.toml` is rebuilt
+automatically on boot - the account is recreated from the seed (at the first `walletpassphrase`
+for an encrypted wallet) and the wallet rescans - so the data directory is a disposable cache and
+the deployment is "mount one Secret, start with an empty PVC".
+
 Memory hardening (in-memory seed): once unlocked, the seed lives in process memory regardless of
 custody model. zecd hardens that against *passive* capture, best-effort at startup (each step is
 a no-op-with-warning if the platform/privileges disallow it, never a startup failure):

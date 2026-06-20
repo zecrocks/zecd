@@ -69,6 +69,21 @@ impl SeedKeeper {
         self.seed = Some(MlockedSeed::new(seed));
     }
 
+    /// Whether the seed is currently loaded (the wallet is unlocked).
+    pub fn is_unlocked(&self) -> bool {
+        self.seed.is_some()
+    }
+
+    /// A copy of the decrypted seed, if loaded - for recreating the wallet account from
+    /// `keys.toml` on an empty datadir (the bootstrap path). The returned `SecretVec` zeroizes on
+    /// drop; the copy is short-lived and not `mlock`ed, matching the transient exposure that
+    /// `derive_usk` already makes during a send.
+    pub fn clone_seed(&self) -> Option<SecretVec<u8>> {
+        self.seed
+            .as_ref()
+            .map(|s| SecretVec::new(s.expose().to_vec()))
+    }
+
     /// Derive the Unified Spending Key for an account index, or return the bitcoind
     /// "unlock needed" error (-13) if the seed is not loaded.
     pub fn derive_usk(
@@ -168,11 +183,12 @@ mod tests {
     #[test]
     fn decrypt_seed_with_identity_reads_identity_file() {
         let dir = tempfile::tempdir().unwrap();
+        let kp = crate::wallet::store::keys_path(dir.path());
         let identity = age::x25519::Identity::generate();
         let recipient = identity.to_public();
         let mnemonic = <Mnemonic<English>>::from_phrase(PHRASE).unwrap();
         WalletStore::init_with_mnemonic(
-            dir.path(),
+            &kp,
             std::iter::once(&recipient as &dyn age::Recipient),
             &mnemonic,
             BlockHeight::from_u32(1),
@@ -187,7 +203,7 @@ mod tests {
             std::fs::write(&id_path, identity.to_string().expose_secret()).unwrap();
         }
 
-        let st = WalletStore::read(dir.path()).unwrap();
+        let st = WalletStore::read(&kp).unwrap();
         let seed = decrypt_seed_with_identity(&st, &id_path)
             .unwrap()
             .expect("the wallet has a stored mnemonic");

@@ -823,6 +823,48 @@ impl Zecd {
         export_ufvk_from_datadir(self._datadir.path(), wallet)
     }
 
+    /// Stop the daemon, delete every wallet's `data.sqlite` (and the compact-block cache), and
+    /// restart against the *same* data directory - simulating a disposable/empty data directory
+    /// next to a preserved `keys.toml`. Exercises the Phase-1 bootstrap rebuild path on a real
+    /// chain. `keys.toml`, the age identity, and `zecd.toml` are left untouched, so the daemon
+    /// rebuilds the account from `keys.toml` (immediately for an auto-unlock wallet, at the first
+    /// `walletpassphrase` for an encrypted one). The RPC port/credentials are unchanged.
+    pub async fn restart_wiping_data_db(&mut self) -> Result<()> {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+
+        // Remove each wallet subdirectory's derived state, keeping its keys.toml.
+        for entry in std::fs::read_dir(self._datadir.path()).context("read datadir for wipe")? {
+            let path = entry.context("datadir entry")?.path();
+            if path.is_dir() {
+                let _ = std::fs::remove_dir_all(path.join("blocks"));
+                for name in ["data.sqlite", "data.sqlite-wal", "data.sqlite-shm"] {
+                    let _ = std::fs::remove_file(path.join(name));
+                }
+            }
+        }
+
+        let (out, err) = if std::env::var_os("ZECD_STDERR").is_some() {
+            (Stdio::inherit(), Stdio::inherit())
+        } else {
+            (Stdio::null(), Stdio::null())
+        };
+        let child = Command::new(zecd_bin())
+            .args([
+                "--datadir",
+                self._datadir.path().to_str().unwrap(),
+                "--regtest",
+                "run",
+            ])
+            .stdout(out)
+            .stderr(err)
+            .spawn()
+            .context("respawn zecd on the wiped data directory")?;
+        self.child = child;
+        self.wait_until_rpc_up().await?;
+        Ok(())
+    }
+
     /// Graceful shutdown via the `stop` RPC: asserts bitcoind's reply shape ("zecd stopping"),
     /// then waits for the process to exit cleanly (status 0).
     pub async fn shutdown(mut self) -> Result<()> {

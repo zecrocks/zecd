@@ -48,15 +48,15 @@ struct StoreEncoding {
 }
 
 impl WalletStore {
-    /// True if a `keys.toml` exists for this wallet directory.
-    pub fn exists(wallet_dir: &Path) -> bool {
-        keys_path(wallet_dir).exists()
+    /// True if a `keys.toml` exists at this path.
+    pub fn exists(keys_path: &Path) -> bool {
+        keys_path.exists()
     }
 
     /// Create a new `keys.toml` holding the mnemonic encrypted to the age identity (no
     /// passphrase - the legacy/unencrypted model, decryptable via the identity file).
     pub fn init_with_mnemonic<'a>(
-        wallet_dir: &Path,
+        keys_path: &Path,
         recipients: impl Iterator<Item = &'a dyn age::Recipient>,
         mnemonic: &Mnemonic,
         birthday: BlockHeight,
@@ -68,13 +68,13 @@ impl WalletStore {
             birthday: Some(u32::from(birthday)),
             encryption: None,
         };
-        write_keys_atomic(wallet_dir, &encoding, true)
+        write_keys_atomic(keys_path, &encoding, true)
     }
 
     /// Create a new `keys.toml` with the mnemonic passphrase-encrypted (age scrypt) - the
     /// Bitcoin-Core-style encrypted wallet, requiring `walletpassphrase` before spending.
     pub fn init_with_passphrase(
-        wallet_dir: &Path,
+        keys_path: &Path,
         passphrase: Passphrase,
         mnemonic: &Mnemonic,
         birthday: BlockHeight,
@@ -89,14 +89,14 @@ impl WalletStore {
             birthday: Some(u32::from(birthday)),
             encryption: Some(ENC_PASSPHRASE.to_string()),
         };
-        write_keys_atomic(wallet_dir, &encoding, true)
+        write_keys_atomic(keys_path, &encoding, true)
     }
 
     /// Create a new `keys.toml` for a watch-only wallet (imported UFVK): network and birthday
     /// only, no mnemonic. The viewing key itself lives (in the clear, as for every wallet) in
     /// the wallet DB's accounts table; there is no spending material on disk at all.
     pub fn init_view_only(
-        wallet_dir: &Path,
+        keys_path: &Path,
         birthday: BlockHeight,
         network: ZNetwork,
     ) -> anyhow::Result<()> {
@@ -106,13 +106,13 @@ impl WalletStore {
             birthday: Some(u32::from(birthday)),
             encryption: None,
         };
-        write_keys_atomic(wallet_dir, &encoding, true)
+        write_keys_atomic(keys_path, &encoding, true)
     }
 
-    pub fn read(wallet_dir: &Path) -> anyhow::Result<WalletStore> {
-        let path = keys_path(wallet_dir);
+    pub fn read(keys_path: &Path) -> anyhow::Result<WalletStore> {
+        let path = keys_path;
         let mut text = String::new();
-        std::fs::File::open(&path)
+        std::fs::File::open(path)
             .map_err(|e| anyhow!("opening {}: {e}", path.display()))?
             .read_to_string(&mut text)?;
         let encoding: StoreEncoding = toml::from_str(&text)?;
@@ -124,10 +124,15 @@ impl WalletStore {
             .transpose()?
             .unwrap_or(ZNetwork::Test);
 
+        // `init` always records a birthday; this fallback only fires for a hand-edited
+        // `keys.toml` missing the field. Default to Orchard activation (NU5) - an Orchard-only
+        // wallet (zecd's default) can hold no notes before it - rather than the older, slower
+        // Sapling-activation default. (Pool-aware resolution lives in `init`, which knows the
+        // wallet's enabled pools; this layer does not.)
         let birthday = encoding.birthday.map(BlockHeight::from).unwrap_or_else(|| {
             network
-                .activation_height(NetworkUpgrade::Sapling)
-                .expect("Sapling activation height is known")
+                .activation_height(NetworkUpgrade::Nu5)
+                .expect("NU5 activation height is known")
         });
 
         let encrypted = encoding.encryption.as_deref() == Some(ENC_PASSPHRASE);
@@ -180,12 +185,13 @@ impl WalletStore {
 /// otherwise the file is replaced atomically (temp + rename) so a crash mid-rewrite can't leave
 /// a truncated mnemonic. The file is created mode 0600 on Unix.
 fn write_keys_atomic(
-    wallet_dir: &Path,
+    path: &Path,
     encoding: &StoreEncoding,
     create_new: bool,
 ) -> anyhow::Result<()> {
-    std::fs::create_dir_all(wallet_dir)?;
-    let path = keys_path(wallet_dir);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
     let text = toml::to_string(encoding).map_err(|_| anyhow!("serializing keys.toml"))?;
 
     let mut opts = std::fs::OpenOptions::new();
@@ -203,7 +209,7 @@ fn write_keys_atomic(
 
     if create_new {
         let mut file = opts
-            .open(&path)
+            .open(path)
             .map_err(|e| anyhow!("creating {}: {e}", path.display()))?;
         file.write_all(text.as_bytes())?;
         file.sync_all()?;
@@ -216,7 +222,7 @@ fn write_keys_atomic(
             file.write_all(text.as_bytes())?;
             file.sync_all()?;
         }
-        std::fs::rename(&tmp, &path).map_err(|e| anyhow!("replacing {}: {e}", path.display()))?;
+        std::fs::rename(&tmp, path).map_err(|e| anyhow!("replacing {}: {e}", path.display()))?;
     }
     Ok(())
 }
@@ -289,9 +295,10 @@ mod tests {
     #[test]
     fn passphrase_wallet_roundtrips_and_marks_encrypted() {
         let dir = tempfile::tempdir().unwrap();
+        let kp = keys_path(dir.path());
         let mnemonic = <Mnemonic<English>>::from_phrase(PHRASE).unwrap();
         WalletStore::init_with_passphrase(
-            dir.path(),
+            &kp,
             Passphrase::from("correct horse battery".to_string()),
             &mnemonic,
             BlockHeight::from_u32(1),
@@ -299,7 +306,7 @@ mod tests {
         )
         .unwrap();
 
-        let st = WalletStore::read(dir.path()).unwrap();
+        let st = WalletStore::read(&kp).unwrap();
         assert!(
             st.is_encrypted(),
             "a passphrase wallet must report as encrypted"
@@ -325,8 +332,9 @@ mod tests {
     #[test]
     fn view_only_wallet_stores_no_seed() {
         let dir = tempfile::tempdir().unwrap();
-        WalletStore::init_view_only(dir.path(), BlockHeight::from_u32(7), ZNetwork::Test).unwrap();
-        let st = WalletStore::read(dir.path()).unwrap();
+        let kp = keys_path(dir.path());
+        WalletStore::init_view_only(&kp, BlockHeight::from_u32(7), ZNetwork::Test).unwrap();
+        let st = WalletStore::read(&kp).unwrap();
         assert!(!st.has_seed(), "a watch-only wallet has no stored mnemonic");
         assert!(
             !st.is_encrypted(),
@@ -343,20 +351,38 @@ mod tests {
     }
 
     #[test]
+    fn missing_birthday_defaults_to_nu5() {
+        // A hand-edited keys.toml without a birthday falls back to Orchard activation (NU5),
+        // not the older Sapling-activation default - an Orchard-only wallet holds no earlier
+        // notes. (`init` always writes a birthday, so this is only the defensive path.)
+        let dir = tempfile::tempdir().unwrap();
+        let kp = keys_path(dir.path());
+        std::fs::write(&kp, "network = \"main\"\n").unwrap();
+        let st = WalletStore::read(&kp).unwrap();
+        assert_eq!(
+            st.birthday,
+            ZNetwork::Main
+                .activation_height(NetworkUpgrade::Nu5)
+                .expect("NU5 height")
+        );
+    }
+
+    #[test]
     fn identity_wallet_is_not_marked_encrypted() {
         let dir = tempfile::tempdir().unwrap();
+        let kp = keys_path(dir.path());
         let identity = age::x25519::Identity::generate();
         let recipient = identity.to_public();
         let mnemonic = <Mnemonic<English>>::from_phrase(PHRASE).unwrap();
         WalletStore::init_with_mnemonic(
-            dir.path(),
+            &kp,
             std::iter::once(&recipient as &dyn age::Recipient),
             &mnemonic,
             BlockHeight::from_u32(1),
             ZNetwork::Test,
         )
         .unwrap();
-        let st = WalletStore::read(dir.path()).unwrap();
+        let st = WalletStore::read(&kp).unwrap();
         assert!(!st.is_encrypted());
         assert!(st.has_seed());
     }

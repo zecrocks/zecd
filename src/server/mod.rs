@@ -212,6 +212,7 @@ mod tests {
             keys: KeysConfig {
                 age_identity: None,
                 auto_unlock: true,
+                bootstrap_from_keys: true,
             },
             sync: SyncConfig {
                 interval_secs: 20,

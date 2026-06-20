@@ -10,6 +10,7 @@ use bip0039::{Count, English, Mnemonic};
 use secrecy::{SecretVec, Zeroize};
 use tokio::io::AsyncWriteExt as _;
 
+use tracing::warn;
 use zcash_client_backend::data_api::{
     Account as _, AccountBirthday, AccountPurpose, AccountSource, WalletRead, WalletWrite,
 };
@@ -19,8 +20,30 @@ use zcash_protocol::consensus::{BlockHeight, NetworkUpgrade, Parameters};
 use crate::backend;
 use crate::chain::ChainSource as _;
 use crate::config::{AppConfig, ExportUfvkArgs, InitArgs, WalletEntry};
+use crate::network::ZNetwork;
+use crate::pools::{Pool, PoolSet};
 use crate::wallet::open;
 use crate::wallet::store::{Passphrase, WalletStore};
+
+/// The default account birthday when `--birthday` is omitted for a restore/import: the
+/// activation height of the earliest *enabled* shielded pool, with a human label. An
+/// Orchard-only wallet (the default) can hold no notes before NU5 (Orchard activation), so it
+/// starts there - much faster than the old Sapling-activation default while never missing an
+/// Orchard note. A Sapling-enabled wallet must start at Sapling activation, where it could
+/// first hold notes.
+fn restore_birthday_default(network: ZNetwork, pools: &PoolSet) -> (u32, &'static str) {
+    let (upgrade, label) = if pools.contains(Pool::Sapling) {
+        (NetworkUpgrade::Sapling, "Sapling")
+    } else {
+        (NetworkUpgrade::Nu5, "Orchard (NU5)")
+    };
+    let height = u32::from(
+        network
+            .activation_height(upgrade)
+            .expect("pool activation height is known"),
+    );
+    (height, label)
+}
 
 /// Minimum length (in characters) for a wallet-encryption passphrase.
 pub const MIN_PASSPHRASE_CHARS: usize = 12;
@@ -59,6 +82,26 @@ fn read_encryption_passphrase() -> anyhow::Result<Passphrase> {
     Ok(Passphrase::from(p1))
 }
 
+/// Read the mnemonic phrase for `init --restore`. Prefers the `ZECD_MNEMONIC` environment
+/// variable, then `--mnemonic-file` (both for non-interactive/automated restore), then an
+/// interactive prompt on stderr reading one line from stdin. Surrounding whitespace is trimmed.
+fn read_restore_mnemonic(args: &InitArgs) -> anyhow::Result<Mnemonic<English>> {
+    let phrase = if let Some(p) = std::env::var_os("ZECD_MNEMONIC") {
+        p.to_string_lossy().trim().to_string()
+    } else if let Some(path) = &args.mnemonic_file {
+        std::fs::read_to_string(path)
+            .with_context(|| format!("reading mnemonic file {}", path.display()))?
+            .trim()
+            .to_string()
+    } else {
+        eprintln!("Enter the mnemonic phrase to restore, then press Enter:");
+        let mut line = String::new();
+        std::io::stdin().read_line(&mut line)?;
+        line.trim().to_string()
+    };
+    Ok(<Mnemonic<English>>::from_phrase(&phrase)?)
+}
+
 pub async fn run(config: &AppConfig, args: &InitArgs) -> anyhow::Result<()> {
     // Single-instance guard: take the exclusive datadir lock before creating any wallet, held
     // until `init` returns. This refuses an `init` against a datadir a running daemon (or another
@@ -71,17 +114,20 @@ pub async fn run(config: &AppConfig, args: &InitArgs) -> anyhow::Result<()> {
         .cloned()
         .unwrap_or_else(|| WalletEntry {
             dir: config.datadir.join(&args.wallet),
+            keys_file: None,
             pools: config.pools.enabled.clone(),
             default_receivers: config.pools.default_receivers.clone(),
         });
+    let keys_path = entry.keys_path();
+    let enabled_pools = entry.pools.clone();
     let wallet_dir = entry.dir;
     let network = config.network;
 
-    if WalletStore::exists(&wallet_dir) {
+    if WalletStore::exists(&keys_path) {
         return Err(anyhow!(
-            "wallet '{}' is already initialized at {}",
+            "wallet '{}' is already initialized ({} exists)",
             args.wallet,
-            wallet_dir.display()
+            keys_path.display()
         ));
     }
 
@@ -162,12 +208,8 @@ pub async fn run(config: &AppConfig, args: &InitArgs) -> anyhow::Result<()> {
         // it like a restore (recovery window up to the current tip).
         (None, Some(BlockHeight::from(chain_tip)))
     } else if args.restore {
-        eprintln!("Enter the mnemonic phrase to restore, then press Enter:");
-        let mut line = String::new();
-        std::io::stdin().read_line(&mut line)?;
-        let phrase = line.trim();
         (
-            Some(<Mnemonic<English>>::from_phrase(phrase)?),
+            Some(read_restore_mnemonic(args)?),
             Some(BlockHeight::from(chain_tip)),
         )
     } else {
@@ -177,22 +219,19 @@ pub async fn run(config: &AppConfig, args: &InitArgs) -> anyhow::Result<()> {
     // A freshly-generated wallet can have no history, so its birthday defaults to just below
     // the tip. A *restored* wallet (or an imported viewing key) may hold notes from any point
     // in its past; defaulting anywhere near the tip would silently skip them (the funds exist
-    // on chain but are never scanned), so without --birthday we scan from Sapling activation -
-    // the start of the shielded-note era - trading sync time for never missing funds.
+    // on chain but are never scanned), so without --birthday we scan from the earliest enabled
+    // pool's activation (Orchard/NU5 for the Orchard-only default) - never missing a note, at
+    // the cost of a long initial sync we warn about.
     let key_may_have_history = args.restore || ufvk.is_some();
     let birthday_height = BlockHeight::from(args.birthday.unwrap_or_else(|| {
         if key_may_have_history {
-            let sapling = u32::from(
-                network
-                    .activation_height(NetworkUpgrade::Sapling)
-                    .expect("Sapling activation height is known"),
+            let (height, label) = restore_birthday_default(network, &enabled_pools);
+            warn!(
+                "no --birthday given; scanning from {label} activation (height {height}) - a \
+                 full rescan that is slow on mainnet. Pass --birthday <height> at or before the \
+                 wallet's first transaction to speed up the initial sync."
             );
-            eprintln!(
-                "No --birthday given; scanning the restored wallet from Sapling activation \
-                 (height {sapling}) so no notes are missed. Pass --birthday <height> (at or \
-                 before the wallet's first transaction) to make the initial sync much faster."
-            );
-            sapling
+            height
         } else {
             chain_tip.saturating_sub(100)
         }
@@ -219,17 +258,18 @@ pub async fn run(config: &AppConfig, args: &InitArgs) -> anyhow::Result<()> {
             .as_ref()
             .expect("non-view-only init always has a mnemonic")
     };
+
     match &at_rest {
-        AtRest::ViewOnly => WalletStore::init_view_only(&wallet_dir, birthday.height(), network)?,
+        AtRest::ViewOnly => WalletStore::init_view_only(&keys_path, birthday.height(), network)?,
         AtRest::Passphrase(passphrase) => WalletStore::init_with_passphrase(
-            &wallet_dir,
+            &keys_path,
             passphrase.clone(),
             require_mnemonic(),
             birthday.height(),
             network,
         )?,
         AtRest::Identity(recipients) => WalletStore::init_with_mnemonic(
-            &wallet_dir,
+            &keys_path,
             recipients.iter().map(|r| r.as_ref() as _),
             require_mnemonic(),
             birthday.height(),
@@ -297,21 +337,23 @@ pub fn export_ufvk(config: &AppConfig, args: &ExportUfvkArgs) -> anyhow::Result<
         .cloned()
         .unwrap_or_else(|| WalletEntry {
             dir: config.datadir.join(&args.wallet),
+            keys_file: None,
             pools: config.pools.enabled.clone(),
             default_receivers: config.pools.default_receivers.clone(),
         });
+    let keys_path = entry.keys_path();
     let wallet_dir = entry.dir;
 
-    if !WalletStore::exists(&wallet_dir) {
+    if !WalletStore::exists(&keys_path) {
         return Err(anyhow!(
-            "wallet '{}' is not initialized at {}",
+            "wallet '{}' is not initialized ({} missing)",
             args.wallet,
-            wallet_dir.display()
+            keys_path.display()
         ));
     }
     // The UFVK encoding is network-scoped; refuse a network flag that contradicts the wallet
     // on disk rather than emit a key the watch-only side would reject.
-    let st = WalletStore::read(&wallet_dir)?;
+    let st = WalletStore::read(&keys_path)?;
     if st.network != config.network {
         return Err(anyhow!(
             "wallet '{}' is a {} wallet, but the configuration selects {}",
@@ -354,7 +396,7 @@ fn existing_spending_wallet(
     wallets
         .iter()
         .filter(|(name, _)| name.as_str() != exclude)
-        .filter(|(_, entry)| WalletStore::exists(&entry.dir))
+        .filter(|(_, entry)| WalletStore::exists(&entry.keys_path()))
         .find(|(_, entry)| wallet_has_spending_keys(network, &entry.dir))
         .map(|(name, _)| name.clone())
 }
@@ -430,6 +472,37 @@ mod tests {
     use super::*;
 
     #[test]
+    fn restore_birthday_default_is_pool_aware() {
+        use crate::pools::{Pool, PoolSet};
+        // Orchard-only (the default): scan from NU5/Orchard activation - no Orchard note can
+        // predate it.
+        let (h, label) = restore_birthday_default(ZNetwork::Main, &PoolSet::single(Pool::Orchard));
+        assert!(label.contains("Orchard"), "{label}");
+        assert_eq!(
+            h,
+            u32::from(
+                ZNetwork::Main
+                    .activation_height(NetworkUpgrade::Nu5)
+                    .unwrap()
+            )
+        );
+        // Sapling enabled: scan from the earlier Sapling activation, where a Sapling note could
+        // first exist (defaulting to NU5 would silently skip pre-NU5 Sapling funds).
+        let sap = PoolSet::parse(&["sapling".to_string(), "orchard".to_string()]).unwrap();
+        let (hs, label_s) = restore_birthday_default(ZNetwork::Main, &sap);
+        assert_eq!(label_s, "Sapling");
+        assert_eq!(
+            hs,
+            u32::from(
+                ZNetwork::Main
+                    .activation_height(NetworkUpgrade::Sapling)
+                    .unwrap()
+            )
+        );
+        assert!(hs < h, "Sapling activation precedes NU5");
+    }
+
+    #[test]
     fn passphrase_min_length_is_enforced() {
         // Too short (and empty) are rejected; exactly the minimum and longer pass.
         assert!(validate_passphrase("").is_err());
@@ -483,7 +556,7 @@ mod tests {
         let net = network::regtest();
         let mnemonic = <Mnemonic<English>>::from_phrase(TEST_PHRASE).unwrap();
         WalletStore::init_with_passphrase(
-            dir,
+            &crate::wallet::store::keys_path(dir),
             Passphrase::from("test-pass".to_string()),
             &mnemonic,
             BlockHeight::from_u32(1),
@@ -499,8 +572,12 @@ mod tests {
     /// import) at `dir`.
     fn make_watch_only_wallet(dir: &Path) {
         let net = network::regtest();
-        WalletStore::init_view_only(dir, BlockHeight::from_u32(1), net)
-            .expect("write watch-only keys.toml");
+        WalletStore::init_view_only(
+            &crate::wallet::store::keys_path(dir),
+            BlockHeight::from_u32(1),
+            net,
+        )
+        .expect("write watch-only keys.toml");
         let ufvk = {
             use secrecy::ExposeSecret as _;
             let seed = test_seed();
@@ -560,6 +637,7 @@ mod tests {
             "default".to_string(),
             WalletEntry {
                 dir: default_dir.path().to_path_buf(),
+                keys_file: None,
                 pools: orchard_pools(),
                 default_receivers: orchard_pools(),
             },
@@ -568,6 +646,7 @@ mod tests {
             "w2".to_string(),
             WalletEntry {
                 dir: w2_dir.path().to_path_buf(),
+                keys_file: None,
                 pools: orchard_pools(),
                 default_receivers: orchard_pools(),
             },
@@ -606,6 +685,7 @@ mod tests {
                 name.to_string(),
                 WalletEntry {
                     dir: dir.path().to_path_buf(),
+                    keys_file: None,
                     pools: orchard_pools(),
                     default_receivers: orchard_pools(),
                 },

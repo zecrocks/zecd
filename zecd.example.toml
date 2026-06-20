@@ -1,5 +1,15 @@
 # Example zecd configuration. Copy to <datadir>/zecd.toml (or pass --conf) and edit.
 # CLI flags (e.g. --rpcuser, --rpcport, --testnet, --datadir, --server) override these.
+#
+# For 12-factor / Kubernetes deployments, several secret inputs can come from the environment
+# or a mounted Secret file instead of this (ConfigMap-bound) TOML:
+#   ZECD_AGE_IDENTITY - path to the age identity (also --age-identity / [keys] age_identity)
+#   ZECD_KEYS_FILE - path to the default wallet's keys.toml (also --keys-file / keys_file)
+#   ZECD_RPC_PASSWORD - the RPC password (also --rpcpassword / [rpc] password_file)
+#   ZECD_DATADIR - the data directory (also --datadir / datadir)
+# And for non-interactive `zecd init --restore`:
+#   ZECD_MNEMONIC - the seed phrase (also --mnemonic-file); else read from stdin
+#   ZECD_WALLET_PASSPHRASE - the at-rest passphrase for `init --encrypt`; else prompted
 
 # Network: "main" or "test".
 network = "test"
@@ -14,6 +24,11 @@ default_wallet = "default"
 # One section per wallet. The directory holds data.sqlite, keys.toml, blocks/, labels.sqlite.
 [wallets.default]
 dir = "./data/default"
+# Optional: put this wallet's keys.toml somewhere other than <dir>/keys.toml - e.g. a
+# Kubernetes Secret mounted read-only, separate from the (disposable, cache-only) data dir.
+# The global [keys] keys_file below sets this for the default wallet; ZECD_KEYS_FILE /
+# --keys-file override it. data.sqlite, blocks/ and labels.sqlite still live under `dir`.
+# keys_file = "/secrets/keys.toml"
 
 [backend]
 # The chain upstream is a LOCAL zebrad's JSON-RPC. The default is "zebra": shorthand for
@@ -43,6 +58,10 @@ port = 18232
 # If user/password are omitted, a bitcoind-style cookie file is generated at <datadir>/.cookie.
 user = "zec"
 password = "change-me"
+# The RPC password is spend-equivalent for clients, so in a ConfigMap+Secret split keep it
+# OUT of this (ConfigMap-bound) file. Source it from a mounted Secret file or the environment
+# instead; precedence is --rpcpassword / ZECD_RPC_PASSWORD > password_file > inline `password`.
+# password_file = "/secrets/rpc.password"
 # Additional bitcoind-style rpcauth credentials (salted - no plaintext in the config).
 # Generate entries with the built-in tool: `zecd rpcauth <user> [password]`
 # (omit the password to have a strong random one generated and printed once).
@@ -128,6 +147,17 @@ password = "change-me"
 age_identity = "./data/identity.txt"
 # Decrypt the seed at startup so sendtoaddress/sendmany work without walletpassphrase.
 auto_unlock = true
+# Optional: location of the DEFAULT wallet's keys.toml (the age-encrypted seed), independent
+# of the datadir, so it can be mounted as a Secret while the datadir stays a disposable cache.
+# Equivalent to [wallets.default] keys_file; ZECD_KEYS_FILE / --keys-file override it.
+# keys_file = "/secrets/keys.toml"
+# Rebuild data.sqlite from keys.toml when the data directory is empty (default true): the
+# account is recreated from the seed - immediately for an identity/auto_unlock wallet, at the
+# first walletpassphrase for an encrypted one - then the wallet rescans from its birthday. This
+# is what lets the data directory be a disposable cache (mount keys.toml as a Secret, start with
+# an empty PVC). Set false to instead fail fast on an empty datadir. (Watch-only wallets have no
+# seed and aren't covered - recreate them with `zecd init --ufvk`.)
+bootstrap_from_keys = true
 
 [pools]
 # Shielded value pools this wallet uses. zecd is shielded-only; supported pools are "sapling"
