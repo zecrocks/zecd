@@ -24,8 +24,12 @@
 //! concurrent-send burst proving the no-double-spend invariant (exactly one winner, losers
 //! get -6, and `getrpcinfo.active_commands` shows the burst in flight). Phase 6: a 2-output
 //! `sendmany` (shielded + transparent recipient). Phase 7: `sendrawtransaction`'s
-//! accept/idempotency contract. Finally `scripts/conformance.py` runs against the live funded
-//! daemon, putting its full Bitcoin-Core wire-format suite under CI.
+//! accept/idempotency contract. Phase 8: a **self-send** (pay our own address) carrying a
+//! memo - surfaced as a send+receive pair in `gettransaction`/`listtransactions`/
+//! `z_listtransactions` (librustzcash flags self-payments `is_change`, so zecd must key off the
+//! external recipient scope, not `is_change`, to keep them - and their memos - visible).
+//! Finally `scripts/conformance.py` runs against the live funded daemon, putting its full
+//! Bitcoin-Core wire-format suite under CI.
 //!
 //! (Tx expiry/abandonment and manual delivery of an *unbroadcast* tx need the broadcast path
 //! down while the chain keeps advancing - two roles a single local zebra node can't separate -
@@ -988,6 +992,172 @@ async fn regtest_funded_orchard_receive() {
         "sendrawtransaction returns the canonical txid for a tx already in the mempool"
     );
     mine_until_confirmed(&zebrad, &zecd, &txid_raw, "sendrawtransaction send").await;
+
+    // ---- Phase 8: a self-send (pay our own address) is visible and carries its memo ----
+    //
+    // librustzcash marks *any* output received by an account that also spent in the same
+    // transaction as `is_change` (scanning's `find_received`: `is_change =
+    // spent_from_accounts.contains(..)`), so a deliberate payment to one of the wallet's own
+    // user-facing addresses lands with `is_change = true` even though it was received on an
+    // external-scope address. zecd must still surface it - Bitcoin Core shows a self-send as a
+    // send+receive pair - so the memo on a self-directed output stays reachable. (The
+    // discriminator is the recipient key scope, not `is_change`: external = a real payment,
+    // internal = true change.) Before the fix this whole transaction vanished from
+    // gettransaction/listtransactions/z_listtransactions and the memo was unreachable.
+
+    // Mature the Phase-7 change so the self-send has a spendable note (trusted depth 3 + skew).
+    let tip = zecd
+        .block_count()
+        .await
+        .expect("getblockcount before the self-send");
+    zebrad
+        .generate_blocks(4)
+        .await
+        .expect("mature change before the self-send");
+    zecd.wait_until_synced(tip + 4, FUND_TIMEOUT)
+        .await
+        .expect("scan the maturing blocks");
+
+    // A fresh own address (external/user-facing) and a ZIP-302 text memo to ourselves.
+    let self_addr = zecd
+        .call("getnewaddress", json!([]))
+        .await
+        .expect("getnewaddress for the self-send")
+        .as_str()
+        .expect("address is a string")
+        .to_string();
+    let self_memo_hex = "676d3a2073656c662d73656e64"; // "gm: self-send"
+    let self_memo_text = "gm: self-send";
+    let self_txid = zecd
+        .call(
+            "sendtoaddress",
+            json!([
+                self_addr,
+                0.001,
+                "",
+                "",
+                null,
+                null,
+                null,
+                null,
+                null,
+                null,
+                null,
+                self_memo_hex
+            ]),
+        )
+        .await
+        .expect("self-send succeeds")
+        .as_str()
+        .expect("txid is a string")
+        .to_string();
+
+    let tip = zecd
+        .block_count()
+        .await
+        .expect("getblockcount before confirm");
+    zebrad
+        .generate_blocks(3)
+        .await
+        .expect("confirm the self-send");
+    zecd.wait_until_synced(tip + 3, FUND_TIMEOUT)
+        .await
+        .expect("scan the confirming blocks");
+
+    // The receive side's memo is backfilled by transaction enhancement (compact blocks carry
+    // no memos), which runs a beat after the scan reaches the tip - poll for it. When it lands,
+    // assert the full self-send shape: a send+receive pair on our own address, memo on receive.
+    let deadline = Instant::now() + FUND_TIMEOUT;
+    loop {
+        let gt = zecd
+            .call("gettransaction", json!([self_txid]))
+            .await
+            .expect("gettransaction on the self-send");
+        let details = gt["details"].as_array().cloned().unwrap_or_default();
+        let recv = details
+            .iter()
+            .find(|d| d["category"] == "receive" && d["memoStr"].as_str() == Some(self_memo_text));
+        if let Some(recv) = recv {
+            // The receive is to our own address and carries both memo encodings.
+            assert_eq!(
+                recv["address"].as_str(),
+                Some(self_addr.as_str()),
+                "self-send receive is to our own address: {recv}"
+            );
+            assert_eq!(
+                recv["memo"].as_str(),
+                Some(self_memo_hex),
+                "self-send receive carries the raw memo hex: {recv}"
+            );
+            // The matching send side: negative, to the same address, with the fee.
+            let send = details
+                .iter()
+                .find(|d| d["category"] == "send" && d["address"] == json!(self_addr.as_str()))
+                .unwrap_or_else(|| panic!("self-send has a send detail: {gt}"));
+            assert!(
+                send["amount"].as_f64().is_some_and(|a| a < 0.0),
+                "self-send debit is negative: {send}"
+            );
+            assert!(
+                send["fee"].as_f64().is_some_and(|f| f < 0.0),
+                "self-send send detail carries the fee: {send}"
+            );
+
+            // listtransactions surfaces both halves (it used to drop the tx entirely).
+            let lt = zecd
+                .call("listtransactions", json!(["*", 50]))
+                .await
+                .expect("listtransactions");
+            let mine: Vec<_> = lt
+                .as_array()
+                .expect("array")
+                .iter()
+                .filter(|t| t["txid"] == json!(self_txid.as_str()))
+                .collect();
+            assert!(
+                mine.iter().any(|t| t["category"] == "send"),
+                "listtransactions shows the self-send's send entry: {lt}"
+            );
+            assert!(
+                mine.iter()
+                    .any(|t| t["category"] == "receive"
+                        && t["memoStr"].as_str() == Some(self_memo_text)),
+                "listtransactions shows the self-send's receive entry + memo: {lt}"
+            );
+
+            // z_listtransactions (zcashd vocabulary) surfaces the receive + memo too.
+            let zlt = zecd
+                .call("z_listtransactions", json!([50]))
+                .await
+                .expect("z_listtransactions");
+            assert!(
+                zlt.as_array()
+                    .expect("array")
+                    .iter()
+                    .any(|t| t["txid"] == json!(self_txid.as_str())
+                        && t["category"] == "receive"
+                        && t["memoStr"].as_str() == Some(self_memo_text)),
+                "z_listtransactions surfaces the self-send receive + memo: {zlt}"
+            );
+
+            // getreceivedbyaddress counts the self-payment to that address (Bitcoin Core does).
+            let received = zecd
+                .call("getreceivedbyaddress", json!([self_addr, 1]))
+                .await
+                .expect("getreceivedbyaddress on the self-send address");
+            assert_eq!(
+                received.as_f64(),
+                Some(0.001),
+                "getreceivedbyaddress counts the self-payment: {received}"
+            );
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the self-send never surfaced its receive memo: {gt}"
+        );
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
 
     // ---- conformance.py against the live, funded daemon ----
     // The wallet was created encrypted (`init --encrypt`) and is unlocked by now; passing the

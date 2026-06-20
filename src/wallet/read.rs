@@ -72,6 +72,11 @@ pub fn tx_count(wallet_dir: &Path) -> anyhow::Result<u64> {
     Ok(n as u64)
 }
 
+/// `v_tx_outputs.recipient_key_scope` for an output received on one of the wallet's own
+/// *external* (user-facing) addresses - the ZIP-32 external scope. Internal/change is `1`,
+/// imported is `-1`, and a pure send (no wallet receive) or an unlinked address is `NULL`.
+pub const EXTERNAL_KEY_SCOPE: i64 = 0;
+
 /// One output row from `v_tx_outputs`.
 #[derive(Debug, Clone)]
 pub struct TxOutputRecord {
@@ -83,8 +88,29 @@ pub struct TxOutputRecord {
     pub to_address: Option<String>,
     pub value: i64,
     pub is_change: bool,
+    /// `v_tx_outputs.recipient_key_scope`: the ZIP-32 scope of the address this output was
+    /// received on - [`EXTERNAL_KEY_SCOPE`] (`0`) external, `1` internal/change, `-1` imported,
+    /// `None` when the output isn't a wallet receive (a pure send) or its address isn't linked.
+    /// This - not [`Self::is_change`] - is the reliable "is this internal change" signal:
+    /// librustzcash marks an output `is_change` whenever the *receiving* account also spent in
+    /// the same transaction (scanning's `find_received`), so a deliberate payment to one of the
+    /// wallet's own user-facing addresses lands with `is_change = true` despite being received
+    /// on an external-scope address. See [`Self::is_internal_change`].
+    pub recipient_key_scope: Option<i64>,
     /// The output's ZIP-302 memo bytes, when the wallet decrypted/stored one.
     pub memo: Option<Vec<u8>>,
+}
+
+impl TxOutputRecord {
+    /// Whether this output is internal change that the history/detail RPCs hide. True change is
+    /// `is_change` on an output received on a non-external scope (internal/imported/unlinked); a
+    /// payment to one of the wallet's *own* user-facing (external) addresses is a deliberate
+    /// self-send and stays visible - Bitcoin Core surfaces such a self-payment as a send+receive
+    /// pair (and so its memo stays reachable). Filtering on raw `is_change` would wrongly hide
+    /// it, because librustzcash flags self-payments `is_change` too.
+    pub fn is_internal_change(&self) -> bool {
+        self.is_change && self.recipient_key_scope != Some(EXTERNAL_KEY_SCOPE)
+    }
 }
 
 /// One transaction row from `v_transactions`, plus its outputs.
@@ -178,7 +204,7 @@ fn load_outputs(
 ) -> anyhow::Result<Vec<TxOutputRecord>> {
     let mut stmt = conn.prepare(
         "SELECT output_pool, output_index, from_account_uuid, to_account_uuid,
-                to_address, value, is_change, memo
+                to_address, value, is_change, recipient_key_scope, memo
          FROM v_tx_outputs
          WHERE txid = :txid",
     )?;
@@ -191,6 +217,7 @@ fn load_outputs(
             to_address: row.get("to_address")?,
             value: row.get("value")?,
             is_change: row.get("is_change")?,
+            recipient_key_scope: row.get::<_, Option<i64>>("recipient_key_scope")?,
             memo: row.get("memo")?,
         })
     })?;
@@ -352,7 +379,8 @@ pub fn received_tx_records(
     // flat path replaced the full N+1 load.
     let mut stmt = conn.prepare(
         "SELECT v.txid, v.mined_height, v.expired_unmined,
-                o.to_address, o.value, o.is_change, o.to_account_uuid, o.output_pool
+                o.to_address, o.value, o.is_change, o.to_account_uuid, o.output_pool,
+                o.recipient_key_scope
          FROM v_transactions v
          JOIN v_tx_outputs o ON o.txid = v.txid
          WHERE (:addr IS NULL OR o.to_address = :addr)
@@ -377,6 +405,7 @@ pub fn received_tx_records(
                 to_address: row.get(3)?,
                 value: row.get(4)?,
                 is_change: row.get(5)?,
+                recipient_key_scope: row.get::<_, Option<i64>>(8)?,
                 memo: None,
             },
         ))

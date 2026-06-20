@@ -440,7 +440,7 @@ fn tx_entries(
 ) -> Vec<Value> {
     let mut entries = Vec::new();
     for out in &tx.outputs {
-        if out.is_change {
+        if out.is_internal_change() {
             continue;
         }
         let categories = output_categories(out.from_account.is_some(), out.to_account.is_some());
@@ -659,7 +659,7 @@ fn z_tx_entries(tx: &read::TxRecord, confirmations: i64, time: i64) -> Vec<Value
     let status = z_tx_status(tx);
     let mut entries = Vec::new();
     for out in &tx.outputs {
-        if out.is_change {
+        if out.is_internal_change() {
             continue;
         }
         let categories = output_categories(out.from_account.is_some(), out.to_account.is_some());
@@ -760,7 +760,7 @@ fn received_by_address(
             continue;
         }
         for out in &tx.outputs {
-            if out.is_change || out.to_account.is_none() {
+            if out.is_internal_change() || out.to_account.is_none() {
                 continue;
             }
             let Some(addr) = &out.to_address else {
@@ -1053,7 +1053,7 @@ pub(crate) async fn gettransaction(
 fn gettransaction_details(rec: &read::TxRecord, label_map: &HashMap<String, String>) -> Vec<Value> {
     let mut details = Vec::new();
     for out in &rec.outputs {
-        if out.is_change {
+        if out.is_internal_change() {
             continue;
         }
         let categories = output_categories(out.from_account.is_some(), out.to_account.is_some());
@@ -1801,8 +1801,30 @@ mod tests {
             to_address: addr.map(str::to_string),
             value,
             is_change,
+            // `None` = not received on a known external address: a pure send, or - for the
+            // `is_change` outputs the tests build - true internal change. A deliberate
+            // self-payment (external scope) is built with [`self_payment_out`].
+            recipient_key_scope: None,
             memo: None,
         }
+    }
+
+    /// A deliberate self-payment: the wallet both spent into this output (`from`) and received
+    /// it (`to`) on one of its own *external* (user-facing) addresses. librustzcash flags such
+    /// an output `is_change` (the receiving account also spent in the tx - scanning's
+    /// `find_received`), but the external key scope keeps it visible as a real send+receive pair.
+    fn self_payment_out(value: i64, addr: &str) -> TxOutputRecord {
+        TxOutputRecord {
+            recipient_key_scope: Some(read::EXTERNAL_KEY_SCOPE),
+            ..out(true, true, value, Some(addr), true)
+        }
+    }
+
+    /// ZIP-302 text memo bytes (a 512-byte field whose UTF-8 prefix decodes to `s`).
+    fn text_memo_bytes(s: &str) -> Vec<u8> {
+        let mut b = vec![0u8; 512];
+        b[..s.len()].copy_from_slice(s.as_bytes());
+        b
     }
 
     fn tx(
@@ -2146,6 +2168,56 @@ mod tests {
         assert!(e[1].get("abandoned").is_none());
         assert_eq!(e[0]["address"], e[1]["address"]);
         assert_eq!(e[0]["vout"], e[1]["vout"]);
+    }
+
+    #[test]
+    fn self_payment_to_own_external_address_is_not_hidden_as_change() {
+        // A payment to one of the wallet's *own* user-facing addresses is flagged `is_change`
+        // by librustzcash (the receiving account also spent in the tx), but it was received on
+        // an external-scope address, so it is a deliberate self-send - not internal change.
+        // Bitcoin Core surfaces it as a send+receive pair, which is also what makes the memo on
+        // the receive side reachable. Filtering on raw `is_change` (the old behaviour) wrongly
+        // hid the whole self-payment from every history/detail RPC.
+        let mut o = self_payment_out(200, "uself");
+        o.memo = Some(text_memo_bytes("gm: self-send"));
+        let t = tx(Some(50), false, Some(10_000), vec![o]);
+
+        // listtransactions / listsinceblock.
+        let e = tx_entries(&t, &HashMap::new(), 1, 0, None);
+        assert_eq!(e.len(), 2, "self-payment pairs send+receive: {e:?}");
+        assert_eq!(e[0]["category"], "send");
+        assert_eq!(e[0]["amount"].to_string(), "-0.00000200");
+        assert_eq!(e[0]["fee"].to_string(), "-0.00010000");
+        assert_eq!(e[1]["category"], "receive");
+        assert_eq!(e[1]["amount"].to_string(), "0.00000200");
+        // The memo rides on the receive side, now that it is no longer hidden.
+        assert_eq!(e[1]["memoStr"], json!("gm: self-send"));
+
+        // gettransaction details agree.
+        let d = gettransaction_details(&t, &HashMap::new());
+        assert_eq!(d.len(), 2, "self-payment details pair send+receive: {d:?}");
+        assert_eq!(d[0]["category"], "send");
+        assert_eq!(d[1]["category"], "receive");
+        assert_eq!(d[1]["memoStr"], json!("gm: self-send"));
+
+        // z_listtransactions (zcashd vocabulary) too.
+        let z = z_tx_entries(&t, 1, 0);
+        assert_eq!(z.len(), 2, "z_listtransactions pairs send+receive: {z:?}");
+        assert_eq!(z[0]["outgoing"], json!(true));
+        assert_eq!(z[1]["category"], "receive");
+        assert_eq!(z[1]["memoStr"], json!("gm: self-send"));
+
+        // True internal change (same shape but internal/unlinked scope) is still hidden.
+        let change = tx(
+            Some(50),
+            false,
+            Some(10_000),
+            vec![out(true, true, 200, Some("uchange"), true)],
+        );
+        assert!(
+            tx_entries(&change, &HashMap::new(), 1, 0, None).is_empty(),
+            "internal change stays hidden"
+        );
     }
 
     #[test]
