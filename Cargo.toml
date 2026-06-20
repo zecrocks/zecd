@@ -84,9 +84,10 @@ libc = "0.2.186"
 fmutex = "0.3"
 
 # Optional drop-in allocator, enabled by both musl release images (`Dockerfile` and
-# `Dockerfile.arm64`). musl's default `malloc-ng` serializes badly under Orchard proving's
-# multi-threaded (rayon) allocation churn, making a shielded send ~5-6x slower than glibc;
-# mimalloc restores glibc parity. Native glibc builds (dev, tests) leave it off - glibc's own
+# `Dockerfile.arm64`). musl's default `malloc-ng` contends under Orchard proving's multi-threaded
+# (rayon) allocation churn - ~80x more futex syscalls than mimalloc - costing ~10% per shielded
+# send on bare metal and several× in syscall-expensive sandboxes (gVisor/nested-virt/some CI);
+# mimalloc restores parity in both. Native glibc builds (dev, tests) leave it off - glibc's own
 # allocator already scales, so the dependency is pure overhead there.
 mimalloc = { version = "0.1", optional = true }
 
