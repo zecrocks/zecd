@@ -525,12 +525,33 @@ fn push_memo_fields(entry: &mut Value, memo: Option<&[u8]>) {
     }
 }
 
+/// The address to display for one output. For an outgoing external recipient (`to_account` is
+/// `None`) we reduce the recorded recipient to the single on-chain receiver actually paid in
+/// this output's pool (`address::single_receiver_for_pool`), so history is identical on the
+/// instance that authored the send and after a restore-from-seed - where only the paid
+/// receiver, never the full UA the caller typed, is recoverable from chain. (This is the
+/// history-display half of zecd's stateless design: the cached recipient UA is off-chain state.)
+/// Received and self-transfer outputs (`to_account` is `Some`) keep their recorded address (the
+/// wallet's own, already single-receiver under the default Orchard-only `default_receivers`).
+fn display_address(network: &crate::network::ZNetwork, out: &read::TxOutputRecord) -> String {
+    let Some(addr) = out.to_address.as_deref() else {
+        return String::new();
+    };
+    if out.to_account.is_none() {
+        if let Some(single) = crate::address::single_receiver_for_pool(network, addr, out.pool) {
+            return single;
+        }
+    }
+    addr.to_string()
+}
+
 /// Build the `listtransactions`-shaped entries for one wallet transaction: one entry per
 /// non-change, non-internal output, sends negative (Bitcoin Core's sign convention).
 /// `label_filter` of `Some(l)` keeps only entries whose (always-empty, since zecd is stateless)
 /// label equals `l` - so any non-`""` filter matches nothing. Shared by `listtransactions` and
 /// `listsinceblock`.
 fn tx_entries(
+    network: &crate::network::ZNetwork,
     tx: &read::TxRecord,
     confirmations: i64,
     time: i64,
@@ -542,7 +563,7 @@ fn tx_entries(
             continue;
         }
         let categories = output_categories(out.from_account.is_some(), out.to_account.is_some());
-        let address = out.to_address.clone().unwrap_or_default();
+        let address = display_address(network, out);
         // zecd is stateless and keeps no address labels; the field stays empty for Core shape
         // conformance, and a label filter for anything other than "" therefore matches nothing.
         if label_filter.is_some_and(|f| !f.is_empty()) {
@@ -710,13 +731,14 @@ pub(crate) fn listtransactions(
         .map(str::to_string);
     let (count, skip) = count_from_params(req, 1, 2)?;
     let handle = state.registry.get(wallet)?;
+    let network = handle.network;
     let st = handle.status();
     let first_seen = handle.first_seen();
 
     let entries = paginate_history(&handle.dir, skip, count, |tx| {
         let confirmations = tx_confirmations(&st, tx);
         let time = tx_time(tx, first_seen.get(&tx.txid_hex).copied());
-        tx_entries(tx, confirmations, time, label_filter.as_deref())
+        tx_entries(&network, tx, confirmations, time, label_filter.as_deref())
     })?;
     Ok(Value::Array(entries))
 }
@@ -749,7 +771,12 @@ fn z_tx_status(tx: &read::TxRecord) -> &'static str {
 /// output, in zcashd's vocabulary (`pool`/`outindex`/`amountZat`/`outgoing`/`status`, plus
 /// `memo`/`memoStr`). Self-transfers pair send+receive like `listtransactions`. Each entry
 /// repeats the tx-level fields, as zcashd's flattened history does.
-fn z_tx_entries(tx: &read::TxRecord, confirmations: i64, time: i64) -> Vec<Value> {
+fn z_tx_entries(
+    network: &crate::network::ZNetwork,
+    tx: &read::TxRecord,
+    confirmations: i64,
+    time: i64,
+) -> Vec<Value> {
     let status = z_tx_status(tx);
     let mut entries = Vec::new();
     for out in &tx.outputs {
@@ -757,6 +784,7 @@ fn z_tx_entries(tx: &read::TxRecord, confirmations: i64, time: i64) -> Vec<Value
             continue;
         }
         let categories = output_categories(out.from_account.is_some(), out.to_account.is_some());
+        let address = display_address(network, out);
         for category in categories {
             let send = *category == "send";
             let amount = if send { -out.value } else { out.value };
@@ -770,7 +798,7 @@ fn z_tx_entries(tx: &read::TxRecord, confirmations: i64, time: i64) -> Vec<Value
                 "category": category,
                 "amount": signed_zats_to_value(amount),
                 "amountZat": amount,
-                "address": out.to_address.clone().unwrap_or_default(),
+                "address": address,
                 "outindex": out.output_index,
                 // Change is filtered above, but the key is always present (zcashd's
                 // `walletInternal`); `outgoing` is true on the send side of a pairing.
@@ -827,13 +855,14 @@ pub(crate) fn z_listtransactions(
         Some(_) => return Err(RpcError::type_error("includeWatchonly must be a boolean")),
     }
     let handle = state.registry.get(wallet)?;
+    let network = handle.network;
     let st = handle.status();
     let first_seen = handle.first_seen();
 
     let entries = paginate_history(&handle.dir, from, count, |tx| {
         let confirmations = tx_confirmations(&st, tx);
         let time = tx_time(tx, first_seen.get(&tx.txid_hex).copied());
-        z_tx_entries(tx, confirmations, time)
+        z_tx_entries(&network, tx, confirmations, time)
     })?;
     Ok(Value::Array(entries))
 }
@@ -985,12 +1014,13 @@ pub(crate) fn listsinceblock(
         newest_first: false,
     };
     let txs = read::query_transactions(&handle.dir, &query)?;
+    let network = handle.network;
     let first_seen = handle.first_seen();
     let mut transactions: Vec<Value> = Vec::new();
     for tx in &txs {
         let confirmations = tx_confirmations(&st, tx);
         let time = tx_time(tx, first_seen.get(&tx.txid_hex).copied());
-        transactions.extend(tx_entries(tx, confirmations, time, None));
+        transactions.extend(tx_entries(&network, tx, confirmations, time, None));
     }
 
     // `lastblock` is the hash of the block that currently has `target_confirmations`
@@ -1033,7 +1063,7 @@ pub(crate) async fn gettransaction(
     let rec = read::get_transaction(handle.network, &handle.dir, txid)?
         .ok_or_else(|| RpcError::invalid_address_or_key("Invalid or non-wallet transaction id"))?;
 
-    let details = gettransaction_details(&rec);
+    let details = gettransaction_details(&handle.network, &rec);
     let hex_str = gettransaction_hex(&handle, &rec).await;
 
     let amount = gettransaction_amount(rec.account_balance_delta, rec.fee_paid);
@@ -1057,13 +1087,14 @@ pub(crate) async fn gettransaction(
 /// Build `gettransaction.details`: one entry per non-change output and category, sends
 /// negative - [`tx_entries`]'s conventions minus the per-tx fields (`confirmations`, `txid`,
 /// times), which `gettransaction` carries at the top level instead.
-fn gettransaction_details(rec: &read::TxRecord) -> Vec<Value> {
+fn gettransaction_details(network: &crate::network::ZNetwork, rec: &read::TxRecord) -> Vec<Value> {
     let mut details = Vec::new();
     for out in &rec.outputs {
         if out.is_internal_change() {
             continue;
         }
         let categories = output_categories(out.from_account.is_some(), out.to_account.is_some());
+        let address = display_address(network, out);
         for category in categories {
             let amount = if *category == "send" {
                 -out.value
@@ -1071,7 +1102,7 @@ fn gettransaction_details(rec: &read::TxRecord) -> Vec<Value> {
                 out.value
             };
             let mut d = json!({
-                "address": out.to_address.clone().unwrap_or_default(),
+                "address": address,
                 "category": category,
                 "amount": signed_zats_to_value(amount),
                 "vout": out.output_index,
@@ -1668,6 +1699,11 @@ mod tests {
     use crate::pools::Pool;
     use crate::wallet::read::{TxOutputRecord, TxRecord};
 
+    // History-display tests use fake recipient strings that don't decode as Zcash addresses,
+    // so `display_address`'s single-receiver reduction is a no-op and the recorded string is
+    // shown verbatim; any network works as the reduction context.
+    const NET: crate::network::ZNetwork = crate::network::ZNetwork::Test;
+
     #[test]
     fn receiver_tokens_default_to_none() {
         // Empty / unified / default all mean "use the wallet's configured default_receivers".
@@ -2048,17 +2084,17 @@ mod tests {
             vec![out(false, true, 5, Some("ua"), false)],
         );
         t.outputs[0].memo = Some(b"invoice 42".to_vec());
-        let e = tx_entries(&t, 1, 0, None);
+        let e = tx_entries(&NET, &t, 1, 0, None);
         assert_eq!(e[0]["memo"], json!(hex::encode(b"invoice 42")));
         assert_eq!(e[0]["memoStr"], json!("invoice 42"));
 
         // Empty (0xF6) and absent memos add nothing; an arbitrary-data memo (first byte
         // 0xFF) is hex-only.
         t.outputs[0].memo = Some(vec![0xF6]);
-        let e = tx_entries(&t, 1, 0, None);
+        let e = tx_entries(&NET, &t, 1, 0, None);
         assert!(e[0].get("memo").is_none() && e[0].get("memoStr").is_none());
         t.outputs[0].memo = Some(vec![0xFF, 0x01, 0x02]);
-        let e = tx_entries(&t, 1, 0, None);
+        let e = tx_entries(&NET, &t, 1, 0, None);
         assert_eq!(e[0]["memo"], json!("ff0102"));
         assert!(e[0].get("memoStr").is_none());
     }
@@ -2164,7 +2200,7 @@ mod tests {
             vec![out(false, true, 150_000_000, Some("ua"), false)],
         );
         let st = status(102);
-        let e = tx_entries(&t, tx_confirmations(&st, &t), tx_time(&t, None), None);
+        let e = tx_entries(&NET, &t, tx_confirmations(&st, &t), tx_time(&t, None), None);
         assert_eq!(e.len(), 1);
         assert_eq!(e[0]["category"], "receive");
         assert_eq!(e[0]["amount"].to_string(), "1.50000000");
@@ -2191,7 +2227,7 @@ mod tests {
             Some(10_000),
             vec![out(true, false, 150_000_000, Some("dest"), false)],
         );
-        let e = tx_entries(&t, 1, tx_time(&t, None), None);
+        let e = tx_entries(&NET, &t, 1, tx_time(&t, None), None);
         assert_eq!(e[0]["category"], "send");
         assert_eq!(e[0]["amount"].to_string(), "-1.50000000");
         assert_eq!(e[0]["fee"].to_string(), "-0.00010000");
@@ -2207,7 +2243,7 @@ mod tests {
             None,
             vec![out(true, true, 1, Some("self"), true)],
         );
-        assert!(tx_entries(&t, 1, 0, None).is_empty());
+        assert!(tx_entries(&NET, &t, 1, 0, None).is_empty());
 
         // A self-transfer (from us, to us, not change) is Bitcoin Core's send + receive
         // pair: same address/vout, debit then credit, abandoned/fee on the send only.
@@ -2217,7 +2253,7 @@ mod tests {
             Some(10_000),
             vec![out(true, true, 200, Some("self"), false)],
         );
-        let e = tx_entries(&t, 1, 0, None);
+        let e = tx_entries(&NET, &t, 1, 0, None);
         assert_eq!(e.len(), 2);
         assert_eq!(e[0]["category"], "send");
         assert_eq!(e[0]["amount"].to_string(), "-0.00000200");
@@ -2243,7 +2279,7 @@ mod tests {
         let t = tx(Some(50), false, Some(10_000), vec![o]);
 
         // listtransactions / listsinceblock.
-        let e = tx_entries(&t, 1, 0, None);
+        let e = tx_entries(&NET, &t, 1, 0, None);
         assert_eq!(e.len(), 2, "self-payment pairs send+receive: {e:?}");
         assert_eq!(e[0]["category"], "send");
         assert_eq!(e[0]["amount"].to_string(), "-0.00000200");
@@ -2254,14 +2290,14 @@ mod tests {
         assert_eq!(e[1]["memoStr"], json!("gm: self-send"));
 
         // gettransaction details agree.
-        let d = gettransaction_details(&t);
+        let d = gettransaction_details(&NET, &t);
         assert_eq!(d.len(), 2, "self-payment details pair send+receive: {d:?}");
         assert_eq!(d[0]["category"], "send");
         assert_eq!(d[1]["category"], "receive");
         assert_eq!(d[1]["memoStr"], json!("gm: self-send"));
 
         // z_listtransactions (zcashd vocabulary) too.
-        let z = z_tx_entries(&t, 1, 0);
+        let z = z_tx_entries(&NET, &t, 1, 0);
         assert_eq!(z.len(), 2, "z_listtransactions pairs send+receive: {z:?}");
         assert_eq!(z[0]["outgoing"], json!(true));
         assert_eq!(z[1]["category"], "receive");
@@ -2275,7 +2311,7 @@ mod tests {
             vec![out(true, true, 200, Some("uchange"), true)],
         );
         assert!(
-            tx_entries(&change, 1, 0, None).is_empty(),
+            tx_entries(&NET, &change, 1, 0, None).is_empty(),
             "internal change stays hidden"
         );
     }
@@ -2292,7 +2328,7 @@ mod tests {
         let st = status(100);
         let conf = tx_confirmations(&st, &t);
         assert_eq!(conf, -1);
-        let e = tx_entries(&t, conf, tx_time(&t, None), None);
+        let e = tx_entries(&NET, &t, conf, tx_time(&t, None), None);
         assert_eq!(e[0]["confirmations"], json!(-1));
         assert_eq!(e[0]["abandoned"], json!(true));
         // Expired txs can never be mined, so they are not trusted even though we authored
@@ -2312,7 +2348,7 @@ mod tests {
         );
         t.account_balance_delta = -10_005;
         // The actor's transient first-seen time (mempool stream) is surfaced while unmined.
-        let e = tx_entries(&t, 0, tx_time(&t, Some(1_700_000_123)), None);
+        let e = tx_entries(&NET, &t, 0, tx_time(&t, Some(1_700_000_123)), None);
         assert_eq!(e[0]["trusted"], json!(true));
         assert_eq!(e[0]["time"], json!(1_700_000_123));
         assert_eq!(e[0]["timereceived"], json!(1_700_000_123));
@@ -2323,7 +2359,7 @@ mod tests {
             None,
             vec![out(false, true, 5, Some("ua"), false)],
         );
-        let e = tx_entries(&f, 0, tx_time(&f, None), None);
+        let e = tx_entries(&NET, &f, 0, tx_time(&f, None), None);
         assert_eq!(e[0]["trusted"], json!(false));
     }
 
@@ -2350,10 +2386,10 @@ mod tests {
             vec![out(false, true, 5, Some("dest"), false)],
         );
         // zecd keeps no labels: every entry's label is "", so a non-empty filter matches nothing.
-        assert!(tx_entries(&t, 1, 0, Some("alice")).is_empty());
+        assert!(tx_entries(&NET, &t, 1, 0, Some("alice")).is_empty());
         // The default/empty label and the no-filter ("*") case both keep the entry.
-        assert_eq!(tx_entries(&t, 1, 0, Some("")).len(), 1);
-        assert_eq!(tx_entries(&t, 1, 0, None).len(), 1);
+        assert_eq!(tx_entries(&NET, &t, 1, 0, Some("")).len(), 1);
+        assert_eq!(tx_entries(&NET, &t, 1, 0, None).len(), 1);
     }
 
     #[test]
@@ -2487,7 +2523,7 @@ mod tests {
         let expand = |tx: &TxRecord| {
             let confirmations = tx_confirmations(&st, tx);
             let time = tx_time(tx, None);
-            tx_entries(tx, confirmations, time, None)
+            tx_entries(&NET, tx, confirmations, time, None)
         };
 
         // OLD reference oracle: expand everything oldest-first, slice the `count`-long tail.
@@ -2532,7 +2568,7 @@ mod tests {
         t.outputs[0].pool = 3;
         t.outputs[0].memo = Some(b"hello world".to_vec());
         let st = status(52);
-        let e = z_tx_entries(&t, tx_confirmations(&st, &t), tx_time(&t, None));
+        let e = z_tx_entries(&NET, &t, tx_confirmations(&st, &t), tx_time(&t, None));
         assert_eq!(e.len(), 1);
         let s = &e[0];
         assert_eq!(s["pool"], json!("orchard"));
@@ -2558,7 +2594,7 @@ mod tests {
         let mut r = tx_with(0x0a, None, false, &[(false, true, 250, false, 0)]);
         r.fee_paid = None;
         r.outputs[0].pool = 0;
-        let e = z_tx_entries(&r, tx_confirmations(&st, &r), tx_time(&r, None));
+        let e = z_tx_entries(&NET, &r, tx_confirmations(&st, &r), tx_time(&r, None));
         assert_eq!(e[0]["pool"], json!("transparent"));
         assert_eq!(e[0]["category"], json!("receive"));
         assert_eq!(e[0]["amountZat"], json!(250));
@@ -2570,11 +2606,11 @@ mod tests {
 
         // An expired unmined tx reports status "expired".
         let x = tx_with(0x0b, None, true, &[(true, false, 5, false, 0)]);
-        let e = z_tx_entries(&x, tx_confirmations(&st, &x), tx_time(&x, None));
+        let e = z_tx_entries(&NET, &x, tx_confirmations(&st, &x), tx_time(&x, None));
         assert_eq!(e[0]["status"], json!("expired"));
 
         // Change outputs are filtered out (no entries).
         let c = tx_with(0x0c, Some(50), false, &[(true, true, 5, true, 0)]);
-        assert!(z_tx_entries(&c, 1, 0).is_empty());
+        assert!(z_tx_entries(&NET, &c, 1, 0).is_empty());
     }
 }

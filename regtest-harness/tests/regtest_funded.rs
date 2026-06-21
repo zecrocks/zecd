@@ -422,13 +422,25 @@ async fn regtest_funded_orchard_receive() {
         gt["hex"].as_str().is_some_and(|h| !h.is_empty()),
         "raw hex is stored for our own send: {gt}"
     );
+    // The send detail's address is the single on-chain Orchard receiver actually paid, not the
+    // full multi-receiver UA the caller typed: zecd reduces every outgoing recipient to its paid
+    // receiver so history is identical on the authoring instance and after a restore-from-seed
+    // (where only the paid receiver is recoverable from chain). So match the (sole) send detail
+    // by category and assert the reduced address is a non-empty Unified Address, rather than
+    // equality with the multi-receiver `funder_ua`.
     let send_detail = gt["details"]
         .as_array()
         .expect("details")
         .iter()
-        .find(|d| d["category"] == "send" && d["address"] == json!(funder_ua.as_str()))
+        .find(|d| d["category"] == "send")
         .cloned()
         .unwrap_or_else(|| panic!("details carry the send to the funder: {gt}"));
+    assert!(
+        send_detail["address"]
+            .as_str()
+            .is_some_and(|a| a.starts_with('u') && a != funder_ua),
+        "send detail carries the reduced single-receiver Orchard UA: {send_detail}"
+    );
     // The memo round-trips onto the send detail (hex + decoded text, zcashd's field names).
     assert_eq!(
         send_detail["memo"].as_str(),
@@ -782,12 +794,14 @@ async fn regtest_funded_orchard_receive() {
         .cloned()
         .collect();
     assert_eq!(sends.len(), 2, "one send detail per recipient: {gt}");
+    // The shielded recipient (the multi-receiver `funder_ua`) is reduced to the single Orchard
+    // receiver actually paid, so match it by amount and assert the reduced address is a non-empty
+    // UA. The transparent recipient is a bare t-addr - already a single receiver, so it reduces
+    // to itself and the exact-equality check still holds.
     assert!(
-        sends
-            .iter()
-            .any(|d| d["address"] == json!(funder_ua.as_str())
-                && d["amount"].as_f64() == Some(-0.05)),
-        "the shielded recipient detail carries its address and amount: {gt}"
+        sends.iter().any(|d| d["amount"].as_f64() == Some(-0.05)
+            && d["address"].as_str().is_some_and(|a| a.starts_with('u'))),
+        "the shielded recipient detail carries its reduced receiver and amount: {gt}"
     );
     assert!(
         sends

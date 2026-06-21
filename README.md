@@ -348,10 +348,10 @@ the validator's job there - so those rows are all - .
 | `getwalletinfo` | ✓ | ✓ (several fields stubbed) | bitcoind shape; `keypoolsize:1`, `descriptors:false`, `scanning` progress, `unlocked_until` when encrypted, `private_keys_enabled:false` when watch-only |
 | `getaddressinfo` | ✓ | - | `ismine` is cryptographic (viewing-key attribution across both shielded pools, so an unrecorded/unfunded own address still resolves after a restore)/`solvable`; `labels` always `[]` (zecd is stateless); `scriptPubKey` empty (shielded); `iswatchonly` always false (deprecated in Core; the watch-only signal is `getwalletinfo.private_keys_enabled`); `isvalid_orchard` + `receiver_types` extension fields report the address's receivers |
 | `setlabel`, `getaddressesbylabel`, `listlabels` | ✓ | - | **Not implemented** (method-not-found, `-32601`): zecd is stateless and keeps no off-chain label store |
-| `listtransactions` | ✓ | - (`z_listtransactions`, different shape) | Core categories/fields (`fee` on sends, count/skip); the `label` filter is accepted but matches only the empty label (no labels are kept); each entry's `label` is `""`; adds `memo`/`memoStr` |
+| `listtransactions` | ✓ | - (`z_listtransactions`, different shape) | Core categories/fields (`fee` on sends, count/skip); the `label` filter is accepted but matches only the empty label (no labels are kept); each entry's `label` is `""`; adds `memo`/`memoStr`; outgoing `address` is the single receiver actually paid, not the multi-receiver UA (deterministic across restore - see *Outgoing addresses in history*) |
 | `z_listtransactions` | *(extension)* | ✓ (zecd matches its shape, no `account` arg) | zcashd's per-output history vocabulary: `pool`/`category`/`amount`/`amountZat`/`address`/`outindex`/`outgoing`/`status`, `memo`/`memoStr`, `fee`/`feeZat` on sends; `[count] [from] [includeWatchonly]` paging like `listtransactions` |
 | `listsinceblock` | ✓ | - | Cursor pattern; `removed` always `[]`; reorged/unknown cursor → `-5`, re-baseline (no fork-point walk-back) |
-| `gettransaction` | ✓ | - (`z_viewtransaction`, different shape) | `amount`/`fee`/`confirmations`/`details`/`hex`; foreign tx hex fetched from zebra on demand |
+| `gettransaction` | ✓ | - (`z_viewtransaction`, different shape) | `amount`/`fee`/`confirmations`/`details`/`hex`; foreign tx hex fetched from zebra on demand; outgoing `details[].address` is the single receiver actually paid (see *Outgoing addresses in history*) |
 | `listunspent` | ✓ | - (`z_listunspent`, different shape) | One entry per unspent Orchard note; synthesized `txid`/`vout`; `address` empty for change |
 | `getreceivedbyaddress`, `listreceivedbyaddress` | ✓ | - | Core shapes over diversified receiving addresses; change never counted; each entry's `label` is `""` (stateless). There is no `listaddresses` (Core has none either) - `listreceivedbyaddress 0 true` is the enumeration: `include_empty` unions every address the wallet has generated (used or not), each with its received total. `include_watchonly` is accepted but ignored (watch-only is wallet-level). The `*bylabel` pair is **not implemented** (`-32601`, stateless) |
 | `sendtoaddress` | ✓ | - (`z_sendmany` is async, returns an operation id) | Synchronous: builds, proves, broadcasts, returns txid; ZIP-317 fee; `subtractfeefromamount`/`fee_rate` → `-8`; extra trailing `memo` hex param |
@@ -442,6 +442,21 @@ Balances, `listtransactions`, `listunspent`, `getreceivedbyaddress`, and friends
 across **all** enabled pools. `validateaddress`/`getaddressinfo` report each address's receivers
 via the `isvalid_orchard` boolean and the `receiver_types` array
 (`transparent`/`sapling`/`orchard`).
+
+### Outgoing addresses in history are the receiver actually paid
+
+When you pay a multi-receiver UA, exactly one receiver is paid on-chain (the pool the
+transaction selected). The full UA you typed is **sender-side metadata that never reaches the
+chain** - it is cached only by the instance that authored the send, and a restore-from-seed
+recovers only the single receiver actually paid. To keep history deterministic across a
+restore, zecd's transaction-history RPCs (`listtransactions`, `gettransaction.details`,
+`listsinceblock`, `z_listtransactions`) report **outgoing** recipients as that single paid
+receiver - a bare `t`/`zs` address, or a single-receiver UA for Orchard - rather than the
+multi-receiver UA. The output's pool is also available directly in `z_listtransactions`'s
+`pool` field. Received and self-transfer entries are unaffected (they show your own address).
+To match a payment to a multi-receiver UA you issued, deconstruct that UA into its individual
+receivers and compare against the displayed receiver (zecd is stateless and keeps no
+recipient-side mapping itself).
 
 ## Watch-only wallets (UFVK)
 

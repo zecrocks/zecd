@@ -5,7 +5,8 @@
 //! address on the configured network; librustzcash's proposal machinery enforces the rest.
 
 use zcash_address::ZcashAddress;
-use zcash_keys::address::Address;
+use zcash_keys::address::{Address, UnifiedAddress};
+use zcash_keys::encoding::AddressCodec;
 use zcash_protocol::consensus::Parameters;
 use zcash_protocol::PoolType;
 use zcash_transparent::address::TransparentAddress;
@@ -54,6 +55,49 @@ pub fn receiver_types_of(addr: &Address) -> Vec<&'static str> {
         types.push("orchard");
     }
     types
+}
+
+/// Reduce a recipient address to the single on-chain receiver a given pool's output actually
+/// pays, re-encoded in its own minimal form: a bare transparent or Sapling address, or a
+/// single-receiver Unified Address for Orchard (Orchard has no standalone encoding). `pool`
+/// is a `v_tx_outputs.output_pool` code (0 = transparent, 2 = Sapling, 3 = Orchard).
+///
+/// This is what makes outgoing transaction history deterministic across a restore-from-seed.
+/// The full (possibly multi-receiver) UA a caller typed is sender-side metadata that never
+/// reaches the chain: it is cached only on the instance that *authored* the send, and a
+/// restore-from-seed recovers only the single receiver actually paid (via OVK enhancement).
+/// Reducing every outgoing output to that paid receiver yields identical history on the
+/// authoring instance and after a restore. It is idempotent: a bare address or an
+/// already-single-receiver UA reduces to itself.
+///
+/// Returns `None` (the caller keeps the recorded string) if the address can't be decoded on
+/// `params`' network or carries no receiver for `pool`. Mirrors zallet's
+/// `z_listunifiedreceivers` per-receiver re-encoding.
+pub fn single_receiver_for_pool<P: Parameters>(params: &P, s: &str, pool: i64) -> Option<String> {
+    let addr = decode_on_network(params, s)?;
+    match pool {
+        // Transparent: a bare t-addr, whether recorded bare or inside a UA.
+        0 => match &addr {
+            Address::Transparent(t) => Some(t.encode(params)),
+            Address::Unified(ua) => ua.transparent().map(|t| t.encode(params)),
+            _ => None,
+        },
+        // Sapling: the bare Sapling receiver.
+        2 => match &addr {
+            Address::Sapling(p) => Some(p.encode(params)),
+            Address::Unified(ua) => ua.sapling().map(|p| p.encode(params)),
+            _ => None,
+        },
+        // Orchard has no standalone encoding, so the single receiver is a UA carrying only it.
+        3 => match &addr {
+            Address::Unified(ua) => ua
+                .orchard()
+                .and_then(|orch| UnifiedAddress::from_receivers(Some(*orch), None, None))
+                .map(|single| single.encode(params)),
+            _ => None,
+        },
+        _ => None,
+    }
 }
 
 /// Result of `validateaddress`, used to build the JSON response.
@@ -183,6 +227,57 @@ mod tests {
         // A bare Sapling address exposes a Sapling receiver but not an Orchard one.
         assert!(!v.is_orchard);
         assert_eq!(v.receiver_types, ["sapling"]);
+    }
+
+    // A single-Orchard-receiver testnet UA generated from the checked-in test wallet (see
+    // the project docs). It carries only an Orchard receiver.
+    const TESTNET_ORCHARD_UA: &str =
+        "utest12r53eljnr7kev8ychw3ahzjgm6fwxm7fd8vfay7hn9uylj05x0pxxhze800h9dcgyr8hkc7kz3s2crnrhjcy2p90yfce2vl8mq667zw0";
+
+    #[test]
+    fn single_receiver_is_idempotent_on_bare_and_single_receiver_addresses() {
+        // A bare Sapling address reduces to itself for the Sapling pool.
+        assert_eq!(
+            single_receiver_for_pool(&ZNetwork::Main, MAINNET_SAPLING, 2).as_deref(),
+            Some(MAINNET_SAPLING)
+        );
+        // A bare transparent address reduces to itself for the transparent pool.
+        assert_eq!(
+            single_receiver_for_pool(&ZNetwork::Main, MAINNET_P2PKH, 0).as_deref(),
+            Some(MAINNET_P2PKH)
+        );
+        // A single-Orchard-receiver UA reduces to itself for the Orchard pool.
+        assert_eq!(
+            single_receiver_for_pool(&ZNetwork::Test, TESTNET_ORCHARD_UA, 3).as_deref(),
+            Some(TESTNET_ORCHARD_UA)
+        );
+    }
+
+    #[test]
+    fn single_receiver_returns_none_for_absent_pool() {
+        // The Sapling address has no Orchard or transparent receiver.
+        assert_eq!(
+            single_receiver_for_pool(&ZNetwork::Main, MAINNET_SAPLING, 3),
+            None
+        );
+        assert_eq!(
+            single_receiver_for_pool(&ZNetwork::Main, MAINNET_SAPLING, 0),
+            None
+        );
+        // The Orchard-only UA has no Sapling or transparent receiver.
+        assert_eq!(
+            single_receiver_for_pool(&ZNetwork::Test, TESTNET_ORCHARD_UA, 2),
+            None
+        );
+        assert_eq!(
+            single_receiver_for_pool(&ZNetwork::Test, TESTNET_ORCHARD_UA, 0),
+            None
+        );
+        // Undecodable input yields None rather than panicking.
+        assert_eq!(
+            single_receiver_for_pool(&ZNetwork::Main, "notanaddress", 3),
+            None
+        );
     }
 
     #[test]
