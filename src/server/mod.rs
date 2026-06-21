@@ -6,7 +6,7 @@ pub mod jsonrpc;
 use std::net::SocketAddr;
 
 use axum::body::Bytes;
-use axum::extract::{Path, State};
+use axum::extract::{ConnectInfo, Path, State};
 use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::post;
@@ -25,9 +25,16 @@ pub async fn run(state: AppState) -> anyhow::Result<()> {
     let app = router(state);
     let listener = tokio::net::TcpListener::bind(addr).await?;
     info!("RPC server listening on http://{addr}");
-    axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown)
-        .await?;
+    // `into_make_service_with_connect_info` makes each connection's peer `SocketAddr` available
+    // to handlers via the `ConnectInfo` extractor, so RPC auth attempts can be attributed to a
+    // client IP. (The `tower::oneshot` integration tests drive `router` directly without it; the
+    // handlers extract it as `Option`, yielding `None` there.)
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .with_graceful_shutdown(shutdown)
+    .await?;
     Ok(())
 }
 
@@ -45,21 +52,34 @@ fn router(state: AppState) -> Router {
         .with_state(state)
 }
 
-async fn handle_root(State(state): State<AppState>, headers: HeaderMap, body: Bytes) -> Response {
-    handle(state, None, headers, body).await
+async fn handle_root(
+    State(state): State<AppState>,
+    peer: Option<ConnectInfo<SocketAddr>>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    handle(state, peer_addr(peer), None, headers, body).await
 }
 
 async fn handle_wallet(
     State(state): State<AppState>,
+    peer: Option<ConnectInfo<SocketAddr>>,
     Path(name): Path<String>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    handle(state, Some(name), headers, body).await
+    handle(state, peer_addr(peer), Some(name), headers, body).await
+}
+
+/// Unwrap the optional `ConnectInfo` extractor into the peer socket address, if known. It is
+/// `None` for requests that arrive without connection info (the in-process `oneshot` tests).
+fn peer_addr(peer: Option<ConnectInfo<SocketAddr>>) -> Option<SocketAddr> {
+    peer.map(|ConnectInfo(addr)| addr)
 }
 
 async fn handle(
     state: AppState,
+    peer: Option<SocketAddr>,
     wallet: Option<String>,
     headers: HeaderMap,
     body: Bytes,
@@ -79,6 +99,12 @@ async fn handle(
         .get(header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok());
     let wallet_label = wallet.as_deref().unwrap_or("default");
+    // The connecting client's address, for auth attribution. Behind a reverse proxy the socket
+    // peer is the proxy, so also surface `X-Forwarded-For` when the proxy set it (logged as-is;
+    // it is client-supplied and only used for the log line, never for an auth decision).
+    let peer = peer.map(|a| a.to_string());
+    let peer = peer.as_deref().unwrap_or("unknown");
+    let forwarded_for = headers.get("x-forwarded-for").and_then(|v| v.to_str().ok());
     if !state.auth.check(auth_header) {
         // Bitcoin Core inserts a small delay on auth failure to deter brute-forcing.
         tokio::time::sleep(std::time::Duration::from_millis(250)).await;
@@ -87,6 +113,8 @@ async fn handle(
                 .as_deref()
                 .unwrap_or("<none>"),
             wallet = wallet_label,
+            peer,
+            forwarded_for,
             "RPC authentication failed"
         );
         return unauthorized();
@@ -96,6 +124,8 @@ async fn handle(
             .as_deref()
             .unwrap_or("<none>"),
         wallet = wallet_label,
+        peer,
+        forwarded_for,
         "RPC authentication succeeded"
     );
 
