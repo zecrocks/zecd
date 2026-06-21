@@ -80,7 +80,9 @@ pub(crate) async fn getrawtransaction(
     let st = handle.status();
     // Wallet-known txs carry their mined height/time locally; anything else comes from
     // lightwalletd, which reports the mined height alongside the raw bytes.
-    let rec = read::get_transaction(&handle.dir, txid_str).ok().flatten();
+    let rec = read::get_transaction(handle.network, &handle.dir, txid_str)
+        .ok()
+        .flatten();
     let rec_height = rec.as_ref().and_then(|r| r.mined_height);
     let (data, mined_height) = match rec.as_ref().and_then(|r| r.raw.clone()) {
         Some(raw) => (raw, rec_height),

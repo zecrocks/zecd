@@ -173,12 +173,41 @@ fn regtest_wallet_lifecycle() {
     assert!(read::list_transactions(wallet_dir)
         .expect("listtransactions")
         .is_empty());
-    assert!(read::get_transaction(wallet_dir, &"ab".repeat(32))
+    assert!(read::get_transaction(net, wallet_dir, &"ab".repeat(32))
         .expect("gettransaction")
         .is_none());
     assert!(!read::tx_exists(wallet_dir, &"ab".repeat(32)));
     assert!(read::first_scanned_block(wallet_dir)
         .expect("first_scanned_block")
+        .is_none());
+
+    // 3b. Column-existence guards for the remaining raw queries that reach into librustzcash's
+    // internal tables (no public API covers them). The wallet is empty, so each returns nothing -
+    // but `prepare()` validates every referenced column against the real schema, so a
+    // `zcash_client_sqlite` bump that renames a column we depend on fails loudly here (offline)
+    // instead of silently at runtime. Together with the `list_unspent`/`list_transactions`/
+    // `get_transaction` calls above, this covers every internal column zecd reads.
+    assert_eq!(read::tx_count(wallet_dir).expect("tx_count"), 0);
+    assert!(read::unmined_raw_txs(wallet_dir, 1)
+        .expect("unmined_raw_txs")
+        .is_empty());
+    // received_tx_records also exercises transparent_receiver_map (the `addresses` table); both
+    // the unfiltered and address-filtered shapes run.
+    assert!(read::received_tx_records(wallet_dir, None)
+        .expect("received_tx_records")
+        .is_empty());
+    assert!(read::received_tx_records(wallet_dir, Some(addr.as_str()))
+        .expect("received_tx_records filtered")
+        .is_empty());
+    // The `blocks`-table queries (no public API exposes block time / a reverse hash lookup).
+    assert!(read::block_info_at(wallet_dir, 1)
+        .expect("block_info_at")
+        .is_none());
+    assert!(read::median_time_past(wallet_dir, 1)
+        .expect("median_time_past")
+        .is_none());
+    assert!(read::block_height_by_hash(wallet_dir, &"ab".repeat(32))
+        .expect("block_height_by_hash")
         .is_none());
 
     // 4. is_mine is network-scoped: true for our own regtest address, false for a testnet UA.

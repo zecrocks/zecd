@@ -1030,7 +1030,7 @@ pub(crate) async fn gettransaction(
     let txid = req.require_str(0, "gettransaction requires a txid")?;
     let handle = state.registry.get(wallet)?.clone();
     let st = handle.status();
-    let rec = read::get_transaction(&handle.dir, txid)?
+    let rec = read::get_transaction(handle.network, &handle.dir, txid)?
         .ok_or_else(|| RpcError::invalid_address_or_key("Invalid or non-wallet transaction id"))?;
 
     let details = gettransaction_details(&rec);

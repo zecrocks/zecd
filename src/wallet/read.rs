@@ -11,7 +11,8 @@ use zcash_client_backend::data_api::wallet::ConfirmationsPolicy;
 use zcash_client_backend::data_api::{Account as _, InputSource, WalletRead};
 use zcash_keys::address::Address;
 use zcash_keys::encoding::AddressCodec as _;
-use zcash_protocol::ShieldedProtocol;
+use zcash_primitives::transaction::builder::DEFAULT_TX_EXPIRY_DELTA;
+use zcash_protocol::{ShieldedProtocol, TxId};
 
 use crate::network::ZNetwork;
 use crate::wallet::open::{data_db_path, open_read};
@@ -173,6 +174,26 @@ fn txid_internal(display_hex: &str) -> Option<Vec<u8>> {
     }
     b.reverse();
     Some(b)
+}
+
+/// SQL predicate that the transaction aliased `alias` is *unexpired*, a faithful port of
+/// librustzcash's `zcash_client_sqlite::wallet::common::tx_unexpired_condition` - the canonical
+/// rule that `select_unspent_notes`/`spent_notes_clause` and the balance queries use. We
+/// reproduce it because there is no public API for the unmined/mempool notes and rebroadcast set
+/// the raw queries below supplement; centralizing it (rather than open-coding a simpler expiry
+/// test, as earlier copies did) keeps `listunspent minconf=0` and `unmined_raw_txs` in lockstep
+/// with `getbalance` - including the `min_observed_height + DEFAULT_TX_EXPIRY_DELTA` staleness
+/// branch (a tx with unknown expiry is treated as unexpired only while recently observed). The
+/// caller must bind `:target_height` to the next-to-be-mined height (chain tip + 1). Keep this in
+/// sync with upstream on every `zcash_client_sqlite` bump.
+fn tx_unexpired_sql(alias: &str) -> String {
+    format!(
+        "{alias}.mined_height < :target_height
+         OR {alias}.expiry_height = 0
+         OR {alias}.expiry_height >= :target_height
+         OR ({alias}.expiry_height IS NULL
+             AND {alias}.min_observed_height + {DEFAULT_TX_EXPIRY_DELTA} >= :target_height)"
+    )
 }
 
 /// Map from an address row's canonical encoding (`addresses.address`, a unified address) to
@@ -447,7 +468,11 @@ pub fn received_tx_records(
 }
 
 /// A single transaction by its display-hex txid.
-pub fn get_transaction(wallet_dir: &Path, txid_hex: &str) -> anyhow::Result<Option<TxRecord>> {
+pub fn get_transaction(
+    network: ZNetwork,
+    wallet_dir: &Path,
+    txid_hex: &str,
+) -> anyhow::Result<Option<TxRecord>> {
     let Some(internal) = txid_internal(txid_hex) else {
         return Ok(None);
     };
@@ -460,16 +485,25 @@ pub fn get_transaction(wallet_dir: &Path, txid_hex: &str) -> anyhow::Result<Opti
     let (txid, mut rec) = tx_from_row(row)?;
     drop(rows);
     rec.outputs = load_outputs(&conn, &txid, &transparent_receiver_map(&conn)?)?;
-    // Fetch the raw transaction bytes for `gettransaction.hex`, if stored.
-    rec.raw = conn
-        .query_row(
-            "SELECT raw FROM transactions WHERE txid = :txid",
-            named_params! {":txid": &internal},
-            |row| row.get::<_, Option<Vec<u8>>>(0),
-        )
-        .optional()?
-        .flatten();
+    // Fetch the raw transaction bytes for `gettransaction.hex` via the public `WalletRead` API
+    // (mirroring the actor's `do_get_raw_tx`) instead of reading librustzcash's internal
+    // `transactions.raw` column directly: this yields the canonical consensus serialization off
+    // the documented interface. `None` when the tx is unknown or its raw data isn't stored -
+    // exactly the contract of the column read it replaces.
+    rec.raw = <[u8; 32]>::try_from(internal)
+        .ok()
+        .and_then(|bytes| raw_tx_bytes(network, wallet_dir, TxId::from_bytes(bytes)));
     Ok(Some(rec))
+}
+
+/// Serialized bytes of a wallet-known transaction, via the public `WalletRead::get_transaction`.
+/// `None` if the txid is unknown to the wallet or its raw data hasn't been stored yet.
+fn raw_tx_bytes(network: ZNetwork, wallet_dir: &Path, txid: TxId) -> Option<Vec<u8>> {
+    let db = open_read(network, wallet_dir).ok()?;
+    let tx = db.get_transaction(txid).ok()??;
+    let mut buf = Vec::new();
+    tx.write(&mut buf).ok()?;
+    Some(buf)
 }
 
 /// Whether the wallet database has a row for this transaction (display-hex txid). The actor
@@ -502,33 +536,29 @@ pub fn tx_exists(wallet_dir: &Path, txid_hex: &str) -> bool {
 /// the sender's to retransmit, not ours.
 pub fn unmined_raw_txs(wallet_dir: &Path, tip: u32) -> anyhow::Result<Vec<(String, Vec<u8>)>> {
     let conn = open_conn(wallet_dir)?;
-    let mut stmt = conn.prepare(
-        "SELECT txid, raw, expiry_height FROM transactions t
+    // Unexpired is the shared `tx_unexpired_sql` predicate (same rule the selector uses), so the
+    // rebroadcast set never diverges from what the wallet considers live. `:target_height` is the
+    // next-to-be-mined height; `expiry_height >= tip + 1` is exactly the old `expiry > tip`.
+    let unexpired = tx_unexpired_sql("t");
+    let sql = format!(
+        "SELECT txid, raw FROM transactions t
          WHERE mined_height IS NULL AND raw IS NOT NULL
+         AND ({unexpired})
          AND (EXISTS (SELECT 1 FROM orchard_received_note_spends s
                       WHERE s.transaction_id = t.id_tx)
               OR EXISTS (SELECT 1 FROM sapling_received_note_spends s
                          WHERE s.transaction_id = t.id_tx)
               OR EXISTS (SELECT 1 FROM transparent_received_output_spends s
-                         WHERE s.transaction_id = t.id_tx))",
-    )?;
-    let rows = stmt.query_map([], |row| {
-        Ok((
-            row.get::<_, Vec<u8>>(0)?,
-            row.get::<_, Vec<u8>>(1)?,
-            row.get::<_, Option<u32>>(2)?,
-        ))
+                         WHERE s.transaction_id = t.id_tx))"
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map(named_params! { ":target_height": tip + 1 }, |row| {
+        Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, Vec<u8>>(1)?))
     })?;
     let mut out = Vec::new();
     for r in rows {
-        let (txid, raw, expiry) = r?;
-        let unexpired = match expiry {
-            None | Some(0) => true,
-            Some(e) => e > tip,
-        };
-        if unexpired {
-            out.push((txid_display(&txid), raw));
-        }
+        let (txid, raw) = r?;
+        out.push((txid_display(&txid), raw));
     }
     Ok(out)
 }
@@ -722,25 +752,30 @@ pub fn list_unspent(network: ZNetwork, wallet_dir: &Path) -> anyhow::Result<Vec<
                 "action_index",
             ),
         ];
+        // Both the note's own creating tx and any spending tx are gated by the shared
+        // `tx_unexpired_sql` predicate, so this supplement and the rebroadcast set agree with the
+        // selector/balances on exactly what "unexpired" means (incl. the unknown-expiry staleness
+        // branch). A note is shown only if its creating tx is unmined and unexpired, and isn't
+        // suppressed by a spend whose tx is still live (mined or unexpired) - an expired spend
+        // releases the note again.
+        let unexpired_t = tx_unexpired_sql("t");
+        let unexpired_stx = tx_unexpired_sql("stx");
         for (note_table, spend_table, fk_col, index_col) in pools {
             let sql = format!(
                 "SELECT t.txid, rn.{index_col}, rn.value
                  FROM {note_table} rn
                  JOIN transactions t ON t.id_tx = rn.transaction_id
                  WHERE t.mined_height IS NULL
-                   AND (t.expiry_height IS NULL OR t.expiry_height = 0
-                        OR t.expiry_height >= :target)
+                   AND ({unexpired_t})
                    AND rn.id NOT IN (
                        SELECT rns.{fk_col}
                        FROM {spend_table} rns
                        JOIN transactions stx ON stx.id_tx = rns.transaction_id
-                       WHERE stx.mined_height IS NOT NULL
-                          OR stx.expiry_height IS NULL OR stx.expiry_height = 0
-                          OR stx.expiry_height >= :target
+                       WHERE {unexpired_stx}
                    )"
             );
             let mut stmt = conn.prepare(&sql)?;
-            let rows = stmt.query_map(named_params! { ":target": target }, |r| {
+            let rows = stmt.query_map(named_params! { ":target_height": target }, |r| {
                 Ok((
                     r.get::<_, Vec<u8>>(0)?,
                     r.get::<_, u32>(1)?,
@@ -888,5 +923,55 @@ mod tests {
             Some(1_781_163_113)
         );
         assert_eq!(parse(None), None);
+    }
+
+    /// [`super::tx_unexpired_sql`] must reproduce librustzcash's `tx_unexpired_condition` across
+    /// every branch: a mined tx (never "expired"), the never-expires (`expiry_height = 0`) case,
+    /// expiry at/after vs strictly before the target, and the unknown-expiry staleness window
+    /// (`min_observed_height + DEFAULT_TX_EXPIRY_DELTA`). This is the canonical spentness/expiry
+    /// rule that our `listunspent minconf=0` supplement and `unmined_raw_txs` share with the
+    /// selector and balances; this test pins the exact semantics (including the staleness branch
+    /// our earlier hand-rolled copies dropped) so a `zcash_client_sqlite` bump that changes the
+    /// rule is caught here. Thresholds are derived from `DEFAULT_TX_EXPIRY_DELTA` so the test
+    /// tracks upstream if the constant moves.
+    #[test]
+    fn tx_unexpired_sql_matches_upstream_branches() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE tx(mined_height INTEGER, expiry_height INTEGER,
+                             min_observed_height INTEGER NOT NULL);",
+        )
+        .unwrap();
+        let pred = super::tx_unexpired_sql("tx");
+        let target: i64 = 100;
+        let delta = i64::from(super::DEFAULT_TX_EXPIRY_DELTA);
+        // (mined_height, expiry_height, min_observed_height) -> expected "unexpired".
+        let cases: &[(Option<i64>, Option<i64>, i64, bool)] = &[
+            (Some(50), Some(80), 50, true), // mined (mined < target): never treated as expired
+            (None, Some(0), 50, true),      // expiry 0 => never expires
+            (None, Some(target), 50, true), // expiry == target => unexpired
+            (None, Some(target + 5), 50, true), // expiry > target => unexpired
+            (None, Some(target - 1), 50, false), // expiry < target => expired
+            (None, None, target - delta, true), // unknown expiry, boundary: mo + delta == target
+            (None, None, target - delta + 1, true), // unknown expiry, recently observed
+            (None, None, target - delta - 1, false), // unknown expiry, stale => expired
+        ];
+        for (i, (m, e, mo, expected)) in cases.iter().enumerate() {
+            conn.execute("DELETE FROM tx", []).unwrap();
+            conn.execute(
+                "INSERT INTO tx(mined_height, expiry_height, min_observed_height)
+                 VALUES (?1, ?2, ?3)",
+                rusqlite::params![m, e, mo],
+            )
+            .unwrap();
+            let got: bool = conn
+                .query_row(
+                    &format!("SELECT EXISTS(SELECT 1 FROM tx WHERE {pred})"),
+                    rusqlite::named_params! { ":target_height": target },
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(got, *expected, "case {i}: ({m:?}, {e:?}, {mo})");
+        }
     }
 }
