@@ -121,7 +121,7 @@ async fn dispatch_zecd(
         "getblockheader" => blockchain::getblockheader(state, req),
 
         // Utility
-        "validateaddress" => util::validateaddress(state, req),
+        "validateaddress" => util::validateaddress(state, wallet, req),
         "settxfee" => util::settxfee(req),
         "estimatesmartfee" => util::estimatesmartfee(req),
         "estimatefee" => util::estimatefee(req),

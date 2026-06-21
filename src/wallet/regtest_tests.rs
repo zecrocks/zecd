@@ -329,6 +329,108 @@ fn is_mine_attributes_unrecorded_addresses_via_viewing_key() {
     );
 }
 
+/// THREAT MODEL - the "unexpected receiver" UA splice (a malicious `is_mine` attempt). An attacker
+/// who learns one of the wallet's receivers can craft a unified address that pairs *their* receiver
+/// in one pool with the *victim's* receiver in another, e.g. `{ attacker Orchard, victim Sapling }`.
+/// A "one receiver is mine ⇒ mine" rule would report `ismine: true`, yet a sender resolves the UA
+/// to its most-preferred pool (ZIP-316: Orchard first) and pays the attacker - and a sender that
+/// only supports the pool holding the *foreign* receiver pays the attacker regardless of order. So
+/// `is_mine` must reject any multi-receiver UA that is not wholly the wallet's at one index. This
+/// test builds both spliced orientations and asserts they are NOT ismine, while a genuinely
+/// own all-pools UA (and the wallet's own single-pool receivers) still is.
+#[test]
+fn is_mine_rejects_spliced_unified_address_with_foreign_receiver() {
+    use zcash_client_backend::data_api::Account as _;
+    use zcash_keys::address::{Address, UnifiedAddress};
+    use zip32::DiversifierIndex;
+
+    let net = network::regtest();
+
+    // Victim wallet.
+    let dir = tempfile::tempdir().unwrap();
+    let wallet_dir = dir.path();
+    let mut db = open::init_dbs(net, wallet_dir).expect("init dbs");
+    let (account_id, _usk) = db
+        .create_account("primary", &test_seed(), &genesis_birthday(), None)
+        .expect("create account");
+    db.update_chain_tip(BlockHeight::from_u32(1)).unwrap();
+    let account = db.get_account(account_id).unwrap().unwrap();
+    let uivk = account.ufvk().unwrap().to_unified_incoming_viewing_key();
+    drop(db);
+
+    // Attacker wallet (a different seed = different keys).
+    let fdir = tempfile::tempdir().unwrap();
+    let mut fdb = open::init_dbs(net, fdir.path()).unwrap();
+    let (faccount_id, _) = fdb
+        .create_account("attacker", &foreign_seed(), &genesis_birthday(), None)
+        .unwrap();
+    let faccount = fdb.get_account(faccount_id).unwrap().unwrap();
+    let fuivk = faccount.ufvk().unwrap().to_unified_incoming_viewing_key();
+    drop(fdb);
+
+    let far = DiversifierIndex::from(1_000_007u32);
+    let mine_all = uivk.address(far, UnifiedAddressRequest::ALLOW_ALL).unwrap();
+    let attacker_all = fuivk
+        .address(far, UnifiedAddressRequest::ALLOW_ALL)
+        .unwrap();
+
+    // Sanity: a genuinely own all-pools UA is still ismine under the consistency-aware rule.
+    assert!(
+        read::is_mine(net, wallet_dir, &mine_all.encode(&net)),
+        "the wallet's own all-pools UA must stay ismine"
+    );
+
+    // Splice A: attacker's Orchard receiver + the victim's Sapling receiver. A sender prefers
+    // Orchard, so funds would go to the attacker - this must NOT be ismine.
+    let splice_a = UnifiedAddress::from_receivers(
+        attacker_all.orchard().cloned(),
+        mine_all.sapling().cloned(),
+        None,
+    )
+    .expect("build spliced UA")
+    .encode(&net);
+    // The victim's Sapling receiver alone IS theirs - proving the splice would fool a naive
+    // "any receiver mine" rule.
+    assert!(
+        read::is_mine(
+            net,
+            wallet_dir,
+            &Address::Sapling(*mine_all.sapling().unwrap()).encode(&net)
+        ),
+        "precondition: the victim's bare Sapling receiver is genuinely theirs"
+    );
+    assert!(
+        !read::is_mine(net, wallet_dir, &splice_a),
+        "a UA pairing the attacker's Orchard receiver with the victim's Sapling receiver must NOT \
+         be ismine (a sender prefers Orchard and pays the attacker)"
+    );
+
+    // Splice B: the victim's Orchard receiver + attacker's Sapling receiver. Even with the
+    // victim's receiver in the preferred pool, a Sapling-only sender pays the attacker - reject.
+    let splice_b = UnifiedAddress::from_receivers(
+        mine_all.orchard().cloned(),
+        attacker_all.sapling().cloned(),
+        None,
+    )
+    .expect("build spliced UA")
+    .encode(&net);
+    assert!(
+        !read::is_mine(net, wallet_dir, &splice_b),
+        "a UA pairing the victim's Orchard receiver with the attacker's Sapling receiver must NOT \
+         be ismine (a Sapling-only sender pays the attacker)"
+    );
+
+    // The classifier agrees: both splices are Inconsistent (a foreign receiver mixed in).
+    assert!(matches!(
+        read::classify_unified_receivers(net, wallet_dir, &splice_a),
+        read::UaReceivers::Inconsistent(_)
+    ));
+    assert!(matches!(
+        read::classify_unified_receivers(net, wallet_dir, &splice_b),
+        read::UaReceivers::Inconsistent(_)
+    ));
+}
+
 /// The watch-only (UFVK) pairing guarantee, offline on regtest:
 ///
 /// 1. a wallet built from the spending wallet's exported UFVK (`init --ufvk` ≙

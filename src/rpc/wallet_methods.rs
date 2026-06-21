@@ -395,8 +395,18 @@ pub(crate) fn getaddressinfo(
     let addr = req.require_str(0, "getaddressinfo requires an address")?;
     let handle = state.registry.get(wallet)?;
     let v = crate::address::validate(&handle.network, addr);
+    // For a unified address, surface whether all its receivers belong to this wallet at one
+    // diversifier index (`receivers_consistent`): `Some(false)` flags a hand-spliced UA - receivers
+    // from different indices, or one of ours mixed with a stranger's - which can never be an address
+    // this wallet issued. `None` (foreign or single-receiver) omits the field. This is informational
+    // here; the consuming RPCs (getreceivedbyaddress/z_sendmany) reject the spliced case outright.
+    let receivers_consistent = if v.is_valid {
+        read::classify_unified_receivers(handle.network, &handle.dir, addr).consistent_flag()
+    } else {
+        None
+    };
     let ismine = v.is_valid && read::is_mine(handle.network, &handle.dir, addr);
-    addressinfo_json(v, addr, ismine)
+    addressinfo_json(v, addr, ismine, receivers_consistent)
 }
 
 /// Build the `getaddressinfo` response. Bitcoin Core throws `-5 Invalid address` for an
@@ -405,11 +415,12 @@ fn addressinfo_json(
     v: crate::address::Validation,
     addr: &str,
     ismine: bool,
+    receivers_consistent: Option<bool>,
 ) -> Result<Value, RpcError> {
     if !v.is_valid {
         return Err(RpcError::invalid_address_or_key("Invalid address"));
     }
-    Ok(json!({
+    let mut out = json!({
         "address": addr,
         // Real scriptPubKey for transparent addresses; shielded addresses have no script
         // form, so the field stays empty (same convention as validateaddress).
@@ -432,7 +443,13 @@ fn addressinfo_json(
         // zecd is stateless and keeps no address labels; the field is retained empty for
         // Bitcoin Core shape conformance.
         "labels": Vec::<String>::new(),
-    }))
+    });
+    // Extension field: only present for a unified address whose receiver consistency is
+    // computable against this wallet's keys (omitted for foreign or single-receiver addresses).
+    if let Some(consistent) = receivers_consistent {
+        out["receivers_consistent"] = json!(consistent);
+    }
+    Ok(out)
 }
 
 /// The per-output categories. A normal receive or send is one entry; a self-transfer (paid
@@ -900,6 +917,15 @@ fn received_by_address(
 
 /// `getreceivedbyaddress <address> [minconf]` - total received by one of the wallet's own
 /// addresses, in transactions with at least `minconf` confirmations.
+///
+/// Matching is whole-UA string equality, not receiver-level: round-tripping the exact value
+/// `getnewaddress` returned always works (and sums receipts across all its receivers, which
+/// share one diversifier index), but a re-encoding with a different receiver subset, or a
+/// different UA that merely shares a receiver, is a different string → `-4`/no contribution.
+/// A *spliced* UA (receivers stapled together from different diversifier indices, or one of this
+/// wallet's receivers mixed with a stranger's) is caught earlier by [`read::classify_unified_receivers`]
+/// and rejected with `-5` rather than silently treated as foreign. (The sole sub-receiver case is
+/// the bare-t-address→UA rewrite, inert here since zecd exposes no transparent receivers.)
 pub(crate) fn getreceivedbyaddress(
     state: &AppState,
     wallet: Option<&str>,
@@ -912,6 +938,11 @@ pub(crate) fn getreceivedbyaddress(
         return Err(RpcError::invalid_address_or_key(format!(
             "Invalid Zcash address: {addr}"
         )));
+    }
+    if let read::UaReceivers::Inconsistent(why) =
+        read::classify_unified_receivers(handle.network, &handle.dir, addr)
+    {
+        return Err(RpcError::invalid_address_or_key(why));
     }
     if !read::is_mine(handle.network, &handle.dir, addr) {
         return Err(RpcError::wallet("Address not found in wallet"));
@@ -1518,6 +1549,11 @@ pub(crate) fn z_sendmany(
         return Err(RpcError::invalid_address_or_key(
             "Invalid from address: should be a taddr, zaddr, or unified address",
         ));
+    }
+    if let read::UaReceivers::Inconsistent(why) =
+        read::classify_unified_receivers(handle.network, &handle.dir, fromaddress)
+    {
+        return Err(RpcError::invalid_address_or_key(why));
     }
     if !read::is_mine(handle.network, &handle.dir, fromaddress) {
         return Err(RpcError::invalid_address_or_key(
@@ -2162,7 +2198,7 @@ mod tests {
             script_pub_key: None,
             is_script: false,
         };
-        let e = addressinfo_json(invalid, "nonsense", false).unwrap_err();
+        let e = addressinfo_json(invalid, "nonsense", false, None).unwrap_err();
         assert_eq!(e.code, crate::error::codes::RPC_INVALID_ADDRESS_OR_KEY);
 
         // Valid: Bitcoin Core's field set, without an isvalid field. The shape is identical
@@ -2176,10 +2212,12 @@ mod tests {
             script_pub_key: None,
             is_script: false,
         };
-        let o = addressinfo_json(valid, "utest1abc", true).unwrap();
+        let o = addressinfo_json(valid, "utest1abc", true, Some(false)).unwrap();
         assert!(o.get("isvalid").is_none());
         assert_eq!(o["address"], json!("utest1abc"));
         assert_eq!(o["ismine"], json!(true));
+        // The receiver-consistency flag is surfaced when computable (here: a spliced UA).
+        assert_eq!(o["receivers_consistent"], json!(false));
         assert_eq!(o["solvable"], json!(true));
         assert_eq!(o["iswatchonly"], json!(false));
         assert_eq!(o["iswitness"], json!(false));

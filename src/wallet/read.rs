@@ -9,10 +9,12 @@ use rusqlite::{named_params, Connection, OptionalExtension};
 use uuid::Uuid;
 use zcash_client_backend::data_api::wallet::ConfirmationsPolicy;
 use zcash_client_backend::data_api::{Account as _, InputSource, WalletRead};
-use zcash_keys::address::Address;
+use zcash_keys::address::{Address, UnifiedAddress};
 use zcash_keys::encoding::AddressCodec as _;
+use zcash_keys::keys::UnifiedFullViewingKey;
 use zcash_primitives::transaction::builder::DEFAULT_TX_EXPIRY_DELTA;
 use zcash_protocol::{ShieldedProtocol, TxId};
+use zip32::{DiversifierIndex, Scope};
 
 use crate::network::ZNetwork;
 use crate::wallet::open::{data_db_path, open_read};
@@ -843,11 +845,14 @@ pub fn all_addresses(network: ZNetwork, wallet_dir: &Path) -> Vec<String> {
 ///    stateless (or any) from-seed restore that was never funded, so the scan never re-added it
 ///    to the `addresses` table.
 ///
-/// Both shielded pools zecd supports - Sapling and Orchard - are covered (a Unified Address is
-/// attributed if *any* of its shielded receivers is ours; a bare Sapling address is tested
-/// directly). Transparent receivers are intentionally not considered: zecd never receives into
-/// the transparent pool, and a transparent receiver can't be attributed to a viewing key without
-/// a gap-limit derivation scan.
+/// Both shielded pools zecd supports - Sapling and Orchard - are covered. A multi-receiver
+/// Unified Address is attributed as ours **only when *every* shielded receiver is ours at one
+/// diversifier index** (the [`UaReceivers::MineConsistent`] verdict), not when merely one
+/// receiver matches: see the threat-model note in the body - a UA that pairs the wallet's
+/// receiver with a stranger's would otherwise read `ismine: true` while a sender pays the
+/// stranger. A single-receiver UA (and a bare Sapling address) is tested directly. Transparent
+/// receivers are intentionally not considered: zecd never receives into the transparent pool, and
+/// a transparent receiver can't be attributed to a viewing key without a gap-limit derivation scan.
 pub fn is_mine(network: ZNetwork, wallet_dir: &Path, addr: &str) -> bool {
     let Ok(db) = open_read(network, wallet_dir) else {
         return false;
@@ -874,13 +879,33 @@ pub fn is_mine(network: ZNetwork, wallet_dir: &Path, addr: &str) -> bool {
         let Ok(Some(acct)) = db.get_account(account) else {
             continue;
         };
-        let Some(uivk) = acct.ufvk().map(|k| k.to_unified_incoming_viewing_key()) else {
+        let Some(ufvk) = acct.ufvk() else {
             continue;
         };
+        let uivk = ufvk.to_unified_incoming_viewing_key();
         let mine = match decoded {
-            // decrypt_diversifiers runs Sapling decrypt_diversifier + Orchard diversifier_index
-            // and returns the recovered indices; non-empty ⇒ a shielded receiver is ours.
-            Address::Unified(ua) => !uivk.decrypt_diversifiers(ua).is_empty(),
+            // THREAT MODEL - the "unexpected receiver" UA splice. A naive "any one receiver is
+            // mine ⇒ the address is mine" rule lets an attacker hand the wallet a UA that pairs
+            // *their* Orchard receiver with the victim's Sapling receiver: attribution says
+            // "yours", but a ZIP-316 sender prefers Orchard and pays the attacker (and a
+            // Sapling-only sender pays the attacker too if the foreign receiver sits in the only
+            // pool it supports). Any foreign receiver is therefore disqualifying. So a UA with two
+            // shielded receivers is ours ONLY when every receiver is ours at a single diversifier
+            // index (`MineConsistent`) - never when it mixes in a stranger's receiver or staples
+            // our own receivers from different indices. A UA with a single shielded receiver has
+            // nothing to splice, so the plain viewing-key membership test stands (this is what
+            // still recognizes a wallet-generated-but-unrecorded address after a restore).
+            Address::Unified(ua) => {
+                let two_shielded =
+                    u8::from(ua.sapling().is_some()) + u8::from(ua.orchard().is_some()) >= 2;
+                if two_shielded {
+                    classify_receivers_with_ufvk(ufvk, ua) == UaReceivers::MineConsistent
+                } else {
+                    // decrypt_diversifiers runs Sapling decrypt_diversifier + Orchard
+                    // diversifier_index; non-empty ⇒ the sole shielded receiver is ours.
+                    !uivk.decrypt_diversifiers(ua).is_empty()
+                }
+            }
             // A bare Sapling address: the same membership test on the Sapling receiver alone.
             Address::Sapling(pa) => uivk
                 .sapling()
@@ -897,8 +922,142 @@ pub fn is_mine(network: ZNetwork, wallet_dir: &Path, addr: &str) -> bool {
     false
 }
 
+/// How a unified address's shielded receivers relate to *this wallet's* account key - the basis
+/// for rejecting hand-spliced UAs (receivers stapled together from different diversifier indices,
+/// or a mix of this wallet's receiver and a stranger's). A diversifier *index* is key-relative
+/// (`FF1⁻¹(dk, d)` under the viewing key), so this is only computable against the wallet's own
+/// keys; a UA whose receivers are all someone else's is simply [`UaReceivers::Foreign`].
+#[derive(Debug, PartialEq, Eq)]
+pub enum UaReceivers {
+    /// Not a unified address, or a UA with at most one shielded receiver: nothing to cross-check
+    /// (a single receiver cannot disagree with itself).
+    NotApplicable,
+    /// No shielded receiver derives from this wallet's account key(s).
+    Foreign,
+    /// Every shielded receiver derives from this wallet at the *same* (index, scope) - a
+    /// well-formed address this wallet could itself have issued.
+    MineConsistent,
+    /// The receivers disagree: at least one belongs to this wallet and at least one does not, or
+    /// they derive at *different* diversifier indices/scopes. A UA this wallet issued can never
+    /// look like this, so it indicates receivers spliced together by hand.
+    Inconsistent(String),
+}
+
+impl UaReceivers {
+    /// An informational tri-state for inspection RPCs (`validateaddress`/`getaddressinfo`):
+    /// `Some(true)` when every receiver is ours at one index, `Some(false)` when the receivers
+    /// are spliced, and `None` when consistency is not computable/meaningful (a foreign UA - the
+    /// index is the owner's secret - or a single-receiver address with nothing to cross-check).
+    pub fn consistent_flag(&self) -> Option<bool> {
+        match self {
+            UaReceivers::MineConsistent => Some(true),
+            UaReceivers::Inconsistent(_) => Some(false),
+            UaReceivers::Foreign | UaReceivers::NotApplicable => None,
+        }
+    }
+}
+
+/// Recover an Orchard receiver's diversifier index (and scope) under a full viewing key, trying
+/// both scopes. `None` if the receiver does not belong to the key.
+fn orchard_receiver_index(
+    fvk: &orchard::keys::FullViewingKey,
+    addr: &orchard::Address,
+) -> Option<(DiversifierIndex, Scope)> {
+    [Scope::External, Scope::Internal]
+        .into_iter()
+        .find_map(|scope| {
+            fvk.to_ivk(scope)
+                .diversifier_index(addr)
+                .map(|j| (j, scope))
+        })
+}
+
+/// Classify a unified address's receivers against a single account's UFVK. Pure (no I/O) so it
+/// can be unit-tested directly without a wallet DB.
+fn classify_receivers_with_ufvk(ufvk: &UnifiedFullViewingKey, ua: &UnifiedAddress) -> UaReceivers {
+    // For each present shielded receiver, recover its (index, scope) under this key. The outer
+    // `Option` is presence; the inner is whether it belongs to this key.
+    let recovered: [Option<Option<(DiversifierIndex, Scope)>>; 2] = [
+        ua.sapling()
+            .map(|a| ufvk.sapling().and_then(|dfvk| dfvk.decrypt_diversifier(a))),
+        ua.orchard().map(|a| {
+            ufvk.orchard()
+                .and_then(|fvk| orchard_receiver_index(fvk, a))
+        }),
+    ];
+
+    let mut resolved: Vec<(DiversifierIndex, Scope)> = Vec::new();
+    let mut has_foreign_receiver = false;
+    for slot in recovered.into_iter().flatten() {
+        match slot {
+            Some(found) => resolved.push(found),
+            None => has_foreign_receiver = true,
+        }
+    }
+
+    if resolved.is_empty() {
+        return UaReceivers::Foreign; // none of the present receivers are ours
+    }
+    if has_foreign_receiver {
+        return UaReceivers::Inconsistent(
+            "unified address combines a receiver owned by this wallet with one that is not".into(),
+        );
+    }
+    // Every present receiver resolved under this key; require a single (index, scope).
+    let (first_idx, first_scope) = resolved[0];
+    if resolved
+        .iter()
+        .all(|(j, s)| j.as_bytes() == first_idx.as_bytes() && *s == first_scope)
+    {
+        UaReceivers::MineConsistent
+    } else {
+        UaReceivers::Inconsistent(
+            "unified address combines this wallet's receivers from different diversifier indices"
+                .into(),
+        )
+    }
+}
+
+/// Classify a unified address's receivers against the wallet's own account key(s) - see
+/// [`UaReceivers`]. Non-unified addresses and UAs carrying fewer than two shielded receivers are
+/// [`UaReceivers::NotApplicable`]. Best-effort: storage errors degrade to `NotApplicable` rather
+/// than erroring, so callers fall back to their existing (byte-exact) ownership checks.
+pub fn classify_unified_receivers(network: ZNetwork, wallet_dir: &Path, addr: &str) -> UaReceivers {
+    let Some(Address::Unified(ua)) = Address::decode(&network, addr) else {
+        return UaReceivers::NotApplicable;
+    };
+    // Only meaningful when there are two shielded receivers to cross-check; zecd's shielded pools
+    // are Sapling and Orchard, so that is exactly {sapling, orchard}.
+    if u8::from(ua.sapling().is_some()) + u8::from(ua.orchard().is_some()) < 2 {
+        return UaReceivers::NotApplicable;
+    }
+    let Ok(db) = open_read(network, wallet_dir) else {
+        return UaReceivers::NotApplicable;
+    };
+    let Ok(ids) = db.get_account_ids() else {
+        return UaReceivers::NotApplicable;
+    };
+    // One account per wallet today, but iterate so a future multi-account wallet still resolves
+    // the receivers against whichever account owns them. The first non-`Foreign` verdict wins.
+    for id in ids {
+        let Ok(Some(account)) = db.get_account(id) else {
+            continue;
+        };
+        let Some(ufvk) = account.ufvk() else {
+            continue;
+        };
+        match classify_receivers_with_ufvk(ufvk, &ua) {
+            UaReceivers::Foreign => {}
+            other => return other,
+        }
+    }
+    UaReceivers::Foreign
+}
+
 #[cfg(test)]
 mod tests {
+    use super::*;
+
     /// The `created_time` expression in [`super::TX_COLS`] must parse rusqlite's
     /// `OffsetDateTime` encoding (`yyyy-MM-dd HH:mm:ss.fffffffzzz`, what librustzcash stores
     /// in `transactions.created`), honoring the offset, and yield NULL for NULL input.
@@ -923,6 +1082,88 @@ mod tests {
             Some(1_781_163_113)
         );
         assert_eq!(parse(None), None);
+    }
+
+    /// The receiver-consistency classifier must accept a UA the wallet could itself issue (all
+    /// receivers at one index), flag a UA spliced from receivers at *different* indices, and treat
+    /// a UA built from a different key as foreign - so a hand-crafted address can't masquerade as
+    /// the wallet's own across `getreceivedbyaddress`/`getaddressinfo`/`z_sendmany`.
+    #[test]
+    fn classify_receivers_detects_spliced_unified_address() {
+        use zcash_keys::address::UnifiedAddress;
+        use zcash_keys::keys::{ReceiverRequirement::*, UnifiedAddressRequest, UnifiedSpendingKey};
+        use zcash_protocol::consensus::Network;
+        use zip32::{AccountId, DiversifierIndex};
+
+        let net = Network::MainNetwork;
+        let account = AccountId::ZERO;
+        // Two shielded receivers (Sapling + Orchard), no transparent.
+        let request = UnifiedAddressRequest::unsafe_custom(Require, Require, Omit);
+
+        let ufvk = UnifiedSpendingKey::from_seed(&net, &[7u8; 32], account)
+            .unwrap()
+            .to_unified_full_viewing_key();
+
+        // Two of *our own* addresses at clearly different diversifier indices.
+        let (ua_low, _) = ufvk.find_address(DiversifierIndex::new(), request).unwrap();
+        let mut j = DiversifierIndex::new();
+        for _ in 0..5000 {
+            j.increment().unwrap();
+        }
+        let (ua_high, _) = ufvk.find_address(j, request).unwrap();
+        assert_ne!(
+            ua_low.encode(&net),
+            ua_high.encode(&net),
+            "the two indices must yield distinct addresses"
+        );
+
+        // A legitimately-issued address: every receiver at one index.
+        assert_eq!(
+            classify_receivers_with_ufvk(&ufvk, &ua_low),
+            UaReceivers::MineConsistent
+        );
+
+        // Splice: our Sapling receiver from one index with our Orchard receiver from another.
+        let spliced = UnifiedAddress::from_receivers(
+            ua_high.orchard().cloned(),
+            ua_low.sapling().cloned(),
+            None,
+        )
+        .unwrap();
+        assert!(
+            matches!(
+                classify_receivers_with_ufvk(&ufvk, &spliced),
+                UaReceivers::Inconsistent(_)
+            ),
+            "receivers from different indices must be Inconsistent"
+        );
+
+        // Mix our Orchard receiver with a *stranger's* Sapling receiver.
+        let other = UnifiedSpendingKey::from_seed(&net, &[9u8; 32], account)
+            .unwrap()
+            .to_unified_full_viewing_key();
+        let (other_ua, _) = other
+            .find_address(DiversifierIndex::new(), request)
+            .unwrap();
+        let mixed = UnifiedAddress::from_receivers(
+            ua_low.orchard().cloned(),
+            other_ua.sapling().cloned(),
+            None,
+        )
+        .unwrap();
+        assert!(
+            matches!(
+                classify_receivers_with_ufvk(&ufvk, &mixed),
+                UaReceivers::Inconsistent(_)
+            ),
+            "one of our receivers mixed with a stranger's must be Inconsistent"
+        );
+
+        // A UA entirely from a different key is foreign, not an error.
+        assert_eq!(
+            classify_receivers_with_ufvk(&ufvk, &other_ua),
+            UaReceivers::Foreign
+        );
     }
 
     /// [`super::tx_unexpired_sql`] must reproduce librustzcash's `tx_unexpired_condition` across

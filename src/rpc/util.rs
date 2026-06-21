@@ -9,7 +9,11 @@ use crate::state::AppState;
 
 /// `validateaddress <address>` - network-aware validity verdict for any Zcash address kind,
 /// with an `isvalid_orchard` extension flagging Orchard-receiver capability.
-pub(crate) fn validateaddress(state: &AppState, req: &RpcRequest) -> Result<Value, RpcError> {
+pub(crate) fn validateaddress(
+    state: &AppState,
+    wallet: Option<&str>,
+    req: &RpcRequest,
+) -> Result<Value, RpcError> {
     let addr = req.require_str(0, "validateaddress requires an address")?;
     let v = crate::address::validate(&state.config.network, addr);
     // Bitcoin Core returns only the verdict plus error details for invalid input; the
@@ -21,7 +25,7 @@ pub(crate) fn validateaddress(state: &AppState, req: &RpcRequest) -> Result<Valu
             "error": "Invalid or unsupported address format",
         }));
     }
-    Ok(json!({
+    let mut out = json!({
         "isvalid": true,
         "address": addr,
         // Real scriptPubKey for transparent addresses; shielded addresses have no
@@ -35,7 +39,21 @@ pub(crate) fn validateaddress(state: &AppState, req: &RpcRequest) -> Result<Valu
         // (`transparent`/`sapling`/`orchard`). For a unified address this enumerates its
         // receivers, so a client can see what a `u1...` actually carries.
         "receiver_types": v.receiver_types,
-    }))
+    });
+    // Extension field: for a unified address, whether all its receivers belong to the routed
+    // wallet at one diversifier index. `false` flags a hand-spliced UA (receivers from different
+    // indices, or one of ours mixed with a stranger's); omitted when not computable - a foreign
+    // UA (the index is the owner's secret) or a single-receiver address. Best-effort: if the
+    // wallet can't be resolved, the field is simply absent.
+    if let Ok(handle) = state.registry.get(wallet) {
+        if let Some(consistent) =
+            crate::wallet::read::classify_unified_receivers(handle.network, &handle.dir, addr)
+                .consistent_flag()
+        {
+            out["receivers_consistent"] = json!(consistent);
+        }
+    }
+    Ok(out)
 }
 
 /// `settxfee` - an explicit fee instruction, so it gets the same treatment as
