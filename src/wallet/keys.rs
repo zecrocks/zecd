@@ -97,11 +97,49 @@ impl SeedKeeper {
     }
 }
 
+/// Refuse to load an age identity file whose permissions are too permissive - i.e. any access
+/// bit is set for group or other (`mode & 0o077 != 0`). The file holds the secret key that
+/// decrypts the wallet mnemonic, so a world-/group-readable identity leaks the wallet to other
+/// local users. `zecd init` creates it `0600`, but nothing stops a later `chmod`; this re-checks
+/// on every load, mirroring SSH's refusal to use an over-permissive private key.
+///
+/// Best-effort and a no-op on non-unix targets (no POSIX mode bits to inspect).
+pub fn check_identity_file_permissions(identity_path: &Path) -> anyhow::Result<()> {
+    #[cfg(unix)]
+    {
+        use anyhow::Context as _;
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let mode = std::fs::metadata(identity_path)
+            .with_context(|| {
+                format!(
+                    "reading permissions of age identity file {}",
+                    identity_path.display()
+                )
+            })?
+            .permissions()
+            .mode();
+        if mode & 0o077 != 0 {
+            anyhow::bail!(
+                "age identity file {path} has insecure permissions {mode:#o}: it is accessible \
+                 to group/other and could leak the wallet seed to other local users. It must be \
+                 readable only by its owner. (try chmod 600)",
+                path = identity_path.display(),
+                mode = mode & 0o7777,
+            );
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = identity_path;
+    Ok(())
+}
+
 /// Load age identities from a file and decrypt the wallet's stored seed.
 pub fn decrypt_seed_with_identity(
     store: &WalletStore,
     identity_path: &Path,
 ) -> anyhow::Result<Option<SecretVec<u8>>> {
+    check_identity_file_permissions(identity_path)?;
     let identities = age::IdentityFile::from_file(identity_path.to_string_lossy().into_owned())?
         .into_identities()?;
     store.decrypt_seed(identities.iter().map(|i| i.as_ref() as _))
@@ -196,11 +234,17 @@ mod tests {
         )
         .unwrap();
 
-        // Write the identity file exactly as `zecd init` does.
+        // Write the identity file with owner-only permissions, as `zecd init` does (and as the
+        // load-time permission check now requires).
         let id_path = dir.path().join("identity.txt");
         {
             use age::secrecy::ExposeSecret as _;
             std::fs::write(&id_path, identity.to_string().expose_secret()).unwrap();
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(&id_path, std::fs::Permissions::from_mode(0o600)).unwrap();
         }
 
         let st = WalletStore::read(&kp).unwrap();
@@ -211,5 +255,46 @@ mod tests {
             .unwrap()
             .to_seed("");
         assert_eq!(seed.expose_secret().as_slice(), &expected[..]);
+
+        // Widening the identity's permissions makes the same load refuse it (SSH-style),
+        // rather than silently decrypting with a seed exposed to other local users.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(&id_path, std::fs::Permissions::from_mode(0o644)).unwrap();
+            // `Option<SecretVec>` isn't `Debug`, so match rather than `expect_err`.
+            match decrypt_seed_with_identity(&st, &id_path) {
+                Err(err) => assert!(
+                    err.to_string().contains("insecure permissions"),
+                    "unexpected error: {err}"
+                ),
+                Ok(_) => panic!("a group/other-readable identity must be refused"),
+            }
+        }
+    }
+
+    /// The permission gate: owner-only modes load, any group/other access bit refuses.
+    #[cfg(unix)]
+    #[test]
+    fn check_identity_file_permissions_rejects_overbroad_modes() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("identity.txt");
+        std::fs::write(&path, b"# identity\n").unwrap();
+
+        for ok in [0o600, 0o400] {
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(ok)).unwrap();
+            check_identity_file_permissions(&path)
+                .unwrap_or_else(|e| panic!("mode {ok:#o} should be accepted: {e}"));
+        }
+
+        for bad in [0o640, 0o604, 0o660, 0o606, 0o644, 0o666] {
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(bad)).unwrap();
+            assert!(
+                check_identity_file_permissions(&path).is_err(),
+                "mode {bad:#o} (group/other-accessible) must be rejected"
+            );
+        }
     }
 }

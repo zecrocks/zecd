@@ -22,6 +22,7 @@ use crate::chain::ChainSource as _;
 use crate::config::{AppConfig, ExportUfvkArgs, InitArgs, WalletEntry};
 use crate::network::ZNetwork;
 use crate::pools::{Pool, PoolSet};
+use crate::wallet::keys;
 use crate::wallet::open;
 use crate::wallet::store::{Passphrase, WalletStore};
 
@@ -430,6 +431,10 @@ fn wallet_has_spending_keys(network: crate::network::ZNetwork, wallet_dir: &Path
 
 async fn ensure_identity(path: &Path) -> anyhow::Result<Vec<Box<dyn age::Recipient + Send>>> {
     if tokio::fs::try_exists(path).await.unwrap_or(false) {
+        // Re-use of an existing identity: refuse it if its permissions have since been widened
+        // (the file is created 0600, but nothing prevents a later chmod) - mirrors the load-time
+        // check on the daemon's auto-unlock path so init can't silently bless an exposed key.
+        keys::check_identity_file_permissions(path)?;
         let recipients =
             age::IdentityFile::from_file(path.to_string_lossy().into_owned())?.to_recipients()?;
         return Ok(recipients);
