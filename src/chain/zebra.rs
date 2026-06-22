@@ -112,6 +112,14 @@ fn basic(cred: &str) -> String {
     )
 }
 
+/// Stand-in `code` for a JSON-RPC error envelope that carries no usable numeric `code`
+/// (missing, non-integer, or an explicit `0`). `error_code == 0` is the success sentinel
+/// shared by `BroadcastOutcome` and the JSON-RPC success path, so a code-less error must
+/// never be parsed as `0` - otherwise a proxy/load-balancer error body without a JSON-RPC
+/// code would be indistinguishable from acceptance. `-1` mirrors Bitcoin Core's
+/// `RPC_MISC_ERROR` ("unspecified error").
+const RPC_ERROR_UNSPECIFIED_CODE: i64 = -1;
+
 /// A JSON-RPC call failure, split along the trait's error contract: `Rpc` is the node
 /// examining the request and refusing it (the connection is healthy); `Transport` is
 /// everything else.
@@ -192,8 +200,16 @@ impl ZebraClient {
             ))
         })?;
         if let Some(err) = envelope.get("error").filter(|e| !e.is_null()) {
+            // An error envelope is never a success. Keep its `code` away from the `0`
+            // acceptance sentinel: a missing, non-integer, or explicit-zero code becomes
+            // RPC_ERROR_UNSPECIFIED_CODE, so only an actual zebra success can reach
+            // `BroadcastOutcome::is_accepted()`.
+            let code = match err.get("code").and_then(Value::as_i64) {
+                Some(0) | None => RPC_ERROR_UNSPECIFIED_CODE,
+                Some(code) => code,
+            };
             return Err(CallError::Rpc {
-                code: err.get("code").and_then(Value::as_i64).unwrap_or(0),
+                code,
                 message: err
                     .get("message")
                     .and_then(Value::as_str)
@@ -742,6 +758,10 @@ mod tests {
         raw_txs: HashMap<String, Value>,
         /// `Err((code, message))` makes `sendrawtransaction` reject.
         send: Result<String, (i64, String)>,
+        /// When set, `sendrawtransaction` returns this exact `error` object verbatim,
+        /// overriding `send`. Lets a test inject a malformed envelope (e.g. one with no
+        /// numeric `code`, as a fronting proxy might emit).
+        send_error_object: Option<Value>,
         /// Authorization header values observed, in order.
         seen_auth: Vec<Option<String>>,
     }
@@ -759,6 +779,7 @@ mod tests {
                 mempool: Vec::new(),
                 raw_txs: HashMap::new(),
                 send: Ok("00".repeat(32)),
+                send_error_object: None,
                 seen_auth: Vec::new(),
             }
         }
@@ -819,9 +840,14 @@ mod tests {
                     None => err(-5, "No such mempool or main chain transaction"),
                 }
             }
-            "sendrawtransaction" => match &fake.send {
-                Ok(txid) => reply(json!(txid)),
-                Err((code, msg)) => err(*code, msg),
+            "sendrawtransaction" => match (&fake.send_error_object, &fake.send) {
+                (Some(error), _) => Json(json!({
+                    "result": null,
+                    "error": error.clone(),
+                    "id": "zecd"
+                })),
+                (None, Ok(txid)) => reply(json!(txid)),
+                (None, Err((code, msg))) => err(*code, msg),
             },
             other => err(-32601, &format!("Method not found: {other}")),
         }
@@ -1017,6 +1043,37 @@ mod tests {
         assert_eq!(outcome.error_code, -26);
         assert_eq!(outcome.error_message, "tx unpaid action limit exceeded");
         assert!(!outcome.is_accepted());
+    }
+
+    #[tokio::test]
+    async fn broadcast_codeless_error_envelope_is_a_rejection_not_acceptance() {
+        // A valid-JSON error envelope carrying a message but no numeric `code` - the shape a
+        // proxy/load balancer fronting zebra can emit. It must parse as a rejection, never as
+        // an accepted broadcast: a `code` defaulting to 0 would collide with the acceptance
+        // sentinel and tell the caller a never-relayed tx succeeded.
+        let fake = Arc::new(Mutex::new(Fake::new()));
+        let mut src = source_for(fake.clone()).await;
+
+        // Missing `code` entirely.
+        fake.lock().unwrap().send_error_object = Some(json!({ "message": "rejected by proxy" }));
+        let outcome = src.broadcast_tx(vec![0xab; 8]).await.unwrap();
+        assert!(
+            !outcome.is_accepted(),
+            "a code-less error must not look like acceptance"
+        );
+        assert_ne!(outcome.error_code, 0);
+        assert_eq!(outcome.error_message, "rejected by proxy");
+
+        // Explicit `code: 0` (also collides with the success sentinel) and a non-integer code.
+        for body in [
+            json!({ "code": 0, "message": "zero code" }),
+            json!({ "code": "oops", "message": "string code" }),
+        ] {
+            fake.lock().unwrap().send_error_object = Some(body);
+            let outcome = src.broadcast_tx(vec![0xab; 8]).await.unwrap();
+            assert!(!outcome.is_accepted());
+            assert_ne!(outcome.error_code, 0);
+        }
     }
 
     #[tokio::test]
