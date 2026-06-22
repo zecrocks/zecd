@@ -176,6 +176,34 @@ bootstrap_from_keys = true
 # constrained to the enabled pools (else -8).
 enabled = ["orchard"]
 default_receivers = ["orchard"]
+#
+# Transparent (t-address) receiving. OFF by default - zecd stays shielded-only. When enabled,
+# `getnewaddress "" "transparent"` hands out a bare transparent address (t1.../tm...), funds
+# received there are detected via the node's address index, and they become spendable by
+# auto-shielding them into a shielded send (the change shields to the change pool). Note: a send
+# that draws on transparent inputs is NOT permitted under [spend] privacy_policy = "FullPrivacy".
+#   transparent = true            # allow getnewaddress "" "transparent"
+#   transparent_default = true    # make a bare t-address the no-argument getnewaddress default
+#                                 #   (implies transparent = true)
+# transparent = false
+# transparent_default = false
+#
+# transparent_gap_limit (default 20) is the stateless-restore safety margin for transparent: how
+# far past the last FUNDED receiving address a rebuilt wallet keeps scanning the node's address
+# index before giving up. Unlike shielded funds (always recoverable by note trial-decryption),
+# transparent funds are only rediscovered on restore within this window. If you pre-generate many
+# addresses ahead of funding (e.g. one per invoice, most never paid), set this to at least your
+# maximum number of outstanding-unfunded addresses, or a restore may miss a later payment to a
+# high-index address. Higher = more address-index queries per restore/scan.
+# transparent_gap_limit = 20
+#
+# transparent_initial_scan (default 0 = off) is the better tool when you hand out MANY addresses
+# ahead of funding. The gap limit is a SLIDING window kept past every funded address, so sizing it
+# to 10000 means scanning 10000 addresses past each receive forever. Instead, transparent_initial_scan
+# pre-exposes external indices 0..N ONCE at startup/restore so the receive scan covers all of them,
+# while transparent_gap_limit stays small for steady-state. Set N to your issuance high-water mark
+# (e.g. an exchange that assigns 10000 customer addresses sets transparent_initial_scan = 10000).
+# transparent_initial_scan = 0
 
 [sync]
 # How often to poll zebra for new blocks (seconds).

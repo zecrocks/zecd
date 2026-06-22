@@ -133,6 +133,10 @@ pub async fn run(config: AppConfig) -> anyhow::Result<()> {
             pipeline_proving: config.spend.pipeline_proving,
             enabled_pools: entry.pools.clone(),
             default_receivers: entry.default_receivers.clone(),
+            transparent_enabled: entry.transparent_enabled,
+            transparent_default: entry.transparent_default,
+            transparent_gap_limit: entry.transparent_gap_limit,
+            transparent_initial_scan: entry.transparent_initial_scan,
             shutdown: shutdown_tx.subscribe(),
         };
         match actor::spawn(actor_cfg).await {

@@ -157,6 +157,10 @@ def main() -> int:
     # A seeded wallet can sign; only watch-only (init --ufvk) wallets report False here.
     ck("private_keys_enabled is True", wi.get("private_keys_enabled") is True,
        repr(wi.get("private_keys_enabled")))
+    # The transparent observability block appears only when [pools] transparent is enabled; this
+    # daemon is shielded-only, so it must be absent (the default response shape is unchanged). The
+    # present-and-populated case is asserted by the regtest_transparent e2e.
+    ck("getwalletinfo omits transparent block when disabled", "transparent" not in wi)
 
     print("== amounts are exact decimals ==")
     bal = rpc.call("getbalance")
@@ -246,6 +250,14 @@ def main() -> int:
         ck("getnewaddress unknown receiver raises", False)
     except JSONRPCException as e:
         ck("getnewaddress unknown receiver -> -5", e.code == -5, e.code)
+    # Transparent receiving is off by default: address_type "transparent" is rejected (-8) unless
+    # the wallet opts in via [pools] transparent = true. (The transparent happy path is covered by
+    # the regtest_transparent e2e, which enables it.)
+    try:
+        rpc.call("getnewaddress", "", "transparent")
+        ck("getnewaddress transparent on shielded-only wallet raises", False)
+    except JSONRPCException as e:
+        ck("getnewaddress transparent -> -8 when disabled", e.code == -8, e.code)
     # Bitcoin Core returns only the verdict + error details for invalid input.
     bad = rpc.call("validateaddress", "not-an-address")
     ck("invalid validateaddress.isvalid False", bad["isvalid"] is False)

@@ -697,6 +697,20 @@ pub struct ZecdConfig {
     /// Optional `[pools]` section as `(enabled, default_receivers)`. `None` omits the section
     /// (the Orchard-only default). Used by the multi-pool (Sapling) e2e.
     pub pools: Option<(Vec<String>, Vec<String>)>,
+    /// Write `[pools] transparent = true` so the wallet can hand out bare transparent addresses
+    /// (`getnewaddress "" "transparent"`). Used by the transparent e2e. Emits a `[pools]` section
+    /// even when `pools` is `None` (keeping the Orchard-only enabled default).
+    pub transparent: bool,
+    /// `[pools] transparent_gap_limit` - the external transparent gap limit, i.e. the
+    /// stateless-restore scan depth. `None` omits it (zecd defaults to 20). Only meaningful with
+    /// `transparent = true`. The transparent-gap restore e2e sets it small (a beyond-gap receive
+    /// is missed) vs large (the same receive is recovered).
+    pub transparent_gap_limit: Option<u32>,
+    /// `[pools] transparent_initial_scan` - the initial scan depth (pre-expose + scan external
+    /// indices `0..N` on startup, independent of the gap limit). `None` omits it (defaults to 0).
+    /// The gap e2e uses it to prove a *small* gap plus a large initial scan still recovers a
+    /// high-index receive.
+    pub transparent_initial_scan: Option<u32>,
     /// When `Some`, the spending `default` wallet is created passphrase-encrypted
     /// (`zecd init --encrypt`, passphrase supplied via `ZECD_WALLET_PASSPHRASE`): it starts
     /// locked and needs `walletpassphrase` before sending. `None` = unencrypted (identity model).
@@ -722,6 +736,9 @@ impl ZecdConfig {
             pipeline_proving: None,
             orchard_action_limit: None,
             pools: None,
+            transparent: false,
+            transparent_gap_limit: None,
+            transparent_initial_scan: None,
             encrypt_passphrase: None,
         }
     }
@@ -1446,22 +1463,35 @@ fn write_zecd_toml(datadir: &Path, cfg: &ZecdConfig) -> Result<()> {
             datadir.display()
         ));
     }
-    // Optional [pools] section (multi-pool / Sapling e2e); omitted → Orchard-only default.
-    let pools = match &cfg.pools {
-        Some((enabled, receivers)) => {
+    // Optional [pools] section (multi-pool / Sapling e2e, and/or transparent receiving); omitted
+    // entirely → Orchard-only, no transparent.
+    let pools = if cfg.pools.is_some() || cfg.transparent {
+        let mut s = String::from("\n[pools]\n");
+        if let Some((enabled, receivers)) = &cfg.pools {
             let list = |v: &[String]| {
                 v.iter()
                     .map(|p| format!("\"{p}\""))
                     .collect::<Vec<_>>()
                     .join(", ")
             };
-            format!(
-                "\n[pools]\nenabled = [{}]\ndefault_receivers = [{}]\n",
+            s.push_str(&format!(
+                "enabled = [{}]\ndefault_receivers = [{}]\n",
                 list(enabled),
                 list(receivers)
-            )
+            ));
         }
-        None => String::new(),
+        if cfg.transparent {
+            s.push_str("transparent = true\n");
+            if let Some(g) = cfg.transparent_gap_limit {
+                s.push_str(&format!("transparent_gap_limit = {g}\n"));
+            }
+            if let Some(n) = cfg.transparent_initial_scan {
+                s.push_str(&format!("transparent_initial_scan = {n}\n"));
+            }
+        }
+        s
+    } else {
+        String::new()
     };
     wallets.push_str(&pools);
     // Fast reconnect backoff (1..2s) so outage-recovery tests converge quickly.

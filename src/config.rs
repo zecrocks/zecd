@@ -92,14 +92,47 @@ pub struct PoolsConfig {
     /// Receivers included in the UAs handed out by `getnewaddress` when no per-call override is
     /// given. Always a subset of `enabled`.
     pub default_receivers: PoolSet,
+    /// Whether the wallet may hand out bare transparent (`t1…`/`tm…`) receiving addresses - via
+    /// `getnewaddress "" "transparent"`, and (when `transparent_default`) as the no-argument
+    /// default. Off preserves zecd's shielded-only behaviour: `address_type = "transparent"` is
+    /// rejected `-8`. Received transparent UTXOs are spendable only by auto-shielding them into a
+    /// shielded send.
+    pub transparent_enabled: bool,
+    /// Whether a no-argument `getnewaddress` returns a bare transparent address instead of a
+    /// Unified Address. Requires `transparent_enabled` (validated at parse time).
+    pub transparent_default: bool,
+    /// The **external** transparent gap limit: how far past the last *funded* receiving address a
+    /// stateless restore keeps scanning the address index before giving up. Sized to the maximum
+    /// number of addresses the operator may hand out ahead of funding - a higher value lets a
+    /// rebuilt (stateless) wallet rediscover transparent funds across sparsely-funded
+    /// pre-generated addresses, at the cost of more address-index queries per restore/scan. Only
+    /// meaningful when `transparent_enabled`.
+    pub transparent_gap_limit: u32,
+    /// **Initial scan depth.** On startup/restore, pre-expose external transparent indices
+    /// `0..transparent_initial_scan` so the wallet scans *all* of them for receives - independent
+    /// of (and typically far larger than) `transparent_gap_limit`. This is the initial-scan lever: an
+    /// exchange that hands out, say, 10 000 addresses sets this to 10 000 so a stateless restore
+    /// rediscovers a payment to any of them, while keeping a small steady-state `gap_limit` (it
+    /// does *not* want a 10 000-deep sliding window past every funded address). `0` (the default)
+    /// means no pre-exposure - discovery is bounded by `gap_limit` alone. Only meaningful when
+    /// `transparent_enabled`.
+    pub transparent_initial_scan: u32,
 }
+
+/// Default external transparent gap limit. Above librustzcash's built-in 10 to give a safer margin
+/// for typical sparse issuance, while keeping restore scans cheap.
+pub const DEFAULT_TRANSPARENT_GAP_LIMIT: u32 = 20;
 
 impl Default for PoolsConfig {
     fn default() -> Self {
-        // Preserves zecd's historical behaviour: Orchard-only receiving.
+        // Preserves zecd's historical behaviour: Orchard-only receiving, no transparent.
         Self {
             enabled: PoolSet::single(Pool::Orchard),
             default_receivers: PoolSet::single(Pool::Orchard),
+            transparent_enabled: false,
+            transparent_default: false,
+            transparent_gap_limit: DEFAULT_TRANSPARENT_GAP_LIMIT,
+            transparent_initial_scan: 0,
         }
     }
 }
@@ -175,6 +208,14 @@ pub struct WalletEntry {
     pub pools: PoolSet,
     /// Receivers included by default in this wallet's Unified Addresses (a subset of `pools`).
     pub default_receivers: PoolSet,
+    /// Whether this wallet may hand out bare transparent receiving addresses (resolved per wallet).
+    pub transparent_enabled: bool,
+    /// Whether a no-argument `getnewaddress` on this wallet returns a bare transparent address.
+    pub transparent_default: bool,
+    /// This wallet's external transparent gap limit (see [`PoolsConfig::transparent_gap_limit`]).
+    pub transparent_gap_limit: u32,
+    /// This wallet's initial transparent scan depth (see [`PoolsConfig::transparent_initial_scan`]).
+    pub transparent_initial_scan: u32,
 }
 
 impl WalletEntry {
@@ -455,6 +496,14 @@ struct WalletFile {
     pools: Option<Vec<String>>,
     /// Override the global `[pools] default_receivers` for this wallet.
     default_receivers: Option<Vec<String>>,
+    /// Override the global `[pools] transparent` for this wallet.
+    transparent: Option<bool>,
+    /// Override the global `[pools] transparent_default` for this wallet.
+    transparent_default: Option<bool>,
+    /// Override the global `[pools] transparent_gap_limit` for this wallet.
+    transparent_gap_limit: Option<u32>,
+    /// Override the global `[pools] transparent_initial_scan` for this wallet.
+    transparent_initial_scan: Option<u32>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -530,6 +579,15 @@ struct SpendFile {
 struct PoolsFile {
     enabled: Option<Vec<String>>,
     default_receivers: Option<Vec<String>>,
+    /// Enable bare transparent (`t1…`/`tm…`) receiving addresses.
+    transparent: Option<bool>,
+    /// Make a bare transparent address the no-argument `getnewaddress` default (implies
+    /// `transparent`).
+    transparent_default: Option<bool>,
+    /// External transparent gap limit (restore scan depth past the last funded address).
+    transparent_gap_limit: Option<u32>,
+    /// Initial transparent scan depth (pre-expose + scan indices `0..N` on startup/restore).
+    transparent_initial_scan: Option<u32>,
 }
 
 // ---------------------------------------------------------------------------
@@ -744,10 +802,21 @@ impl AppConfig {
                     None
                 }
             });
-            let (enabled, default_receivers) = resolve_wallet_pools(
+            let (
+                enabled,
+                default_receivers,
+                transparent_enabled,
+                transparent_default,
+                transparent_gap_limit,
+                transparent_initial_scan,
+            ) = resolve_wallet_pools(
                 name,
                 w.pools.as_deref(),
                 w.default_receivers.as_deref(),
+                w.transparent,
+                w.transparent_default,
+                w.transparent_gap_limit,
+                w.transparent_initial_scan,
                 &pools,
             )?;
             wallets.insert(
@@ -757,6 +826,10 @@ impl AppConfig {
                     keys_file,
                     pools: enabled,
                     default_receivers,
+                    transparent_enabled,
+                    transparent_default,
+                    transparent_gap_limit,
+                    transparent_initial_scan,
                 },
             );
         }
@@ -767,6 +840,10 @@ impl AppConfig {
                 keys_file: keys_file_global.clone(),
                 pools: pools.enabled.clone(),
                 default_receivers: pools.default_receivers.clone(),
+                transparent_enabled: pools.transparent_enabled,
+                transparent_default: pools.transparent_default,
+                transparent_gap_limit: pools.transparent_gap_limit,
+                transparent_initial_scan: pools.transparent_initial_scan,
             });
 
         let backend_file = file.backend.unwrap_or(BackendFile {
@@ -985,21 +1062,63 @@ fn resolve_global_pools(file: Option<&PoolsFile>) -> anyhow::Result<PoolsConfig>
             enabled.display_names()
         );
     }
+    let transparent_enabled = file.and_then(|f| f.transparent).unwrap_or(false);
+    let transparent_default = file.and_then(|f| f.transparent_default).unwrap_or(false);
+    let transparent_gap_limit = file
+        .and_then(|f| f.transparent_gap_limit)
+        .unwrap_or(DEFAULT_TRANSPARENT_GAP_LIMIT);
+    let transparent_initial_scan = file.and_then(|f| f.transparent_initial_scan).unwrap_or(0);
+    validate_transparent_flags(
+        "[pools]",
+        transparent_enabled,
+        transparent_default,
+        transparent_gap_limit,
+    )?;
     Ok(PoolsConfig {
         enabled,
         default_receivers,
+        transparent_enabled,
+        transparent_default,
+        transparent_gap_limit,
+        transparent_initial_scan,
     })
+}
+
+/// `transparent_default` makes a bare t-address the no-argument `getnewaddress` default, so it
+/// only makes sense when transparent receiving is enabled at all. The gap limit must be at least 1
+/// (0 would scan no addresses and recover nothing on restore).
+fn validate_transparent_flags(
+    ctx: &str,
+    transparent_enabled: bool,
+    transparent_default: bool,
+    transparent_gap_limit: u32,
+) -> anyhow::Result<()> {
+    if transparent_default && !transparent_enabled {
+        anyhow::bail!(
+            "{ctx} transparent_default = true requires transparent = true \
+             (transparent receiving must be enabled to default to it)"
+        );
+    }
+    if transparent_gap_limit == 0 {
+        anyhow::bail!("{ctx} transparent_gap_limit must be at least 1");
+    }
+    Ok(())
 }
 
 /// Resolve and validate one wallet's pools/receivers against the global defaults. A wallet that
 /// overrides `pools` but not `default_receivers` receives into all of its enabled pools by
 /// default; a wallet that overrides neither inherits the global defaults.
+#[allow(clippy::too_many_arguments)]
 fn resolve_wallet_pools(
     name: &str,
     pools: Option<&[String]>,
     default_receivers: Option<&[String]>,
+    transparent: Option<bool>,
+    transparent_default: Option<bool>,
+    transparent_gap_limit: Option<u32>,
+    transparent_initial_scan: Option<u32>,
     global: &PoolsConfig,
-) -> anyhow::Result<(PoolSet, PoolSet)> {
+) -> anyhow::Result<(PoolSet, PoolSet, bool, bool, u32, u32)> {
     let enabled = match pools {
         Some(tokens) => {
             PoolSet::parse(tokens).with_context(|| format!("[wallets.{name}] pools"))?
@@ -1022,7 +1141,26 @@ fn resolve_wallet_pools(
             enabled.display_names()
         );
     }
-    Ok((enabled, receivers))
+    // Per-wallet transparent flags fall back to the global values when not overridden.
+    let transparent_enabled = transparent.unwrap_or(global.transparent_enabled);
+    let transparent_default = transparent_default.unwrap_or(global.transparent_default);
+    let transparent_gap_limit = transparent_gap_limit.unwrap_or(global.transparent_gap_limit);
+    let transparent_initial_scan =
+        transparent_initial_scan.unwrap_or(global.transparent_initial_scan);
+    validate_transparent_flags(
+        &format!("[wallets.{name}]"),
+        transparent_enabled,
+        transparent_default,
+        transparent_gap_limit,
+    )?;
+    Ok((
+        enabled,
+        receivers,
+        transparent_enabled,
+        transparent_default,
+        transparent_gap_limit,
+        transparent_initial_scan,
+    ))
 }
 
 #[cfg(test)]
@@ -1047,6 +1185,7 @@ mod tests {
         let f = PoolsFile {
             enabled: Some(s(&["sapling", "orchard"])),
             default_receivers: None,
+            ..Default::default()
         };
         let p = resolve_global_pools(Some(&f)).unwrap();
         assert!(p.enabled.contains(Pool::Sapling) && p.enabled.contains(Pool::Orchard));
@@ -1059,6 +1198,7 @@ mod tests {
         let f = PoolsFile {
             enabled: Some(s(&["orchard"])),
             default_receivers: Some(s(&["sapling"])),
+            ..Default::default()
         };
         let err = resolve_global_pools(Some(&f)).unwrap_err().to_string();
         assert!(err.contains("subset"), "{err}");
@@ -1070,6 +1210,7 @@ mod tests {
         let f = PoolsFile {
             enabled: Some(s(&["ironwood"])),
             default_receivers: None,
+            ..Default::default()
         };
         let err = format!("{:#}", resolve_global_pools(Some(&f)).unwrap_err());
         assert!(
@@ -1083,6 +1224,7 @@ mod tests {
         let f = PoolsFile {
             enabled: Some(vec![]),
             default_receivers: None,
+            ..Default::default()
         };
         assert!(resolve_global_pools(Some(&f)).is_err());
     }
@@ -1092,8 +1234,13 @@ mod tests {
         let global = PoolsConfig {
             enabled: PoolSet::parse(&s(&["sapling", "orchard"])).unwrap(),
             default_receivers: PoolSet::single(Pool::Orchard),
+            transparent_enabled: false,
+            transparent_default: false,
+            transparent_gap_limit: DEFAULT_TRANSPARENT_GAP_LIMIT,
+            transparent_initial_scan: 0,
         };
-        let (enabled, receivers) = resolve_wallet_pools("w", None, None, &global).unwrap();
+        let (enabled, receivers, _, _, _, _) =
+            resolve_wallet_pools("w", None, None, None, None, None, None, &global).unwrap();
         assert_eq!(enabled, global.enabled);
         assert_eq!(receivers, global.default_receivers);
     }
@@ -1103,8 +1250,17 @@ mod tests {
         // A wallet that narrows its pools but doesn't set receivers must not inherit the global
         // receivers (which could name a now-disabled pool) - it receives into all it enabled.
         let global = PoolsConfig::default(); // orchard-only
-        let (enabled, receivers) =
-            resolve_wallet_pools("w", Some(&s(&["sapling"])), None, &global).unwrap();
+        let (enabled, receivers, _, _, _, _) = resolve_wallet_pools(
+            "w",
+            Some(&s(&["sapling"])),
+            None,
+            None,
+            None,
+            None,
+            None,
+            &global,
+        )
+        .unwrap();
         assert!(enabled.contains(Pool::Sapling) && !enabled.contains(Pool::Orchard));
         assert_eq!(receivers, enabled);
     }
@@ -1116,12 +1272,80 @@ mod tests {
             "hot",
             Some(&s(&["orchard"])),
             Some(&s(&["sapling"])),
+            None,
+            None,
+            None,
+            None,
             &global,
         )
         .unwrap_err()
         .to_string();
         assert!(err.contains("wallets.hot"), "{err}");
         assert!(err.contains("subset"), "{err}");
+    }
+
+    #[test]
+    fn transparent_flags_and_gap_limit() {
+        // Default: transparent off, gap limit at the zecd default.
+        let p = resolve_global_pools(None).unwrap();
+        assert!(!p.transparent_enabled);
+        assert!(!p.transparent_default);
+        assert_eq!(p.transparent_gap_limit, DEFAULT_TRANSPARENT_GAP_LIMIT);
+
+        // Explicit enable + custom gap limit are honored.
+        let f = PoolsFile {
+            transparent: Some(true),
+            transparent_gap_limit: Some(50),
+            ..Default::default()
+        };
+        let p = resolve_global_pools(Some(&f)).unwrap();
+        assert!(p.transparent_enabled);
+        assert_eq!(p.transparent_gap_limit, 50);
+        assert_eq!(p.transparent_initial_scan, 0, "initial scan defaults off");
+
+        // Initial scan depth is independent of the gap limit.
+        let f = PoolsFile {
+            transparent: Some(true),
+            transparent_gap_limit: Some(20),
+            transparent_initial_scan: Some(10_000),
+            ..Default::default()
+        };
+        let p = resolve_global_pools(Some(&f)).unwrap();
+        assert_eq!(p.transparent_gap_limit, 20);
+        assert_eq!(p.transparent_initial_scan, 10_000);
+
+        // A zero gap limit is rejected (would recover nothing on restore).
+        let f = PoolsFile {
+            transparent: Some(true),
+            transparent_gap_limit: Some(0),
+            ..Default::default()
+        };
+        assert!(resolve_global_pools(Some(&f)).is_err());
+
+        // transparent_default without transparent is rejected.
+        let f = PoolsFile {
+            transparent_default: Some(true),
+            ..Default::default()
+        };
+        let err = resolve_global_pools(Some(&f)).unwrap_err().to_string();
+        assert!(err.contains("transparent"), "{err}");
+
+        // Per-wallet override of the flags + gap limit + initial scan depth.
+        let global = PoolsConfig::default();
+        let (_, _, te, td, gap, init) = resolve_wallet_pools(
+            "w",
+            None,
+            None,
+            Some(true),
+            None,
+            Some(7),
+            Some(500),
+            &global,
+        )
+        .unwrap();
+        assert!(te && !td);
+        assert_eq!(gap, 7);
+        assert_eq!(init, 500, "per-wallet transparent_initial_scan override");
     }
 
     #[test]

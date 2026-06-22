@@ -50,8 +50,8 @@ use crate::wallet::keys::{self, SeedKeeper};
 use crate::wallet::open::{self, WriteDb};
 use crate::wallet::read;
 use crate::wallet::{
-    make_handle, store, ConnState, FirstSeen, RawTx, SharedSeed, SyncStatus, WalletCommand,
-    WalletHandle,
+    make_handle, store, ConnState, FirstSeen, RawTx, ReceiverRequest, SharedSeed, SyncStatus,
+    WalletCommand, WalletHandle,
 };
 
 /// Note-management defaults for change splitting (match zcash-devtool's send defaults).
@@ -222,6 +222,17 @@ pub struct ActorConfig {
     pub enabled_pools: PoolSet,
     /// Receivers included by default in this wallet's Unified Addresses.
     pub default_receivers: PoolSet,
+    /// Whether this wallet may hand out bare transparent receiving addresses.
+    pub transparent_enabled: bool,
+    /// Whether a no-argument `getnewaddress` returns a bare transparent address.
+    pub transparent_default: bool,
+    /// External transparent gap limit (restore scan depth). Applied to the wallet DB only when
+    /// `transparent_enabled`.
+    pub transparent_gap_limit: u32,
+    /// Initial transparent scan depth: pre-expose external indices `0..N` on startup so the
+    /// receive scan covers them, independent of the gap limit. `0` = off. Only used when
+    /// `transparent_enabled`.
+    pub transparent_initial_scan: u32,
     /// Flips to `true` on Ctrl-C/`stop`; the actor exits its loop (between sync batches)
     /// so the `WalletDb` is dropped cleanly before the process ends.
     pub shutdown: watch::Receiver<bool>,
@@ -249,6 +260,23 @@ struct WalletActor {
     enabled_pools: PoolSet,
     /// Receivers included by default in this wallet's Unified Addresses.
     default_receivers: PoolSet,
+    /// Whether this wallet may hand out bare transparent receiving addresses.
+    transparent_enabled: bool,
+    /// Whether a no-argument `getnewaddress` returns a bare transparent address.
+    transparent_default: bool,
+    /// Initial transparent scan depth: pre-expose external indices `0..N` once so the receive
+    /// scan covers them. `0` = off.
+    transparent_initial_scan: u32,
+    /// Receive-discovery throttle (transient - rebuilt on restart, like sync progress; respects the
+    /// stateless invariant). librustzcash never asks us to scan our *receiving* transparent
+    /// addresses for incoming funds (only to find spends of UTXOs we already hold), so zecd owns
+    /// that scan via `getaddressutxos`. `getaddressutxos` returns the full current UTXO set (no
+    /// height filter), so re-running it every idle pass is wasteful: this records `(tip,
+    /// exposed_receiver_count)` of the last scan and re-scans only when the tip advances or new
+    /// receivers are exposed (a gap extension). `transparent_preexposed` flips once
+    /// `0..transparent_initial_scan` has been pre-exposed.
+    transparent_last_scan: Option<(u32, usize)>,
+    transparent_preexposed: bool,
     /// Transient first-seen times for unmined txs, shared with the read-path handle. Stamped when
     /// the mempool stream first stores an unmined tx; pruned once the tx mines. Never persisted
     /// (zecd is stateless). See [`crate::wallet::FirstSeen`].
@@ -353,7 +381,22 @@ pub async fn spawn(
     ensure_dir_writable(&cfg.wallet_dir)
         .with_context(|| format!("wallet '{}' data directory is not usable", cfg.name))?;
 
-    let db_data = open::init_dbs(cfg.network, &cfg.wallet_dir)?;
+    // Apply the configured external transparent gap limit only for transparent-enabled wallets, so
+    // shielded-only wallets keep librustzcash's default and are completely unaffected.
+    let db_data = open::init_dbs_with_gap_limit(
+        cfg.network,
+        &cfg.wallet_dir,
+        cfg.transparent_enabled.then_some(cfg.transparent_gap_limit),
+    )?;
+    if cfg.transparent_enabled {
+        // Surface the transparent receiving config for operator auditing of restore coverage:
+        // a stateless rebuild rediscovers transparent funds only within `gap_limit` of the last
+        // funded address.
+        info!(
+            "[{}] transparent receiving enabled (default_address={}, external_gap_limit={})",
+            cfg.name, cfg.transparent_default, cfg.transparent_gap_limit
+        );
+    }
     let db_cache = open::open_fsblockdb(&cfg.wallet_dir)?;
     let st = store::WalletStore::read(&cfg.keys_path)?;
     let encrypted = st.is_encrypted();
@@ -542,6 +585,11 @@ pub async fn spawn(
         orchard_action_limit: cfg.orchard_action_limit,
         enabled_pools: cfg.enabled_pools.clone(),
         default_receivers: cfg.default_receivers.clone(),
+        transparent_enabled: cfg.transparent_enabled,
+        transparent_default: cfg.transparent_default,
+        transparent_initial_scan: cfg.transparent_initial_scan,
+        transparent_last_scan: None,
+        transparent_preexposed: false,
         first_seen: first_seen.clone(),
         account_id,
         account_index,
@@ -583,6 +631,9 @@ pub async fn spawn(
             cfg.confirmations_policy,
             cfg.enabled_pools,
             cfg.default_receivers,
+            cfg.transparent_enabled,
+            cfg.transparent_default,
+            cfg.transparent_gap_limit,
             first_seen,
             handle_seed,
             cmd_tx,
@@ -771,6 +822,10 @@ impl WalletActor {
                             // logged and treated as "no more work this pass" rather than taking the
                             // actor (and all wallet writes) down.
                             let more_enhance = self.enhance_step_caught().await;
+                            // Transparent receive discovery (opt-in): enumerate the account's
+                            // exposed t-addresses and pull any txs paying them. Independent of the
+                            // shielded enhancement drain above.
+                            self.scan_transparent_receives().await;
                             self.ensure_mempool_stream().await;
                             more_work = more_enhance;
                         }
@@ -1190,18 +1245,215 @@ impl WalletActor {
                     }
                 }
             }
-            // `TransactionsInvolvingAddress` scans a transparent address's on-chain history.
-            // zecd hands out Orchard-only receivers and the `ChainSource` trait exposes no
-            // transparent-txid query, so there's nothing to fetch here; skip it (best-effort).
-            // Marking it satisfied for the pass keeps the re-query loop from spinning.
-            other => {
-                tracing::debug!(
-                    "[{}] skipping unsupported transaction data request: {other:?}",
-                    self.name
-                );
+            // `TransactionsInvolvingAddress` discovers transactions that receive or spend funds at
+            // one of the wallet's transparent addresses. Compact blocks omit transparent I/O, so
+            // mined transparent receives/spends are invisible to the block scan - this is the only
+            // path that finds them. Query the upstream's address index for the requested range,
+            // fetch+store each tx (filling in the transparent outputs), then record the address as
+            // checked up to the range end so librustzcash stops re-requesting it.
+            TransactionDataRequest::TransactionsInvolvingAddress(addr_req) => {
+                use zcash_keys::encoding::AddressCodec as _;
+                let address = addr_req.address().encode(&self.network);
+                let chain_tip_u32 = u32::from(chain_tip);
+                let start = u32::from(addr_req.block_range_start()).max(1);
+                // librustzcash's `block_range_end` is exclusive; clamp the inclusive query/checked
+                // height to the chain tip (or the tip itself when the request is open-ended).
+                let as_of = match addr_req.block_range_end() {
+                    Some(end_excl) => u32::from(end_excl).saturating_sub(1).min(chain_tip_u32),
+                    None => chain_tip_u32,
+                };
+                if start <= as_of {
+                    tracing::debug!(
+                        "[{}] TIA: getaddresstxids addr={address} range={start}..={as_of}",
+                        self.name
+                    );
+                    let txids = self
+                        .fetch_transparent_txids(vec![address], start, as_of)
+                        .await
+                        .map_err(|e| anyhow!("{e}"))?;
+                    tracing::debug!(
+                        "[{}] TIA: getaddresstxids returned {} txid(s)",
+                        self.name,
+                        txids.len()
+                    );
+                    for txid in txids {
+                        if let Some((tx, mined)) = self.fetch_full_tx(txid, chain_tip).await? {
+                            decrypt_and_store_transaction(
+                                &self.network,
+                                &mut self.db_data,
+                                &tx,
+                                mined,
+                            )?;
+                        }
+                    }
+                }
+                // Record the address as checked up to `as_of` (the inclusive end), whether or not
+                // any txs were found, so the request converges instead of being re-emitted every
+                // caught-up pass.
+                self.db_data
+                    .notify_address_checked(addr_req.clone(), BlockHeight::from_u32(as_of))?;
             }
         }
         Ok(())
+    }
+
+    /// Discover **incoming** transparent payments to the wallet's own receiving addresses.
+    ///
+    /// librustzcash's `transaction_data_requests` only asks us to scan transparent addresses for
+    /// *spends* of UTXOs we already hold (and for ephemeral ZIP-320 addresses); it never asks us to
+    /// scan our *receiving* addresses for incoming funds - transparent I/O isn't in the compact
+    /// blocks it scans, and `decrypt_and_store` only records shielded outputs. So zecd owns this,
+    /// mirroring `zcash_client_backend::sync`: enumerate the exposed transparent receivers, query
+    /// the upstream's `getaddressutxos`, and feed each UTXO to `put_received_transparent_utxo`
+    /// (which records the receive and lets librustzcash extend the gap and later find the spend).
+    /// The scanned set is bounded by what's exposed - `transparent_gap_limit` past each funded
+    /// address, plus the `transparent_initial_scan` floor pre-exposed below.
+    ///
+    /// `getaddressutxos` returns the full current UTXO set (no height filter), so this throttles to
+    /// runs where the tip advanced or a new receiver was exposed; `put_received_transparent_utxo`
+    /// is idempotent, so an occasional redundant run is harmless. State is transient (rebuilt on
+    /// restart, like sync progress - no statelessness break).
+    async fn scan_transparent_receives(&mut self) {
+        if !self.transparent_enabled || self.client.is_none() {
+            return;
+        }
+        let Some(tip) = self.tip_height else {
+            return;
+        };
+        let Ok(account_id) = self.require_account() else {
+            return;
+        };
+
+        // one-time pre-exposure of external indices `0..transparent_initial_scan`, so a
+        // stateless restore scans deep enough to find a high funded index while the steady-state
+        // gap stays small.
+        if !self.transparent_preexposed {
+            self.preexpose_transparent(account_id);
+            self.transparent_preexposed = true;
+        }
+
+        // Exposed transparent receivers (external + internal/change).
+        let addresses: Vec<String> = match self
+            .db_data
+            .get_transparent_receivers(account_id, true, false)
+        {
+            Ok(r) => {
+                use zcash_keys::encoding::AddressCodec as _;
+                r.keys().map(|a| a.encode(&self.network)).collect()
+            }
+            Err(e) => {
+                warn!("[{}] get_transparent_receivers failed: {e}", self.name);
+                return;
+            }
+        };
+        if addresses.is_empty() {
+            return;
+        }
+        // Throttle: re-scan only when the tip moved or a new receiver was exposed (gap extension).
+        if self.transparent_last_scan == Some((tip, addresses.len())) {
+            return;
+        }
+        match self.scan_transparent_utxos(addresses.clone()).await {
+            Ok(()) => self.transparent_last_scan = Some((tip, addresses.len())),
+            Err(e) => warn!("[{}] transparent receive scan failed: {e}", self.name),
+        }
+    }
+
+    /// Query `getaddressutxos` for `addresses` (in batches, since the upstream accepts many per
+    /// call) and record each returned UTXO via `put_received_transparent_utxo`. Idempotent.
+    async fn scan_transparent_utxos(&mut self, addresses: Vec<String>) -> anyhow::Result<()> {
+        use zcash_transparent::address::Script;
+        use zcash_transparent::bundle::{OutPoint, TxOut};
+        const BATCH: usize = 100;
+        let mut found = 0usize;
+        for chunk in addresses.chunks(BATCH) {
+            let utxos = self.fetch_address_utxos(chunk.to_vec()).await?;
+            for u in utxos {
+                let value = Zatoshis::from_u64(u.value_zat)
+                    .map_err(|e| anyhow!("getaddressutxos value: {e}"))?;
+                let outpoint = OutPoint::new(*u.txid.as_ref(), u.index);
+                let txout = TxOut::new(value, Script(zcash_script::script::Code(u.script)));
+                let output = zcash_client_backend::wallet::WalletTransparentOutput::from_parts(
+                    outpoint,
+                    txout,
+                    Some(BlockHeight::from_u32(u.height)),
+                )
+                .ok_or_else(|| anyhow!("getaddressutxos returned a non-recognized output"))?;
+                self.db_data.put_received_transparent_utxo(&output)?;
+                found += 1;
+            }
+        }
+        if found > 0 {
+            tracing::debug!("[{}] recorded {found} transparent UTXO(s)", self.name);
+        }
+        Ok(())
+    }
+
+    /// Thin wrapper around [`ChainSource::get_address_utxos`] that (re)connects and applies the
+    /// unary RPC timeout, mirroring [`Self::fetch_transparent_txids`].
+    async fn fetch_address_utxos(
+        &mut self,
+        addresses: Vec<String>,
+    ) -> anyhow::Result<Vec<crate::chain::TransparentUtxo>> {
+        if self.client.is_none() {
+            self.connect().await?;
+        }
+        let client = self
+            .client
+            .as_mut()
+            .ok_or_else(|| anyhow!("not connected to upstream"))?;
+        let result = tokio::time::timeout(UNARY_RPC_TIMEOUT, client.get_address_utxos(addresses))
+            .await
+            .map_err(|_| anyhow!("getaddressutxos timed out after {UNARY_RPC_TIMEOUT:?}"))
+            .and_then(|r| r);
+        if result.is_err() {
+            // Transport failure: drop the client so the next op reconnects (matches the other
+            // unary fetchers).
+            self.mark_disconnected("getaddressutxos failed".to_string());
+        }
+        result
+    }
+
+    /// Pre-expose external transparent indices `0..transparent_initial_scan` so the receive
+    /// scan covers them regardless of the (small) steady-state gap limit. Idempotent: only derives
+    /// indices past the highest already exposed, so a restart is cheap. No-op when the depth is 0.
+    fn preexpose_transparent(&mut self, account_id: AccountUuid) {
+        let depth = self.transparent_initial_scan;
+        if depth == 0 {
+            return;
+        }
+        let request = crate::pools::transparent_extraction_request();
+        // Resume past the highest external index already exposed (e.g. on a restart where the DB
+        // survived), so we don't re-derive the whole range.
+        let start = match self
+            .db_data
+            .get_transparent_receivers(account_id, false, false)
+        {
+            Ok(r) => r
+                .values()
+                .filter_map(|m| m.address_index())
+                .map(|i| i.index().saturating_add(1))
+                .max()
+                .unwrap_or(0),
+            Err(_) => 0,
+        };
+        if start >= depth {
+            return;
+        }
+        for i in start..depth {
+            let div = DiversifierIndex::from(i);
+            if let Err(e) = self.db_data.get_address_for_index(account_id, div, request) {
+                warn!(
+                    "[{}] pre-exposing transparent index {i} failed: {e}",
+                    self.name
+                );
+                break;
+            }
+        }
+        info!(
+            "[{}] pre-exposed transparent external indices {start}..{depth} (initial scan depth)",
+            self.name
+        );
     }
 
     /// Fetch a full transaction from the upstream and parse it for enhancement, returning the
@@ -1255,14 +1507,19 @@ impl WalletActor {
         let txid = tx.txid();
         match decrypt_and_store_transaction(&self.network, &mut self.db_data, &tx, mined_height) {
             Ok(()) => {
-                tracing::debug!("[{}] processed mempool tx {txid}", self.name);
+                // `decrypt_and_store_transaction` no-ops for txs that don't pay us, so the tx is
+                // ours iff it now exists in the wallet DB. Log that verdict (diagnostic: a 0-conf
+                // transparent receive that never shows up as `ours=true` here means the mempool
+                // path isn't attributing the transparent output).
+                let txid_hex = txid.to_string();
+                let ours = super::read::tx_exists(&self.wallet_dir, &txid_hex);
+                tracing::debug!("[{}] processed mempool tx {txid} (ours={ours})", self.name);
                 // If the tx is ours and still unmined, stamp when we first saw it so
                 // `gettransaction`/`listtransactions` can report `time`/`timereceived` (Bitcoin
                 // Core's `nTimeReceived`) while it has no block time. This is held in memory only
                 // - zecd is stateless, so it is never persisted (a restart/restore rebuilds it as
                 // the mempool stream re-observes the tx, or it mines and the block time wins).
-                let txid_hex = txid.to_string();
-                if mined_height.is_none() && super::read::tx_exists(&self.wallet_dir, &txid_hex) {
+                if mined_height.is_none() && ours {
                     let now = std::time::SystemTime::now()
                         .duration_since(std::time::UNIX_EPOCH)
                         .map(|d| d.as_secs() as i64)
@@ -1711,8 +1968,8 @@ impl WalletActor {
     /// Returns `true` if the actor should stop.
     async fn handle_command(&mut self, cmd: WalletCommand) -> bool {
         match cmd {
-            WalletCommand::GetNewAddress { receivers, reply } => {
-                let res = self.get_new_address(receivers);
+            WalletCommand::GetNewAddress { request, reply } => {
+                let res = self.get_new_address(request);
                 let _ = reply.send(res);
             }
             WalletCommand::GetAddressForAccount {
@@ -1775,12 +2032,19 @@ impl WalletActor {
         self.account_id.ok_or_else(account_not_ready)
     }
 
-    fn get_new_address(&mut self, receivers: Option<PoolSet>) -> Result<String, RpcError> {
-        // No override → the wallet's configured default receivers. An override must be a subset
-        // of the wallet's enabled pools (the RPC layer also validates this, but the actor is the
-        // authority on the wallet's configuration, so re-check here).
-        let receivers = match receivers {
-            Some(set) => {
+    fn get_new_address(&mut self, request: ReceiverRequest) -> Result<String, RpcError> {
+        // Resolve the request against the wallet's configuration. `Default` becomes a bare
+        // transparent address when the wallet defaults to transparent, else the configured
+        // shielded `default_receivers`. The actor is the authority on the wallet's configuration,
+        // so it re-validates an explicit shielded override and re-checks transparent enablement
+        // (the RPC layer validates these too, before dispatch).
+        let receivers = match request {
+            ReceiverRequest::Transparent => return self.new_transparent_address(),
+            ReceiverRequest::Default if self.transparent_default => {
+                return self.new_transparent_address()
+            }
+            ReceiverRequest::Default => self.default_receivers.clone(),
+            ReceiverRequest::Shielded(set) => {
                 if !set.is_subset_of(&self.enabled_pools) {
                     return Err(RpcError::invalid_parameter(format!(
                         "requested receivers ({}) include a pool not enabled on this wallet ({})",
@@ -1790,7 +2054,6 @@ impl WalletActor {
                 }
                 set
             }
-            None => self.default_receivers.clone(),
         };
         let account_id = self.require_account()?;
         let request = receivers.to_unified_address_request();
@@ -1807,6 +2070,39 @@ impl WalletActor {
             })?;
         let encoded = ua.encode(&self.network);
         Ok(encoded)
+    }
+
+    /// Derive and persist a fresh bare transparent (`t1…`/`tm…`) receiving address for the
+    /// account. ZIP-316 forbids a transparent-only Unified Address, so we derive a UA that
+    /// requires both an Orchard and a transparent receiver (keys always derive all pools, so the
+    /// Orchard receiver is always available), then extract and bare-encode the transparent
+    /// receiver. Generating the UA persists `addresses.cached_transparent_receiver_address`, which
+    /// is what lets the read paths and the receive-servicing loop recognise the address.
+    fn new_transparent_address(&mut self) -> Result<String, RpcError> {
+        if !self.transparent_enabled {
+            return Err(RpcError::invalid_parameter(
+                "transparent addresses are not enabled on this wallet \
+                 (set [pools] transparent = true)",
+            ));
+        }
+        let account_id = self.require_account()?;
+        let request = crate::pools::transparent_extraction_request();
+        let (ua, _) = self
+            .db_data
+            .get_next_available_address(account_id, request)
+            .map_err(|e| RpcError::wallet(format!("address generation failed: {e}")))?
+            .ok_or_else(|| {
+                RpcError::wallet(
+                    "no transparent address available for account; the account's viewing key may \
+                     not support a transparent receiver"
+                        .to_string(),
+                )
+            })?;
+        let taddr = ua.transparent().ok_or_else(|| {
+            RpcError::wallet("derived address unexpectedly has no transparent receiver".to_string())
+        })?;
+        use zcash_keys::encoding::AddressCodec as _;
+        Ok(taddr.encode(&self.network))
     }
 
     /// Derive a Unified Address for this wallet's account, backing `z_getaddressforaccount`.
@@ -2465,6 +2761,45 @@ impl WalletActor {
                 self.mark_disconnected(format!("transaction fetch failed: {e}"));
                 self.update_status();
                 Err(RpcError::misc(format!("transaction fetch failed: {e}")))
+            }
+        }
+    }
+
+    /// Query the upstream for all txids touching a transparent address in `[start, end]`
+    /// (`getaddresstxids`). A transport failure drops the client (so the next op reconnects) and
+    /// surfaces as `Err`; an unseen address simply yields an empty list.
+    async fn fetch_transparent_txids(
+        &mut self,
+        addresses: Vec<String>,
+        start: u32,
+        end: u32,
+    ) -> Result<Vec<TxId>, RpcError> {
+        if self.client.is_none() {
+            self.connect()
+                .await
+                .map_err(|e| RpcError::misc(format!("connect to upstream: {e}")))?;
+        }
+        let result = {
+            let client = self
+                .client
+                .as_mut()
+                .ok_or_else(|| RpcError::misc("not connected to upstream"))?;
+            tokio::time::timeout(
+                UNARY_RPC_TIMEOUT,
+                client.transparent_txids(addresses, start, end),
+            )
+            .await
+            .map_err(|_| anyhow!("getaddresstxids timed out after {UNARY_RPC_TIMEOUT:?}"))
+            .and_then(|r| r)
+        };
+        match result {
+            Ok(txids) => Ok(txids),
+            Err(e) => {
+                self.mark_disconnected(format!("transparent txid query failed: {e}"));
+                self.update_status();
+                Err(RpcError::misc(format!(
+                    "transparent txid query failed: {e}"
+                )))
             }
         }
     }

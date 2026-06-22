@@ -24,6 +24,9 @@ use crate::wallet::open::{data_db_path, open_read};
 pub struct BalanceInfo {
     pub orchard_spendable: u64,
     pub sapling_spendable: u64,
+    /// Spendable transparent (unshielded) value. Spendable here means "usable as an input": zecd
+    /// spends transparent UTXOs by auto-shielding them into a shielded send.
+    pub transparent_spendable: u64,
     pub total_spendable: u64,
     /// Value received but not yet spendable (needs more confirmations).
     pub pending: u64,
@@ -47,12 +50,19 @@ pub fn balance(
         for bal in summary.account_balances().values() {
             info.orchard_spendable += bal.orchard_balance().spendable_value().into_u64();
             info.sapling_spendable += bal.sapling_balance().spendable_value().into_u64();
+            // Transparent (unshielded) value: spendable via auto-shielding. Immature coinbase and
+            // unconfirmed UTXOs ride in the same pending/immature buckets as shielded value.
+            info.transparent_spendable += bal.unshielded_balance().spendable_value().into_u64();
             info.pending += bal
                 .orchard_balance()
                 .value_pending_spendability()
                 .into_u64()
                 + bal
                     .sapling_balance()
+                    .value_pending_spendability()
+                    .into_u64()
+                + bal
+                    .unshielded_balance()
                     .value_pending_spendability()
                     .into_u64();
             info.immature += bal
@@ -62,9 +72,14 @@ pub fn balance(
                 + bal
                     .sapling_balance()
                     .change_pending_confirmation()
+                    .into_u64()
+                + bal
+                    .unshielded_balance()
+                    .change_pending_confirmation()
                     .into_u64();
         }
-        info.total_spendable = info.orchard_spendable + info.sapling_spendable;
+        info.total_spendable =
+            info.orchard_spendable + info.sapling_spendable + info.transparent_spendable;
     }
     Ok(info)
 }
@@ -699,7 +714,7 @@ pub fn list_unspent(network: ZNetwork, wallet_dir: &Path) -> anyhow::Result<Vec<
     // every pool is safe regardless of which pools are enabled in config.
     let protocols: Vec<ShieldedProtocol> = crate::pools::Pool::SUPPORTED
         .iter()
-        .map(|p| p.shielded_protocol())
+        .filter_map(|p| p.shielded_protocol())
         .collect();
     for account in db.get_account_ids()? {
         let notes = db.select_unspent_notes(account, &protocols, target_height, &[])?;
@@ -810,6 +825,50 @@ pub fn list_unspent(network: ZNetwork, wallet_dir: &Path) -> anyhow::Result<Vec<
                 });
             }
         }
+
+        // Transparent UTXOs. Unlike shielded notes there's no `select_unspent_notes` path, so list
+        // all unspent received transparent outputs here (mined and unmined alike), with real
+        // bitcoin-style `(txid, vout)` outpoints and the bare t-address. An output is shown if its
+        // creating tx is mined or unmined-and-unexpired, and isn't suppressed by a spend whose tx
+        // is still live (mined or unexpired) - mirroring the shielded suppression above. Real
+        // outpoints don't collide with the shielded synthesized ones, so this isn't deduped
+        // against `seen`.
+        let unexpired_t = tx_unexpired_sql("t");
+        let unexpired_stx = tx_unexpired_sql("stx");
+        let sql = format!(
+            "SELECT t.txid, txo.output_index, txo.value_zat, txo.address
+             FROM transparent_received_outputs txo
+             JOIN transactions t ON t.id_tx = txo.transaction_id
+             WHERE (t.mined_height IS NOT NULL OR ({unexpired_t}))
+               AND txo.id NOT IN (
+                   SELECT s.transparent_received_output_id
+                   FROM transparent_received_output_spends s
+                   JOIN transactions stx ON stx.id_tx = s.transaction_id
+                   WHERE {unexpired_stx}
+               )"
+        );
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt.query_map(named_params! { ":target_height": target }, |r| {
+            Ok((
+                r.get::<_, Vec<u8>>(0)?,
+                r.get::<_, u32>(1)?,
+                r.get::<_, i64>(2)?,
+                r.get::<_, String>(3)?,
+            ))
+        })?;
+        for row in rows {
+            let (txid, vout, value, address) = row?;
+            let txid = txid_display(&txid);
+            let (mined_height, trusted) = tx_meta.get(&txid).copied().unwrap_or((None, false));
+            out.push(UnspentNote {
+                vout,
+                txid,
+                value: u64::try_from(value).unwrap_or(0),
+                mined_height,
+                trusted,
+                address: Some(address),
+            });
+        }
     }
     Ok(out)
 }
@@ -858,14 +917,15 @@ pub fn all_addresses(network: ZNetwork, wallet_dir: &Path) -> Vec<String> {
 /// diversifier index** (the [`UaReceivers::MineConsistent`] verdict), not when merely one
 /// receiver matches: see the threat-model note in the body - a UA that pairs the wallet's
 /// receiver with a stranger's would otherwise read `ismine: true` while a sender pays the
-/// stranger. A single-receiver UA (and a bare Sapling address) is tested directly. Transparent
-/// receivers are never attributed to a viewing key (zecd never receives into the transparent pool,
-/// and a transparent receiver can't be attributed without a gap-limit derivation scan), so a
-/// **transparent receiver inside a UA is disqualifying**: because zecd never issues a transparent
-/// receiver, a UA that carries one can never be an address this wallet handed out - it is the same
-/// splice as a foreign shielded receiver (a transparent-only sender would pay the attacker), and is
-/// rejected even when a shielded receiver alongside it genuinely is the wallet's. A bare transparent
-/// address is likewise never ours.
+/// stranger. A single-receiver UA (and a bare Sapling address) is tested directly. A bare
+/// transparent address the wallet handed out is recognized via the recorded-receiver fast path
+/// (layer 1b, its `cached_transparent_receiver_address`); the cryptographic path never attributes
+/// transparent receivers - an unrecorded one can't be attributed to a viewing key without a
+/// gap-limit derivation scan (a funded one is re-recorded by the scan, so it then matches layer 1b).
+/// A transparent receiver **inside a UA** is still disqualifying: zecd hands out transparent only as
+/// a bare t-address, never mixed into a UA, so a UA that carries one can only be a splice (a
+/// transparent-only sender would pay the attacker), rejected even when a shielded receiver alongside
+/// it genuinely is the wallet's.
 pub fn is_mine(network: ZNetwork, wallet_dir: &Path, addr: &str) -> bool {
     let Ok(db) = open_read(network, wallet_dir) else {
         return false;
@@ -882,6 +942,14 @@ pub fn is_mine(network: ZNetwork, wallet_dir: &Path, addr: &str) -> bool {
                 .iter()
                 .any(|info| info.address().encode(&network) == addr)
             {
+                return true;
+            }
+        }
+        // (1b) Recorded transparent receiver: a bare t-address the wallet handed out (its
+        // `cached_transparent_receiver_address`). The crypto path below can't attribute transparent
+        // receivers, so this recorded match is how `getaddressinfo.ismine` recognizes own t-addrs.
+        if let Ok(receivers) = db.get_transparent_receivers(account, false, false) {
+            if receivers.keys().any(|t| t.encode(&network) == addr) {
                 return true;
             }
         }

@@ -116,6 +116,18 @@ fn basic(cred: &str) -> String {
     )
 }
 
+/// Parse a display-hex txid (the byte-reversed form the RPC returns) into a [`TxId`] (internal
+/// byte order). The inverse of `TxId`'s `Display`.
+fn parse_display_txid(s: &str) -> anyhow::Result<TxId> {
+    let mut bytes = hex::decode(s.trim()).context("decoding txid hex")?;
+    if bytes.len() != 32 {
+        bail!("txid is not 32 bytes: {s:?}");
+    }
+    bytes.reverse();
+    let arr: [u8; 32] = bytes.try_into().expect("length checked above");
+    Ok(TxId::from_bytes(arr))
+}
+
 /// Stand-in `code` for a JSON-RPC error envelope that carries no usable numeric `code`
 /// (missing, non-integer, or an explicit `0`). `error_code == 0` is the success sentinel
 /// shared by `BroadcastOutcome` and the JSON-RPC success path, so a code-less error must
@@ -638,6 +650,71 @@ impl ChainSource for ZebraSource {
         Ok(Some(FetchedTx { data, mined_height }))
     }
 
+    async fn transparent_txids(
+        &mut self,
+        addresses: Vec<String>,
+        start: u32,
+        end: u32,
+    ) -> anyhow::Result<Vec<TxId>> {
+        // zcashd/zebra `getaddresstxids` takes an object param (with a batch of addresses) and
+        // returns display-hex txids in chain order. Valid-but-unseen addresses yield `[]`; an error
+        // is transport/application and propagates (dropping the client).
+        let params = json!([{ "addresses": addresses, "start": start, "end": end }]);
+        tracing::debug!(
+            "getaddresstxids req addrs={} start={start} end={end}",
+            addresses.len()
+        );
+        let hexes: Vec<String> = self
+            .client
+            .call_as("getaddresstxids", params)
+            .await
+            .context("getaddresstxids")?;
+        tracing::debug!("getaddresstxids resp -> {} txid(s)", hexes.len());
+        let mut out = Vec::with_capacity(hexes.len());
+        for h in hexes {
+            out.push(parse_display_txid(&h)?);
+        }
+        Ok(out)
+    }
+
+    async fn get_address_utxos(
+        &mut self,
+        addresses: Vec<String>,
+    ) -> anyhow::Result<Vec<super::TransparentUtxo>> {
+        // zcashd/zebra `getaddressutxos` takes `{ addresses, chainInfo }` and returns every
+        // currently-unspent output paying those addresses (no height filter). `txid` is big-endian
+        // (display) hex; `outputIndex`/`satoshis`/`height` are numeric; `script` is hex. An error is
+        // transport/application and propagates (dropping the client).
+        #[derive(serde::Deserialize)]
+        struct Entry {
+            txid: String,
+            #[serde(rename = "outputIndex")]
+            output_index: u32,
+            script: String,
+            satoshis: u64,
+            height: u32,
+        }
+        let params = json!([{ "addresses": addresses, "chainInfo": false }]);
+        tracing::debug!("getaddressutxos req addrs={}", addresses.len());
+        let entries: Vec<Entry> = self
+            .client
+            .call_as("getaddressutxos", params)
+            .await
+            .context("getaddressutxos")?;
+        tracing::debug!("getaddressutxos resp -> {} utxo(s)", entries.len());
+        let mut out = Vec::with_capacity(entries.len());
+        for e in entries {
+            out.push(super::TransparentUtxo {
+                txid: parse_display_txid(&e.txid)?,
+                index: e.output_index,
+                value_zat: e.satoshis,
+                script: hex::decode(&e.script).context("getaddressutxos script hex")?,
+                height: e.height,
+            });
+        }
+        Ok(out)
+    }
+
     async fn subscribe_mempool(&mut self) -> anyhow::Result<MempoolStream> {
         // Baseline tip: the stream synthesizes lightwalletd's close-on-new-block by ending
         // itself once the best hash moves away from this.
@@ -1025,6 +1102,11 @@ mod tests {
         subtrees: Value,
         mempool: Vec<String>,
         raw_txs: HashMap<String, Value>,
+        /// `getaddresstxids` responses keyed by transparent address → display-hex txids.
+        addr_txids: HashMap<String, Vec<String>>,
+        /// `getaddressutxos` responses keyed by transparent address → UTXO objects
+        /// (`{txid, outputIndex, script, satoshis, height}`).
+        addr_utxos: HashMap<String, Vec<Value>>,
         /// `Err((code, message))` makes `sendrawtransaction` reject.
         send: Result<String, (i64, String)>,
         /// When set, `sendrawtransaction` returns this exact `error` object verbatim,
@@ -1047,6 +1129,8 @@ mod tests {
                 subtrees: Value::Null,
                 mempool: Vec::new(),
                 raw_txs: HashMap::new(),
+                addr_txids: HashMap::new(),
+                addr_utxos: HashMap::new(),
                 send: Ok("00".repeat(32)),
                 send_error_object: None,
                 seen_auth: Vec::new(),
@@ -1109,6 +1193,31 @@ mod tests {
                     None => err(-5, "No such mempool or main chain transaction"),
                 }
             }
+            "getaddresstxids" => {
+                // Param is an object `{ "addresses": [...], "start": N, "end": M }`.
+                let arg = &params[0];
+                let addrs = arg["addresses"].as_array().cloned().unwrap_or_default();
+                let txids: Vec<String> = addrs
+                    .iter()
+                    .filter_map(|a| a.as_str())
+                    .flat_map(|a| fake.addr_txids.get(a).cloned().unwrap_or_default())
+                    .collect();
+                reply(json!(txids))
+            }
+            "getaddressutxos" => {
+                // Param is `{ "addresses": [...], "chainInfo": bool }`; returns the union of the
+                // configured UTXO objects across the requested addresses.
+                let addrs = params[0]["addresses"]
+                    .as_array()
+                    .cloned()
+                    .unwrap_or_default();
+                let utxos: Vec<Value> = addrs
+                    .iter()
+                    .filter_map(|a| a.as_str())
+                    .flat_map(|a| fake.addr_utxos.get(a).cloned().unwrap_or_default())
+                    .collect();
+                reply(json!(utxos))
+            }
             "sendrawtransaction" => match (&fake.send_error_object, &fake.send) {
                 (Some(error), _) => Json(json!({
                     "result": null,
@@ -1143,6 +1252,81 @@ mod tests {
         )
         .await
         .expect("connect to fake zebrad")
+    }
+
+    #[tokio::test]
+    async fn transparent_txids_maps_getaddresstxids() {
+        let mut fake = Fake::new();
+        let addr = "t1KnownTransparentAddressForTest".to_string();
+        // A display-hex txid (64 chars). `parse_display_txid` reverses to internal order, and
+        // `TxId::to_string` reverses back, so the round-trip equals the input.
+        let txid_hex = format!("aa{}", "bb".repeat(31));
+        fake.addr_txids.insert(addr.clone(), vec![txid_hex.clone()]);
+        let mut src = source_for(Arc::new(Mutex::new(fake))).await;
+
+        let got = src.transparent_txids(vec![addr], 1, 100).await.unwrap();
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].to_string(), txid_hex);
+
+        // An address with no recorded txids yields an empty list, not an error.
+        let none = src
+            .transparent_txids(vec!["t1Unseen".into()], 1, 100)
+            .await
+            .unwrap();
+        assert!(none.is_empty());
+
+        // A batch query returns the union across addresses (zebra accepts many per call).
+        let mut fake2 = Fake::new();
+        let (a, b) = ("t1Aaa".to_string(), "t1Bbb".to_string());
+        fake2
+            .addr_txids
+            .insert(a.clone(), vec![format!("11{}", "22".repeat(31))]);
+        fake2
+            .addr_txids
+            .insert(b.clone(), vec![format!("33{}", "44".repeat(31))]);
+        let mut src2 = source_for(Arc::new(Mutex::new(fake2))).await;
+        let both = src2.transparent_txids(vec![a, b], 1, 100).await.unwrap();
+        assert_eq!(both.len(), 2, "batch query unions txids across addresses");
+    }
+
+    #[tokio::test]
+    async fn get_address_utxos_maps_getaddressutxos() {
+        let mut fake = Fake::new();
+        let addr = "t1KnownTransparentAddressForTest".to_string();
+        let txid_hex = format!("aa{}", "bb".repeat(31));
+        fake.addr_utxos.insert(
+            addr.clone(),
+            vec![json!({
+                "address": addr,
+                "txid": txid_hex,
+                "outputIndex": 2,
+                // p2pkh script (25 bytes): OP_DUP OP_HASH160 <20> OP_EQUALVERIFY OP_CHECKSIG
+                "script": format!("76a914{}88ac", "00".repeat(20)),
+                "satoshis": 100_000_000u64,
+                "height": 42,
+            })],
+        );
+        let mut src = source_for(Arc::new(Mutex::new(fake))).await;
+
+        let utxos = src.get_address_utxos(vec![addr]).await.unwrap();
+        assert_eq!(utxos.len(), 1);
+        let u = &utxos[0];
+        assert_eq!(
+            u.txid.to_string(),
+            txid_hex,
+            "txid round-trips display order"
+        );
+        assert_eq!(u.index, 2);
+        assert_eq!(u.value_zat, 100_000_000);
+        assert_eq!(u.height, 42);
+        assert_eq!(u.script.len(), 25, "p2pkh script_pubkey decoded from hex");
+
+        // An address with no UTXOs yields an empty list, not an error.
+        let none = src
+            .get_address_utxos(vec!["t1Unseen".into()])
+            .await
+            .unwrap();
+        assert!(none.is_empty());
     }
 
     #[tokio::test]

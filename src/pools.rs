@@ -15,27 +15,35 @@ use std::fmt;
 use zcash_keys::keys::{ReceiverRequirement, UnifiedAddressRequest};
 use zcash_protocol::{PoolType, ShieldedProtocol};
 
-/// A shielded value pool that a zecd wallet can receive into and spend from.
+/// A value pool that a zecd wallet can receive into and spend from.
 ///
-/// Transparent is intentionally absent: zecd never exposes a transparent receiver.
+/// [`Pool::Transparent`] is supported for *receiving* (a bare t-address handed out by
+/// `getnewaddress`) and for *spending* (received transparent UTXOs auto-shielded into a send),
+/// but it is never a member of a [`PoolSet`] - a `PoolSet` is always "≥1 shielded pool" (it feeds
+/// `change_pool` and the shielded-protocol enumeration). Transparent receiving is a separate
+/// per-wallet capability flag (`config::PoolsConfig::transparent_*`), not a value pool.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Pool {
+    Transparent,
     Sapling,
     Orchard,
     // future: Ironwood - add the variant here, then fill in every `match self` below.
 }
 
 impl Pool {
-    /// Every pool zecd supports today, in canonical (precedence) order.
+    /// Every *shielded* pool zecd supports today, in canonical (precedence) order. Transparent is
+    /// deliberately excluded: this list drives [`PoolSet`] ordering and the shielded-protocol
+    /// enumeration in balances/`listunspent`, neither of which apply to transparent.
     pub const SUPPORTED: &'static [Pool] = &[Pool::Sapling, Pool::Orchard];
 
-    /// Parse a config token (`"sapling"` | `"orchard"`), case-insensitively.
+    /// Parse a config/RPC token (`"sapling"` | `"orchard"` | `"transparent"`), case-insensitively.
     pub fn from_config_str(s: &str) -> anyhow::Result<Self> {
         match s.trim().to_ascii_lowercase().as_str() {
             "sapling" => Ok(Pool::Sapling),
             "orchard" => Ok(Pool::Orchard),
+            "transparent" => Ok(Pool::Transparent),
             other => anyhow::bail!(
-                "unknown pool {other:?}; supported pools are {}",
+                "unknown pool {other:?}; supported pools are {}, transparent",
                 supported_names()
             ),
         }
@@ -44,32 +52,43 @@ impl Pool {
     /// The canonical lowercase name used in config and RPC.
     pub fn as_str(&self) -> &'static str {
         match self {
+            Pool::Transparent => "transparent",
             Pool::Sapling => "sapling",
             Pool::Orchard => "orchard",
         }
     }
 
-    /// The librustzcash shielded-protocol identifier for this pool.
-    pub fn shielded_protocol(&self) -> ShieldedProtocol {
+    /// The librustzcash shielded-protocol identifier for this pool, or `None` for transparent.
+    pub fn shielded_protocol(&self) -> Option<ShieldedProtocol> {
         match self {
-            Pool::Sapling => ShieldedProtocol::Sapling,
-            Pool::Orchard => ShieldedProtocol::Orchard,
+            Pool::Transparent => None,
+            Pool::Sapling => Some(ShieldedProtocol::Sapling),
+            Pool::Orchard => Some(ShieldedProtocol::Orchard),
         }
     }
 
-    /// The `v_tx_outputs.output_pool` / received-note pool code (2 = Sapling, 3 = Orchard),
-    /// matching zcash_client_sqlite's `PoolType` encoding.
+    /// The `v_tx_outputs.output_pool` / received-note pool code (0 = transparent, 2 = Sapling,
+    /// 3 = Orchard), matching zcash_client_sqlite's `PoolType` encoding.
     pub fn output_pool_code(&self) -> i64 {
         match self {
+            Pool::Transparent => 0,
             Pool::Sapling => 2,
             Pool::Orchard => 3,
         }
+    }
+
+    /// Whether this is the transparent pool.
+    pub fn is_transparent(&self) -> bool {
+        matches!(self, Pool::Transparent)
     }
 }
 
 impl From<Pool> for PoolType {
     fn from(p: Pool) -> Self {
-        PoolType::Shielded(p.shielded_protocol())
+        match p.shielded_protocol() {
+            Some(sp) => PoolType::Shielded(sp),
+            None => PoolType::Transparent,
+        }
     }
 }
 
@@ -102,6 +121,14 @@ impl PoolSet {
     /// and a UA must have at least one shielded receiver).
     pub fn new(pools: impl IntoIterator<Item = Pool>) -> anyhow::Result<Self> {
         let given: Vec<Pool> = pools.into_iter().collect();
+        // A `PoolSet` is shielded-only; transparent is a separate per-wallet capability, not a
+        // value pool. Reject it explicitly so the error is clear rather than "empty set".
+        if given.iter().any(|p| p.is_transparent()) {
+            anyhow::bail!(
+                "transparent is not a shielded pool; enable transparent receiving via the \
+                 [pools] transparent flag, not as a pool/receiver"
+            );
+        }
         let ordered: Vec<Pool> = Pool::SUPPORTED
             .iter()
             .copied()
@@ -172,14 +199,26 @@ impl PoolSet {
         if self.contains(Pool::Orchard) {
             ShieldedProtocol::Orchard
         } else {
-            // Non-empty by construction; fall back to the first enabled pool.
+            // Non-empty and shielded-only by construction; fall back to the first enabled pool.
             self.pools
                 .first()
                 .copied()
-                .unwrap_or(Pool::Orchard)
-                .shielded_protocol()
+                .and_then(|p| p.shielded_protocol())
+                .unwrap_or(ShieldedProtocol::Orchard)
         }
     }
+}
+
+/// The librustzcash address request used to derive a **bare transparent** receiver: require both an
+/// Orchard receiver (to satisfy ZIP-316, which forbids a transparent-only Unified Address - the
+/// shielded receiver is discarded after extraction) and a p2pkh receiver, omitting Sapling. Keys
+/// always derive all pools regardless of a wallet's enabled set, so the Orchard receiver is always
+/// available. The caller extracts the transparent receiver from the resulting UA and encodes it
+/// bare (`t1…`/`tm…`).
+pub fn transparent_extraction_request() -> UnifiedAddressRequest {
+    use ReceiverRequirement::*;
+    // Argument order is (orchard, sapling, p2pkh), matching `to_unified_address_request`.
+    UnifiedAddressRequest::unsafe_custom(Require, Omit, Require)
 }
 
 #[cfg(test)]

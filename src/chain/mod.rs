@@ -26,6 +26,24 @@ pub struct ChainTip {
     pub hash: Vec<u8>,
 }
 
+/// A currently-unspent transparent output (UTXO) discovered via the upstream address index
+/// (`getaddressutxos`). Carries exactly what `WalletTransparentOutput::from_parts` needs so the
+/// actor can feed it to `WalletWrite::put_received_transparent_utxo` - the path by which a wallet
+/// learns of transparent *receives* (`decrypt_and_store` only handles shielded outputs).
+#[derive(Clone, Debug)]
+pub struct TransparentUtxo {
+    /// Internal-byte-order txid of the funding transaction.
+    pub txid: TxId,
+    /// Output index within that transaction's `vout`.
+    pub index: u32,
+    /// Value in zatoshis.
+    pub value_zat: u64,
+    /// The output's `script_pubkey` bytes.
+    pub script: Vec<u8>,
+    /// The height at which the UTXO was mined.
+    pub height: u32,
+}
+
 /// Upstream identity, used by the wrong-chain guard. `chain_name` follows zcashd's
 /// `getblockchaininfo.chain` / lightwalletd's `chain_name`: `"main"`, `"test"`, `"regtest"`.
 #[derive(Clone, Debug)]
@@ -122,6 +140,31 @@ pub trait ChainSource: Send {
         txid: TxId,
     ) -> impl Future<Output = anyhow::Result<Option<FetchedTx>>> + Send;
 
+    /// All txids that touch any of the given **transparent** addresses within the inclusive height
+    /// range `[start, end]` (lightwalletd `GetTaddressTxids`; zebra `getaddresstxids`, which accepts
+    /// a batch of addresses in one call). Compact blocks omit transparent inputs/outputs, so this is
+    /// how the wallet discovers *mined* transparent receives and spends in order to enhance
+    /// (fetch+store) them. Each address is the bare encoding (`t1…`/`tm…`). Ordering is not
+    /// guaranteed, and txids may repeat across addresses (callers de-dupe / store idempotently).
+    fn transparent_txids(
+        &mut self,
+        addresses: Vec<String>,
+        start: u32,
+        end: u32,
+    ) -> impl Future<Output = anyhow::Result<Vec<TxId>>> + Send;
+
+    /// All currently-**unspent** transparent UTXOs paying any of the given addresses
+    /// (zcashd/zebra `getaddresstxids`'s sibling `getaddressutxos`; lightwalletd `GetAddressUtxos`).
+    /// This is how the wallet discovers transparent **receives**: librustzcash's
+    /// `decrypt_and_store` only records shielded outputs, so received transparent UTXOs come from
+    /// this query and are stored via `WalletWrite::put_received_transparent_utxo` (mirrors
+    /// `zcash_client_backend::sync`). Returns the wallet-relevant fields per UTXO; ordering is not
+    /// guaranteed.
+    fn get_address_utxos(
+        &mut self,
+        addresses: Vec<String>,
+    ) -> impl Future<Output = anyhow::Result<Vec<TransparentUtxo>>> + Send;
+
     /// Subscribe to the mempool (lightwalletd `GetMempoolStream`; zebra a `getrawmempool`
     /// poller). The stream yields the current mempool and newly-arriving transactions, and
     /// **closes (yields `None`) when a new block arrives** - the actor relies on that as its
@@ -182,6 +225,26 @@ impl ChainSource for AnySource {
     async fn fetch_tx(&mut self, txid: TxId) -> anyhow::Result<Option<FetchedTx>> {
         match self {
             AnySource::Zebra(s) => s.fetch_tx(txid).await,
+        }
+    }
+
+    async fn transparent_txids(
+        &mut self,
+        addresses: Vec<String>,
+        start: u32,
+        end: u32,
+    ) -> anyhow::Result<Vec<TxId>> {
+        match self {
+            AnySource::Zebra(s) => s.transparent_txids(addresses, start, end).await,
+        }
+    }
+
+    async fn get_address_utxos(
+        &mut self,
+        addresses: Vec<String>,
+    ) -> anyhow::Result<Vec<TransparentUtxo>> {
+        match self {
+            AnySource::Zebra(s) => s.get_address_utxos(addresses).await,
         }
     }
 

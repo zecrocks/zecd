@@ -369,7 +369,7 @@ the validator's job there - so those rows are all - .
 | Method | Bitcoin Core | Zallet | What to expect from zecd |
 |---|---|---|---|
 | **Wallet** | | | |
-| `getnewaddress` | ✓ | - (`z_getaddressforaccount`) | Fresh diversified UA of the wallet's single account; a `label` argument is **rejected** `-8` (zecd is stateless - see below); `address_type` is a per-call receiver override (`unified`/`sapling`/`orchard`/`sapling,orchard`), constrained to the wallet's enabled pools; Bitcoin types rejected `-5` |
+| `getnewaddress` | ✓ | - (`z_getaddressforaccount`) | Fresh diversified UA of the wallet's single account; a `label` argument is **rejected** `-8` (zecd is stateless - see below); `address_type` is a per-call receiver override (`unified`/`sapling`/`orchard`/`sapling,orchard`, or `transparent` for a bare t-address when `[pools] transparent = true`), constrained to the wallet's enabled pools; unknown types rejected `-5` |
 | `getbalance` | ✓ | - (`z_gettotalbalance`) | Spendable balance under the ZIP-315 confirmations policy; explicit `minconf` overrides it per call (`minconf=0` is treated as 1 - a shielded note is never spendable unmined) |
 | `getbalances` | ✓ | - (`z_getbalances`, per-account) | `mine.trusted/untrusted_pending/immature` + `lastprocessedblock`; no `watchonly` object |
 | `getunconfirmedbalance` | *removed* | - | Incoming funds below the confirmation policy (incl. 0-conf via mempool stream) |
@@ -464,10 +464,54 @@ getnewaddress ""                    # the wallet's configured default_receivers
 getnewaddress "" "unified"          # same (alias: "default")
 getnewaddress "" "sapling"          # a UA with a Sapling receiver only
 getnewaddress "" "sapling,orchard"  # a UA with both shielded receivers
+getnewaddress "" "transparent"      # a bare t-address (only if [pools] transparent = true)
 ```
 
-Balances, `listtransactions`, `listunspent`, `getreceivedbyaddress`, and friends report notes
-across **all** enabled pools. `validateaddress`/`getaddressinfo` report each address's receivers
+### Transparent (t-address) receiving
+
+Transparent receiving is **off by default** - zecd stays shielded-only. Set `[pools] transparent =
+true` (globally or per wallet) to let a wallet hand out **bare transparent addresses** (`t1...` /
+`tm...`) via `getnewaddress "" "transparent"`; `transparent_default = true` additionally makes a
+t-address the no-argument `getnewaddress` default. A transparent address carries a single receiver
+type - it is never mixed into a Unified Address.
+
+Funds received at a t-address are discovered through the node's transparent UTXO index (zebra
+`getaddressutxos`), since compact blocks omit transparent data and librustzcash's shielded scan
+can't see them. A transparent receive therefore becomes visible once it is **mined** (not at
+0-conf - the mempool path is shielded-only). Received transparent funds are reported across
+`getbalance`/`listunspent`/`getaddressinfo`/`getreceivedbyaddress`.
+
+> **Spending received transparent funds is not yet implemented.** librustzcash's transfer builder
+> funds payments from shielded notes only and does not select transparent UTXOs as inputs, so
+> spending them first requires *shielding* them into the Orchard pool. zecd does not yet auto-shield
+> received transparent funds, so a transparent-only wallet cannot `sendtoaddress`/`sendmany` yet
+> (it returns `-6` "insufficient funds"). Treat transparent receivers as a **receive-only on-ramp**
+> for now; auto-shielding into Orchard is planned. (Sending *to* a transparent recipient from
+> shielded funds works, and is rejected under `[spend] privacy_policy = "FullPrivacy"`.)
+
+**Statelessness caveat - the gap limit.** Shielded funds are *unconditionally* recoverable on a
+from-seed restore (note trial-decryption needs no scan range). Transparent funds are not: a
+stateless rebuild rediscovers them only within the **external transparent gap limit** - how far
+past the last *funded* receiving address librustzcash keeps scanning the node's address index. zecd
+exposes this as `[pools] transparent_gap_limit` (default **20**, above librustzcash's built-in 10).
+If you hand out addresses far ahead of funding (e.g. pre-generate one per invoice, most never
+paid), set it to at least your maximum number of outstanding-unfunded addresses - otherwise a
+restore can miss a later payment to a high-index address that was unfunded at rebuild time. This is
+the standard HD-wallet gap-limit limitation, made sharper by statelessness (zecd doesn't persist a
+keypool to fall back on). It does not apply to shielded receiving.
+
+**Large pre-generated runs - `transparent_initial_scan`.** A big gap limit is the wrong tool
+when you hand out *many* addresses ahead of funding (e.g. an exchange assigns 10 000, only a high
+one is funded): the gap is a *sliding* window kept `gap_limit` past every funded address forever, so
+sizing it to 10 000 means scanning 10 000 addresses past each receive. Instead set `[pools]
+transparent_initial_scan = N` to **pre-expose external indices `0..N` once** at startup/restore - so
+the receive scan covers all of them - while keeping `transparent_gap_limit` small for steady-state.
+Set `N` to your issuance high-water mark. When transparent receiving is on, `getwalletinfo` reports a
+`transparent` block (`enabled`/`default`/`gap_limit`) and the daemon logs the effective gap limit and
+initial scan depth at startup, so you can audit coverage against that high-water mark.
+
+Balances, `listtransactions`, `listunspent`, `getreceivedbyaddress`, and friends report notes and
+transparent UTXOs across **all** enabled pools. `validateaddress`/`getaddressinfo` report each address's receivers
 via the `isvalid_orchard` boolean and the `receiver_types` array
 (`transparent`/`sapling`/`orchard`).
 

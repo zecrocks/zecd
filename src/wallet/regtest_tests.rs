@@ -158,8 +158,33 @@ fn regtest_wallet_lifecycle() {
         "regtest UA should use the uregtest1 HRP, got {addr}"
     );
 
+    // 2b. Derive a bare transparent receiver - the `getnewaddress "" "transparent"` path: a UA
+    // that requires a p2pkh receiver, from which the transparent receiver is extracted and
+    // bare-encoded. Regtest uses testnet's "tm" P2PKH prefix. Generating it also persists the
+    // address's `cached_transparent_receiver_address`, which `is_mine` reads (checked below).
+    let (tua, _) = db
+        .get_next_available_address(account_id, crate::pools::transparent_extraction_request())
+        .expect("transparent address query")
+        .expect("a transparent address is available for a fresh account");
+    let taddr = {
+        use zcash_keys::encoding::AddressCodec as _;
+        tua.transparent()
+            .expect("the derived UA carries a transparent receiver")
+            .encode(&net)
+    };
+    assert!(
+        taddr.starts_with("tm"),
+        "regtest t-addr should use the tm prefix, got {taddr}"
+    );
+
     // Release the writer connection before the read helpers open their own.
     drop(db);
+
+    // The handed-out transparent address is recognised as the wallet's own.
+    assert!(
+        read::is_mine(net, wallet_dir, &taddr),
+        "a handed-out transparent receiver should be is_mine, got {taddr}"
+    );
 
     // 3. Read helpers operate on a regtest wallet: empty-but-valid balances and note set.
     let bal = read::balance(net, wallet_dir, Default::default()).expect("balance");
@@ -661,6 +686,10 @@ fn offline_actor_cfg(
         pipeline_proving: false,
         enabled_pools: crate::pools::PoolSet::single(crate::pools::Pool::Orchard),
         default_receivers: crate::pools::PoolSet::single(crate::pools::Pool::Orchard),
+        transparent_enabled: false,
+        transparent_default: false,
+        transparent_gap_limit: crate::config::DEFAULT_TRANSPARENT_GAP_LIMIT,
+        transparent_initial_scan: 0,
         shutdown,
     };
     (cfg, shutdown_tx)
@@ -817,7 +846,10 @@ async fn watch_only_wallet_disables_spending_rpcs() {
     // Address generation works from the viewing key alone. (Round-tripping a command also
     // guarantees the actor has published its first status snapshot, which `spawn` itself
     // does not wait for.)
-    let addr = handle.get_new_address(None).await.unwrap();
+    let addr = handle
+        .get_new_address(crate::wallet::ReceiverRequest::Default)
+        .await
+        .unwrap();
     assert!(addr.starts_with("uregtest1"), "{addr}");
 
     // The status feed marks the wallet watch-only (not encrypted - there is nothing to lock).
