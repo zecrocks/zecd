@@ -217,12 +217,22 @@ async fn regtest_transparent_receive_and_autoshield_spend() {
         "the UTXO holds 1 ZEC: {lu}"
     );
 
-    // NOTE: *spending* a received transparent UTXO is deliberately out of scope here. librustzcash's
-    // `propose_transfer` funds payments from shielded notes only - it does not select the wallet's
-    // transparent UTXOs as inputs - so spending transparent funds requires first shielding them
-    // (`propose_shielding`). zecd does not yet auto-shield received transparent funds, so this e2e
-    // covers receive discovery + balance/listunspent/is_mine reporting only. The auto-shield spend
-    // is tracked as follow-up work (see README / the project docs).
+    // The opt-in gate: this wallet runs under the DEFAULT privacy policy (AllowRevealedRecipients),
+    // so a fully-transparent spend is refused. librustzcash's `propose_transfer` funds payments from
+    // shielded notes only and never selects the wallet's transparent UTXOs as inputs, and zecd takes
+    // its own transparent-builder path *only* under the explicit AllowFullyTransparent policy. With
+    // 1 ZEC of transparent funds but 0 shielded notes, `sendtoaddress` therefore fails -6 - proving
+    // kept-transparent spending never happens by default. (`regtest_transparent_t2t` exercises the
+    // AllowFullyTransparent path that *does* spend a received transparent UTXO here.)
+    let err = zecd
+        .call("sendtoaddress", json!([funder_taddr, 0.5]))
+        .await
+        .expect_err("a fully-transparent spend is refused under the default policy");
+    assert_eq!(
+        err.code(),
+        Some(-6),
+        "default-policy transparent spend returns insufficient-funds (-6): {err}"
+    );
 
     lwd.stop();
     drop(zecd);

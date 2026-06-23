@@ -694,6 +694,10 @@ pub struct ZecdConfig {
     /// (zecd defaults to 50). The stress test lifts the cap so its big fan-out/sweep sends aren't
     /// rejected.
     pub orchard_action_limit: Option<usize>,
+    /// `[spend] privacy_policy`: `Some("AllowFullyTransparent")` etc. writes the knob explicitly,
+    /// `None` omits it (zecd defaults to `AllowRevealedRecipients`). The fully-transparent spend
+    /// e2e sets it to `AllowFullyTransparent`.
+    pub privacy_policy: Option<String>,
     /// Optional `[pools]` section as `(enabled, default_receivers)`. `None` omits the section
     /// (the Orchard-only default). Used by the multi-pool (Sapling) e2e.
     pub pools: Option<(Vec<String>, Vec<String>)>,
@@ -735,6 +739,7 @@ impl ZecdConfig {
             cache_proving_key: None,
             pipeline_proving: None,
             orchard_action_limit: None,
+            privacy_policy: None,
             pools: None,
             transparent: false,
             transparent_gap_limit: None,
@@ -1429,24 +1434,29 @@ fn export_ufvk_from_datadir(datadir: &Path, wallet: &str) -> Result<String> {
 fn write_zecd_toml(datadir: &Path, cfg: &ZecdConfig) -> Result<()> {
     // zecd is zebra-only: the single upstream is a local zebrad JSON-RPC endpoint.
     let server = format!("zebra://127.0.0.1:{}", cfg.zebra_rpc_port);
-    // Optional `[spend]` knobs: `cache_proving_key` (proving-key-cache benchmark) and
-    // `pipeline_proving` (stress test). Emit the section only if at least one is set.
-    let spend_section = {
-        let mut lines = String::new();
+    // Optional `[spend]` knobs: `cache_proving_key` (the proving-key-cache benchmark) and
+    // `privacy_policy` (the fully-transparent spend e2e). Emit the section if either is set.
+    let spend_section = if cfg.cache_proving_key.is_some()
+        || cfg.pipeline_proving.is_some()
+        || cfg.orchard_action_limit.is_some()
+        || cfg.privacy_policy.is_some()
+    {
+        let mut s = String::from("\n[spend]\n");
         if let Some(b) = cfg.cache_proving_key {
-            lines.push_str(&format!("cache_proving_key = {b}\n"));
+            s.push_str(&format!("cache_proving_key = {b}\n"));
         }
         if let Some(b) = cfg.pipeline_proving {
-            lines.push_str(&format!("pipeline_proving = {b}\n"));
+            s.push_str(&format!("pipeline_proving = {b}\n"));
         }
         if let Some(n) = cfg.orchard_action_limit {
-            lines.push_str(&format!("orchard_action_limit = {n}\n"));
+            s.push_str(&format!("orchard_action_limit = {n}\n"));
         }
-        if lines.is_empty() {
-            String::new()
-        } else {
-            format!("\n[spend]\n{lines}")
+        if let Some(p) = &cfg.privacy_policy {
+            s.push_str(&format!("privacy_policy = \"{p}\"\n"));
         }
+        s
+    } else {
+        String::new()
     };
     // The default wallet plus any extra `[wallets.<name>]` entries (multiwallet tests).
     let mut wallets = format!(

@@ -1,7 +1,8 @@
 # zecd
 
-A shielded-only wallet server built on [librustzcash](https://github.com/zcash/librustzcash),
-exposed through bitcoind's RPC dialect for developer ease of use. It uses the same method names,
+A shielded-first wallet server built on [librustzcash](https://github.com/zcash/librustzcash) - 
+Orchard by default, with opt-in transparent (t-address) support - exposed through bitcoind's RPC
+dialect for developer ease of use. It uses the same method names,
 response shapes, auth, and error codes as Bitcoin Core, so that many existing Bitcoin RPC clients
 can use Zcash with little or no changes.
 
@@ -19,8 +20,9 @@ zecd is a light client, for quick scalability. It syncs compact blocks in the ba
 never speaks P2P or indexes the chain itself. It connects to a **self-hosted Zcash full
 node** - a local [zebra](https://github.com/ZcashFoundation/zebra) over its JSON-RPC.
 
-All zecd funds are recoverable by a seed phrase. Importing private keys per-address is not
-supported, all addresses are dervied from wallet seeds.
+All zecd funds are recoverable from the seed phrase - shielded funds unconditionally, transparent
+funds within the configured gap limit (see *Transparent support*). Importing private keys per-address
+is not supported; all addresses derive from the wallet seed.
 
 ## Deployment model
 
@@ -177,9 +179,10 @@ rebroadcast_secs = 60            # max spacing of unmined-tx re-broadcast passes
 [spend]
 trusted_confirmations = 3        # depth before the wallet's own change is spendable
 untrusted_confirmations = 10     # depth before third-party payments are spendable (>= trusted)
-privacy_policy = "AllowRevealedRecipients"  # ladder: "FullPrivacy" (single-shielded-pool only),
-                                 #   "AllowRevealedAmounts" (cross-pool ok, transparent recipient
-                                 #   still -8), "AllowRevealedRecipients" (transparent ok, default)
+privacy_policy = "AllowRevealedRecipients"  # "FullPrivacy" (only single-shielded-pool sends - no
+                                 #   transparent recipients, no Sapling<->Orchard crossing), or
+                                 #   "AllowFullyTransparent" (also permits a t->t send funded from
+                                 #   transparent UTXOs with kept-transparent change - see below)
 orchard_action_limit = 50        # cap on Orchard actions per send (0 disables); like Zallet's
                                  #   builder.limits.orchard_actions - too many recipients -> -8
 cache_proving_key = true         # build the Orchard proving key once (PCZT path) vs. per send
@@ -441,9 +444,9 @@ same key (ZIP-316 + ZIP-32 diversification).
 
 ### Configurable shielded pools
 
-zecd is shielded-only. Each wallet declares which shielded pools it uses and which receivers its
-Unified Addresses include, via the `[pools]` config section (global default) and/or a per-wallet
-`[wallets.<name>]` override:
+zecd is shielded-first (transparent receiving/spending is opt-in - see the next section). Each
+wallet declares which shielded pools it uses and which receivers its Unified Addresses include, via
+the `[pools]` config section (global default) and/or a per-wallet `[wallets.<name>]` override:
 
 ```toml
 [pools]
@@ -467,13 +470,33 @@ getnewaddress "" "sapling,orchard"  # a UA with both shielded receivers
 getnewaddress "" "transparent"      # a bare t-address (only if [pools] transparent = true)
 ```
 
-### Transparent (t-address) receiving
+### Transparent (t-address) support
 
-Transparent receiving is **off by default** - zecd stays shielded-only. Set `[pools] transparent =
-true` (globally or per wallet) to let a wallet hand out **bare transparent addresses** (`t1...` /
-`tm...`) via `getnewaddress "" "transparent"`; `transparent_default = true` additionally makes a
-t-address the no-argument `getnewaddress` default. A transparent address carries a single receiver
-type - it is never mixed into a Unified Address.
+Transparent support is **off by default** - a wallet is shielded-only until you enable it. It is an
+**additive capability that coexists with the shielded pools**, not a mode switch: `enabled`/`default_receivers`
+remain shielded-only (`sapling`/`orchard`), and `transparent = true` is a *separate* flag that
+*adds* the ability to also hand out - and, opt-in, spend from - bare transparent addresses. So a
+wallet can be Orchard-only **plus** transparent, Sapling+Orchard **plus** transparent, etc. Enable it
+globally or per wallet:
+
+```toml
+[pools]
+enabled = ["orchard"]          # shielded pools (unchanged; transparent is NOT listed here)
+default_receivers = ["orchard"]
+transparent = true             # additionally allow bare t-addresses (receive; opt-in spend)
+transparent_default = false    # if true, no-arg getnewaddress returns a t-address instead of a UA
+# transparent_gap_limit = 20         # restore-recovery window (see the caveat below)
+# transparent_initial_scan = 0       # pre-expose external indices 0..N (see below)
+```
+
+With `transparent = true`, `getnewaddress "" "transparent"` returns a **bare transparent address**
+(`t1...` mainnet / `tm...` test/regtest); the shielded `getnewaddress` forms above
+(`""`/`"unified"`/`"sapling"`/`"orchard"`/`"sapling,orchard"`) keep working unchanged. Each call
+yields **one** address kind: a bare t-address **or** a shielded UA - a transparent receiver is never
+mixed into a Unified Address (ZIP-316 forbids a transparent-only UA, so zecd derives a compliant UA
+and bare-encodes just the transparent receiver). `transparent_default = true` makes a t-address the
+no-argument `getnewaddress` default (the shielded forms remain available by passing `address_type`).
+Requesting `"transparent"` on a wallet without the flag is rejected `-8`.
 
 Funds received at a t-address are discovered through the node's transparent UTXO index (zebra
 `getaddressutxos`), since compact blocks omit transparent data and librustzcash's shielded scan
@@ -481,13 +504,22 @@ can't see them. A transparent receive therefore becomes visible once it is **min
 0-conf - the mempool path is shielded-only). Received transparent funds are reported across
 `getbalance`/`listunspent`/`getaddressinfo`/`getreceivedbyaddress`.
 
-> **Spending received transparent funds is not yet implemented.** librustzcash's transfer builder
-> funds payments from shielded notes only and does not select transparent UTXOs as inputs, so
-> spending them first requires *shielding* them into the Orchard pool. zecd does not yet auto-shield
-> received transparent funds, so a transparent-only wallet cannot `sendtoaddress`/`sendmany` yet
-> (it returns `-6` "insufficient funds"). Treat transparent receivers as a **receive-only on-ramp**
-> for now; auto-shielding into Orchard is planned. (Sending *to* a transparent recipient from
-> shielded funds works, and is rejected under `[spend] privacy_policy = "FullPrivacy"`.)
+> **Spending received transparent funds - fully-transparent only, opt-in.** A transparent UTXO can
+> be spent to a transparent recipient with the change kept transparent (a normal bitcoin-style t→t
+> send that never touches a shielded pool), but **only** under `[spend] privacy_policy =
+> "AllowFullyTransparent"` (or a `z_sendmany` `privacyPolicy` of
+> `AllowFullyTransparent`/`NoPrivacy`) - the most revealing send, so it is strictly opt-in.
+> librustzcash's transfer builder funds payments from shielded notes only and won't select
+> transparent UTXOs as inputs, *and* its change accounting has no transparent-change form, so zecd
+> builds the transaction itself (greedy ZIP-317 coin selection over the wallet's transparent UTXOs,
+> transparent recipient + change outputs). Change is routed to the wallet's **internal change
+> chain**, so it is recovered on a from-seed restore (via the internal gap) and is hidden from
+> transaction history as change - distinct from a deliberate self-send to your own receive address,
+> which stays visible. Under the **default** `AllowRevealedRecipients`, a transparent-only wallet's
+> `sendtoaddress`/`sendmany` still returns `-6` "insufficient funds" - there is no auto-shielding of
+> received transparent funds into Orchard (planned), and transparent + shielded inputs cannot be
+> mixed in one send. Sending *to* a transparent recipient from shielded funds works under the
+> default policy and is rejected under `FullPrivacy`.
 
 **Statelessness caveat - the gap limit.** Shielded funds are *unconditionally* recoverable on a
 from-seed restore (note trial-decryption needs no scan range). Transparent funds are not: a
@@ -514,6 +546,62 @@ Balances, `listtransactions`, `listunspent`, `getreceivedbyaddress`, and friends
 transparent UTXOs across **all** enabled pools. `validateaddress`/`getaddressinfo` report each address's receivers
 via the `isvalid_orchard` boolean and the `receiver_types` array
 (`transparent`/`sapling`/`orchard`).
+
+#### What librustzcash provides vs. what zecd implements
+
+zecd is built entirely on librustzcash and reuses every transparent primitive it offers; the
+wallet-level *policy* and the pieces librustzcash deliberately omits are zecd's own. librustzcash's
+high-level wallet API is shielded-first by design: it "does not provide any functionality that
+allows users to directly spend transparent funds except by sending them to a shielded internal
+address" - so transparent **receive discovery** and the **fully-transparent spend** are
+zecd-implemented, on top of librustzcash's lower-level building blocks.
+
+| Concern | librustzcash provides | zecd implements (on top) |
+| --- | --- | --- |
+| Transparent key derivation (BIP-44 external/internal, secp256k1) | ✓ `AccountPrivKey`/`AccountPubKey`, `derive_secret_key`, ZIP-32 scopes | uses it for signing + change-address derivation |
+| Transparent UTXO storage & spendability query | ✓ `transparent_received_outputs` table, `put_received_transparent_utxo`, `get_spendable_transparent_outputs` (coinbase-maturity + confirmations + dust) | uses it; no extra UTXO store |
+| Per-scope gap chains + restore recovery | ✓ external **and** internal gap chains seeded at account creation, `with_gap_limits` | sets `transparent_gap_limit`; adds the `transparent_initial_scan` pre-exposure |
+| Transparent **receive** discovery | ✗ - the shielded scan never sees transparent I/O; `transaction_data_requests` only finds *spends* of held UTXOs | zecd owns it: `getaddressutxos` scan over exposed receivers (`actor::scan_transparent_receives`) |
+| Transparent input signing | ✓ `TransparentSigningSet`, PCZT `sign_transparent` | uses it via the `zcash_primitives` `Builder` |
+| Spend transparent UTXOs to an arbitrary recipient | ✗ - `propose_transfer` funds from shielded notes only (transparent handling is ZIP-320 ephemeral *outputs*) | zecd builds the tx itself: greedy ZIP-317 coin selection + exact fee + `Builder` |
+| **Persistent transparent change** (kept-transparent) | ✗ - `ChangeValue` has only shielded + ephemeral-transparent variants | zecd sizes change and routes it to the **internal** change chain |
+| Change recognized as change in history | partial - `recipient_key_scope` is recorded, but `is_change` is hard-coded `0` for *all* transparent outputs | `read::is_internal_change` keys on the **scope** (internal ⇒ change), so change is hidden while an external self-send stays visible |
+| Recording a wallet-built tx (lock inputs, rebroadcast) | ✓ `store_transactions_to_be_sent` (`SentTransaction` + `utxos_spent`); auto-records a wallet-owned transparent output | uses it; rides the existing rebroadcast loop |
+| 0-conf transparent receives | ✗ (`getaddressutxos` is a chain index) | not implemented - confirmed-only (planned follow-up) |
+| Auto-shielding transparent → Orchard | `propose_shielding` exists | not wired (planned) - transparent is spend-transparently-or-leave |
+
+#### Caching and statelessness
+
+**The invariant:** zecd persists **no off-chain data that a from-seed restore + full chain sync
+couldn't rebuild.** Everything on disk is either recoverable from the seed and the chain, or it is a
+**cache** of such data - never authoritative state. The one kind of state with no on-chain source
+*and* that is persistent by nature - **address labels** - zecd keeps **none of** (the label RPCs are
+removed; see *Stateless by design* above). This holds for the transparent feature too.
+
+What is on disk is the librustzcash wallet DB (`data.sqlite`), which is a **cache**:
+
+- **Balances, notes, and transparent UTXOs** - rebuilt by re-scanning the chain (note
+  trial-decryption for shielded; the `getaddressutxos` receive scan for transparent).
+- **Addresses** (shielded diversifiers and transparent external/internal gap addresses) - re-derived
+  from the seed. The shielded diversifier cursor is *clock-derived* and the transparent gap chain is
+  *sequential*; both are caches of on-chain-recoverable data. An unused handed-out address that was
+  never funded is simply forgotten on restore - harmless, **except** for transparent, where recovery
+  is bounded by the **gap limit** (see the caveat above): a transparent address only recovers if it
+  is funded within `transparent_gap_limit` of the last funded index, or pre-exposed by
+  `transparent_initial_scan`. Transparent **change** lands on the internal gap chain and is governed
+  by the same limit.
+
+Caches that are **in-memory only** (never written to disk, rebuilt on restart): unmined-tx
+**first-seen times** and the **async-operation registry** (`z_sendmany` `opid`s) - both detailed in
+*Stateless by design* above - plus the **Orchard proving key** (`ProvingKeyCache`), built once at
+startup and shared across wallets (a performance cache, not state). None of these are
+transparent-specific, and none survive a restart.
+
+So a transparent-enabled wallet is as stateless as a shielded-only one in the persistence sense - 
+the only *practical* difference is recovery breadth: shielded funds are **unconditionally**
+recoverable from the seed (trial-decryption needs no scan range), while transparent funds are
+recoverable only within the configured gap window. Size `transparent_gap_limit` /
+`transparent_initial_scan` to your issuance + outstanding-change high-water mark.
 
 ### Outgoing addresses in history are the receiver actually paid
 
@@ -590,10 +678,12 @@ Bitcoin-Core RPC (request an address with `getnewaddress`, poll
 Out of scope by design:
 
 - BTCPayServer via NBXplorer. NBXplorer indexes the chain over Bitcoin P2P / full blocks and
-  tracks xpub derivation schemes over transparent UTXOs. The zebra/zecd stack
-  exposes no P2P surface and the wallet is shielded-only.
+  tracks arbitrary xpub derivation schemes over transparent UTXOs. The zebra/zecd stack exposes no
+  P2P surface, and zecd is a single-seed, single-account wallet - not an xpub-tracking indexer - 
+  so it is not a drop-in for that integration (its own transparent support is opt-in and
+  single-account).
 
-Edges to be aware of (consequences of being a shielded light wallet):
+Edges to be aware of (consequences of being a shielded-first light wallet):
 
 - Spending needs confirmations: an incoming mempool payment is visible immediately
   (`getunconfirmedbalance` / `listtransactions` at 0 conf, via zebra's `getrawmempool`

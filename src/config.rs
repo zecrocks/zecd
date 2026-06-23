@@ -390,8 +390,16 @@ pub enum SendPrivacy {
     AllowRevealedAmounts,
     /// Permits transparent recipients and cross-pool sends (which reveal the transferred amount,
     /// and the recipient if transparent). This is the default: the Bitcoin-RPC dialect promises
-    /// "send to any valid address".
+    /// "send to any valid address". A transparent recipient is paid from shielded notes, so the
+    /// *sender* side stays shielded; the wallet's leftover change also stays shielded.
     AllowRevealedRecipients,
+    /// Additionally permits a **fully transparent** spend: funding a send directly from the
+    /// wallet's received transparent (t-address) UTXOs, with the change kept transparent - the
+    /// most revealing send possible (amount, sender UTXOs, recipient, and change are all public,
+    /// and never touch a shielded pool). Strictly opt-in; this is the only policy under which zecd
+    /// spends transparent inputs without first shielding them. Mirrors zcashd/Zallet
+    /// `AllowFullyTransparent`/`NoPrivacy`.
+    AllowFullyTransparent,
 }
 
 impl SendPrivacy {
@@ -400,9 +408,10 @@ impl SendPrivacy {
             "FullPrivacy" => Ok(Self::FullPrivacy),
             "AllowRevealedAmounts" => Ok(Self::AllowRevealedAmounts),
             "AllowRevealedRecipients" => Ok(Self::AllowRevealedRecipients),
+            "AllowFullyTransparent" => Ok(Self::AllowFullyTransparent),
             other => anyhow::bail!(
-                "[spend] privacy_policy must be \"FullPrivacy\", \"AllowRevealedAmounts\", or \
-                 \"AllowRevealedRecipients\" (got \"{other}\")"
+                "[spend] privacy_policy must be \"FullPrivacy\", \"AllowRevealedAmounts\", \
+                 \"AllowRevealedRecipients\", or \"AllowFullyTransparent\" (got \"{other}\")"
             ),
         }
     }
@@ -412,7 +421,10 @@ impl SendPrivacy {
     /// zcashd policies that map onto it) do; `FullPrivacy` and `AllowRevealedAmounts` reject a
     /// transparent recipient (the latter opts into revealed *amounts* only).
     pub fn allows_transparent_recipient(self) -> bool {
-        matches!(self, Self::AllowRevealedRecipients)
+        matches!(
+            self,
+            Self::AllowRevealedRecipients | Self::AllowFullyTransparent
+        )
     }
 
     /// The zcashd `privacyPolicy` name for this policy, used in the self-diagnosing send errors.
@@ -421,6 +433,7 @@ impl SendPrivacy {
             Self::FullPrivacy => "FullPrivacy",
             Self::AllowRevealedAmounts => "AllowRevealedAmounts",
             Self::AllowRevealedRecipients => "AllowRevealedRecipients",
+            Self::AllowFullyTransparent => "AllowFullyTransparent",
         }
     }
 }
@@ -1427,8 +1440,13 @@ mod tests {
             SendPrivacy::parse("AllowRevealedRecipients").unwrap(),
             SendPrivacy::AllowRevealedRecipients
         );
-        // Unknown values (including the stricter-sender zcashd policies that don't apply to an
-        // Orchard-only wallet) are a startup error, never a silent default.
+        assert_eq!(
+            SendPrivacy::parse("AllowFullyTransparent").unwrap(),
+            SendPrivacy::AllowFullyTransparent
+        );
+        // Unknown values, and the `z_sendmany`-only `NoPrivacy` alias (which maps to
+        // AllowFullyTransparent at the RPC layer but is not a canonical config token), are a
+        // startup error, never a silent default.
         assert!(SendPrivacy::parse("NoPrivacy").is_err());
         assert!(SendPrivacy::parse("AllowRevealedSenders").is_err());
         assert!(SendPrivacy::parse("fullprivacy").is_err());
