@@ -117,11 +117,31 @@ pub struct PoolsConfig {
     /// means no pre-exposure - discovery is bounded by `gap_limit` alone. Only meaningful when
     /// `transparent_enabled`.
     pub transparent_initial_scan: u32,
+    /// Whether `getnewaddress "" "transparent"` may keep issuing receiving addresses **past** the
+    /// recovery window (`transparent_gap_limit` consecutive unfunded addresses, plus the
+    /// `transparent_initial_scan` floor). librustzcash fails closed at the gap limit; with this set
+    /// (the default) zecd issues beyond it anyway, logging a loud warning that funds received at
+    /// such an address may be unrecoverable from seed. Set `false` to instead fail the call with an
+    /// actionable error. Only meaningful when `transparent_enabled`.
+    pub transparent_allow_beyond_recovery_window: bool,
+    /// Warn (once per `getnewaddress`) when fewer than this many transparent address slots remain
+    /// inside the recovery window before generation would hit the gap limit. Lets an operator widen
+    /// `transparent_gap_limit`/`transparent_initial_scan` (or fund a lower index) before addresses
+    /// start landing outside the window. `0` warns only on actual exhaustion. Only meaningful when
+    /// `transparent_enabled`.
+    pub transparent_gap_warn_threshold: u32,
 }
 
 /// Default external transparent gap limit. Above librustzcash's built-in 10 to give a safer margin
 /// for typical sparse issuance, while keeping restore scans cheap.
 pub const DEFAULT_TRANSPARENT_GAP_LIMIT: u32 = 20;
+
+/// Default for `transparent_allow_beyond_recovery_window`: permissive (warn, don't block), matching
+/// the Bitcoin-RPC promise that `getnewaddress` keeps handing out addresses.
+pub const DEFAULT_TRANSPARENT_ALLOW_BEYOND: bool = true;
+
+/// Default for `transparent_gap_warn_threshold`: warn once the last few in-window slots remain.
+pub const DEFAULT_TRANSPARENT_GAP_WARN_THRESHOLD: u32 = 5;
 
 impl Default for PoolsConfig {
     fn default() -> Self {
@@ -133,6 +153,8 @@ impl Default for PoolsConfig {
             transparent_default: false,
             transparent_gap_limit: DEFAULT_TRANSPARENT_GAP_LIMIT,
             transparent_initial_scan: 0,
+            transparent_allow_beyond_recovery_window: DEFAULT_TRANSPARENT_ALLOW_BEYOND,
+            transparent_gap_warn_threshold: DEFAULT_TRANSPARENT_GAP_WARN_THRESHOLD,
         }
     }
 }
@@ -216,6 +238,12 @@ pub struct WalletEntry {
     pub transparent_gap_limit: u32,
     /// This wallet's initial transparent scan depth (see [`PoolsConfig::transparent_initial_scan`]).
     pub transparent_initial_scan: u32,
+    /// Whether this wallet may issue transparent addresses past the recovery window
+    /// (see [`PoolsConfig::transparent_allow_beyond_recovery_window`]).
+    pub transparent_allow_beyond_recovery_window: bool,
+    /// This wallet's remaining-slot warning threshold
+    /// (see [`PoolsConfig::transparent_gap_warn_threshold`]).
+    pub transparent_gap_warn_threshold: u32,
 }
 
 impl WalletEntry {
@@ -517,6 +545,10 @@ struct WalletFile {
     transparent_gap_limit: Option<u32>,
     /// Override the global `[pools] transparent_initial_scan` for this wallet.
     transparent_initial_scan: Option<u32>,
+    /// Override the global `[pools] transparent_allow_beyond_recovery_window` for this wallet.
+    transparent_allow_beyond_recovery_window: Option<bool>,
+    /// Override the global `[pools] transparent_gap_warn_threshold` for this wallet.
+    transparent_gap_warn_threshold: Option<u32>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -601,6 +633,10 @@ struct PoolsFile {
     transparent_gap_limit: Option<u32>,
     /// Initial transparent scan depth (pre-expose + scan indices `0..N` on startup/restore).
     transparent_initial_scan: Option<u32>,
+    /// Allow `getnewaddress` to issue transparent addresses beyond the recovery window (warn-only).
+    transparent_allow_beyond_recovery_window: Option<bool>,
+    /// Warn when fewer than this many in-window transparent address slots remain.
+    transparent_gap_warn_threshold: Option<u32>,
 }
 
 // ---------------------------------------------------------------------------
@@ -822,6 +858,8 @@ impl AppConfig {
                 transparent_default,
                 transparent_gap_limit,
                 transparent_initial_scan,
+                transparent_allow_beyond_recovery_window,
+                transparent_gap_warn_threshold,
             ) = resolve_wallet_pools(
                 name,
                 w.pools.as_deref(),
@@ -830,6 +868,8 @@ impl AppConfig {
                 w.transparent_default,
                 w.transparent_gap_limit,
                 w.transparent_initial_scan,
+                w.transparent_allow_beyond_recovery_window,
+                w.transparent_gap_warn_threshold,
                 &pools,
             )?;
             wallets.insert(
@@ -843,6 +883,8 @@ impl AppConfig {
                     transparent_default,
                     transparent_gap_limit,
                     transparent_initial_scan,
+                    transparent_allow_beyond_recovery_window,
+                    transparent_gap_warn_threshold,
                 },
             );
         }
@@ -857,6 +899,9 @@ impl AppConfig {
                 transparent_default: pools.transparent_default,
                 transparent_gap_limit: pools.transparent_gap_limit,
                 transparent_initial_scan: pools.transparent_initial_scan,
+                transparent_allow_beyond_recovery_window: pools
+                    .transparent_allow_beyond_recovery_window,
+                transparent_gap_warn_threshold: pools.transparent_gap_warn_threshold,
             });
 
         let backend_file = file.backend.unwrap_or(BackendFile {
@@ -1081,6 +1126,12 @@ fn resolve_global_pools(file: Option<&PoolsFile>) -> anyhow::Result<PoolsConfig>
         .and_then(|f| f.transparent_gap_limit)
         .unwrap_or(DEFAULT_TRANSPARENT_GAP_LIMIT);
     let transparent_initial_scan = file.and_then(|f| f.transparent_initial_scan).unwrap_or(0);
+    let transparent_allow_beyond_recovery_window = file
+        .and_then(|f| f.transparent_allow_beyond_recovery_window)
+        .unwrap_or(DEFAULT_TRANSPARENT_ALLOW_BEYOND);
+    let transparent_gap_warn_threshold = file
+        .and_then(|f| f.transparent_gap_warn_threshold)
+        .unwrap_or(DEFAULT_TRANSPARENT_GAP_WARN_THRESHOLD);
     validate_transparent_flags(
         "[pools]",
         transparent_enabled,
@@ -1094,6 +1145,8 @@ fn resolve_global_pools(file: Option<&PoolsFile>) -> anyhow::Result<PoolsConfig>
         transparent_default,
         transparent_gap_limit,
         transparent_initial_scan,
+        transparent_allow_beyond_recovery_window,
+        transparent_gap_warn_threshold,
     })
 }
 
@@ -1121,7 +1174,7 @@ fn validate_transparent_flags(
 /// Resolve and validate one wallet's pools/receivers against the global defaults. A wallet that
 /// overrides `pools` but not `default_receivers` receives into all of its enabled pools by
 /// default; a wallet that overrides neither inherits the global defaults.
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, clippy::type_complexity)]
 fn resolve_wallet_pools(
     name: &str,
     pools: Option<&[String]>,
@@ -1130,8 +1183,10 @@ fn resolve_wallet_pools(
     transparent_default: Option<bool>,
     transparent_gap_limit: Option<u32>,
     transparent_initial_scan: Option<u32>,
+    transparent_allow_beyond_recovery_window: Option<bool>,
+    transparent_gap_warn_threshold: Option<u32>,
     global: &PoolsConfig,
-) -> anyhow::Result<(PoolSet, PoolSet, bool, bool, u32, u32)> {
+) -> anyhow::Result<(PoolSet, PoolSet, bool, bool, u32, u32, bool, u32)> {
     let enabled = match pools {
         Some(tokens) => {
             PoolSet::parse(tokens).with_context(|| format!("[wallets.{name}] pools"))?
@@ -1160,6 +1215,10 @@ fn resolve_wallet_pools(
     let transparent_gap_limit = transparent_gap_limit.unwrap_or(global.transparent_gap_limit);
     let transparent_initial_scan =
         transparent_initial_scan.unwrap_or(global.transparent_initial_scan);
+    let transparent_allow_beyond_recovery_window = transparent_allow_beyond_recovery_window
+        .unwrap_or(global.transparent_allow_beyond_recovery_window);
+    let transparent_gap_warn_threshold =
+        transparent_gap_warn_threshold.unwrap_or(global.transparent_gap_warn_threshold);
     validate_transparent_flags(
         &format!("[wallets.{name}]"),
         transparent_enabled,
@@ -1173,6 +1232,8 @@ fn resolve_wallet_pools(
         transparent_default,
         transparent_gap_limit,
         transparent_initial_scan,
+        transparent_allow_beyond_recovery_window,
+        transparent_gap_warn_threshold,
     ))
 }
 
@@ -1251,9 +1312,12 @@ mod tests {
             transparent_default: false,
             transparent_gap_limit: DEFAULT_TRANSPARENT_GAP_LIMIT,
             transparent_initial_scan: 0,
+            transparent_allow_beyond_recovery_window: DEFAULT_TRANSPARENT_ALLOW_BEYOND,
+            transparent_gap_warn_threshold: DEFAULT_TRANSPARENT_GAP_WARN_THRESHOLD,
         };
-        let (enabled, receivers, _, _, _, _) =
-            resolve_wallet_pools("w", None, None, None, None, None, None, &global).unwrap();
+        let (enabled, receivers, _, _, _, _, _, _) =
+            resolve_wallet_pools("w", None, None, None, None, None, None, None, None, &global)
+                .unwrap();
         assert_eq!(enabled, global.enabled);
         assert_eq!(receivers, global.default_receivers);
     }
@@ -1263,9 +1327,11 @@ mod tests {
         // A wallet that narrows its pools but doesn't set receivers must not inherit the global
         // receivers (which could name a now-disabled pool) - it receives into all it enabled.
         let global = PoolsConfig::default(); // orchard-only
-        let (enabled, receivers, _, _, _, _) = resolve_wallet_pools(
+        let (enabled, receivers, _, _, _, _, _, _) = resolve_wallet_pools(
             "w",
             Some(&s(&["sapling"])),
+            None,
+            None,
             None,
             None,
             None,
@@ -1285,6 +1351,8 @@ mod tests {
             "hot",
             Some(&s(&["orchard"])),
             Some(&s(&["sapling"])),
+            None,
+            None,
             None,
             None,
             None,
@@ -1343,9 +1411,27 @@ mod tests {
         let err = resolve_global_pools(Some(&f)).unwrap_err().to_string();
         assert!(err.contains("transparent"), "{err}");
 
-        // Per-wallet override of the flags + gap limit + initial scan depth.
+        // Recovery-window knobs default to permissive + the standard warn threshold.
+        let p = resolve_global_pools(None).unwrap();
+        assert!(p.transparent_allow_beyond_recovery_window);
+        assert_eq!(
+            p.transparent_gap_warn_threshold,
+            DEFAULT_TRANSPARENT_GAP_WARN_THRESHOLD
+        );
+        // ...and parse from `[pools]`.
+        let f = PoolsFile {
+            transparent: Some(true),
+            transparent_allow_beyond_recovery_window: Some(false),
+            transparent_gap_warn_threshold: Some(3),
+            ..Default::default()
+        };
+        let p = resolve_global_pools(Some(&f)).unwrap();
+        assert!(!p.transparent_allow_beyond_recovery_window);
+        assert_eq!(p.transparent_gap_warn_threshold, 3);
+
+        // Per-wallet override of the flags + gap limit + initial scan depth + recovery-window knobs.
         let global = PoolsConfig::default();
-        let (_, _, te, td, gap, init) = resolve_wallet_pools(
+        let (_, _, te, td, gap, init, allow_beyond, warn_thresh) = resolve_wallet_pools(
             "w",
             None,
             None,
@@ -1353,12 +1439,34 @@ mod tests {
             None,
             Some(7),
             Some(500),
+            Some(false),
+            Some(2),
             &global,
         )
         .unwrap();
         assert!(te && !td);
         assert_eq!(gap, 7);
         assert_eq!(init, 500, "per-wallet transparent_initial_scan override");
+        assert!(
+            !allow_beyond,
+            "per-wallet transparent_allow_beyond_recovery_window override"
+        );
+        assert_eq!(
+            warn_thresh, 2,
+            "per-wallet transparent_gap_warn_threshold override"
+        );
+
+        // Per-wallet knobs inherit the global values when unset.
+        let global = PoolsConfig {
+            transparent_allow_beyond_recovery_window: false,
+            transparent_gap_warn_threshold: 9,
+            ..PoolsConfig::default()
+        };
+        let (_, _, _, _, _, _, allow_beyond, warn_thresh) =
+            resolve_wallet_pools("w", None, None, None, None, None, None, None, None, &global)
+                .unwrap();
+        assert!(!allow_beyond, "inherits global allow_beyond");
+        assert_eq!(warn_thresh, 9, "inherits global warn threshold");
     }
 
     #[test]

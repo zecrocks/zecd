@@ -122,6 +122,10 @@ pub async fn run(config: &AppConfig, args: &InitArgs) -> anyhow::Result<()> {
             transparent_default: config.pools.transparent_default,
             transparent_gap_limit: config.pools.transparent_gap_limit,
             transparent_initial_scan: config.pools.transparent_initial_scan,
+            transparent_allow_beyond_recovery_window: config
+                .pools
+                .transparent_allow_beyond_recovery_window,
+            transparent_gap_warn_threshold: config.pools.transparent_gap_warn_threshold,
         });
     let keys_path = entry.keys_path();
     let enabled_pools = entry.pools.clone();
@@ -402,6 +406,10 @@ pub fn export_ufvk(config: &AppConfig, args: &ExportUfvkArgs) -> anyhow::Result<
             transparent_default: config.pools.transparent_default,
             transparent_gap_limit: config.pools.transparent_gap_limit,
             transparent_initial_scan: config.pools.transparent_initial_scan,
+            transparent_allow_beyond_recovery_window: config
+                .pools
+                .transparent_allow_beyond_recovery_window,
+            transparent_gap_warn_threshold: config.pools.transparent_gap_warn_threshold,
         });
     let keys_path = entry.keys_path();
     let wallet_dir = entry.dir;
@@ -772,6 +780,8 @@ mod tests {
                 transparent_default: false,
                 transparent_gap_limit: 20,
                 transparent_initial_scan: 0,
+                transparent_allow_beyond_recovery_window: true,
+                transparent_gap_warn_threshold: 5,
             },
         );
         wallets.insert(
@@ -785,6 +795,8 @@ mod tests {
                 transparent_default: false,
                 transparent_gap_limit: 20,
                 transparent_initial_scan: 0,
+                transparent_allow_beyond_recovery_window: true,
+                transparent_gap_warn_threshold: 5,
             },
         );
 
@@ -828,6 +840,8 @@ mod tests {
                     transparent_default: false,
                     transparent_gap_limit: 20,
                     transparent_initial_scan: 0,
+                    transparent_allow_beyond_recovery_window: true,
+                    transparent_gap_warn_threshold: 5,
                 },
             );
         }
