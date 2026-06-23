@@ -500,11 +500,15 @@ and bare-encodes just the transparent receiver). `transparent_default = true` ma
 no-argument `getnewaddress` default (the shielded forms remain available by passing `address_type`).
 Requesting `"transparent"` on a wallet without the flag is rejected `-8`.
 
-Funds received at a t-address are discovered through the node's transparent UTXO index (zebra
-`getaddressutxos`), since compact blocks omit transparent data and librustzcash's shielded scan
-can't see them. A transparent receive therefore becomes visible once it is **mined** (not at
-0-conf - the mempool path is shielded-only). Received transparent funds are reported across
-`getbalance`/`listunspent`/`getaddressinfo`/`getreceivedbyaddress`.
+Funds received at a t-address are discovered by **scanning blocks** (the way zcashd and zallet do
+it), since compact blocks omit transparent data and librustzcash's shielded scan can't see them:
+zecd already fetches and parses each full block for the shielded compact-block conversion, so it
+matches that block's transparent outputs against the wallet's own addresses at no extra request - 
+O(outputs-per-block) with a constant-time set lookup, independent of how many addresses the wallet
+holds (so an exchange tracking ~100k addresses pays no per-address cost). An incoming transparent
+payment shows at **0-conf** the moment it hits the mempool (the mempool poller matches transparent
+outputs too) and is confirmed by the block scan once mined. Received transparent funds are reported
+across `getbalance`/`listunspent`/`getaddressinfo`/`getreceivedbyaddress`.
 
 > **Spending received transparent funds - fully-transparent only, opt-in.** A transparent UTXO can
 > be spent to a transparent recipient with the change kept transparent (a normal bitcoin-style t→t
@@ -526,7 +530,8 @@ can't see them. A transparent receive therefore becomes visible once it is **min
 **Statelessness caveat - the gap limit.** Shielded funds are *unconditionally* recoverable on a
 from-seed restore (note trial-decryption needs no scan range). Transparent funds are not: a
 stateless rebuild rediscovers them only within the **external transparent gap limit** - how far
-past the last *funded* receiving address librustzcash keeps scanning the node's address index. zecd
+past the last *funded* receiving address the block scan keeps *exposing* (and therefore matching)
+receiving addresses. zecd
 exposes this as `[pools] transparent_gap_limit` (default **20**, above librustzcash's built-in 10).
 If you hand out addresses far ahead of funding (e.g. pre-generate one per invoice, most never
 paid), set it to at least your maximum number of outstanding-unfunded addresses - otherwise a
@@ -574,13 +579,13 @@ zecd-implemented, on top of librustzcash's lower-level building blocks.
 | Transparent key derivation (BIP-44 external/internal, secp256k1) | ✓ `AccountPrivKey`/`AccountPubKey`, `derive_secret_key`, ZIP-32 scopes | uses it for signing + change-address derivation |
 | Transparent UTXO storage & spendability query | ✓ `transparent_received_outputs` table, `put_received_transparent_utxo`, `get_spendable_transparent_outputs` (coinbase-maturity + confirmations + dust) | uses it; no extra UTXO store |
 | Per-scope gap chains + restore recovery | ✓ external **and** internal gap chains seeded at account creation, `with_gap_limits` | sets `transparent_gap_limit`; adds the `transparent_initial_scan` pre-exposure |
-| Transparent **receive** discovery | ✗ - the shielded scan never sees transparent I/O; `transaction_data_requests` only finds *spends* of held UTXOs | zecd owns it: `getaddressutxos` scan over exposed receivers (`actor::scan_transparent_receives`) |
+| Transparent **receive** discovery | ✗ - the shielded scan never sees transparent I/O; `transaction_data_requests` only finds *spends* of held UTXOs | zecd owns it: **block scan** matches each block's transparent outputs against the wallet's address set (`engine::owned_transparent_output`), at no extra fetch |
 | Transparent input signing | ✓ `TransparentSigningSet`, PCZT `sign_transparent` | uses it via the `zcash_primitives` `Builder` |
 | Spend transparent UTXOs to an arbitrary recipient | ✗ - `propose_transfer` funds from shielded notes only (transparent handling is ZIP-320 ephemeral *outputs*) | zecd builds the tx itself: greedy ZIP-317 coin selection + exact fee + `Builder` |
 | **Persistent transparent change** (kept-transparent) | ✗ - `ChangeValue` has only shielded + ephemeral-transparent variants | zecd sizes change and routes it to the **internal** change chain |
 | Change recognized as change in history | partial - `recipient_key_scope` is recorded, but `is_change` is hard-coded `0` for *all* transparent outputs | `read::is_internal_change` keys on the **scope** (internal ⇒ change), so change is hidden while an external self-send stays visible |
 | Recording a wallet-built tx (lock inputs, rebroadcast) | ✓ `store_transactions_to_be_sent` (`SentTransaction` + `utxos_spent`); auto-records a wallet-owned transparent output | uses it; rides the existing rebroadcast loop |
-| 0-conf transparent receives | ✗ (`getaddressutxos` is a chain index) | not implemented - confirmed-only (planned follow-up) |
+| 0-conf transparent receives | ✗ - the shielded mempool trial-decrypt never matches a transparent output | zecd matches mempool txs' transparent outputs against the address set (`actor::record_tx_transparent_receives`), recording them unmined |
 | Auto-shielding transparent → Orchard | `propose_shielding` exists | not wired (planned) - transparent is spend-transparently-or-leave |
 
 #### Caching and statelessness
@@ -594,7 +599,7 @@ removed; see *Stateless by design* above). This holds for the transparent featur
 What is on disk is the librustzcash wallet DB (`data.sqlite`), which is a **cache**:
 
 - **Balances, notes, and transparent UTXOs** - rebuilt by re-scanning the chain (note
-  trial-decryption for shielded; the `getaddressutxos` receive scan for transparent).
+  trial-decryption for shielded; the block-scan transparent-output matcher for transparent).
 - **Addresses** (shielded diversifiers and transparent external/internal gap addresses) - re-derived
   from the seed. The shielded diversifier cursor is *clock-derived* and the transparent gap chain is
   *sequential*; both are caches of on-chain-recoverable data. An unused handed-out address that was

@@ -23,6 +23,7 @@
 //! its docs. Do not "simplify" this module down to what `sync::run` does: that version
 //! wedges.
 
+use std::collections::HashSet;
 use std::path::Path;
 
 use anyhow::anyhow;
@@ -38,11 +39,14 @@ use zcash_client_backend::data_api::{
     scanning::{ScanPriority, ScanRange},
     WalletCommitmentTrees, WalletRead, WalletWrite,
 };
+use zcash_client_backend::wallet::WalletTransparentOutput;
 use zcash_client_sqlite::error::SqliteClientError;
 use zcash_client_sqlite::{chain::BlockMeta, FsBlockDb, FsBlockDbError};
 use zcash_primitives::merkle_tree::HashSer;
 use zcash_protocol::consensus::BlockHeight;
-use zcash_protocol::ShieldedProtocol;
+use zcash_protocol::value::Zatoshis;
+use zcash_protocol::{ShieldedProtocol, TxId};
+use zcash_transparent::address::TransparentAddress;
 
 use crate::chain::ChainSource;
 use crate::network::ZNetwork;
@@ -87,23 +91,53 @@ pub async fn update_subtree_roots<C: ChainSource>(
     Ok(())
 }
 
+/// Build a [`WalletTransparentOutput`] for `utxo` iff its recipient address is one of the
+/// wallet's exposed transparent addresses (`addresses`). Returns `None` for an output paying
+/// someone else, or one whose script isn't a recognized p2pkh/p2sh (librustzcash can't attribute
+/// those). The funding `height` may be `None` for a mempool (0-conf) output.
+///
+/// Shared by the block scan (this module) and the actor's mempool path so the two discovery
+/// sources stay byte-for-byte consistent.
+pub fn owned_transparent_output(
+    addresses: &HashSet<TransparentAddress>,
+    txid: TxId,
+    index: u32,
+    value_zat: u64,
+    script: Vec<u8>,
+    height: Option<u32>,
+) -> Option<WalletTransparentOutput> {
+    use zcash_transparent::address::Script;
+    use zcash_transparent::bundle::{OutPoint, TxOut};
+    let value = Zatoshis::from_u64(value_zat).ok()?;
+    let outpoint = OutPoint::new(*txid.as_ref(), index);
+    let txout = TxOut::new(value, Script(zcash_script::script::Code(script)));
+    let output =
+        WalletTransparentOutput::from_parts(outpoint, txout, height.map(BlockHeight::from_u32))?;
+    addresses
+        .contains(output.recipient_address())
+        .then_some(output)
+}
+
 async fn download_blocks<C: ChainSource>(
     name: &str,
     client: &mut C,
     wallet_dir: &Path,
     db_cache: &mut FsBlockDb,
     scan_range: &ScanRange,
-) -> anyhow::Result<Vec<BlockMeta>> {
+    transparent: Option<&HashSet<TransparentAddress>>,
+) -> anyhow::Result<(Vec<BlockMeta>, Vec<WalletTransparentOutput>)> {
     info!("[{name}] Fetching {scan_range}");
     let mut stream = client
         .compact_block_range(
             scan_range.block_range().start,
             scan_range.block_range().end - 1,
+            transparent.is_some(),
         )
         .await?;
 
     let mut block_meta = vec![];
-    while let Some(block) = stream.next().await? {
+    let mut received = vec![];
+    while let Some((block, t_outs)) = stream.next().await? {
         let (sapling_outputs_count, orchard_actions_count) = block
             .vtx
             .iter()
@@ -118,6 +152,26 @@ async fn download_blocks<C: ChainSource>(
             orchard_actions_count,
         };
 
+        // Match this block's transparent outputs against the wallet's exposed addresses. This is
+        // O(outputs-in-block) with a hash-set membership test per output, independent of how many
+        // addresses the wallet holds - the property that lets an exchange track ~100k addresses
+        // without per-address requests. The full block was already fetched for the shielded scan,
+        // so there is no extra round-trip.
+        if let Some(addresses) = transparent {
+            for u in t_outs {
+                if let Some(output) = owned_transparent_output(
+                    addresses,
+                    u.txid,
+                    u.index,
+                    u.value_zat,
+                    u.script,
+                    u.height,
+                ) {
+                    received.push(output);
+                }
+            }
+        }
+
         let encoded = block.encode_to_vec();
         let mut block_file = File::create(block_path(wallet_dir, &meta)).await?;
         block_file.write_all(&encoded).await?;
@@ -127,7 +181,7 @@ async fn download_blocks<C: ChainSource>(
     db_cache
         .write_block_metadata(&block_meta)
         .map_err(|e| anyhow!("{e:?}"))?;
-    Ok(block_meta)
+    Ok((block_meta, received))
 }
 
 async fn download_chain_state<C: ChainSource>(
@@ -231,8 +285,18 @@ fn perform_rewind(
     }
 }
 
-/// Scan a downloaded range; handle continuity (reorg) errors by rewinding. Returns whether
-/// the suggested scan ranges changed materially.
+/// The result of scanning one downloaded range.
+pub struct ScanOutcome {
+    /// Whether the highest-priority suggested scan range changed materially (caller may want to
+    /// re-evaluate what to scan next).
+    pub ranges_changed: bool,
+    /// Whether a continuity (reorg) error was caught and the wallet rewound *instead of* applying
+    /// the range. When set, the range's blocks were **not** scanned, so any transparent receives
+    /// harvested from them must be discarded (they belong to the abandoned fork).
+    pub reorged: bool,
+}
+
+/// Scan a downloaded range; handle continuity (reorg) errors by rewinding. See [`ScanOutcome`].
 fn scan_blocks(
     name: &str,
     params: &ZNetwork,
@@ -241,7 +305,7 @@ fn scan_blocks(
     db_data: &mut WriteDb,
     initial_chain_state: &ChainState,
     scan_range: &ScanRange,
-) -> anyhow::Result<bool> {
+) -> anyhow::Result<ScanOutcome> {
     info!("[{name}] Scanning {scan_range}");
     let scan_result = scan_cached_blocks(
         params,
@@ -313,21 +377,41 @@ fn scan_blocks(
             db_cache
                 .truncate_to_height(rewind_height)
                 .map_err(|e| anyhow!("{:?}", e))?;
-            Ok(true)
+            Ok(ScanOutcome {
+                ranges_changed: true,
+                reorged: true,
+            })
         }
         Ok(_) => {
             let latest_ranges = db_data.suggest_scan_ranges()?;
-            Ok(latest_ranges
+            let ranges_changed = latest_ranges
                 .first()
                 .map(|range| range.priority() > scan_range.priority())
-                .unwrap_or(false))
+                .unwrap_or(false);
+            Ok(ScanOutcome {
+                ranges_changed,
+                reorged: false,
+            })
         }
         Err(e) => Err(anyhow!("{:?}", e)),
     }
 }
 
-/// Process at most one batch of work. Returns `true` if a batch was scanned (caller should
+/// Outcome of one sync batch: whether a batch was scanned (so the caller should call again), and
+/// how many transparent receives were recorded from the block scan (so the actor can refresh its
+/// exposed-address set - a recorded receive may have extended the transparent gap).
+pub struct BatchOutcome {
+    pub worked: bool,
+    pub transparent_recorded: usize,
+}
+
+/// Process at most one batch of work. `worked` is `true` if a batch was scanned (caller should
 /// call again), `false` if there are no pending scan ranges (wallet is caught up).
+///
+/// `transparent` is the wallet's exposed transparent address set when transparent receiving is
+/// enabled (`None` for shielded-only wallets, which skips transparent extraction entirely). When
+/// present, each scanned block's transparent outputs are matched against it and recorded as
+/// receives via `put_received_transparent_utxo` after the shielded scan succeeds.
 pub async fn sync_one_batch<C: ChainSource>(
     name: &str,
     client: &mut C,
@@ -335,7 +419,8 @@ pub async fn sync_one_batch<C: ChainSource>(
     wallet_dir: &Path,
     db_cache: &mut FsBlockDb,
     db_data: &mut WriteDb,
-) -> anyhow::Result<bool> {
+    transparent: Option<&HashSet<TransparentAddress>>,
+) -> anyhow::Result<BatchOutcome> {
     let scan_ranges = db_data.suggest_scan_ranges()?;
     tracing::debug!(
         "[{name}] suggest_scan_ranges -> {} range(s): {:?}",
@@ -352,7 +437,10 @@ pub async fn sync_one_batch<C: ChainSource>(
             .collect::<Vec<_>>()
     );
     let Some(first) = scan_ranges.first() else {
-        return Ok(false);
+        return Ok(BatchOutcome {
+            worked: false,
+            transparent_recorded: 0,
+        });
     };
 
     // A `Verify` range is always returned first and is small; scan it whole. Otherwise scan
@@ -366,7 +454,8 @@ pub async fn sync_one_batch<C: ChainSource>(
         }
     };
 
-    let block_meta = download_blocks(name, client, wallet_dir, db_cache, &scan_range).await?;
+    let (block_meta, received) =
+        download_blocks(name, client, wallet_dir, db_cache, &scan_range, transparent).await?;
 
     // Fetch the prior block's chain state and scan. Anything that fails here must still clean up
     // the just-downloaded cache files, so the result is captured and the delete runs regardless.
@@ -379,7 +468,7 @@ pub async fn sync_one_batch<C: ChainSource>(
         let chain_state = download_chain_state(client, prior_height).await?;
 
         // `scan_cached_blocks` is CPU-bound; keep the async runtime healthy.
-        tokio::task::block_in_place(|| {
+        let outcome = tokio::task::block_in_place(|| {
             scan_blocks(
                 name,
                 params,
@@ -390,16 +479,44 @@ pub async fn sync_one_batch<C: ChainSource>(
                 &scan_range,
             )
         })?;
-        Ok::<(), anyhow::Error>(())
+        Ok::<ScanOutcome, anyhow::Error>(outcome)
     }
     .await;
 
     // Remove the downloaded compact blocks (files and their metadata rows) whether the scan
-    // succeeded or failed, so a transient error (or a reorg-shifted range) can't strand cache
+    // succeeded or failed, so a transient error (or a reorg-shifted range) cannot strand cache
     // files on disk or leave stale `compactblocks_meta` rows behind.
     delete_cached_blocks(name, wallet_dir, db_cache, block_meta);
-    result?;
-    Ok(true)
+    let outcome = result?;
+
+    // Record the transparent receives matched during download - but only when the range was
+    // actually applied. On a reorg the wallet rewound instead of scanning these blocks, so the
+    // outputs belong to the abandoned fork and must be dropped (the replacement chain's blocks
+    // re-surface the real receives on the next pass). `put_received_transparent_utxo` is
+    // idempotent, so re-recording across overlapping passes is harmless.
+    let mut transparent_recorded = 0;
+    if !outcome.reorged {
+        for output in &received {
+            match db_data.put_received_transparent_utxo(output) {
+                Ok(_) => transparent_recorded += 1,
+                Err(e) => warn!(
+                    "[{name}] recording transparent receive {}:{} failed: {e}",
+                    output.outpoint().txid(),
+                    output.outpoint().n(),
+                ),
+            }
+        }
+        if transparent_recorded > 0 {
+            info!(
+                "[{name}] recorded {transparent_recorded} transparent receive(s) from block scan"
+            );
+        }
+    }
+
+    Ok(BatchOutcome {
+        worked: true,
+        transparent_recorded,
+    })
 }
 
 #[cfg(test)]
@@ -414,6 +531,54 @@ mod tests {
 
     type OrchardFrontier =
         Frontier<MerkleHashOrchard, { orchard::NOTE_COMMITMENT_TREE_DEPTH as u8 }>;
+
+    /// The standard p2pkh `scriptPubKey` for a 20-byte key hash:
+    /// `OP_DUP OP_HASH160 <20> OP_EQUALVERIFY OP_CHECKSIG`.
+    fn p2pkh_script(hash: [u8; 20]) -> Vec<u8> {
+        let mut s = vec![0x76, 0xa9, 0x14];
+        s.extend_from_slice(&hash);
+        s.extend_from_slice(&[0x88, 0xac]);
+        s
+    }
+
+    /// The receive matcher attributes a transparent output to the wallet iff its recipient address
+    /// is in the exposed set, honors the (optional) mined height, and rejects unrecognized scripts -
+    /// the shared core of the block-scan and mempool discovery paths.
+    #[test]
+    fn owned_transparent_output_matches_only_the_wallets_addresses() {
+        let mine = [0x11u8; 20];
+        let theirs = [0x22u8; 20];
+        let txid = TxId::from_bytes([0xABu8; 32]);
+        let mut set = HashSet::new();
+        set.insert(TransparentAddress::PublicKeyHash(mine));
+
+        // An output paying our address, mined at height 100, is attributed with that height.
+        let got = owned_transparent_output(&set, txid, 0, 50_000, p2pkh_script(mine), Some(100))
+            .expect("output paying the wallet is recognized");
+        assert_eq!(
+            got.recipient_address(),
+            &TransparentAddress::PublicKeyHash(mine)
+        );
+        assert_eq!(got.mined_height(), Some(BlockHeight::from_u32(100)));
+
+        // The same output with no height is an unmined (0-conf / mempool) UTXO.
+        let unmined = owned_transparent_output(&set, txid, 0, 50_000, p2pkh_script(mine), None)
+            .expect("a 0-conf output is still recognized");
+        assert_eq!(unmined.mined_height(), None);
+
+        // An output paying someone else is not ours.
+        assert!(
+            owned_transparent_output(&set, txid, 1, 50_000, p2pkh_script(theirs), Some(100))
+                .is_none(),
+            "an output to a foreign address is not attributed"
+        );
+
+        // A non-standard script has no recipient address librustzcash can attribute.
+        assert!(
+            owned_transparent_output(&set, txid, 2, 50_000, vec![0x6a, 0x00], Some(100)).is_none(),
+            "a non-standard script is rejected"
+        );
+    }
 
     /// A deterministic fake block hash: `tag` distinguishes chains, `i` the height.
     fn fake_hash(tag: u8, i: u32) -> [u8; 32] {
@@ -579,7 +744,7 @@ mod tests {
             cmx_bytes(0x0B, 11),
             11,
         );
-        let worked = scan_blocks(
+        let outcome = scan_blocks(
             "test",
             &net,
             wd,
@@ -591,7 +756,10 @@ mod tests {
             &range(11, 12),
         )
         .expect("the continuity error is handled, not propagated");
-        assert!(worked, "a rewind reports that the scan ranges changed");
+        assert!(
+            outcome.reorged,
+            "a continuity break is reported as a reorg (rewound, range not applied)"
+        );
 
         // The rewind: continuity broke at 11, so the wallet rewound to 11 - 10 = 1...
         assert_eq!(
@@ -881,7 +1049,10 @@ mod tests {
             &range(11, 12),
         )
         .expect("reorg recovery must succeed even though prior batch files are gone");
-        assert!(worked, "a rewind reports that the scan ranges changed");
+        assert!(
+            worked.ranges_changed,
+            "a rewind reports that the scan ranges changed"
+        );
         delete_cached_blocks("test", wd, &mut db_cache, vec![meta_11]);
 
         // Rewound to 11 - 10 = 1, and the cache metadata was truncated to match (empty, since
