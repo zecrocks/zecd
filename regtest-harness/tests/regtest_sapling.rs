@@ -14,6 +14,13 @@
 //! call zecd uses when it sends Orchard→transparent in `regtest_funded`), so the value simply
 //! lands as a Sapling note.
 //!
+//! The final phase is the flagship **tri-pool mixed-recipient `sendmany`**: a single v5 transaction
+//! that carries a transparent output AND a Sapling output AND an Orchard output simultaneously,
+//! funded from the wallet's Orchard change - the exact path behind the PCZT prover proving Orchard
+//! spends plus a Sapling output in one shot. The two shielded legs are self-sends so each pool's
+//! receipt is verifiable via `getreceivedbyaddress` (zebra's verbose getrawtransaction doesn't
+//! decode shielded bundles into JSON, so this behavioral check stands in for a structural one).
+//!
 //! Skips cleanly unless `ZEBRAD_BIN`, `LIGHTWALLETD_BIN` and `DEVTOOL_BIN` are all set.
 
 use std::time::{Duration, Instant};
@@ -452,9 +459,153 @@ async fn regtest_sapling_and_orchard_balances() {
     zebrad.generate_blocks(3).await.expect("confirm the spend");
     wait_until_confirmed(&zecd, &txid).await;
 
+    // 9. TRI-POOL mixed-recipient sendmany - the flagship: a single v5 transaction that carries a
+    //    transparent output AND a Sapling output AND an Orchard output at once, funded from the
+    //    wallet's Orchard change. This is the exact protocol path behind "the PCZT prover proves
+    //    Orchard spends (+ Sapling outputs when a recipient is Sapling) in one shot", with change
+    //    routed back to Orchard. We pay three recipients in one `sendmany` under the default policy:
+    //      - the funder's bare t-address          -> forces a TRANSPARENT output
+    //      - zecd's own Sapling-only UA           -> forces a SAPLING output (self-receive)
+    //      - zecd's own Orchard-only UA           -> forces an ORCHARD output (self-receive)
+    //    The two shielded legs are self-sends so the harness can *verify each pool actually
+    //    received* via `getreceivedbyaddress` (the only verifiable shielded receivers in the harness
+    //    are zecd's own addresses; zebra's verbose getrawtransaction doesn't decode the shielded
+    //    bundles into JSON, so this behavioral check stands in for a structural one).
+    const TRI_AMOUNT: f64 = 0.05;
+    // Cumulative-received baselines for the two self-receivers (received totals never decrease on
+    // spend, so the earlier 1-ZEC fundings sit here); we assert each grows by exactly TRI_AMOUNT.
+    let sapling_before = received_by(&zecd, &sapling_ua).await;
+    let orchard_before = received_by(&zecd, &orchard_ua).await;
+
+    // The Orchard change must be scanned-to-tip and spendable; retry on -6 while aging it.
+    let tri_deadline = Instant::now() + FUND_TIMEOUT;
+    let tri_txid = loop {
+        let tip = zebrad
+            .rpc("getblockcount", json!([]))
+            .await
+            .expect("zebra getblockcount")
+            .as_u64()
+            .expect("tip height");
+        zecd.wait_until_synced(tip, Duration::from_secs(30))
+            .await
+            .expect("zecd scans to the tip before the tri-pool send");
+        let mut recipients = serde_json::Map::new();
+        recipients.insert(funder_taddr.clone(), json!(TRI_AMOUNT));
+        recipients.insert(sapling_ua.clone(), json!(TRI_AMOUNT));
+        recipients.insert(orchard_ua.clone(), json!(TRI_AMOUNT));
+        match zecd.call("sendmany", json!(["", recipients])).await {
+            Ok(v) => break v.as_str().expect("txid string").to_string(),
+            Err(e) if e.code() == Some(-6) => {
+                assert!(
+                    Instant::now() < tri_deadline,
+                    "the Orchard change never became spendable for the tri-pool send: {e}"
+                );
+                zebrad
+                    .generate_blocks(1)
+                    .await
+                    .expect("mine a block toward spendable depth");
+            }
+            Err(e) => panic!("unexpected tri-pool sendmany error: {e}"),
+        }
+    };
+    assert_eq!(
+        tri_txid.len(),
+        64,
+        "tri-pool sendmany returns a txid: {tri_txid}"
+    );
+    zebrad
+        .generate_blocks(3)
+        .await
+        .expect("confirm the tri-pool send");
+    wait_until_confirmed(&zecd, &tri_txid).await;
+
+    // 9a. gettransaction lists exactly three sends - one per recipient - each reduced to the single
+    //     receiver actually paid in its pool (display_address per-pool reduction). The transparent
+    //     leg stays a bare t-addr (reduces to itself); the Sapling leg reduces to a bare Sapling
+    //     receiver; the Orchard leg reduces to a single-receiver UA (Orchard has no bare encoding).
+    let tri = zecd
+        .call("gettransaction", json!([tri_txid]))
+        .await
+        .expect("gettransaction for the tri-pool send");
+    let tri_sends: Vec<_> = tri["details"]
+        .as_array()
+        .expect("details array")
+        .iter()
+        .filter(|d| d["category"] == json!("send"))
+        .collect();
+    assert_eq!(
+        tri_sends.len(),
+        3,
+        "one send detail per pool (transparent + Sapling + Orchard) in a single tx: {tri}"
+    );
+    // The transparent leg is exactly the funder's bare t-address.
+    assert!(
+        tri_sends
+            .iter()
+            .any(|d| d["address"].as_str() == Some(funder_taddr.as_str())
+                && d["amount"].as_f64() == Some(-TRI_AMOUNT)),
+        "the transparent leg pays the funder's bare t-address: {tri}"
+    );
+    // The other two legs are shielded; identify each by validating its reduced receiver's pool.
+    let mut saw_sapling_leg = false;
+    let mut saw_orchard_leg = false;
+    for d in &tri_sends {
+        let Some(addr) = d["address"].as_str() else {
+            continue;
+        };
+        if addr == funder_taddr {
+            continue;
+        }
+        let v = zecd
+            .call("validateaddress", json!([addr]))
+            .await
+            .expect("validateaddress on a reduced send receiver");
+        let has = |t: &str| {
+            v["receiver_types"]
+                .as_array()
+                .is_some_and(|a| a.iter().any(|x| x == t))
+        };
+        if has("sapling") && !has("orchard") {
+            saw_sapling_leg = true;
+        } else if has("orchard") && !has("sapling") {
+            saw_orchard_leg = true;
+        }
+    }
+    assert!(
+        saw_sapling_leg && saw_orchard_leg,
+        "the two shielded legs reduce to a Sapling-only and an Orchard-only receiver: {tri}"
+    );
+
+    // 9b. Each shielded pool ACTUALLY received its output: the self-receivers' cumulative received
+    //     totals each grew by exactly the paid amount. This is the behavioral proof that the single
+    //     transaction really carried a Sapling output and an Orchard output (not just a transparent
+    //     one with shielded change) - change lands as Orchard and is excluded from these per-address
+    //     totals.
+    let sapling_after = received_by(&zecd, &sapling_ua).await;
+    let orchard_after = received_by(&zecd, &orchard_ua).await;
+    assert!(
+        (sapling_after - sapling_before - TRI_AMOUNT).abs() < 1e-8,
+        "the Sapling-only receiver gained exactly {TRI_AMOUNT} (a Sapling output landed): \
+         {sapling_before} -> {sapling_after}"
+    );
+    assert!(
+        (orchard_after - orchard_before - TRI_AMOUNT).abs() < 1e-8,
+        "the Orchard-only receiver gained exactly {TRI_AMOUNT} (an Orchard output landed): \
+         {orchard_before} -> {orchard_after}"
+    );
+
     lwd.stop();
     drop(zecd);
     // `zebrad` and `funder` clean up on drop.
+}
+
+/// The cumulative ZEC `getreceivedbyaddress` reports for `addr`.
+async fn received_by(zecd: &Zecd, addr: &str) -> f64 {
+    zecd.call("getreceivedbyaddress", json!([addr]))
+        .await
+        .expect("getreceivedbyaddress")
+        .as_f64()
+        .expect("received number")
 }
 
 /// Wait until `gettransaction` reports the spend at >= 1 confirmation.
