@@ -5,6 +5,21 @@ All notable changes to zecd are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com), and this
 project adheres to [Semantic Versioning](https://semver.org).
 
+## [0.3.1] - 2026-06-23
+
+### Changed
+- Outgoing transaction history is deterministic across a restore from seed.
+- Run SQLite `synchronous = NORMAL` on the writer connection (WAL-safe, much faster on networked or encrypted storage).
+- Reduce raw-SQL coupling to librustzcash's schema in wallet reads.
+- Log the client IP on RPC auth attempts.
+
+### Fixed
+- Treat code-less zebra RPC errors as broadcast rejections instead of acceptance.
+
+### Security
+- Detect and reject hand-spliced unified addresses across own-address RPCs.
+- Refuse to load over-permissive age identity files.
+
 ## [0.3.0] - 2026-06-20
 
 ### Added
@@ -47,5 +62,6 @@ Zcash, backed entirely by librustzcash and running as a light client.
 ### Security
 - Pre-release audit hardening; refuse to start on mainnet with the placeholder RPC password; enforce a 12-character passphrase minimum.
 
+[0.3.1]: https://github.com/zecrocks/zecd/compare/v0.3.0...v0.3.1
 [0.3.0]: https://github.com/zecrocks/zecd/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/zecrocks/zecd/releases/tag/v0.2.0
