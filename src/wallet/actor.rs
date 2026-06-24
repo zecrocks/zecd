@@ -163,6 +163,63 @@ fn is_serviceable_request(req: &TransactionDataRequest) -> bool {
 /// guards against by setting the chain tip only after the account, with its birthday, exists).
 const BOOTSTRAP_SCAN_FLOOR_WARN_GAP: u32 = 1 << 16;
 
+/// How many transparent external addresses to derive per initial-sync chunk. Pre-exposure
+/// is incremental: `sync_step` exposes one chunk per pass (before the block scan) and the actor
+/// services queued RPC commands between chunks, so a deep `transparent_initial_scan` fills the
+/// window without freezing the daemon in one uninterrupted synchronous burst. Sized so a single
+/// chunk's synchronous derivation stays well under a second on typical disks (the actor can't
+/// service a queued command mid-chunk), keeping worst-case RPC latency low without paying
+/// per-chunk loop overhead on every index.
+const TRANSPARENT_PREEXPOSE_CHUNK: u32 = 1_000;
+
+/// How often to emit a transparent initial-sync progress heartbeat (throttled by wall time, not
+/// by row - a deep scan must never log per address).
+const PREEXPOSE_LOG_INTERVAL: Duration = Duration::from_secs(30);
+
+/// Progress of the transparent initial sync (`transparent_initial_scan` pre-exposure) for the
+/// current process. Transient - rebuilt on restart from the highest already-exposed index, like
+/// the rest of sync progress (no statelessness break). Surfaced on [`SyncStatus`] and logged as a
+/// time-throttled heartbeat.
+struct PreexposeProgress {
+    /// External indices exposed so far (also the next chunk's start index within this run).
+    done: u32,
+    /// Target depth (= `transparent_initial_scan`).
+    total: u32,
+    /// When this run began (for the completion-time and ETA lines).
+    started: Instant,
+    /// Last heartbeat time (throttle clock).
+    last_log: Instant,
+    /// `done` at the last heartbeat, so the rate is a short rolling window (not a drifting
+    /// cumulative average).
+    last_log_count: u32,
+}
+
+/// Pure progress math for the transparent initial-sync heartbeat: given the running count
+/// (`done`), the `total` target, how many addresses were exposed in the last window (`did`), and
+/// that window's length in seconds (`window`), return `(percent, addr_per_sec, eta_string)`. The
+/// rate is a rolling window (not a cumulative average) so it tracks the current speed; both the
+/// rate and ETA divides are guarded so a zero-length window or a stalled rate can't produce
+/// `inf`/NaN (the ETA reads `"unknown"` instead). Extracted as a pure fn so it's unit-testable.
+fn preexpose_progress_stats(done: u32, total: u32, did: u32, window: f64) -> (f64, f64, String) {
+    let rate = if window > 0.0 {
+        did as f64 / window
+    } else {
+        0.0
+    };
+    let pct = if total > 0 {
+        (100.0 * done as f64 / total as f64).clamp(0.0, 100.0)
+    } else {
+        100.0
+    };
+    let remaining = total.saturating_sub(done);
+    let eta = if rate > 0.0 {
+        format!("~{:.0}s", remaining as f64 / rate)
+    } else {
+        "unknown".to_string()
+    };
+    (pct, rate, eta)
+}
+
 // NB: the unmined-tx rebroadcast interval is configurable (`[sync] rebroadcast_secs`,
 // default 60) and arrives via `ActorConfig::rebroadcast_interval`. It covers sends whose
 // original broadcast failed (their notes are already locked in the DB until expiry) and
@@ -300,6 +357,10 @@ struct WalletActor {
     /// pre-exposed.
     transparent_set_dirty: bool,
     transparent_preexposed: bool,
+    /// Live initial-sync progress while it runs (and the final state afterward), for the
+    /// heartbeat log and the `getwalletinfo`/`/status` surfaces. `None` until the first chunk;
+    /// stays `Some` once started so an operator can poll the completed count too.
+    transparent_preexpose: Option<PreexposeProgress>,
     /// Transient first-seen times for unmined txs, shared with the read-path handle. Stamped when
     /// the mempool stream first stores an unmined tx; pruned once the tx mines. Never persisted
     /// (zecd is stateless). See [`crate::wallet::FirstSeen`].
@@ -616,6 +677,7 @@ pub async fn spawn(
         transparent_scripts: None,
         transparent_set_dirty: true,
         transparent_preexposed: false,
+        transparent_preexpose: None,
         first_seen: first_seen.clone(),
         account_id,
         account_index,
@@ -1537,18 +1599,95 @@ impl WalletActor {
         recorded
     }
 
-    /// Pre-expose external transparent indices `0..transparent_initial_scan` so the receive
-    /// scan covers them regardless of the (small) steady-state gap limit. Idempotent: only derives
-    /// indices past the highest already exposed, so a restart is cheap. No-op when the depth is 0.
-    fn preexpose_transparent(&mut self, account_id: AccountUuid) {
+    /// Expose one chunk of external transparent indices `0..transparent_initial_scan` so the
+    /// block scan covers them regardless of the (small) steady-state gap limit. Returns `true` while
+    /// more indices remain, so the caller (`sync_step`) keeps cycling - servicing queued RPC commands
+    /// between chunks - instead of freezing the actor for the whole derivation. Updates
+    /// [`PreexposeProgress`] and emits the throttled heartbeat; logs the opening and completion lines
+    /// once each. Resumable: within a run `progress.done` is the cursor, and the first chunk of a run
+    /// recomputes the start from the highest already-exposed index (cheap restart). No-op (returns
+    /// `false`) when the depth is 0 or already covered.
+    fn preexpose_transparent_chunk(&mut self, account_id: AccountUuid) -> bool {
         let depth = self.transparent_initial_scan;
         if depth == 0 {
-            return;
+            return false;
         }
         let request = crate::pools::transparent_extraction_request();
-        // Resume past the highest external index already exposed (e.g. on a restart where the DB
-        // survived), so we don't re-derive the whole range.
-        let start = match self
+        // Within a run, `progress.done` is the authoritative cursor; only the first chunk consults
+        // the DB (to resume past whatever a surviving DB already exposed), so we don't re-query the
+        // full receiver set on every chunk.
+        let start = match self.transparent_preexpose.as_ref() {
+            Some(p) => p.done,
+            None => self.next_unexposed_external_index(account_id),
+        };
+        if start >= depth {
+            // Already covered before we derived anything (e.g. a restart whose DB was complete).
+            if self.transparent_preexpose.is_none() {
+                info!(
+                    "[{}] transparent initial sync already complete ({depth} addresses)",
+                    self.name
+                );
+            }
+            return false;
+        }
+        if self.transparent_preexpose.is_none() {
+            let now = Instant::now();
+            self.transparent_preexpose = Some(PreexposeProgress {
+                done: start,
+                total: depth,
+                started: now,
+                last_log: now,
+                last_log_count: start,
+            });
+            if start > 0 {
+                info!(
+                    "[{}] resuming transparent initial sync at {start}/{depth} addresses",
+                    self.name
+                );
+            } else {
+                info!(
+                    "[{}] starting transparent initial sync: {depth} addresses to scan",
+                    self.name
+                );
+            }
+        }
+        let end = depth.min(start.saturating_add(TRANSPARENT_PREEXPOSE_CHUNK));
+        for i in start..end {
+            let div = DiversifierIndex::from(i);
+            if let Err(e) = self.db_data.get_address_for_index(account_id, div, request) {
+                warn!(
+                    "[{}] transparent initial sync failed at index {i}: {e}",
+                    self.name
+                );
+                // Stop attempting this process so we don't spin re-hitting the same index every
+                // pass; the window is left partially exposed (recoverable on a later restart).
+                return false;
+            }
+        }
+        if let Some(p) = self.transparent_preexpose.as_mut() {
+            p.done = end;
+        }
+        if end >= depth {
+            let elapsed = self
+                .transparent_preexpose
+                .as_ref()
+                .map(|p| p.started.elapsed().as_secs_f64())
+                .unwrap_or(0.0);
+            info!(
+                "[{}] transparent initial sync complete: {depth} addresses in {elapsed:.0}s",
+                self.name
+            );
+            return false;
+        }
+        self.maybe_log_preexpose_progress();
+        true
+    }
+
+    /// The next external transparent index a restore would need to expose: one past the highest
+    /// already-exposed external index (0 for a fresh/empty account). Used only for the first chunk
+    /// of a run, to resume after a restart without re-deriving what the DB already has.
+    fn next_unexposed_external_index(&self, account_id: AccountUuid) -> u32 {
+        match self
             .db_data
             .get_transparent_receivers(account_id, false, false)
         {
@@ -1559,24 +1698,33 @@ impl WalletActor {
                 .max()
                 .unwrap_or(0),
             Err(_) => 0,
+        }
+    }
+
+    /// Emit a transparent initial-sync progress heartbeat, throttled to one line per
+    /// [`PREEXPOSE_LOG_INTERVAL`]. Rate is a short rolling window (addresses since the last line ÷
+    /// wall time since it), so it tracks the current speed rather than a drifting average; the ETA
+    /// is derived from that rate and flagged approximate. Monotonic `Instant` throughout, and the
+    /// rate divide is guarded so a zero-length interval can't produce `inf`/NaN.
+    fn maybe_log_preexpose_progress(&mut self) {
+        let name = self.name.clone();
+        let Some(p) = self.transparent_preexpose.as_mut() else {
+            return;
         };
-        if start >= depth {
+        let now = Instant::now();
+        let window = now.saturating_duration_since(p.last_log).as_secs_f64();
+        if window < PREEXPOSE_LOG_INTERVAL.as_secs_f64() {
             return;
         }
-        for i in start..depth {
-            let div = DiversifierIndex::from(i);
-            if let Err(e) = self.db_data.get_address_for_index(account_id, div, request) {
-                warn!(
-                    "[{}] pre-exposing transparent index {i} failed: {e}",
-                    self.name
-                );
-                break;
-            }
-        }
+        let done = p.done;
+        let total = p.total;
+        let did = done.saturating_sub(p.last_log_count);
+        let (pct, rate, eta) = preexpose_progress_stats(done, total, did, window);
         info!(
-            "[{}] pre-exposed transparent external indices {start}..{depth} (initial scan depth)",
-            self.name
+            "[{name}] transparent initial sync: {done}/{total} ({pct:.1}%), {rate:.0} addr/s, ETA {eta}"
         );
+        p.last_log = now;
+        p.last_log_count = done;
     }
 
     /// Fetch a full transaction from the upstream and parse it for enhancement, returning the
@@ -1752,7 +1900,20 @@ impl WalletActor {
         // restore, where a high funded index is found only if `transparent_initial_scan` exposed it.
         if self.transparent_enabled {
             if !self.transparent_preexposed {
-                self.preexpose_transparent(account_id);
+                // Derive the initial-scan window a chunk at a time. The window must be fully exposed before
+                // the scan (so historical blocks are matched against every address), but a deep
+                // `transparent_initial_scan` (~1180 addr/s) would freeze every actor-routed RPC for
+                // minutes if done in one synchronous burst. So each pass exposes one chunk and, while
+                // more remain, returns `worked = true` *without scanning*: the actor loop drains
+                // queued commands between chunks and resumes here next pass, keeping the daemon live
+                // (reads already bypass the actor; `/readyz` stays ready) while the window fills.
+                let more = self.preexpose_transparent_chunk(account_id);
+                // Newly-exposed indices must enter the match set before the scan reaches their blocks.
+                self.transparent_set_dirty = true;
+                if more {
+                    self.update_status();
+                    return Ok(true);
+                }
                 self.transparent_preexposed = true;
                 // Startup audit: if the wallet already sits near/over the recovery window (e.g. many
                 // addresses handed out ahead of funding, carried across a restart), warn once.
@@ -2087,6 +2248,10 @@ impl WalletActor {
             encrypted: self.encrypted,
             watch_only: self.watch_only,
             unlocked_until,
+            transparent_preexpose: self
+                .transparent_preexpose
+                .as_ref()
+                .map(|p| (p.done, p.total)),
         };
         let _ = self.status_tx.send(status);
     }
@@ -2310,7 +2475,7 @@ impl WalletActor {
     /// `get_next_available_address` hit the gap limit and the operator has opted in via
     /// `transparent_allow_beyond_recovery_window`. librustzcash's gap reservation refuses such an
     /// address, so we expose the next sequential external index directly via `get_address_for_index`
-    /// (the same primitive `preexpose_transparent` uses). An address at an index a from-seed restore
+    /// (the same primitive the initial sync uses). An address at an index a from-seed restore
     /// won't re-expose (i.e. `>= transparent_initial_scan`, with no nearby funding to extend the
     /// gap) may be unrecoverable, so it is warned about loudly.
     fn new_transparent_address_beyond_gap(
@@ -4036,8 +4201,42 @@ fn enrich_insufficient_funds(db: &WriteDb, policy: ConfirmationsPolicy, err: Rpc
 #[cfg(test)]
 mod tests {
     use super::gap_slots_remaining;
+    use super::preexpose_progress_stats;
     use super::sanitize_upstream_msg;
     use super::select_transparent_inputs;
+
+    #[test]
+    fn preexpose_progress_stats_computes_pct_rate_eta() {
+        // 1000 of 100000 in a 30s window where 1000 were just exposed: 1% done, ~33 addr/s,
+        // ETA = 99000/33.3 ≈ 2970s.
+        let (pct, rate, eta) = preexpose_progress_stats(1_000, 100_000, 1_000, 30.0);
+        assert!((pct - 1.0).abs() < 1e-9, "pct {pct}");
+        assert!((rate - 1_000.0 / 30.0).abs() < 1e-9, "rate {rate}");
+        assert_eq!(eta, "~2970s");
+    }
+
+    #[test]
+    fn preexpose_progress_stats_guards_divides() {
+        // Zero-length window: rate must be 0 (not inf/NaN) and ETA "unknown".
+        let (pct, rate, eta) = preexpose_progress_stats(500, 1_000, 500, 0.0);
+        assert_eq!(rate, 0.0);
+        assert_eq!(eta, "unknown");
+        assert!((pct - 50.0).abs() < 1e-9);
+
+        // A stalled rate (did = 0 over a real window) also yields no ETA, never a divide-by-zero.
+        let (_, rate, eta) = preexpose_progress_stats(500, 1_000, 0, 30.0);
+        assert_eq!(rate, 0.0);
+        assert_eq!(eta, "unknown");
+
+        // total = 0 (degenerate): treated as fully complete, no NaN from 0/0.
+        let (pct, _, _) = preexpose_progress_stats(0, 0, 0, 30.0);
+        assert_eq!(pct, 100.0);
+
+        // Completion: 100% and a finite ETA.
+        let (pct, _, eta) = preexpose_progress_stats(1_000, 1_000, 1_000, 30.0);
+        assert_eq!(pct, 100.0);
+        assert_eq!(eta, "~0s");
+    }
 
     #[test]
     fn gap_slots_remaining_counts_down_and_saturates() {

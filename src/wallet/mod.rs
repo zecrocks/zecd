@@ -105,6 +105,11 @@ pub struct SyncStatus {
     /// For an encrypted wallet: the unix time the seed auto-relocks (0 = locked now), matching
     /// Bitcoin Core's `getwalletinfo.unlocked_until`. `None` for unencrypted wallets.
     pub unlocked_until: Option<i64>,
+    /// Transparent initial-sync progress as `(exposed, target)`, when the wallet is
+    /// pre-exposing (or has finished pre-exposing) `transparent_initial_scan` external addresses.
+    /// `None` when the feature is off. Surfaced in `getwalletinfo.transparent.initial_sync` so an
+    /// operator can poll the fill instead of grepping logs. Transient (rebuilt on restart).
+    pub transparent_preexpose: Option<(u32, u32)>,
 }
 
 impl SyncStatus {
