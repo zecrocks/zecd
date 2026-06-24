@@ -11,6 +11,25 @@
 //! Each operation is tagged with the owning wallet, so the tracking RPCs
 //! (`z_getoperationstatus` / `z_getoperationresult` / `z_listoperationids`) only ever observe
 //! the operations of the wallet they are called on - preserving zecd's multiwallet isolation.
+//!
+//! ## Lifecycle, reaping, and the two caps (read before changing the limits)
+//!
+//! `z_getoperationresult` is **destructive and one-shot**, exactly as in zcashd/Zallet: it
+//! returns each finished operation's status *once* and removes it. After that the result is
+//! gone - a second `z_getoperationresult` for the same opid returns nothing. Use
+//! `z_getoperationstatus` (non-destructive) to poll without consuming. Reaping is the client's
+//! responsibility, but it is an **optimization, not a requirement**: a client that never reaps
+//! cannot wedge the daemon, because of how the two caps are arranged.
+//!
+//! - [`MAX_OPERATIONS`] bounds *retained* operations. Past it, the oldest **finished** results
+//!   are auto-evicted (oldest-first). So unreaped finished results are reclaimed automatically;
+//!   the only consequence of never reaping is that old results may be discarded before they are
+//!   read (the underlying transactions still broadcast - only the status object is lost). When
+//!   this happens it is logged at WARN so an operator notices a runaway unreaped backlog.
+//! - [`MAX_INFLIGHT_OPERATIONS_PER_WALLET`] bounds a wallet's **unfinished** (queued + executing)
+//!   operations. An in-flight operation owns a real pending send and *cannot* be evicted, so once
+//!   a wallet hits this cap new `z_sendmany` calls are rejected with `-4` (back-pressure) until
+//!   some finish. Reaping does not affect this cap (finished ops never count toward it).
 
 use std::collections::HashMap;
 use std::future::Future;
@@ -28,6 +47,16 @@ use crate::error::RpcError;
 /// client that fires `z_sendmany` and never reaps results cannot grow the registry without
 /// bound. A queued or executing operation is never evicted (its result is still pending).
 const MAX_OPERATIONS: usize = 1024;
+
+/// Cap on a single wallet's *unfinished* (queued + executing) operations. Unlike a finished
+/// operation, an in-flight one cannot be evicted - it owns a pending send (a spawned task, the
+/// `TransactionRequest`, and a slot contending for the single-writer actor's channel). So the
+/// only safe response to a flood is back-pressure: reject the new operation rather than let an
+/// authenticated client grow unfinished work without bound (memory + tasks + actor backlog).
+/// The bound is per-wallet so one wallet's burst can't starve another's. Generous versus any
+/// legitimate concurrency - sends are serialized by the actor regardless, so a handful in flight
+/// is already the practical ceiling.
+const MAX_INFLIGHT_OPERATIONS_PER_WALLET: usize = 16;
 
 /// An async operation ID: `opid-{uuid-v4}` (identical to zcashd/Zallet).
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -281,11 +310,61 @@ impl OperationRegistry {
         Self::default()
     }
 
-    /// Insert an operation tagged with its owning wallet; returns the opid string.
-    pub fn insert(&self, wallet: &str, op: AsyncOperation) -> String {
+    /// Launch an operation for `wallet` and insert it, subject to the per-wallet in-flight cap.
+    ///
+    /// The cap check, the spawn, and the insert all happen under one lock acquisition, so
+    /// concurrent `z_sendmany` calls can't race past the limit. When the wallet already has
+    /// [`MAX_INFLIGHT_OPERATIONS_PER_WALLET`] unfinished operations the new one is **not**
+    /// spawned and an `-4` error is returned - back-pressure, since an in-flight operation owns
+    /// a real pending send and cannot be safely discarded. Finished operations never count
+    /// toward this cap (they are reaped on `z_getoperationresult` and auto-evicted past
+    /// [`MAX_OPERATIONS`]), so a client that simply forgets to reap results is never blocked.
+    pub fn try_insert<T, F>(
+        &self,
+        wallet: &str,
+        context: Option<ContextInfo>,
+        f: F,
+    ) -> Result<String, RpcError>
+    where
+        T: Serialize + Send + 'static,
+        F: Future<Output = Result<T, RpcError>> + Send + 'static,
+    {
+        let mut map = self.inner.lock().expect("operation registry poisoned");
+
+        let inflight = map
+            .values()
+            .filter(|e| e.wallet == wallet && !e.op.state().is_finished())
+            .count();
+        if inflight >= MAX_INFLIGHT_OPERATIONS_PER_WALLET {
+            tracing::warn!(
+                wallet,
+                inflight,
+                cap = MAX_INFLIGHT_OPERATIONS_PER_WALLET,
+                "rejecting z_sendmany: too many unfinished async operations in flight (the \
+                 wallet actor may be backed up or the upstream may be unreachable)"
+            );
+            return Err(RpcError::wallet(format!(
+                "Too many operations already in progress ({inflight}); the limit is \
+                 {MAX_INFLIGHT_OPERATIONS_PER_WALLET}. Wait for in-flight operations to finish \
+                 before starting another."
+            )));
+        }
+
+        // Spawn only now that capacity is confirmed; `AsyncOperation::new` starts the task but
+        // `tokio::spawn` does not await, so doing it under the std `Mutex` is fine.
+        let op = AsyncOperation::new(context, f);
+        Ok(Self::insert_op(&mut map, wallet, op))
+    }
+
+    /// Raw insertion: record `op` under `wallet` and evict finished overflow. Shared by
+    /// [`Self::try_insert`] and the tests; does **not** enforce the in-flight cap.
+    fn insert_op(
+        map: &mut HashMap<OperationId, OperationEntry>,
+        wallet: &str,
+        op: AsyncOperation,
+    ) -> String {
         let id = op.operation_id().clone();
         let opid = id.0.clone();
-        let mut map = self.inner.lock().expect("operation registry poisoned");
         map.insert(
             id,
             OperationEntry {
@@ -293,7 +372,7 @@ impl OperationRegistry {
                 op,
             },
         );
-        Self::evict_if_over_cap(&mut map);
+        Self::evict_if_over_cap(map);
         opid
     }
 
@@ -368,8 +447,21 @@ impl OperationRegistry {
             .collect();
         finished.sort_by_key(|(t, _)| *t);
         let excess = map.len() - MAX_OPERATIONS;
+        let mut evicted = 0;
         for (_, id) in finished.into_iter().take(excess) {
             map.remove(&id);
+            evicted += 1;
+        }
+        if evicted > 0 {
+            // These are finished results the client never read with z_getoperationresult; they
+            // are gone now. The transactions themselves still broadcast (see the module docs) -
+            // only the status objects are discarded - but loudly flag the unreaped backlog.
+            tracing::warn!(
+                evicted,
+                retained = MAX_OPERATIONS,
+                "evicting unreaped finished async operations to stay under the cap; reap results \
+                 with z_getoperationresult to avoid silently discarding them"
+            );
         }
     }
 }
@@ -378,6 +470,16 @@ impl OperationRegistry {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    impl OperationRegistry {
+        /// Insert a pre-built operation directly, bypassing the in-flight cap. Lets the tests
+        /// seed the registry with synchronously-constructed (non-spawning) operations in a
+        /// chosen state. Production code goes through [`OperationRegistry::try_insert`].
+        fn insert(&self, wallet: &str, op: AsyncOperation) -> String {
+            let mut map = self.inner.lock().expect("operation registry poisoned");
+            Self::insert_op(&mut map, wallet, op)
+        }
+    }
 
     impl AsyncOperation {
         /// Build an already-finished operation synchronously (no spawn) so the registry's
@@ -532,6 +634,50 @@ mod tests {
         }
         // Nothing is finished, so the soft cap can evict nothing - every op survives.
         assert_eq!(reg.list_ids("w", None).len(), MAX_OPERATIONS + 5);
+    }
+
+    #[tokio::test]
+    async fn inflight_cap_rejects_over_limit_and_is_per_wallet() {
+        let reg = OperationRegistry::new();
+
+        // Fill the wallet to its in-flight cap with operations that never complete.
+        for _ in 0..MAX_INFLIGHT_OPERATIONS_PER_WALLET {
+            let opid = reg
+                .try_insert("w", None, std::future::pending::<Result<Value, RpcError>>())
+                .expect("inserts succeed up to the cap");
+            assert!(opid.starts_with("opid-"));
+        }
+
+        // One past the cap is rejected with -4 (not spawned).
+        let err = reg
+            .try_insert("w", None, std::future::pending::<Result<Value, RpcError>>())
+            .unwrap_err();
+        assert_eq!(err.code, crate::error::codes::RPC_WALLET_ERROR);
+        assert_eq!(
+            reg.list_ids("w", None).len(),
+            MAX_INFLIGHT_OPERATIONS_PER_WALLET
+        );
+
+        // The cap is per-wallet: a different wallet is unaffected.
+        assert!(reg
+            .try_insert(
+                "other",
+                None,
+                std::future::pending::<Result<Value, RpcError>>()
+            )
+            .is_ok());
+    }
+
+    #[tokio::test]
+    async fn finished_operations_do_not_count_toward_the_inflight_cap() {
+        let reg = OperationRegistry::new();
+        // Pile on far more than the in-flight cap, all finished - they never block new work.
+        for _ in 0..MAX_INFLIGHT_OPERATIONS_PER_WALLET * 4 {
+            reg.insert("w", AsyncOperation::finished(None, Ok(json!(1))));
+        }
+        assert!(reg
+            .try_insert("w", None, std::future::pending::<Result<Value, RpcError>>())
+            .is_ok());
     }
 
     /// Bounded-poll a real spawned operation to a terminal state.

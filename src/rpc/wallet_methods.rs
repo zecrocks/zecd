@@ -13,7 +13,7 @@ use zip321::{Payment, TransactionRequest};
 use crate::amount::{signed_zats_to_value, value_to_zats, zats_to_value};
 use crate::config::SendPrivacy;
 use crate::error::RpcError;
-use crate::operations::{AsyncOperation, ContextInfo, OperationId};
+use crate::operations::{ContextInfo, OperationId};
 use crate::server::jsonrpc::RpcRequest;
 use crate::state::AppState;
 use crate::wallet::store::Passphrase;
@@ -1649,11 +1649,12 @@ pub(crate) fn z_sendmany(
     // a synchronous error here. The send still funnels through the single-writer actor, so the
     // no-double-spend invariant holds exactly as for the synchronous sends.
     let send_handle = handle.clone();
-    let op = AsyncOperation::new(Some(context), async move {
-        let txid = send_handle.send(request, Some(policy), privacy).await?;
-        Ok::<Value, RpcError>(json!({ "txid": txid.to_string() }))
-    });
-    let opid = state.operations.insert(&handle.name, op);
+    let opid = state
+        .operations
+        .try_insert(&handle.name, Some(context), async move {
+            let txid = send_handle.send(request, Some(policy), privacy).await?;
+            Ok::<Value, RpcError>(json!({ "txid": txid.to_string() }))
+        })?;
     Ok(Value::String(opid))
 }
 
