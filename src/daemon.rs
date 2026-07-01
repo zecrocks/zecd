@@ -122,6 +122,7 @@ pub async fn run(config: AppConfig) -> anyhow::Result<()> {
             confirmations_policy: config.spend.confirmations_policy()?,
             orchard_action_limit: config.spend.orchard_action_limit,
             orchard_keys: orchard_keys.clone(),
+            pipeline_proving: config.spend.pipeline_proving,
             enabled_pools: entry.pools.clone(),
             default_receivers: entry.default_receivers.clone(),
             shutdown: shutdown_tx.subscribe(),

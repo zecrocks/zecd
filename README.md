@@ -169,6 +169,9 @@ privacy_policy = "AllowRevealedRecipients"  # or "FullPrivacy": only single-shie
                                  #   (no transparent recipients, no Sapling<->Orchard crossing)
 orchard_action_limit = 50        # cap on Orchard actions per send (0 disables); like Zallet's
                                  #   builder.limits.orchard_actions - too many recipients -> -8
+cache_proving_key = true         # build the Orchard proving key once (PCZT path) vs. per send
+pipeline_proving = false         # prove a send OFF the actor so a long send doesn't freeze sync
+                                 #   (Orchard-only/PCZT path)
 
 [log]
 level = "info"                   # tracing filter; RUST_LOG overrides

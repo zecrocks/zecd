@@ -1,6 +1,7 @@
 //! The per-wallet actor: the single owner/writer of the `WalletDb`, running the sync loop
 //! and serving writer commands (address generation, sends, lock/unlock) from RPC handlers.
 
+use std::collections::VecDeque;
 use std::convert::Infallible;
 use std::num::NonZeroUsize;
 use std::path::PathBuf;
@@ -8,7 +9,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{anyhow, Context};
-use tokio::sync::{mpsc, watch};
+use tokio::sync::{mpsc, oneshot, watch};
 use tracing::{error, info, warn};
 
 use zcash_client_backend::data_api::wallet::{
@@ -76,6 +77,42 @@ impl ProvingKeyCache {
             orchard_vk: orchard::circuit::VerifyingKey::build(),
         }
     }
+}
+
+/// Cap on sends queued behind an in-flight proof (`[spend] pipeline_proving`). Each queued send
+/// is a blocked RPC handler, so the work-queue semaphore already bounds this; the cap is a
+/// defensive backstop so a misconfigured client can't grow the queue without limit. Past it,
+/// `begin_or_queue_send` sheds with `-4` back-pressure (the caller retries), like the async-op
+/// registry's inflight cap.
+const MAX_QUEUED_SENDS: usize = 64;
+
+/// A send deferred because another send's proof is still in flight. Sends stay serialized even
+/// when proving is pipelined off the actor: only one PCZT is ever uncommitted at a time, so there
+/// is no double-spend surface and no reservation overlay is needed. A send arriving mid-proof waits here and
+/// starts once the in-flight one commits.
+struct PendingSend {
+    request: TransactionRequest,
+    confirmations: Option<ConfirmationsPolicy>,
+    privacy: SendPrivacy,
+    reply: oneshot::Sender<Result<TxId, RpcError>>,
+}
+
+/// A send whose prove+sign finished on a blocking thread, routed back to the actor so phase C
+/// (extract + store + mark-spent + broadcast) runs on the single writer.
+struct SendCompletion {
+    /// The signed PCZT ready to extract+store, or the error that aborted phase A/B (proposal,
+    /// PCZT build, proving, signing, or a caught panic in the proof job).
+    result: Result<pczt::Pczt, RpcError>,
+    /// The confirmations policy this send used, to enrich a `-6` if storing surfaces one.
+    policy: ConfirmationsPolicy,
+    /// The send's shape (input/action counts), carried through for the latency log line.
+    shape: SendShape,
+    /// Wall time phase A (select + PCZT build) took on the actor.
+    build_elapsed: Duration,
+    /// Wall time the off-actor prove+sign took (phase B).
+    prove_elapsed: Duration,
+    /// The caller awaiting the txid.
+    reply: oneshot::Sender<Result<TxId, RpcError>>,
 }
 
 /// Deadlines for RPCs issued on an already-connected channel. The dial timeout covers only
@@ -176,6 +213,9 @@ pub struct ActorConfig {
     /// path here signs only Orchard spends, so a wallet that can spend Sapling notes
     /// (`enabled_pools` includes Sapling) falls back to the fused path regardless - see `do_send`.
     pub orchard_keys: Option<Arc<ProvingKeyCache>>,
+    /// Run the proving step off the actor so a long send doesn't freeze sync (`[spend]
+    /// pipeline_proving`). Only engages on the cached-Orchard PCZT path; off by default.
+    pub pipeline_proving: bool,
     /// Shielded pools this wallet receives into and spends from (change pool selection).
     pub enabled_pools: PoolSet,
     /// Receivers included by default in this wallet's Unified Addresses.
@@ -235,10 +275,24 @@ struct WalletActor {
     /// an incoming payment before its first confirmation (bitcoind parity). Best-effort:
     /// any stream error just drops it and the next caught-up pass reopens.
     mempool: Option<MempoolStream>,
-    prover: LocalTxProver,
+    /// Shared (`Arc`) so the proving step can be moved onto a blocking thread when
+    /// `pipeline_proving` is on (`LocalTxProver` is built once and is read-only during proving).
+    prover: Arc<LocalTxProver>,
     /// Cached Orchard keys for the PCZT send path (`None` = legacy fused path). See
     /// [`ProvingKeyCache`].
     orchard_keys: Option<Arc<ProvingKeyCache>>,
+    /// `[spend] pipeline_proving`: run a send's prove+sign off the actor so it doesn't freeze
+    /// sync. Only engages on the cached-Orchard PCZT path (see [`Self::pipeline_eligible`]).
+    pipeline_proving: bool,
+    /// Whether a pipelined send's proof is currently running on a blocking thread. While `true`,
+    /// new sends queue (in [`Self::send_queue`]) rather than starting - sends stay serialized.
+    send_in_flight: bool,
+    /// Sends deferred behind the in-flight proof, started in FIFO order as each one commits.
+    send_queue: VecDeque<PendingSend>,
+    /// Loopback channel: the off-actor proof job posts its [`SendCompletion`] here, and the
+    /// actor's command loop drains it to run phase C on the single writer.
+    send_done_tx: mpsc::Sender<SendCompletion>,
+    send_done_rx: mpsc::Receiver<SendCompletion>,
     seed: SeedKeeper,
     status_tx: watch::Sender<SyncStatus>,
     cmd_rx: mpsc::Receiver<WalletCommand>,
@@ -391,12 +445,18 @@ pub async fn spawn(
         );
     }
 
-    // The local prover bundles Sapling parameters; build it once (off the async threads).
-    let prover = tokio::task::spawn_blocking(LocalTxProver::bundled)
-        .await
-        .map_err(|e| anyhow!("failed to build prover: {e}"))?;
+    // The local prover bundles Sapling parameters; build it once (off the async threads). Shared
+    // via `Arc` so the proving step can be handed to a blocking thread under `pipeline_proving`.
+    let prover = Arc::new(
+        tokio::task::spawn_blocking(LocalTxProver::bundled)
+            .await
+            .map_err(|e| anyhow!("failed to build prover: {e}"))?,
+    );
 
     let (cmd_tx, cmd_rx) = mpsc::channel(64);
+    // Loopback for pipelined-send completions. Bounded by `MAX_QUEUED_SENDS` since at most that
+    // many sends can be outstanding (one in flight + the queue), and only one is ever proving.
+    let (send_done_tx, send_done_rx) = mpsc::channel(MAX_QUEUED_SENDS + 1);
     // Seed the status channel with the wallet's static facts (encryption mode, watch-only)
     // so an RPC racing the actor's first `update_status` - which only runs after the initial
     // connect attempt - never reports a default-shaped wallet (e.g. `private_keys_enabled:
@@ -439,6 +499,11 @@ pub async fn spawn(
         connected_logged: false,
         prover,
         orchard_keys: cfg.orchard_keys,
+        pipeline_proving: cfg.pipeline_proving,
+        send_in_flight: false,
+        send_queue: VecDeque::new(),
+        send_done_tx,
+        send_done_rx,
         seed,
         status_tx,
         cmd_rx,
@@ -581,6 +646,12 @@ impl WalletActor {
             // `select!` branch below handles the idle case, and `do_send` has a hard backstop.
             self.relock_if_expired();
             if more_work {
+                // Commit any pipelined send whose proof just finished, before the next sync
+                // batch - phase C is short (store + bounded broadcast) and the caller is waiting.
+                // `finish_send_caught` pumps the send queue, so a deferred send starts promptly.
+                while let Ok(done) = self.send_done_rx.try_recv() {
+                    self.finish_send_caught(done).await;
+                }
                 // Service any queued commands first so writers aren't starved by sync.
                 loop {
                     match self.cmd_rx.try_recv() {
@@ -645,6 +716,9 @@ impl WalletActor {
                 enum IdleEvent {
                     Shutdown(Result<(), watch::error::RecvError>),
                     Cmd(Option<WalletCommand>),
+                    // Boxed: a `SendCompletion` carries a proven PCZT (hundreds of bytes), which
+                    // would otherwise bloat every `IdleEvent` (clippy::large_enum_variant).
+                    SendDone(Option<Box<SendCompletion>>),
                     Relock,
                     Tick,
                     Mempool(anyhow::Result<Option<service::RawTransaction>>),
@@ -654,6 +728,7 @@ impl WalletActor {
                     let event = tokio::select! {
                         res = self.shutdown.changed() => IdleEvent::Shutdown(res),
                         maybe_cmd = self.cmd_rx.recv() => IdleEvent::Cmd(maybe_cmd),
+                        done = self.send_done_rx.recv() => IdleEvent::SendDone(done.map(Box::new)),
                         _ = relock_sleep(self.unlock_until) => IdleEvent::Relock,
                         _ = tokio::time::sleep(wait) => IdleEvent::Tick,
                         res = mempool_next(&mut mempool) => IdleEvent::Mempool(res),
@@ -677,6 +752,10 @@ impl WalletActor {
                         }
                     }
                     IdleEvent::Cmd(None) => return,
+                    // A pipelined send's proof finished while idle: commit it (phase C). The
+                    // sender is a field, so `recv()` only yields `None` at teardown.
+                    IdleEvent::SendDone(Some(done)) => self.finish_send_caught(*done).await,
+                    IdleEvent::SendDone(None) => return,
                     IdleEvent::Relock => self.relock_if_expired(),
                     IdleEvent::Tick => {
                         if self.client.is_none() {
@@ -1487,8 +1566,8 @@ impl WalletActor {
                 privacy,
                 reply,
             } => {
-                let res = self.do_send(request, confirmations, privacy).await;
-                let _ = reply.send(res);
+                self.begin_or_queue_send(request, confirmations, privacy, reply)
+                    .await;
             }
             WalletCommand::GetRawTx { txid, reply } => {
                 let res = self.do_get_raw_tx(txid).await;
@@ -1611,6 +1690,81 @@ impl WalletActor {
         Ok((ua.encode(&self.network), u128::from(j)))
     }
 
+    /// Whether sends on this wallet use the cached-Orchard PCZT path (so prove and store are
+    /// separable). True for the default Orchard-only wallet with `cache_proving_key` on. A
+    /// Sapling-spending wallet (or `cache_proving_key` off) uses the fused path, which has no
+    /// prove/store seam - see [`Self::do_send_fused`].
+    fn cached_pczt_path(&self) -> bool {
+        self.orchard_keys.is_some() && !self.enabled_pools.contains(Pool::Sapling)
+    }
+
+    /// Whether a send should be pipelined: `[spend] pipeline_proving` on *and* the cached PCZT
+    /// path applies (only that path can prove off the actor and store back on it).
+    fn pipeline_eligible(&self) -> bool {
+        self.pipeline_proving && self.cached_pczt_path()
+    }
+
+    /// Phase A (note selection + PCZT build), on the actor. Selects inputs with the greedy
+    /// selector + ZIP-317 change strategy, enforces the privacy / Orchard-action policies on the
+    /// built proposal, then builds the (unproven, `Send`-able) PCZT. A DB read - milliseconds even
+    /// on a large wallet - so it stays on the single writer. Returns the PCZT plus the send's
+    /// shape and how long phase A took, for the latency log line.
+    fn build_proposal_and_pczt(
+        &mut self,
+        request: TransactionRequest,
+        policy: ConfirmationsPolicy,
+        privacy: SendPrivacy,
+    ) -> Result<(pczt::Pczt, SendShape, Duration), RpcError> {
+        let account_id = self.require_account()?;
+        let net = self.network;
+        let change_pool = self.enabled_pools.change_pool();
+        let orchard_action_limit = self.orchard_action_limit;
+        let db = &mut self.db_data;
+        tokio::task::block_in_place(move || -> Result<_, RpcError> {
+            let start = Instant::now();
+            let change_strategy = MultiOutputChangeStrategy::new(
+                StandardFeeRule::Zip317,
+                None,
+                change_pool,
+                DustOutputPolicy::default(),
+                SplitPolicy::with_min_output_value(
+                    NonZeroUsize::new(TARGET_NOTE_COUNT).expect("nonzero"),
+                    Zatoshis::from_u64(MIN_SPLIT_OUTPUT_VALUE).expect("valid"),
+                ),
+            );
+            let input_selector = GreedyInputSelector::new();
+            let proposal = propose_transfer(
+                db,
+                &net,
+                account_id,
+                &input_selector,
+                &change_strategy,
+                request,
+                policy,
+                None,
+            )
+            .map_err(|e| enrich_insufficient_funds(db, policy, classify_err(e)))?;
+            if privacy == SendPrivacy::FullPrivacy {
+                enforce_full_privacy(&proposal)?;
+            }
+            enforce_orchard_action_limit(&proposal, orchard_action_limit)?;
+            let shape = proposal_shape(&proposal);
+            let pczt = create_pczt_from_proposal::<_, _, Infallible, _, Infallible, _>(
+                db,
+                &net,
+                account_id,
+                OvkPolicy::Sender,
+                &proposal,
+            )
+            .map_err(|e| enrich_insufficient_funds(db, policy, classify_pczt_err(e)))?;
+            Ok((pczt, shape, start.elapsed()))
+        })
+    }
+
+    /// Build, prove, and broadcast a send inline (today's behaviour): the whole of phase A→C runs
+    /// on the actor under `block_in_place`, so the actor (and thus sync) is blocked for the whole
+    /// proof. `[spend] pipeline_proving` moves the proof off the actor - see
+    /// [`Self::begin_or_queue_send`]. Used directly when pipelining is disabled or ineligible.
     async fn do_send(
         &mut self,
         request: TransactionRequest,
@@ -1621,40 +1775,72 @@ impl WalletActor {
         // hasn't fired yet (e.g. a long sync batch was in progress), lock now so the spend
         // can't slip through past its timeout. `derive_usk` then returns -13 as expected.
         self.relock_if_expired();
-        let account_id = self.require_account()?;
         let account_index = self.account_index.ok_or_else(private_keys_disabled)?;
         let usk = self.seed.derive_usk(self.network, account_index)?;
-
-        // Proposal building + proving is CPU-heavy (Sapling/Orchard proofs take seconds).
-        // Run it under `block_in_place` so it doesn't stall the async runtime, and so the
-        // single send doesn't block the actor thread from being cooperatively yielded.
-        let net = self.network;
         // A per-call `minconf` (z_sendmany) overrides the wallet-wide policy for this send's
         // note selection; the synchronous sends pass `None` and use the configured policy.
         let policy = confirmations.unwrap_or(self.confirmations_policy);
-        let orchard_action_limit = self.orchard_action_limit;
-        let change_pool = self.enabled_pools.change_pool();
-        let prover = &self.prover;
-        // `Some` => prove via PCZT with the cached Orchard key; `None` => legacy fused path.
-        // The PCZT path here signs only Orchard spends; a wallet that can hold (and therefore
-        // spend) Sapling notes must use the fused path, which signs every pool. Orchard-only
-        // wallets - the default - keep the cache. (A Sapling *output*, e.g. a Sapling recipient,
-        // is fine on the PCZT path; only Sapling *spends* are the issue, and only a
-        // Sapling-enabled wallet can have Sapling notes to spend.)
-        let orchard_keys = if self.enabled_pools.contains(Pool::Sapling) {
-            None
-        } else {
-            self.orchard_keys.clone()
-        };
+
+        if !self.cached_pczt_path() {
+            return self.do_send_fused(usk, request, policy, privacy).await;
+        }
+
+        // Cached-Orchard PCZT path: phase A (select+build) → phase B (prove+sign) → phase C
+        // (store), all on the actor. Each phase is timed so the send-latency log shows where the
+        // cost lands on a large, note-fragmented wallet.
+        let (pczt, shape, build) = self.build_proposal_and_pczt(request, policy, privacy)?;
+        let keys = self.orchard_keys.clone().expect("cached path");
+        let prover = self.prover.clone();
         let db = &mut self.db_data;
-        let (txid, raw): (TxId, Vec<u8>) =
+        let (txid, raw, prove, store): (TxId, Vec<u8>, Duration, Duration) =
             tokio::task::block_in_place(move || -> Result<_, RpcError> {
+                let p0 = Instant::now();
+                let signed = prove_sign_pczt(pczt, &usk, &prover, &keys)?;
+                let prove = p0.elapsed();
+                let s0 = Instant::now();
+                let txid = store_pczt(db, signed, &keys)?;
+                let raw = read_raw_tx(db, txid)?;
+                Ok((txid, raw, prove, s0.elapsed()))
+            })?;
+
+        let b0 = Instant::now();
+        self.broadcast_committed(txid, raw).await?;
+        self.update_status();
+        log_send_latency(
+            &self.name,
+            "inline",
+            shape,
+            build,
+            prove,
+            store,
+            b0.elapsed(),
+        );
+        Ok(txid)
+    }
+
+    /// The legacy fused send path: librustzcash's `create_proposed_transactions` builds, proves,
+    /// and stores under one `&mut` (rebuilding the proving key per send). Used by a Sapling-
+    /// spending wallet (the PCZT path here signs only Orchard spends) or when
+    /// `cache_proving_key` is off. Not pipelined - there is no prove/store seam to split.
+    async fn do_send_fused(
+        &mut self,
+        usk: zcash_keys::keys::UnifiedSpendingKey,
+        request: TransactionRequest,
+        policy: ConfirmationsPolicy,
+        privacy: SendPrivacy,
+    ) -> Result<TxId, RpcError> {
+        let net = self.network;
+        let change_pool = self.enabled_pools.change_pool();
+        let orchard_action_limit = self.orchard_action_limit;
+        let account_id = self.require_account()?;
+        let prover: &LocalTxProver = &self.prover;
+        let db = &mut self.db_data;
+        let (txid, raw, shape, build, prove): (TxId, Vec<u8>, SendShape, Duration, Duration) =
+            tokio::task::block_in_place(move || -> Result<_, RpcError> {
+                let start = Instant::now();
                 let change_strategy = MultiOutputChangeStrategy::new(
                     StandardFeeRule::Zip317,
                     None,
-                    // Change goes to the strongest enabled pool (Orchard if enabled, else the
-                    // first enabled pool); inputs are still selected from any pool by the
-                    // greedy selector.
                     change_pool,
                     DustOutputPolicy::default(),
                     SplitPolicy::with_min_output_value(
@@ -1663,7 +1849,6 @@ impl WalletActor {
                     ),
                 );
                 let input_selector = GreedyInputSelector::new();
-
                 let proposal = propose_transfer(
                     db,
                     &net,
@@ -1675,72 +1860,245 @@ impl WalletActor {
                     None,
                 )
                 .map_err(|e| enrich_insufficient_funds(db, policy, classify_err(e)))?;
-
-                // FullPrivacy: reject before the (expensive) proving step if the proposal would
-                // leave a single shielded pool - i.e. involve a transparent component or cross
-                // the Sapling↔Orchard turnstile (which reveals the crossed amount on-chain).
-                // The input pool is only known now that the proposal is built, so this is where
-                // the no-cross-pool half of the policy is enforced (the no-transparent-recipient
-                // half is a cheap pre-check in `build_payment`).
                 if privacy == SendPrivacy::FullPrivacy {
                     enforce_full_privacy(&proposal)?;
                 }
-
-                // Cap the Orchard actions before the (expensive) proving step, so a send with
-                // too many recipients fails fast with a clear `-8` instead of exhausting memory
-                // or surfacing a deep librustzcash error (mirrors Zallet's `orchard_actions`).
                 enforce_orchard_action_limit(&proposal, orchard_action_limit)?;
-
-                let txid = match orchard_keys.as_deref() {
-                    // PCZT prove path: build the PCZT, then prove with the cached Orchard
-                    // proving key and store - the same transaction the fused path produces,
-                    // without rebuilding the proving key on every send.
-                    Some(keys) => {
-                        let pczt = create_pczt_from_proposal::<_, _, Infallible, _, Infallible, _>(
-                            db,
-                            &net,
-                            account_id,
-                            OvkPolicy::Sender,
-                            &proposal,
-                        )
-                        .map_err(|e| enrich_insufficient_funds(db, policy, classify_pczt_err(e)))?;
-                        prove_sign_store_pczt(db, pczt, &usk, prover, keys)?
-                    }
-                    // Legacy fused path: librustzcash rebuilds the Orchard proving key per send.
-                    None => {
-                        let txids = create_proposed_transactions(
-                            db,
-                            &net,
-                            prover,
-                            prover,
-                            &SpendingKeys::from_unified_spending_key(usk),
-                            OvkPolicy::Sender,
-                            &proposal,
-                            None,
-                        )
-                        .map_err(|e| enrich_insufficient_funds(db, policy, classify_err(e)))?;
-                        if txids.len() > 1 {
-                            return Err(RpcError::wallet(
-                                "multi-transaction proposals are not supported",
-                            ));
-                        }
-                        *txids.first()
-                    }
-                };
-
-                let tx = db
-                    .get_transaction(txid)
-                    .map_err(RpcError::database_internal)?
-                    .ok_or_else(|| RpcError::wallet("created transaction not found in wallet"))?;
-                let mut raw_tx = Vec::new();
-                tx.write(&mut raw_tx)
-                    .map_err(|e| RpcError::misc(format!("failed to serialize transaction: {e}")))?;
-                Ok((txid, raw_tx))
+                let shape = proposal_shape(&proposal);
+                let build = start.elapsed();
+                let p0 = Instant::now();
+                let txids = create_proposed_transactions(
+                    db,
+                    &net,
+                    prover,
+                    prover,
+                    &SpendingKeys::from_unified_spending_key(usk),
+                    OvkPolicy::Sender,
+                    &proposal,
+                    None,
+                )
+                .map_err(|e| enrich_insufficient_funds(db, policy, classify_err(e)))?;
+                if txids.len() > 1 {
+                    return Err(RpcError::wallet(
+                        "multi-transaction proposals are not supported",
+                    ));
+                }
+                let txid = *txids.first();
+                let raw = read_raw_tx(db, txid)?;
+                Ok((txid, raw, shape, build, p0.elapsed()))
             })?;
 
+        let b0 = Instant::now();
         self.broadcast_committed(txid, raw).await?;
         self.update_status();
+        log_send_latency(
+            &self.name,
+            "fused",
+            shape,
+            build,
+            prove,
+            Duration::ZERO,
+            b0.elapsed(),
+        );
         Ok(txid)
+    }
+
+    /// Entry point for a `Send` command. Runs inline (today's behaviour) unless pipelining is
+    /// eligible, in which case the proof runs off the actor so sync stays live. Pipelined sends
+    /// stay serialized: only one PCZT is uncommitted at a time (no double-spend surface, no
+    /// reservation overlay), so a send arriving while a proof is in flight is queued and started
+    /// once the in-flight one commits.
+    async fn begin_or_queue_send(
+        &mut self,
+        request: TransactionRequest,
+        confirmations: Option<ConfirmationsPolicy>,
+        privacy: SendPrivacy,
+        reply: oneshot::Sender<Result<TxId, RpcError>>,
+    ) {
+        if !self.pipeline_eligible() {
+            let res = self.do_send(request, confirmations, privacy).await;
+            let _ = reply.send(res);
+            return;
+        }
+        if self.send_in_flight {
+            if self.send_queue.len() >= MAX_QUEUED_SENDS {
+                let _ = reply.send(Err(RpcError::wallet(format!(
+                    "too many sends queued behind an in-flight proof ({MAX_QUEUED_SENDS}); \
+                     retry shortly"
+                ))));
+                return;
+            }
+            self.send_queue.push_back(PendingSend {
+                request,
+                confirmations,
+                privacy,
+                reply,
+            });
+            return;
+        }
+        self.start_pipelined_send(request, confirmations, privacy, reply)
+            .await;
+    }
+
+    /// Start a pipelined send: do phase A on the actor, then hand phase B (prove+sign) to a
+    /// blocking thread and return to the loop. On a phase-A failure the caller is replied to here
+    /// and `send_in_flight` is left clear (the queue is pumped by the caller). On success
+    /// `send_in_flight` is set and the completion arrives later via `send_done_tx`.
+    async fn start_pipelined_send(
+        &mut self,
+        request: TransactionRequest,
+        confirmations: Option<ConfirmationsPolicy>,
+        privacy: SendPrivacy,
+        reply: oneshot::Sender<Result<TxId, RpcError>>,
+    ) {
+        self.relock_if_expired();
+        let account_index = match self.account_index.ok_or_else(private_keys_disabled) {
+            Ok(i) => i,
+            Err(e) => {
+                let _ = reply.send(Err(e));
+                return;
+            }
+        };
+        let usk = match self.seed.derive_usk(self.network, account_index) {
+            Ok(u) => u,
+            Err(e) => {
+                let _ = reply.send(Err(e));
+                return;
+            }
+        };
+        let policy = confirmations.unwrap_or(self.confirmations_policy);
+        let (pczt, shape, build) = match self.build_proposal_and_pczt(request, policy, privacy) {
+            Ok(v) => v,
+            Err(e) => {
+                let _ = reply.send(Err(e));
+                return;
+            }
+        };
+
+        let prover = self.prover.clone();
+        let keys = self
+            .orchard_keys
+            .clone()
+            .expect("pipeline requires cached keys");
+        let done_tx = self.send_done_tx.clone();
+        let name = self.name.clone();
+        self.send_in_flight = true;
+        tokio::task::spawn_blocking(move || {
+            let p0 = Instant::now();
+            // Isolate a proving panic: a completion MUST always be sent, or the pipeline would
+            // wedge with `send_in_flight` stuck true.
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                prove_sign_pczt(pczt, &usk, &prover, &keys)
+            }))
+            .unwrap_or_else(|_| {
+                error!("[{name}] send proof panicked off-actor; the actor continues");
+                Err(RpcError::wallet("proving panicked"))
+            });
+            let _ = done_tx.blocking_send(SendCompletion {
+                result,
+                policy,
+                shape,
+                build_elapsed: build,
+                prove_elapsed: p0.elapsed(),
+                reply,
+            });
+            // `usk` is dropped (zeroized) here.
+        });
+    }
+
+    /// Start the next queued send, draining sends whose phase A fails immediately so the queue
+    /// keeps moving. Stops once a send is in flight (its proof started) or the queue is empty.
+    async fn pump_send_queue(&mut self) {
+        while !self.send_in_flight {
+            let Some(p) = self.send_queue.pop_front() else {
+                break;
+            };
+            self.start_pipelined_send(p.request, p.confirmations, p.privacy, p.reply)
+                .await;
+        }
+    }
+
+    /// Phase C of a pipelined send, on the actor: store the proven tx (marking inputs spent),
+    /// reply to the caller, and broadcast. Clears `send_in_flight` first so a panic mid-commit
+    /// can't wedge the pipeline (the loop pumps the queue afterwards).
+    async fn finish_send(&mut self, done: SendCompletion) {
+        self.send_in_flight = false;
+        let SendCompletion {
+            result,
+            policy,
+            shape,
+            build_elapsed,
+            prove_elapsed,
+            reply,
+        } = done;
+        let outcome = match result {
+            Err(e) => Err(e),
+            Ok(signed) => {
+                self.store_and_broadcast(signed, policy, shape, build_elapsed, prove_elapsed)
+                    .await
+            }
+        };
+        let _ = reply.send(outcome);
+    }
+
+    /// Store + broadcast a proven PCZT (phase C body). Storing marks the send's inputs spent in
+    /// the DB (the authoritative spend record from here on); broadcast is best-effort and rides
+    /// the rebroadcast loop on failure, like the inline path.
+    async fn store_and_broadcast(
+        &mut self,
+        signed: pczt::Pczt,
+        policy: ConfirmationsPolicy,
+        shape: SendShape,
+        build: Duration,
+        prove: Duration,
+    ) -> Result<TxId, RpcError> {
+        let keys = self
+            .orchard_keys
+            .clone()
+            .expect("pipeline requires cached keys");
+        let db = &mut self.db_data;
+        let _ = policy; // store rarely surfaces -6; kept for symmetry with the inline path.
+        let (txid, raw, store): (TxId, Vec<u8>, Duration) =
+            tokio::task::block_in_place(move || -> Result<_, RpcError> {
+                let s0 = Instant::now();
+                let txid = store_pczt(db, signed, &keys)?;
+                let raw = read_raw_tx(db, txid)?;
+                Ok((txid, raw, s0.elapsed()))
+            })?;
+        let b0 = Instant::now();
+        self.broadcast_committed(txid, raw).await?;
+        self.update_status();
+        log_send_latency(
+            &self.name,
+            "pipelined",
+            shape,
+            build,
+            prove,
+            store,
+            b0.elapsed(),
+        );
+        Ok(txid)
+    }
+
+    /// Run [`finish_send`](Self::finish_send) under panic isolation, then pump the send queue.
+    /// Mirrors [`handle_command_caught`](Self::handle_command_caught): a panic on the commit path
+    /// must not take the actor (and every wallet write) down. `send_in_flight` is already cleared
+    /// inside `finish_send`, so the queue can always make progress afterwards.
+    async fn finish_send_caught(&mut self, done: SendCompletion) {
+        use futures_util::FutureExt as _;
+        if std::panic::AssertUnwindSafe(self.finish_send(done))
+            .catch_unwind()
+            .await
+            .is_err()
+        {
+            error!(
+                "[{}] pipelined send commit panicked; the actor continues (this is a bug - \
+                 please report it)",
+                self.name
+            );
+            self.send_in_flight = false;
+        }
+        self.pump_send_queue().await;
     }
 
     /// Broadcast a transaction that is already committed to the wallet DB (its inputs are
@@ -2139,23 +2497,23 @@ fn now_unix() -> i64 {
         .as_secs() as i64
 }
 
-/// Prove (Orchard, plus Sapling outputs if any), sign the Orchard spends with the account's
-/// key, and persist the resulting transaction - the PCZT equivalent of the proving + storing
-/// `create_proposed_transactions` does, but with the *cached* Orchard proving key rather than
-/// rebuilding it per send. zecd wallets spend only Orchard notes (no transparent or Sapling
-/// spends), so the only spend authorizations required are the Orchard ones.
-fn prove_sign_store_pczt(
-    db: &mut WriteDb,
+/// Prove (Orchard, plus Sapling outputs if any) and sign the Orchard spends with the account's
+/// key, returning the signed PCZT ready to extract+store. This is the **pure-CPU** half of a PCZT
+/// send (phase B): it touches no DB, so it can run off the single-writer actor (see
+/// `[spend] pipeline_proving`). zecd wallets spend only Orchard notes (no transparent or Sapling
+/// spends), so the only spend authorizations required are the Orchard ones. Pair with
+/// [`store_pczt`] for phase C.
+fn prove_sign_pczt(
     pczt: pczt::Pczt,
     usk: &zcash_keys::keys::UnifiedSpendingKey,
     sapling_prover: &LocalTxProver,
     keys: &ProvingKeyCache,
-) -> Result<TxId, RpcError> {
+) -> Result<pczt::Pczt, RpcError> {
     use pczt::roles::prover::Prover;
     use pczt::roles::signer::{Error as SignerError, Signer};
 
-    // Phase B - proofs. Every zecd send spends Orchard notes (Orchard proof always required); a
-    // Sapling output proof is only needed when a recipient is a Sapling address.
+    // Proofs. Every zecd send spends Orchard notes (Orchard proof always required); a Sapling
+    // output proof is only needed when a recipient is a Sapling address.
     let prover = Prover::new(pczt);
     let prover = if prover.requires_orchard_proof() {
         prover
@@ -2199,14 +2557,20 @@ fn prove_sign_store_pczt(
             }
         }
     }
-    let pczt = signer.finish();
+    Ok(signer.finish())
+}
 
-    // Phase C - finalize + persist (records spends/change like create_proposed_transactions).
-    // The cached verifying key avoids regenerating it per send; no Sapling verifying key is
-    // needed since zecd never produces Sapling spends.
-    // `N` (the note-ref type) is otherwise unconstrained here - it only appears in the error
-    // type - so pin it to our `WalletDb`'s note ref, as `error::ProposalError` does for the
-    // fused path.
+/// Finalize + persist a proven, signed PCZT (phase C): records the tx, its spends/change, and
+/// marks inputs spent - the same wallet bookkeeping `create_proposed_transactions` does. A DB
+/// write, so it runs on the single-writer actor. The cached verifying key avoids regenerating it
+/// per send; no Sapling verifying key is needed since zecd never produces Sapling spends. `N` (the
+/// note-ref type) is otherwise unconstrained here - it only appears in the error type - so pin it
+/// to our `WalletDb`'s note ref, as `error::ProposalError` does for the fused path.
+fn store_pczt(
+    db: &mut WriteDb,
+    pczt: pczt::Pczt,
+    keys: &ProvingKeyCache,
+) -> Result<TxId, RpcError> {
     extract_and_store_transaction_from_pczt::<_, zcash_client_sqlite::ReceivedNoteId>(
         db,
         pczt,
@@ -2214,6 +2578,66 @@ fn prove_sign_store_pczt(
         Some(&keys.orchard_vk),
     )
     .map_err(|e| RpcError::wallet(format!("storing transaction failed: {e}")))
+}
+
+/// A send's size, for the latency log line. Proving cost scales with `orchard_actions`; a large,
+/// note-fragmented wallet inflates `inputs` (and thus actions), which is the headline scaling
+/// finding. Summed across the proposal's steps.
+#[derive(Clone, Copy, Default)]
+struct SendShape {
+    /// Orchard notes the send spends (zecd spends only Orchard).
+    inputs: usize,
+    /// Orchard actions built across all steps (`sum of max(spends, outputs)`).
+    orchard_actions: usize,
+}
+
+/// Summarize a built proposal's spend/action counts for the send-latency log.
+fn proposal_shape<FeeRuleT, NoteRef>(proposal: &Proposal<FeeRuleT, NoteRef>) -> SendShape {
+    let mut shape = SendShape::default();
+    for step in proposal.steps() {
+        let (spends, outputs) = step_orchard_actions(step);
+        shape.inputs += spends;
+        shape.orchard_actions += spends.max(outputs);
+    }
+    shape
+}
+
+/// Read a just-created transaction's raw bytes back from the wallet DB (for broadcast).
+fn read_raw_tx(db: &WriteDb, txid: TxId) -> Result<Vec<u8>, RpcError> {
+    let tx = db
+        .get_transaction(txid)
+        .map_err(RpcError::database_internal)?
+        .ok_or_else(|| RpcError::wallet("created transaction not found in wallet"))?;
+    let mut raw = Vec::new();
+    tx.write(&mut raw)
+        .map_err(|e| RpcError::misc(format!("failed to serialize transaction: {e}")))?;
+    Ok(raw)
+}
+
+/// Emit the per-send latency profile (the Layer-0 instrumentation): which path proved the send,
+/// its shape, and the wall time of each phase. `path` is `inline` / `fused` / `pipelined`. On a
+/// large wallet this line is the primary stress-test artifact - it shows whether the minutes land
+/// in selection (`select+build`) or proving (`prove`).
+#[allow(clippy::too_many_arguments)]
+fn log_send_latency(
+    name: &str,
+    path: &str,
+    shape: SendShape,
+    build: Duration,
+    prove: Duration,
+    store: Duration,
+    broadcast: Duration,
+) {
+    info!(
+        "[{name}] send complete ({path}): {} inputs, {} orchard actions; \
+         select+build {} ms, prove+sign {} ms, store {} ms, broadcast {} ms",
+        shape.inputs,
+        shape.orchard_actions,
+        build.as_millis(),
+        prove.as_millis(),
+        store.as_millis(),
+        broadcast.as_millis(),
+    );
 }
 
 /// Map a PCZT create/extract error to an `RpcError`, surfacing insufficient-funds conditions as

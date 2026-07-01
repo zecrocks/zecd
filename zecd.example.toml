@@ -212,6 +212,14 @@ orchard_action_limit = 50
 # every transaction. On by default. Set false to fall back to the fused path (e.g. to
 # benchmark, or if a PCZT issue is suspected); both paths produce identical transactions.
 cache_proving_key = true
+# Run a send's proving step OFF the single-writer actor, so a long send (which, on a large,
+# note-fragmented wallet, can take minutes) no longer freezes background sync, reads, and the
+# health/status endpoints for its whole duration. Sends still serialize (only one proof is
+# uncommitted at a time - no double-spend surface); the win is that the actor stays live while
+# the proof runs on a blocking thread. Only engages on the cached-Orchard PCZT path above (an
+# Orchard-only wallet with cache_proving_key on); a Sapling-spending wallet keeps the inline
+# path. OFF by default - enable once validated for your workload.
+pipeline_proving = false
 
 [health]
 # Unauthenticated liveness/readiness probes on a separate port (for Kubernetes/load balancers).

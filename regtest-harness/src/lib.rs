@@ -622,6 +622,25 @@ pub fn extended_enabled() -> bool {
     std::env::var("ZECD_REGTEST_EXTENDED").is_ok_and(|v| !v.is_empty() && v != "0")
 }
 
+/// Whether the **stress** regtest tier is enabled: set `ZECD_REGTEST_STRESS=1`. Distinct from
+/// (and heavier than) the extended tier - building thousands of notes and timing multi-minute
+/// sends would blow up even the weekly extended run - so it is gated separately and driven only
+/// by an explicit workflow dispatch and a rare (monthly) schedule, never on push/PR.
+pub fn stress_enabled() -> bool {
+    std::env::var("ZECD_REGTEST_STRESS").is_ok_and(|v| !v.is_empty() && v != "0")
+}
+
+/// How many notes the stress test should build before measuring a send, from
+/// `ZECD_STRESS_NOTE_COUNT` (default 256). The dispatch can dial this from a quick smoke (a few
+/// hundred) to a heavy soak (thousands) without code changes.
+pub fn stress_note_count() -> usize {
+    std::env::var("ZECD_STRESS_NOTE_COUNT")
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .filter(|n| *n > 0)
+        .unwrap_or(256)
+}
+
 /// A running `zecd` daemon plus the HTTP client and credentials to drive it.
 pub struct Zecd {
     child: Child,
@@ -667,6 +686,14 @@ pub struct ZecdConfig {
     /// omits it (zecd defaults to `true`). The proving-key-cache benchmark runs one instance
     /// each way.
     pub cache_proving_key: Option<bool>,
+    /// `[spend] pipeline_proving`: `Some(true/false)` writes the knob explicitly, `None` omits it
+    /// (zecd defaults to `false`). The stress test runs with it on to exercise the off-actor
+    /// proving pipeline (sync stays live during a send).
+    pub pipeline_proving: Option<bool>,
+    /// `[spend] orchard_action_limit`: `Some(n)` writes the cap (`0` disables it), `None` omits it
+    /// (zecd defaults to 50). The stress test lifts the cap so its big fan-out/sweep sends aren't
+    /// rejected.
+    pub orchard_action_limit: Option<usize>,
     /// Optional `[pools]` section as `(enabled, default_receivers)`. `None` omits the section
     /// (the Orchard-only default). Used by the multi-pool (Sapling) e2e.
     pub pools: Option<(Vec<String>, Vec<String>)>,
@@ -692,6 +719,8 @@ impl ZecdConfig {
             ufvk: None,
             birthday: None,
             cache_proving_key: None,
+            pipeline_proving: None,
+            orchard_action_limit: None,
             pools: None,
             encrypt_passphrase: None,
         }
@@ -1287,10 +1316,24 @@ fn export_ufvk_from_datadir(datadir: &Path, wallet: &str) -> Result<String> {
 fn write_zecd_toml(datadir: &Path, cfg: &ZecdConfig) -> Result<()> {
     // zecd is zebra-only: the single upstream is a local zebrad JSON-RPC endpoint.
     let server = format!("zebra://127.0.0.1:{}", cfg.zebra_rpc_port);
-    // Optional `[spend] cache_proving_key` knob (the proving-key-cache benchmark sets it).
-    let spend_section = match cfg.cache_proving_key {
-        Some(b) => format!("\n[spend]\ncache_proving_key = {b}\n"),
-        None => String::new(),
+    // Optional `[spend]` knobs: `cache_proving_key` (proving-key-cache benchmark) and
+    // `pipeline_proving` (stress test). Emit the section only if at least one is set.
+    let spend_section = {
+        let mut lines = String::new();
+        if let Some(b) = cfg.cache_proving_key {
+            lines.push_str(&format!("cache_proving_key = {b}\n"));
+        }
+        if let Some(b) = cfg.pipeline_proving {
+            lines.push_str(&format!("pipeline_proving = {b}\n"));
+        }
+        if let Some(n) = cfg.orchard_action_limit {
+            lines.push_str(&format!("orchard_action_limit = {n}\n"));
+        }
+        if lines.is_empty() {
+            String::new()
+        } else {
+            format!("\n[spend]\n{lines}")
+        }
     };
     // The default wallet plus any extra `[wallets.<name>]` entries (multiwallet tests).
     let mut wallets = format!(

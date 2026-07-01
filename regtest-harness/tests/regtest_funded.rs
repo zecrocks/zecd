@@ -130,6 +130,13 @@ async fn regtest_funded_orchard_receive() {
     // still works (scanning needs only viewing keys), and Phase 2 exercises the unlock gate.
     let mut cfg = ZecdConfig::new(zebrad.rpc_port, pick_port().expect("pick zecd rpc port"));
     cfg.encrypt_passphrase = Some(ENCRYPT_PASSPHRASE.to_string());
+    // Run this comprehensive send suite through the off-actor proving pipeline (`[spend]
+    // pipeline_proving`): this wallet is Orchard-only with the cached proving key, so the pipeline
+    // engages, and every send below (sendtoaddress/sendmany/z_sendmany, the self-send, the
+    // concurrent burst, the send-during-outage) becomes correctness coverage for it on every PR
+    // run. The inline PCZT path stays covered by regtest_proving_cache, the fused path by
+    // regtest_sapling, so all three send paths are exercised across the funded tier.
+    cfg.pipeline_proving = Some(true);
     let mut zecd = Zecd::start(&cfg)
         .await
         .expect("start zecd against regtest zebra");

@@ -14,6 +14,11 @@ name: Regtest E2E
 # (an early-warning canary for upstream zebra changes), and - like manual dispatches - sets
 # ZECD_REGTEST_EXTENDED=1 so the extended tests (reorg, multiwallet, stop/restore, watch-only) run too;
 # on PR runs those skip in seconds (each spins its own zebra+lightwalletd stack).
+#
+# The note-scaling stress test (regtest_stress_notes) is heavier still - it builds thousands of
+# notes and times multi-minute sends - so it is gated separately (ZECD_REGTEST_STRESS) and runs
+# ONLY on a monthly cron (1st of the month) or a manual dispatch with the `stress` box ticked.
+# It compiles on every run but skips in seconds otherwise.
 
 on:
   workflow_dispatch:
@@ -22,9 +27,20 @@ on:
         description: "zfnd/zebra image tag to test against (e.g. 5.0.0, latest)"
         required: false
         default: ""
+      stress:
+        description: "Run the heavy note-scaling stress test (regtest_stress_notes)"
+        type: boolean
+        default: false
+      stress-note-count:
+        description: "Notes to build in the stress test (blank = default 256)"
+        required: false
+        default: ""
   schedule:
     # Weekly canary against zfnd/zebra:latest (Mondays 06:17 UTC; an off-peak odd minute).
     - cron: "17 6 * * 1"
+    # Monthly note-scaling stress run (1st of the month, 07:33 UTC). This cron - and only this
+    # one - enables ZECD_REGTEST_STRESS; the weekly cron above leaves the stress test skipping.
+    - cron: "33 7 1 * *"
   push:
     branches: [main, master]
     paths:
@@ -76,7 +92,7 @@ jobs:
         image: ${{ github.event_name == 'schedule' && fromJSON('["pinned", "latest"]') || fromJSON('["event"]') }}
         include:
           - suite: zecd
-            tests: --test regtest_e2e --test regtest_funded --test regtest_proving_cache --test regtest_sapling --test regtest_hang --test regtest_reorg --test regtest_multiwallet --test regtest_restore --test regtest_watchonly
+            tests: --test regtest_e2e --test regtest_funded --test regtest_proving_cache --test regtest_sapling --test regtest_hang --test regtest_reorg --test regtest_multiwallet --test regtest_restore --test regtest_watchonly --test regtest_stress_notes
     name: regtest (${{ matrix.suite }}, ${{ matrix.image }})
     steps:
       - uses: actions/checkout@v4
@@ -178,6 +194,11 @@ jobs:
           # The extended tier (reorg, multiwallet, stop/restore, watch-only) runs on the weekly "big
           # run" and on manual dispatches; PR/push runs let those tests skip in seconds.
           ZECD_REGTEST_EXTENDED: ${{ (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && '1' || '' }}
+          # The heavy note-scaling stress test runs ONLY on the monthly cron (the 1st-of-month
+          # schedule) and on a manual dispatch that ticks `stress` - never on push/PR, and not on
+          # the weekly cron. Its note target is `stress-note-count` on dispatch (blank → default 256).
+          ZECD_REGTEST_STRESS: ${{ (github.event.schedule == '33 7 1 * *' || (github.event_name == 'workflow_dispatch' && inputs.stress)) && '1' || '' }}
+          ZECD_STRESS_NOTE_COUNT: ${{ inputs.stress-note-count }}
           # ZEBRAD_BIN / LIGHTWALLETD_BIN are exported by the provisioning step above.
         # --locked: build against the committed lock. Single-threaded: two zebrad+lightwalletd
         # stacks plus Orchard proving would contend badly on a 2-core runner.

@@ -286,6 +286,15 @@ pub struct SpendConfig {
     /// set `cache_proving_key = false` to fall back to the fused path (e.g. for benchmarking
     /// or if a PCZT issue is suspected). Both paths produce identical transactions.
     pub cache_proving_key: bool,
+    /// Run a send's proving step *off* the single-writer actor so it no longer freezes the
+    /// background sync (and reads/status/mempool) for the whole proof - which, on a large,
+    /// note-fragmented wallet, can be many minutes. The actor still serializes sends (only one
+    /// proof is uncommitted at a time, so there is no double-spend surface and no reservation
+    /// overlay); the win is that sync stays live while the proof runs on a blocking thread.
+    /// Only engages on the cached-Orchard PCZT path (an Orchard-only wallet with
+    /// `cache_proving_key` on); a Sapling-spending wallet keeps the inline fused path. **Off by
+    /// default** - flip it on once validated by the funded/stress regtest tiers.
+    pub pipeline_proving: bool,
 }
 
 impl Default for SpendConfig {
@@ -296,6 +305,7 @@ impl Default for SpendConfig {
             privacy: SendPrivacy::AllowRevealedRecipients,
             orchard_action_limit: DEFAULT_ORCHARD_ACTION_LIMIT,
             cache_proving_key: true,
+            pipeline_proving: false,
         }
     }
 }
@@ -470,6 +480,7 @@ struct SpendFile {
     privacy_policy: Option<String>,
     orchard_action_limit: Option<usize>,
     cache_proving_key: Option<bool>,
+    pipeline_proving: Option<bool>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -849,6 +860,7 @@ impl AppConfig {
                 .orchard_action_limit
                 .unwrap_or(DEFAULT_ORCHARD_ACTION_LIMIT),
             cache_proving_key: spend_file.cache_proving_key.unwrap_or(true),
+            pipeline_proving: spend_file.pipeline_proving.unwrap_or(false),
         };
         // Fail at startup, not on the first balance/send call.
         spend.confirmations_policy()?;
@@ -1116,6 +1128,17 @@ mod tests {
         assert_eq!(f.orchard_action_limit, Some(200));
         let f: SpendFile = toml::from_str("orchard_action_limit = 0").unwrap();
         assert_eq!(f.orchard_action_limit, Some(0));
+    }
+
+    #[test]
+    fn pipeline_proving_defaults_off_and_parses() {
+        // Absent → off (the inline send path, byte-identical to today's behaviour).
+        assert!(!SpendConfig::default().pipeline_proving);
+        // Explicit value round-trips both ways.
+        let f: SpendFile = toml::from_str("pipeline_proving = true").unwrap();
+        assert_eq!(f.pipeline_proving, Some(true));
+        let f: SpendFile = toml::from_str("pipeline_proving = false").unwrap();
+        assert_eq!(f.pipeline_proving, Some(false));
     }
 
     #[test]
