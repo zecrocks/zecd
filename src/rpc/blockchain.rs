@@ -15,9 +15,13 @@ use crate::state::AppState;
 use crate::wallet::read;
 
 /// The best (fully-scanned) block's `(height, hash, time)`, when known. Falls back to the
-/// upstream tip hash in the brief window before anything has been scanned.
-fn best_block(state: &AppState) -> Result<(u32, Option<String>, Option<i64>), RpcError> {
-    let w = state.registry.get(None)?;
+/// upstream tip hash in the brief window before anything has been scanned. Resolves the
+/// `/wallet/<name>`-routed wallet so a syncing wallet reports its own height, not the default's.
+fn best_block(
+    state: &AppState,
+    wallet: Option<&str>,
+) -> Result<(u32, Option<String>, Option<i64>), RpcError> {
+    let w = state.registry.get(wallet)?;
     let st = w.status();
     if let Some(h) = st.fully_scanned {
         if let Some((hash, time)) = read::block_info_at(&w.dir, h)? {
@@ -29,10 +33,10 @@ fn best_block(state: &AppState) -> Result<(u32, Option<String>, Option<i64>), Rp
 
 /// `getblockchaininfo` - chain/sync overview; `blocks`/`headers` follow the module-level
 /// height conventions and `initialblockdownload` mirrors the wallet's scanning state.
-pub(crate) fn getblockchaininfo(state: &AppState) -> Result<Value, RpcError> {
-    let w = state.registry.get(None)?;
+pub(crate) fn getblockchaininfo(state: &AppState, wallet: Option<&str>) -> Result<Value, RpcError> {
+    let w = state.registry.get(wallet)?;
     let st = w.status();
-    let (blocks, best_hash, best_time) = best_block(state)?;
+    let (blocks, best_hash, best_time) = best_block(state, wallet)?;
     let headers = st.chain_tip.unwrap_or(blocks);
     let mediantime = read::median_time_past(&w.dir, blocks).ok().flatten();
     Ok(json!({
@@ -54,15 +58,15 @@ pub(crate) fn getblockchaininfo(state: &AppState) -> Result<Value, RpcError> {
 }
 
 /// `getblockcount` - the fully-scanned height (the height at which balances are accurate).
-pub(crate) fn getblockcount(state: &AppState) -> Result<Value, RpcError> {
-    let w = state.registry.get(None)?;
+pub(crate) fn getblockcount(state: &AppState, wallet: Option<&str>) -> Result<Value, RpcError> {
+    let w = state.registry.get(wallet)?;
     Ok(json!(w.status().fully_scanned.unwrap_or(0)))
 }
 
 /// `getbestblockhash` - the hash of the [`getblockcount`] block (`-1` while nothing is
 /// scanned yet).
-pub(crate) fn getbestblockhash(state: &AppState) -> Result<Value, RpcError> {
-    match best_block(state)? {
+pub(crate) fn getbestblockhash(state: &AppState, wallet: Option<&str>) -> Result<Value, RpcError> {
+    match best_block(state, wallet)? {
         (_, Some(hash), _) => Ok(Value::String(hash)),
         _ => Err(RpcError::misc(
             "best block hash not yet known (still syncing)",
@@ -72,14 +76,18 @@ pub(crate) fn getbestblockhash(state: &AppState) -> Result<Value, RpcError> {
 
 /// `getblockhash <height>` - answered from the wallet's scanned-blocks table (or the sync
 /// status for the not-yet-scanned tip); heights outside the wallet's range are `-8`.
-pub(crate) fn getblockhash(state: &AppState, req: &RpcRequest) -> Result<Value, RpcError> {
+pub(crate) fn getblockhash(
+    state: &AppState,
+    wallet: Option<&str>,
+    req: &RpcRequest,
+) -> Result<Value, RpcError> {
     let height = req
         .param(0)
         .and_then(|v| v.as_u64())
         .filter(|h| *h <= u64::from(u32::MAX))
         .ok_or_else(|| RpcError::invalid_params("getblockhash requires a height"))?
         as u32;
-    let w = state.registry.get(None)?;
+    let w = state.registry.get(wallet)?;
     // Any block the wallet has scanned can be answered from the wallet DB; the not-yet-scanned
     // chain tip is answered from the sync status. Anything else (below the wallet birthday,
     // beyond the tip) is out of range for a light wallet.
@@ -117,7 +125,11 @@ fn parse_blockhash_param(s: &str) -> Result<(), RpcError> {
 /// the `previousblockhash`/`nextblockhash` links (no version/merkleroot/nonce/bits/
 /// difficulty - a light client never sees them). The common poller pattern - walk
 /// `nextblockhash` from a checkpoint, read `height`/`confirmations`/`time` - works.
-pub(crate) fn getblockheader(state: &AppState, req: &RpcRequest) -> Result<Value, RpcError> {
+pub(crate) fn getblockheader(
+    state: &AppState,
+    wallet: Option<&str>,
+    req: &RpcRequest,
+) -> Result<Value, RpcError> {
     let hash = req.require_str(0, "getblockheader requires a block hash")?;
     parse_blockhash_param(hash)?;
     // Param 1 (verbose, default true): the non-verbose form is the serialized 80-byte-style
@@ -133,7 +145,7 @@ pub(crate) fn getblockheader(state: &AppState, req: &RpcRequest) -> Result<Value
         Some(_) => return Err(RpcError::type_error("verbose must be a boolean")),
     }
 
-    let w = state.registry.get(None)?;
+    let w = state.registry.get(wallet)?;
     let height = read::block_height_by_hash(&w.dir, hash)?
         .ok_or_else(|| RpcError::invalid_address_or_key("Block not found"))?;
     let (_, time) = read::block_info_at(&w.dir, height)?

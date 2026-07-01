@@ -114,11 +114,11 @@ async fn dispatch_zecd(
         "ping" => network::ping(),
 
         // Blockchain
-        "getblockchaininfo" => blockchain::getblockchaininfo(state),
-        "getblockcount" => blockchain::getblockcount(state),
-        "getbestblockhash" => blockchain::getbestblockhash(state),
-        "getblockhash" => blockchain::getblockhash(state, req),
-        "getblockheader" => blockchain::getblockheader(state, req),
+        "getblockchaininfo" => blockchain::getblockchaininfo(state, wallet),
+        "getblockcount" => blockchain::getblockcount(state, wallet),
+        "getbestblockhash" => blockchain::getbestblockhash(state, wallet),
+        "getblockhash" => blockchain::getblockhash(state, wallet, req),
+        "getblockheader" => blockchain::getblockheader(state, wallet, req),
 
         // Utility
         "validateaddress" => util::validateaddress(state, wallet, req),
