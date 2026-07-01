@@ -550,6 +550,38 @@ pub async fn spawn(
     ))
 }
 
+/// Fetch the upstream's current tip and record it as the wallet DB's chain tip, returning the
+/// parsed tip height plus its block hash (upstream/internal byte order). This is the first step
+/// of the pre-spend catch-up (`sync_to_tip_for_send`): librustzcash derives a transaction's
+/// target height - and thus its expiry (target + expiry delta) - from the DB's chain tip, so
+/// before a spend the tip must reflect the *real* chain, not zecd's last-scanned height (which
+/// lags under load). Recording the tip also extends the scan queue up to it, which the catch-up
+/// loop then scans. Extracted from `refresh_tip` as a free function so that "a stale DB tip
+/// advances to the upstream tip" contract can be unit-tested against the fake zebrad without
+/// spinning up a full actor + prover.
+pub(crate) async fn fetch_and_store_chain_tip(
+    client: &mut impl ChainSource,
+    db: &mut WriteDb,
+) -> anyhow::Result<(BlockHeight, Vec<u8>)> {
+    let (tip, hash) = fetch_chain_tip(client).await?;
+    db.update_chain_tip(tip)?;
+    Ok((tip, hash))
+}
+
+/// Fetch the upstream's current tip (parsed height + block hash in upstream/internal byte
+/// order) without touching the wallet DB. `refresh_tip` uses this before the account bootstrap
+/// has run: with no account, `update_chain_tip` would floor the scan queue at a subtree
+/// boundary far below the birthday (see the comment in `refresh_tip`), so the tip must not be
+/// recorded yet.
+async fn fetch_chain_tip(client: &mut impl ChainSource) -> anyhow::Result<(BlockHeight, Vec<u8>)> {
+    let chain_tip = tokio::time::timeout(UNARY_RPC_TIMEOUT, client.latest_block())
+        .await
+        .map_err(|_| anyhow!("latest_block timed out after {UNARY_RPC_TIMEOUT:?}"))??;
+    let tip = BlockHeight::try_from(chain_tip.height)
+        .map_err(|_| anyhow!("chain tip height out of range"))?;
+    Ok((tip, chain_tip.hash))
+}
+
 /// The actor's view of the wallet's (single) account: its id, the ZIP-32 index spending keys
 /// derive at (`None` when no spending is possible), and whether the account is watch-only
 /// (imported UFVK - `init --ufvk`). `Ok(None)` means the data directory carries no account yet
@@ -1169,17 +1201,10 @@ impl WalletActor {
     }
 
     async fn refresh_tip(&mut self) -> anyhow::Result<()> {
-        let chain_tip = {
-            let client = self
-                .client
-                .as_mut()
-                .ok_or_else(|| anyhow!("not connected"))?;
-            tokio::time::timeout(UNARY_RPC_TIMEOUT, client.latest_block())
-                .await
-                .map_err(|_| anyhow!("latest_block timed out after {UNARY_RPC_TIMEOUT:?}"))??
-        };
-        let tip = BlockHeight::try_from(chain_tip.height)
-            .map_err(|_| anyhow!("chain tip height out of range"))?;
+        let client = self
+            .client
+            .as_mut()
+            .ok_or_else(|| anyhow!("not connected"))?;
         let prev = self.tip_height;
         // Only push the chain tip into the wallet DB once an account exists. `update_chain_tip`
         // derives the scan queue, and with no account `wallet_birthday` (MIN over accounts) is
@@ -1194,9 +1219,11 @@ impl WalletActor {
         // floor. So defer it: `maybe_bootstrap_account` calls `update_chain_tip` itself right
         // after creating the account (birthday now set → the scan floors at the birthday). We
         // still record the tip height/hash below so the bootstrap can run.
-        if self.account_id.is_some() {
-            self.db_data.update_chain_tip(tip)?;
-        }
+        let (tip, hash) = if self.account_id.is_some() {
+            fetch_and_store_chain_tip(client, &mut self.db_data).await?
+        } else {
+            fetch_chain_tip(client).await?
+        };
         self.tip_height = Some(u32::from(tip));
         // Announce a freshly established connection now that we know the upstream's tip. Logged
         // once per connection (reset by `mark_disconnected`), so connect/disconnect pair up.
@@ -1215,8 +1242,8 @@ impl WalletActor {
             prev,
             u32::from(tip)
         );
-        if chain_tip.hash.len() == 32 {
-            let mut h = chain_tip.hash.clone();
+        if hash.len() == 32 {
+            let mut h = hash;
             h.reverse();
             self.tip_hash = Some(hex::encode(h));
         }
@@ -1702,6 +1729,63 @@ impl WalletActor {
         Ok((ua.encode(&self.network), u128::from(j)))
     }
 
+    /// Best-effort catch-up sync run once before each spend so the transaction is built
+    /// against zebra's real chain tip (see the call site in `do_send`).
+    ///
+    /// librustzcash derives a transaction's target height - and thus its expiry (target +
+    /// expiry delta) - from the wallet DB's chain tip, so a spend built while that tip lags
+    /// zebra's real tip by more than the expiry delta lands already-expired and zebra rejects
+    /// it with -25. It is NOT enough to just bump the DB chain tip, though: librustzcash also
+    /// derives the spend *anchor* (target − confirmations) from the same tip, and its
+    /// spendability check zeroes the entire shielded balance when the anchor falls in a range
+    /// that hasn't been scanned (`zcash_client_sqlite`'s `get_wallet_summary`). So we must pull
+    /// the tip in *and* scan up to it: refresh the tip (records zebra's real tip, extending the
+    /// scan queue), then drive `sync_step` until caught up, leaving no unscanned range below the
+    /// anchor. After this, both the expiry and the anchor are valid.
+    ///
+    /// Normally the actor's sync loop already keeps the wallet caught up, so this is a no-op
+    /// (one latest-block RPC, then a `sync_step` that reports no work). Only when the loop has
+    /// starved under load - the case that produced the intermittent -25 - does it actually scan
+    /// a gap here, on the actor thread it already holds for the send. The catch-up loop targets
+    /// the tip captured by `refresh_tip` (it isn't re-bumped mid-loop), so newly-mined blocks
+    /// can't make it spin; it terminates once that tip is scanned.
+    ///
+    /// Best-effort throughout: an unreachable upstream or a sync error logs and falls back to
+    /// the last-scanned tip (the send then rides the usual commit/rebroadcast path, and would
+    /// fail at broadcast anyway if the upstream is truly gone), so this must never hard-fail the
+    /// spend.
+    async fn sync_to_tip_for_send(&mut self) {
+        if self.client.is_none() {
+            if let Err(e) = self.connect().await {
+                warn!(
+                    "[{}] could not reach upstream to sync before sending ({e}); building \
+                     against the last-scanned height",
+                    self.name
+                );
+                return;
+            }
+        }
+        // Record zebra's real tip (and extend the scan queue up to it).
+        if let Err(e) = self.refresh_tip().await {
+            // A failed refresh means the client is likely stale; drop it so the broadcast
+            // path reconnects cleanly, and build against the last-scanned tip.
+            self.mark_disconnected(format!("tip refresh before send failed ({e})"));
+            return;
+        }
+        // Scan up to that tip so the spend anchor lands in a fully-scanned range. Bounded: the
+        // target is the tip just captured, so the loop ends when the wallet reaches it.
+        loop {
+            match self.sync_step().await {
+                Ok(true) => continue,
+                Ok(false) => break,
+                Err(e) => {
+                    self.mark_disconnected(format!("sync before send failed ({e})"));
+                    break;
+                }
+            }
+        }
+    }
+
     /// Whether sends on this wallet use the cached-Orchard PCZT path (so prove and store are
     /// separable). True for the default Orchard-only wallet with `cache_proving_key` on. A
     /// Sapling-spending wallet (or `cache_proving_key` off) uses the fused path, which has no
@@ -1787,6 +1871,15 @@ impl WalletActor {
         // hasn't fired yet (e.g. a long sync batch was in progress), lock now so the spend
         // can't slip through past its timeout. `derive_usk` then returns -13 as expected.
         self.relock_if_expired();
+
+        // Catch up to zebra's real chain tip before building the spend, so the transaction's
+        // target height - and therefore its expiry (target + expiry delta) - is computed
+        // against the real tip rather than zecd's last-scanned height, which can lag it under
+        // load and produce an already-expired tx that zebra rejects with -25. This scans up to
+        // the tip (not just bumps the pointer) so the spend anchor also lands in a fully-scanned
+        // range; normally a no-op because the sync loop keeps the wallet caught up.
+        self.sync_to_tip_for_send().await;
+
         let account_index = self.account_index.ok_or_else(private_keys_disabled)?;
         // Lock the shared seed only long enough to derive the spending key; the guard is released
         // before the (long) proving below, so a concurrent `walletlock` fast path can zeroize the
@@ -1967,6 +2060,16 @@ impl WalletActor {
         reply: oneshot::Sender<Result<TxId, RpcError>>,
     ) {
         self.relock_if_expired();
+
+        // Catch up to zebra's real chain tip before phase A builds the proposal, so the
+        // transaction's target/expiry height and spend anchor are computed against the real tip
+        // rather than zecd's last-scanned height (which lags under load, producing an
+        // already-expired -25). Mirrors the call in `do_send` for the non-pipelined path; a
+        // no-op when the sync loop already has the wallet caught up. Runs here (not in
+        // `begin_or_queue_send`) so a send queued behind an in-flight proof re-syncs when it
+        // actually starts, keeping its tip fresh.
+        self.sync_to_tip_for_send().await;
+
         let account_index = match self.account_index.ok_or_else(private_keys_disabled) {
             Ok(i) => i,
             Err(e) => {
