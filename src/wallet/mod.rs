@@ -35,6 +35,13 @@ use crate::wallet::store::Passphrase;
 /// actor prunes entries once their tx mines, so the map stays bounded by the unmined set.
 pub type FirstSeen = Arc<Mutex<HashMap<String, i64>>>;
 
+/// Shared, independently-lockable custody of the decrypted seed (see [`keys::SeedKeeper`]).
+/// The wallet actor is the seed's normal owner/writer, but `walletlock`'s fast path locks this
+/// directly from the [`WalletHandle`] - bypassing the actor's serialized command queue - so the
+/// seed can be zeroized promptly even while the actor is blocked proving a long send. `Arc<Mutex>`
+/// mirrors [`FirstSeen`]; the guarded operations are trivial and never `.await` while held.
+pub type SharedSeed = Arc<Mutex<keys::SeedKeeper>>;
+
 /// Connection state to lightwalletd, surfaced for monitoring (e.g. to distinguish "all
 /// upstreams down" from "still syncing" on `/readyz`).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -188,6 +195,10 @@ pub struct WalletHandle {
     /// Transient first-seen times for unmined txs, shared with the actor (the writer). See
     /// [`FirstSeen`].
     first_seen: FirstSeen,
+    /// The shared seed, present only for a passphrase-encrypted wallet - the only kind
+    /// `walletlock` can lock. `Some` enables the fast path in [`WalletHandle::lock`]; `None`
+    /// (unencrypted/watch-only) makes it a no-op so the actor returns the usual `-15`.
+    seed: Option<SharedSeed>,
     cmd_tx: mpsc::Sender<WalletCommand>,
     status_rx: watch::Receiver<SyncStatus>,
 }
@@ -292,7 +303,27 @@ impl WalletHandle {
         .await
     }
 
+    /// `walletlock`: drop the decrypted seed.
+    ///
+    /// Fast path (belt-and-suspenders): the wallet actor processes one command at a time, so a
+    /// `Lock` queued behind a send that is mid-proof would otherwise wait out the whole proving
+    /// window before the seed is zeroized - leaving the decrypted seed resident far longer than
+    /// the operator intended. For an encrypted wallet, zeroize the in-memory seed *immediately*,
+    /// without waiting for the actor's queue. The in-flight send already derived its spending key
+    /// into a local before proving, so this can't disturb it; any *queued* send then fails `-13`
+    /// (unlock needed) when it reaches key derivation, which is the correct post-lock behavior.
+    ///
+    /// The actor still runs the `Lock` command below: it is the single writer of the relock
+    /// deadline and the published status, and it returns the authoritative result (notably `-15`
+    /// for an unencrypted wallet, which carries no `seed` here and so skips the fast path).
+    /// [`keys::SeedKeeper::lock`] is idempotent, so the actor re-locking an already-locked seed is
+    /// a harmless no-op.
     pub async fn lock(&self) -> Result<(), RpcError> {
+        if let Some(seed) = &self.seed {
+            // Recover from a poisoned mutex (a panic while a guard was held): a locked-out seed
+            // that can never be zeroized would be strictly worse than proceeding.
+            seed.lock().unwrap_or_else(|p| p.into_inner()).lock();
+        }
         self.dispatch(|reply| WalletCommand::Lock { reply }).await
     }
 }
@@ -346,6 +377,7 @@ pub(crate) fn make_handle(
     enabled_pools: PoolSet,
     default_receivers: PoolSet,
     first_seen: FirstSeen,
+    seed: Option<SharedSeed>,
     cmd_tx: mpsc::Sender<WalletCommand>,
     status_rx: watch::Receiver<SyncStatus>,
 ) -> WalletHandle {
@@ -357,7 +389,100 @@ pub(crate) fn make_handle(
         enabled_pools,
         default_receivers,
         first_seen,
+        seed,
         cmd_tx,
         status_rx,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    use secrecy::SecretVec;
+
+    use crate::pools::Pool;
+
+    fn handle_with_seed(seed: Option<SharedSeed>) -> (WalletHandle, mpsc::Receiver<WalletCommand>) {
+        let (cmd_tx, cmd_rx) = mpsc::channel(4);
+        // The sender is dropped here; a watch receiver still reads the last value after that, and
+        // these tests never call `status()` anyway.
+        let (_status_tx, status_rx) = watch::channel(SyncStatus::default());
+        let handle = make_handle(
+            "t".into(),
+            PathBuf::from("/nonexistent"),
+            crate::network::regtest(),
+            ConfirmationsPolicy::default(),
+            PoolSet::single(Pool::Orchard),
+            PoolSet::single(Pool::Orchard),
+            Arc::new(Mutex::new(HashMap::new())),
+            seed,
+            cmd_tx,
+            status_rx,
+        );
+        (handle, cmd_rx)
+    }
+
+    /// `walletlock`'s fast path must zeroize the seed *immediately*, before the actor drains its
+    /// command queue - this is the whole point: an operator can lock a wallet whose actor is
+    /// blocked proving a long send. We stand in for a mid-proof actor with one that receives the
+    /// `Lock` command but delays its reply, and assert the shared seed is already gone while the
+    /// `lock()` call is still waiting on that reply.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn walletlock_fast_path_zeroizes_seed_before_actor_replies() {
+        let shared: SharedSeed = Arc::new(Mutex::new(keys::SeedKeeper::unlocked(SecretVec::new(
+            vec![7u8; 32],
+        ))));
+        let (handle, mut cmd_rx) = handle_with_seed(Some(shared.clone()));
+        assert!(shared.lock().unwrap().is_unlocked());
+
+        // A deliberately slow "busy actor": it accepts the Lock but replies only after a delay,
+        // the way an actor stuck in `block_in_place` proving would.
+        let actor = tokio::spawn(async move {
+            match cmd_rx.recv().await {
+                Some(WalletCommand::Lock { reply }) => {
+                    tokio::time::sleep(Duration::from_millis(300)).await;
+                    let _ = reply.send(Ok(()));
+                }
+                _ => panic!("expected a Lock command"),
+            }
+        });
+
+        let lock_call = tokio::spawn(async move { handle.lock().await });
+
+        // Well within the actor's 300ms reply delay: the fast path should already have zeroized
+        // the seed even though `lock()` has not returned yet.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(
+            !shared.lock().unwrap().is_unlocked(),
+            "fast path must zeroize the seed before the busy actor replies"
+        );
+        assert!(
+            !lock_call.is_finished(),
+            "lock() should still be awaiting the actor"
+        );
+
+        // And once the actor finally drains the command, the call completes successfully.
+        lock_call.await.unwrap().unwrap();
+        actor.await.unwrap();
+    }
+
+    /// A handle with no shared seed (an unencrypted or watch-only wallet) has no fast path: it
+    /// simply forwards `Lock` to the actor, which is the authority on the `-15`/`-4` result.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn walletlock_without_shared_seed_defers_to_actor() {
+        let (handle, mut cmd_rx) = handle_with_seed(None);
+        let actor = tokio::spawn(async move {
+            match cmd_rx.recv().await {
+                Some(WalletCommand::Lock { reply }) => {
+                    let _ = reply.send(Err(RpcError::misc("from actor")));
+                }
+                _ => panic!("expected Lock"),
+            }
+        });
+        let err = handle.lock().await.unwrap_err();
+        assert_eq!(err.message, "from actor");
+        actor.await.unwrap();
     }
 }

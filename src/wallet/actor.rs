@@ -49,7 +49,8 @@ use crate::wallet::keys::{self, SeedKeeper};
 use crate::wallet::open::{self, WriteDb};
 use crate::wallet::read;
 use crate::wallet::{
-    make_handle, store, ConnState, FirstSeen, RawTx, SyncStatus, WalletCommand, WalletHandle,
+    make_handle, store, ConnState, FirstSeen, RawTx, SharedSeed, SyncStatus, WalletCommand,
+    WalletHandle,
 };
 
 /// Note-management defaults for change splitting (match zcash-devtool's send defaults).
@@ -293,7 +294,9 @@ struct WalletActor {
     /// actor's command loop drains it to run phase C on the single writer.
     send_done_tx: mpsc::Sender<SendCompletion>,
     send_done_rx: mpsc::Receiver<SendCompletion>,
-    seed: SeedKeeper,
+    /// The decrypted seed, shared with the [`WalletHandle`] so `walletlock` can zeroize it
+    /// without waiting on this actor's command queue. See [`SharedSeed`].
+    seed: SharedSeed,
     status_tx: watch::Sender<SyncStatus>,
     cmd_rx: mpsc::Receiver<WalletCommand>,
     tip_height: Option<u32>,
@@ -474,6 +477,14 @@ pub async fn spawn(
     let first_seen: FirstSeen =
         std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
 
+    // Share the seed with the handle so `walletlock` can zeroize it directly (the fast path),
+    // but only for a passphrase-encrypted wallet - the only kind that can be locked. An
+    // unencrypted (identity/auto-unlock) or watch-only wallet keeps `None` on the handle, so its
+    // `walletlock` falls through to the actor's `-15`, and its always-resident seed is never
+    // zeroized out from under an in-flight send.
+    let seed: SharedSeed = std::sync::Arc::new(std::sync::Mutex::new(seed));
+    let handle_seed = encrypted.then(|| seed.clone());
+
     let actor = WalletActor {
         name: cfg.name.clone(),
         network: cfg.network,
@@ -531,6 +542,7 @@ pub async fn spawn(
             cfg.enabled_pools,
             cfg.default_receivers,
             first_seen,
+            handle_seed,
             cmd_tx,
             status_rx,
         ),
@@ -1255,7 +1267,7 @@ impl WalletActor {
             return;
         }
         // A copy of the seed (zeroized on drop); absent means the wallet is still locked.
-        let Some(seed) = self.seed.clone_seed() else {
+        let Some(seed) = seed_guard(&self.seed).clone_seed() else {
             return;
         };
         let Some(tip) = self.tip_height else {
@@ -1597,7 +1609,7 @@ impl WalletActor {
     /// in-memory seed and clear the deadline. Cheap and idempotent.
     fn relock_if_expired(&mut self) {
         if self.unlock_until.is_some_and(|t| Instant::now() >= t) {
-            self.seed.lock();
+            seed_guard(&self.seed).lock();
             self.unlock_until = None;
             info!(
                 "[{}] wallet auto-locked (walletpassphrase timeout elapsed)",
@@ -1776,7 +1788,10 @@ impl WalletActor {
         // can't slip through past its timeout. `derive_usk` then returns -13 as expected.
         self.relock_if_expired();
         let account_index = self.account_index.ok_or_else(private_keys_disabled)?;
-        let usk = self.seed.derive_usk(self.network, account_index)?;
+        // Lock the shared seed only long enough to derive the spending key; the guard is released
+        // before the (long) proving below, so a concurrent `walletlock` fast path can zeroize the
+        // resident seed while this send proves with its already-derived local USK.
+        let usk = seed_guard(&self.seed).derive_usk(self.network, account_index)?;
         // A per-call `minconf` (z_sendmany) overrides the wallet-wide policy for this send's
         // note selection; the synchronous sends pass `None` and use the configured policy.
         let policy = confirmations.unwrap_or(self.confirmations_policy);
@@ -1959,7 +1974,10 @@ impl WalletActor {
                 return;
             }
         };
-        let usk = match self.seed.derive_usk(self.network, account_index) {
+        // Lock the shared seed only long enough to derive the spending key; the guard is released
+        // before the (long) proving below, so a concurrent `walletlock` fast path can zeroize the
+        // resident seed while this send proves with its already-derived local USK.
+        let usk = match seed_guard(&self.seed).derive_usk(self.network, account_index) {
             Ok(u) => u,
             Err(e) => {
                 let _ = reply.send(Err(e));
@@ -2296,7 +2314,7 @@ impl WalletActor {
                 )
             })?
             .ok_or_else(|| RpcError::wallet("wallet has no stored seed"))?;
-        self.seed.set(seed);
+        seed_guard(&self.seed).set(seed);
         // Re-running walletpassphrase overwrites the deadline (resets the timer). A timeout of 0
         // relocks ~immediately, which `relock_if_expired` then enforces.
         self.unlock_until = Some(Instant::now() + Duration::from_secs(timeout_secs.max(0) as u64));
@@ -2305,7 +2323,7 @@ impl WalletActor {
         // available, rebuild the account from keys.toml right away (best-effort; if the upstream
         // isn't connected yet the regular sync loop retries). Skipped if the timeout was 0 (the
         // seed was just relocked) or no bootstrap is pending.
-        if self.pending_bootstrap.is_some() && self.seed.is_unlocked() {
+        if self.pending_bootstrap.is_some() && seed_guard(&self.seed).is_unlocked() {
             self.maybe_bootstrap_account().await;
         }
         self.update_status();
@@ -2320,7 +2338,7 @@ impl WalletActor {
                 "Error: running with an unencrypted wallet, but walletlock was called.",
             ));
         }
-        self.seed.lock();
+        seed_guard(&self.seed).lock();
         self.unlock_until = None;
         self.update_status();
         Ok(())
@@ -2478,6 +2496,14 @@ async fn mempool_next(
         Some(s) => s.message().await,
         None => std::future::pending().await,
     }
+}
+
+/// Lock the shared seed, recovering from a poisoned mutex. The guarded operations (derive/set/
+/// lock/clone) are trivial and shouldn't panic, but if one ever did while holding the guard,
+/// recovering the inner value keeps a single bad command from wedging every later seed access -
+/// and crucially never blocks `walletlock` from zeroizing the seed.
+fn seed_guard(seed: &SharedSeed) -> std::sync::MutexGuard<'_, SeedKeeper> {
+    seed.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 /// Sleep until the unlock deadline, or forever when there is none. Used as a `select!` arm so an
