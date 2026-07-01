@@ -171,13 +171,14 @@ pub async fn run(config: AppConfig) -> anyhow::Result<()> {
         operations: Arc::new(crate::operations::OperationRegistry::new()),
     };
 
-    // Translate Ctrl-C into a graceful shutdown (flag first, so in-flight new requests 503).
-    let ctrl_c_state = state.clone();
+    // Translate a termination signal into a graceful shutdown (flag first, so in-flight new
+    // requests 503). Both Ctrl-C (SIGINT) and SIGTERM are handled: init systems (systemd,
+    // Docker, k8s) stop the daemon with SIGTERM, and the README documents SIGINT/SIGTERM as
+    // equivalent stop signals.
+    let signal_state = state.clone();
     tokio::spawn(async move {
-        if tokio::signal::ctrl_c().await.is_ok() {
-            info!("received Ctrl-C, shutting down");
-            ctrl_c_state.trigger_shutdown();
-        }
+        wait_for_shutdown_signal().await;
+        signal_state.trigger_shutdown();
     });
 
     // Liveness/readiness probes on a separate port (best-effort; non-fatal if it can't bind).
@@ -211,6 +212,42 @@ pub async fn run(config: AppConfig) -> anyhow::Result<()> {
         }
     }
     result
+}
+
+/// Await the first termination signal and return so the caller can trigger a graceful shutdown.
+///
+/// Both SIGINT (Ctrl-C) and SIGTERM are treated identically - the README advertises them as
+/// interchangeable stop signals, and process managers stop the daemon with SIGTERM. On non-Unix
+/// platforms only Ctrl-C is available. If the SIGTERM handler can't be installed we fall back to
+/// Ctrl-C alone rather than aborting startup.
+async fn wait_for_shutdown_signal() {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{signal, SignalKind};
+        let mut term = match signal(SignalKind::terminate()) {
+            Ok(term) => term,
+            Err(e) => {
+                warn!("could not install SIGTERM handler: {e}; only Ctrl-C will stop the daemon");
+                let _ = tokio::signal::ctrl_c().await;
+                info!("received Ctrl-C, shutting down");
+                return;
+            }
+        };
+        tokio::select! {
+            r = tokio::signal::ctrl_c() => {
+                if r.is_ok() {
+                    info!("received Ctrl-C, shutting down");
+                }
+            }
+            _ = term.recv() => info!("received SIGTERM, shutting down"),
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        if tokio::signal::ctrl_c().await.is_ok() {
+            info!("received Ctrl-C, shutting down");
+        }
+    }
 }
 
 /// Log the configured RPC authentication method(s) at startup, mirroring the credential union
