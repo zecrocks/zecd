@@ -95,6 +95,17 @@ async fn handle(
         );
     }
 
+    // Bound concurrent in-flight requests like bitcoind's work queue; excess → 503. This gate
+    // must precede the auth check: authentication (and its anti-bruteforce sleep on failure) is
+    // real work, so admitting it without a permit would let unauthenticated floods bypass the
+    // in-flight bound and starve legitimate clients.
+    let _permit = match state.work_queue.clone().try_acquire_owned() {
+        Ok(p) => p,
+        Err(_) => {
+            return plain_response(StatusCode::SERVICE_UNAVAILABLE, "Work queue depth exceeded");
+        }
+    };
+
     let auth_header = headers
         .get(header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok());
@@ -128,14 +139,6 @@ async fn handle(
         forwarded_for,
         "RPC authentication succeeded"
     );
-
-    // Bound concurrent in-flight requests like bitcoind's work queue; excess → 503.
-    let _permit = match state.work_queue.clone().try_acquire_owned() {
-        Ok(p) => p,
-        Err(_) => {
-            return plain_response(StatusCode::SERVICE_UNAVAILABLE, "Work queue depth exceeded");
-        }
-    };
 
     match jsonrpc::parse_body(&body) {
         Err(e) => json_response(status_for(&e), &jsonrpc::error(Value::Null, &e)),
@@ -291,7 +294,13 @@ mod tests {
     }
 
     fn req(body: &str, auth: Option<(&str, &str)>) -> Request<AxumBody> {
-        let mut b = Request::builder().method("POST").uri("/");
+        req_to("/", body, auth)
+    }
+
+    /// Like `req`, but targets an explicit URI (e.g. `/wallet/<name>`) so tests can drive the
+    /// `/wallet/<name>` routing path.
+    fn req_to(uri: &str, body: &str, auth: Option<(&str, &str)>) -> Request<AxumBody> {
+        let mut b = Request::builder().method("POST").uri(uri);
         if let Some((u, p)) = auth {
             let creds = base64::engine::general_purpose::STANDARD.encode(format!("{u}:{p}"));
             b = b.header("authorization", format!("Basic {creds}"));
@@ -441,6 +450,80 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(r.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    /// The in-flight bound must apply to *unauthenticated* traffic too: with the queue exhausted,
+    /// even a bad-credential request is rejected with 503 before the auth check (and its
+    /// anti-bruteforce sleep) runs - otherwise a bad-credential flood bypasses the work queue and
+    /// can degrade availability for legitimate clients.
+    #[tokio::test]
+    async fn work_queue_exhaustion_bounds_bad_credentials() {
+        use std::sync::Arc;
+        let mut state = test_state();
+        state.work_queue = Arc::new(tokio::sync::Semaphore::new(0));
+        let r = router(state)
+            .oneshot(req(
+                r#"{"method":"getnetworkinfo","id":1}"#,
+                Some(("u", "wrong")),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(r.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    /// The chain-status RPCs must honor `/wallet/<name>` routing (like the wallet methods), not
+    /// always report the default wallet's sync state. A default wallet caught up at height 2000
+    /// and a routed `w2` still scanning at 500 must report their *own* heights - otherwise an
+    /// integration polling `/wallet/w2` with `getblockcount` treats a not-yet-scanned deposit as
+    /// confirmed. `getblockcount` reads only the published sync status, so no DB/network is
+    /// involved (the other four chain-status RPCs thread the routed name identically).
+    #[tokio::test]
+    async fn getblockcount_honors_wallet_routing() {
+        use crate::network::ZNetwork;
+        use crate::wallet::{SyncStatus, WalletHandle};
+
+        let mut reg = WalletRegistry::new("default".into());
+        reg.insert(WalletHandle::for_test(
+            "default",
+            ZNetwork::Test,
+            SyncStatus {
+                fully_scanned: Some(2000),
+                scanning: false,
+                ..Default::default()
+            },
+        ));
+        reg.insert(WalletHandle::for_test(
+            "w2",
+            ZNetwork::Test,
+            SyncStatus {
+                fully_scanned: Some(500),
+                scanning: true,
+                ..Default::default()
+            },
+        ));
+        let mut state = test_state();
+        state.registry = Arc::new(reg);
+
+        // The default route reports the default wallet's height…
+        let r = router(state.clone())
+            .oneshot(req(
+                r#"{"method":"getblockcount","id":1}"#,
+                Some(("u", "p")),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(body_json(r).await["result"].as_u64(), Some(2000));
+
+        // …while /wallet/w2 reports w2's own (still-scanning) height, not the default's.
+        let r = router(state)
+            .oneshot(req_to(
+                "/wallet/w2",
+                r#"{"method":"getblockcount","id":1}"#,
+                Some(("u", "p")),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(body_json(r).await["result"].as_u64(), Some(500));
     }
 
     /// One-shot a single RPC call against a state whose `[rpc] allowed_methods` safelist is

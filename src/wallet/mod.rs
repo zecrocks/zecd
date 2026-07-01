@@ -23,6 +23,8 @@ use zip321::TransactionRequest;
 use crate::config::SendPrivacy;
 use crate::error::RpcError;
 use crate::network::ZNetwork;
+#[cfg(test)]
+use crate::pools::Pool;
 use crate::pools::PoolSet;
 use crate::wallet::store::Passphrase;
 
@@ -206,6 +208,29 @@ pub struct WalletHandle {
 impl WalletHandle {
     pub fn status(&self) -> SyncStatus {
         self.status_rx.borrow().clone()
+    }
+
+    /// Build a handle wired to a fixed [`SyncStatus`] for unit tests - no actor, no DB behind it.
+    /// The command channel is inert (its receiver is dropped, so any `dispatch` would fail), and
+    /// `dir` is empty; only `status()`/`name`/`network` reads are meaningful. Used to exercise
+    /// `/wallet/<name>` routing in RPC handlers that read solely from the published sync status.
+    #[cfg(test)]
+    pub(crate) fn for_test(name: &str, network: ZNetwork, status: SyncStatus) -> Self {
+        let (cmd_tx, _cmd_rx) = mpsc::channel(1);
+        // The receiver keeps borrowing the seeded value after the sender drops (tokio watch
+        // retains the last value), so the seeded status stays readable for the handle's life.
+        let (_status_tx, status_rx) = watch::channel(status);
+        WalletHandle {
+            name: name.to_string(),
+            dir: PathBuf::new(),
+            network,
+            confirmations: ConfirmationsPolicy::default(),
+            enabled_pools: PoolSet::single(Pool::Orchard),
+            default_receivers: PoolSet::single(Pool::Orchard),
+            first_seen: Arc::new(Mutex::new(HashMap::new())),
+            cmd_tx,
+            status_rx,
+        }
     }
 
     /// Snapshot of the transient first-seen times for unmined txs (display-hex txid → unix time),
