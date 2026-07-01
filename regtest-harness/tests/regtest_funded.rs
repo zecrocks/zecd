@@ -314,6 +314,20 @@ async fn regtest_funded_orchard_receive() {
         Some(RECEIVE_MEMO),
         "gettransaction's receive detail decodes the memo: {recv_detail}"
     );
+    // A pure receive reports `amount` == exactly what arrived (fee-exclusive) and carries no
+    // top-level `fee` - like bitcoind, where `fee` appears only on txs the wallet sent.
+    // librustzcash records a fee for every fully-shielded tx (derived from the public value
+    // balance, even for a tx the wallet never paid for); this asserts zecd does not fold that
+    // phantom fee into the deposit amount or expose it.
+    assert_eq!(
+        gt_recv["amount"].as_f64(),
+        Some(FUND_ZATOSHIS as f64 / 100_000_000.0),
+        "gettransaction.amount on a pure receive equals what arrived, fee excluded: {gt_recv}"
+    );
+    assert!(
+        gt_recv.get("fee").is_none(),
+        "a pure receive carries no top-level fee field: {gt_recv}"
+    );
 
     // ---- Phase 2: zecd spends ----
 
