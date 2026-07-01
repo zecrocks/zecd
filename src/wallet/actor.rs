@@ -708,7 +708,7 @@ impl WalletActor {
                         Err(mpsc::error::TryRecvError::Disconnected) => return,
                     }
                 }
-                match self.sync_step().await {
+                match self.sync_step_caught().await {
                     Ok(worked) => {
                         if worked {
                             more_work = true;
@@ -724,7 +724,11 @@ impl WalletActor {
                             // set while requests remain so the loop keeps draining (servicing queued
                             // commands and republishing the shrinking backlog between batches)
                             // instead of going idle for a full `sync_interval` between each.
-                            let more_enhance = self.enhance_step().await;
+                            // Panic-isolated (#83): enhancement fetches and decrypts full txs, so it
+                            // shares the block scan's exposure to hostile/edge data - a poison tx is
+                            // logged and treated as "no more work this pass" rather than taking the
+                            // actor (and all wallet writes) down.
+                            let more_enhance = self.enhance_step_caught().await;
                             self.ensure_mempool_stream().await;
                             more_work = more_enhance;
                         }
@@ -881,6 +885,55 @@ impl WalletActor {
                 error!(
                     "[{}] wallet command handler panicked; the actor continues and the command \
                      failed (this is a bug - please report it)",
+                    self.name
+                );
+                false
+            }
+        }
+    }
+
+    /// Run one sync batch, catching any panic so it can't take the actor (and thus every wallet
+    /// *write*) down until process restart. The block scan funnels upstream block bytes through
+    /// the same `decrypt_and_store_transaction` as the command and mempool paths, so hostile or
+    /// edge chain data could trip a librustzcash panic here too; this is the third untrusted-data
+    /// ingress and gets the same isolation as `handle_command_caught` and the mempool-path guard.
+    /// A caught panic is surfaced to the caller as an error, so the loop paces retries via the
+    /// persistent-sync-error path instead of spinning on a poison batch (and `/readyz` reflects it).
+    async fn sync_step_caught(&mut self) -> anyhow::Result<bool> {
+        use futures_util::FutureExt as _;
+        match std::panic::AssertUnwindSafe(self.sync_step())
+            .catch_unwind()
+            .await
+        {
+            Ok(res) => res,
+            Err(_) => {
+                error!(
+                    "[{}] wallet sync batch panicked; the actor continues (this is a bug - \
+                     please report it)",
+                    self.name
+                );
+                Err(anyhow!("sync batch panicked"))
+            }
+        }
+    }
+
+    /// Run [`enhance_step`](Self::enhance_step), catching any panic. Enhancement
+    /// fetches full transactions from the upstream and decrypts them through the same
+    /// `decrypt_and_store_transaction`, so it shares the block scan's exposure to hostile/edge
+    /// data; isolate it for the same reason. Best-effort already, so a caught panic is just
+    /// logged and treated as "no more work this pass" - the still-pending requests are retried
+    /// on the next caught-up pass. Returns whether serviceable requests still remain (see
+    /// [`enhance_step`](Self::enhance_step)); a caught panic returns `false`.
+    async fn enhance_step_caught(&mut self) -> bool {
+        use futures_util::FutureExt as _;
+        match std::panic::AssertUnwindSafe(self.enhance_step())
+            .catch_unwind()
+            .await
+        {
+            Ok(more) => more,
+            Err(_) => {
+                error!(
+                    "[{}] transaction enhancement panicked; the actor continues",
                     self.name
                 );
                 false
