@@ -228,6 +228,8 @@ impl WalletHandle {
             enabled_pools: PoolSet::single(Pool::Orchard),
             default_receivers: PoolSet::single(Pool::Orchard),
             first_seen: Arc::new(Mutex::new(HashMap::new())),
+            // Inert test handle: no encrypted seed, so `walletlock` is a no-op (returns -15).
+            seed: None,
             cmd_tx,
             status_rx,
         }
