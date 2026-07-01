@@ -92,6 +92,26 @@ const UNARY_RPC_TIMEOUT: Duration = Duration::from_secs(30);
 /// unrecoverable reorg) can't spin the actor loop at full speed reconnecting and re-failing.
 const SYNC_ERROR_RETRY_INTERVAL: Duration = Duration::from_secs(2);
 
+/// How many transaction-enhancement requests to service per `enhance_step` call before
+/// yielding back to the actor loop. Enhancement runs only once the block scan is caught up,
+/// but it can be a multi-hour backlog on a from-birthday restore (one upstream
+/// `getrawtransaction` then decrypt/store per request). Draining it in bounded batches - instead
+/// of one monolithic pass - keeps the single-writer actor responsive: queued commands (sends) are
+/// serviced between batches and the shrinking backlog is republished on `SyncStatus` after each
+/// one. At ~0.3s/request this is a few seconds of work per batch.
+const ENHANCE_BATCH: usize = 16;
+
+/// Whether a [`TransactionDataRequest`] is one zecd can actually service (and therefore one that
+/// counts toward the enhancement backlog). `TransactionsInvolvingAddress` needs a transparent-txid
+/// query the `ChainSource` trait has no source for, so it's skipped - and deliberately *not*
+/// counted, since it never drains and would otherwise pin the backlog above zero forever.
+fn is_serviceable_request(req: &TransactionDataRequest) -> bool {
+    matches!(
+        req,
+        TransactionDataRequest::GetStatus(_) | TransactionDataRequest::Enhancement(_)
+    )
+}
+
 /// At bootstrap, warn when the derived scan floor lands more than one note-commitment-tree
 /// shard (2^16 blocks) below the wallet birthday - the symptom of the scan queue flooring at
 /// an in-progress subtree boundary instead of the birthday (the failure `maybe_bootstrap_account`
@@ -242,6 +262,13 @@ struct WalletActor {
     /// For an encrypted wallet that's currently unlocked: when the seed auto-relocks. Re-running
     /// `walletpassphrase` overwrites it (resetting the timer); `walletlock` clears it.
     unlock_until: Option<Instant>,
+    /// Serviceable transaction-data requests already attempted in the current enhancement drain.
+    /// Mirrors zcash-devtool/zkv's per-pass `satisfied` set, but carried across `enhance_step`
+    /// batches so a request the upstream can't satisfy (left in the DB after servicing) is
+    /// re-fetched at most once per drain instead of spinning the batch loop. Cleared whenever a
+    /// sync batch does work (new blocks may add or re-satisfy requests). Entries removed from the
+    /// DB by librustzcash on success simply never reappear.
+    enhance_satisfied: std::collections::BTreeSet<TransactionDataRequest>,
     /// Graceful-shutdown signal (see [`ActorConfig::shutdown`]).
     shutdown: watch::Receiver<bool>,
 }
@@ -424,6 +451,7 @@ pub async fn spawn(
         encrypted,
         watch_only,
         unlock_until: None,
+        enhance_satisfied: std::collections::BTreeSet::new(),
         shutdown: cfg.shutdown,
     };
 
@@ -567,14 +595,23 @@ impl WalletActor {
                 }
                 match self.sync_step().await {
                     Ok(worked) => {
-                        more_work = worked;
-                        if !worked {
+                        if worked {
+                            more_work = true;
+                            // New blocks were scanned, which may add or re-satisfy enhancement
+                            // requests - start the next drain from a clean slate.
+                            self.enhance_satisfied.clear();
+                        } else {
                             // Caught up: give any unmined wallet txs another shot at the mempool,
                             // pull the full data (memos, …) for transactions seen only as compact
                             // blocks, and (re)subscribe to incoming mempool txs for 0-conf visibility.
                             self.maybe_rebroadcast().await;
-                            self.enhance_transactions().await;
+                            // Drain one bounded batch of the enhancement backlog. Keep `more_work`
+                            // set while requests remain so the loop keeps draining (servicing queued
+                            // commands and republishing the shrinking backlog between batches)
+                            // instead of going idle for a full `sync_interval` between each.
+                            let more_enhance = self.enhance_step().await;
                             self.ensure_mempool_stream().await;
+                            more_work = more_enhance;
                         }
                     }
                     Err(e) => {
@@ -806,12 +843,32 @@ impl WalletActor {
         }
     }
 
-    /// Service the wallet's pending transaction-data requests - the "enhancement" step.
-    /// `scan_cached_blocks` records these (`WalletRead::transaction_data_requests`) while
-    /// scanning compact blocks, which carry no memos and no full transparent data: for each
-    /// request, fetch the full transaction from the upstream and either decrypt+store it
-    /// (which fills in `v_tx_outputs.memo` on received shielded outputs) or record its chain
-    /// status. Called only when caught up to the tip.
+    /// Count the serviceable transaction-data requests still pending in this enhancement drain -
+    /// the "enhancement backlog" surfaced on `SyncStatus.pending_enhancements`. This is the work
+    /// that remains *after* the block scan reaches the tip: compact blocks carry no memos, so each
+    /// pending request is one full-transaction fetch + decrypt/store away from being served.
+    /// Requests already attempted this drain (`enhance_satisfied`) and unsupported ones
+    /// ([`is_serviceable_request`]) are excluded, so a clean drain converges to zero. A DB read
+    /// error reports zero (best-effort; the count is observability, not a correctness gate).
+    fn count_pending_enhancements(&self) -> u64 {
+        match self.db_data.transaction_data_requests() {
+            Ok(reqs) => reqs
+                .iter()
+                .filter(|r| is_serviceable_request(r) && !self.enhance_satisfied.contains(r))
+                .count() as u64,
+            Err(e) => {
+                tracing::debug!("[{}] counting pending enhancements: {e}", self.name);
+                0
+            }
+        }
+    }
+
+    /// Service one bounded batch of the wallet's pending transaction-data requests - the
+    /// "enhancement" step. `scan_cached_blocks` records these
+    /// (`WalletRead::transaction_data_requests`) while scanning compact blocks, which carry no
+    /// memos and no full transparent data: for each request, fetch the full transaction from the
+    /// upstream and either decrypt+store it (which fills in `v_tx_outputs.memo` on received
+    /// shielded outputs) or record its chain status. Called only when caught up to the tip.
     ///
     /// Without this, a memo on a transaction the wallet only ever saw as a compact block -
     /// every receive picked up during initial sync or a `--restore`, and any live receive the
@@ -820,50 +877,70 @@ impl WalletActor {
     /// backfills it. (A receive the mempool stream *does* catch is already enhanced: that path
     /// stores the full tx via `decrypt_and_store_transaction`.)
     ///
+    /// Returns `true` if serviceable requests still remain (so the caller should keep driving the
+    /// drain), `false` when the backlog is empty, the client dropped, or shutdown was signalled.
+    /// On a from-birthday restore the backlog can be tens of thousands of requests (hours of work
+    /// at one upstream fetch each), so this services at most [`ENHANCE_BATCH`] per call and yields:
+    /// the actor loop services queued commands and republishes the shrinking
+    /// `pending_enhancements` count between batches, instead of disappearing into one monolithic
+    /// pass that hides the backlog and starves writers for hours.
+    ///
     /// Mirrors zcash-devtool's `enhance` command and zkv's `enhance`. Best-effort: a transport
-    /// failure drops the client (so the next loop reconnects/fails over) and aborts the pass;
-    /// the still-pending requests are retried on the next caught-up pass. librustzcash removes
-    /// each request once it is satisfied, so a clean pass converges and stops re-fetching.
-    async fn enhance_transactions(&mut self) {
-        let Some(tip) = self.tip_height else { return };
+    /// failure drops the client (so the next loop reconnects/fails over) and ends the batch; the
+    /// still-pending requests are retried on the next caught-up pass. librustzcash removes each
+    /// request once it is satisfied, so a clean drain converges and stops re-fetching.
+    async fn enhance_step(&mut self) -> bool {
+        let Some(tip) = self.tip_height else {
+            return false;
+        };
         if self.client.is_none() {
-            return;
+            return false;
         }
         let chain_tip = BlockHeight::from_u32(tip);
-        // Requests are removed from the wallet as they're satisfied; track those handled in
-        // this pass so a request the upstream can't satisfy (left in place) can't spin the
-        // re-query loop. Mirrors zcash-devtool/zkv's `satisfied` set.
-        let mut satisfied = std::collections::BTreeSet::new();
-        loop {
-            let requests = match self.db_data.transaction_data_requests() {
-                Ok(r) => r,
-                Err(e) => {
-                    warn!("[{}] reading transaction data requests: {e}", self.name);
-                    return;
-                }
-            };
-            let mut any_new = false;
-            for req in requests {
-                if satisfied.contains(&req) {
-                    continue;
-                }
-                any_new = true;
-                if let Err(e) = self.service_data_request(&req, chain_tip).await {
-                    // A transport failure has already dropped the client (a DB-write error just
-                    // aborts the pass); either way, stop here and retry the remaining requests
-                    // on the next caught-up pass rather than spinning on a persistent failure.
-                    tracing::debug!("[{}] transaction enhancement aborted: {e}", self.name);
-                    return;
-                }
-                satisfied.insert(req);
+        let requests = match self.db_data.transaction_data_requests() {
+            Ok(r) => r,
+            Err(e) => {
+                warn!("[{}] reading transaction data requests: {e}", self.name);
+                return false;
             }
-            if !any_new {
+        };
+        // Serviceable requests not yet attempted in this drain. Inserting each into
+        // `enhance_satisfied` (whether it was removed from the DB on success or left in place
+        // because the upstream couldn't satisfy it) guarantees forward progress: the unattempted
+        // set strictly shrinks every call, so the drain terminates instead of re-fetching the same
+        // front-of-queue requests forever.
+        let pending: Vec<TransactionDataRequest> = requests
+            .into_iter()
+            .filter(|r| is_serviceable_request(r) && !self.enhance_satisfied.contains(r))
+            .collect();
+        let mut handled = 0usize;
+        for req in &pending {
+            // Bail promptly on Ctrl-C/`stop` rather than fetching out the rest of a long backlog.
+            if *self.shutdown.borrow() {
+                return false;
+            }
+            if let Err(e) = self.service_data_request(req, chain_tip).await {
+                // A transport failure has already dropped the client (a DB-write error just ends
+                // the batch); either way stop here and retry the remainder on the next pass rather
+                // than spinning on a persistent failure.
+                tracing::debug!("[{}] transaction enhancement aborted: {e}", self.name);
+                self.update_status();
+                return false;
+            }
+            self.enhance_satisfied.insert(req.clone());
+            handled += 1;
+            if handled >= ENHANCE_BATCH {
                 break;
             }
         }
+        // Republish the shrinking backlog (now reflected by `enhance_satisfied`) so /status,
+        // getwalletinfo and readiness track the drain between batches.
+        self.update_status();
+        // More to do only if the batch cap stopped us short of the serviceable requests in hand.
+        pending.len() > handled
     }
 
-    /// Handle one [`TransactionDataRequest`] for [`enhance_transactions`]. Returns `Err` only
+    /// Handle one [`TransactionDataRequest`] for [`enhance_step`]. Returns `Err` only
     /// for failures worth aborting the whole pass (transport, or a wallet-write error).
     async fn service_data_request(
         &mut self,
@@ -1289,9 +1366,24 @@ impl WalletActor {
             None => (None, 0.0, true),
         };
 
+        // The enhancement backlog is the work that remains *after* the block scan reaches the tip
+        // (memos, full transparent data - see `enhance_step`). While the block scan is still
+        // running it dominates readiness via the height gap, so don't pay the extra DB read; once
+        // caught up, this count is what stands between "scanned to tip" and "ready to serve full
+        // history", so measure it fresh. `0` while scanning means "not yet measured", not "drained".
+        let pending_enhancements = if scanning {
+            0
+        } else {
+            self.count_pending_enhancements()
+        };
+
+        // `Ready` must mean "ready to serve full history", so a non-empty enhancement backlog keeps
+        // the connection in `Syncing` even though the block scan is done - otherwise /status,
+        // getpeerinfo and getblockchaininfo would all report caught-up while memos are still
+        // missing and history calls lag behind the drain.
         let conn_state = if self.client.is_none() {
             ConnState::Down
-        } else if scanning {
+        } else if scanning || pending_enhancements > 0 {
             ConnState::Syncing
         } else {
             ConnState::Ready
@@ -1312,6 +1404,7 @@ impl WalletActor {
             best_block_hash: self.tip_hash.clone(),
             scan_progress,
             scanning,
+            pending_enhancements,
             encrypted: self.encrypted,
             watch_only: self.watch_only,
             unlocked_until,
@@ -2340,6 +2433,25 @@ mod tests {
             ensure_dir_writable(&file.join("sub")).is_err(),
             "a non-directory parent must fail the writability probe"
         );
+    }
+
+    /// The enhancement backlog counts only requests zecd can actually service: full-tx
+    /// `Enhancement` and `GetStatus`. The transparent-address variant (which zecd has no source
+    /// for and skips) must be excluded, or it would pin `pending_enhancements` above zero forever
+    /// and a wallet would never report ready.
+    #[test]
+    fn serviceable_request_classification() {
+        use super::is_serviceable_request;
+        use zcash_client_backend::data_api::TransactionDataRequest;
+        use zcash_protocol::TxId;
+
+        let txid = TxId::from_bytes([7u8; 32]);
+        assert!(is_serviceable_request(
+            &TransactionDataRequest::Enhancement(txid)
+        ));
+        assert!(is_serviceable_request(&TransactionDataRequest::GetStatus(
+            txid
+        )));
     }
 
     /// FullPrivacy's single-pool rule: violated by any transparent component, or by touching

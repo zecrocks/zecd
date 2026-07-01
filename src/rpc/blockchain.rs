@@ -44,7 +44,9 @@ pub(crate) fn getblockchaininfo(state: &AppState) -> Result<Value, RpcError> {
         "time": best_time.unwrap_or(0),
         "mediantime": mediantime.or(best_time).unwrap_or(0),
         "verificationprogress": st.scan_progress,
-        "initialblockdownload": st.scanning,
+        // True until the wallet is ready to serve full history - which includes draining the
+        // post-scan transaction-enhancement backlog, not just catching the block scan up to tip.
+        "initialblockdownload": st.scanning || st.pending_enhancements > 0,
         "size_on_disk": 0,
         "pruned": false,
         "warnings": ""

@@ -109,12 +109,25 @@ it reveals the wallet's entire transaction graph, though it cannot spend.
 - `GET /readyz` - readiness, gated by `[health] readiness`. In `"connected"` mode
   (default) it's 200 as soon as zebra is connected and its tip is past the wallet's
   birthday - it does NOT wait for the scan to finish, so it stays ready (no flapping)
-  while the wallet catches up. In `"synced"` mode it's 200 only once connected and
-  within `[health] max_scan_lag` blocks of the tip. When 503, the body's `reason`
-  distinguishes `upstream_down` (zebra unreachable - page someone) from `syncing`
-  (normal catch-up) and `actor_down` (a dead writer - restart the process).
+  while the wallet catches up. In `"synced"` mode it's 200 only once connected,
+  within `[health] max_scan_lag` blocks of the tip, AND with the transaction-enhancement
+  backlog drained (see below). When 503, the body's `reason` distinguishes `upstream_down`
+  (zebra unreachable - page someone) from `syncing` (normal block catch-up), `enhancing`
+  (scanned to tip, still backfilling memos), and `actor_down` (a dead writer - restart
+  the process).
 - `GET /status` - per-wallet sync state, active upstream endpoint, `conn_state`
-  (`down` | `syncing` | `ready`). Alert if `conn_state` stays `down`.
+  (`down` | `syncing` | `ready`), and `pending_enhancements` (the enhancement backlog).
+  Alert if `conn_state` stays `down`.
+- **Enhancement backlog (`pending_enhancements`).** The compact-block scan reaching the
+  tip (`scan_progress: 1.0`, `scanning: false` for the block scan) is NOT "ready to serve
+  full history". Compact blocks carry no memos, so a per-transaction enhancement pass then
+  fetches each tx's full data from zebra and decrypts it to backfill memos. On a
+  from-birthday restore of a busy wallet this is one `getrawtransaction` + decrypt per
+  transaction - tens of thousands of them, potentially hours of work *after* the scan
+  reports done. While it drains, `conn_state` stays `syncing`, `getwalletinfo.scanning` and
+  `getblockchaininfo.initialblockdownload` stay truthy, and `synced` readiness stays 503
+  (`reason=enhancing`). Watch `pending_enhancements` trend to zero; if zebra's
+  `getrawtransaction` is slow, confirm its transaction index is enabled.
 - `locked` (top-level on both `/readyz` and `/status`, plus per-wallet `locked`/`encrypted`)
  - `true` when a passphrase-encrypted wallet is synced and serving reads but still needs a
   `walletpassphrase` before it can spend. It is reported independently of readiness (a locked

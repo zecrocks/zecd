@@ -1262,6 +1262,31 @@ async fn regtest_funded_orchard_receive() {
         tokio::time::sleep(Duration::from_millis(500)).await;
     }
 
+    // The enhancement backlog is an observable signal, not just an internal step: once the drain
+    // completes, /status must report `pending_enhancements: 0` and the connection back to `ready`
+    // (it stays `syncing` while the backlog drains, even after the block scan reaches the tip).
+    // This is the end-to-end check that the headline bug - "sync complete" hiding the backlog - is
+    // fixed: the field is plumbed actor → SyncStatus → /status and reaches zero.
+    let watch_health = format!("http://127.0.0.1:{}", watch_cfg.health_port());
+    let deadline = Instant::now() + FUND_TIMEOUT;
+    loop {
+        let st: serde_json::Value = reqwest::get(format!("{watch_health}/status"))
+            .await
+            .expect("GET /status on the watch-only wallet")
+            .json()
+            .await
+            .expect("watch-only /status body is JSON");
+        let w = &st["wallets"]["default"];
+        if w["pending_enhancements"] == json!(0) && w["conn_state"] == json!("ready") {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the watch-only wallet's enhancement backlog never drained: {st}"
+        );
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+
     // ---- bootstrap: rebuild data.sqlite from keys.toml on an empty data directory ----
     //
     // The cloud-native Phase-1 guarantee end to end on a real chain: wipe the wallet's

@@ -72,7 +72,9 @@ pub(crate) fn getpeerinfo(state: &AppState) -> Result<Value, RpcError> {
         "addr": st.server.clone().unwrap_or_default(),
         "inbound": false,
         "conn_state": st.conn_state.as_str(),
-        "syncing": st.scanning,
+        // Stays true while the post-scan enhancement backlog drains, to agree with `conn_state`
+        // (which is `syncing` until the wallet is truly ready to serve full history).
+        "syncing": st.scanning || st.pending_enhancements > 0,
     }]))
 }
 

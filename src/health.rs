@@ -28,14 +28,20 @@ fn wallet_ready(st: &SyncStatus, cfg: &HealthConfig) -> bool {
         return false;
     }
     match cfg.readiness {
-        // Strict: the wallet has actually scanned to (near) the tip, measured by the height gap.
-        // We deliberately do NOT gate on librustzcash's note-weighted `progress().scan()` ratio:
-        // it's computed over the tip-priority range and hits 1.0 while lower-priority historical
-        // ranges keep climbing `fully_scanned` (e.g. a from-birthday restore), so progress alone
-        // would report ready with the wallet hundreds of thousands of blocks short of its own
-        // funds. The height gap is the meaningful signal.
+        // Strict: the wallet has actually scanned to (near) the tip, measured by the height gap,
+        // AND its transaction-enhancement backlog has drained. We deliberately do NOT gate on
+        // librustzcash's note-weighted `progress().scan()` ratio: it's computed over the
+        // tip-priority range and hits 1.0 while lower-priority historical ranges keep climbing
+        // `fully_scanned` (e.g. a from-birthday restore), so progress alone would report ready with
+        // the wallet hundreds of thousands of blocks short of its own funds. The height gap is the
+        // meaningful scan signal. But "scanned to tip" is not "ready to serve full history": after
+        // the block scan catches up, `enhance_step` still has one upstream fetch + decrypt/store per
+        // transaction to backfill memos - a multi-hour backlog on a from-birthday restore. Until
+        // that drains, history RPCs are missing memos and lag, so readiness must wait on it too.
         ReadinessMode::Synced => match (st.chain_tip, st.fully_scanned) {
-            (Some(tip), Some(scanned)) => tip.saturating_sub(scanned) <= cfg.max_scan_lag,
+            (Some(tip), Some(scanned)) => {
+                tip.saturating_sub(scanned) <= cfg.max_scan_lag && st.pending_enhancements == 0
+            }
             // Until both heights are known the wallet hasn't demonstrably caught up.
             _ => false,
         },
@@ -92,6 +98,11 @@ struct Snapshot {
     any_down: bool,
     any_actor_down: bool,
     any_locked: bool,
+    /// Some wallet has caught its block scan up to the tip but is still draining its
+    /// transaction-enhancement backlog (see `SyncStatus::pending_enhancements`). Surfaced as a
+    /// distinct `readyz` reason so an operator can tell "scanned to tip, backfilling memos" apart
+    /// from "still scanning blocks" - the two look identical without it (both not-ready, scan done).
+    any_enhancing: bool,
     wallets: Value,
 }
 
@@ -108,6 +119,7 @@ fn snapshot(state: &AppState) -> Snapshot {
     let mut any_down = false;
     let mut any_actor_down = false;
     let mut any_locked = false;
+    let mut any_enhancing = false;
     let mut wallets = Map::new();
     for name in names {
         if let Ok(h) = state.registry.get(Some(&name)) {
@@ -131,6 +143,10 @@ fn snapshot(state: &AppState) -> Snapshot {
             if locked {
                 any_locked = true;
             }
+            // Block scan caught up to the tip, but the enhancement backlog hasn't drained yet.
+            if !st.scanning && st.pending_enhancements > 0 {
+                any_enhancing = true;
+            }
             wallets.insert(
                 name,
                 json!({
@@ -143,6 +159,7 @@ fn snapshot(state: &AppState) -> Snapshot {
                     "birthday": st.birthday,
                     "scan_progress": st.scan_progress,
                     "scanning": st.scanning,
+                    "pending_enhancements": st.pending_enhancements,
                     "encrypted": st.encrypted,
                     "locked": locked,
                     "ready": w_ready,
@@ -155,6 +172,7 @@ fn snapshot(state: &AppState) -> Snapshot {
         any_down,
         any_actor_down,
         any_locked,
+        any_enhancing,
         wallets: Value::Object(wallets),
     }
 }
@@ -175,12 +193,15 @@ async fn readyz(State(state): State<AppState>) -> Response {
         "wallets": snap.wallets,
     });
     if !snap.ready {
-        // Distinguish a dead writer actor from "all upstreams down" from "still syncing" so
-        // probes/alerts can tell them apart (a dead actor needs a process restart).
+        // Distinguish a dead writer actor from "all upstreams down" from "still backfilling memos"
+        // from "still scanning blocks" so probes/alerts can tell them apart (a dead actor needs a
+        // process restart; an enhancing wallet is scanned to tip but not yet serving full history).
         body["reason"] = json!(if snap.any_actor_down {
             "actor_down"
         } else if snap.any_down {
             "upstream_down"
+        } else if snap.any_enhancing {
+            "enhancing"
         } else {
             "syncing"
         });
@@ -249,6 +270,37 @@ mod tests {
         assert!(!wallet_ready(&st(false, Some(100), Some(100)), &synced));
         assert!(!wallet_ready(&st(true, None, Some(100)), &synced));
         assert!(!wallet_ready(&st(true, Some(100), None), &synced));
+    }
+
+    #[test]
+    fn synced_mode_waits_for_the_enhancement_backlog_to_drain() {
+        let synced = cfg(ReadinessMode::Synced);
+        // Caught the block scan up to the tip (gap 0) but the transaction-enhancement backlog
+        // hasn't drained: the headline bug - "scan complete" while memos are still being
+        // backfilled for hours. That must NOT report ready.
+        let mut caught_up_but_enhancing = st(true, Some(4_080_983), Some(4_080_983));
+        caught_up_but_enhancing.pending_enhancements = 29_660;
+        assert!(!wallet_ready(&caught_up_but_enhancing, &synced));
+
+        // Even a single pending request keeps the wallet not-ready.
+        let mut one_left = st(true, Some(100), Some(100));
+        one_left.pending_enhancements = 1;
+        assert!(!wallet_ready(&one_left, &synced));
+
+        // Backlog drained (and within the lag budget): ready.
+        let mut drained = st(true, Some(100), Some(100));
+        drained.pending_enhancements = 0;
+        assert!(wallet_ready(&drained, &synced));
+    }
+
+    #[test]
+    fn connected_mode_ignores_the_enhancement_backlog() {
+        // The lenient mode is "upstream is live past our birthday"; it deliberately doesn't wait on
+        // the scan, so it shouldn't wait on enhancement either.
+        let connected = cfg(ReadinessMode::Connected);
+        let mut enhancing = st(true, Some(4_080_983), Some(4_080_983));
+        enhancing.pending_enhancements = 29_660;
+        assert!(wallet_ready(&enhancing, &connected));
     }
 
     #[test]

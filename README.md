@@ -253,14 +253,26 @@ With `[health] enabled` (default), zecd serves unauthenticated probes on a separ
     the wallet's birthday height (a sanity check that we're on the right, live network). It does
     **not** wait for the wallet to finish scanning, so RPC clients can reach zecd while it catches
     up and readiness doesn't flap during a long sync - reads may lag the tip until caught up.
-  - `"synced"`: ready only once every wallet is connected **and** within `[health] max_scan_lag`
-    blocks of the chain tip. Strict - a from-birthday restore stays not-ready until it has scanned
-    to its own funds.
+  - `"synced"`: ready only once every wallet is connected, within `[health] max_scan_lag`
+    blocks of the chain tip, **and** with an empty transaction-enhancement backlog. Strict - a
+    from-birthday restore stays not-ready until it has scanned to its own funds *and* finished
+    backfilling memos (see below).
 
-  Body is JSON with per-wallet detail; when not ready it carries a `reason` (`"upstream_down"` vs
-  `"syncing"`) so alerting can tell an unreachable zebra apart from normal catch-up.
-- `GET /status`: JSON snapshot of per-wallet sync state, including the active `server` endpoint
-  and `conn_state` (`down` | `syncing` | `ready`). `getpeerinfo` reflects the same active upstream.
+  Body is JSON with per-wallet detail; when not ready it carries a `reason` (`"upstream_down"`,
+  `"actor_down"`, `"enhancing"`, or `"syncing"`) so alerting can tell an unreachable zebra apart
+  from a dead writer, from backfilling memos, from normal block catch-up.
+- `GET /status`: JSON snapshot of per-wallet sync state, including the active `server` endpoint,
+  `conn_state` (`down` | `syncing` | `ready`), and the per-wallet `pending_enhancements` count.
+  `getpeerinfo` reflects the same active upstream.
+
+  **Enhancement backlog.** Reaching the chain tip in the compact-block scan is not the same as
+  being ready to serve full history. Compact blocks carry no memos, so after the scan catches up
+  a per-transaction *enhancement* pass fetches each transaction's full data from zebra and decrypts
+  it to backfill memos - work that, on a from-birthday restore of a busy wallet, can take hours
+  *after* `scan_progress` hits `1.0`. zecd surfaces that backlog as `pending_enhancements` on
+  `/status` (and `getwalletinfo.scanning`), keeps `conn_state`/`scanning`/`initialblockdownload`
+  busy while it drains, and (in `"synced"` mode) holds `/readyz` at 503 with `reason="enhancing"`
+  until it reaches zero - so "ready" never lies about history being complete.
 
 Set `[health] bind = "0.0.0.0"` for Kubernetes/LB probes. The health server starts after wallets
 load, so cover the brief prover-init at boot with a `startupProbe` / `initialDelaySeconds`.
@@ -368,7 +380,7 @@ the validator's job there - so those rows are all - .
 | `getrawtransaction` | ✓ (verbose JSON differs) | ✓ | Hex, or verbose JSON in zcashd's `TxToJSON` shape with shielded bundles - matches Zallet, not bitcoind; `blockhash` param rejected; wallet store first, upstream fallback |
 | `sendrawtransaction` | ✓ | - (planned) | Broadcasts caller-built bytes through the upstream; `maxfeerate` ignored |
 | **Blockchain** | | | |
-| `getblockchaininfo` | ✓ | - | `blocks` = fully-scanned height, `headers` = tip, `initialblockdownload` = scanning; `difficulty`/`size_on_disk` stubs |
+| `getblockchaininfo` | ✓ | - | `blocks` = fully-scanned height, `headers` = tip, `initialblockdownload` = scanning **or** draining the enhancement backlog; `difficulty`/`size_on_disk` stubs |
 | `getblockcount` | ✓ | - | Fully-scanned height, so `getblockhash(getblockcount())` always answers |
 | `getbestblockhash` | ✓ | - | Hash at the fully-scanned height |
 | `getblockhash` | ✓ | - | From the wallet's scanned blocks; pre-birthday or beyond-tip heights → `-8` |
@@ -566,7 +578,14 @@ Edges to be aware of (consequences of being a shielded light wallet):
   so far: `getbalance` on a half-synced wallet is a partial number, not an error (bitcoind
   would block or warm-up here). Gate automation on `GET /readyz`, or on
   `getwalletinfo.scanning` / `getblockchaininfo.initialblockdownload`, before trusting
-  balances.
+  balances. These signals stay "busy" until the wallet is ready to serve *full history*, not
+  just until the block scan reaches the tip: after the compact-block scan catches up, a
+  per-transaction *enhancement* pass still backfills memos (and full transparent data) for
+  transactions seen only as compact blocks - a multi-hour backlog on a from-birthday restore.
+  That backlog is surfaced as `GET /status`'s per-wallet `pending_enhancements` count (and the
+  `enhancing` `/readyz` reason); `scanning`/`initialblockdownload` stay truthy and `synced`
+  readiness keeps returning 503 until it drains to zero, so memos and history aren't trusted
+  early.
 - `sendmany` recipients arrive as a JSON object, and JSON parsing collapses duplicate keys
   (last one wins) before zecd sees them - Bitcoin Core's "duplicated address" error cannot
   be reproduced. Don't list the same address twice; combine the amounts instead.

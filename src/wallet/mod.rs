@@ -72,9 +72,19 @@ pub struct SyncStatus {
     /// sanity-check the upstream's tip against it without a DB read.
     pub birthday: Option<u32>,
     pub best_block_hash: Option<String>,
-    /// Scan progress in `[0, 1]`.
+    /// Scan progress in `[0, 1]`. This is the *block scan* (compact-block) progress only; it
+    /// reaches 1.0 when the scan catches up to the tip, which can be well before the wallet is
+    /// ready to serve full history - see `pending_enhancements`.
     pub scan_progress: f64,
     pub scanning: bool,
+    /// Pending transaction-enhancement requests: the per-transaction full-tx fetches that backfill
+    /// memos (and full transparent data) for transactions the wallet only ever saw as compact
+    /// blocks. Non-zero only once the block scan is caught up (it's `0` while `scanning`, where it
+    /// would be unmeasured anyway). On a from-birthday restore this can be a multi-hour backlog
+    /// that drains *after* `scan_progress` hits 1.0 and `scanning` goes false - so a wallet is only
+    /// fully ready to serve history once this reaches `0`. Surfaced on `/status`, factored into
+    /// `synced` readiness, and reflected in `getwalletinfo.scanning`.
+    pub pending_enhancements: u64,
     /// True when the wallet is passphrase-encrypted (Bitcoin Core's `HasEncryptionKeys()`).
     /// Drives whether `getwalletinfo` reports `unlocked_until` and how the passphrase RPCs behave.
     pub encrypted: bool,

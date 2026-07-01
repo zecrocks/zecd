@@ -354,7 +354,13 @@ pub(crate) fn getwalletinfo(state: &AppState, wallet: Option<&str>) -> Result<Va
     let info = read::balance(handle.network, &handle.dir, handle.confirmations)?;
     let txcount = read::tx_count(&handle.dir).unwrap_or(0);
     let st = handle.status();
-    let scanning = if st.scanning {
+    // `scanning` stays truthy while a transaction-enhancement backlog drains, not just during the
+    // block scan: the wallet has reached the tip but is still backfilling memos/full tx data, so it
+    // isn't yet serving complete history. `progress` is the block-scan ratio (1.0 once the scan is
+    // caught up); the backlog itself is an open-ended count, surfaced on `/status` and factored into
+    // readiness rather than squeezed into this [0,1] field. Matches Bitcoin Core's shape (an object
+    // while scanning, `false` when idle).
+    let scanning = if st.scanning || st.pending_enhancements > 0 {
         json!({ "duration": 0, "progress": st.scan_progress })
     } else {
         Value::Bool(false)
