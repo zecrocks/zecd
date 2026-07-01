@@ -152,9 +152,14 @@ impl std::error::Error for RpcError {}
 // anyhow errors that bubble up from the wallet/sync layers without a more specific
 // classification become generic RPC errors. Call sites should prefer the specific
 // constructors above where the failure mode is known (e.g. insufficient funds).
+//
+// The detail is logged server-side only and never placed in `message`: an unclassified
+// anyhow error can embed filesystem paths, database internals, or other host state that RPC
+// clients have no business seeing (mirrors `database_internal`). Clients get a generic string.
 impl From<anyhow::Error> for RpcError {
     fn from(e: anyhow::Error) -> Self {
-        RpcError::misc(e.to_string())
+        tracing::warn!("internal RPC error: {e:#}");
+        RpcError::misc("Internal error")
     }
 }
 

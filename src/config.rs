@@ -842,7 +842,9 @@ impl AppConfig {
             rebroadcast_secs: None,
         });
         let sync = SyncConfig {
-            interval_secs: sync_file.interval_secs.unwrap_or(20),
+            // Clamp to >= 1s so a misconfigured `interval_secs = 0` can't make the actor busy-poll
+            // the backend with no idle delay between passes (same guard as `rebroadcast_secs`).
+            interval_secs: sync_file.interval_secs.unwrap_or(20).max(1),
             rebroadcast_secs: sync_file.rebroadcast_secs.unwrap_or(60).max(1),
         };
 
@@ -1243,6 +1245,33 @@ mod tests {
         ]);
         let cfg = AppConfig::resolve(&cli).unwrap();
         assert_eq!(cfg.datadir, PathBuf::from("/tmp/zecd-from-cli"));
+    }
+
+    #[test]
+    fn sync_interval_secs_is_clamped_to_at_least_one() {
+        use clap::Parser as _;
+        let dir = tempfile::tempdir().unwrap();
+        let conf = dir.path().join("zecd.toml");
+
+        // A misconfigured `interval_secs = 0` must not make the actor busy-poll with no idle
+        // delay; it clamps up to 1s (mirroring `rebroadcast_secs`).
+        std::fs::write(&conf, "[sync]\ninterval_secs = 0\nrebroadcast_secs = 0\n").unwrap();
+        let cli = Cli::parse_from(["zecd", "--conf", conf.to_str().unwrap()]);
+        let cfg = AppConfig::resolve(&cli).unwrap();
+        assert_eq!(cfg.sync.interval_secs, 1);
+        assert_eq!(cfg.sync.rebroadcast_secs, 1);
+
+        // An explicit larger value is preserved unchanged.
+        std::fs::write(&conf, "[sync]\ninterval_secs = 45\n").unwrap();
+        let cli = Cli::parse_from(["zecd", "--conf", conf.to_str().unwrap()]);
+        let cfg = AppConfig::resolve(&cli).unwrap();
+        assert_eq!(cfg.sync.interval_secs, 45);
+
+        // Absent section → the 20s default.
+        std::fs::write(&conf, "datadir = \"/tmp/zecd-x\"\n").unwrap();
+        let cli = Cli::parse_from(["zecd", "--conf", conf.to_str().unwrap()]);
+        let cfg = AppConfig::resolve(&cli).unwrap();
+        assert_eq!(cfg.sync.interval_secs, 20);
     }
 
     #[test]
