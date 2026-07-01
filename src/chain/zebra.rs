@@ -889,6 +889,59 @@ mod tests {
         assert_eq!(info.chain_name, "main");
     }
 
+    /// Regression guard for the tip-advance step of the -25 (already-expired) send fix: a
+    /// spend's expiry height is derived from the wallet DB's chain tip, so before building one
+    /// the actor pulls the upstream's *real* tip into the DB and scans up to it (`do_send` →
+    /// `sync_to_tip_for_send` → `fetch_and_store_chain_tip`, then a catch-up scan). This covers
+    /// the tip-advance half: the DB starts at a stale height far below the upstream's, and one
+    /// call must advance it to the upstream tip (the actor then scans the gap so the anchor is
+    /// valid too). If the tip didn't advance, a send would expire against the stale height.
+    #[tokio::test]
+    async fn fetch_and_store_chain_tip_advances_a_stale_wallet_db_height() {
+        use zcash_client_backend::data_api::chain::ChainState;
+        use zcash_client_backend::data_api::{AccountBirthday, WalletRead, WalletWrite};
+        use zcash_primitives::block::BlockHash;
+
+        // Upstream reports height 415000 (the fixture tip).
+        let fake = Arc::new(Mutex::new(Fake::new()));
+        let mut src = source_for(fake).await;
+
+        // A wallet DB whose recorded tip lags the chain by a wide margin - the sync-starvation
+        // condition that produced already-expired sends. (`chain_height` reads the scan-queue
+        // extent, which `update_chain_tip` only populates for heights at/after the account's
+        // birthday and the network's shielded activation - use regtest, which activates at
+        // height 1, so both the stale and the real tip register.)
+        let net = crate::network::regtest();
+        let dir = tempfile::tempdir().unwrap();
+        let mut db = crate::wallet::open::init_dbs(net, dir.path()).expect("init dbs");
+        let birthday = AccountBirthday::from_parts(
+            ChainState::empty(BlockHeight::from_u32(0), BlockHash([0u8; 32])),
+            None,
+        );
+        db.create_account(
+            "t",
+            &secrecy::SecretVec::new(vec![1u8; 64]),
+            &birthday,
+            None,
+        )
+        .expect("create account");
+        db.update_chain_tip(BlockHeight::from_u32(100))
+            .expect("seed a stale tip");
+        assert_eq!(db.chain_height().unwrap(), Some(BlockHeight::from_u32(100)));
+
+        // One refresh pulls the real tip into the DB, so the next spend expires against it.
+        let (tip, hash) = crate::wallet::actor::fetch_and_store_chain_tip(&mut src, &mut db)
+            .await
+            .expect("refresh tip");
+        assert_eq!(tip, BlockHeight::from_u32(415000));
+        assert_eq!(hash, internal(BLOCK_415000_HASH));
+        assert_eq!(
+            db.chain_height().unwrap(),
+            Some(BlockHeight::from_u32(415000)),
+            "the wallet DB tip must advance to the upstream tip"
+        );
+    }
+
     #[tokio::test]
     async fn basic_auth_and_cookie_auth_send_the_right_header() {
         // user/password.
