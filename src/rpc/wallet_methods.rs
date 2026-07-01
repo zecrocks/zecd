@@ -623,12 +623,27 @@ fn tx_entries(
     entries
 }
 
+/// True when the wallet funded (sent) this transaction. librustzcash records a `fee_paid` for
+/// *every* fully-shielded tx - including pure receives, where it derives the fee from the public
+/// value balance even though the wallet never paid it - so `fee_paid.is_some()` is NOT a "we paid
+/// it" signal. The balance delta is: a send nets negative (it loses at least the fee), a pure
+/// receive nets positive. This mirrors the `trusted` heuristic in [`push_wallet_tx_fields`].
+fn wallet_funded_tx(account_balance_delta: i64) -> bool {
+    account_balance_delta < 0
+}
+
 /// Bitcoin Core's `gettransaction.amount` excludes the fee (reported separately in `fee`):
-/// for a wallet-funded tx the balance delta is -(payments + fee), so add the fee back.
-/// `fee_paid` is only known when the wallet funded the tx; for pure receives it is None and
-/// the delta is already the received amount. A self-transfer nets to 0.
+/// for a wallet-funded tx the balance delta is -(payments + fee), so add the fee back. For a
+/// pure receive the balance delta is already the received amount and must be reported as-is -
+/// librustzcash still attaches a `fee_paid` to it (derived from the public value balance), but
+/// the wallet never paid that fee, so adding it back would over-report the deposit by the fee.
+/// A self-transfer nets to just the fee, so it reports 0.
 fn gettransaction_amount(account_balance_delta: i64, fee_paid: Option<u64>) -> i64 {
-    account_balance_delta + fee_paid.unwrap_or(0) as i64
+    if wallet_funded_tx(account_balance_delta) {
+        account_balance_delta + fee_paid.unwrap_or(0) as i64
+    } else {
+        account_balance_delta
+    }
 }
 
 /// The most recent `count` history entries after skipping `from`, in oldest-to-newest order,
@@ -1114,8 +1129,12 @@ pub(crate) async fn gettransaction(
         "details": details,
         "hex": hex_str,
     });
-    if let Some(fee) = rec.fee_paid {
-        obj["fee"] = signed_zats_to_value(-(fee as i64));
+    // Bitcoin Core only attaches `fee` to transactions the wallet sent; a pure receive omits it
+    // (librustzcash records a `fee_paid` even for receives, so gate on the balance-change signal).
+    if wallet_funded_tx(rec.account_balance_delta) {
+        if let Some(fee) = rec.fee_paid {
+            obj["fee"] = signed_zats_to_value(-(fee as i64));
+        }
     }
     push_wallet_tx_fields(&mut obj, &rec, time);
     Ok(obj)
@@ -2492,6 +2511,24 @@ mod tests {
         assert_eq!(gettransaction_amount(250_000_000, None), 250_000_000);
         // Self-transfer: delta is just -fee; nets to 0.
         assert_eq!(gettransaction_amount(-10_000, Some(10_000)), 0);
+        // Pure receive where librustzcash still recorded a fee (derived from the public value
+        // balance, not paid by the wallet): the positive delta IS the received amount, so the
+        // fee must NOT be added back - else the deposit over-reports by the fee.
+        assert_eq!(
+            gettransaction_amount(250_000_000, Some(10_000)),
+            250_000_000
+        );
+    }
+
+    #[test]
+    fn wallet_funded_tx_discriminates_on_balance_sign() {
+        // A send loses at least the fee (negative delta); a pure receive nets positive even
+        // when librustzcash attaches a fee to it. A zero delta is not "funded" - a wallet that
+        // spent always loses the fee, so it can never net exactly zero.
+        assert!(wallet_funded_tx(-150_010_000));
+        assert!(wallet_funded_tx(-10_000));
+        assert!(!wallet_funded_tx(250_000_000));
+        assert!(!wallet_funded_tx(0));
     }
 
     #[test]
