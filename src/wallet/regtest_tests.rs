@@ -335,9 +335,13 @@ fn is_mine_attributes_unrecorded_addresses_via_viewing_key() {
 /// A "one receiver is mine ⇒ mine" rule would report `ismine: true`, yet a sender resolves the UA
 /// to its most-preferred pool (ZIP-316: Orchard first) and pays the attacker - and a sender that
 /// only supports the pool holding the *foreign* receiver pays the attacker regardless of order. So
-/// `is_mine` must reject any multi-receiver UA that is not wholly the wallet's at one index. This
-/// test builds both spliced orientations and asserts they are NOT ismine, while a genuinely
-/// own all-pools UA (and the wallet's own single-pool receivers) still is.
+/// `is_mine` must reject any multi-receiver UA that is not wholly the wallet's at one index. The
+/// same splice also has a **transparent** form - the attacker staples their transparent receiver
+/// onto the victim's shielded receiver; since zecd never issues transparent receivers, any UA
+/// carrying one can never be the wallet's, and a transparent-only sender pays the attacker. This
+/// test builds all three spliced orientations (two shielded, one transparent) and asserts they are
+/// NOT ismine, while a genuinely own shielded UA (and the wallet's own single-pool receivers) still
+/// is.
 #[test]
 fn is_mine_rejects_spliced_unified_address_with_foreign_receiver() {
     use zcash_client_backend::data_api::Account as _;
@@ -369,22 +373,30 @@ fn is_mine_rejects_spliced_unified_address_with_foreign_receiver() {
     drop(fdb);
 
     let far = DiversifierIndex::from(1_000_007u32);
-    let mine_all = uivk.address(far, UnifiedAddressRequest::ALLOW_ALL).unwrap();
+    // The victim's own *shielded* (Sapling + Orchard, no transparent) UA - the shape zecd actually
+    // issues (`getnewaddress` builds shielded-only UAs). Its receivers are the raw material for the
+    // splices below.
+    use zcash_keys::keys::ReceiverRequirement::*;
+    let shielded_only = UnifiedAddressRequest::unsafe_custom(Require, Require, Omit);
+    let mine_shielded = uivk.address(far, shielded_only).unwrap();
+    // The attacker's UA, requested with *all* receivers so it carries a transparent receiver to
+    // staple onto the victim's (Splice C).
     let attacker_all = fuivk
         .address(far, UnifiedAddressRequest::ALLOW_ALL)
         .unwrap();
 
-    // Sanity: a genuinely own all-pools UA is still ismine under the consistency-aware rule.
+    // Sanity: a genuinely own shielded UA (every receiver ours at one index) is still ismine under
+    // the consistency-aware rule.
     assert!(
-        read::is_mine(net, wallet_dir, &mine_all.encode(&net)),
-        "the wallet's own all-pools UA must stay ismine"
+        read::is_mine(net, wallet_dir, &mine_shielded.encode(&net)),
+        "the wallet's own shielded UA must stay ismine"
     );
 
     // Splice A: attacker's Orchard receiver + the victim's Sapling receiver. A sender prefers
     // Orchard, so funds would go to the attacker - this must NOT be ismine.
     let splice_a = UnifiedAddress::from_receivers(
         attacker_all.orchard().cloned(),
-        mine_all.sapling().cloned(),
+        mine_shielded.sapling().cloned(),
         None,
     )
     .expect("build spliced UA")
@@ -395,7 +407,7 @@ fn is_mine_rejects_spliced_unified_address_with_foreign_receiver() {
         read::is_mine(
             net,
             wallet_dir,
-            &Address::Sapling(*mine_all.sapling().unwrap()).encode(&net)
+            &Address::Sapling(*mine_shielded.sapling().unwrap()).encode(&net)
         ),
         "precondition: the victim's bare Sapling receiver is genuinely theirs"
     );
@@ -408,7 +420,7 @@ fn is_mine_rejects_spliced_unified_address_with_foreign_receiver() {
     // Splice B: the victim's Orchard receiver + attacker's Sapling receiver. Even with the
     // victim's receiver in the preferred pool, a Sapling-only sender pays the attacker - reject.
     let splice_b = UnifiedAddress::from_receivers(
-        mine_all.orchard().cloned(),
+        mine_shielded.orchard().cloned(),
         attacker_all.sapling().cloned(),
         None,
     )
@@ -418,6 +430,41 @@ fn is_mine_rejects_spliced_unified_address_with_foreign_receiver() {
         !read::is_mine(net, wallet_dir, &splice_b),
         "a UA pairing the victim's Orchard receiver with the attacker's Sapling receiver must NOT \
          be ismine (a Sapling-only sender pays the attacker)"
+    );
+
+    // Splice C: the victim's *own* Orchard receiver + the attacker's *transparent* receiver. Only
+    // one shielded receiver is present, so the shielded-consistency check (which counts shielded
+    // receivers) never engages - this is the transparent variant of the splice. zecd never issues
+    // a transparent receiver, so a UA carrying one can never be an address it handed out, and a
+    // transparent-only sender pays the attacker. It must NOT be ismine even though the Orchard
+    // receiver alone is genuinely the wallet's.
+    let attacker_taddr = attacker_all
+        .transparent()
+        .cloned()
+        .expect("attacker all-pools UA carries a transparent receiver");
+    let splice_c = UnifiedAddress::from_receivers(
+        mine_shielded.orchard().cloned(),
+        None,
+        Some(attacker_taddr),
+    )
+    .expect("build spliced UA with a transparent receiver")
+    .encode(&net);
+    // Precondition: the victim's bare Orchard receiver alone IS theirs - so only the transparent
+    // receiver makes Splice C foreign.
+    assert!(
+        read::is_mine(
+            net,
+            wallet_dir,
+            &UnifiedAddress::from_receivers(mine_shielded.orchard().cloned(), None, None)
+                .unwrap()
+                .encode(&net)
+        ),
+        "precondition: the victim's Orchard-only UA is genuinely theirs"
+    );
+    assert!(
+        !read::is_mine(net, wallet_dir, &splice_c),
+        "a UA stapling the wallet's Orchard receiver to a transparent receiver must NOT be ismine \
+         (zecd never issues transparent receivers; a transparent-only sender pays the attacker)"
     );
 
     // The classifier agrees: both splices are Inconsistent (a foreign receiver mixed in).

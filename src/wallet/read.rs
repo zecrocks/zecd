@@ -851,8 +851,13 @@ pub fn all_addresses(network: ZNetwork, wallet_dir: &Path) -> Vec<String> {
 /// receiver matches: see the threat-model note in the body - a UA that pairs the wallet's
 /// receiver with a stranger's would otherwise read `ismine: true` while a sender pays the
 /// stranger. A single-receiver UA (and a bare Sapling address) is tested directly. Transparent
-/// receivers are intentionally not considered: zecd never receives into the transparent pool, and
-/// a transparent receiver can't be attributed to a viewing key without a gap-limit derivation scan.
+/// receivers are never attributed to a viewing key (zecd never receives into the transparent pool,
+/// and a transparent receiver can't be attributed without a gap-limit derivation scan), so a
+/// **transparent receiver inside a UA is disqualifying**: because zecd never issues a transparent
+/// receiver, a UA that carries one can never be an address this wallet handed out - it is the same
+/// splice as a foreign shielded receiver (a transparent-only sender would pay the attacker), and is
+/// rejected even when a shielded receiver alongside it genuinely is the wallet's. A bare transparent
+/// address is likewise never ours.
 pub fn is_mine(network: ZNetwork, wallet_dir: &Path, addr: &str) -> bool {
     let Ok(db) = open_read(network, wallet_dir) else {
         return false;
@@ -895,6 +900,18 @@ pub fn is_mine(network: ZNetwork, wallet_dir: &Path, addr: &str) -> bool {
             // our own receivers from different indices. A UA with a single shielded receiver has
             // nothing to splice, so the plain viewing-key membership test stands (this is what
             // still recognizes a wallet-generated-but-unrecorded address after a restore).
+            Address::Unified(ua) if ua.transparent().is_some() => {
+                // A transparent receiver is itself a splice zecd can never have issued: zecd
+                // receives only into shielded pools, so it never puts a transparent receiver in a
+                // UA it hands out. An attacker can therefore staple *their* transparent receiver
+                // onto the victim's Orchard/Sapling receiver - the shielded receiver is genuinely
+                // the wallet's, but a transparent-only (or transparent-preferring) sender pays the
+                // attacker. Since the count-shielded-receivers test below sees only one shielded
+                // receiver, that UA would slip through the single-receiver membership check; so a
+                // transparent receiver is unconditionally disqualifying here, exactly as a foreign
+                // shielded receiver is in the two-shielded case.
+                false
+            }
             Address::Unified(ua) => {
                 let two_shielded =
                     u8::from(ua.sapling().is_some()) + u8::from(ua.orchard().is_some()) >= 2;
