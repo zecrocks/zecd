@@ -132,6 +132,11 @@ jobs:
     steps:
       - uses: actions/download-artifact@v4
         with:
+          # Only the packaged release artifacts - NOT the `.dockerbuild` metadata
+          # artifacts that docker/build-push-action auto-uploads from the `binary` jobs.
+          # Without this filter, download-artifact fetches all 4 artifacts and a flaky
+          # `.dockerbuild` download (which the release doesn't need) fails the whole job.
+          pattern: release-*
           path: dist
           merge-multiple: true
 
