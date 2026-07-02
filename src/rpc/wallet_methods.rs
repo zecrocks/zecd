@@ -1026,6 +1026,16 @@ pub(crate) fn listreceivedbyaddress(
 /// `lastblock` hash to feed back into the next call. Reorged-away transactions are rescanned
 /// and re-reported by the sync engine rather than tracked separately, so `removed` is always
 /// empty.
+///
+/// Surviving reorgs is the whole point of the `lastblock` cursor: a poller stores the tip hash
+/// and passes it back next call, and that hash is reorged away the first time a 1-block reorg
+/// lands (`perform_rewind` deletes its `blocks` row). Bitcoin Core resolves such a stale hash
+/// via `findCommonAncestor` and lists from the fork point onward. zecd keeps no stale-branch
+/// index to compute the exact fork point, so a **well-formed** reference hash that is not among
+/// the wallet's scanned blocks is treated as "since the earliest scanned block" (i.e. list
+/// everything): a lower cursor only ever re-reports, never misses, so the poller self-heals
+/// instead of wedging on `-5` forever. A **malformed** hash can never be a cursor zecd handed
+/// out, so it stays `-5 Block not found` (a clear client error).
 pub(crate) fn listsinceblock(
     state: &AppState,
     wallet: Option<&str>,
@@ -1035,15 +1045,19 @@ pub(crate) fn listsinceblock(
     let st = handle.status();
 
     // Param 0: list activity *since* this block (exclusive). Omitted/empty means everything.
+    // A well-formed hash the wallet no longer has scanned (reorged away, or otherwise off the
+    // scanned range) is treated as "since the earliest scanned block" so a poller feeding back a
+    // reorged-away cursor never wedges (see the method doc); only a malformed hash is -5.
     let since_height = match req
         .param(0)
         .and_then(|v| v.as_str())
         .filter(|s| !s.is_empty())
     {
-        Some(hash) => Some(
-            read::block_height_by_hash(&handle.dir, hash)?
-                .ok_or_else(|| RpcError::invalid_address_or_key("Block not found"))?,
-        ),
+        Some(hash) => match read::block_height_by_hash(&handle.dir, hash)? {
+            Some(height) => Some(height),
+            None if read::is_block_hash_wellformed(hash) => None,
+            None => return Err(RpcError::invalid_address_or_key("Block not found")),
+        },
         None => None,
     };
     // Param 1: which depth's block hash to return as `lastblock` (>= 1, like Bitcoin Core).

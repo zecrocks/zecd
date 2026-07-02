@@ -155,6 +155,24 @@ async fn regtest_reorg_rewinds_and_follows() {
         tokio::time::sleep(Duration::from_millis(500)).await;
     }
 
+    // The `listsinceblock` cursor survives the reorg: a poller that stored the old tip hash
+    // (now reorged away, its `blocks` row deleted by `perform_rewind`) must not wedge on -5.
+    // zecd lists from the earliest scanned block and hands back a fresh cursor instead.
+    let since_reorged = zecd
+        .call("listsinceblock", json!([old_hash_at_tip]))
+        .await
+        .expect("listsinceblock with a reorged-away cursor must not error");
+    assert!(
+        since_reorged["transactions"].is_array(),
+        "listsinceblock across a reorg returns a transactions list: {since_reorged}"
+    );
+    assert!(
+        since_reorged["lastblock"]
+            .as_str()
+            .is_some_and(|h| h.len() == 64),
+        "listsinceblock across a reorg hands back a fresh 64-hex cursor: {since_reorged}"
+    );
+
     // The wallet survived the rewind: balances and address derivation still answer.
     let bal = zecd
         .call("getbalance", json!([]))
