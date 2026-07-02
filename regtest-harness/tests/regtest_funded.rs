@@ -958,6 +958,67 @@ async fn regtest_funded_orchard_receive() {
         "FullPrivacy + transparent recipient -> -8: {err}"
     );
 
+    // AllowRevealedAmounts is the intermediate rung: it opts into revealing *amounts* (a
+    // Sapling<->Orchard crossing) but NOT *recipients*, so a transparent recipient must still be
+    // -8 - exactly as zcashd rejects it. Regression guard for the collapse bug where the three
+    // mid-tier policies all fell through to fully-permissive and silently paid transparent.
+    let err = zecd
+        .call(
+            "z_sendmany",
+            json!([zecd_ua, [{ "address": funder_taddr, "amount": 0.001 }], null, null, "AllowRevealedAmounts"]),
+        )
+        .await
+        .expect_err("AllowRevealedAmounts must reject a transparent recipient");
+    assert_eq!(
+        err.code(),
+        Some(-8),
+        "AllowRevealedAmounts + transparent recipient -> -8: {err}"
+    );
+
+    // A memo-only send: zcashd's standard pattern is a zero-valued output to a shielded recipient
+    // carrying a memo. z_sendmany must accept `amount: 0` (the Bitcoin-Core-dialect sends still
+    // reject it) and build a valid transaction - proved end-to-end here, not just that
+    // build_payment stops rejecting it.
+    let memo_only_memo = "6d656d6f2d6f6e6c79"; // "memo-only"
+    let opid = zecd
+        .call(
+            "z_sendmany",
+            json!([zecd_ua, [{ "address": funder_ua, "amount": 0, "memo": memo_only_memo }]]),
+        )
+        .await
+        .expect("z_sendmany accepts a zero-valued memo-only output")
+        .as_str()
+        .expect("opid string")
+        .to_string();
+    let mut memo_only_txid = None;
+    for _ in 0..120 {
+        let st = zecd
+            .call("z_getoperationstatus", json!([[opid]]))
+            .await
+            .expect("z_getoperationstatus");
+        let obj = st
+            .as_array()
+            .expect("status array")
+            .first()
+            .expect("our operation is present")
+            .clone();
+        match obj["status"].as_str().expect("status string") {
+            "success" => {
+                memo_only_txid = Some(
+                    obj["result"]["txid"]
+                        .as_str()
+                        .expect("a successful op carries result.txid")
+                        .to_string(),
+                );
+                break;
+            }
+            "failed" => panic!("the memo-only (amount 0) send must succeed: {obj}"),
+            _ => tokio::time::sleep(Duration::from_millis(500)).await,
+        }
+    }
+    let memo_only_txid = memo_only_txid.expect("the memo-only send reached success");
+    mine_until_confirmed(&zebrad, &zecd, &memo_only_txid, "z_sendmany memo-only send").await;
+
     // minconf is honored: an absurd minconf makes the send unsatisfiable, so the async op
     // reaches `failed` (whereas the default-minconf send in Phase 6b succeeded - that A/B is
     // the proof minconf threads through). The concrete error is librustzcash's

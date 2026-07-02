@@ -319,12 +319,23 @@ pub const DEFAULT_ORCHARD_ACTION_LIMIT: usize = 50;
 /// shielded pools. Crossing pools (Sapling↔Orchard) reveals the transferred amount on-chain via
 /// `valueBalance`; a transparent recipient additionally reveals the recipient. zcashd/Zallet
 /// require an explicit `AllowRevealed*` opt-in for either, and this knob is zecd's equivalent.
+/// The two leaks are independent, so the policy is a three-rung ladder, not a boolean:
+/// `FullPrivacy` (neither), `AllowRevealedAmounts` (cross-pool only), `AllowRevealedRecipients`
+/// (both). zcashd's stricter-sender policies (`AllowRevealedSenders` and weaker) have no analog
+/// here - zecd spends only shielded Orchard notes, so it has no transparent sender to reveal -
+/// and `z_sendmany` maps them onto `AllowRevealedRecipients`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SendPrivacy {
     /// Only fully-shielded transactions confined to a **single** shielded value pool: no
     /// transparent recipients, and no Sapling↔Orchard crossing. Such a send reveals neither the
     /// amount nor the recipient. (Enforced on the built proposal - see the actor's `do_send`.)
     FullPrivacy,
+    /// Permits crossing the Sapling↔Orchard turnstile (which reveals the transferred *amount*
+    /// on-chain via `valueBalance`) but **not** a transparent recipient (which would additionally
+    /// reveal the *recipient*). This is zcashd's `AllowRevealedAmounts`, the policy one notch
+    /// weaker than `FullPrivacy`: a caller who opts into revealing amounts has not thereby opted
+    /// into revealing recipients.
+    AllowRevealedAmounts,
     /// Permits transparent recipients and cross-pool sends (which reveal the transferred amount,
     /// and the recipient if transparent). This is the default: the Bitcoin-RPC dialect promises
     /// "send to any valid address".
@@ -335,11 +346,29 @@ impl SendPrivacy {
     fn parse(s: &str) -> anyhow::Result<Self> {
         match s {
             "FullPrivacy" => Ok(Self::FullPrivacy),
+            "AllowRevealedAmounts" => Ok(Self::AllowRevealedAmounts),
             "AllowRevealedRecipients" => Ok(Self::AllowRevealedRecipients),
             other => anyhow::bail!(
-                "[spend] privacy_policy must be \"FullPrivacy\" or \"AllowRevealedRecipients\" \
-                 (got \"{other}\")"
+                "[spend] privacy_policy must be \"FullPrivacy\", \"AllowRevealedAmounts\", or \
+                 \"AllowRevealedRecipients\" (got \"{other}\")"
             ),
+        }
+    }
+
+    /// Whether this policy permits paying a transparent recipient, which reveals both the
+    /// recipient and the amount on-chain. Only `AllowRevealedRecipients` (and the more-permissive
+    /// zcashd policies that map onto it) do; `FullPrivacy` and `AllowRevealedAmounts` reject a
+    /// transparent recipient (the latter opts into revealed *amounts* only).
+    pub fn allows_transparent_recipient(self) -> bool {
+        matches!(self, Self::AllowRevealedRecipients)
+    }
+
+    /// The zcashd `privacyPolicy` name for this policy, used in the self-diagnosing send errors.
+    pub fn policy_name(self) -> &'static str {
+        match self {
+            Self::FullPrivacy => "FullPrivacy",
+            Self::AllowRevealedAmounts => "AllowRevealedAmounts",
+            Self::AllowRevealedRecipients => "AllowRevealedRecipients",
         }
     }
 }
@@ -1150,12 +1179,17 @@ mod tests {
             SendPrivacy::FullPrivacy
         );
         assert_eq!(
+            SendPrivacy::parse("AllowRevealedAmounts").unwrap(),
+            SendPrivacy::AllowRevealedAmounts
+        );
+        assert_eq!(
             SendPrivacy::parse("AllowRevealedRecipients").unwrap(),
             SendPrivacy::AllowRevealedRecipients
         );
-        // Unknown values (including other zcashd policies that don't apply to an
+        // Unknown values (including the stricter-sender zcashd policies that don't apply to an
         // Orchard-only wallet) are a startup error, never a silent default.
         assert!(SendPrivacy::parse("NoPrivacy").is_err());
+        assert!(SendPrivacy::parse("AllowRevealedSenders").is_err());
         assert!(SendPrivacy::parse("fullprivacy").is_err());
     }
 

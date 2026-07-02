@@ -165,8 +165,9 @@ rebroadcast_secs = 60            # max spacing of unmined-tx re-broadcast passes
 [spend]
 trusted_confirmations = 3        # depth before the wallet's own change is spendable
 untrusted_confirmations = 10     # depth before third-party payments are spendable (>= trusted)
-privacy_policy = "AllowRevealedRecipients"  # or "FullPrivacy": only single-shielded-pool sends
-                                 #   (no transparent recipients, no Sapling<->Orchard crossing)
+privacy_policy = "AllowRevealedRecipients"  # ladder: "FullPrivacy" (single-shielded-pool only),
+                                 #   "AllowRevealedAmounts" (cross-pool ok, transparent recipient
+                                 #   still -8), "AllowRevealedRecipients" (transparent ok, default)
 orchard_action_limit = 50        # cap on Orchard actions per send (0 disables); like Zallet's
                                  #   builder.limits.orchard_actions - too many recipients -> -8
 cache_proving_key = true         # build the Orchard proving key once (PCZT path) vs. per send
@@ -371,7 +372,7 @@ the validator's job there - so those rows are all - .
 | `getreceivedbyaddress`, `listreceivedbyaddress` | ✓ | - | Core shapes over diversified receiving addresses; change never counted; each entry's `label` is `""` (stateless). There is no `listaddresses` (Core has none either) - `listreceivedbyaddress 0 true` is the enumeration: `include_empty` unions every address the wallet has generated (used or not), each with its received total. `include_watchonly` is accepted but ignored (watch-only is wallet-level). The `*bylabel` pair is **not implemented** (`-32601`, stateless) |
 | `sendtoaddress` | ✓ | - (`z_sendmany` is async, returns an operation id) | Synchronous: builds, proves, broadcasts, returns txid; ZIP-317 fee; `subtractfeefromamount`/`fee_rate` → `-8`; extra trailing `memo` hex param |
 | `sendmany` | ✓ | - (`z_sendmany`) | Same; dummy `""` first arg as in Core |
-| `z_sendmany` | ✓ (Orchard-only) | ✓ | **Async**: returns an `opid`, proves/broadcasts on a background task; spends from the wallet's Orchard account (`fromaddress` must be one of its own addresses; `ANY_TADDR`/foreign → `-5`); zcashd `amounts` array with per-recipient `memo`; ZIP-317 fee (explicit `fee` → `-8`); `minconf` honored; `privacyPolicy` mapped onto `[spend] privacy_policy` (unknown → `-8`); too many recipients (Orchard actions over `[spend] orchard_action_limit`, default 50) → `-8`; a wallet may have at most 16 unfinished operations in flight at once - beyond that, new calls are rejected with `-4` (back-pressure) until some finish |
+| `z_sendmany` | ✓ (Orchard-only) | ✓ | **Async**: returns an `opid`, proves/broadcasts on a background task; spends from the wallet's Orchard account (`fromaddress` must be one of its own addresses; `ANY_TADDR`/foreign → `-5`); zcashd `amounts` array with per-recipient `memo` and zero-valued (memo-only) outputs; ZIP-317 fee (explicit `fee` → `-8`); `minconf` honored; `privacyPolicy` (three-rung: `FullPrivacy`/`AllowRevealedAmounts`/`AllowRevealedRecipients`, plus zcashd's stricter-sender names) mapped onto `[spend] privacy_policy` - a transparent recipient under `FullPrivacy` or `AllowRevealedAmounts` is `-8`; unknown policy → `-8`; too many recipients (Orchard actions over `[spend] orchard_action_limit`, default 50) → `-8`; a wallet may have at most 16 unfinished operations in flight at once - beyond that, new calls are rejected with `-4` (back-pressure) until some finish |
 | `z_getoperationstatus` | ✓ | ✓ | Status objects for the wallet's operations, non-destructive; per-wallet scoped; unknown opid omitted, malformed opid → `-8` |
 | `z_getoperationresult` | ✓ | ✓ | Like `z_getoperationstatus`, but returns only finished operations and **removes** them from memory - destructive and one-shot, so each result is returned only once (use `z_getoperationstatus` to poll without consuming). Reaping is optional: unread finished results are auto-evicted once the registry exceeds its cap (the transaction still broadcasts; only the status object is dropped) |
 | `z_listoperationids` | ✓ | ✓ | The wallet's operation ids; optional status filter (`queued`/`executing`/`success`/`failed`/`cancelled`) |
@@ -563,15 +564,21 @@ Edges to be aware of (consequences of being a shielded light wallet):
 - A send that leaves a single shielded pool reveals information on-chain: a transparent
   recipient reveals the amount and the recipient, and crossing the Sapling↔Orchard turnstile
   (spending one pool, paying the other) reveals the crossed amount via `valueBalance`. Both are
-  allowed by default; set `[spend] privacy_policy = "FullPrivacy"` to reject them with `-8` -
-  FullPrivacy permits only fully-shielded sends confined to one pool (matching zcashd/Zallet,
-  zcash/zcash#6240). The transparent-recipient half is caught up front; the no-cross-pool half
-  is enforced on the built transaction proposal (the input pool isn't known until then).
+  allowed by default; `[spend] privacy_policy` (and `z_sendmany`'s per-call `privacyPolicy`) is a
+  three-rung ladder matching zcashd/Zallet (zcash/zcash#6240): `FullPrivacy` permits only
+  fully-shielded sends confined to one pool (both leaks rejected with `-8`), `AllowRevealedAmounts`
+  permits the cross-pool crossing but still rejects a transparent recipient with `-8`, and
+  `AllowRevealedRecipients` (the default) permits both. `z_sendmany` also accepts zcashd's
+  stricter-sender policy names, which have no analog for a source-less wallet and map onto
+  `AllowRevealedRecipients`. The transparent-recipient half is caught up front; the no-cross-pool
+  half is enforced on the built transaction proposal (the input pool isn't known until then).
 - Shielded memos (ZIP 302) are supported as extensions beyond Bitcoin Core's surface:
   `sendtoaddress` takes a hex memo as an extra trailing parameter (after `verbose`, zcashd's
   `z_sendmany` conventions: ≤512 bytes, rejected for transparent recipients), and history
   entries (`listtransactions`/`gettransaction.details`) carry `memo` (hex) and `memoStr`
-  (decoded text) fields when an output has one.
+  (decoded text) fields when an output has one. `z_sendmany` also permits a zero-valued output
+  (zcashd's memo-only-send pattern: a shielded recipient, `amount: 0`, and a `memo`); the
+  Bitcoin-Core-dialect `sendtoaddress`/`sendmany` keep rejecting a zero amount with `-3`.
 - `listunspent` lists each unspent Orchard note as one entry. Its `txid`/`vout` identify the
   shielded action that created the note (there is no transparent `scriptPubKey`); `address` is
   the diversified address the note was received on, or empty for change/internal notes. The

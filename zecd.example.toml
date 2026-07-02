@@ -193,13 +193,19 @@ rebroadcast_secs = 60
 trusted_confirmations = 3
 # Confirmations before third-party payments are spendable (must be >= trusted_confirmations).
 untrusted_confirmations = 10
-# What sends may reveal on-chain (zcashd/Zallet's privacy-policy opt-in, zcash/zcash#6240):
-#   "AllowRevealedRecipients" (default) - allow transparent recipients and Sapling<->Orchard
-#       cross-pool sends; such sends reveal the transferred amount on-chain (and the recipient,
-#       if transparent).
+# What sends may reveal on-chain (zcashd/Zallet's privacy-policy opt-in, zcash/zcash#6240). The
+# two leaks are independent, so this is a three-rung ladder from most to least private:
 #   "FullPrivacy" - only fully-shielded sends confined to a single shielded pool: no transparent
 #       recipients, and no Sapling<->Orchard crossing. Anything that would reveal an amount or a
 #       recipient is rejected with -8.
+#   "AllowRevealedAmounts" - allow Sapling<->Orchard cross-pool sends (which reveal the transferred
+#       amount on-chain via valueBalance) but still reject transparent recipients (which would
+#       additionally reveal the recipient) with -8.
+#   "AllowRevealedRecipients" (default) - additionally allow transparent recipients; such a send
+#       reveals both the amount and the recipient.
+# z_sendmany's per-call privacyPolicy accepts these plus zcashd's stricter-sender names
+# (AllowRevealedSenders and weaker), which have no analog for a source-less wallet and map onto
+# AllowRevealedRecipients.
 privacy_policy = "AllowRevealedRecipients"
 # Cap on the number of Orchard actions (max of Orchard inputs vs. Orchard outputs) a single
 # send may build, mirroring Zallet's [builder.limits] orchard_actions. It bounds the memory and

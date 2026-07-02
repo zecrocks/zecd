@@ -1341,30 +1341,35 @@ fn build_payment(
     addr: &str,
     amount: &Value,
     memo_hex: Option<&str>,
+    allow_zero: bool,
 ) -> Result<Payment, RpcError> {
     let zaddr = crate::address::parse_recipient_on_network(network, addr)?;
-    // FullPrivacy forbids a transparent component, so a recipient with no shielded receiver
-    // (a transparent-only address) is rejected up front - paying it would force a transparent
-    // output, revealing the amount and the recipient on-chain. This is the cheap per-recipient
-    // half of the policy; the no-cross-pool (Sapling↔Orchard turnstile) half can only be judged
-    // once the proposal's input pool is known, and is enforced on the built proposal in the
-    // actor's `do_send`. zcashd/Zallet require an explicit AllowRevealed* opt-in for either;
-    // zecd's is `[spend] privacy_policy`, which defaults to allowing both.
-    if privacy == SendPrivacy::FullPrivacy {
+    // A recipient with no shielded receiver (a transparent-only address) forces a transparent
+    // output, revealing both the amount and the recipient on-chain - so every policy short of
+    // `AllowRevealedRecipients` rejects it up front. Notably `AllowRevealedAmounts` opts into
+    // revealing *amounts* (the Sapling↔Orchard turnstile) but not *recipients*, so it rejects a
+    // transparent recipient here just as `FullPrivacy` does; zcashd returns -8 for exactly this.
+    // This is the cheap per-recipient half of the policy; the no-cross-pool (turnstile) half
+    // applies only to `FullPrivacy` and can only be judged once the proposal's input pool is
+    // known, so it is enforced on the built proposal in the actor's `do_send`.
+    if !privacy.allows_transparent_recipient() {
         let receives_shielded = crate::address::decode_on_network(network, addr)
             .is_some_and(|a| crate::address::has_shielded_receiver(&a));
         if !receives_shielded {
             return Err(RpcError::invalid_parameter(format!(
-                "Privacy policy FullPrivacy rejects {addr}: it has no shielded receiver, so \
-                 paying it would reveal the amount and recipient on-chain. Set [spend] \
-                 privacy_policy = \"AllowRevealedRecipients\" to permit this."
+                "Privacy policy {} rejects {addr}: it has no shielded receiver, so paying it \
+                 would reveal the amount and recipient on-chain. Use privacyPolicy \
+                 \"AllowRevealedRecipients\" (or set [spend] privacy_policy) to permit this.",
+                privacy.policy_name()
             )));
         }
     }
     let zats = value_to_zats(amount)?;
     // Bitcoin Core rejects sending a zero amount with -3 "Invalid amount" (negative and
-    // over-MAX_MONEY amounts are already "Amount out of range" in value_to_zats).
-    if zats.into_u64() == 0 {
+    // over-MAX_MONEY amounts are already "Amount out of range" in value_to_zats). zcashd's
+    // `z_sendmany`, however, permits a zero-valued output - its standard memo-only-send pattern
+    // (a shielded recipient, `amount: 0`, and a memo) - so that path passes `allow_zero`.
+    if !allow_zero && zats.into_u64() == 0 {
         return Err(RpcError::type_error("Invalid amount"));
     }
     // Hex-encoded shielded memo, zcashd's z_sendmany convention (and error messages).
@@ -1457,6 +1462,7 @@ pub(crate) async fn sendtoaddress(
         addr,
         amount,
         memo,
+        false,
     )?;
     let request = TransactionRequest::new(vec![payment])
         .map_err(|e| RpcError::wallet(format!("invalid payment request: {e}")))?;
@@ -1509,6 +1515,7 @@ pub(crate) async fn sendmany(
             addr,
             amount,
             None,
+            false,
         )?);
     }
     if payments.is_empty() {
@@ -1526,18 +1533,21 @@ pub(crate) async fn sendmany(
 
 // ---- Asynchronous operations (zcashd-style `z_sendmany` + `z_getoperation*`) ----
 
-/// Map a zcashd `privacyPolicy` string onto zecd's two-variant [`SendPrivacy`]. zecd only ever
-/// spends shielded Orchard notes, so the one privacy axis it can act on is whether a recipient
-/// *without* an Orchard receiver (transparent / Sapling-only) is permitted - zcashd's other
-/// policies differ only in sender-side leakage, which has no analog here. Omitted or
-/// `LegacyCompat` fall back to the wallet's configured `[spend] privacy_policy`; an unknown
-/// value is `-8`.
+/// Map a zcashd `privacyPolicy` string onto zecd's [`SendPrivacy`] ladder. zecd only ever spends
+/// shielded Orchard notes, so the two leaks it can act on are whether the send crosses the
+/// Sapling↔Orchard turnstile (revealing the *amount*) and whether it pays a transparent recipient
+/// (additionally revealing the *recipient*). These map onto three rungs: `FullPrivacy` (neither),
+/// `AllowRevealedAmounts` (cross-pool only), and `AllowRevealedRecipients` (both). zcashd's
+/// stricter-sender policies (`AllowRevealedSenders` and weaker) differ only in sender-side
+/// leakage, which has no analog here (zecd has no transparent source), so they collapse onto
+/// `AllowRevealedRecipients` - the most a zecd send can reveal. Omitted or `LegacyCompat` fall
+/// back to the wallet's configured `[spend] privacy_policy`; an unknown value is `-8`.
 fn privacy_from_policy(s: Option<&str>, default: SendPrivacy) -> Result<SendPrivacy, RpcError> {
     match s {
         None | Some("LegacyCompat") => Ok(default),
         Some("FullPrivacy") => Ok(SendPrivacy::FullPrivacy),
-        Some("AllowRevealedAmounts")
-        | Some("AllowRevealedRecipients")
+        Some("AllowRevealedAmounts") => Ok(SendPrivacy::AllowRevealedAmounts),
+        Some("AllowRevealedRecipients")
         | Some("AllowRevealedSenders")
         | Some("AllowFullyTransparent")
         | Some("AllowLinkingAccountAddresses")
@@ -1670,7 +1680,15 @@ pub(crate) fn z_sendmany(
                 "Invalid parameter, duplicated recipient address: {addr}"
             )));
         }
-        payments.push(build_payment(&handle.network, privacy, addr, amount, memo)?);
+        // z_sendmany permits a zero-valued output (zcashd's memo-only-send pattern).
+        payments.push(build_payment(
+            &handle.network,
+            privacy,
+            addr,
+            amount,
+            memo,
+            true,
+        )?);
     }
 
     let request = TransactionRequest::new(payments)
@@ -1916,9 +1934,15 @@ mod tests {
             privacy_from_policy(Some("FullPrivacy"), AllowRevealedRecipients).unwrap(),
             FullPrivacy
         );
-        // Every weaker-or-equal zcashd policy maps onto AllowRevealedRecipients.
+        // AllowRevealedAmounts is its own rung: cross-pool allowed, transparent recipient not.
+        // It must NOT collapse onto AllowRevealedRecipients.
+        assert_eq!(
+            privacy_from_policy(Some("AllowRevealedAmounts"), FullPrivacy).unwrap(),
+            AllowRevealedAmounts
+        );
+        // The stricter-sender zcashd policies have no analog for a source-less wallet, so they
+        // map onto AllowRevealedRecipients (the most a zecd send can reveal).
         for p in [
-            "AllowRevealedAmounts",
             "AllowRevealedRecipients",
             "AllowRevealedSenders",
             "AllowFullyTransparent",
@@ -2140,11 +2164,15 @@ mod tests {
         let net = crate::network::ZNetwork::Test;
         let revealed = SendPrivacy::AllowRevealedRecipients;
         let ua = "utest12r53eljnr7kev8ychw3ahzjgm6fwxm7fd8vfay7hn9uylj05x0pxxhze800h9dcgyr8hkc7kz3s2crnrhjcy2p90yfce2vl8mq667zw0";
-        // Zero amounts are a -3 "Invalid amount" like Bitcoin Core; positive ones build.
-        let e = build_payment(&net, revealed, ua, &json!(0), None).unwrap_err();
+        // Zero amounts are a -3 "Invalid amount" for the Bitcoin-Core-dialect sends (allow_zero
+        // = false); positive ones build.
+        let e = build_payment(&net, revealed, ua, &json!(0), None, false).unwrap_err();
         assert_eq!(e.code, crate::error::codes::RPC_TYPE_ERROR);
         assert!(e.message.contains("Invalid amount"), "{}", e.message);
-        assert!(build_payment(&net, revealed, ua, &json!(0.1), None).is_ok());
+        assert!(build_payment(&net, revealed, ua, &json!(0.1), None, false).is_ok());
+        // z_sendmany permits a zero-valued output (memo-only send): allow_zero = true accepts it.
+        assert!(build_payment(&net, revealed, ua, &json!(0), Some("f00f"), true).is_ok());
+        assert!(build_payment(&net, revealed, ua, &json!(0), None, true).is_ok());
 
         // verbose: bare txid by default, {txid, fee_reason} object when set, -3 on junk.
         assert!(!verbose_param(None).unwrap());
@@ -2190,18 +2218,19 @@ mod tests {
         let p = SendPrivacy::AllowRevealedRecipients;
         let ua = "utest12r53eljnr7kev8ychw3ahzjgm6fwxm7fd8vfay7hn9uylj05x0pxxhze800h9dcgyr8hkc7kz3s2crnrhjcy2p90yfce2vl8mq667zw0";
         // A hex memo to a shielded recipient builds.
-        assert!(build_payment(&net, p, ua, &json!(0.1), Some("f00f")).is_ok());
+        assert!(build_payment(&net, p, ua, &json!(0.1), Some("f00f"), false).is_ok());
         // Bad hex and oversized memos are -8 with zcashd's messages.
-        let e = build_payment(&net, p, ua, &json!(0.1), Some("xyz")).unwrap_err();
+        let e = build_payment(&net, p, ua, &json!(0.1), Some("xyz"), false).unwrap_err();
         assert_eq!(e.code, crate::error::codes::RPC_INVALID_PARAMETER);
         assert!(e.message.contains("hexadecimal"), "{}", e.message);
-        let e = build_payment(&net, p, ua, &json!(0.1), Some(&"ab".repeat(513))).unwrap_err();
+        let e =
+            build_payment(&net, p, ua, &json!(0.1), Some(&"ab".repeat(513)), false).unwrap_err();
         assert!(e.message.contains("512"), "{}", e.message);
         // A memo to a transparent recipient is rejected.
         use zcash_keys::encoding::AddressCodec as _;
         let taddr =
             zcash_transparent::address::TransparentAddress::PublicKeyHash([0u8; 20]).encode(&net);
-        let e = build_payment(&net, p, &taddr, &json!(0.1), Some("f00f")).unwrap_err();
+        let e = build_payment(&net, p, &taddr, &json!(0.1), Some("f00f"), false).unwrap_err();
         assert_eq!(e.code, crate::error::codes::RPC_INVALID_PARAMETER);
         assert!(e.message.contains("transparent"), "{}", e.message);
     }
@@ -2220,18 +2249,49 @@ mod tests {
 
         // FullPrivacy: any shielded recipient passes build_payment; a transparent recipient is
         // -8 with a self-diagnosing message; the default policy allows all of them.
-        assert!(build_payment(&net, SendPrivacy::FullPrivacy, ua, &json!(0.1), None).is_ok());
-        assert!(build_payment(&net, SendPrivacy::FullPrivacy, sapling, &json!(0.1), None).is_ok());
-        let e =
-            build_payment(&net, SendPrivacy::FullPrivacy, &taddr, &json!(0.1), None).unwrap_err();
+        assert!(
+            build_payment(&net, SendPrivacy::FullPrivacy, ua, &json!(0.1), None, false).is_ok()
+        );
+        assert!(build_payment(
+            &net,
+            SendPrivacy::FullPrivacy,
+            sapling,
+            &json!(0.1),
+            None,
+            false
+        )
+        .is_ok());
+        let e = build_payment(
+            &net,
+            SendPrivacy::FullPrivacy,
+            &taddr,
+            &json!(0.1),
+            None,
+            false,
+        )
+        .unwrap_err();
         assert_eq!(e.code, crate::error::codes::RPC_INVALID_PARAMETER);
         assert!(e.message.contains("privacy_policy"), "{}", e.message);
+        assert!(e.message.contains("FullPrivacy"), "{}", e.message);
+
+        // AllowRevealedAmounts opts into revealed *amounts* (cross-pool) but NOT revealed
+        // *recipients*: shielded recipients pass, but a transparent recipient is still -8 (the
+        // bug was that it collapsed onto AllowRevealedRecipients and silently paid transparent).
+        let amounts = SendPrivacy::AllowRevealedAmounts;
+        assert!(build_payment(&net, amounts, ua, &json!(0.1), None, false).is_ok());
+        assert!(build_payment(&net, amounts, sapling, &json!(0.1), None, false).is_ok());
+        let e = build_payment(&net, amounts, &taddr, &json!(0.1), None, false).unwrap_err();
+        assert_eq!(e.code, crate::error::codes::RPC_INVALID_PARAMETER);
+        assert!(e.message.contains("AllowRevealedAmounts"), "{}", e.message);
+
+        // AllowRevealedRecipients allows the transparent recipient.
         assert!(build_payment(
             &net,
             SendPrivacy::AllowRevealedRecipients,
             &taddr,
             &json!(0.1),
-            None
+            None,
+            false
         )
         .is_ok());
     }
