@@ -64,13 +64,18 @@ impl RpcRequest {
         self.params.get(i)
     }
 
-    /// A required string parameter, or Bitcoin Core's `-32602` invalid-params error carrying
-    /// `msg` when the parameter is missing or is not a string. Centralizes the most common
-    /// param-parsing idiom in the handlers.
+    /// A required string parameter, with Bitcoin Core's argument-error taxonomy: a missing
+    /// (absent or `null`) argument raises `msg` under `RPC_MISC_ERROR` (-1, Core's help path),
+    /// while a present-but-non-string argument is a `RPC_TYPE_ERROR` (-3). Core never emits
+    /// `RPC_INVALID_PARAMS` (-32602) from a handler, so neither does this. Centralizes the most
+    /// common param-parsing idiom in the handlers.
     pub fn require_str(&self, i: usize, msg: &str) -> Result<&str, RpcError> {
-        self.param(i)
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| RpcError::invalid_params(msg))
+        match self.param(i) {
+            None | Some(Value::Null) => Err(RpcError::missing_param(msg)),
+            Some(v) => v
+                .as_str()
+                .ok_or_else(|| RpcError::type_error(format!("{msg} (expected a string)"))),
+        }
     }
 }
 

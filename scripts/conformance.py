@@ -343,12 +343,13 @@ def main() -> int:
         ck("z_getaddressforaccount negative diversifier raises", False)
     except JSONRPCException as e:
         ck("z_getaddressforaccount negative diversifier -> -8", e.code == -8, e.code)
-    # No arguments at all is the standard invalid-params error.
+    # A missing required argument is Bitcoin Core's help error (-1), never -32602 (which Core
+    # reserves for framing and never emits from a handler).
     try:
         rpc.call("z_getaddressforaccount")
         ck("z_getaddressforaccount no args raises", False)
     except JSONRPCException as e:
-        ck("z_getaddressforaccount no args -> -32602", e.code == -32602, e.code)
+        ck("z_getaddressforaccount no args -> -1", e.code == -1, e.code)
 
     print("== received-by-address ==")
     recv = rpc.call("getreceivedbyaddress", addr)
@@ -593,6 +594,19 @@ def main() -> int:
         ck("sendmany fee_rate raises", False)
     except JSONRPCException as e:
         ck("sendmany fee_rate -> code -8", e.code == -8, e.code)
+    # Arity: like Bitcoin Core, a call with more positional arguments than the method accepts is
+    # rejected (-1, the help error) rather than silently ignoring the trailing junk. A no-arg
+    # method with one extra arg, and a one-arg method with a second, both trip it.
+    try:
+        rpc.call("getblockcount", 1)
+        ck("getblockcount extra arg raises", False)
+    except JSONRPCException as e:
+        ck("getblockcount extra arg -> code -1", e.code == -1, e.code)
+    try:
+        rpc.call("validateaddress", addr, "extra")
+        ck("validateaddress extra arg raises", False)
+    except JSONRPCException as e:
+        ck("validateaddress extra arg -> code -1", e.code == -1, e.code)
     # z_sendmany is zcashd's async send: it returns an opid; the trio z_getoperationstatus /
     # z_getoperationresult / z_listoperationids track it. These checks all reject (or query
     # empty) *before* any send is spawned, so they move no money. addr is the wallet's own
@@ -620,11 +634,12 @@ def main() -> int:
     except JSONRPCException as e:
         ck("z_sendmany bad fromaddress -> code -5", e.code == -5, e.code)
     try:
-        # A missing fromaddress is the invalid-params -32602 (require_str).
+        # A missing fromaddress is Bitcoin Core's help error (-1, via require_str), not the
+        # framing-only -32602.
         rpc.call("z_sendmany")
         ck("z_sendmany no args raises", False)
     except JSONRPCException as e:
-        ck("z_sendmany no args -> code -32602", e.code == -32602, e.code)
+        ck("z_sendmany no args -> code -1", e.code == -1, e.code)
     try:
         # ANY_TADDR is unsupported (zecd has no transparent source) -> -5.
         rpc.call("z_sendmany", "ANY_TADDR", [{"address": addr, "amount": "0.1"}])

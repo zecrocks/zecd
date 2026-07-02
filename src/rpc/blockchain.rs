@@ -81,12 +81,20 @@ pub(crate) fn getblockhash(
     wallet: Option<&str>,
     req: &RpcRequest,
 ) -> Result<Value, RpcError> {
-    let height = req
-        .param(0)
-        .and_then(|v| v.as_u64())
-        .filter(|h| *h <= u64::from(u32::MAX))
-        .ok_or_else(|| RpcError::invalid_params("getblockhash requires a height"))?
-        as u32;
+    // Bitcoin Core's argument taxonomy: an omitted height is the help error (-1), a non-integer
+    // is a type error (-3), and an integer outside the representable/valid range is -8.
+    let height = match req.param(0) {
+        None | Some(Value::Null) => {
+            return Err(RpcError::missing_param("getblockhash requires a height"))
+        }
+        Some(v) => {
+            let n = v
+                .as_i64()
+                .ok_or_else(|| RpcError::type_error("Block height must be an integer"))?;
+            u32::try_from(n)
+                .map_err(|_| RpcError::invalid_parameter("Block height out of range"))?
+        }
+    };
     let w = state.registry.get(wallet)?;
     // Any block the wallet has scanned can be answered from the wallet DB; the not-yet-scanned
     // chain tip is answered from the sync status. Anything else (below the wallet birthday,

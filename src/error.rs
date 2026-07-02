@@ -11,7 +11,10 @@ use std::fmt;
 /// `python-bitcoinrpc` and `bitcoincore-rpc` match on these.
 #[allow(dead_code)]
 pub mod codes {
-    // JSON-RPC 2.0 transport-level errors.
+    // JSON-RPC 2.0 transport-level errors. NB: `RPC_INVALID_PARAMS` (-32602) is a framing-level
+    // code that Bitcoin Core never emits from a method handler - a missing argument raises the
+    // help text (`RPC_MISC_ERROR`, -1) and a wrong-typed one raises `RPC_TYPE_ERROR` (-3). zecd
+    // follows suit: handlers use [`RpcError::missing_param`]/[`RpcError::type_error`], never this.
     pub const RPC_INVALID_REQUEST: i32 = -32600;
     pub const RPC_METHOD_NOT_FOUND: i32 = -32601;
     pub const RPC_INVALID_PARAMS: i32 = -32602;
@@ -86,8 +89,11 @@ impl RpcError {
         Self::new(codes::RPC_MISC_ERROR, message)
     }
 
-    pub fn invalid_params(message: impl Into<String>) -> Self {
-        Self::new(codes::RPC_INVALID_PARAMS, message)
+    /// A required parameter was omitted. Bitcoin Core answers a missing argument with the
+    /// method's help text under `RPC_MISC_ERROR` (-1); zecd carries a short description instead
+    /// of a full help page. Never `RPC_INVALID_PARAMS` (-32602), which Core reserves for framing.
+    pub fn missing_param(message: impl Into<String>) -> Self {
+        Self::new(codes::RPC_MISC_ERROR, message)
     }
 
     pub fn invalid_parameter(message: impl Into<String>) -> Self {

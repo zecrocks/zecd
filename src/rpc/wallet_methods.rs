@@ -153,7 +153,7 @@ pub(crate) async fn z_getaddressforaccount(
 /// while a value outside zcashd's `0..=(2^31)-2` range - or a non-integer - is a `-8`.
 fn parse_account_arg(v: Option<&Value>) -> Result<u64, RpcError> {
     let v = v.ok_or_else(|| {
-        RpcError::invalid_params("z_getaddressforaccount requires an account number")
+        RpcError::missing_param("z_getaddressforaccount requires an account number")
     })?;
     // `as_i64` yields `None` for non-integers (strings, floats, oversized), all of which fail
     // the range check identically.
@@ -1404,9 +1404,12 @@ pub(crate) async fn sendtoaddress(
     req: &RpcRequest,
 ) -> Result<Value, RpcError> {
     let addr = req.require_str(0, "sendtoaddress requires an address")?;
-    let amount = req
-        .param(1)
-        .ok_or_else(|| RpcError::invalid_params("sendtoaddress requires an amount"))?;
+    let amount = match req.param(1) {
+        None | Some(Value::Null) => {
+            return Err(RpcError::missing_param("sendtoaddress requires an amount"))
+        }
+        Some(v) => v,
+    };
     // Params 2/3 (comment, comment_to) are metadata and safe to ignore, but
     // subtractfeefromamount changes who pays the fee: silently ignoring it would debit the
     // sender more than the caller intended. Reject it until it is implemented.
@@ -1460,10 +1463,16 @@ pub(crate) async fn sendmany(
     // The dummy is ignored (legacy) and minconf is an "ignored dummy value" in Bitcoin Core
     // too, but subtractfeefrom changes who pays the fee - reject it rather than silently
     // sending different amounts than the caller intended.
-    let recipients = req
-        .param(1)
-        .and_then(|v| v.as_object())
-        .ok_or_else(|| RpcError::invalid_params("sendmany requires an address->amount object"))?;
+    let recipients = match req.param(1) {
+        None | Some(Value::Null) => {
+            return Err(RpcError::missing_param(
+                "sendmany requires an amounts object",
+            ))
+        }
+        Some(v) => v
+            .as_object()
+            .ok_or_else(|| RpcError::type_error("amounts must be an address->amount object"))?,
+    };
     if req.param(4).is_some_and(param_engaged) {
         return Err(RpcError::invalid_parameter(
             "subtractfeefrom is not supported (fees are ZIP-317, paid by the sender)",
@@ -1489,7 +1498,7 @@ pub(crate) async fn sendmany(
         )?);
     }
     if payments.is_empty() {
-        return Err(RpcError::invalid_params(
+        return Err(RpcError::invalid_parameter(
             "sendmany requires at least one recipient",
         ));
     }
@@ -1820,10 +1829,10 @@ mod tests {
         // The single account is 0.
         assert_eq!(parse_account_arg(Some(&json!(0))).unwrap(), 0);
 
-        // Missing -> -32602 (invalid params), as for any required argument.
+        // Missing -> -1 (Bitcoin Core's help path for an omitted required argument).
         assert_eq!(
             parse_account_arg(None).unwrap_err().code,
-            crate::error::codes::RPC_INVALID_PARAMS
+            crate::error::codes::RPC_MISC_ERROR
         );
 
         // In-range but not the wallet's only account -> -4 "has not been generated".

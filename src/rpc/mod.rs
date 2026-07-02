@@ -76,6 +76,97 @@ pub fn is_known_method(name: &str) -> bool {
     ALL_METHODS.contains(&name)
 }
 
+/// The maximum number of *positional* parameters each method accepts. Bitcoin Core rejects a
+/// call carrying more positional arguments than the method declares (it raises the help text,
+/// `RPC_MISC_ERROR`/-1); zecd mirrors that via [`check_arity`] in dispatch, closing the gap where
+/// handlers silently ignored trailing junk. Counts follow Bitcoin Core's / zcashd's argument
+/// lists, plus zecd's own trailing extension args where they exist (e.g. `sendtoaddress`'s
+/// `memo` at index 11 → arity 12). Object params are unaffected: an object request body yields
+/// zero positional params, so an object-shaped call never trips the bound.
+///
+/// Kept in lockstep with [`ALL_METHODS`] by the `arity_table_matches_all_methods` test.
+const MAX_POSITIONAL_ARGS: &[(&str, usize)] = &[
+    // Control
+    ("stop", 0),
+    ("uptime", 0),
+    ("help", 1),
+    ("getrpcinfo", 0),
+    // Network
+    ("getnetworkinfo", 0),
+    ("getconnectioncount", 0),
+    ("getpeerinfo", 0),
+    ("ping", 0),
+    // Blockchain
+    ("getblockchaininfo", 0),
+    ("getblockcount", 0),
+    ("getbestblockhash", 0),
+    ("getblockhash", 1),
+    ("getblockheader", 2),
+    // Utility
+    ("validateaddress", 1),
+    ("settxfee", 1),
+    ("estimatesmartfee", 2),
+    ("estimatefee", 1),
+    ("getmempoolinfo", 0),
+    // Raw transactions
+    ("getrawtransaction", 3),
+    ("sendrawtransaction", 2),
+    // Wallet - reads
+    ("getbalance", 4),
+    ("getbalances", 0),
+    ("getunconfirmedbalance", 0),
+    ("getwalletinfo", 0),
+    ("getaddressinfo", 1),
+    ("listtransactions", 4),
+    ("z_listtransactions", 3),
+    ("listsinceblock", 4),
+    ("gettransaction", 3),
+    ("listunspent", 5),
+    ("getreceivedbyaddress", 3),
+    ("listreceivedbyaddress", 5),
+    ("listwallets", 0),
+    // Wallet - writes / async
+    ("getnewaddress", 2),
+    ("sendtoaddress", 12),
+    ("sendmany", 10),
+    ("walletpassphrase", 2),
+    ("walletlock", 0),
+    // Wallet - async operations (zcashd-style)
+    ("z_sendmany", 5),
+    ("z_getoperationstatus", 1),
+    ("z_getoperationresult", 1),
+    ("z_listoperationids", 1),
+    // Wallet - address derivation (zcashd-style)
+    ("z_getaddressforaccount", 3),
+];
+
+/// The positional-argument cap for `method`, or `None` when the method is unknown (the
+/// method-not-found path handles those).
+fn max_positional_args(method: &str) -> Option<usize> {
+    MAX_POSITIONAL_ARGS
+        .iter()
+        .find(|(m, _)| *m == method)
+        .map(|(_, n)| *n)
+}
+
+/// Enforce Bitcoin Core's arity rule: a positional call may not carry more arguments than the
+/// method declares. Excess positional params are rejected with `RPC_MISC_ERROR` (-1), matching
+/// Core (which raises the method help text). Unknown methods are left to the dispatch table's
+/// method-not-found handling.
+fn check_arity(req: &RpcRequest) -> Result<(), RpcError> {
+    if let Some(max) = max_positional_args(&req.method) {
+        if req.params.len() > max {
+            return Err(RpcError::misc(format!(
+                "{} takes at most {} argument(s) ({} provided)",
+                req.method,
+                max,
+                req.params.len()
+            )));
+        }
+    }
+    Ok(())
+}
+
 /// Route a parsed request to zecd's method table. `wallet` is the wallet name from a
 /// `/wallet/<name>` path (or `None` for the default wallet).
 pub(crate) async fn dispatch(
@@ -91,6 +182,10 @@ pub(crate) async fn dispatch(
     if !safelist.is_empty() && !safelist.iter().any(|m| m == &req.method) {
         return Err(RpcError::method_not_found(&req.method));
     }
+    // Reject over-arity positional calls before dispatch (Bitcoin Core's help error, -1). Runs
+    // after the safelist so a disabled method still reads as method-not-found, not a bad-arity
+    // hint about a surface the operator hid.
+    check_arity(req)?;
     dispatch_zecd(state, wallet, req).await
 }
 
@@ -207,6 +302,27 @@ mod tests {
             super::ALL_METHODS.len(),
             declared.len(),
             "ALL_METHODS contains duplicate method names"
+        );
+    }
+
+    /// The arity table must name exactly the methods in `ALL_METHODS` - no gaps (an unlisted
+    /// method would silently keep accepting extra positional junk) and no strays (a typo'd key
+    /// never fires). This keeps [`super::check_arity`] total over the dispatch surface.
+    #[test]
+    fn arity_table_matches_all_methods() {
+        let declared: BTreeSet<String> = super::ALL_METHODS.iter().map(|s| s.to_string()).collect();
+        let arity: BTreeSet<String> = super::MAX_POSITIONAL_ARGS
+            .iter()
+            .map(|(m, _)| m.to_string())
+            .collect();
+        assert_eq!(
+            arity, declared,
+            "MAX_POSITIONAL_ARGS is out of sync with ALL_METHODS"
+        );
+        assert_eq!(
+            super::MAX_POSITIONAL_ARGS.len(),
+            arity.len(),
+            "MAX_POSITIONAL_ARGS contains duplicate method names"
         );
     }
 }
