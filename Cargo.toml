@@ -41,6 +41,11 @@ sha2 = "0.10"
 # hash160 (= ripemd160(sha256)) for transparent-script address extraction in
 # `getrawtransaction`; already in the tree via the zcash crates.
 ripemd = "0.1"
+# `signmessage`/`verifymessage` sign the double-SHA256 message hash with the transparent
+# address's secp256k1 key and recover the signer's pubkey. The `recovery` feature provides the
+# recoverable-ECDSA API (compact 65-byte header+sig, as zcashd/zallet produce). Already in the
+# tree via the zcash crates; matches zallet's pin.
+secp256k1 = { version = "0.29", features = ["recovery"] }
 rand = { version = "0.8", default-features = false, features = ["std", "std_rng"] }
 hex = "0.4"
 
@@ -65,6 +70,10 @@ uuid = { version = "1", features = ["v4", "serde"] }
 # librustzcash's fused builder which rebuilds it per transaction.
 orchard = { version = "0.14", default-features = false, features = ["circuit"] }
 zcash_address = "0.12"
+# `CompactSize` builds the length-prefixed preimage for the `signmessage`/`verifymessage`
+# message hash (magic + message, each CompactSize-prefixed, double-SHA256), byte-identical to
+# zcashd's `rpc/misc.cpp` and zallet.
+zcash_encoding = "0.4"
 # `transparent-inputs` lets transparent receivers surface in getrawtransaction/getaddressinfo
 # and the received-by-address read paths; zecd's own wallets never expose transparent receivers.
 # `pczt` exposes `create_pczt_from_proposal` / `extract_and_store_transaction_from_pczt`, the

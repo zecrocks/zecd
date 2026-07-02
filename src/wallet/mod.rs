@@ -18,6 +18,7 @@ use std::sync::{Arc, Mutex};
 use tokio::sync::{mpsc, oneshot, watch};
 use zcash_client_backend::data_api::wallet::ConfirmationsPolicy;
 use zcash_protocol::TxId;
+use zcash_transparent::address::TransparentAddress;
 use zip32::DiversifierIndex;
 use zip321::TransactionRequest;
 
@@ -196,6 +197,15 @@ pub enum WalletCommand {
     /// Zeroize the in-memory seed and cancel any pending relock (`walletlock`).
     Lock {
         reply: oneshot::Sender<Result<(), RpcError>>,
+    },
+    /// Sign `message` with the private key of a transparent address the wallet owns
+    /// (`signmessage`). Routed through the actor because it needs the seed (held by the actor's
+    /// `SeedKeeper`): a locked wallet yields `-13`, a watch-only wallet `-4`, an unowned address
+    /// `-4`. Returns the base64-encoded signature.
+    SignMessage {
+        address: TransparentAddress,
+        message: String,
+        reply: oneshot::Sender<Result<String, RpcError>>,
     },
 }
 
@@ -384,6 +394,21 @@ impl WalletHandle {
             seed.lock().unwrap_or_else(|p| p.into_inner()).lock();
         }
         self.dispatch(|reply| WalletCommand::Lock { reply }).await
+    }
+
+    /// Sign `message` with the private key of the transparent `address` (which must belong to this
+    /// wallet's account), returning the base64-encoded signature. See [`WalletCommand::SignMessage`].
+    pub async fn sign_message(
+        &self,
+        address: TransparentAddress,
+        message: String,
+    ) -> Result<String, RpcError> {
+        self.dispatch(|reply| WalletCommand::SignMessage {
+            address,
+            message,
+            reply,
+        })
+        .await
     }
 }
 

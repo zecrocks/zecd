@@ -283,6 +283,46 @@ def main() -> int:
     except JSONRPCException as e:
         ck("getaddressinfo invalid -> code -5", e.code == -5, e.code)
 
+    print("== signmessage / verifymessage ==")
+    # signmessage signs with a transparent address's key; verifymessage recovers the signer and
+    # compares the address (Bitcoin Core's pair, ported from zallet). This wallet is shielded-only
+    # (no transparent addresses to own), so the happy-path round-trip is covered by the
+    # regtest_transparent e2e; here we assert the argument/error contract, which is
+    # network-independent. A "t2…" regtest P2SH address is a valid transparent address that does
+    # not refer to a key.
+    P2SH_ADDR = "t27eWDgjFYJGVXmzrXeVjnb5J3uXDM9xH9v"
+    try:
+        rpc.call("signmessage", "not-an-address", "hello")
+        ck("signmessage invalid address raises", False)
+    except JSONRPCException as e:
+        ck("signmessage invalid address -> -5", e.code == -5, e.code)
+    try:
+        # A shielded UA is not a transparent address: rejected before the seed is touched.
+        rpc.call("signmessage", addr, "hello")
+        ck("signmessage shielded address raises", False)
+    except JSONRPCException as e:
+        ck("signmessage shielded address -> -5", e.code == -5, e.code)
+    try:
+        rpc.call("signmessage", P2SH_ADDR, "hello")
+        ck("signmessage P2SH address raises", False)
+    except JSONRPCException as e:
+        ck("signmessage P2SH address -> -3", e.code == -3, e.code)
+    # verifymessage error/edge contract. Malformed base64 is -5; a P2SH address is -3; a
+    # well-formed-but-wrong-length signature verifies false (not an error).
+    try:
+        rpc.call("verifymessage", P2SH_ADDR, "AAAA", "hello")
+        ck("verifymessage P2SH address raises", False)
+    except JSONRPCException as e:
+        ck("verifymessage P2SH address -> -3", e.code == -3, e.code)
+    try:
+        rpc.call("verifymessage", "not-an-address", "AAAA", "hello")
+        ck("verifymessage invalid address raises", False)
+    except JSONRPCException as e:
+        ck("verifymessage invalid address -> -3", e.code == -3, e.code)
+    # (The malformed-base64 -5, wrong-length -> false, and full sign->verify round-trip against a
+    # real transparent key are covered by the src/rpc/signmessage.rs unit tests - which pin
+    # zallet's forum vector - and the regtest_transparent e2e.)
+
     print("== z_getaddressforaccount ==")
     # zcashd-syntax derivation of a Unified Address for the wallet's single account (0). zecd is
     # shielded-only: the default config is Orchard-only, so a default UA carries just "orchard".

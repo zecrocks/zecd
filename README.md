@@ -411,6 +411,8 @@ the validator's job there - so those rows are all - .
 | `ping` | ✓ | - | No-op success (no P2P ping to measure) |
 | **Utility** | | | |
 | `validateaddress` | ✓ | ✓ (transparent-only: a valid UA gets `isvalid:false`) | Validates every Zcash address kind; valid UA → `isvalid:true`, `scriptPubKey` empty, plus extension fields `isvalid_orchard` and a `receiver_types` array (`transparent`/`sapling`/`orchard`) enumerating what the address can receive |
+| `signmessage` | ✓ | ✓ | Signs a message with the private key of a **transparent** address the wallet owns (zcashd's double-SHA256 magic-prefixed digest, base64 recoverable signature). Requires an unlocked spending wallet (`-13`/`-4`); the address must be an owned t-addr (`-4`), not shielded (`-5`) or P2SH (`-3`) |
+| `verifymessage` | ✓ | ✓ | Verifies a `signmessage` signature against a transparent address (stateless: recovers the signer's pubkey and compares) |
 | `estimatesmartfee` | ✓ | - | Inert stub: conventional ZIP-317 rate (0.00001) + `blocks` echo |
 | `estimatefee` | *removed* | - | Same stub rate, for old clients |
 | `getmempoolinfo` | ✓ | - | Fixed shape with empty-mempool numbers (a light client holds no mempool) |
