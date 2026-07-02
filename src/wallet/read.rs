@@ -607,6 +607,14 @@ pub fn first_scanned_block(wallet_dir: &Path) -> anyhow::Result<Option<(u32, Str
     Ok(row.map(|(h, hash)| (h, txid_display(&hash))))
 }
 
+/// Whether `display_hash` is a syntactically valid block-hash string (64 hex chars → 32
+/// bytes). `listsinceblock` uses this to tell a reorged-away cursor (well-formed, whose
+/// `blocks` row `perform_rewind` deleted - worth surviving) from a malformed client argument
+/// (still `-5`).
+pub fn is_block_hash_wellformed(display_hash: &str) -> bool {
+    txid_internal(display_hash).is_some()
+}
+
 /// The height of a wallet-scanned block, looked up by its display-hex hash (for
 /// `listsinceblock`). Hashes are stored in internal byte order, displayed reversed.
 pub fn block_height_by_hash(wallet_dir: &Path, display_hash: &str) -> anyhow::Result<Option<u32>> {

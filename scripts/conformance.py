@@ -511,11 +511,19 @@ def main() -> int:
     again = rpc.call("listsinceblock", lsb["lastblock"])
     ck("since lastblock reports only unconfirmed",
        all(t["confirmations"] < 1 for t in again["transactions"]))
+    # A well-formed but unknown blockhash (e.g. a cursor whose block was reorged away) does NOT
+    # wedge the poller: zecd lists from the earliest scanned block (re-reports, never misses)
+    # instead of erroring, so a reorg can't kill the lastblock cursor loop.
+    reorged = rpc.call("listsinceblock", "00" * 32)
+    ck("reorged-away cursor lists instead of raising",
+       isinstance(reorged.get("transactions"), list)
+       and isinstance(reorged.get("lastblock"), str) and len(reorged["lastblock"]) == 64)
+    # A malformed hash is a clear client error and still raises -5.
     try:
-        rpc.call("listsinceblock", "00" * 32)
-        ck("unknown block raises", False)
+        rpc.call("listsinceblock", "not-a-block-hash")
+        ck("malformed block raises", False)
     except JSONRPCException as e:
-        ck("unknown block -> code -5", e.code == -5, e.code)
+        ck("malformed block -> code -5", e.code == -5, e.code)
 
     print("== error handling (JSONRPCException with Bitcoin Core codes) ==")
     try:
