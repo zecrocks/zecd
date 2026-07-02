@@ -640,6 +640,72 @@ mod tests {
         assert_ne!(code, Some(RPC_INVALID_ADDRESS_OR_KEY as i64));
     }
 
+    /// Bitcoin Core's argument-error taxonomy: a missing required param is the help error (-1),
+    /// a wrong-typed one is a type error (-3), and no handler ever emits -32602 (which Core
+    /// reserves for framing). All of these fire before any wallet access.
+    #[tokio::test]
+    async fn missing_and_wrong_typed_params_use_core_codes() {
+        use crate::error::codes::{RPC_MISC_ERROR, RPC_TYPE_ERROR};
+        // Missing required params -> -1. (These parse the param before resolving the wallet, so
+        // the walletless state still reaches the param check. z_sendmany / z_getaddressforaccount
+        // resolve the wallet first, so their missing-arg -1 is covered by conformance's funded
+        // run instead.)
+        for body in [
+            r#"{"method":"getblockhash","id":1,"params":[]}"#,
+            r#"{"method":"getblockheader","id":1,"params":[]}"#,
+            r#"{"method":"sendtoaddress","id":1,"params":["uaddr"]}"#,
+        ] {
+            assert_eq!(
+                call_err_code(body).await,
+                Some(RPC_MISC_ERROR as i64),
+                "missing param must be -1: {body}"
+            );
+        }
+        // Present-but-wrong-typed params -> -3.
+        for body in [
+            // getblockhash height must be an integer.
+            r#"{"method":"getblockhash","id":1,"params":["nope"]}"#,
+            // require_str: a non-string where a string is required.
+            r#"{"method":"getblockheader","id":1,"params":[123]}"#,
+            r#"{"method":"sendmany","id":1,"params":["",42]}"#,
+        ] {
+            assert_eq!(
+                call_err_code(body).await,
+                Some(RPC_TYPE_ERROR as i64),
+                "wrong-typed param must be -3: {body}"
+            );
+        }
+    }
+
+    /// Arity: a positional call with more arguments than the method accepts is rejected with
+    /// Bitcoin Core's help error (-1) rather than silently ignoring the extras. Runs before any
+    /// wallet access, so an empty registry suffices.
+    #[tokio::test]
+    async fn extra_positional_args_are_rejected() {
+        use crate::error::codes::RPC_MISC_ERROR;
+        for body in [
+            // Zero-arg methods reject any positional arg.
+            r#"{"method":"getblockcount","id":1,"params":[1]}"#,
+            r#"{"method":"uptime","id":1,"params":["x"]}"#,
+            // One-arg methods reject a second.
+            r#"{"method":"getblockhash","id":1,"params":[1,2]}"#,
+            r#"{"method":"validateaddress","id":1,"params":["a","b"]}"#,
+        ] {
+            assert_eq!(
+                call_err_code(body).await,
+                Some(RPC_MISC_ERROR as i64),
+                "over-arity call must be -1: {body}"
+            );
+        }
+        // A call at exactly the arity limit is not an arity error: getblockhash accepts one arg,
+        // so `[1]` clears the bound and reaches the handler (failing later on the missing wallet).
+        assert_ne!(
+            call_err_code(r#"{"method":"getblockhash","id":1,"params":[1]}"#).await,
+            Some(RPC_MISC_ERROR as i64),
+            "a within-arity call must not be an arity error"
+        );
+    }
+
     /// The newer wallet methods are wired into dispatch: they must fail on the missing
     /// wallet / missing params - never with -32601 (method not found).
     #[tokio::test]
