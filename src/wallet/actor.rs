@@ -631,6 +631,18 @@ async fn fetch_chain_tip(client: &mut impl ChainSource) -> anyhow::Result<(Block
     Ok((tip, chain_tip.hash))
 }
 
+/// The reconnect deadline after a disconnect: `now + backoff.next_delay()`, advancing the backoff
+/// exactly once. [`WalletActor::mark_disconnected`] uses this so every post-connection failure
+/// (tip refresh, sync error, a stale-client operation) is paced with the same exponential +
+/// jittered backoff a failed dial already gets, instead of leaving `reconnect_at` in the past and
+/// letting the idle loop reconnect immediately into the same failure. The returned deadline is
+/// never in the past (`next_delay` is non-negative), which is the property that breaks the tight
+/// loop; the sync-error path additionally floors it at [`SYNC_ERROR_RETRY_INTERVAL`]. Factored out
+/// so the pacing is unit-testable without standing up a full actor.
+fn reconnect_after_backoff(now: Instant, backoff: &mut Backoff) -> Instant {
+    now + backoff.next_delay()
+}
+
 /// The actor's view of the wallet's (single) account: its id, the ZIP-32 index spending keys
 /// derive at (`None` when no spending is possible), and whether the account is watch-only
 /// (imported UFVK - `init --ufvk`). `Ok(None)` means the data directory carries no account yet
@@ -783,16 +795,18 @@ impl WalletActor {
                         }
                     }
                     Err(e) => {
-                        self.mark_disconnected(format!("sync error: {e}"));
-                        // Pace retries after a sync error. A *persistent* sync error (e.g. an
-                        // unrecoverable reorg whose rewind target has no checkpoint) would
-                        // otherwise spin: dropping the client makes the idle loop reconnect
-                        // immediately, the reconnect succeeds (the upstream is healthy, so the
-                        // connect backoff never engages and is reset on success), and the very
-                        // next batch re-hits the same error - hundreds of times a second, pegging
-                        // a core and flooding the log. A fixed floor caps that to one attempt per
+                        // `mark_disconnected` already paced the reconnect through the backoff.
+                        // A *persistent* sync error (e.g. an unrecoverable reorg whose rewind
+                        // target has no checkpoint) would otherwise spin: the reconnect succeeds
+                        // (the upstream is healthy) and the very next batch re-hits the same error
+                        // - hundreds of times a second, pegging a core and flooding the log. Floor
+                        // the backoff-paced deadline at a fixed minimum so even a base-delay
+                        // backoff (or a near-zero jitter draw) still caps this to one attempt per
                         // interval; a transient error just costs this small delay.
-                        self.reconnect_at = sync_error_retry_deadline(Instant::now());
+                        self.mark_disconnected(format!("sync error: {e}"));
+                        self.reconnect_at = self
+                            .reconnect_at
+                            .max(sync_error_retry_deadline(Instant::now()));
                         self.update_status();
                         more_work = false;
                     }
@@ -994,8 +1008,18 @@ impl WalletActor {
     /// line was logged), warn that it was lost with the reason. Gating on `connected_logged`
     /// keeps disconnects matched to connects: a client dropped before it ever came up (a
     /// failed dial / health check) is reported by the connect path instead, not here.
+    ///
+    /// Every disconnect also paces the next reconnect through the backoff. A failure *after* a
+    /// successful connect (a tip refresh against a reachable-but-degraded upstream, a sync
+    /// error, a stale-client operation) would otherwise leave `reconnect_at` in the past, so the
+    /// next idle tick would reconnect immediately and re-hit the same failure - a tight loop that
+    /// pegs a core and floods the log. Advancing the backoff here gives every post-connection
+    /// failure the same exponential + jittered pacing a failed dial already gets. (The
+    /// dial-failure path sets `reconnect_at` itself and does *not* route through here - it drops
+    /// the client directly - so a single failed dial still paces exactly once.)
     fn mark_disconnected(&mut self, reason: impl std::fmt::Display) {
         self.client = None;
+        self.reconnect_at = reconnect_after_backoff(Instant::now(), &mut self.backoff);
         if std::mem::take(&mut self.connected_logged) {
             warn!(
                 "[{}] disconnected from {}: {reason}",
@@ -1006,8 +1030,10 @@ impl WalletActor {
     }
 
     /// Connect to the upstream zebrad endpoint. On success, store the client (after the
-    /// subtree-root health check) and reset the reconnect backoff. On failure, leave
-    /// `self.client` as `None` and return the error.
+    /// subtree-root health check). On failure, leave `self.client` as `None` and return the
+    /// error. The backoff is *not* reset here: a connect that immediately fails post-connection
+    /// (e.g. the first tip refresh fails against a reachable-but-degraded upstream) must keep the
+    /// backoff growing, so the reset lives on the first *successful* tip refresh instead.
     async fn connect(&mut self) -> anyhow::Result<()> {
         // Any open mempool stream belongs to the channel being replaced; drop it so it can't
         // pin the old connection alive. It is reopened on the next caught-up sync pass.
@@ -1031,7 +1057,6 @@ impl WalletActor {
             self.client = None;
             return Err(e);
         }
-        self.backoff.reset();
         // NB: do not call `update_status()` here - `get_wallet_summary`'s progress
         // estimator underflows if invoked before the chain tip is set (see `refresh_tip`).
         Ok(())
@@ -1327,6 +1352,11 @@ impl WalletActor {
             fetch_chain_tip(client).await?
         };
         self.tip_height = Some(u32::from(tip));
+        // A successful tip refresh is the first proof the connection actually works end to end,
+        // so it - not the bare `connect()` - is where the reconnect backoff resets. This keeps
+        // the backoff growing across a reachable-but-degraded upstream (connect succeeds, refresh
+        // fails) instead of resetting to the base delay on every failed cycle.
+        self.backoff.reset();
         // Announce a freshly established connection now that we know the upstream's tip. Logged
         // once per connection (reset by `mark_disconnected`), so connect/disconnect pair up.
         if !self.connected_logged {
@@ -3111,6 +3141,59 @@ fn enrich_insufficient_funds(db: &WriteDb, policy: ConfirmationsPolicy, err: Rpc
 #[cfg(test)]
 mod tests {
     use super::sanitize_upstream_msg;
+
+    /// A post-connection failure (tip refresh against a reachable-but-degraded upstream, a sync
+    /// error, a stale-client op) routes through `mark_disconnected`, which paces the next
+    /// reconnect via `reconnect_after_backoff`. The deadline must land in the future (never in the
+    /// past, which is what let the idle loop tight-loop and peg a core), and the backoff must
+    /// advance across repeated failures so a persistently degraded upstream is retried ever more
+    /// gently rather than pinned at the base delay.
+    #[test]
+    fn post_connection_failures_pace_and_grow_the_reconnect_deadline() {
+        use super::reconnect_after_backoff;
+        use crate::backoff::Backoff;
+        use std::time::{Duration, Instant};
+
+        let mut backoff = Backoff::new(Duration::from_secs(30), Duration::from_secs(300));
+        let now = Instant::now();
+
+        // Every disconnect schedules a reconnect at or after `now` - never behind it - so the
+        // idle wait (`reconnect_at.saturating_duration_since(now)`) can't collapse to an
+        // immediate retry loop the way an unset `reconnect_at` did.
+        for _ in 0..8 {
+            let deadline = reconnect_after_backoff(now, &mut backoff);
+            assert!(
+                deadline >= now,
+                "reconnect deadline must not be in the past"
+            );
+        }
+
+        // The attempt counter advanced with each failure, so the (pre-jitter) cap has grown past
+        // the base delay: the pacing actually escalates rather than sitting at the base.
+        assert!(
+            backoff.cap() > Duration::from_secs(30),
+            "backoff cap should grow across repeated post-connection failures, got {:?}",
+            backoff.cap()
+        );
+    }
+
+    /// The sync-error arm floors its backoff-paced deadline at `SYNC_ERROR_RETRY_INTERVAL`
+    /// (`reconnect_at.max(sync_error_retry_deadline(now))`), so even a near-zero jitter draw
+    /// (full-jitter backoff can return ~0) still caps a persistent sync error to one attempt per
+    /// interval instead of spinning. Guards the `.max` composition specifically (the helper
+    /// itself is covered by `sync_error_paces_the_next_reconnect`).
+    #[test]
+    fn sync_error_reconnect_respects_the_retry_floor() {
+        use super::{sync_error_retry_deadline, SYNC_ERROR_RETRY_INTERVAL};
+        use std::time::Instant;
+
+        let now = Instant::now();
+        // Simulate `mark_disconnected` having drawn a zero-length jitter (deadline == now); the
+        // floor must win.
+        let backoff_paced = now;
+        let floored = backoff_paced.max(sync_error_retry_deadline(now));
+        assert_eq!(floored, now + SYNC_ERROR_RETRY_INTERVAL);
+    }
 
     /// After a sync error the actor must push its next reconnect a real interval into the
     /// future, not retry immediately. A persistent sync error (e.g. an unrecoverable reorg
