@@ -5,6 +5,42 @@ All notable changes to zecd are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com), and this
 project adheres to [Semantic Versioning](https://semver.org).
 
+## [Unreleased]
+
+### Added
+- `[spend] pipeline_proving` (default off): prove a send off the single-writer actor so a long send no longer freezes background sync.
+
+### Changed
+- Readiness (`synced` mode), `getwalletinfo.scanning`, and `getblockchaininfo.initialblockdownload` now also account for the post-scan transaction-enhancement backlog, surfaced per-wallet as `pending_enhancements`; a wallet is not "ready" until memos have been backfilled.
+- `z_sendmany`'s `privacyPolicy` is a three-rung ladder (`FullPrivacy` / `AllowRevealedAmounts` / `AllowRevealedRecipients`); a transparent recipient is now rejected under every policy short of `AllowRevealedRecipients`.
+- RPC argument errors follow Bitcoin Core's taxonomy (missing -1, wrong type -3, out of range -8) and enforce arity.
+
+### Fixed
+- A wallet no longer reports ready while the post-scan enhancement backlog is still draining (memos temporarily missing with no signal).
+- Chain-status RPCs (`getblockchaininfo`, `getblockcount`, `getbestblockhash`, `getblockhash`, `getblockheader`) honor `/wallet/<name>` routing instead of always reporting the default wallet.
+- `z_sendmany` accepts zero-valued (memo-only) outputs; the privacy-policy collapse that let stricter policies pay transparent recipients is fixed.
+- Already-expired sends sync to the real chain tip before spending.
+- `gettransaction` no longer over-reports the received amount by the fee.
+- `listsinceblock` no longer wedges permanently after a reorg.
+- Bound block-cache metadata growth and harden reorg recovery so the cache cannot grow without limit.
+- Bound the full zebra request and response round-trip with the request timeout, so a stalled upstream cannot wedge sync.
+- Pace reconnects with the exponential backoff after a post-connection failure, so a reachable-but-degraded upstream can no longer drive a tight reconnect loop that pegs a core.
+
+### Security
+- `walletlock` zeroizes the decrypted seed immediately via a fast path that bypasses the actor's command queue, so it takes effect even while the actor is mid-proof on a long send.
+- Cap a wallet's in-flight async operations to bound a `z_sendmany` denial-of-service.
+- Panic-isolate the block-scan and enhancement paths so hostile chain data cannot kill the single-writer actor.
+- Gate credentialed zebra RPC connections behind a locality check, refusing cleartext auth to a globally-routable host unless `[backend] allow_remote_cleartext` is set.
+- Bind the wallet database to the account viewing key recorded in `keys.toml`, so a mismatched database or keys file is detected instead of silently used.
+- Only an explicit environment variable opts out of seed-memory hardening; an unset value no longer disables it.
+- Warn at startup when the RPC password is passed via `--rpcpassword`, since it is visible to local users; prefer the environment variable or `password_file`.
+- Bump `anyhow` to 1.0.103 for RUSTSEC-2026-0190.
+- Harden config clamping, error disclosure, and SIGTERM shutdown.
+- Reject unified addresses carrying a transparent receiver in `is_mine`.
+- Harden cookie-file writes against symlink and stale-permission exposure.
+- Reject out-of-range zebra responses (a mismatched tree-state height or an oversized per-block transaction count) as transport errors before they reach the scanner.
+- Warn when an unencrypted wallet auto-unlocks its seed at startup, and document the assumed deployment posture (trust boundary) in the operations guide.
+
 ## [0.3.1] - 2026-06-23
 
 ### Changed
