@@ -2,6 +2,7 @@
 //! and the multiwallet registry.
 
 pub mod actor;
+pub mod binding;
 pub mod keys;
 pub mod open;
 pub mod read;

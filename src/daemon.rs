@@ -12,6 +12,7 @@ use crate::health;
 use crate::server;
 use crate::state::AppState;
 use crate::wallet::actor::{self, ActorConfig};
+use crate::wallet::binding;
 use crate::wallet::store::WalletStore;
 use crate::wallet::WalletRegistry;
 
@@ -145,6 +146,15 @@ pub async fn run(config: AppConfig) -> anyhow::Result<()> {
                 loaded.push((name.clone(), watch_only));
                 registry.insert(handle);
                 actor_tasks.push((name.clone(), task));
+            }
+            // A failed account-to-keys binding check is evidence the wallet database (or
+            // keys.toml) was replaced, so it is fatal for the whole daemon, like the
+            // single-spending-wallet invariant: zecd won't quietly keep serving the other
+            // wallets while one of them shows signs of tampering. Any other per-wallet
+            // startup failure (unreadable database, missing files) skips just that wallet.
+            Err(e) if e.downcast_ref::<binding::BindingMismatch>().is_some() => {
+                shutdown_tx.send_replace(true);
+                return Err(e);
             }
             Err(e) => error!("failed to start wallet '{}': {e}", name),
         }

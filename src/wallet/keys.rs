@@ -231,6 +231,7 @@ mod tests {
             &mnemonic,
             BlockHeight::from_u32(1),
             ZNetwork::Test,
+            "uviewtest1keystestplaceholder",
         )
         .unwrap();
 

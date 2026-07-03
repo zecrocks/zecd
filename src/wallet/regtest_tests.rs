@@ -618,6 +618,18 @@ use crate::error::codes;
 use crate::wallet::actor::{self, ActorConfig};
 use crate::wallet::store::{Passphrase, WalletStore};
 
+/// The test seed's index-0 UFVK in its regtest encoding: the pin a real `zecd init` would
+/// record for a wallet built from [`test_seed`], required by the actor's startup binding
+/// check (keys.toml pin vs the database account).
+fn test_pinned_ufvk(net: crate::network::ZNetwork) -> String {
+    crate::wallet::binding::seed_ufvk_encoded(
+        net,
+        &test_seed(),
+        zip32::AccountId::try_from(0u32).unwrap(),
+    )
+    .expect("derive the test seed's UFVK")
+}
+
 /// An ActorConfig pointed at a dead local endpoint (connect fails fast; the actor still runs).
 /// The returned shutdown sender must be kept alive for the actor's lifetime (dropping it is
 /// itself a shutdown signal).
@@ -669,6 +681,7 @@ async fn encrypted_wallet_unlock_lock_cycle() {
         &mnemonic,
         BlockHeight::from_u32(1),
         net,
+        &test_pinned_ufvk(net),
     )
     .unwrap();
     let mut db = open::init_dbs(net, &wd).unwrap();
@@ -725,6 +738,7 @@ async fn unencrypted_wallet_rejects_passphrase_rpcs() {
         &mnemonic,
         BlockHeight::from_u32(1),
         net,
+        &test_pinned_ufvk(net),
     )
     .unwrap();
     let mut db = open::init_dbs(net, &wd).unwrap();
@@ -770,6 +784,7 @@ async fn watch_only_wallet_disables_spending_rpcs() {
         &crate::wallet::store::keys_path(&wd),
         BlockHeight::from_u32(1),
         net,
+        &test_pinned_ufvk(net),
     )
     .unwrap();
     let ufvk = {
@@ -841,4 +856,194 @@ async fn watch_only_wallet_disables_spending_rpcs() {
         .await
         .unwrap_err();
     assert_eq!(e.code, codes::RPC_WALLET_WRONG_ENC_STATE, "{e}");
+}
+
+// --- Account-to-keys binding (wallet::binding) through the actor: the startup pin check,
+// the legacy-keys.toml backfill, and the unlock-time seed check. Same #[ignore] rationale as
+// the encryption tests above (actor::spawn loads the bundled prover). ---
+
+/// A foreign account's UFVK (regtest encoding): what a planted/swapped database would carry.
+fn foreign_ufvk(net: crate::network::ZNetwork) -> String {
+    crate::wallet::binding::seed_ufvk_encoded(
+        net,
+        &foreign_seed(),
+        zip32::AccountId::try_from(0u32).unwrap(),
+    )
+    .expect("derive the foreign seed's UFVK")
+}
+
+/// Layer 3, mismatch: a wallet whose database account does not match keys.toml's pinned UFVK
+/// must refuse to start (fail closed), because serving it would hand out a foreign account's
+/// receive addresses.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "spawns an actor that loads the bundled prover (slow); offline otherwise"]
+async fn startup_refuses_database_not_matching_pinned_ufvk() {
+    let net = network::regtest();
+    let dir = tempfile::tempdir().unwrap();
+    let wd = dir.path().to_path_buf();
+
+    // keys.toml carries the operator's seed and pin, but the database holds a FOREIGN account,
+    // as if data.sqlite had been swapped after init.
+    let mnemonic = <Mnemonic<English>>::from_phrase(TEST_PHRASE).unwrap();
+    WalletStore::init_with_passphrase(
+        &crate::wallet::store::keys_path(&wd),
+        Passphrase::from("pw".to_string()),
+        &mnemonic,
+        BlockHeight::from_u32(1),
+        net,
+        &test_pinned_ufvk(net),
+    )
+    .unwrap();
+    let mut db = open::init_dbs(net, &wd).unwrap();
+    db.create_account("planted", &foreign_seed(), &genesis_birthday(), None)
+        .unwrap();
+    drop(db);
+
+    let (cfg, _shutdown_tx) = offline_actor_cfg("swapped", wd);
+    let err = match actor::spawn(cfg).await {
+        Ok(_) => panic!("a swapped database must fail the startup binding check"),
+        Err(e) => e,
+    };
+    let msg = err.to_string();
+    assert!(msg.contains("does not match"), "{msg}");
+    // Error paths abbreviate the keys: a full UFVK is itself a viewing capability.
+    assert!(!msg.contains(&foreign_ufvk(net)), "no full UFVK in errors");
+}
+
+/// Layer 3, backfill: a keys.toml from before the pin existed starts normally, gets the pin
+/// backfilled trust-on-first-use, and (layer 4) the first unlock verifies the seed against
+/// the now-pinned account.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "spawns an actor that loads the bundled prover (slow); offline otherwise"]
+async fn startup_backfills_pin_on_legacy_keys_toml() {
+    let net = network::regtest();
+    let dir = tempfile::tempdir().unwrap();
+    let wd = dir.path().to_path_buf();
+    let kp = crate::wallet::store::keys_path(&wd);
+
+    let mnemonic = <Mnemonic<English>>::from_phrase(TEST_PHRASE).unwrap();
+    WalletStore::init_with_passphrase(
+        &kp,
+        Passphrase::from("pw".to_string()),
+        &mnemonic,
+        BlockHeight::from_u32(1),
+        net,
+        &test_pinned_ufvk(net),
+    )
+    .unwrap();
+    WalletStore::strip_pin_for_tests(&kp); // simulate a pre-pin keys.toml
+    let mut db = open::init_dbs(net, &wd).unwrap();
+    db.create_account("primary", &test_seed(), &genesis_birthday(), None)
+        .unwrap();
+    drop(db);
+
+    let (cfg, _shutdown_tx) = offline_actor_cfg("legacy", wd);
+    let (handle, _task) = actor::spawn(cfg).await.expect("legacy wallet starts");
+
+    // The pin was backfilled with the account's real UFVK.
+    let st = WalletStore::read(&kp).unwrap();
+    assert_eq!(
+        st.pinned_ufvk(),
+        Some(test_pinned_ufvk(net).as_str()),
+        "startup backfills the pin trust-on-first-use"
+    );
+
+    // And the unlock-time seed check passes for the matching seed.
+    handle
+        .unlock(Passphrase::from("pw".to_string()), 60)
+        .await
+        .expect("the matching seed unlocks");
+}
+
+/// Layer 4b: a passphrase wallet whose database was swapped for a foreign account *before*
+/// the pin existed (so the TOFU pin blessed the foreign account) is caught at the first
+/// walletpassphrase: the decrypted seed does not derive the pinned account, the unlock is
+/// refused with -4, and the wallet stays locked.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "spawns an actor that loads the bundled prover (slow); offline otherwise"]
+async fn unlock_refuses_seed_that_does_not_derive_the_account() {
+    let net = network::regtest();
+    let dir = tempfile::tempdir().unwrap();
+    let wd = dir.path().to_path_buf();
+    let kp = crate::wallet::store::keys_path(&wd);
+
+    let mnemonic = <Mnemonic<English>>::from_phrase(TEST_PHRASE).unwrap();
+    WalletStore::init_with_passphrase(
+        &kp,
+        Passphrase::from("pw".to_string()),
+        &mnemonic,
+        BlockHeight::from_u32(1),
+        net,
+        &test_pinned_ufvk(net),
+    )
+    .unwrap();
+    WalletStore::strip_pin_for_tests(&kp); // legacy file: startup cannot verify, TOFU pins
+    let mut db = open::init_dbs(net, &wd).unwrap();
+    db.create_account("planted", &foreign_seed(), &genesis_birthday(), None)
+        .unwrap();
+    drop(db);
+
+    // Startup succeeds: the wallet is locked, so only the (unverifiable) TOFU pin ran.
+    let (cfg, _shutdown_tx) = offline_actor_cfg("tofu", wd);
+    let (handle, _task) = actor::spawn(cfg).await.expect("locked wallet starts");
+
+    // The correct passphrase decrypts the seed, but the seed does not derive the (foreign)
+    // account, so the unlock is refused and the wallet stays locked.
+    let e = handle
+        .unlock(Passphrase::from("pw".to_string()), 60)
+        .await
+        .expect_err("a seed that does not derive the account must not unlock");
+    assert_eq!(e.code, codes::RPC_WALLET_ERROR, "{e}");
+    assert!(e.message.contains("does not derive"), "{e}");
+    assert_eq!(
+        handle.status().unlocked_until,
+        Some(0),
+        "the wallet must remain locked"
+    );
+}
+
+/// Layer 4a: the identity/auto-unlock model has no walletpassphrase where a mismatch could
+/// surface later, so the seed check runs at startup and a foreign database is fatal.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "spawns an actor that loads the bundled prover (slow); offline otherwise"]
+async fn auto_unlock_refuses_foreign_database_at_startup() {
+    use age::secrecy::ExposeSecret as _;
+
+    let net = network::regtest();
+    let dir = tempfile::tempdir().unwrap();
+    let wd = dir.path().to_path_buf();
+    let kp = crate::wallet::store::keys_path(&wd);
+
+    let identity = age::x25519::Identity::generate();
+    let recipient = identity.to_public();
+    let mnemonic = <Mnemonic<English>>::from_phrase(TEST_PHRASE).unwrap();
+    WalletStore::init_with_mnemonic(
+        &kp,
+        std::iter::once(&recipient as &dyn age::Recipient),
+        &mnemonic,
+        BlockHeight::from_u32(1),
+        net,
+        &test_pinned_ufvk(net),
+    )
+    .unwrap();
+    WalletStore::strip_pin_for_tests(&kp); // even without a pin, the seed check must catch it
+    let id_path = wd.join("identity.txt");
+    std::fs::write(&id_path, identity.to_string().expose_secret()).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(&id_path, std::fs::Permissions::from_mode(0o600)).unwrap();
+    }
+    let mut db = open::init_dbs(net, &wd).unwrap();
+    db.create_account("planted", &foreign_seed(), &genesis_birthday(), None)
+        .unwrap();
+    drop(db);
+
+    let (mut cfg, _shutdown_tx) = offline_actor_cfg("auto", wd);
+    cfg.age_identity = Some(id_path);
+    let err = match actor::spawn(cfg).await {
+        Ok(_) => panic!("auto-unlock against a foreign database must be fatal"),
+        Err(e) => e,
+    };
+    assert!(err.to_string().contains("does not derive"), "{err}");
 }

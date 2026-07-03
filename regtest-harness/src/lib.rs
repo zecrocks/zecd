@@ -857,6 +857,102 @@ impl Zecd {
         export_ufvk_from_datadir(self._datadir.path(), wallet)
     }
 
+    /// The daemon's data directory (owned by this handle; deleted when it drops). Lets tests
+    /// inspect and tamper with on-disk wallet state (`keys.toml`, `data.sqlite`) around
+    /// restarts, e.g. the account-to-keys binding e2e.
+    pub fn datadir(&self) -> &Path {
+        self._datadir.path()
+    }
+
+    /// Gracefully stop the daemon (the `stop` RPC, falling back to kill), keeping the data
+    /// directory intact so a test can modify on-disk state and relaunch against it with
+    /// [`Zecd::respawn`] or [`Zecd::respawn_expect_startup_failure`].
+    pub async fn stop_keeping_datadir(&mut self) -> Result<()> {
+        let _ = self.call("stop", json!([])).await;
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            match self.child.try_wait() {
+                Ok(Some(_)) => return Ok(()),
+                Ok(None) if Instant::now() < deadline => {
+                    tokio::time::sleep(Duration::from_millis(200)).await;
+                }
+                _ => {
+                    let _ = self.child.kill();
+                    let _ = self.child.wait();
+                    return Ok(());
+                }
+            }
+        }
+    }
+
+    /// Relaunch the daemon on the kept data directory (after [`Zecd::stop_keeping_datadir`])
+    /// with the same config, and wait for the RPC to come back up.
+    pub async fn respawn(&mut self) -> Result<()> {
+        let (out, err) = if std::env::var_os("ZECD_STDERR").is_some() {
+            (Stdio::inherit(), Stdio::inherit())
+        } else {
+            (Stdio::null(), Stdio::null())
+        };
+        self.child = Command::new(zecd_bin())
+            .args([
+                "--datadir",
+                self._datadir.path().to_str().unwrap(),
+                "--regtest",
+                "run",
+            ])
+            .stdout(out)
+            .stderr(err)
+            .spawn()
+            .context("respawn zecd")?;
+        self.wait_until_rpc_up().await?;
+        Ok(())
+    }
+
+    /// Relaunch the daemon on the kept data directory and expect startup to FAIL: wait for
+    /// the process to exit nonzero and return its stderr (for asserting on the refusal
+    /// message). Errors if the daemon comes up or exits cleanly. Used by the binding e2e:
+    /// a swapped `data.sqlite` must refuse to serve.
+    pub async fn respawn_expect_startup_failure(&mut self) -> Result<String> {
+        let mut child = Command::new(zecd_bin())
+            .args([
+                "--datadir",
+                self._datadir.path().to_str().unwrap(),
+                "--regtest",
+                "run",
+            ])
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .context("respawn zecd expecting a startup failure")?;
+        let deadline = Instant::now() + Duration::from_secs(60);
+        loop {
+            match child.try_wait() {
+                Ok(Some(status)) => {
+                    let mut stderr = String::new();
+                    if let Some(mut pipe) = child.stderr.take() {
+                        use std::io::Read as _;
+                        let _ = pipe.read_to_string(&mut stderr);
+                    }
+                    anyhow::ensure!(
+                        !status.success(),
+                        "zecd was expected to refuse startup but exited cleanly; stderr:\n\
+                         {stderr}"
+                    );
+                    return Ok(stderr);
+                }
+                Ok(None) if Instant::now() < deadline => {
+                    tokio::time::sleep(Duration::from_millis(200)).await;
+                }
+                Ok(None) => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    bail!("zecd was expected to refuse startup but is still running after 60s");
+                }
+                Err(e) => return Err(anyhow!("waiting for zecd to exit: {e}")),
+            }
+        }
+    }
+
     /// Stop the daemon, delete every wallet's `data.sqlite` (and the compact-block cache), and
     /// restart against the *same* data directory - simulating a disposable/empty data directory
     /// next to a preserved `keys.toml`. Exercises the Phase-1 bootstrap rebuild path on a real
