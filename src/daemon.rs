@@ -66,7 +66,7 @@ pub async fn run(config: AppConfig) -> anyhow::Result<()> {
     actor::install_panic_hook();
     let config = Arc::new(config);
     let auth = server::auth::Authenticator::from_config(&config.rpc)?;
-    log_auth_mode(&config.rpc);
+    log_auth_mode(&config.rpc, rpcpassword_on_cli(std::env::args_os()));
 
     // Shutdown broadcast: `true` is sent on Ctrl-C / `stop`. Created before the actors so
     // each one carries a receiver and can stop its sync loop between batches.
@@ -267,12 +267,31 @@ async fn wait_for_shutdown_signal() {
     }
 }
 
+/// True when the RPC password was supplied as a `--rpcpassword` command-line argument (handling
+/// both `--rpcpassword VALUE` and `--rpcpassword=VALUE` forms), as opposed to the
+/// `ZECD_RPC_PASSWORD` environment variable or `[rpc] password_file`. clap merges the flag and its
+/// env fallback into one field, so the raw argv is the only way to tell them apart. Argv is the
+/// more exposed of the two: `/proc/<pid>/cmdline` is world-readable and shows up in `ps`, while
+/// `/proc/<pid>/environ` is readable only by the process owner - hence the env-var recommendation.
+fn rpcpassword_on_cli<I, S>(args: I) -> bool
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<std::ffi::OsStr>,
+{
+    args.into_iter().any(|a| {
+        let a = a.as_ref().to_string_lossy();
+        a == "--rpcpassword" || a.starts_with("--rpcpassword=")
+    })
+}
+
 /// Log the configured RPC authentication method(s) at startup, mirroring the credential union
 /// `Authenticator::from_config` accepts: salted `rpcauth` entries, a bare `rpcuser`/`rpcpassword`
 /// pair, and/or a generated cookie file (used whenever no bare pair is set). A bare password on a
 /// non-loopback bind is called out at WARN: zecd serves plaintext HTTP, so the credential would
-/// cross the network in the clear.
-fn log_auth_mode(rpc: &config::RpcConfig) {
+/// cross the network in the clear. A password passed via `--rpcpassword` on the command line
+/// (`password_on_cli`) is called out separately: it leaks to any local user through
+/// `/proc/<pid>/cmdline` and `ps`, independent of the bind address.
+fn log_auth_mode(rpc: &config::RpcConfig, password_on_cli: bool) {
     if !rpc.auth.is_empty() {
         info!("RPC auth: {} salted rpcauth credential(s)", rpc.auth.len());
     }
@@ -288,6 +307,13 @@ fn log_auth_mode(rpc: &config::RpcConfig) {
         }
     } else if let Some(cookie) = &rpc.cookiefile {
         info!("RPC auth: cookie file {}", cookie.display());
+    }
+    if password_on_cli {
+        warn!(
+            "RPC password was passed via --rpcpassword on the command line; it is exposed to \
+             any local user through `ps` and /proc/<pid>/cmdline. Prefer the ZECD_RPC_PASSWORD \
+             environment variable or `[rpc] password_file` (a mounted Secret) instead."
+        );
     }
 }
 
@@ -314,7 +340,7 @@ fn ensure_single_spending_wallet(loaded: &[(String, bool)]) -> anyhow::Result<()
 
 #[cfg(test)]
 mod tests {
-    use super::ensure_single_spending_wallet;
+    use super::{ensure_single_spending_wallet, rpcpassword_on_cli};
 
     fn wallets(entries: &[(&str, bool)]) -> Vec<(String, bool)> {
         entries
@@ -381,5 +407,28 @@ mod tests {
         let msg = err.to_string();
         assert!(msg.contains("'spend-a'"), "{msg}");
         assert!(msg.contains("'spend-b'"), "{msg}");
+    }
+
+    #[test]
+    fn rpcpassword_on_cli_detects_both_flag_forms() {
+        // Separate-value form: `--rpcpassword hunter2`.
+        assert!(rpcpassword_on_cli([
+            "zecd",
+            "--rpcport",
+            "8232",
+            "--rpcpassword",
+            "hunter2"
+        ]));
+        // Joined form: `--rpcpassword=hunter2`.
+        assert!(rpcpassword_on_cli(["zecd", "--rpcpassword=hunter2"]));
+    }
+
+    #[test]
+    fn rpcpassword_on_cli_ignores_env_and_other_flags() {
+        // No `--rpcpassword` on argv (the password came from ZECD_RPC_PASSWORD or a file).
+        assert!(!rpcpassword_on_cli(["zecd", "--rpcuser", "u", "--testnet"]));
+        // A different flag that merely shares a prefix must not match.
+        assert!(!rpcpassword_on_cli(["zecd", "--rpcpassword-file", "/x"]));
+        assert!(!rpcpassword_on_cli(["zecd"]));
     }
 }
