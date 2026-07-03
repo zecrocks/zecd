@@ -192,6 +192,13 @@ pub async fn run(config: &AppConfig, args: &InitArgs) -> anyhow::Result<()> {
     // init is a one-shot interactive command that dials the configured zebra endpoint once.
     let mut server = backend::resolve(&config.backend.server, network)?;
     backend::apply_zebra_auth(&mut server, &config.zebra.auth());
+    backend::apply_cleartext_policy(
+        &mut server,
+        crate::chain::zebra::CleartextPolicy {
+            rfc1918_is_local: config.backend.rfc1918_is_local,
+            allow_remote_cleartext: config.backend.allow_remote_cleartext,
+        },
+    );
     let mut client = server
         .connect_timeout(Duration::from_secs(config.backend.connect_timeout_secs))
         .await

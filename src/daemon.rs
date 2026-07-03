@@ -104,6 +104,13 @@ pub async fn run(config: AppConfig) -> anyhow::Result<()> {
         }
         let mut server = backend::resolve(&config.backend.server, config.network)?;
         backend::apply_zebra_auth(&mut server, &config.zebra.auth());
+        backend::apply_cleartext_policy(
+            &mut server,
+            crate::chain::zebra::CleartextPolicy {
+                rfc1918_is_local: config.backend.rfc1918_is_local,
+                allow_remote_cleartext: config.backend.allow_remote_cleartext,
+            },
+        );
         let actor_cfg = ActorConfig {
             name: name.clone(),
             network: config.network,
