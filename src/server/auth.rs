@@ -219,16 +219,34 @@ fn write_cookie(path: &Path, user: &str, password: &str) -> std::io::Result<()> 
     }
     let contents = format!("{user}:{password}");
 
-    // Create the file with mode 0600 atomically (via OpenOptions) rather than writing then
-    // chmod-ing, so the cookie is never briefly world-readable between create and set_permissions.
+    // The cookie carries a live credential, so it must never be exposed to another user - not
+    // through a pre-existing world-readable file we'd merely truncate (keeping its old mode), and
+    // not through a symlink an attacker planted at `path` to redirect the write or trick us into
+    // opening a file we don't own. `create_new` (O_CREAT|O_EXCL) refuses to open any existing path
+    // entry - including a symlink - so we first unlink whatever is there (unlink removes the link
+    // itself, never its target) and then create the file fresh. If a symlink is raced in between,
+    // O_EXCL makes the open fail loudly rather than follow it. O_NOFOLLOW is belt-and-suspenders on
+    // the same guarantee, and `set_permissions` (fchmod on the open fd) pins mode 0600 with no
+    // window in which the file is readable by anyone else.
+    match std::fs::remove_file(path) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e),
+    }
+
     let mut opts = std::fs::OpenOptions::new();
-    opts.write(true).create(true).truncate(true);
+    opts.write(true).create_new(true);
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
-        opts.mode(0o600);
+        opts.mode(0o600).custom_flags(libc::O_NOFOLLOW);
     }
     let mut file = opts.open(path)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+    }
     file.write_all(contents.as_bytes())?;
     Ok(())
 }
@@ -357,5 +375,66 @@ mod tests {
             ..rpc
         };
         assert!(Authenticator::from_config(&bad).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn write_cookie_creates_0600_file() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(".cookie");
+        write_cookie(&path, "__cookie__", "s3cret").unwrap();
+
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "__cookie__:s3cret");
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "cookie must be owner-only, got {mode:o}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn write_cookie_replaces_world_readable_file_with_0600() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(".cookie");
+
+        // A pre-existing world-readable cookie (e.g. left by an older, laxer version).
+        std::fs::write(&path, "__cookie__:stale").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        write_cookie(&path, "__cookie__", "fresh").unwrap();
+
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "__cookie__:fresh");
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(
+            mode, 0o600,
+            "stale perms must be tightened to 0600, got {mode:o}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn write_cookie_refuses_to_follow_a_symlink() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("victim");
+        std::fs::write(&target, "do-not-overwrite").unwrap();
+
+        // An attacker plants a symlink where the cookie will be written, aiming the credential
+        // (or the truncation) at `target`.
+        let path = dir.path().join(".cookie");
+        std::os::unix::fs::symlink(&target, &path).unwrap();
+
+        // The write removes the symlink (unlink follows nothing) and creates a real file in its
+        // place - the credential lands at `path`, never at the symlink target.
+        write_cookie(&path, "__cookie__", "s3cret").unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(&target).unwrap(),
+            "do-not-overwrite"
+        );
+        assert!(!std::fs::symlink_metadata(&path)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "__cookie__:s3cret");
     }
 }
