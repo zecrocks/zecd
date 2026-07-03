@@ -131,6 +131,13 @@ const UNARY_RPC_TIMEOUT: Duration = Duration::from_secs(30);
 /// unrecoverable reorg) can't spin the actor loop at full speed reconnecting and re-failing.
 const SYNC_ERROR_RETRY_INTERVAL: Duration = Duration::from_secs(2);
 
+/// The reconnect deadline to set after a sync error: a fixed floor past `now`. Extracted as a
+/// free function (rather than inlined into the run loop) so the pacing is unit-testable without
+/// standing up a full [`WalletActor`]; the run loop's sync-error arm is its only caller.
+fn sync_error_retry_deadline(now: Instant) -> Instant {
+    now + SYNC_ERROR_RETRY_INTERVAL
+}
+
 /// How many transaction-enhancement requests to service per `enhance_step` call before
 /// yielding back to the actor loop. Enhancement runs only once the block scan is caught up,
 /// but it can be a multi-hour backlog on a from-birthday restore (one upstream
@@ -785,7 +792,7 @@ impl WalletActor {
                         // next batch re-hits the same error - hundreds of times a second, pegging
                         // a core and flooding the log. A fixed floor caps that to one attempt per
                         // interval; a transient error just costs this small delay.
-                        self.reconnect_at = Instant::now() + SYNC_ERROR_RETRY_INTERVAL;
+                        self.reconnect_at = sync_error_retry_deadline(Instant::now());
                         self.update_status();
                         more_work = false;
                     }
@@ -3104,6 +3111,34 @@ fn enrich_insufficient_funds(db: &WriteDb, policy: ConfirmationsPolicy, err: Rpc
 #[cfg(test)]
 mod tests {
     use super::sanitize_upstream_msg;
+
+    /// After a sync error the actor must push its next reconnect a real interval into the
+    /// future, not retry immediately. A persistent sync error (e.g. an unrecoverable reorg
+    /// whose rewind target has no checkpoint) otherwise spins: dropping the client makes the
+    /// idle loop reconnect at once, the reconnect succeeds (so the connect backoff never
+    /// engages), and the next batch re-hits the same error hundreds of times a second. This
+    /// guards the pacing the run loop's sync-error arm applies via `sync_error_retry_deadline`.
+    #[test]
+    fn sync_error_paces_the_next_reconnect() {
+        use super::{sync_error_retry_deadline, SYNC_ERROR_RETRY_INTERVAL};
+        use std::time::{Duration, Instant};
+
+        let now = Instant::now();
+        let deadline = sync_error_retry_deadline(now);
+
+        // The retry is scheduled exactly one interval out...
+        assert_eq!(
+            deadline.saturating_duration_since(now),
+            SYNC_ERROR_RETRY_INTERVAL
+        );
+        // ...and that interval is a meaningful floor, not ~0 (which would re-introduce the spin).
+        assert!(
+            SYNC_ERROR_RETRY_INTERVAL >= Duration::from_secs(1),
+            "the sync-error pace must be a real floor to prevent a busy loop"
+        );
+        // The deadline is strictly in the future of the error, so the idle loop waits.
+        assert!(deadline > now);
+    }
 
     /// The launch-time data-directory writability probe: succeeds on a fresh writable dir
     /// (creating it if needed) and fails clearly when the path can't be a writable directory.
