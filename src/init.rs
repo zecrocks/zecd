@@ -166,6 +166,15 @@ pub async fn run(config: &AppConfig, args: &InitArgs) -> anyhow::Result<()> {
 
     std::fs::create_dir_all(&wallet_dir)?;
 
+    // Open (and migrate) the wallet database up front and refuse to initialize into one that
+    // already holds an account. Without this, a pre-existing (planted or leftover) database
+    // would gain the operator's account *alongside* its own, and the daemon selects the first
+    // account, so receive addresses could derive from a key that is not the operator's. Done
+    // before any interactive or network I/O so a refusal is fast and leaves no keys.toml
+    // behind.
+    let mut db = open::init_dbs(network, &wallet_dir)?;
+    ensure_no_preexisting_account(&db, &args.wallet, &wallet_dir)?;
+
     let identity_path = config
         .keys
         .age_identity
@@ -267,14 +276,40 @@ pub async fn run(config: &AppConfig, args: &InitArgs) -> anyhow::Result<()> {
             .expect("non-view-only init always has a mnemonic")
     };
 
+    // The BIP-39 seed for a seed wallet (zeroized on drop). Derived once, used both to pin the
+    // account's UFVK into keys.toml and to create the account itself.
+    let seed = mnemonic.as_ref().map(|m| {
+        let mut s = m.to_seed("");
+        let secret = SecretVec::new(s.to_vec());
+        s.zeroize();
+        secret
+    });
+
+    // The account UFVK to pin into keys.toml: the imported key for a watch-only wallet, the
+    // seed's ZIP-32 index-0 derivation otherwise (the account `create_account` builds on the
+    // account-less database guaranteed above). Every startup verifies the database's account
+    // against this pin, so a later database swap fails closed (see `wallet::binding`).
+    let pinned_ufvk = match (&ufvk, &seed) {
+        (Some(ufvk), _) => ufvk.encode(&network),
+        (None, Some(seed)) => crate::wallet::binding::seed_ufvk_encoded(
+            network,
+            seed,
+            zip32::AccountId::try_from(0u32).expect("0 is a valid account index"),
+        )?,
+        (None, None) => unreachable!("init either imports a UFVK or has a mnemonic"),
+    };
+
     match &at_rest {
-        AtRest::ViewOnly => WalletStore::init_view_only(&keys_path, birthday.height(), network)?,
+        AtRest::ViewOnly => {
+            WalletStore::init_view_only(&keys_path, birthday.height(), network, &pinned_ufvk)?
+        }
         AtRest::Passphrase(passphrase) => WalletStore::init_with_passphrase(
             &keys_path,
             passphrase.clone(),
             require_mnemonic(),
             birthday.height(),
             network,
+            &pinned_ufvk,
         )?,
         AtRest::Identity(recipients) => WalletStore::init_with_mnemonic(
             &keys_path,
@@ -282,33 +317,39 @@ pub async fn run(config: &AppConfig, args: &InitArgs) -> anyhow::Result<()> {
             require_mnemonic(),
             birthday.height(),
             network,
+            &pinned_ufvk,
         )?,
     }
 
-    let mut db = open::init_dbs(network, &wallet_dir)?;
     // zecd surfaces a single account per wallet, so the account label is a fixed constant
     // (the name is stored by librustzcash but zecd never reads it back).
     let account_name = "primary";
-    match (&ufvk, &mnemonic) {
-        (Some(ufvk), _) => {
-            db.import_account_ufvk(
+    let account_id = match (&ufvk, &seed) {
+        (Some(ufvk), _) => db
+            .import_account_ufvk(
                 account_name,
                 ufvk,
                 &birthday,
                 AccountPurpose::ViewOnly,
                 None,
-            )?;
-        }
-        (None, Some(mnemonic)) => {
-            let seed = {
-                let mut s = mnemonic.to_seed("");
-                let secret = SecretVec::new(s.to_vec());
-                s.zeroize();
-                secret
-            };
-            db.create_account(account_name, &seed, &birthday, None)?;
-        }
+            )?
+            .id(),
+        (None, Some(seed)) => db.create_account(account_name, seed, &birthday, None)?.0,
         (None, None) => unreachable!("init either imports a UFVK or has a mnemonic"),
+    };
+
+    // Cross-check the pin against the account actually created. These agree by construction
+    // (same key material, same derivation); if they ever diverge, e.g. a librustzcash bump
+    // changes what `create_account` derives, failing here at init is loud and immediate,
+    // where a divergence first hitting the startup verifier would brick every fresh wallet
+    // one boot later.
+    let created_ufvk = crate::wallet::binding::account_ufvk_encoded(network, &db, account_id)?;
+    if created_ufvk != pinned_ufvk {
+        bail!(
+            "internal error: the created account's viewing key does not match the key derived \
+             for the keys.toml pin; refusing to leave an inconsistent wallet. Please report \
+             this bug."
+        );
     }
 
     eprintln!(
@@ -390,6 +431,32 @@ pub fn export_ufvk(config: &AppConfig, args: &ExportUfvkArgs) -> anyhow::Result<
     );
     println!("{}", ufvk.encode(&config.network));
     Ok(())
+}
+
+/// Refuse to initialize into a wallet database that already contains an account. `init` only
+/// ever creates the account of a *fresh* database; a database that has one already was planted,
+/// left over from a different wallet, or otherwise unexpected, and silently adding the
+/// operator's account beside it would let the daemon later serve the pre-existing (first)
+/// account's addresses. Fail loud and let the operator decide.
+fn ensure_no_preexisting_account(
+    db: &open::WriteDb,
+    wallet: &str,
+    wallet_dir: &Path,
+) -> anyhow::Result<()> {
+    let accounts = db.get_account_ids()?.len();
+    if accounts == 0 {
+        return Ok(());
+    }
+    Err(anyhow!(
+        "wallet '{}' has no keys.toml, but its database at {} already contains {} account(s). \
+         Refusing to initialize into an unexpected pre-existing database: it may belong to a \
+         different wallet, and the daemon would serve its first account's addresses. Move the \
+         existing data directory aside (or delete it, if it is not yours) and re-run `zecd \
+         init`.",
+        wallet,
+        open::data_db_path(wallet_dir).display(),
+        accounts
+    ))
 }
 
 /// Scan the configured `wallets` (other than `exclude`) for one that is already initialized and
@@ -561,6 +628,16 @@ mod tests {
         )
     }
 
+    /// The test seed's index-0 UFVK in its network-scoped encoding (what `init` pins).
+    fn test_ufvk_encoded(net: crate::network::ZNetwork) -> String {
+        crate::wallet::binding::seed_ufvk_encoded(
+            net,
+            &test_seed(),
+            zip32::AccountId::try_from(0u32).unwrap(),
+        )
+        .expect("derive the test seed's UFVK")
+    }
+
     /// Build a fully-initialized spending wallet (keys.toml with a seed + a seed-derived
     /// account) at `dir`, so both the `WalletStore::exists` gate and the DB account match a
     /// real `zecd init`.
@@ -573,6 +650,7 @@ mod tests {
             &mnemonic,
             BlockHeight::from_u32(1),
             net,
+            &test_ufvk_encoded(net),
         )
         .expect("write spending keys.toml");
         let mut db = open::init_dbs(net, dir).expect("init spending dbs");
@@ -588,6 +666,7 @@ mod tests {
             &crate::wallet::store::keys_path(dir),
             BlockHeight::from_u32(1),
             net,
+            &test_ufvk_encoded(net),
         )
         .expect("write watch-only keys.toml");
         let ufvk = {
@@ -610,6 +689,30 @@ mod tests {
             None,
         )
         .expect("import the UFVK view-only");
+    }
+
+    /// The init-time data-directory guard: an account-bearing database refuses `init`, an
+    /// empty (fresh) one passes. This is the check that keeps `zecd init` from absorbing a
+    /// planted or leftover database's account as the wallet's own.
+    #[test]
+    fn init_refuses_a_database_that_already_has_an_account() {
+        let net = network::regtest();
+        let dir = tempfile::tempdir().unwrap();
+
+        // A fresh (migrated, account-less) database passes.
+        let mut db = open::init_dbs(net, dir.path()).expect("init dbs");
+        ensure_no_preexisting_account(&db, "default", dir.path())
+            .expect("an empty database must not block init");
+
+        // The same database with an account (planted, leftover, whatever) refuses.
+        db.create_account("primary", &test_seed(), &genesis_birthday(), None)
+            .expect("create account");
+        let err = ensure_no_preexisting_account(&db, "default", dir.path())
+            .expect_err("an account-bearing database must refuse init");
+        assert!(
+            err.to_string().contains("already contains 1 account"),
+            "{err}"
+        );
     }
 
     #[test]

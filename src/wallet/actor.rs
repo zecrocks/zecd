@@ -45,6 +45,7 @@ use crate::error::{codes, RpcError};
 use crate::network::ZNetwork;
 use crate::pools::{Pool, PoolSet};
 use crate::sync::engine;
+use crate::wallet::binding;
 use crate::wallet::keys::{self, SeedKeeper};
 use crate::wallet::open::{self, WriteDb};
 use crate::wallet::read;
@@ -399,6 +400,15 @@ pub async fn spawn(
             }
         };
 
+    // The selected account's UFVK (its canonical encoded form), for the binding checks below:
+    // the database account must match keys.toml's pin, and an unlocked seed must derive it.
+    // `None` only while a bootstrap is pending (no account yet); the bootstrap path runs the
+    // same checks once it creates one.
+    let account_ufvk = match account_id {
+        Some(id) => Some(binding::account_ufvk_encoded(cfg.network, &db_data, id)?),
+        None => None,
+    };
+
     // Determine the wallet's encryption mode, and for unencrypted wallets optionally decrypt
     // the seed up-front for unattended sending. An encrypted wallet has no passphrase at rest,
     // so it cannot auto-unlock - it starts locked and requires `walletpassphrase` (matching
@@ -422,6 +432,27 @@ pub async fn spawn(
             if st.has_seed() {
                 match keys::decrypt_seed_with_identity(&st, identity) {
                     Ok(Some(s)) => {
+                        // Bind the decrypted seed to the account before trusting it: the seed
+                        // must derive the account's UFVK, or keys.toml and the wallet database
+                        // describe different wallets (a swapped database, or a swapped
+                        // keys.toml + identity pair). Serving that would decrypt with keys the
+                        // account's addresses do not belong to. Fatal, not a warning: this is
+                        // the auto-unlock (unattended) wallet, so there is no later
+                        // walletpassphrase where the mismatch could surface.
+                        if let (Some(expected), Some(index)) =
+                            (account_ufvk.as_deref(), account_index)
+                        {
+                            let derived = binding::seed_ufvk_encoded(cfg.network, &s, index)?;
+                            if derived != expected {
+                                return Err(anyhow::Error::new(binding::BindingMismatch(format!(
+                                    "wallet '{}': the decrypted seed does not derive this \
+                                         wallet's account; keys.toml and the wallet database \
+                                         disagree (one of them was replaced or belongs to a \
+                                         different wallet). Refusing to start.",
+                                    cfg.name
+                                ))));
+                            }
+                        }
                         seed.set(s);
                         info!("[{}] seed unlocked for unattended sending", cfg.name);
                     }
@@ -446,6 +477,17 @@ pub async fn spawn(
              passphrase-encrypted with `zecd init --encrypt` (then walletpassphrase unlocks).",
             cfg.name
         );
+    }
+
+    // Bind the database's account to keys.toml before serving anything: a match is required, a
+    // mismatch is fatal (the database was swapped), and a missing pin (a keys.toml from before
+    // the pin existed) is backfilled trust-on-first-use. Runs *after* the unlock chain above so
+    // that when a seed is available the seed check has already vetoed a foreign account, and a
+    // TOFU pin never blesses an account the seed disowns. (For a locked passphrase wallet the
+    // TOFU pin is unverified until the first walletpassphrase, which runs the seed check and
+    // refuses to unlock on a mismatch.)
+    if let Some(ufvk) = account_ufvk.as_deref() {
+        binding::verify_or_pin_account(&cfg.name, &cfg.keys_path, st.pinned_ufvk(), ufvk)?;
     }
 
     // The local prover bundles Sapling parameters; build it once (off the async threads). Shared
@@ -1432,6 +1474,35 @@ impl WalletActor {
                     zip32::AccountId::try_from(0u32).ok(),
                     "bootstrap must rebuild the account at ZIP-32 index 0"
                 );
+                // Bind the rebuilt account to keys.toml's pin before adopting it (the same
+                // startup check in `spawn`). The account was just derived from keys.toml's own
+                // seed, so a mismatch means the pinned UFVK is inconsistent with that seed
+                // (a tampered or foreign pin). Fail closed: leave the account unadopted (the
+                // wallet serves no account) rather than serve under a pin the seed disowns.
+                // The account row stays in the database, so the next daemon start surfaces
+                // the same mismatch as a hard startup failure.
+                match binding::account_ufvk_encoded(self.network, &self.db_data, id).and_then(
+                    |ufvk| {
+                        let pinned = store::WalletStore::read(&self.keys_path)?;
+                        binding::verify_or_pin_account(
+                            &self.name,
+                            &self.keys_path,
+                            pinned.pinned_ufvk(),
+                            &ufvk,
+                        )
+                    },
+                ) {
+                    Ok(()) => {}
+                    Err(e) => {
+                        error!(
+                            "[{}] bootstrap: {e}. The rebuilt account is left unadopted; \
+                             restarting the daemon will surface this as a startup failure.",
+                            self.name
+                        );
+                        self.pending_bootstrap = None;
+                        return;
+                    }
+                }
                 self.account_id = Some(id);
                 self.account_index = index;
                 self.watch_only = watch_only;
@@ -2470,6 +2541,25 @@ impl WalletActor {
                 )
             })?
             .ok_or_else(|| RpcError::wallet("wallet has no stored seed"))?;
+        // Bind the decrypted seed to the account before holding it unlocked: the seed must
+        // derive the account's UFVK, or keys.toml and the wallet database describe different
+        // wallets. For an encrypted wallet this is the first moment the check is possible (the
+        // seed is never resident at startup), and it retroactively validates a
+        // trust-on-first-use pin taken then. Skipped while a bootstrap is pending (no account
+        // yet); the bootstrap creates the account from this same seed and verifies the pin.
+        if let (Some(id), Some(index)) = (self.account_id, self.account_index) {
+            let expected = binding::account_ufvk_encoded(self.network, &self.db_data, id)
+                .map_err(|e| RpcError::wallet(format!("reading the wallet account: {e}")))?;
+            let derived = binding::seed_ufvk_encoded(self.network, &seed, index)
+                .map_err(|e| RpcError::wallet(format!("deriving from the seed: {e}")))?;
+            if derived != expected {
+                return Err(RpcError::wallet(
+                    "Error: The decrypted seed does not derive this wallet's account; \
+                     keys.toml and the wallet database disagree (one of them was replaced or \
+                     belongs to a different wallet). Refusing to unlock.",
+                ));
+            }
+        }
         seed_guard(&self.seed).set(seed);
         // Re-running walletpassphrase overwrites the deadline (resets the timer). A timeout of 0
         // relocks ~immediately, which `relock_if_expired` then enforces.

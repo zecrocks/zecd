@@ -34,6 +34,12 @@ pub struct WalletStore {
     /// True when the mnemonic is passphrase-encrypted (age scrypt) rather than wrapped to the
     /// age identity file. This is zecd's analog of Bitcoin Core's `HasEncryptionKeys()`.
     encrypted: bool,
+    /// The account's pinned Unified Full Viewing Key (network-scoped encoding). `init` records
+    /// it and the daemon verifies the wallet database's account against it at every startup
+    /// (see `wallet::binding`), so a replaced `data.sqlite` fails closed instead of silently
+    /// diverting deposits to a foreign account. `None` only for a `keys.toml` written before
+    /// this field existed; the daemon backfills it trust-on-first-use.
+    pinned_ufvk: Option<String>,
 }
 
 #[derive(Deserialize, Serialize)]
@@ -45,6 +51,10 @@ struct StoreEncoding {
     /// identity-file model so existing `keys.toml` files round-trip unchanged.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     encryption: Option<String>,
+    /// The account's UFVK pin (see [`WalletStore::pinned_ufvk`]). Skipped when absent so a
+    /// pre-pin `keys.toml` round-trips unchanged until the daemon backfills it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    ufvk: Option<String>,
 }
 
 impl WalletStore {
@@ -55,30 +65,35 @@ impl WalletStore {
 
     /// Create a new `keys.toml` holding the mnemonic encrypted to the age identity (no
     /// passphrase - the legacy/unencrypted model, decryptable via the identity file).
+    /// `ufvk` is the account's pinned viewing key (see [`WalletStore::pinned_ufvk`]).
     pub fn init_with_mnemonic<'a>(
         keys_path: &Path,
         recipients: impl Iterator<Item = &'a dyn age::Recipient>,
         mnemonic: &Mnemonic,
         birthday: BlockHeight,
         network: ZNetwork,
+        ufvk: &str,
     ) -> anyhow::Result<()> {
         let encoding = StoreEncoding {
             mnemonic: Some(encrypt_mnemonic(recipients, mnemonic)?),
             network: Some(network.name().to_string()),
             birthday: Some(u32::from(birthday)),
             encryption: None,
+            ufvk: Some(ufvk.to_string()),
         };
         write_keys_atomic(keys_path, &encoding, true)
     }
 
     /// Create a new `keys.toml` with the mnemonic passphrase-encrypted (age scrypt) - the
     /// Bitcoin-Core-style encrypted wallet, requiring `walletpassphrase` before spending.
+    /// `ufvk` is the account's pinned viewing key (see [`WalletStore::pinned_ufvk`]).
     pub fn init_with_passphrase(
         keys_path: &Path,
         passphrase: Passphrase,
         mnemonic: &Mnemonic,
         birthday: BlockHeight,
         network: ZNetwork,
+        ufvk: &str,
     ) -> anyhow::Result<()> {
         let encoding = StoreEncoding {
             mnemonic: Some(encrypt_phrase_with_passphrase(
@@ -88,25 +103,46 @@ impl WalletStore {
             network: Some(network.name().to_string()),
             birthday: Some(u32::from(birthday)),
             encryption: Some(ENC_PASSPHRASE.to_string()),
+            ufvk: Some(ufvk.to_string()),
         };
         write_keys_atomic(keys_path, &encoding, true)
     }
 
-    /// Create a new `keys.toml` for a watch-only wallet (imported UFVK): network and birthday
-    /// only, no mnemonic. The viewing key itself lives (in the clear, as for every wallet) in
-    /// the wallet DB's accounts table; there is no spending material on disk at all.
+    /// Create a new `keys.toml` for a watch-only wallet (imported UFVK): network, birthday,
+    /// and the pinned viewing key, no mnemonic. The UFVK also lives (in the clear, as for
+    /// every wallet) in the wallet DB's accounts table; the copy pinned here is what startup
+    /// verifies that database account against. There is no spending material on disk at all.
     pub fn init_view_only(
         keys_path: &Path,
         birthday: BlockHeight,
         network: ZNetwork,
+        ufvk: &str,
     ) -> anyhow::Result<()> {
         let encoding = StoreEncoding {
             mnemonic: None,
             network: Some(network.name().to_string()),
             birthday: Some(u32::from(birthday)),
             encryption: None,
+            ufvk: Some(ufvk.to_string()),
         };
         write_keys_atomic(keys_path, &encoding, true)
+    }
+
+    /// Record `ufvk` as the wallet's pinned viewing key, rewriting `keys.toml` atomically and
+    /// preserving every other field (the mnemonic ciphertext above all). A no-op when the file
+    /// already pins exactly this value. Used to backfill the pin on a `keys.toml` from before
+    /// the field existed; `init` writes the pin directly.
+    pub fn pin_ufvk(keys_path: &Path, ufvk: &str) -> anyhow::Result<()> {
+        let mut text = String::new();
+        std::fs::File::open(keys_path)
+            .map_err(|e| anyhow!("opening {}: {e}", keys_path.display()))?
+            .read_to_string(&mut text)?;
+        let mut encoding: StoreEncoding = toml::from_str(&text)?;
+        if encoding.ufvk.as_deref() == Some(ufvk) {
+            return Ok(());
+        }
+        encoding.ufvk = Some(ufvk.to_string());
+        write_keys_atomic(keys_path, &encoding, false)
     }
 
     pub fn read(keys_path: &Path) -> anyhow::Result<WalletStore> {
@@ -142,6 +178,7 @@ impl WalletStore {
             birthday,
             seed_ciphertext: encoding.mnemonic,
             encrypted,
+            pinned_ufvk: encoding.ufvk,
         })
     }
 
@@ -178,6 +215,21 @@ impl WalletStore {
     /// Whether the mnemonic is passphrase-encrypted (Bitcoin Core's `HasEncryptionKeys()`).
     pub fn is_encrypted(&self) -> bool {
         self.encrypted
+    }
+
+    /// The pinned account UFVK, if this `keys.toml` carries one (see the field docs).
+    pub fn pinned_ufvk(&self) -> Option<&str> {
+        self.pinned_ufvk.as_deref()
+    }
+
+    /// Test-only: remove the `ufvk` pin from an existing `keys.toml`, simulating a file
+    /// written before the pin existed (the backfill/upgrade path under test).
+    #[cfg(test)]
+    pub fn strip_pin_for_tests(keys_path: &Path) {
+        let text = std::fs::read_to_string(keys_path).unwrap();
+        let mut encoding: StoreEncoding = toml::from_str(&text).unwrap();
+        encoding.ufvk = None;
+        write_keys_atomic(keys_path, &encoding, false).unwrap();
     }
 }
 
@@ -292,6 +344,10 @@ mod tests {
         midnight culture idea mountain fame park social drip bid doctor scatter glance defy \
         moment stage";
 
+    /// A stand-in pinned UFVK. The store layer treats the pin as an opaque string (derivation
+    /// and verification live in `wallet::binding`), so any marker value exercises it.
+    const UFVK: &str = "uviewtest1storeplaceholder";
+
     #[test]
     fn passphrase_wallet_roundtrips_and_marks_encrypted() {
         let dir = tempfile::tempdir().unwrap();
@@ -303,10 +359,12 @@ mod tests {
             &mnemonic,
             BlockHeight::from_u32(1),
             ZNetwork::Test,
+            UFVK,
         )
         .unwrap();
 
         let st = WalletStore::read(&kp).unwrap();
+        assert_eq!(st.pinned_ufvk(), Some(UFVK), "init records the pin");
         assert!(
             st.is_encrypted(),
             "a passphrase wallet must report as encrypted"
@@ -333,8 +391,9 @@ mod tests {
     fn view_only_wallet_stores_no_seed() {
         let dir = tempfile::tempdir().unwrap();
         let kp = keys_path(dir.path());
-        WalletStore::init_view_only(&kp, BlockHeight::from_u32(7), ZNetwork::Test).unwrap();
+        WalletStore::init_view_only(&kp, BlockHeight::from_u32(7), ZNetwork::Test, UFVK).unwrap();
         let st = WalletStore::read(&kp).unwrap();
+        assert_eq!(st.pinned_ufvk(), Some(UFVK));
         assert!(!st.has_seed(), "a watch-only wallet has no stored mnemonic");
         assert!(
             !st.is_encrypted(),
@@ -365,6 +424,8 @@ mod tests {
                 .activation_height(NetworkUpgrade::Nu5)
                 .expect("NU5 height")
         );
+        // A pre-pin keys.toml reads back unpinned (the daemon backfills it at startup).
+        assert_eq!(st.pinned_ufvk(), None);
     }
 
     #[test]
@@ -380,10 +441,57 @@ mod tests {
             &mnemonic,
             BlockHeight::from_u32(1),
             ZNetwork::Test,
+            UFVK,
         )
         .unwrap();
         let st = WalletStore::read(&kp).unwrap();
         assert!(!st.is_encrypted());
         assert!(st.has_seed());
+        assert_eq!(st.pinned_ufvk(), Some(UFVK));
+    }
+
+    /// The backfill path: `pin_ufvk` adds the pin to a pre-pin file while preserving every
+    /// other field, above all the mnemonic ciphertext (a corrupted rewrite here would brick
+    /// the wallet), and keeps the file private (0600). Re-pinning the same value is a no-op.
+    #[test]
+    fn pin_ufvk_backfills_preserving_mnemonic_and_mode() {
+        let dir = tempfile::tempdir().unwrap();
+        let kp = keys_path(dir.path());
+        let mnemonic = <Mnemonic<English>>::from_phrase(PHRASE).unwrap();
+        let passphrase = || Passphrase::from("correct horse battery".to_string());
+        WalletStore::init_with_passphrase(
+            &kp,
+            passphrase(),
+            &mnemonic,
+            BlockHeight::from_u32(42),
+            ZNetwork::Test,
+            UFVK,
+        )
+        .unwrap();
+        WalletStore::strip_pin_for_tests(&kp);
+        assert_eq!(WalletStore::read(&kp).unwrap().pinned_ufvk(), None);
+
+        WalletStore::pin_ufvk(&kp, UFVK).unwrap();
+        let st = WalletStore::read(&kp).unwrap();
+        assert_eq!(st.pinned_ufvk(), Some(UFVK));
+        // Everything else survived the rewrite: the ciphertext still decrypts, and the
+        // metadata round-trips.
+        assert!(st.is_encrypted());
+        assert_eq!(u32::from(st.birthday), 42);
+        assert!(st
+            .decrypt_seed_with_passphrase(passphrase())
+            .unwrap()
+            .is_some());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&kp).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o600, "keys.toml must stay private (0600)");
+        }
+
+        // Idempotent: re-pinning the identical value succeeds and changes nothing.
+        let before = std::fs::read_to_string(&kp).unwrap();
+        WalletStore::pin_ufvk(&kp, UFVK).unwrap();
+        assert_eq!(std::fs::read_to_string(&kp).unwrap(), before);
     }
 }
