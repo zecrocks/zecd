@@ -409,11 +409,22 @@ pub(crate) fn getwalletinfo(state: &AppState, wallet: Option<&str>) -> Result<Va
     // restore rescans the address index). Present only when transparent receiving is enabled, so
     // a shielded-only wallet's response shape is unchanged (Bitcoin Core conformance).
     if handle.transparent_enabled {
-        obj["transparent"] = json!({
+        let mut transparent = json!({
             "enabled": true,
             "default": handle.transparent_default,
             "gap_limit": handle.transparent_gap_limit,
         });
+        // Initial-sync progress (pre-exposing `transparent_initial_scan` external addresses),
+        // so an operator can poll the fill rather than scrape the log. Present only while the
+        // wallet is/was pre-exposing this process; absent when the depth is 0.
+        if let Some((exposed, total)) = st.transparent_preexpose {
+            transparent["initial_sync"] = json!({
+                "exposed": exposed,
+                "total": total,
+                "complete": exposed >= total,
+            });
+        }
+        obj["transparent"] = transparent;
     }
     Ok(obj)
 }
