@@ -4,6 +4,43 @@ How to run `zecd` in production (mainnet) without losing funds or sleep. Read th
 README first for the architecture (`zebra → zecd`) and configuration reference; this
 document covers backup/restore, monitoring, upgrades, and the mainnet checklist.
 
+## Assumed deployment posture (trust boundary)
+
+`zecd` is built for one shape of deployment, and its safe-by-default behavior assumes it.
+Know the assumptions so you can see when you are widening the trust boundary.
+
+**The assumed posture:**
+
+- **RPC is reachable only by trusted callers** - bound to loopback (`127.0.0.1`), or behind
+  authentication / a reverse proxy if it must cross a machine. The RPC credentials are spend
+  authority: anyone who can reach an unlocked wallet's RPC can move funds.
+- **zebra is co-located** - the upstream is a local full node reached over plaintext loopback
+  HTTP (`server = "zebra"`). No secrets and no chain-affecting authority cross the wire, so
+  the hop is unencrypted by design.
+- **The operator owns the datadir** - `keys.toml`, `identity.txt`, the wallet DB, and the
+  single-instance lock live on storage only the operator controls. zecd binds the DB to the
+  key material (`keys.toml` UFVK pin) and refuses to start on a mismatch, but it cannot defend
+  a datadir an attacker can rewrite at will.
+- **Auto-unlock keeps spend authority resident** - an identity-file (unencrypted) wallet with
+  `auto_unlock` decrypts its seed into memory at startup and holds it there, so unattended
+  sends work without a passphrase. That convenience *is* resident spend authority; it logs a
+  warning at startup to make the trade-off visible.
+
+**What widens the boundary (deliberate opt-ins, each a bigger blast radius):**
+
+- **Binding RPC off loopback** - exposes spend authority to whatever can reach the bind
+  address. zecd warns when a non-loopback bind is paired with a bare password; put TLS / a
+  reverse proxy / network policy in front.
+- **A remote zebra over plaintext** (`[backend] allow_remote_cleartext = true`) - sends the
+  `[zebra]` RPC credentials in cleartext to a non-local host. Only do this when the hop is
+  secured out of band (VPN / private link); zecd refuses it otherwise (#111 loopback gate).
+- **Auto-unlocking an unencrypted wallet** - the resident-seed model above. Prefer
+  `zecd init --encrypt` (Bitcoin-Core-style passphrase, unlocked per session with an enforced
+  timeout) whenever unattended spend authority is not actually required.
+
+See the README **Security** section for the underlying rationale (RPC credentials as spend
+authority, custody models, the cleartext gate).
+
 ## What to back up
 
 Funds are recoverable from **the mnemonic alone**. Everything else is convenience.

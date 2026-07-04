@@ -588,7 +588,12 @@ pub async fn spawn(
                             }
                         }
                         seed.set(s);
-                        info!("[{}] seed unlocked for unattended sending", cfg.name);
+                        warn!(
+                            "[{}] auto-unlocked an unencrypted seed at startup: spend authority is \
+                             resident in memory without a passphrase. Use `zecd init --encrypt` for \
+                             the passphrase model if unattended spend authority is not intended",
+                            cfg.name
+                        );
                     }
                     Ok(None) => {}
                     Err(e) => warn!("[{}] could not decrypt seed at startup: {e}", cfg.name),
