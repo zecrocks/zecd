@@ -129,12 +129,27 @@ pub struct RawTx {
     pub mined_height: Option<u32>,
 }
 
+/// What kind of receiving address `getnewaddress` should derive. Resolved at the RPC layer from
+/// the `address_type` argument and the wallet's configured defaults; the actor is the authority
+/// that turns it into an actual address.
+#[derive(Debug, Clone)]
+pub enum ReceiverRequest {
+    /// No per-call override: the wallet's configured default - a bare transparent address when
+    /// the wallet's `transparent_default` is set, otherwise a Unified Address with the wallet's
+    /// `default_receivers`.
+    Default,
+    /// An explicit shielded receiver set (already validated as a subset of the enabled pools).
+    Shielded(PoolSet),
+    /// A bare transparent (`t1…`/`tm…`) address. Only valid when the wallet enables transparent
+    /// receiving (checked at the RPC layer and re-checked by the actor).
+    Transparent,
+}
+
 /// Commands sent from RPC handlers to the per-wallet actor (the sole DB writer).
 pub enum WalletCommand {
     GetNewAddress {
-        /// Per-call override of the UA receivers to include. `None` uses the wallet's configured
-        /// `default_receivers`; `Some` must be a subset of the wallet's enabled pools.
-        receivers: Option<PoolSet>,
+        /// The kind of address to derive (per-call override resolved against wallet config).
+        request: ReceiverRequest,
         reply: oneshot::Sender<Result<String, RpcError>>,
     },
     /// Derive a Unified Address for the wallet's (single) account, backing `z_getaddressforaccount`.
@@ -195,6 +210,14 @@ pub struct WalletHandle {
     pub enabled_pools: PoolSet,
     /// Receivers this wallet's Unified Addresses include by default (a subset of `enabled_pools`).
     pub default_receivers: PoolSet,
+    /// Whether this wallet may hand out bare transparent receiving addresses - gates a
+    /// `getnewaddress "" "transparent"` request (`-8` when off).
+    pub transparent_enabled: bool,
+    /// Whether a no-argument `getnewaddress` returns a bare transparent address.
+    pub transparent_default: bool,
+    /// This wallet's external transparent gap limit - the stateless-restore scan depth, surfaced
+    /// in `getwalletinfo` so an operator can audit transparent coverage.
+    pub transparent_gap_limit: u32,
     /// Transient first-seen times for unmined txs, shared with the actor (the writer). See
     /// [`FirstSeen`].
     first_seen: FirstSeen,
@@ -229,6 +252,9 @@ impl WalletHandle {
             enabled_pools: PoolSet::single(Pool::Orchard),
             default_receivers: PoolSet::single(Pool::Orchard),
             first_seen: Arc::new(Mutex::new(HashMap::new())),
+            transparent_enabled: false,
+            transparent_default: false,
+            transparent_gap_limit: 20,
             // Inert test handle: no encrypted seed, so `walletlock` is a no-op (returns -15).
             seed: None,
             cmd_tx,
@@ -272,8 +298,8 @@ impl WalletHandle {
             .map_err(|_| RpcError::misc("wallet actor dropped the reply"))?
     }
 
-    pub async fn get_new_address(&self, receivers: Option<PoolSet>) -> Result<String, RpcError> {
-        self.dispatch(|reply| WalletCommand::GetNewAddress { receivers, reply })
+    pub async fn get_new_address(&self, request: ReceiverRequest) -> Result<String, RpcError> {
+        self.dispatch(|reply| WalletCommand::GetNewAddress { request, reply })
             .await
     }
 
@@ -404,6 +430,9 @@ pub(crate) fn make_handle(
     confirmations: ConfirmationsPolicy,
     enabled_pools: PoolSet,
     default_receivers: PoolSet,
+    transparent_enabled: bool,
+    transparent_default: bool,
+    transparent_gap_limit: u32,
     first_seen: FirstSeen,
     seed: Option<SharedSeed>,
     cmd_tx: mpsc::Sender<WalletCommand>,
@@ -416,6 +445,9 @@ pub(crate) fn make_handle(
         confirmations,
         enabled_pools,
         default_receivers,
+        transparent_enabled,
+        transparent_default,
+        transparent_gap_limit,
         first_seen,
         seed,
         cmd_tx,
@@ -444,6 +476,9 @@ mod tests {
             ConfirmationsPolicy::default(),
             PoolSet::single(Pool::Orchard),
             PoolSet::single(Pool::Orchard),
+            false,
+            false,
+            20,
             Arc::new(Mutex::new(HashMap::new())),
             seed,
             cmd_tx,

@@ -17,7 +17,7 @@ use crate::operations::{ContextInfo, OperationId};
 use crate::server::jsonrpc::RpcRequest;
 use crate::state::AppState;
 use crate::wallet::store::Passphrase;
-use crate::wallet::{read, SyncStatus, WalletHandle};
+use crate::wallet::{read, ReceiverRequest, SyncStatus, WalletHandle};
 
 pub(crate) fn opt_str(req: &RpcRequest, i: usize) -> Option<String> {
     req.param(i).and_then(|v| v.as_str()).map(|s| s.to_string())
@@ -69,33 +69,43 @@ pub(crate) async fn getnewaddress(
     // so an unknown type is a `-5` regardless of which wallet is targeted (and even when no
     // wallet exists). Enablement is wallet-specific and checked once the handle is in hand.
     let raw_type = opt_str(req, 1);
-    let requested = parse_receiver_tokens(raw_type.as_deref())?;
+    let request = parse_receiver_tokens(raw_type.as_deref())?;
     let handle = state.registry.get(wallet)?.clone();
-    if let Some(set) = &requested {
-        if !set.is_subset_of(&handle.enabled_pools) {
+    match &request {
+        ReceiverRequest::Shielded(set) if !set.is_subset_of(&handle.enabled_pools) => {
             return Err(RpcError::invalid_parameter(format!(
                 "address type requests a receiver not enabled on this wallet; enabled pools: {}",
                 handle.enabled_pools.display_names()
             )));
         }
+        ReceiverRequest::Transparent if !handle.transparent_enabled => {
+            return Err(RpcError::invalid_parameter(
+                "transparent addresses are not enabled on this wallet; set [pools] transparent = true",
+            ));
+        }
+        _ => {}
     }
-    let addr = handle.get_new_address(requested).await?;
+    let addr = handle.get_new_address(request).await?;
     Ok(Value::String(addr))
 }
 
-/// Parse the `getnewaddress` `address_type` argument into an optional receiver set, validating
-/// only its syntax (wallet-independent). Returns `Ok(None)` for the default (empty / `unified` /
-/// `default`), `Ok(Some(set))` for an explicit single pool or comma-separated list, or a `-5` for
-/// an unknown token. Whether the wallet actually enables those pools is checked by the caller.
-fn parse_receiver_tokens(
-    address_type: Option<&str>,
-) -> Result<Option<crate::pools::PoolSet>, RpcError> {
+/// Parse the `getnewaddress` `address_type` argument into a [`ReceiverRequest`], validating only
+/// its syntax (wallet-independent). Returns `Default` for empty / `unified` / `default`,
+/// `Transparent` for a bare `transparent`, `Shielded(set)` for an explicit shielded pool or
+/// comma-separated list, or a `-5` for an unknown token. Transparent cannot be combined with
+/// shielded receivers (zecd hands out one receiver type at a time). Whether the wallet actually
+/// enables the requested type is checked by the caller.
+fn parse_receiver_tokens(address_type: Option<&str>) -> Result<ReceiverRequest, RpcError> {
     use crate::pools::{Pool, PoolSet};
     let Some(raw) = address_type.map(str::trim).filter(|s| !s.is_empty()) else {
-        return Ok(None);
+        return Ok(ReceiverRequest::Default);
     };
     if raw.eq_ignore_ascii_case("unified") || raw.eq_ignore_ascii_case("default") {
-        return Ok(None);
+        return Ok(ReceiverRequest::Default);
+    }
+    // A bare "transparent" requests a bare t-address (one receiver type at a time).
+    if raw.eq_ignore_ascii_case("transparent") {
+        return Ok(ReceiverRequest::Transparent);
     }
     let mut pools = Vec::new();
     for token in raw.split(',') {
@@ -103,11 +113,17 @@ fn parse_receiver_tokens(
         let pool = Pool::from_config_str(token).map_err(|_| {
             RpcError::invalid_address_or_key(format!("Unknown address type '{token}'"))
         })?;
+        if pool.is_transparent() {
+            return Err(RpcError::invalid_address_or_key(
+                "transparent cannot be combined with shielded receivers; \
+                 request \"transparent\" alone for a bare t-address",
+            ));
+        }
         pools.push(pool);
     }
     let set = PoolSet::new(pools)
         .map_err(|e| RpcError::invalid_address_or_key(format!("Invalid address type: {e}")))?;
-    Ok(Some(set))
+    Ok(ReceiverRequest::Shielded(set))
 }
 
 /// `z_getaddressforaccount account ( ["receiver_type", ...] diversifier_index )` - derive a
@@ -387,6 +403,17 @@ pub(crate) fn getwalletinfo(state: &AppState, wallet: Option<&str>) -> Result<Va
     // wallet auto-relocks, or 0 if currently locked.
     if st.encrypted {
         obj["unlocked_until"] = json!(st.unlocked_until.unwrap_or(0));
+    }
+    // zecd extension: surface the transparent receiving configuration so an operator can audit
+    // restore coverage (the `gap_limit` is how far past the last funded address a stateless
+    // restore rescans the address index). Present only when transparent receiving is enabled, so
+    // a shielded-only wallet's response shape is unchanged (Bitcoin Core conformance).
+    if handle.transparent_enabled {
+        obj["transparent"] = json!({
+            "enabled": true,
+            "default": handle.transparent_default,
+            "gap_limit": handle.transparent_gap_limit,
+        });
     }
     Ok(obj)
 }
@@ -1807,31 +1834,55 @@ mod tests {
     // shown verbatim; any network works as the reduction context.
     const NET: crate::network::ZNetwork = crate::network::ZNetwork::Test;
 
+    /// Extract the shielded set from a [`ReceiverRequest`], or panic (test helper).
+    fn shielded_set(r: ReceiverRequest) -> crate::pools::PoolSet {
+        match r {
+            ReceiverRequest::Shielded(s) => s,
+            _ => panic!("expected a shielded receiver request"),
+        }
+    }
+
     #[test]
-    fn receiver_tokens_default_to_none() {
+    fn receiver_tokens_default_to_default() {
         // Empty / unified / default all mean "use the wallet's configured default_receivers".
-        assert!(parse_receiver_tokens(None).unwrap().is_none());
-        assert!(parse_receiver_tokens(Some("")).unwrap().is_none());
-        assert!(parse_receiver_tokens(Some("  ")).unwrap().is_none());
-        assert!(parse_receiver_tokens(Some("unified")).unwrap().is_none());
-        assert!(parse_receiver_tokens(Some("UNIFIED")).unwrap().is_none());
-        assert!(parse_receiver_tokens(Some("default")).unwrap().is_none());
+        assert!(matches!(
+            parse_receiver_tokens(None).unwrap(),
+            ReceiverRequest::Default
+        ));
+        for t in ["", "  ", "unified", "UNIFIED", "default"] {
+            assert!(matches!(
+                parse_receiver_tokens(Some(t)).unwrap(),
+                ReceiverRequest::Default
+            ));
+        }
+    }
+
+    #[test]
+    fn receiver_tokens_transparent() {
+        // A bare "transparent" (any case) requests a bare t-address.
+        assert!(matches!(
+            parse_receiver_tokens(Some("transparent")).unwrap(),
+            ReceiverRequest::Transparent
+        ));
+        assert!(matches!(
+            parse_receiver_tokens(Some("TRANSPARENT")).unwrap(),
+            ReceiverRequest::Transparent
+        ));
+        // Transparent cannot be mixed with shielded receivers.
+        let err = parse_receiver_tokens(Some("orchard,transparent")).unwrap_err();
+        assert_eq!(err.code, crate::error::codes::RPC_INVALID_ADDRESS_OR_KEY);
     }
 
     #[test]
     fn receiver_tokens_single_and_list() {
-        let one = parse_receiver_tokens(Some("sapling")).unwrap().unwrap();
+        let one = shielded_set(parse_receiver_tokens(Some("sapling")).unwrap());
         assert!(one.contains(Pool::Sapling) && !one.contains(Pool::Orchard));
 
-        let both = parse_receiver_tokens(Some("sapling,orchard"))
-            .unwrap()
-            .unwrap();
+        let both = shielded_set(parse_receiver_tokens(Some("sapling,orchard")).unwrap());
         assert!(both.contains(Pool::Sapling) && both.contains(Pool::Orchard));
 
         // Whitespace around list members is tolerated.
-        let spaced = parse_receiver_tokens(Some(" orchard , sapling "))
-            .unwrap()
-            .unwrap();
+        let spaced = shielded_set(parse_receiver_tokens(Some(" orchard , sapling ")).unwrap());
         assert!(spaced.contains(Pool::Sapling) && spaced.contains(Pool::Orchard));
     }
 
@@ -1848,9 +1899,9 @@ mod tests {
     fn requested_receivers_must_be_subset_of_enabled() {
         // The enablement check (a `-8`) is what getnewaddress applies once it has the handle.
         let enabled = crate::pools::PoolSet::single(Pool::Orchard);
-        let requested = parse_receiver_tokens(Some("sapling")).unwrap().unwrap();
+        let requested = shielded_set(parse_receiver_tokens(Some("sapling")).unwrap());
         assert!(!requested.is_subset_of(&enabled));
-        let ok = parse_receiver_tokens(Some("orchard")).unwrap().unwrap();
+        let ok = shielded_set(parse_receiver_tokens(Some("orchard")).unwrap());
         assert!(ok.is_subset_of(&enabled));
     }
 

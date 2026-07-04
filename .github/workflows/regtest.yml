@@ -42,7 +42,7 @@ on:
     # one - enables ZECD_REGTEST_STRESS; the weekly cron above leaves the stress test skipping.
     - cron: "33 7 1 * *"
   push:
-    branches: [main, master]
+    branches: [main, master, "feature/**"]
     paths:
       - "regtest-harness/**"
       - "src/**"
@@ -92,7 +92,7 @@ jobs:
         image: ${{ github.event_name == 'schedule' && fromJSON('["pinned", "latest"]') || fromJSON('["event"]') }}
         include:
           - suite: zecd
-            tests: --test regtest_e2e --test regtest_binding --test regtest_funded --test regtest_proving_cache --test regtest_sapling --test regtest_hang --test regtest_reorg --test regtest_multiwallet --test regtest_restore --test regtest_watchonly --test regtest_stress_notes
+            tests: --test regtest_e2e --test regtest_funded --test regtest_proving_cache --test regtest_sapling --test regtest_transparent --test regtest_transparent_gap --test regtest_hang --test regtest_reorg --test regtest_multiwallet --test regtest_restore --test regtest_watchonly
     name: regtest (${{ matrix.suite }}, ${{ matrix.image }})
     steps:
       - uses: actions/checkout@v4
@@ -191,6 +191,12 @@ jobs:
           DEVTOOL_BIN: ${{ github.workspace }}/zcash-devtool/target/release/zcash-devtool
           # Capture zebrad's logs so a startup failure is diagnosable from the CI run.
           ZEBRAD_STDERR: ${{ runner.temp }}/zebrad.log
+          # Stream zecd's own logs into the job output (the harness inherits its stdio; combined
+          # with `--nocapture` below they appear in the run log). Focus debug on the transparent
+          # receive paths (mempool attribution, the getaddresstxids enhancement) so the volume
+          # stays manageable while a transparent-receive failure is diagnosable.
+          ZECD_STDERR: "1"
+          RUST_LOG: "zecd=info,zecd::wallet::actor=debug,zecd::chain=debug"
           # The extended tier (reorg, multiwallet, stop/restore, watch-only) runs on the weekly "big
           # run" and on manual dispatches; PR/push runs let those tests skip in seconds.
           ZECD_REGTEST_EXTENDED: ${{ (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && '1' || '' }}

@@ -118,9 +118,18 @@ pub async fn run(config: &AppConfig, args: &InitArgs) -> anyhow::Result<()> {
             keys_file: None,
             pools: config.pools.enabled.clone(),
             default_receivers: config.pools.default_receivers.clone(),
+            transparent_enabled: config.pools.transparent_enabled,
+            transparent_default: config.pools.transparent_default,
+            transparent_gap_limit: config.pools.transparent_gap_limit,
+            transparent_initial_scan: config.pools.transparent_initial_scan,
         });
     let keys_path = entry.keys_path();
     let enabled_pools = entry.pools.clone();
+    // Create the account under the wallet's external transparent gap limit (only when transparent
+    // is enabled), so init pre-generates the same receiving-address window the daemon scans.
+    let init_gap_limit = entry
+        .transparent_enabled
+        .then_some(entry.transparent_gap_limit);
     let wallet_dir = entry.dir;
     let network = config.network;
 
@@ -172,7 +181,7 @@ pub async fn run(config: &AppConfig, args: &InitArgs) -> anyhow::Result<()> {
     // account, so receive addresses could derive from a key that is not the operator's. Done
     // before any interactive or network I/O so a refusal is fast and leaves no keys.toml
     // behind.
-    let mut db = open::init_dbs(network, &wallet_dir)?;
+    let mut db = open::init_dbs_with_gap_limit(network, &wallet_dir, init_gap_limit)?;
     ensure_no_preexisting_account(&db, &args.wallet, &wallet_dir)?;
 
     let identity_path = config
@@ -389,6 +398,10 @@ pub fn export_ufvk(config: &AppConfig, args: &ExportUfvkArgs) -> anyhow::Result<
             keys_file: None,
             pools: config.pools.enabled.clone(),
             default_receivers: config.pools.default_receivers.clone(),
+            transparent_enabled: config.pools.transparent_enabled,
+            transparent_default: config.pools.transparent_default,
+            transparent_gap_limit: config.pools.transparent_gap_limit,
+            transparent_initial_scan: config.pools.transparent_initial_scan,
         });
     let keys_path = entry.keys_path();
     let wallet_dir = entry.dir;
@@ -755,6 +768,10 @@ mod tests {
                 keys_file: None,
                 pools: orchard_pools(),
                 default_receivers: orchard_pools(),
+                transparent_enabled: false,
+                transparent_default: false,
+                transparent_gap_limit: 20,
+                transparent_initial_scan: 0,
             },
         );
         wallets.insert(
@@ -764,6 +781,10 @@ mod tests {
                 keys_file: None,
                 pools: orchard_pools(),
                 default_receivers: orchard_pools(),
+                transparent_enabled: false,
+                transparent_default: false,
+                transparent_gap_limit: 20,
+                transparent_initial_scan: 0,
             },
         );
 
@@ -803,6 +824,10 @@ mod tests {
                     keys_file: None,
                     pools: orchard_pools(),
                     default_receivers: orchard_pools(),
+                    transparent_enabled: false,
+                    transparent_default: false,
+                    transparent_gap_limit: 20,
+                    transparent_initial_scan: 0,
                 },
             );
         }

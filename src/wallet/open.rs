@@ -10,6 +10,7 @@ use zcash_client_sqlite::chain::BlockMeta;
 use zcash_client_sqlite::util::SystemClock;
 use zcash_client_sqlite::wallet::init::init_wallet_db;
 use zcash_client_sqlite::{FsBlockDb, WalletDb};
+use zcash_keys::keys::transparent::gap_limits::GapLimits;
 
 use crate::network::ZNetwork;
 
@@ -48,9 +49,7 @@ pub fn block_path(wallet_dir: &Path, meta: &BlockMeta) -> PathBuf {
 /// enough). Read connections (`open_read`) never commit, so `synchronous` there is a no-op and
 /// is left untouched.
 pub fn open_write(network: ZNetwork, wallet_dir: &Path) -> anyhow::Result<WriteDb> {
-    let conn = rusqlite::Connection::open(data_db_path(wallet_dir))?;
-    configure_writer_conn(&conn)?;
-    Ok(WalletDb::from_connection(conn, network, SystemClock, OsRng))
+    open_write_with_gap_limit(network, wallet_dir, None)
 }
 
 /// Apply the write-path PRAGMAs (and the array vtab module `WalletDb` requires) to a
@@ -64,6 +63,35 @@ fn configure_writer_conn(conn: &rusqlite::Connection) -> rusqlite::Result<()> {
     // journal. `journal_mode=WAL` returns the resulting mode as a row, which `execute_batch`
     // discards.
     conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL;")
+}
+
+/// librustzcash's default transparent gap limits for the internal (change) and ephemeral (TEX)
+/// scopes. zecd only ever varies the *external* gap limit (the user-facing receiving chain), so
+/// these mirror `zcash_keys::keys::transparent::gap_limits::GapLimits::default()`.
+const DEFAULT_INTERNAL_GAP: u32 = 5;
+const DEFAULT_EPHEMERAL_GAP: u32 = 10;
+
+/// Open the wallet DB for writing, optionally overriding the **external** transparent gap limit
+/// (`Some(n)` widens the window librustzcash scans/derives on the receiving chain; `None` keeps
+/// the crate default of 10). A larger external gap limit is how a stateless restore rediscovers
+/// transparent funds across many pre-generated-but-unfunded addresses. The writer connection is
+/// configured (WAL + `synchronous = NORMAL`) the same way as [`open_write`].
+pub fn open_write_with_gap_limit(
+    network: ZNetwork,
+    wallet_dir: &Path,
+    external_gap_limit: Option<u32>,
+) -> anyhow::Result<WriteDb> {
+    let conn = rusqlite::Connection::open(data_db_path(wallet_dir))?;
+    configure_writer_conn(&conn)?;
+    let db = WalletDb::from_connection(conn, network, SystemClock, OsRng);
+    Ok(match external_gap_limit {
+        Some(n) => db.with_gap_limits(GapLimits::new(
+            n,
+            DEFAULT_INTERNAL_GAP,
+            DEFAULT_EPHEMERAL_GAP,
+        )),
+        None => db,
+    })
 }
 
 /// Open the wallet DB read-only (balances, history); short-lived per request.
@@ -83,10 +111,22 @@ pub fn open_fsblockdb(wallet_dir: &Path) -> anyhow::Result<FsBlockDb> {
 
 /// Initialize both the wallet DB and the block-cache DB (idempotent migrations).
 pub fn init_dbs(network: ZNetwork, wallet_dir: &Path) -> anyhow::Result<WriteDb> {
+    init_dbs_with_gap_limit(network, wallet_dir, None)
+}
+
+/// As [`init_dbs`], but with an explicit **external** transparent gap limit (`None` = crate
+/// default). The actor and `zecd init` pass the wallet's configured `transparent_gap_limit` when
+/// transparent receiving is enabled, so address generation and the restore scan use the same
+/// (wider) window.
+pub fn init_dbs_with_gap_limit(
+    network: ZNetwork,
+    wallet_dir: &Path,
+    external_gap_limit: Option<u32>,
+) -> anyhow::Result<WriteDb> {
     std::fs::create_dir_all(wallet_dir)?;
     enable_wal(wallet_dir)?;
     let mut db_cache = open_fsblockdb(wallet_dir)?;
-    let mut db_data = open_write(network, wallet_dir)?;
+    let mut db_data = open_write_with_gap_limit(network, wallet_dir, external_gap_limit)?;
     init_blockmeta_db(&mut db_cache)
         .map_err(|e| anyhow::anyhow!("initializing block-cache db: {e}"))?;
     init_wallet_db(&mut db_data, None)?;
