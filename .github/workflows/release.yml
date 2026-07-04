@@ -155,14 +155,17 @@ jobs:
             dist/zecd_*.deb
             dist/zecd_*.deb.sha256
 
-  # amd64: the reproducible StageX image (bare semver tags). rewrite-timestamp + forced
-  # compression keep the pushed layers deterministic too, and the SBOM/provenance
-  # attestations ride along with the image (mirrors zallet's publish flow).
+  # amd64: the reproducible StageX image, pushed *by digest* (no tags of its own). The
+  # `manifest` job stitches amd64 + arm64 into one multi-arch tag, so consumers pull a single
+  # `ghcr.io/.../zecd:<version>` and Docker picks the right arch. rewrite-timestamp + forced
+  # compression keep the pushed layers deterministic; SBOM/provenance ride along on the digest.
   docker:
     needs: setup
     # Always on a tag push; on manual dispatch only when push_images was requested.
     if: github.event_name == 'push' || inputs.push_images
     runs-on: ubuntu-latest
+    outputs:
+      digest: ${{ steps.build.outputs.digest }}
     steps:
       - uses: actions/checkout@v4
 
@@ -174,37 +177,27 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - uses: docker/metadata-action@v5
-        id: meta
-        with:
-          images: ghcr.io/${{ github.repository }}
-          tags: |
-            type=semver,pattern={{version}}
-            type=semver,pattern={{major}}.{{minor}}
-            type=raw,value=${{ needs.setup.outputs.version }},enable=${{ github.event_name == 'workflow_dispatch' }}
-
       - uses: docker/build-push-action@v6
+        id: build
         with:
           context: .
-          push: true
-          tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
           sbom: true
           provenance: mode=max
-          outputs: |
-            type=registry,rewrite-timestamp=true,force-compression=true
+          outputs: type=image,name=ghcr.io/${{ github.repository }},push-by-digest=true,name-canonical=true,push=true,rewrite-timestamp=true,force-compression=true
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
-  # arm64: the static-musl Alpine image (`-arm64` suffixed tags), built natively on a GitHub
-  # arm64 runner. StageX publishes no arm64 images yet, so this isn't full-source-bootstrapped
-  # like amd64 - but it is bit-for-bit reproducible (pinned base + apk toolchain). See
-  # Dockerfile.arm64.
+  # arm64: the static-musl Alpine image (Dockerfile.arm64), built natively on a GitHub arm64
+  # runner and pushed by digest. StageX publishes no arm64 images yet, so this isn't
+  # full-source-bootstrapped like amd64 - but it is bit-for-bit reproducible (pinned base + apk
+  # toolchain).
   docker-arm64:
     needs: setup
     # Always on a tag push; on manual dispatch only when push_images was requested.
     if: github.event_name == 'push' || inputs.push_images
     runs-on: ubuntu-24.04-arm
+    outputs:
+      digest: ${{ steps.build.outputs.digest }}
     steps:
       - uses: actions/checkout@v4
 
@@ -216,24 +209,44 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      - uses: docker/build-push-action@v6
+        id: build
+        with:
+          context: .
+          file: Dockerfile.arm64
+          platforms: linux/arm64
+          outputs: type=image,name=ghcr.io/${{ github.repository }},push-by-digest=true,name-canonical=true,push=true
+          cache-from: type=gha,scope=arm64
+          cache-to: type=gha,mode=max,scope=arm64
+
+  # Combine the two arch digests into one multi-arch manifest under the real tags
+  # (<version>, <major>.<minor>, and latest via metadata-action's default) - no -arm64 suffix.
+  manifest:
+    needs: [setup, docker, docker-arm64]
+    if: github.event_name == 'push' || inputs.push_images
+    runs-on: ubuntu-latest
+    steps:
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
       - uses: docker/metadata-action@v5
         id: meta
         with:
           images: ghcr.io/${{ github.repository }}
-          flavor: |
-            suffix=-arm64
           tags: |
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
             type=raw,value=${{ needs.setup.outputs.version }},enable=${{ github.event_name == 'workflow_dispatch' }}
 
-      - uses: docker/build-push-action@v6
-        with:
-          context: .
-          file: Dockerfile.arm64
-          platforms: linux/arm64
-          push: true
-          tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
-          cache-from: type=gha,scope=arm64
-          cache-to: type=gha,mode=max,scope=arm64
+      - name: Create and push the multi-arch manifest
+        run: |
+          tags=$(jq -r '.tags[] | "-t " + .' <<< '${{ steps.meta.outputs.json }}')
+          docker buildx imagetools create $tags \
+            ghcr.io/${{ github.repository }}@${{ needs.docker.outputs.digest }} \
+            ghcr.io/${{ github.repository }}@${{ needs.docker-arm64.outputs.digest }}
+
+      - name: Show the resulting manifest
+        run: docker buildx imagetools inspect ghcr.io/${{ github.repository }}:${{ needs.setup.outputs.version }}
