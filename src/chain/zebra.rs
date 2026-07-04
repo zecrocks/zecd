@@ -574,12 +574,14 @@ impl ChainSource for ZebraSource {
         &mut self,
         start: BlockHeight,
         end: BlockHeight,
+        include_transparent: bool,
     ) -> anyhow::Result<CompactBlockStream> {
         Ok(CompactBlockStream::Zebra(ZebraBlockStream {
             client: self.client.clone(),
             network: self.network,
             next: u32::from(start),
             end: u32::from(end),
+            include_transparent,
         }))
     }
 
@@ -720,7 +722,7 @@ impl ChainSource for ZebraSource {
                 index: e.output_index,
                 value_zat: e.satoshis,
                 script: hex::decode(&e.script).context("getaddressutxos script hex")?,
-                height: e.height,
+                height: Some(e.height),
             });
         }
         Ok(out)
@@ -752,10 +754,16 @@ pub struct ZebraBlockStream {
     next: u32,
     /// Inclusive end height.
     end: u32,
+    /// Extract each block's transparent outputs alongside its compact block (the wallet's
+    /// transparent receive-discovery path). Off for shielded-only wallets so the extraction is
+    /// skipped entirely.
+    include_transparent: bool,
 }
 
 impl ZebraBlockStream {
-    pub async fn next(&mut self) -> anyhow::Result<Option<pb::CompactBlock>> {
+    pub async fn next(
+        &mut self,
+    ) -> anyhow::Result<Option<(pb::CompactBlock, Vec<crate::chain::TransparentUtxo>)>> {
         if self.next > self.end {
             return Ok(None);
         }
@@ -786,9 +794,44 @@ impl ZebraBlockStream {
             .client
             .block_trees(&block.header().hash().to_string())
             .await?;
+        // The raw block was already fetched and parsed for the shielded compact block, so
+        // harvesting its transparent outputs here is free (no extra request). The matcher
+        // filters to the wallet's addresses; we just surface every output.
+        let transparent = if self.include_transparent {
+            block_transparent_outputs(&block, height)
+        } else {
+            Vec::new()
+        };
         self.next += 1;
-        Ok(Some(block_to_compact(&block, sapling_size, orchard_size)))
+        Ok(Some((
+            block_to_compact(&block, sapling_size, orchard_size),
+            transparent,
+        )))
     }
+}
+
+/// Every transparent output in `block`, tagged with the mining `height`, as
+/// [`crate::chain::TransparentUtxo`]s. The wallet matches these against its own transparent
+/// addresses to discover receives - compact blocks omit transparent I/O, and librustzcash's
+/// `decrypt_and_store` only records shielded outputs, so this is the receive-discovery source.
+fn block_transparent_outputs(block: &Block, height: u32) -> Vec<crate::chain::TransparentUtxo> {
+    let mut out = Vec::new();
+    for tx in block.vtx() {
+        let Some(bundle) = tx.transparent_bundle() else {
+            continue;
+        };
+        let txid = tx.txid();
+        for (index, txout) in bundle.vout.iter().enumerate() {
+            out.push(crate::chain::TransparentUtxo {
+                txid,
+                index: index as u32,
+                value_zat: u64::from(txout.value()),
+                script: txout.script_pubkey().0 .0.clone(),
+                height: Some(height),
+            });
+        }
+    }
+    out
 }
 
 /// Convert a parsed full block into the CompactBlock lightwalletd would serve for it: per
@@ -1340,7 +1383,7 @@ mod tests {
         );
         assert_eq!(u.index, 2);
         assert_eq!(u.value_zat, 100_000_000);
-        assert_eq!(u.height, 42);
+        assert_eq!(u.height, Some(42));
         assert_eq!(u.script.len(), 25, "p2pkh script_pubkey decoded from hex");
 
         // An address with no UTXOs yields an empty list, not an error.
@@ -1697,11 +1740,15 @@ mod tests {
         }
         let mut src = source_for(fake).await;
         let mut stream = src
-            .compact_block_range(BlockHeight::from_u32(415000), BlockHeight::from_u32(415000))
+            .compact_block_range(
+                BlockHeight::from_u32(415000),
+                BlockHeight::from_u32(415000),
+                true,
+            )
             .await
             .unwrap();
 
-        let cb = stream.next().await.unwrap().expect("one block");
+        let (cb, transparent) = stream.next().await.unwrap().expect("one block");
         assert_eq!(cb.height, 415000);
         assert_eq!(
             cb.hash,
@@ -1730,6 +1777,22 @@ mod tests {
             "absent pool size maps to 0"
         );
 
+        // `include_transparent` harvested the block's transparent outputs from the same parsed
+        // block. This block's lone (coinbase) tx has transparent outputs (the miner reward +
+        // founders'/funding-stream outputs), all tagged with the block height and the coinbase
+        // txid - the receive-discovery source for the wallet's transparent addresses.
+        assert!(
+            !transparent.is_empty(),
+            "the coinbase tx's transparent outputs were extracted"
+        );
+        for u in &transparent {
+            assert_eq!(u.height, Some(415000));
+            assert_eq!(
+                &u.txid.as_ref()[..],
+                &internal(BLOCK_415000_COINBASE_TXID)[..]
+            );
+        }
+
         assert!(stream.next().await.unwrap().is_none(), "range exhausted");
     }
 
@@ -1748,7 +1811,7 @@ mod tests {
         let mut src = source_for(fake).await;
 
         let mut stream = src
-            .compact_block_range(BlockHeight::from_u32(5), BlockHeight::from_u32(5))
+            .compact_block_range(BlockHeight::from_u32(5), BlockHeight::from_u32(5), false)
             .await
             .unwrap();
         let err = stream.next().await.expect_err("height mismatch must error");
@@ -1758,7 +1821,7 @@ mod tests {
         );
 
         let mut stream = src
-            .compact_block_range(BlockHeight::from_u32(6), BlockHeight::from_u32(6))
+            .compact_block_range(BlockHeight::from_u32(6), BlockHeight::from_u32(6), false)
             .await
             .unwrap();
         assert!(
@@ -1834,7 +1897,7 @@ mod tests {
         let mut src = source_for(fake).await;
 
         let mut stream = src
-            .compact_block_range(BlockHeight::from_u32(1), BlockHeight::from_u32(1))
+            .compact_block_range(BlockHeight::from_u32(1), BlockHeight::from_u32(1), false)
             .await
             .unwrap();
         let err = stream

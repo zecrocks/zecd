@@ -1,9 +1,13 @@
 //! Transparent (t-address) regtest end-to-end: prove that a wallet configured with `[pools]
-//! transparent = true` hands out a **bare transparent address**, receives funds there once mined
-//! (transparent receives are discovered by querying the node's `getaddressutxos` index, not by the
-//! shielded mempool trial-decryption path), and reports them across the balance/listunspent/is_mine
-//! RPCs. **Spending** received transparent funds (which requires shielding them first) is not yet
-//! implemented and is out of scope here - see the note at the end of the test.
+//! transparent = true` hands out a **bare transparent address**, sees a payment there at **0-conf**
+//! (the mempool poller matches the tx's transparent outputs against the wallet's address set, the
+//! same way it trial-decrypts shielded outputs) and then **confirmed** once mined (the block scan
+//! matches each block's transparent outputs), and reports the receive across the
+//! balance/listunspent/is_mine RPCs. **Spending** received transparent funds (which requires
+//! shielding them first) is not yet implemented and is out of scope here - see the note at the end
+//! of the test. Finally it guards the matcher's address-set refresh: a payment to an address issued
+//! *beyond* the recovery window must still be discovered, which only holds if issuing the address
+//! refreshes the in-memory set the block-scan / mempool matcher works off of.
 //!
 //! Setup mirrors `regtest_funded.rs`/`regtest_sapling.rs`: mine a transparent coinbase to the
 //! funder, mature it, shield it, then have the funder pay zecd. The difference is that zecd is
@@ -150,13 +154,52 @@ async fn regtest_transparent_receive_and_autoshield_spend() {
     }
     tokio::time::sleep(Duration::from_secs(3)).await;
 
-    // 7. Fund the transparent address, then confirm it. Unlike shielded receives (found at 0-conf
-    //    by trial-decrypting mempool txs), transparent receives are discovered by querying the
-    //    node's address index (`getaddressutxos`), which is chain-only - so a transparent receive
-    //    becomes visible once it's mined, not while it sits in the mempool.
+    // 7. Fund the transparent address. The receive is visible at **0-conf** the moment it hits the
+    //    mempool: the mempool poller matches the tx's transparent outputs against the wallet's
+    //    address set (the shielded trial-decrypt path never matches a transparent output) and
+    //    records the UTXO unmined, exactly like a shielded mempool receive. Mining then confirms it
+    //    via the block scan. (`listunspent minconf=0` reads the wallet DB directly and lists unmined
+    //    transparent UTXOs, so it is the authoritative 0-conf signal here.)
     funder
         .send(lwd.grpc_port, &taddr, FUND_ZATOSHIS)
         .expect("send to zecd's transparent address");
+
+    // 7a. 0-conf: before any block confirms the funding tx, the transparent receive shows in
+    //     `listunspent minconf=0` at the t-address with 0 confirmations - and is *not* yet listed at
+    //     the default minconf (>= 1), proving it is genuinely unconfirmed (the mempool path, not a
+    //     premature confirmation).
+    let deadline = Instant::now() + FUND_TIMEOUT;
+    loop {
+        let lu0 = zecd
+            .call("listunspent", json!([0]))
+            .await
+            .expect("listunspent minconf=0");
+        let unconfirmed = lu0.as_array().is_some_and(|notes| {
+            notes
+                .iter()
+                .any(|u| u["address"] == json!(taddr) && u["confirmations"].as_i64() == Some(0))
+        });
+        if unconfirmed {
+            let lu_default = zecd
+                .call("listunspent", json!([]))
+                .await
+                .expect("listunspent default minconf");
+            assert!(
+                lu_default
+                    .as_array()
+                    .is_some_and(|notes| notes.iter().all(|u| u["address"] != json!(taddr))),
+                "the 0-conf transparent receive must not be listed at the default minconf yet: \
+                 {lu_default}"
+            );
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the transparent receive never appeared at 0 conf via the mempool poller: {lu0}"
+        );
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+
     zebrad
         .generate_blocks(12)
         .await
@@ -233,6 +276,56 @@ async fn regtest_transparent_receive_and_autoshield_spend() {
         Some(-6),
         "default-policy transparent spend returns insufficient-funds (-6): {err}"
     );
+
+    // 9. Regression guard for the matcher's address-set refresh. A transparent address issued
+    //    *beyond* the recovery window (past `transparent_gap_limit`, via the allow-beyond-window
+    //    path that `transparent_allow_beyond_recovery_window` enables by default) sits OUTSIDE the
+    //    pre-exposed gap window. The block-scan / mempool matcher works off an in-memory set of the
+    //    wallet's exposed addresses, so a payment to such an address is recognized ONLY if issuing
+    //    the address refreshed that set. zecd marks the set dirty on every transparent issuance for
+    //    exactly this case (see `actor::new_transparent_address`); without it, the set still holds
+    //    just the original window and this receive is silently dropped. Issue well past the default
+    //    gap (20), fund the last (beyond-window) address, and assert it is discovered.
+    let mut beyond_taddr = String::new();
+    for _ in 0..25 {
+        beyond_taddr = zecd
+            .call("getnewaddress", json!(["", "transparent"]))
+            .await
+            .expect("getnewaddress transparent (beyond the recovery window)")
+            .as_str()
+            .expect("address string")
+            .to_string();
+    }
+    assert!(
+        beyond_taddr.starts_with("tm") && beyond_taddr != taddr,
+        "issued a distinct beyond-window t-addr: {beyond_taddr}"
+    );
+    funder
+        .send(lwd.grpc_port, &beyond_taddr, FUND_ZATOSHIS)
+        .expect("fund the beyond-window transparent address");
+
+    // Discovery (at 0-conf, via the mempool matcher) of the beyond-window receive is the proof that
+    // issuing the address refreshed the matcher set. If this times out, the issued address was
+    // missing from the set - i.e. issuance failed to mark it dirty.
+    let deadline = Instant::now() + FUND_TIMEOUT;
+    loop {
+        let lu0 = zecd
+            .call("listunspent", json!([0]))
+            .await
+            .expect("listunspent minconf=0");
+        let found = lu0
+            .as_array()
+            .is_some_and(|notes| notes.iter().any(|u| u["address"] == json!(beyond_taddr)));
+        if found {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "a receive to a beyond-recovery-window address was never discovered - the issued \
+             address was absent from the matcher set (transparent issuance must refresh it): {lu0}"
+        );
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
 
     lwd.stop();
     drop(zecd);

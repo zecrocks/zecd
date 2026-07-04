@@ -1,7 +1,7 @@
 //! The per-wallet actor: the single owner/writer of the `WalletDb`, running the sync loop
 //! and serving writer commands (address generation, sends, lock/unlock) from RPC handlers.
 
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
 use std::convert::Infallible;
 use std::num::NonZeroUsize;
 use std::path::PathBuf;
@@ -292,15 +292,20 @@ struct WalletActor {
     /// Warn when fewer than this many in-window transparent address slots remain before generation
     /// would hit the gap limit.
     transparent_gap_warn_threshold: u32,
-    /// Receive-discovery throttle (transient - rebuilt on restart, like sync progress; respects the
-    /// stateless invariant). librustzcash never asks us to scan our *receiving* transparent
-    /// addresses for incoming funds (only to find spends of UTXOs we already hold), so zecd owns
-    /// that scan via `getaddressutxos`. `getaddressutxos` returns the full current UTXO set (no
-    /// height filter), so re-running it every idle pass is wasteful: this records `(tip,
-    /// exposed_receiver_count)` of the last scan and re-scans only when the tip advances or new
-    /// receivers are exposed (a gap extension). `transparent_preexposed` flips once
-    /// `0..transparent_initial_scan` has been pre-exposed.
-    transparent_last_scan: Option<(u32, usize)>,
+    /// The wallet's exposed transparent receiving + change addresses, as a membership set for the
+    /// block-scan / mempool receive matcher. Transient (rebuilt from the DB, respects the stateless
+    /// invariant). librustzcash never asks us to scan our *receiving* transparent addresses for
+    /// incoming funds (only to find spends of UTXOs we already hold), so zecd owns receive
+    /// discovery: it matches each scanned block's (and each mempool tx's) transparent outputs
+    /// against this set. Matching is O(outputs) with an O(1) membership test, independent of the
+    /// set's size - what lets an exchange track ~100k addresses without per-address requests.
+    /// `None` until first built; rebuilt lazily when `transparent_set_dirty`.
+    transparent_scripts: Option<HashSet<TransparentAddress>>,
+    /// Set when the exposed-address set may have grown (a recorded receive can extend the
+    /// transparent gap, exposing new indices), so the next sync pass rebuilds `transparent_scripts`
+    /// before matching. `transparent_preexposed` flips once `0..transparent_initial_scan` has been
+    /// pre-exposed.
+    transparent_set_dirty: bool,
     transparent_preexposed: bool,
     /// Transient first-seen times for unmined txs, shared with the read-path handle. Stamped when
     /// the mempool stream first stores an unmined tx; pruned once the tx mines. Never persisted
@@ -620,7 +625,8 @@ pub async fn spawn(
         transparent_initial_scan: cfg.transparent_initial_scan,
         transparent_allow_beyond_recovery_window: cfg.transparent_allow_beyond_recovery_window,
         transparent_gap_warn_threshold: cfg.transparent_gap_warn_threshold,
-        transparent_last_scan: None,
+        transparent_scripts: None,
+        transparent_set_dirty: true,
         transparent_preexposed: false,
         first_seen: first_seen.clone(),
         account_id,
@@ -1002,6 +1008,9 @@ impl WalletActor {
                             // Caught up: give any unmined wallet txs another shot at the mempool,
                             // pull the full data (memos, …) for transactions seen only as compact
                             // blocks, and (re)subscribe to incoming mempool txs for 0-conf visibility.
+                            // (Transparent receives are discovered by the block scan itself - see
+                            // `sync_step` - and at 0-conf by the mempool path below; no separate
+                            // per-address `getaddressutxos` pass is needed.)
                             self.maybe_rebroadcast().await;
                             // Drain one bounded batch of the enhancement backlog. Keep `more_work`
                             // set while requests remain so the loop keeps draining (servicing queued
@@ -1012,10 +1021,6 @@ impl WalletActor {
                             // logged and treated as "no more work this pass" rather than taking the
                             // actor (and all wallet writes) down.
                             let more_enhance = self.enhance_step_caught().await;
-                            // Transparent receive discovery (opt-in): enumerate the account's
-                            // exposed t-addresses and pull any txs paying them. Independent of the
-                            // shielded enhancement drain above.
-                            self.scan_transparent_receives().await;
                             self.ensure_mempool_stream().await;
                             more_work = more_enhance;
                         }
@@ -1500,124 +1505,73 @@ impl WalletActor {
         Ok(())
     }
 
-    /// Discover **incoming** transparent payments to the wallet's own receiving addresses.
+    /// Match a transaction's transparent outputs against the wallet's exposed transparent address
+    /// set and record any that pay us as received UTXOs (`put_received_transparent_utxo`). Returns
+    /// how many were recorded.
     ///
-    /// librustzcash's `transaction_data_requests` only asks us to scan transparent addresses for
-    /// *spends* of UTXOs we already hold (and for ephemeral ZIP-320 addresses); it never asks us to
-    /// scan our *receiving* addresses for incoming funds - transparent I/O isn't in the compact
-    /// blocks it scans, and `decrypt_and_store` only records shielded outputs. So zecd owns this,
-    /// mirroring `zcash_client_backend::sync`: enumerate the exposed transparent receivers, query
-    /// the upstream's `getaddressutxos`, and feed each UTXO to `put_received_transparent_utxo`
-    /// (which records the receive and lets librustzcash extend the gap and later find the spend).
-    /// The scanned set is bounded by what's exposed - `transparent_gap_limit` past each funded
-    /// address, plus the `transparent_initial_scan` floor pre-exposed below.
+    /// This is the 0-conf half of transparent receive discovery: the block scan
+    /// (`engine::sync_one_batch`) discovers *mined* transparent receives, and the mempool poller
+    /// calls this with `height = None` so an incoming transparent payment is visible at 0 conf
+    /// (`getunconfirmedbalance`/`listunspent minconf=0`), matching the shielded mempool path and
+    /// bitcoind. librustzcash never discovers transparent *receives* itself - its
+    /// `transaction_data_requests` only ask us to find *spends* of UTXOs we already hold - and
+    /// `decrypt_and_store_transaction` records only shielded outputs, so zecd owns this.
     ///
-    /// `getaddressutxos` returns the full current UTXO set (no height filter), so this throttles to
-    /// runs where the tip advanced or a new receiver was exposed; `put_received_transparent_utxo`
-    /// is idempotent, so an occasional redundant run is harmless. State is transient (rebuilt on
-    /// restart, like sync progress - no statelessness break).
-    async fn scan_transparent_receives(&mut self) {
-        if !self.transparent_enabled || self.client.is_none() {
-            return;
-        }
-        let Some(tip) = self.tip_height else {
-            return;
-        };
-        let Ok(account_id) = self.require_account() else {
-            return;
-        };
-
-        // one-time pre-exposure of external indices `0..transparent_initial_scan`, so a
-        // stateless restore scans deep enough to find a high funded index while the steady-state
-        // gap stays small.
-        if !self.transparent_preexposed {
-            self.preexpose_transparent(account_id);
-            self.transparent_preexposed = true;
-            // Startup audit: if the wallet already sits near/over the recovery window (e.g. many
-            // addresses handed out ahead of funding, carried across a restart), warn once.
-            self.audit_transparent_recovery_window(account_id);
-        }
-
-        // Exposed transparent receivers (external + internal/change).
-        let addresses: Vec<String> = match self
-            .db_data
-            .get_transparent_receivers(account_id, true, false)
-        {
-            Ok(r) => {
-                use zcash_keys::encoding::AddressCodec as _;
-                r.keys().map(|a| a.encode(&self.network)).collect()
-            }
-            Err(e) => {
-                warn!("[{}] get_transparent_receivers failed: {e}", self.name);
-                return;
-            }
-        };
-        if addresses.is_empty() {
-            return;
-        }
-        // Throttle: re-scan only when the tip moved or a new receiver was exposed (gap extension).
-        if self.transparent_last_scan == Some((tip, addresses.len())) {
-            return;
-        }
-        match self.scan_transparent_utxos(addresses.clone()).await {
-            Ok(()) => self.transparent_last_scan = Some((tip, addresses.len())),
-            Err(e) => warn!("[{}] transparent receive scan failed: {e}", self.name),
-        }
-    }
-
-    /// Query `getaddressutxos` for `addresses` (in batches, since the upstream accepts many per
-    /// call) and record each returned UTXO via `put_received_transparent_utxo`. Idempotent.
-    async fn scan_transparent_utxos(&mut self, addresses: Vec<String>) -> anyhow::Result<()> {
-        use zcash_transparent::address::Script;
-        use zcash_transparent::bundle::{OutPoint, TxOut};
-        const BATCH: usize = 100;
-        let mut found = 0usize;
-        for chunk in addresses.chunks(BATCH) {
-            let utxos = self.fetch_address_utxos(chunk.to_vec()).await?;
-            for u in utxos {
-                let value = Zatoshis::from_u64(u.value_zat)
-                    .map_err(|e| anyhow!("getaddressutxos value: {e}"))?;
-                let outpoint = OutPoint::new(*u.txid.as_ref(), u.index);
-                let txout = TxOut::new(value, Script(zcash_script::script::Code(u.script)));
-                let output = zcash_client_backend::wallet::WalletTransparentOutput::from_parts(
-                    outpoint,
-                    txout,
-                    Some(BlockHeight::from_u32(u.height)),
-                )
-                .ok_or_else(|| anyhow!("getaddressutxos returned a non-recognized output"))?;
-                self.db_data.put_received_transparent_utxo(&output)?;
-                found += 1;
-            }
-        }
-        if found > 0 {
-            tracing::debug!("[{}] recorded {found} transparent UTXO(s)", self.name);
-        }
-        Ok(())
-    }
-
-    /// Thin wrapper around [`ChainSource::get_address_utxos`] that (re)connects and applies the
-    /// unary RPC timeout, mirroring [`Self::fetch_transparent_txids`].
-    async fn fetch_address_utxos(
+    /// Matching is O(outputs-in-tx) with an O(1) set membership test, independent of how many
+    /// addresses the wallet tracks. Sharing [`engine::owned_transparent_output`] with the block
+    /// scan keeps the two discovery paths byte-for-byte consistent.
+    fn record_tx_transparent_receives(
         &mut self,
-        addresses: Vec<String>,
-    ) -> anyhow::Result<Vec<crate::chain::TransparentUtxo>> {
-        if self.client.is_none() {
-            self.connect().await?;
+        tx: &Transaction,
+        height: Option<BlockHeight>,
+    ) -> usize {
+        if !self.transparent_enabled {
+            return 0;
         }
-        let client = self
-            .client
-            .as_mut()
-            .ok_or_else(|| anyhow!("not connected to upstream"))?;
-        let result = tokio::time::timeout(UNARY_RPC_TIMEOUT, client.get_address_utxos(addresses))
-            .await
-            .map_err(|_| anyhow!("getaddressutxos timed out after {UNARY_RPC_TIMEOUT:?}"))
-            .and_then(|r| r);
-        if result.is_err() {
-            // Transport failure: drop the client so the next op reconnects (matches the other
-            // unary fetchers).
-            self.mark_disconnected("getaddressutxos failed".to_string());
+        let h = height.map(u32::from);
+        // Build the owned outputs while holding the (immutable) address-set borrow, then record
+        // them with `&mut self.db_data` - keeping the two borrows from overlapping.
+        let outputs: Vec<_> = {
+            let Some(addresses) = self.transparent_scripts.as_ref() else {
+                return 0;
+            };
+            let Some(bundle) = tx.transparent_bundle() else {
+                return 0;
+            };
+            let txid = tx.txid();
+            bundle
+                .vout
+                .iter()
+                .enumerate()
+                .filter_map(|(index, txout)| {
+                    engine::owned_transparent_output(
+                        addresses,
+                        txid,
+                        index as u32,
+                        u64::from(txout.value()),
+                        txout.script_pubkey().0 .0.clone(),
+                        h,
+                    )
+                })
+                .collect()
+        };
+        let mut recorded = 0;
+        for output in outputs {
+            match self.db_data.put_received_transparent_utxo(&output) {
+                Ok(_) => recorded += 1,
+                Err(e) => warn!(
+                    "[{}] recording transparent receive {}:{} failed: {e}",
+                    self.name,
+                    output.outpoint().txid(),
+                    output.outpoint().n(),
+                ),
+            }
         }
-        result
+        if recorded > 0 {
+            // A new receive may have extended the transparent gap; rebuild the set next pass.
+            self.transparent_set_dirty = true;
+        }
+        recorded
     }
 
     /// Pre-expose external transparent indices `0..transparent_initial_scan` so the receive
@@ -1713,13 +1667,21 @@ impl WalletActor {
         let txid = tx.txid();
         match decrypt_and_store_transaction(&self.network, &mut self.db_data, &tx, mined_height) {
             Ok(()) => {
-                // `decrypt_and_store_transaction` no-ops for txs that don't pay us, so the tx is
-                // ours iff it now exists in the wallet DB. Log that verdict (diagnostic: a 0-conf
-                // transparent receive that never shows up as `ours=true` here means the mempool
-                // path isn't attributing the transparent output).
+                // `decrypt_and_store_transaction` records only *shielded* outputs, so a transparent
+                // receive needs zecd's own matcher: check this tx's transparent outputs against the
+                // wallet's address set and record any that pay us as unmined (0-conf) UTXOs. This is
+                // what makes an incoming transparent payment visible before its first confirmation
+                // (`getunconfirmedbalance`/`listunspent minconf=0`), the same as the shielded path.
+                let t_recorded = self.record_tx_transparent_receives(&tx, mined_height);
+
+                // The tx is ours iff it now exists in the wallet DB - either the shielded
+                // decrypt stored it or we just recorded a transparent receive from it.
                 let txid_hex = txid.to_string();
-                let ours = super::read::tx_exists(&self.wallet_dir, &txid_hex);
-                tracing::debug!("[{}] processed mempool tx {txid} (ours={ours})", self.name);
+                let ours = t_recorded > 0 || super::read::tx_exists(&self.wallet_dir, &txid_hex);
+                tracing::debug!(
+                    "[{}] processed mempool tx {txid} (ours={ours}, transparent_receives={t_recorded})",
+                    self.name
+                );
                 // If the tx is ours and still unmined, stamp when we first saw it so
                 // `gettransaction`/`listtransactions` can report `time`/`timereceived` (Bitcoin
                 // Core's `nTimeReceived`) while it has no block time. This is held in memory only
@@ -1821,10 +1783,30 @@ impl WalletActor {
         // Rebuild the account from keys.toml if the data directory was empty. Until that
         // succeeds there is nothing to scan, so don't run a batch.
         self.maybe_bootstrap_account().await;
-        if self.account_id.is_none() {
+        let Some(account_id) = self.account_id else {
             return Ok(false);
+        };
+
+        // Transparent receive discovery rides on the block scan: the wallet's exposed transparent
+        // addresses are matched against each scanned block's outputs (see `engine::sync_one_batch`).
+        // Pre-expose the initial-scan window and (re)build the address set *before* the scan so
+        // the historic range is matched against the full address set - including a from-seed
+        // restore, where a high funded index is found only if `transparent_initial_scan` exposed it.
+        if self.transparent_enabled {
+            if !self.transparent_preexposed {
+                self.preexpose_transparent(account_id);
+                self.transparent_preexposed = true;
+                // Startup audit: if the wallet already sits near/over the recovery window (e.g. many
+                // addresses handed out ahead of funding, carried across a restart), warn once.
+                self.audit_transparent_recovery_window(account_id);
+            }
+            if self.transparent_set_dirty {
+                self.rebuild_transparent_set(account_id);
+            }
         }
-        let worked = {
+
+        let outcome = {
+            let transparent = self.transparent_scripts.as_ref();
             let client = self
                 .client
                 .as_mut()
@@ -1836,11 +1818,40 @@ impl WalletActor {
                 &self.wallet_dir,
                 &mut self.db_cache,
                 &mut self.db_data,
+                transparent,
             )
             .await?
         };
+        // A recorded receive may have extended the transparent gap (exposing new indices), so
+        // rebuild the address set before the next pass to cover them.
+        if outcome.transparent_recorded > 0 {
+            self.transparent_set_dirty = true;
+        }
         self.update_status();
-        Ok(worked)
+        Ok(outcome.worked)
+    }
+
+    /// Rebuild [`Self::transparent_scripts`] from the account's exposed transparent receivers
+    /// (external + internal/change). Cheap relative to a sync batch and only run when the set may
+    /// have changed (`transparent_set_dirty`), so an exchange with ~100k addresses pays the query
+    /// once per gap extension, not once per scanned block.
+    fn rebuild_transparent_set(&mut self, account_id: AccountUuid) {
+        match self
+            .db_data
+            .get_transparent_receivers(account_id, true, false)
+        {
+            Ok(receivers) => {
+                let set: HashSet<TransparentAddress> = receivers.into_keys().collect();
+                tracing::debug!(
+                    "[{}] transparent address set rebuilt: {} exposed receiver(s)",
+                    self.name,
+                    set.len()
+                );
+                self.transparent_scripts = Some(set);
+                self.transparent_set_dirty = false;
+            }
+            Err(e) => warn!("[{}] rebuilding transparent address set: {e}", self.name),
+        }
     }
 
     /// Rebuild the wallet account from `keys.toml` on an empty data directory (the bootstrap
@@ -2297,6 +2308,13 @@ impl WalletActor {
             ));
         }
         let account_id = self.require_account()?;
+        // Handing out a transparent receiver may expose a new address (notably the beyond-gap
+        // issuance path, which exposes an index outside the current gap window): mark the matcher's
+        // address set stale so the next sync pass rebuilds it and the block-scan / mempool matcher
+        // recognizes a payment to the address we just issued. Within-window addresses are already in
+        // the set (the gap window is pre-exposed), so this is only load-bearing past the window, but
+        // it's cheap (one coalesced rebuild per sync pass) and keeps the set authoritative.
+        self.transparent_set_dirty = true;
         let request = crate::pools::transparent_extraction_request();
         match self.db_data.get_next_available_address(account_id, request) {
             Ok(Some((ua, _))) => {

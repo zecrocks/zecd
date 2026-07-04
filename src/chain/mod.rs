@@ -26,10 +26,22 @@ pub struct ChainTip {
     pub hash: Vec<u8>,
 }
 
-/// A currently-unspent transparent output (UTXO) discovered via the upstream address index
-/// (`getaddressutxos`). Carries exactly what `WalletTransparentOutput::from_parts` needs so the
-/// actor can feed it to `WalletWrite::put_received_transparent_utxo` - the path by which a wallet
-/// learns of transparent *receives* (`decrypt_and_store` only handles shielded outputs).
+/// A transparent output observed upstream, carrying exactly what
+/// `WalletTransparentOutput::from_parts` needs so the actor can feed it to
+/// `WalletWrite::put_received_transparent_utxo` - the path by which a wallet learns of transparent
+/// *receives* (`decrypt_and_store` only handles shielded outputs).
+///
+/// Two sources produce these, with slightly different semantics:
+///  * the address index (`getaddressutxos`) returns only **currently-unspent** outputs, mined,
+///    for a given set of addresses; and
+///  * the block scan ([`CompactBlockStream::next`] with `include_transparent`) yields **every**
+///    transparent output in each scanned block (the matcher filters to the wallet's addresses).
+///    Such an output may already have been spent in a later block; the spend is discovered
+///    separately by the enhancement path (librustzcash's `TransactionsInvolvingAddress` request,
+///    serviced via `getaddresstxids`), so recording it as a receive is correct.
+///
+/// `height` is the block height the output was mined at; for a mempool (0-conf) output it is
+/// `None` (the matcher feeds that straight to `from_parts` as an unmined output).
 #[derive(Clone, Debug)]
 pub struct TransparentUtxo {
     /// Internal-byte-order txid of the funding transaction.
@@ -40,8 +52,8 @@ pub struct TransparentUtxo {
     pub value_zat: u64,
     /// The output's `script_pubkey` bytes.
     pub script: Vec<u8>,
-    /// The height at which the UTXO was mined.
-    pub height: u32,
+    /// The height at which the output was mined, or `None` for a mempool (0-conf) output.
+    pub height: Option<u32>,
 }
 
 /// Upstream identity, used by the wrong-chain guard. `chain_name` follows zcashd's
@@ -110,10 +122,17 @@ pub trait ChainSource: Send {
 
     /// Stream the compact blocks for `start..=end` in order (lightwalletd `GetBlockRange`;
     /// zebra `getblock` + local full-block→CompactBlock conversion).
+    ///
+    /// When `include_transparent` is set, each streamed item also carries the block's transparent
+    /// outputs (see [`CompactBlockStream::next`]) so the caller can discover transparent receives
+    /// from the *same* full block it already fetched - no extra per-block or per-address request.
+    /// Shielded-only wallets pass `false` so the (non-trivial) per-block transparent extraction is
+    /// skipped entirely.
     fn compact_block_range(
         &mut self,
         start: BlockHeight,
         end: BlockHeight,
+        include_transparent: bool,
     ) -> impl Future<Output = anyhow::Result<CompactBlockStream>> + Send;
 
     /// All note-commitment-subtree roots for `protocol`, from index 0 (lightwalletd
@@ -195,9 +214,10 @@ impl ChainSource for AnySource {
         &mut self,
         start: BlockHeight,
         end: BlockHeight,
+        include_transparent: bool,
     ) -> anyhow::Result<CompactBlockStream> {
         match self {
-            AnySource::Zebra(s) => s.compact_block_range(start, end).await,
+            AnySource::Zebra(s) => s.compact_block_range(start, end, include_transparent).await,
         }
     }
 
@@ -261,8 +281,15 @@ pub enum CompactBlockStream {
 }
 
 impl CompactBlockStream {
-    /// The next block, `Ok(None)` at end of range, or a transport-class error.
-    pub async fn next(&mut self) -> anyhow::Result<Option<CompactBlock>> {
+    /// The next block paired with its transparent outputs, `Ok(None)` at end of range, or a
+    /// transport-class error.
+    ///
+    /// The transparent-output vector is the block's full set of transparent `vout`s (every
+    /// output, not just the wallet's - the caller matches against its address set); it is always
+    /// empty unless the stream was opened with `include_transparent`. Carrying it here lets the
+    /// wallet discover transparent receives from the block it already downloaded for the shielded
+    /// scan, at no extra fetch.
+    pub async fn next(&mut self) -> anyhow::Result<Option<(CompactBlock, Vec<TransparentUtxo>)>> {
         match self {
             CompactBlockStream::Zebra(s) => s.next().await,
         }
