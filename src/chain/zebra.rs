@@ -546,6 +546,17 @@ impl ChainSource for ZebraSource {
             .client
             .call_as("z_gettreestate", json!([u32::from(height).to_string()]))
             .await?;
+        // The birthday anchor is derived from this height (`AccountBirthday::from_treestate`),
+        // and the scanner asserts the chain state sits exactly one block below the scan range,
+        // so a wrong height silently corrupts the anchor and later panics the scanner. Reject a
+        // mismatch as a transport error here (mirrors the raw-block `claimed_height` guard).
+        if reply.height != u32::from(height) {
+            bail!(
+                "zebra served tree state for height {} but height {} was requested",
+                reply.height,
+                u32::from(height),
+            );
+        }
         // Identical mapping to lightwalletd's GetTreeState: hash/height/time pass through
         // (hash stays display hex; `to_chain_state` reverses it), and the tree fields are
         // the `commitments.finalState` hex (empty when the pool isn't active yet).
@@ -766,6 +777,17 @@ impl ZebraBlockStream {
             bail!(
                 "zebra served block claiming height {} for requested height {height}",
                 u32::from(block.claimed_height()),
+            );
+        }
+        // The scanner's per-block transaction index is a 16-bit integer, so more than
+        // `u16::MAX` transactions overflows it and panics librustzcash. A real block can't
+        // hold that many (non-consensus), so this only guards a malicious or buggy upstream;
+        // reject it as a transport error before `block_to_compact` feeds the scanner.
+        if block.vtx().len() > usize::from(u16::MAX) {
+            bail!(
+                "zebra served block {height} with {} transactions, exceeding the {} the scanner supports",
+                block.vtx().len(),
+                u16::MAX,
             );
         }
         let (sapling_size, orchard_size) = self
@@ -1568,6 +1590,32 @@ mod tests {
         assert_eq!(ts.orchard_tree, "cdef45");
     }
 
+    /// A node serving a tree state for the wrong height must fail the request, not feed the
+    /// scanner a corrupted birthday anchor (which it enforces with a panic). Mirrors the
+    /// raw-block `claimed_height` guard.
+    #[tokio::test]
+    async fn tree_state_rejects_height_mismatch() {
+        let fake = Arc::new(Mutex::new(Fake::new()));
+        fake.lock().unwrap().treestate = json!({
+            "hash": BLOCK_415000_HASH,
+            "height": 415000,
+            "time": 1540144808,
+            "sapling": { "commitments": {} },
+            "orchard": {},
+        });
+        let mut src = source_for(fake).await;
+        // Request one block earlier than the node returns.
+        let err = src
+            .tree_state(BlockHeight::from_u32(414999))
+            .await
+            .expect_err("height mismatch must error");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("414999") && msg.contains("415000"),
+            "got: {msg}"
+        );
+    }
+
     #[tokio::test]
     async fn subtree_roots_decode_hex_without_reversal() {
         let fake = Arc::new(Mutex::new(Fake::new()));
@@ -1779,6 +1827,87 @@ mod tests {
         assert!(
             stream.next().await.is_err(),
             "unparseable block bytes must error"
+        );
+    }
+
+    /// A block with more than `u16::MAX` transactions would overflow the scanner's 16-bit
+    /// per-block transaction index and panic librustzcash. Such a block is non-consensus (only
+    /// a malicious or buggy upstream produces it), so the stream must reject it as a transport
+    /// error before it reaches `block_to_compact`.
+    #[tokio::test]
+    async fn block_range_rejects_more_than_u16_max_transactions() {
+        fn compact_size(n: u64, out: &mut Vec<u8>) {
+            if n < 0xFD {
+                out.push(n as u8);
+            } else if n <= 0xFFFF {
+                out.push(0xFD);
+                out.extend_from_slice(&(n as u16).to_le_bytes());
+            } else if n <= 0xFFFF_FFFF {
+                out.push(0xFE);
+                out.extend_from_slice(&(n as u32).to_le_bytes());
+            } else {
+                out.push(0xFF);
+                out.extend_from_slice(&n.to_le_bytes());
+            }
+        }
+
+        // One over the 16-bit limit: a valid coinbase plus this many minimal transactions. The
+        // bytes only need to *parse* - we want the vtx-count guard, not a parse error, to reject.
+        const TX_COUNT: u64 = u16::MAX as u64 + 1; // 65_536
+
+        let mut raw = Vec::new();
+        // Block header: version, prev, merkle, final_sapling_root, time, bits, nonce, empty solution.
+        raw.extend_from_slice(&4i32.to_le_bytes());
+        raw.extend_from_slice(&[0u8; 32]);
+        raw.extend_from_slice(&[0u8; 32]);
+        raw.extend_from_slice(&[0u8; 32]);
+        raw.extend_from_slice(&0u32.to_le_bytes());
+        raw.extend_from_slice(&0u32.to_le_bytes());
+        raw.extend_from_slice(&[0u8; 32]);
+        raw.push(0x00); // solution: empty vector
+
+        compact_size(TX_COUNT, &mut raw);
+
+        // Coinbase (v1) claiming height 1: a single NULL-prevout input whose scriptSig pushes
+        // the 1-byte height, and no outputs.
+        raw.extend_from_slice(&1u32.to_le_bytes()); // version
+        raw.push(0x01); // one input
+        raw.extend_from_slice(&[0u8; 32]); // prevout hash (NULL)
+        raw.extend_from_slice(&0xFFFF_FFFFu32.to_le_bytes()); // prevout index (NULL)
+        raw.extend_from_slice(&[0x02, 0x01, 0x01]); // scriptSig: push the 1-byte height 0x01
+        raw.extend_from_slice(&0xFFFF_FFFFu32.to_le_bytes()); // sequence
+        raw.push(0x00); // no outputs
+        raw.extend_from_slice(&0u32.to_le_bytes()); // lock_time
+
+        // The remaining minimal empty v1 transactions.
+        let mut mintx = Vec::new();
+        mintx.extend_from_slice(&1u32.to_le_bytes()); // version
+        mintx.push(0x00); // no inputs
+        mintx.push(0x00); // no outputs
+        mintx.extend_from_slice(&0u32.to_le_bytes()); // lock_time
+        for _ in 0..(TX_COUNT - 1) {
+            raw.extend_from_slice(&mintx);
+        }
+
+        let fake = Arc::new(Mutex::new(Fake::new()));
+        fake.lock()
+            .unwrap()
+            .raw_blocks
+            .insert("1".into(), hex::encode(&raw));
+        let mut src = source_for(fake).await;
+
+        let mut stream = src
+            .compact_block_range(BlockHeight::from_u32(1), BlockHeight::from_u32(1), false)
+            .await
+            .unwrap();
+        let err = stream
+            .next()
+            .await
+            .expect_err("an over-large block must error, not panic");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("65536") && msg.contains("transactions"),
+            "got: {msg}"
         );
     }
 
