@@ -65,7 +65,10 @@ so none of them should land in a ConfigMap. Each can come from the environment o
 Secret file instead of the TOML:
 
 - **RPC password** - `ZECD_RPC_PASSWORD`, `--rpcpassword`, or `[rpc] password_file`
-  (precedence: flag/env > `password_file` > inline `[rpc] password`).
+  (precedence: flag/env > `password_file` > inline `[rpc] password`). Prefer
+  `ZECD_RPC_PASSWORD` or `password_file` over `--rpcpassword`: a password on the command line
+  is exposed to any local user via `ps` and `/proc/<pid>/cmdline`, so zecd warns at startup when
+  the password is passed that way.
 - **keys.toml location** - `ZECD_KEYS_FILE` / `--keys-file` / `[keys] keys_file` (default wallet)
   or per-wallet `[wallets.<name>] keys_file`.
 - **age identity** - `ZECD_AGE_IDENTITY` / `--age-identity` / `[keys] age_identity`.
