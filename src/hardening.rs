@@ -30,12 +30,19 @@ pub const ALLOW_CORE_DUMPS_ENV: &str = "ZECD_ALLOW_CORE_DUMPS";
 /// Apply the process-wide hardening once at startup (before any secret is decrypted). Safe to
 /// call from every subcommand; best-effort, so failures are logged and never fatal.
 pub fn harden_process() {
-    if std::env::var_os(ALLOW_CORE_DUMPS_ENV).is_some() {
-        warn!("{ALLOW_CORE_DUMPS_ENV} set; leaving core dumps and ptrace enabled");
+    if core_dumps_allowed() {
+        warn!("{ALLOW_CORE_DUMPS_ENV}=1 set; leaving core dumps and ptrace enabled");
         return;
     }
     disable_core_dumps();
     set_non_dumpable();
+}
+
+/// Whether the operator opted out of core-dump / non-dumpable hardening. Only the explicit
+/// truthy value `1` opts out; anything else - including `ZECD_ALLOW_CORE_DUMPS=0`, empty, or
+/// unset - keeps hardening on, matching the documented `=1` escape hatch.
+fn core_dumps_allowed() -> bool {
+    matches!(std::env::var(ALLOW_CORE_DUMPS_ENV), Ok(v) if v == "1")
 }
 
 #[cfg(unix)]
@@ -137,6 +144,25 @@ mod tests {
         // Best-effort: calling it (twice) must never panic, regardless of platform/privilege.
         harden_process();
         harden_process();
+    }
+
+    #[test]
+    fn only_explicit_1_opts_out_of_core_dump_hardening() {
+        // Guards the ZECD_ALLOW_CORE_DUMPS=0 regression: only `=1` is an opt-out.
+        std::env::set_var(ALLOW_CORE_DUMPS_ENV, "1");
+        assert!(core_dumps_allowed());
+
+        std::env::set_var(ALLOW_CORE_DUMPS_ENV, "0");
+        assert!(!core_dumps_allowed());
+
+        std::env::set_var(ALLOW_CORE_DUMPS_ENV, "");
+        assert!(!core_dumps_allowed());
+
+        std::env::set_var(ALLOW_CORE_DUMPS_ENV, "true");
+        assert!(!core_dumps_allowed());
+
+        std::env::remove_var(ALLOW_CORE_DUMPS_ENV);
+        assert!(!core_dumps_allowed());
     }
 
     #[cfg(unix)]
