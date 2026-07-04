@@ -138,10 +138,32 @@ async fn download_chain_state<C: ChainSource>(
     Ok(tree_state.to_chain_state()?)
 }
 
-fn delete_cached_blocks(name: &str, wallet_dir: &Path, block_meta: Vec<BlockMeta>) {
-    for meta in block_meta {
-        if let Err(e) = std::fs::remove_file(block_path(wallet_dir, &meta)) {
+/// Remove a just-scanned batch's cached compact-block files *and* their `compactblocks_meta`
+/// rows, keeping the on-disk cache and the metadata table consistent.
+///
+/// Dropping only the files (as this used to) left the metadata rows behind for every scanned
+/// height forever: on a long-lived node `compactblocks_meta` then grew without bound, and -
+/// worse - a later reorg's `with_blocks` pass would try to open those now-fileless rows and
+/// fail with `NotFound` before the rewind's `truncate_to_height` could run, so the intended
+/// in-place reorg recovery never completed. Because sync processes one batch per call
+/// (download → scan → delete before the next), truncating to just below the batch's lowest
+/// height removes exactly this batch's rows, so the table never accumulates.
+fn delete_cached_blocks(
+    name: &str,
+    wallet_dir: &Path,
+    db_cache: &mut FsBlockDb,
+    block_meta: Vec<BlockMeta>,
+) {
+    let lowest = block_meta.iter().map(|m| m.height).min();
+    for meta in &block_meta {
+        if let Err(e) = std::fs::remove_file(block_path(wallet_dir, meta)) {
             warn!("[{name}] Failed to remove cached block {:?}: {}", meta, e);
+        }
+    }
+    if let Some(lowest) = lowest {
+        let truncate_to = BlockHeight::from(u32::from(lowest).saturating_sub(1));
+        if let Err(e) = db_cache.truncate_to_height(truncate_to) {
+            warn!("[{name}] Failed to truncate block cache metadata to {truncate_to}: {e:?}");
         }
     }
 }
@@ -244,19 +266,50 @@ fn scan_blocks(
             // valid checkpoint when the requested height has none; the cache is then
             // truncated to the height actually rewound to.
             let rewind_height = perform_rewind(name, db_data, err.at_height(), requested)?;
-            db_cache
-                .with_blocks(Some(rewind_height + 1), None, |block| {
-                    let meta = BlockMeta {
-                        height: block.height(),
-                        block_hash: block.hash(),
-                        block_time: block.time,
-                        sapling_outputs_count: 0,
-                        orchard_actions_count: 0,
-                    };
-                    std::fs::remove_file(block_path(wallet_dir, &meta))
-                        .map_err(|e| ChainError::<(), _>::BlockSource(FsBlockDbError::Fs(e)))
-                })
-                .map_err(|e| anyhow!("{:?}", e))?;
+            // Delete the now-stale cached block files above the rewind height. A metadata row
+            // whose backing file is already gone (rows left behind by an older zecd that removed
+            // files but not their `compactblocks_meta` rows) must not abort this: `with_blocks`
+            // opens each row's file *before* handing it to the closure, so a `NotFound` there
+            // would propagate and skip the `truncate_to_height` below - leaving the metadata
+            // un-truncated and the in-place reorg recovery broken (the node could then only
+            // recover by dropping the client and redownloading). Treat a missing file as
+            // already-cleaned and fall through to the truncate, which drops every stale row in a
+            // single statement regardless of how far `with_blocks` got.
+            let cleanup = db_cache.with_blocks(Some(rewind_height + 1), None, |block| {
+                let meta = BlockMeta {
+                    height: block.height(),
+                    block_hash: block.hash(),
+                    block_time: block.time,
+                    sapling_outputs_count: 0,
+                    orchard_actions_count: 0,
+                };
+                match std::fs::remove_file(block_path(wallet_dir, &meta)) {
+                    Ok(()) => Ok(()),
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                    Err(e) => Err(ChainError::<(), _>::BlockSource(FsBlockDbError::Fs(e))),
+                }
+            });
+            match cleanup {
+                Ok(()) => {}
+                // The metadata rows above the rewind height were already removed (per-batch
+                // cleanup keeps files and rows consistent), so `with_blocks` can't find its
+                // `rewind_height + 1` starting row. Nothing left to delete on disk; the
+                // in-flight batch's own files are removed by `delete_cached_blocks` back in
+                // `sync_one_batch`. Fall through to truncate any remaining stale rows.
+                Err(ChainError::BlockSource(FsBlockDbError::CacheMiss(_))) => {}
+                // A metadata row whose backing file is already gone (rows left behind by an
+                // older zecd that removed files but not their `compactblocks_meta` rows). Treat
+                // it as already-cleaned; the truncate below drops the stale row.
+                Err(ChainError::BlockSource(FsBlockDbError::Fs(e)))
+                    if e.kind() == std::io::ErrorKind::NotFound =>
+                {
+                    warn!(
+                        "[{name}] Stale block-cache metadata row had no backing file during \
+                         reorg cleanup; truncating it"
+                    );
+                }
+                Err(e) => return Err(anyhow!("{:?}", e)),
+            }
             db_cache
                 .truncate_to_height(rewind_height)
                 .map_err(|e| anyhow!("{:?}", e))?;
@@ -341,9 +394,10 @@ pub async fn sync_one_batch<C: ChainSource>(
     }
     .await;
 
-    // Remove the downloaded compact blocks whether the scan succeeded or failed, so a transient
-    // error (or a reorg-shifted range) can't strand cache files on disk.
-    delete_cached_blocks(name, wallet_dir, block_meta);
+    // Remove the downloaded compact blocks (files and their metadata rows) whether the scan
+    // succeeded or failed, so a transient error (or a reorg-shifted range) can't strand cache
+    // files on disk or leave stale `compactblocks_meta` rows behind.
+    delete_cached_blocks(name, wallet_dir, db_cache, block_meta);
     result?;
     Ok(true)
 }
@@ -689,5 +743,278 @@ mod tests {
             "unexpected error: {err:#}"
         );
         assert_eq!(max_scanned(&db_data), Some(1), "wallet state untouched");
+    }
+
+    /// `delete_cached_blocks` must drop the batch's `compactblocks_meta` rows along with the
+    /// files. Dropping only the files (the pre-fix behaviour) left a metadata row for every
+    /// scanned height behind forever, so a caught-up node's cache metadata grew without bound
+    /// (finding 3.4).
+    #[test]
+    fn delete_cached_blocks_removes_metadata_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let wd = dir.path();
+        // `init_dbs` also runs `init_blockmeta_db`, creating the `compactblocks_meta` table.
+        let _db_data =
+            crate::wallet::open::init_dbs(crate::network::regtest(), wd).expect("init dbs");
+        let mut db_cache = crate::wallet::open::open_fsblockdb(wd).expect("open cache");
+        std::fs::create_dir_all(wd.join("blocks")).expect("blocks dir");
+
+        // Simulate one downloaded+scanned batch: files on disk + matching metadata rows.
+        let mut prev = fake_hash(0xAA, 0);
+        let mut metas = Vec::new();
+        for h in 1..=5u32 {
+            let hash = fake_hash(0xA1, h);
+            metas.push(write_block(
+                wd,
+                &mut db_cache,
+                h,
+                hash,
+                prev,
+                cmx_bytes(0x0A, h),
+                h,
+            ));
+            prev = hash;
+        }
+        assert_eq!(
+            db_cache.get_max_cached_height().expect("max cached"),
+            Some(BlockHeight::from_u32(5)),
+            "batch metadata present before cleanup"
+        );
+
+        delete_cached_blocks("test", wd, &mut db_cache, metas.clone());
+
+        assert_eq!(
+            db_cache.get_max_cached_height().expect("max cached"),
+            None,
+            "metadata rows removed together with the files (no unbounded growth)"
+        );
+        for m in &metas {
+            assert!(
+                db_cache.find_block(m.height).expect("find_block").is_none(),
+                "metadata row for {:?} gone",
+                m.height
+            );
+            assert!(!block_path(wd, m).exists(), "file for {:?} gone", m.height);
+        }
+    }
+
+    /// The finding's core regression: after normal multi-batch forward sync - where each
+    /// batch's cache files (and now its metadata rows) are removed once scanned - a naturally
+    /// occurring reorg must still recover *in place*. Before the fix the retained, now-fileless
+    /// metadata rows made the rewind's `with_blocks` pass fail with `NotFound` before
+    /// `truncate_to_height` ran, so recovery broke and `compactblocks_meta` was never truncated.
+    #[test]
+    fn reorg_recovers_after_per_batch_cache_deletion() {
+        let net = crate::network::regtest();
+        let dir = tempfile::tempdir().unwrap();
+        let wd = dir.path();
+        let mut db_data = crate::wallet::open::init_dbs(net, wd).expect("init dbs");
+        let mut db_cache = crate::wallet::open::open_fsblockdb(wd).expect("open cache");
+        std::fs::create_dir_all(wd.join("blocks")).expect("blocks dir");
+
+        let genesis = fake_hash(0xAA, 0);
+        let birthday = AccountBirthday::from_parts(
+            ChainState::empty(BlockHeight::from_u32(0), BlockHash(genesis)),
+            None,
+        );
+        db_data
+            .create_account("t", &SecretVec::new(vec![1u8; 64]), &birthday, None)
+            .expect("create account");
+        db_data
+            .update_chain_tip(BlockHeight::from_u32(10))
+            .expect("set tip");
+
+        // Forward-sync chain A one block at a time, deleting each batch's cache after scanning
+        // it (exactly what `sync_one_batch` does) so no block file survives on disk.
+        let mut frontier = OrchardFrontier::empty();
+        let mut frontier_at_1 = OrchardFrontier::empty();
+        let mut prev = genesis;
+        for h in 1..=10u32 {
+            let from = chain_state(h - 1, prev, &frontier);
+            let hash = fake_hash(0xA1, h);
+            let cmx = cmx_bytes(0x0A, h);
+            let meta = write_block(wd, &mut db_cache, h, hash, prev, cmx, h);
+            scan_blocks(
+                "test",
+                &net,
+                wd,
+                &mut db_cache,
+                &mut db_data,
+                &from,
+                &range(h, h + 1),
+            )
+            .expect("scan chain A block");
+            delete_cached_blocks("test", wd, &mut db_cache, vec![meta]);
+            assert!(frontier.append(MerkleHashOrchard::from_cmx(
+                &ExtractedNoteCommitment::from_bytes(&cmx).unwrap()
+            )));
+            if h == 1 {
+                frontier_at_1 = frontier.clone();
+            }
+            prev = hash;
+        }
+        assert_eq!(max_scanned(&db_data), Some(10), "chain A fully scanned");
+        assert_eq!(
+            db_cache.get_max_cached_height().expect("max cached"),
+            None,
+            "block cache metadata does not accumulate across batches"
+        );
+
+        // The reorg: a replacement block 11 whose prev_hash is a *different* block 10.
+        let alien_10 = fake_hash(0xB1, 10);
+        let meta_11 = write_block(
+            wd,
+            &mut db_cache,
+            11,
+            fake_hash(0xB1, 11),
+            alien_10,
+            cmx_bytes(0x0B, 11),
+            11,
+        );
+        let worked = scan_blocks(
+            "test",
+            &net,
+            wd,
+            &mut db_cache,
+            &mut db_data,
+            &ChainState::empty(BlockHeight::from_u32(10), BlockHash(alien_10)),
+            &range(11, 12),
+        )
+        .expect("reorg recovery must succeed even though prior batch files are gone");
+        assert!(worked, "a rewind reports that the scan ranges changed");
+        delete_cached_blocks("test", wd, &mut db_cache, vec![meta_11]);
+
+        // Rewound to 11 - 10 = 1, and the cache metadata was truncated to match (empty, since
+        // block 1's file+row were already removed by its own batch).
+        assert_eq!(
+            max_scanned(&db_data),
+            Some(1),
+            "wallet truncated to the rewind height"
+        );
+        assert_eq!(
+            db_cache.get_max_cached_height().expect("max cached"),
+            None,
+            "cache metadata truncated, not left stale"
+        );
+
+        // The replacement chain B (2..=12, linking from the surviving block 1) scans cleanly.
+        let mut prev = fake_hash(0xA1, 1);
+        for h in 2..=12u32 {
+            let hash = fake_hash(0xB1, h);
+            write_block(wd, &mut db_cache, h, hash, prev, cmx_bytes(0x0B, h), h);
+            prev = hash;
+        }
+        db_data
+            .update_chain_tip(BlockHeight::from_u32(12))
+            .expect("advance tip");
+        scan_blocks(
+            "test",
+            &net,
+            wd,
+            &mut db_cache,
+            &mut db_data,
+            &chain_state(1, fake_hash(0xA1, 1), &frontier_at_1),
+            &range(2, 13),
+        )
+        .expect("scan the replacement chain");
+        assert_eq!(
+            max_scanned(&db_data),
+            Some(12),
+            "recovered past the old tip"
+        );
+    }
+
+    /// Backwards-compatibility for a node upgraded in place: an older zecd left
+    /// `compactblocks_meta` rows whose backing files were already deleted. A reorg must still
+    /// recover - the rewind treats the missing files as already-cleaned and truncates the stale
+    /// rows - instead of failing on `NotFound` before `truncate_to_height` runs.
+    #[test]
+    fn reorg_tolerates_orphaned_metadata_rows() {
+        let net = crate::network::regtest();
+        let dir = tempfile::tempdir().unwrap();
+        let wd = dir.path();
+        let mut db_data = crate::wallet::open::init_dbs(net, wd).expect("init dbs");
+        let mut db_cache = crate::wallet::open::open_fsblockdb(wd).expect("open cache");
+        std::fs::create_dir_all(wd.join("blocks")).expect("blocks dir");
+
+        let genesis = fake_hash(0xAA, 0);
+        let birthday = AccountBirthday::from_parts(
+            ChainState::empty(BlockHeight::from_u32(0), BlockHash(genesis)),
+            None,
+        );
+        db_data
+            .create_account("t", &SecretVec::new(vec![1u8; 64]), &birthday, None)
+            .expect("create account");
+        db_data
+            .update_chain_tip(BlockHeight::from_u32(10))
+            .expect("set tip");
+
+        // Scan chain A 1..=10, then simulate the OLD buggy cleanup: keep every metadata row but
+        // delete the files for heights 2..=10 (the drift the finding is about).
+        let mut frontier = OrchardFrontier::empty();
+        let mut prev = genesis;
+        let mut metas = Vec::new();
+        for h in 1..=10u32 {
+            let from = chain_state(h - 1, prev, &frontier);
+            let hash = fake_hash(0xA1, h);
+            let cmx = cmx_bytes(0x0A, h);
+            metas.push(write_block(wd, &mut db_cache, h, hash, prev, cmx, h));
+            scan_blocks(
+                "test",
+                &net,
+                wd,
+                &mut db_cache,
+                &mut db_data,
+                &from,
+                &range(h, h + 1),
+            )
+            .expect("scan chain A block");
+            assert!(frontier.append(MerkleHashOrchard::from_cmx(
+                &ExtractedNoteCommitment::from_bytes(&cmx).unwrap()
+            )));
+            prev = hash;
+        }
+        for m in &metas[1..] {
+            std::fs::remove_file(block_path(wd, m)).expect("remove stale cache file");
+        }
+        assert_eq!(
+            db_cache.get_max_cached_height().expect("max cached"),
+            Some(BlockHeight::from_u32(10)),
+            "orphaned metadata rows retained, reproducing the drift"
+        );
+
+        // The reorg now drives the rewind over the orphaned rows: it must tolerate the missing
+        // files and still truncate the metadata rather than erroring.
+        let alien_10 = fake_hash(0xB1, 10);
+        write_block(
+            wd,
+            &mut db_cache,
+            11,
+            fake_hash(0xB1, 11),
+            alien_10,
+            cmx_bytes(0x0B, 11),
+            11,
+        );
+        scan_blocks(
+            "test",
+            &net,
+            wd,
+            &mut db_cache,
+            &mut db_data,
+            &ChainState::empty(BlockHeight::from_u32(10), BlockHash(alien_10)),
+            &range(11, 12),
+        )
+        .expect("reorg recovery tolerates orphaned metadata rows");
+
+        assert_eq!(
+            max_scanned(&db_data),
+            Some(1),
+            "wallet truncated to the rewind height"
+        );
+        assert_eq!(
+            db_cache.get_max_cached_height().expect("max cached"),
+            Some(BlockHeight::from_u32(1)),
+            "stale metadata truncated to the rewind height (no longer growing without bound)"
+        );
     }
 }
