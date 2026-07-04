@@ -297,22 +297,28 @@ impl ZebraClient {
             .body(Full::new(Bytes::from(body.to_string())))
             .map_err(CallError::transport)?;
 
-        let response = tokio::time::timeout(REQUEST_TIMEOUT, self.http.request(req))
-            .await
-            .map_err(|_| {
-                CallError::Transport(anyhow!("zebra rpc timed out after {REQUEST_TIMEOUT:?}"))
-            })?
-            .map_err(CallError::transport)?;
+        // One deadline covers the whole round-trip - sending the request, reading the
+        // response headers, *and* draining the body. Timing out only `http.request` leaves a
+        // header-then-stall upstream free to wedge the body read (`Limited::collect`) forever,
+        // which would freeze the sync-batch calls this client serves.
+        let (status, body) = tokio::time::timeout(REQUEST_TIMEOUT, async {
+            let response = self.http.request(req).await.map_err(CallError::transport)?;
+            // RPC-level failures come back with non-200 statuses but still carry the JSON error
+            // envelope (Bitcoin-Core convention), so parse the body regardless of status and
+            // fall back to the status code only when there is no envelope to read.
+            let status = response.status();
+            let body = Limited::new(response.into_body(), MAX_RESPONSE_BYTES)
+                .collect()
+                .await
+                .map_err(|e| CallError::Transport(anyhow!("reading zebra rpc response: {e}")))?
+                .to_bytes();
+            Ok::<_, CallError>((status, body))
+        })
+        .await
+        .map_err(|_| {
+            CallError::Transport(anyhow!("zebra rpc timed out after {REQUEST_TIMEOUT:?}"))
+        })??;
 
-        // RPC-level failures come back with non-200 statuses but still carry the JSON error
-        // envelope (Bitcoin-Core convention), so parse the body regardless of status and
-        // fall back to the status code only when there is no envelope to read.
-        let status = response.status();
-        let body = Limited::new(response.into_body(), MAX_RESPONSE_BYTES)
-            .collect()
-            .await
-            .map_err(|e| CallError::Transport(anyhow!("reading zebra rpc response: {e}")))?
-            .to_bytes();
         let envelope: Value = serde_json::from_slice(&body).map_err(|e| {
             CallError::Transport(anyhow!(
                 "zebra rpc returned non-JSON response (HTTP {status}): {e}"
