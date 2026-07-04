@@ -121,14 +121,28 @@ pub struct TxOutputRecord {
 }
 
 impl TxOutputRecord {
-    /// Whether this output is internal change that the history/detail RPCs hide. True change is
-    /// `is_change` on an output received on a non-external scope (internal/imported/unlinked); a
-    /// payment to one of the wallet's *own* user-facing (external) addresses is a deliberate
-    /// self-send and stays visible - Bitcoin Core surfaces such a self-payment as a send+receive
-    /// pair (and so its memo stays reachable). Filtering on raw `is_change` would wrongly hide
-    /// it, because librustzcash flags self-payments `is_change` too.
+    /// Whether this output is internal change that the history/detail RPCs hide. An output received
+    /// on a **non-external** scope (internal/imported) is change: the BIP-32 internal chain is the
+    /// change chain and is never handed out as a receive address, so an output landing there is
+    /// change by construction. This is the reliable signal for **transparent** change, where
+    /// librustzcash records `is_change = 0` unconditionally (so only the recipient *key scope*
+    /// distinguishes change from a self-send); for shielded change the recorded scope is internal
+    /// too, so the same rule hides it. A payment to one of the wallet's *own* user-facing
+    /// (**external**) addresses is a deliberate self-send and stays visible - Bitcoin Core surfaces
+    /// such a self-payment as a send+receive pair (and so its memo stays reachable). Filtering on
+    /// raw `is_change` would wrongly hide it, because librustzcash flags self-payments `is_change`
+    /// too; conversely it would wrongly *show* transparent change, which never carries `is_change`.
     pub fn is_internal_change(&self) -> bool {
-        self.is_change && self.recipient_key_scope != Some(EXTERNAL_KEY_SCOPE)
+        match self.recipient_key_scope {
+            // External scope (a user-facing receive address): never hidden - a self-send here is a
+            // deliberate, visible payment.
+            Some(EXTERNAL_KEY_SCOPE) => false,
+            // Internal/imported scope: change by construction (covers transparent change, whose
+            // `is_change` flag is always 0, and shielded change alike).
+            Some(_) => true,
+            // No recorded scope (a pure send with no own receiver): fall back to `is_change`.
+            None => self.is_change,
+        }
     }
 }
 

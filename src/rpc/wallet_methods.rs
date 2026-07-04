@@ -1560,15 +1560,18 @@ pub(crate) async fn sendmany(
 
 // ---- Asynchronous operations (zcashd-style `z_sendmany` + `z_getoperation*`) ----
 
-/// Map a zcashd `privacyPolicy` string onto zecd's [`SendPrivacy`] ladder. zecd only ever spends
-/// shielded Orchard notes, so the two leaks it can act on are whether the send crosses the
-/// Sapling↔Orchard turnstile (revealing the *amount*) and whether it pays a transparent recipient
-/// (additionally revealing the *recipient*). These map onto three rungs: `FullPrivacy` (neither),
-/// `AllowRevealedAmounts` (cross-pool only), and `AllowRevealedRecipients` (both). zcashd's
-/// stricter-sender policies (`AllowRevealedSenders` and weaker) differ only in sender-side
-/// leakage, which has no analog here (zecd has no transparent source), so they collapse onto
-/// `AllowRevealedRecipients` - the most a zecd send can reveal. Omitted or `LegacyCompat` fall
-/// back to the wallet's configured `[spend] privacy_policy`; an unknown value is `-8`.
+/// Map a zcashd `privacyPolicy` string onto zecd's [`SendPrivacy`] ladder. zecd spends shielded
+/// Orchard notes (and, opt-in, transparent UTXOs), so the leaks it can act on are whether the send
+/// crosses the Sapling↔Orchard turnstile (revealing the *amount*), whether it pays a transparent
+/// recipient (additionally revealing the *recipient*), and whether it may be funded directly from
+/// transparent UTXOs with kept-transparent change (a fully transparent spend). These map onto four
+/// rungs: `FullPrivacy` (neither shielded leak), `AllowRevealedAmounts` (cross-pool only),
+/// `AllowRevealedRecipients` (both shielded leaks), and `AllowFullyTransparent`/`NoPrivacy` (the
+/// two most-permissive policies, the only ones that also permit a transparent-funded spend).
+/// zcashd's stricter-sender policies (`AllowRevealedSenders` and weaker) differ only in sender-side
+/// leakage, which has no analog here (zecd has no transparent source to reveal), so they collapse
+/// onto `AllowRevealedRecipients`. Omitted or `LegacyCompat` fall back to the wallet's configured
+/// `[spend] privacy_policy`; an unknown value is `-8`.
 fn privacy_from_policy(s: Option<&str>, default: SendPrivacy) -> Result<SendPrivacy, RpcError> {
     match s {
         None | Some("LegacyCompat") => Ok(default),
@@ -1576,9 +1579,10 @@ fn privacy_from_policy(s: Option<&str>, default: SendPrivacy) -> Result<SendPriv
         Some("AllowRevealedAmounts") => Ok(SendPrivacy::AllowRevealedAmounts),
         Some("AllowRevealedRecipients")
         | Some("AllowRevealedSenders")
-        | Some("AllowFullyTransparent")
-        | Some("AllowLinkingAccountAddresses")
-        | Some("NoPrivacy") => Ok(SendPrivacy::AllowRevealedRecipients),
+        | Some("AllowLinkingAccountAddresses") => Ok(SendPrivacy::AllowRevealedRecipients),
+        // The two most-permissive zcashd policies are the only ones that permit funding a send
+        // from transparent UTXOs with kept-transparent change (a fully transparent spend).
+        Some("AllowFullyTransparent") | Some("NoPrivacy") => Ok(SendPrivacy::AllowFullyTransparent),
         Some(other) => Err(RpcError::invalid_parameter(format!(
             "Unknown privacy policy: {other}"
         ))),
@@ -1996,13 +2000,19 @@ mod tests {
         for p in [
             "AllowRevealedRecipients",
             "AllowRevealedSenders",
-            "AllowFullyTransparent",
             "AllowLinkingAccountAddresses",
-            "NoPrivacy",
         ] {
             assert_eq!(
                 privacy_from_policy(Some(p), FullPrivacy).unwrap(),
                 AllowRevealedRecipients,
+                "{p}"
+            );
+        }
+        // The fully-transparent policies map onto AllowFullyTransparent (kept-transparent change).
+        for p in ["AllowFullyTransparent", "NoPrivacy"] {
+            assert_eq!(
+                privacy_from_policy(Some(p), FullPrivacy).unwrap(),
+                AllowFullyTransparent,
                 "{p}"
             );
         }
@@ -2511,6 +2521,47 @@ mod tests {
         assert!(
             tx_entries(&NET, &change, 1, 0, None).is_empty(),
             "internal change stays hidden"
+        );
+    }
+
+    #[test]
+    fn transparent_change_on_internal_scope_is_hidden_without_is_change_flag() {
+        // librustzcash records `is_change = 0` for *all* transparent outputs, so the recipient key
+        // scope is the only signal that distinguishes change from a self-send. A fully-transparent
+        // send routes its change to the wallet's INTERNAL (change) chain; an output received there
+        // is change and must be hidden from history even though `is_change` is false - otherwise
+        // every transparent send would show a phantom self-payment for its change.
+        let transparent_change = TxOutputRecord {
+            pool: 0, // transparent
+            output_index: 1,
+            from_account: Some(uuid::Uuid::new_v4()),
+            to_account: Some(uuid::Uuid::new_v4()),
+            to_address: Some("tmChangeAddr".to_string()),
+            value: 49_990_000,
+            is_change: false, // transparent outputs never carry the is_change flag
+            recipient_key_scope: Some(1), // internal/change scope
+            memo: None,
+        };
+        assert!(
+            transparent_change.is_internal_change(),
+            "an internal-scope transparent output is change"
+        );
+
+        // The same value received on an EXTERNAL transparent address is a deliberate self-send and
+        // stays visible (users must always be able to pay their own addresses).
+        let transparent_self_send = TxOutputRecord {
+            recipient_key_scope: Some(read::EXTERNAL_KEY_SCOPE),
+            ..transparent_change.clone()
+        };
+        assert!(
+            !transparent_self_send.is_internal_change(),
+            "an external-scope transparent self-send stays visible"
+        );
+
+        let t = tx(Some(50), false, Some(10_000), vec![transparent_change]);
+        assert!(
+            tx_entries(&NET, &t, 1, 0, None).is_empty(),
+            "transparent change is hidden from history"
         );
     }
 
