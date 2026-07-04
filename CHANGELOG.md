@@ -5,6 +5,19 @@ All notable changes to zecd are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com), and this
 project adheres to [Semantic Versioning](https://semver.org).
 
+## [0.4.0] - 2026-07-04
+
+### Added
+- Opt-in transparent (t-address) receiving, with restore recovery via a configurable `transparent_gap_limit`.
+- Transparent spending: sends can be funded from transparent UTXOs (auto-shielded through the builder) with ZIP-317 coin selection and exact fees.
+- `transparent_initial_scan` pre-exposure so a stateless restore rediscovers funds sent to high address indices, derived incrementally so a deep scan never freezes the daemon.
+- Transparent mempool and block scanning for transparent receive discovery and 0-conf visibility.
+- Regtest end-to-end coverage for fully-transparent and tri-pool `z_sendmany`.
+
+### Changed
+- `z_sendmany`'s privacy policy gains a fourth rung, `AllowFullyTransparent`, permitting fully-transparent sends; transparent recipients remain rejected under stricter policies.
+- Transparent addresses are always issued as bare t-addresses, never embedded in a unified address.
+
 ## [0.3.2] - 2026-07-03
 
 ### Added
@@ -98,6 +111,7 @@ Zcash, backed entirely by librustzcash and running as a light client.
 ### Security
 - Pre-release audit hardening; refuse to start on mainnet with the placeholder RPC password; enforce a 12-character passphrase minimum.
 
+[0.4.0]: https://github.com/zecrocks/zecd/compare/v0.3.2...v0.4.0
 [0.3.2]: https://github.com/zecrocks/zecd/compare/v0.3.1...v0.3.2
 [0.3.1]: https://github.com/zecrocks/zecd/compare/v0.3.0...v0.3.1
 [0.3.0]: https://github.com/zecrocks/zecd/compare/v0.2.0...v0.3.0
