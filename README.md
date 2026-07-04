@@ -40,8 +40,16 @@ there is no lightwalletd to operate.
 **Run the node yourself.** zecd holds spend authority over real funds; its entire view of the
 chain - balances, confirmations, incoming payments - is whatever zebra serves it. The
 endpoint is deliberately local-only (plaintext HTTP) - never expose a zebra RPC port to the
-network. The [Docker stack](#docker--self-hosted-stack) below runs the full `zebra → zecd`
-pipeline with one compose file.
+network. Because that connection carries the `[zebra]` RPC credentials in cleartext, zecd
+**refuses to send them to a globally-routable host**: a credentialed `zebra://host:port` on a
+public IP fails at startup. Loopback (`127.0.0.1`/`::1`/`localhost`) and, by default,
+private/LAN ranges (RFC1918, container networks) are allowed - so the co-located
+`zebra → zecd` Docker/LAN setup works out of the box. Two `[backend]` knobs adjust the gate:
+set `rfc1918_is_local = false` to tighten it to loopback-only, or `allow_remote_cleartext =
+true` to permit credentials to a public host anyway (only when the hop is secured out-of-band - 
+an SSH/WireGuard tunnel, a private overlay). The
+[Docker stack](#docker--self-hosted-stack) below runs the full `zebra → zecd` pipeline with one
+compose file.
 
 ## Stateless by design
 
@@ -140,6 +148,10 @@ server = "zebra"                 # a local zebrad's JSON-RPC ("zebra" = zebra://
 connect_timeout_secs = 10       # per-attempt dial timeout (so a hung endpoint can't stall sync)
 reconnect_base_secs = 1         # reconnect backoff: base delay (doubles, full jitter)
 reconnect_max_secs = 60         # reconnect backoff: ceiling
+# rfc1918_is_local = true        # treat private/LAN ranges (RFC1918, container nets) as local, so
+                                 #   credentialed connects to them are allowed (false = loopback-only)
+# allow_remote_cleartext = false # send [zebra] credentials over plaintext HTTP to a globally-
+                                 #   routable host (default false; only when secured out-of-band)
 
 [zebra]                          # credentials for the zebra:// endpoint (omit when zebrad has
 # rpc_cookie = "/path/.cookie"   #   `enable_cookie_auth = false`); a cookie wins over user/password

@@ -7,7 +7,7 @@ use std::time::Duration;
 
 use anyhow::anyhow;
 
-use crate::chain::zebra::{ZebraAuth, ZebraSource};
+use crate::chain::zebra::{CleartextPolicy, ZebraAuth, ZebraSource};
 use crate::chain::AnySource;
 use crate::network::ZNetwork;
 
@@ -27,6 +27,9 @@ pub struct Server {
     network: ZNetwork,
     /// zebrad RPC credentials (`[zebra]` config).
     zebra_auth: ZebraAuth,
+    /// Cleartext-credential gate policy for the plaintext zebra connection
+    /// (`[backend] rfc1918_is_local` / `allow_remote_cleartext`).
+    cleartext_policy: CleartextPolicy,
 }
 
 impl Server {
@@ -38,7 +41,13 @@ impl Server {
     /// hung/black-holed endpoint can't stall the caller. The dial is the client construction
     /// (cookie read) plus one `getblockchaininfo` round-trip.
     pub async fn connect_timeout(&self, timeout: Duration) -> anyhow::Result<AnySource> {
-        let connect = ZebraSource::connect(&self.host, self.port, &self.zebra_auth, self.network);
+        let connect = ZebraSource::connect(
+            &self.host,
+            self.port,
+            &self.zebra_auth,
+            self.network,
+            self.cleartext_policy,
+        );
         let source = tokio::time::timeout(timeout, connect)
             .await
             .map_err(|_| anyhow!("connect to {} timed out after {timeout:?}", self.describe()))??;
@@ -58,6 +67,13 @@ pub fn apply_zebra_auth(server: &mut Server, auth: &ZebraAuth) {
     server.zebra_auth = auth.clone();
 }
 
+/// Set the cleartext-credential gate policy on the resolved endpoint (`[backend] rfc1918_is_local`
+/// / `allow_remote_cleartext`). Governs whether the plaintext zebra connection may carry RPC
+/// credentials to a private-network or globally-routable host.
+pub fn apply_cleartext_policy(server: &mut Server, policy: CleartextPolicy) {
+    server.cleartext_policy = policy;
+}
+
 /// Resolve the configured `server` token into a single local zebrad endpoint. Accepted forms:
 /// `zebra` (the default - `127.0.0.1` on the recommended RPC port for the network), or an
 /// explicit `zebra://host:port` / `host:port`.
@@ -72,6 +88,7 @@ pub fn resolve(server: &str, network: ZNetwork) -> anyhow::Result<Server> {
             port,
             network,
             zebra_auth: ZebraAuth::default(),
+            cleartext_policy: CleartextPolicy::default(),
         });
     }
     let rest = server.strip_prefix("zebra://").unwrap_or(server);
@@ -91,6 +108,7 @@ pub fn resolve(server: &str, network: ZNetwork) -> anyhow::Result<Server> {
         port,
         network,
         zebra_auth: ZebraAuth::default(),
+        cleartext_policy: CleartextPolicy::default(),
     })
 }
 
@@ -150,5 +168,54 @@ mod tests {
         };
         apply_zebra_auth(&mut server, &auth);
         assert_eq!(server.zebra_auth, auth);
+    }
+
+    /// End-to-end wiring: the cleartext-credential gate runs inside `ZebraClient::new`, which
+    /// `connect_timeout` reaches *before* any network I/O, so a credentialed globally-routable
+    /// endpoint under the default policy is refused without dialing. Proves the whole chain
+    /// (`resolve` → `apply_zebra_auth` → `apply_cleartext_policy` → `connect_timeout`) honors the
+    /// policy - the unit tests bypass it by calling `ZebraClient::new` directly.
+    #[tokio::test]
+    async fn connect_refuses_credentialed_public_host_without_dialing() {
+        let creds = crate::chain::zebra::ZebraAuth {
+            user: Some("u".into()),
+            password: Some("p".into()),
+            cookie: None,
+        };
+
+        // 203.0.113.0/24 is TEST-NET-3 (RFC 5737) - globally-routable but guaranteed unrouted, so
+        // if the gate *didn't* fire this would hang until the dial timeout rather than pass.
+        let mut server = resolve("zebra://203.0.113.5:8234", ZNetwork::Main).unwrap();
+        apply_zebra_auth(&mut server, &creds);
+        apply_cleartext_policy(&mut server, CleartextPolicy::default());
+        let err = match server.connect_timeout(Duration::from_secs(5)).await {
+            Ok(_) => panic!("credentialed public host must be refused by the gate"),
+            Err(e) => e.to_string(),
+        };
+        assert!(err.contains("cleartext"), "gate error expected, got: {err}");
+        assert!(
+            err.contains("allow_remote_cleartext"),
+            "message should name the override: {err}"
+        );
+
+        // The override lets the same endpoint past the gate (it then fails on the dial, not the
+        // gate) - asserting the policy is actually threaded, not hard-coded.
+        let mut allowed = resolve("zebra://203.0.113.5:8234", ZNetwork::Main).unwrap();
+        apply_zebra_auth(&mut allowed, &creds);
+        apply_cleartext_policy(
+            &mut allowed,
+            CleartextPolicy {
+                rfc1918_is_local: true,
+                allow_remote_cleartext: true,
+            },
+        );
+        let err = match allowed.connect_timeout(Duration::from_millis(200)).await {
+            Ok(_) => panic!("unrouted host cannot actually complete the dial"),
+            Err(e) => e.to_string(),
+        };
+        assert!(
+            !err.contains("cleartext"),
+            "override must bypass the gate, got: {err}"
+        );
     }
 }

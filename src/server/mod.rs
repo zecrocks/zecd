@@ -254,6 +254,8 @@ mod tests {
                 connect_timeout_secs: 10,
                 reconnect_base_secs: 1,
                 reconnect_max_secs: 60,
+                rfc1918_is_local: true,
+                allow_remote_cleartext: false,
             },
             zebra: Default::default(),
             rpc: rpc.clone(),

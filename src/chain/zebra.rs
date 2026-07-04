@@ -24,9 +24,13 @@
 //! from the `trees` field of `getblock verbosity=1`, exactly as lightwalletd obtains them.
 //!
 //! Scope: a zebra endpoint is for a **local node** - connections are plaintext HTTP with
-//! optional cookie/basic auth. Genesis is never requested (no scan range starts there and
-//! tree-state requests are clamped to height ≥ 1), which matches `Block::read`'s genesis
-//! limitation.
+//! optional cookie/basic auth. Because the auth header would otherwise cross the network in
+//! cleartext, [`ZebraClient::new`] gates credentialed connections behind a locality check (see
+//! [`host_is_local`] / [`CleartextPolicy`]): loopback and - by default - private/LAN ranges are
+//! allowed, but a credentialed connect to a globally-routable host is refused unless the operator
+//! opts in via `[backend] allow_remote_cleartext`. Genesis is never requested (no scan range
+//! starts there and tree-state requests are clamped to height ≥ 1), which matches `Block::read`'s
+//! genesis limitation.
 
 use std::collections::HashSet;
 use std::path::PathBuf;
@@ -151,17 +155,132 @@ pub struct ZebraClient {
     auth_header: Option<String>,
 }
 
+/// Policy for the plaintext zebra connection's cleartext-credential gate. The zebra RPC is
+/// plaintext HTTP, so putting the `Authorization` header on the wire to a host off the local
+/// machine risks leaking spend-authority credentials to an eavesdropper.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CleartextPolicy {
+    /// Treat private / non-globally-routable addresses (RFC1918 `10/172.16/192.168`, link-local,
+    /// CGNAT `100.64/10`, IPv6 unique-local `fc00::/7` and link-local `fe80::/10`) as "local", so
+    /// a credentialed connect to a container/LAN zebra is allowed without an override. Default
+    /// `true` (matches the self-hosted `zebra → zecd` Docker/LAN norm); set `false` for a strict
+    /// loopback-only posture. `[backend] rfc1918_is_local`.
+    pub rfc1918_is_local: bool,
+    /// Allow credentials over cleartext to *any* host, including globally-routable ones - the
+    /// escape hatch when the hop is secured out-of-band (SSH/WireGuard tunnel, private overlay).
+    /// Default `false`. `[backend] allow_remote_cleartext`.
+    pub allow_remote_cleartext: bool,
+}
+
+impl Default for CleartextPolicy {
+    fn default() -> Self {
+        CleartextPolicy {
+            rfc1918_is_local: true,
+            allow_remote_cleartext: false,
+        }
+    }
+}
+
+/// Parse `host` as an IP literal, accepting an IPv6 literal in URL bracket form (`[::1]`) as
+/// well as bare (`::1`). Returns `None` for a hostname (no DNS lookup - the gate fails closed).
+fn parse_host_ip(host: &str) -> Option<std::net::IpAddr> {
+    let bare = host
+        .strip_prefix('[')
+        .and_then(|h| h.strip_suffix(']'))
+        .unwrap_or(host);
+    bare.parse().ok()
+}
+
+/// Is `host` a loopback address (an IP literal that `is_loopback()`, or the name `localhost`)?
+/// Hostnames other than `localhost` are treated as non-loopback without a DNS lookup.
+fn host_is_loopback(host: &str) -> bool {
+    match parse_host_ip(host) {
+        Some(ip) => ip.is_loopback(),
+        None => host.eq_ignore_ascii_case("localhost"),
+    }
+}
+
+/// Does `host` sit on the local machine or a private / non-globally-routable network, keeping the
+/// plaintext zebra connection off the public internet? Loopback and `localhost` always qualify;
+/// private ranges qualify only when `rfc1918_is_local` is set (see [`CleartextPolicy`]). A
+/// globally-routable host never qualifies, so credentials there would cross the internet in the
+/// clear - that is what the gate refuses. A hostname other than `localhost` is treated as
+/// non-local (no DNS lookup - fail closed).
+fn host_is_local(host: &str, rfc1918_is_local: bool) -> bool {
+    match parse_host_ip(host) {
+        Some(ip) => ip.is_loopback() || (rfc1918_is_local && ip_is_private_network(ip)),
+        None => host.eq_ignore_ascii_case("localhost"),
+    }
+}
+
+/// Is `ip` in a private / non-globally-routable range (as opposed to loopback, handled by the
+/// caller, or a globally-routable public address)?
+fn ip_is_private_network(ip: std::net::IpAddr) -> bool {
+    use std::net::IpAddr;
+    match ip {
+        IpAddr::V4(v4) => ipv4_is_private_network(v4),
+        // An IPv4-mapped IPv6 address (`::ffff:a.b.c.d`) inherits the mapped v4's class.
+        IpAddr::V6(v6) => match v6.to_ipv4_mapped() {
+            Some(mapped) => ipv4_is_private_network(mapped),
+            None => {
+                let seg0 = v6.segments()[0];
+                (seg0 & 0xfe00) == 0xfc00 // unique local fc00::/7
+                    || (seg0 & 0xffc0) == 0xfe80 // link-local fe80::/10
+            }
+        },
+    }
+}
+
+fn ipv4_is_private_network(ip: std::net::Ipv4Addr) -> bool {
+    let [a, b, ..] = ip.octets();
+    ip.is_private()      // RFC1918 10/8, 172.16/12, 192.168/16
+        || ip.is_link_local() // 169.254/16
+        // CGNAT 100.64.0.0/10 (RFC 6598) - non-globally-routable, not covered by is_private().
+        || (a == 100 && (64..=127).contains(&b))
+}
+
 impl ZebraClient {
     /// Build a client for `http://host:port/`. The auth header is resolved here (cookie
     /// read once per connect) so a bad credential setup fails at connect time.
-    pub fn new(host: &str, port: u16, auth: &ZebraAuth) -> anyhow::Result<ZebraClient> {
+    ///
+    /// Cleartext-credential gate: the connection is plaintext HTTP (a zebra endpoint is a local
+    /// node by design), so sending RPC credentials to a host off the local machine would leak
+    /// them. When credentials are configured for a host that isn't [`host_is_local`] under
+    /// `policy`, we refuse the connect unless `policy.allow_remote_cleartext` is set. Private/LAN
+    /// ranges count as local by default (`policy.rfc1918_is_local`); loopback always does.
+    pub fn new(
+        host: &str,
+        port: u16,
+        auth: &ZebraAuth,
+        policy: CleartextPolicy,
+    ) -> anyhow::Result<ZebraClient> {
         let url: hyper::Uri = format!("http://{host}:{port}/")
             .parse()
             .with_context(|| format!("invalid zebra rpc address {host}:{port}"))?;
+        let auth_header = auth.header()?;
+        if auth_header.is_some()
+            && !host_is_local(host, policy.rfc1918_is_local)
+            && !policy.allow_remote_cleartext
+        {
+            bail!(
+                "refusing to send zebra RPC credentials in cleartext to the globally-routable \
+                 host '{host}': the zebra connection is plaintext HTTP, so the Authorization \
+                 header would cross the public internet in the clear. Point zecd at a loopback or \
+                 private-network zebra (127.0.0.1/localhost, an RFC1918/container address), tunnel \
+                 the RPC port over SSH/WireGuard and use the local end, or set `[backend] \
+                 allow_remote_cleartext = true` if the hop is already secured."
+            );
+        }
+        if !host_is_loopback(host) {
+            tracing::warn!(
+                host,
+                "zebra endpoint is non-loopback: JSON-RPC traffic is plaintext HTTP"
+            );
+        }
         Ok(ZebraClient {
             http: HyperClient::builder(TokioExecutor::new()).build(HttpConnector::new()),
             url,
-            auth_header: auth.header()?,
+            auth_header,
         })
     }
 
@@ -372,8 +491,9 @@ impl ZebraSource {
         port: u16,
         auth: &ZebraAuth,
         network: ZNetwork,
+        policy: CleartextPolicy,
     ) -> anyhow::Result<ZebraSource> {
-        let client = ZebraClient::new(host, port, auth)?;
+        let client = ZebraClient::new(host, port, auth, policy)?;
         let info = client.blockchain_info().await?;
         Ok(ZebraSource {
             client,
@@ -721,6 +841,149 @@ mod tests {
     use axum::routing::post;
     use axum::{Json, Router};
 
+    #[test]
+    fn host_is_loopback_classifies_local_and_remote() {
+        // Loopback IP literals (v4 whole /8, v6, and URL-bracketed v6) and the name `localhost`.
+        for h in [
+            "127.0.0.1",
+            "127.5.6.7",
+            "::1",
+            "[::1]",
+            "localhost",
+            "LocalHost",
+        ] {
+            assert!(host_is_loopback(h), "{h} should be loopback");
+        }
+        // Anything routable, or a hostname other than `localhost`, is treated as remote.
+        for h in [
+            "10.0.0.5",
+            "192.168.1.2",
+            "0.0.0.0",
+            "zebra.internal",
+            "example.com",
+        ] {
+            assert!(!host_is_loopback(h), "{h} should be non-loopback");
+        }
+    }
+
+    #[test]
+    fn host_is_local_classifies_private_and_public() {
+        // Loopback + private/non-routable ranges count as local when rfc1918_is_local is on.
+        for h in [
+            "127.0.0.1",
+            "localhost",
+            "10.0.0.5",
+            "172.16.0.1",
+            "172.31.255.255",
+            "172.18.0.2", // a typical Docker user-bridge address
+            "192.168.1.2",
+            "169.254.7.7", // link-local
+            "100.64.0.1",  // CGNAT (RFC 6598)
+            "::1",
+            "[fc00::1]",       // IPv6 unique-local
+            "fe80::1",         // IPv6 link-local
+            "::ffff:10.0.0.5", // IPv4-mapped private v6
+        ] {
+            assert!(host_is_local(h, true), "{h} should be local");
+        }
+        // Globally-routable hosts, and hostnames other than `localhost`, are never local.
+        for h in [
+            "203.0.113.5", // TEST-NET-3, stands in for a public IP
+            "8.8.8.8",
+            "172.32.0.1",   // just outside the 172.16/12 block
+            "100.128.0.1",  // just outside CGNAT 100.64/10
+            "2606:4700::1", // public v6
+            "zebra.internal",
+            "example.com",
+        ] {
+            assert!(!host_is_local(h, true), "{h} should be non-local");
+        }
+        // With rfc1918_is_local off, only loopback stays local - private ranges are treated as
+        // remote (the strict posture).
+        assert!(host_is_local("127.0.0.1", false));
+        assert!(host_is_local("localhost", false));
+        assert!(!host_is_local("10.0.0.5", false));
+        assert!(!host_is_local("192.168.1.2", false));
+    }
+
+    fn creds() -> ZebraAuth {
+        ZebraAuth {
+            user: Some("u".into()),
+            password: Some("p".into()),
+            cookie: None,
+        }
+    }
+
+    /// Default policy: private ranges are local, no remote override.
+    fn default_policy() -> CleartextPolicy {
+        CleartextPolicy::default()
+    }
+
+    #[test]
+    fn client_refuses_cleartext_credentials_to_public_host() {
+        let err = match ZebraClient::new("203.0.113.5", 8234, &creds(), default_policy()) {
+            Ok(_) => panic!("credentialed public connect must be refused"),
+            Err(e) => e.to_string(),
+        };
+        assert!(
+            err.contains("cleartext"),
+            "message should explain why: {err}"
+        );
+        assert!(
+            err.contains("allow_remote_cleartext"),
+            "message should name the override: {err}"
+        );
+    }
+
+    #[test]
+    fn client_allows_credentials_to_loopback_and_private_hosts() {
+        // Loopback never leaves the machine; private/LAN ranges are allowed by default.
+        for h in [
+            "127.0.0.1",
+            "localhost",
+            "10.0.0.5",
+            "172.18.0.2",
+            "192.168.1.2",
+        ] {
+            assert!(
+                ZebraClient::new(h, 8234, &creds(), default_policy()).is_ok(),
+                "{h} should be allowed under the default policy"
+            );
+        }
+    }
+
+    #[test]
+    fn client_refuses_private_host_under_strict_loopback_policy() {
+        // rfc1918_is_local = false tightens the gate to loopback-only.
+        let strict = CleartextPolicy {
+            rfc1918_is_local: false,
+            allow_remote_cleartext: false,
+        };
+        assert!(ZebraClient::new("10.0.0.5", 8234, &creds(), strict).is_err());
+        assert!(ZebraClient::new("127.0.0.1", 8234, &creds(), strict).is_ok());
+    }
+
+    #[test]
+    fn client_allows_credentials_to_public_host_when_opted_in() {
+        let allow = CleartextPolicy {
+            rfc1918_is_local: true,
+            allow_remote_cleartext: true,
+        };
+        assert!(
+            ZebraClient::new("203.0.113.5", 8234, &creds(), allow).is_ok(),
+            "explicit allow_remote_cleartext override"
+        );
+    }
+
+    #[test]
+    fn client_allows_unauthenticated_public_connect() {
+        // No credentials to leak, so the gate does not apply (traffic is still public chain data).
+        assert!(
+            ZebraClient::new("203.0.113.5", 8234, &ZebraAuth::default(), default_policy()).is_ok(),
+            "no-auth remote connect is allowed"
+        );
+    }
+
     /// Real mainnet block 415000 (the `zcash_primitives` test vector): one transparent-only
     /// coinbase transaction, Overwinter era. Ground truth (independent, from block
     /// explorers): hash `0000000001ab37793ce771262b2ffa082519aa3fe891250a1adb43baaf856168`,
@@ -870,6 +1133,7 @@ mod tests {
             addr.port(),
             &ZebraAuth::default(),
             ZNetwork::Main,
+            CleartextPolicy::default(),
         )
         .await
         .expect("connect to fake zebrad")
@@ -952,10 +1216,15 @@ mod tests {
             password: Some("p".into()),
             cookie: None,
         };
-        let mut src =
-            ZebraSource::connect(&addr.ip().to_string(), addr.port(), &auth, ZNetwork::Main)
-                .await
-                .unwrap();
+        let mut src = ZebraSource::connect(
+            &addr.ip().to_string(),
+            addr.port(),
+            &auth,
+            ZNetwork::Main,
+            CleartextPolicy::default(),
+        )
+        .await
+        .unwrap();
         src.latest_block().await.unwrap();
         let expected = format!(
             "Basic {}",
@@ -979,10 +1248,15 @@ mod tests {
             password: None,
             cookie: Some(cookie),
         };
-        let mut src =
-            ZebraSource::connect(&addr2.ip().to_string(), addr2.port(), &auth, ZNetwork::Main)
-                .await
-                .unwrap();
+        let mut src = ZebraSource::connect(
+            &addr2.ip().to_string(),
+            addr2.port(),
+            &auth,
+            ZNetwork::Main,
+            CleartextPolicy::default(),
+        )
+        .await
+        .unwrap();
         src.latest_block().await.unwrap();
         let expected = format!(
             "Basic {}",

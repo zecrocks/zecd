@@ -198,6 +198,17 @@ pub struct BackendConfig {
     pub reconnect_base_secs: u64,
     /// Reconnect backoff maximum delay (seconds).
     pub reconnect_max_secs: u64,
+    /// Treat private / non-globally-routable ranges (RFC1918, link-local, CGNAT, IPv6 unique-local
+    /// and link-local) as "local" for the cleartext-credential gate, so a credentialed connect to
+    /// a container/LAN zebra is allowed without an override. Default `true` (the self-hosted
+    /// `zebra → zecd` Docker/LAN norm); set `false` for a strict loopback-only posture.
+    pub rfc1918_is_local: bool,
+    /// Escape hatch for the cleartext-credential gate: allow the (plaintext) zebra connection to
+    /// carry RPC credentials to *any* host, including globally-routable ones. Off by default; the
+    /// gate otherwise refuses a globally-routable host, since the credentials travel in cleartext.
+    /// Set this only when the hop to a remote zebra is secured out-of-band (SSH/WireGuard tunnel,
+    /// private overlay).
+    pub allow_remote_cleartext: bool,
 }
 
 /// `[zebra]` - credentials for the `zebra://host:port` endpoint (direct-to-zebrad mode).
@@ -453,6 +464,8 @@ struct BackendFile {
     connect_timeout_secs: Option<u64>,
     reconnect_base_secs: Option<u64>,
     reconnect_max_secs: Option<u64>,
+    rfc1918_is_local: Option<bool>,
+    allow_remote_cleartext: Option<bool>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -761,6 +774,8 @@ impl AppConfig {
             connect_timeout_secs: None,
             reconnect_base_secs: None,
             reconnect_max_secs: None,
+            rfc1918_is_local: None,
+            allow_remote_cleartext: None,
         });
         let server = select_server_token(cli.server.clone(), backend_file.server);
         let reconnect_base_secs = backend_file.reconnect_base_secs.unwrap_or(1).max(1);
@@ -772,6 +787,8 @@ impl AppConfig {
                 .reconnect_max_secs
                 .unwrap_or(60)
                 .max(reconnect_base_secs),
+            rfc1918_is_local: backend_file.rfc1918_is_local.unwrap_or(true),
+            allow_remote_cleartext: backend_file.allow_remote_cleartext.unwrap_or(false),
         };
 
         let zebra_file = file.zebra.unwrap_or_default();
@@ -1224,6 +1241,14 @@ mod tests {
         assert_eq!(f.connect_timeout_secs, Some(5));
         assert_eq!(f.reconnect_base_secs, Some(2));
         assert_eq!(f.reconnect_max_secs, Some(30));
+        // The cleartext-gate knobs default to unset (→ rfc1918_is_local true, remote override
+        // false) and parse when present.
+        assert_eq!(f.rfc1918_is_local, None);
+        assert_eq!(f.allow_remote_cleartext, None);
+        let f: BackendFile =
+            toml::from_str("rfc1918_is_local = false\nallow_remote_cleartext = true").unwrap();
+        assert_eq!(f.rfc1918_is_local, Some(false));
+        assert_eq!(f.allow_remote_cleartext, Some(true));
     }
 
     #[test]
@@ -1279,6 +1304,30 @@ mod tests {
         ]);
         let cfg = AppConfig::resolve(&cli).unwrap();
         assert_eq!(cfg.datadir, PathBuf::from("/tmp/zecd-from-cli"));
+    }
+
+    #[test]
+    fn cleartext_gate_defaults_and_overrides_resolve() {
+        use clap::Parser as _;
+        // Security-critical defaults: an absent [backend] resolves to rfc1918_is_local = true
+        // (private/LAN self-hosting works) and allow_remote_cleartext = false (no public leak).
+        let cli = Cli::parse_from(["zecd"]);
+        let cfg = AppConfig::resolve(&cli).unwrap();
+        assert!(cfg.backend.rfc1918_is_local);
+        assert!(!cfg.backend.allow_remote_cleartext);
+
+        // Both knobs are honored from the file.
+        let dir = tempfile::tempdir().unwrap();
+        let conf = dir.path().join("zecd.toml");
+        std::fs::write(
+            &conf,
+            "[backend]\nrfc1918_is_local = false\nallow_remote_cleartext = true\n",
+        )
+        .unwrap();
+        let cli = Cli::parse_from(["zecd", "--conf", conf.to_str().unwrap()]);
+        let cfg = AppConfig::resolve(&cli).unwrap();
+        assert!(!cfg.backend.rfc1918_is_local);
+        assert!(cfg.backend.allow_remote_cleartext);
     }
 
     #[test]
