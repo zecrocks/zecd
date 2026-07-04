@@ -1689,17 +1689,39 @@ impl WalletActor {
             }
         }
         let end = depth.min(start.saturating_add(TRANSPARENT_PREEXPOSE_CHUNK));
-        for i in start..end {
-            let div = DiversifierIndex::from(i);
-            if let Err(e) = self.db_data.get_address_for_index(account_id, div, request) {
-                warn!(
-                    "[{}] transparent initial sync failed at index {i}: {e}",
-                    self.name
-                );
-                // Stop attempting this process so we don't spin re-hitting the same index every
-                // pass; the window is left partially exposed (recoverable on a later restart).
-                return false;
-            }
+        // Deriving a chunk of diversified addresses is CPU-bound (FF1 + key derivation per index)
+        // and DB-bound (an upsert per index). Two things keep it from freezing the daemon for the
+        // whole multi-minute window - #81 chunked the work but still ran each chunk *synchronously*
+        // on the actor's runtime worker, so read RPCs still stalled (see the regression guard in
+        // `regtest_transparent_preexpose_responsive.rs`):
+        //   * `block_in_place` tells tokio to relocate the other tasks on this worker to a sibling
+        //     thread for the duration of the burst - exactly as the block scan does - so read RPCs
+        //     (which bypass the actor on their own short-lived SQLite connections) keep getting
+        //     scheduled; and
+        //   * `transactionally` batches the whole chunk into a single SQLite transaction, so we pay
+        //     one commit per chunk instead of one per address - which both cuts the wall-clock and
+        //     avoids the WAL churn that would otherwise slow fresh read connections.
+        // The chunk boundary in `sync_step` then yields to the runtime so the actor task actually
+        // suspends between chunks rather than tight-looping through them synchronously.
+        let derived = tokio::task::block_in_place(|| {
+            self.db_data
+                .transactionally::<_, _, SqliteClientError>(|wdb| {
+                    for i in start..end {
+                        let div = DiversifierIndex::from(i);
+                        wdb.get_address_for_index(account_id, div, request)?;
+                    }
+                    Ok(())
+                })
+        });
+        if let Err(e) = derived {
+            warn!(
+                "[{}] transparent initial sync failed in [{start}, {end}): {e}",
+                self.name
+            );
+            // Stop attempting this process so we don't spin re-hitting the same chunk every pass;
+            // the transaction rolled back, so the window stays exposed up to `start` and a later
+            // restart resumes there via `next_unexposed_external_index`.
+            return false;
         }
         if let Some(p) = self.transparent_preexpose.as_mut() {
             p.done = end;
@@ -1954,6 +1976,13 @@ impl WalletActor {
                 self.transparent_set_dirty = true;
                 if more {
                     self.update_status();
+                    // Make the chunk boundary a real runtime yield, not just an actor-loop return:
+                    // during pre-exposure neither the loop's `try_recv` nor `sync_step` hit a pending
+                    // await, so without this the actor task would poll straight into the next chunk
+                    // and never suspend - monopolizing its worker for the whole window. Yielding hands
+                    // control back to the scheduler each chunk so other tasks (and queued commands on
+                    // the next loop turn) get a window.
+                    tokio::task::yield_now().await;
                     return Ok(true);
                 }
                 self.transparent_preexposed = true;
