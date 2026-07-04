@@ -6,7 +6,9 @@ name: CI
 
 on:
   push:
-    branches: [main, master, "feature/**"]
+    # Mainline only: feature branches (incl. feature/**) are covered by the pull_request trigger
+    # below, so listing them here too would run every job twice on a PR push.
+    branches: [main, master]
     # Skip the Rust build/test/clippy/deny/msrv tier for changes that can't affect it:
     # docs, deploy samples, the release/docker/regtest workflows, the Dockerfiles, and the
     # release packaging script. (Editing ci.yml itself still runs - it's not ignored.)

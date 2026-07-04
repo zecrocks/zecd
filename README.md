@@ -487,6 +487,8 @@ transparent = true             # additionally allow bare t-addresses (receive; o
 transparent_default = false    # if true, no-arg getnewaddress returns a t-address instead of a UA
 # transparent_gap_limit = 20         # restore-recovery window (see the caveat below)
 # transparent_initial_scan = 0       # pre-expose external indices 0..N (see below)
+# transparent_allow_beyond_recovery_window = true   # issue past the window (warn) vs fail closed
+# transparent_gap_warn_threshold = 5                # warn when this few in-window slots remain
 ```
 
 With `transparent = true`, `getnewaddress "" "transparent"` returns a **bare transparent address**
@@ -541,6 +543,17 @@ the receive scan covers all of them - while keeping `transparent_gap_limit` smal
 Set `N` to your issuance high-water mark. When transparent receiving is on, `getwalletinfo` reports a
 `transparent` block (`enabled`/`default`/`gap_limit`) and the daemon logs the effective gap limit and
 initial scan depth at startup, so you can audit coverage against that high-water mark.
+
+**At the edge of the window - `transparent_allow_beyond_recovery_window` / `transparent_gap_warn_threshold`.**
+librustzcash refuses to allocate a transparent receiving address once the recovery window is full
+(the gap limit reached with everything unfunded), precisely because a from-seed restore could not
+rediscover funds sent there. By default (`transparent_allow_beyond_recovery_window = true`) zecd
+issues the address anyway and logs a loud warning that funds received there may be **unrecoverable
+from seed**; set it `false` to instead **fail the `getnewaddress` call** with an actionable error
+(fail-closed). Independently, zecd warns as you approach the limit - once fewer than
+`transparent_gap_warn_threshold` (default 5) in-window address slots remain - and on startup if a
+wallet is already at/over the window, so you can widen `transparent_gap_limit` /
+`transparent_initial_scan` (or get a lower index funded) before addresses start landing outside it.
 
 Balances, `listtransactions`, `listunspent`, `getreceivedbyaddress`, and friends report notes and
 transparent UTXOs across **all** enabled pools. `validateaddress`/`getaddressinfo` report each address's receivers

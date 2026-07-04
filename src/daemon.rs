@@ -137,6 +137,9 @@ pub async fn run(config: AppConfig) -> anyhow::Result<()> {
             transparent_default: entry.transparent_default,
             transparent_gap_limit: entry.transparent_gap_limit,
             transparent_initial_scan: entry.transparent_initial_scan,
+            transparent_allow_beyond_recovery_window: entry
+                .transparent_allow_beyond_recovery_window,
+            transparent_gap_warn_threshold: entry.transparent_gap_warn_threshold,
             shutdown: shutdown_tx.subscribe(),
         };
         match actor::spawn(actor_cfg).await {

@@ -204,6 +204,22 @@ default_receivers = ["orchard"]
 # while transparent_gap_limit stays small for steady-state. Set N to your issuance high-water mark
 # (e.g. an exchange that assigns 10000 customer addresses sets transparent_initial_scan = 10000).
 # transparent_initial_scan = 0
+#
+# transparent_allow_beyond_recovery_window (default true) controls what getnewaddress "" "transparent"
+# does once the recovery window is full - i.e. after transparent_gap_limit consecutive UNFUNDED
+# addresses (above the transparent_initial_scan floor) have been handed out. librustzcash itself
+# refuses to allocate past this point, because a from-seed restore could not rediscover funds sent to
+# such an address. The default (true) issues the address anyway and logs a loud warning that funds
+# received there may be UNRECOVERABLE from seed. Set it to false to instead FAIL the call with an
+# actionable error - fail-closed, so funds can never land on an unrecoverable address. Either way,
+# widen transparent_gap_limit / transparent_initial_scan (or get a lower index funded) to move the
+# window forward.
+# transparent_allow_beyond_recovery_window = true
+#
+# transparent_gap_warn_threshold (default 5) - getnewaddress logs a warning once fewer than this many
+# in-window address slots remain, giving you lead time to widen the limits before addresses start
+# landing outside the recovery window.
+# transparent_gap_warn_threshold = 5
 
 [sync]
 # How often to poll zebra for new blocks (seconds).

@@ -246,6 +246,12 @@ pub struct ActorConfig {
     /// receive scan covers them, independent of the gap limit. `0` = off. Only used when
     /// `transparent_enabled`.
     pub transparent_initial_scan: u32,
+    /// Whether `getnewaddress` may issue transparent addresses past the recovery window (warn-only);
+    /// `false` fails the call with an actionable error instead. Only used when `transparent_enabled`.
+    pub transparent_allow_beyond_recovery_window: bool,
+    /// Warn when fewer than this many in-window transparent address slots remain. Only used when
+    /// `transparent_enabled`.
+    pub transparent_gap_warn_threshold: u32,
     /// Flips to `true` on Ctrl-C/`stop`; the actor exits its loop (between sync batches)
     /// so the `WalletDb` is dropped cleanly before the process ends.
     pub shutdown: watch::Receiver<bool>,
@@ -280,6 +286,12 @@ struct WalletActor {
     /// Initial transparent scan depth: pre-expose external indices `0..N` once so the receive
     /// scan covers them. `0` = off.
     transparent_initial_scan: u32,
+    /// Whether `getnewaddress` may issue transparent addresses past the recovery window (warn-only);
+    /// `false` fails the call with an actionable error instead.
+    transparent_allow_beyond_recovery_window: bool,
+    /// Warn when fewer than this many in-window transparent address slots remain before generation
+    /// would hit the gap limit.
+    transparent_gap_warn_threshold: u32,
     /// Receive-discovery throttle (transient - rebuilt on restart, like sync progress; respects the
     /// stateless invariant). librustzcash never asks us to scan our *receiving* transparent
     /// addresses for incoming funds (only to find spends of UTXOs we already hold), so zecd owns
@@ -606,6 +618,8 @@ pub async fn spawn(
         transparent_enabled: cfg.transparent_enabled,
         transparent_default: cfg.transparent_default,
         transparent_initial_scan: cfg.transparent_initial_scan,
+        transparent_allow_beyond_recovery_window: cfg.transparent_allow_beyond_recovery_window,
+        transparent_gap_warn_threshold: cfg.transparent_gap_warn_threshold,
         transparent_last_scan: None,
         transparent_preexposed: false,
         first_seen: first_seen.clone(),
@@ -902,6 +916,24 @@ fn map_address_for_index_error(e: SqliteClientError) -> RpcError {
         )),
         other => RpcError::wallet(format!("address generation failed: {other}")),
     }
+}
+
+/// Extract the bare transparent receiver from a UA derived for a transparent-requiring request.
+/// The request always requires a p2pkh receiver, so this is normally infallible; a `None` means
+/// the account's viewing key unexpectedly lacks a transparent receiver.
+fn transparent_receiver(
+    ua: &zcash_keys::address::UnifiedAddress,
+) -> Result<TransparentAddress, RpcError> {
+    ua.transparent().copied().ok_or_else(|| {
+        RpcError::wallet("derived address unexpectedly has no transparent receiver".to_string())
+    })
+}
+
+/// In-window transparent address slots remaining before `getnewaddress` would hit the gap limit,
+/// given an address at `gap_position` within a gap of size `gap_limit`. Matches librustzcash's
+/// `GapMetadata::InGap` accounting: `gap_limit - (gap_position + 1)`.
+fn gap_slots_remaining(gap_position: u32, gap_limit: u32) -> u32 {
+    gap_limit.saturating_sub(gap_position.saturating_add(1))
 }
 
 /// Render a tree-state frontier (the hex-encoded `final_state` from a `tree_state` reply) for
@@ -1501,6 +1533,9 @@ impl WalletActor {
         if !self.transparent_preexposed {
             self.preexpose_transparent(account_id);
             self.transparent_preexposed = true;
+            // Startup audit: if the wallet already sits near/over the recovery window (e.g. many
+            // addresses handed out ahead of funding, carried across a restart), warn once.
+            self.audit_transparent_recovery_window(account_id);
         }
 
         // Exposed transparent receivers (external + internal/change).
@@ -2263,22 +2298,158 @@ impl WalletActor {
         }
         let account_id = self.require_account()?;
         let request = crate::pools::transparent_extraction_request();
-        let (ua, _) = self
+        match self.db_data.get_next_available_address(account_id, request) {
+            Ok(Some((ua, _))) => {
+                let taddr = transparent_receiver(&ua)?;
+                self.warn_if_gap_low(account_id, &taddr);
+                use zcash_keys::encoding::AddressCodec as _;
+                Ok(taddr.encode(&self.network))
+            }
+            Ok(None) => Err(RpcError::wallet(
+                "no transparent address available for account; the account's viewing key may \
+                 not support a transparent receiver"
+                    .to_string(),
+            )),
+            // librustzcash fails closed once the recovery window (`gap_limit` consecutive unfunded
+            // addresses) is full. With the operator's opt-in we issue past it anyway, warning that
+            // such an address may be unrecoverable from seed; otherwise surface an actionable error.
+            Err(SqliteClientError::ReachedGapLimit(..))
+                if self.transparent_allow_beyond_recovery_window =>
+            {
+                self.new_transparent_address_beyond_gap(account_id)
+            }
+            Err(SqliteClientError::ReachedGapLimit(..)) => Err(RpcError::wallet(
+                "transparent address gap limit reached: the recovery window is full of unfunded \
+                 addresses, so no new address is recoverable from seed. Increase [pools] \
+                 transparent_gap_limit and/or transparent_initial_scan, fund a lower-index \
+                 address, or set transparent_allow_beyond_recovery_window = true to issue beyond \
+                 the window anyway."
+                    .to_string(),
+            )),
+            Err(e) => Err(RpcError::wallet(format!("address generation failed: {e}"))),
+        }
+    }
+
+    /// Issue a transparent receiving address **beyond** the recovery window, used when
+    /// `get_next_available_address` hit the gap limit and the operator has opted in via
+    /// `transparent_allow_beyond_recovery_window`. librustzcash's gap reservation refuses such an
+    /// address, so we expose the next sequential external index directly via `get_address_for_index`
+    /// (the same primitive `preexpose_transparent` uses). An address at an index a from-seed restore
+    /// won't re-expose (i.e. `>= transparent_initial_scan`, with no nearby funding to extend the
+    /// gap) may be unrecoverable, so it is warned about loudly.
+    fn new_transparent_address_beyond_gap(
+        &mut self,
+        account_id: AccountUuid,
+    ) -> Result<String, RpcError> {
+        let next = self.next_external_transparent_index(account_id);
+        let request = crate::pools::transparent_extraction_request();
+        let div = DiversifierIndex::from(next);
+        let ua = self
             .db_data
-            .get_next_available_address(account_id, request)
-            .map_err(|e| RpcError::wallet(format!("address generation failed: {e}")))?
+            .get_address_for_index(account_id, div, request)
+            .map_err(map_address_for_index_error)?
             .ok_or_else(|| {
-                RpcError::wallet(
-                    "no transparent address available for account; the account's viewing key may \
-                     not support a transparent receiver"
-                        .to_string(),
-                )
+                RpcError::wallet(format!("Error: no address at diversifier index {next}."))
             })?;
-        let taddr = ua.transparent().ok_or_else(|| {
-            RpcError::wallet("derived address unexpectedly has no transparent receiver".to_string())
-        })?;
+        let taddr = transparent_receiver(&ua)?;
+        // A restore re-exposes external indices `0..transparent_initial_scan`, so an index below
+        // that floor stays recoverable even though it's past the steady-state generation gap.
+        if next < self.transparent_initial_scan {
+            info!(
+                "[{}] issued transparent address at external index {next}, past the steady-state \
+                 gap but still within transparent_initial_scan ({}) - recoverable from seed.",
+                self.name, self.transparent_initial_scan
+            );
+        } else {
+            warn!(
+                "[{}] issued transparent address at external index {next}, OUTSIDE the \
+                 stateless-restore recovery window. Funds received here may be UNRECOVERABLE from \
+                 seed unless you raise [pools] transparent_gap_limit / transparent_initial_scan. \
+                 (permitted by transparent_allow_beyond_recovery_window = true)",
+                self.name
+            );
+        }
         use zcash_keys::encoding::AddressCodec as _;
         Ok(taddr.encode(&self.network))
+    }
+
+    /// The next external (non-change) transparent child index to hand out: one past the highest
+    /// already-**exposed** external receiver (contiguous with what has been issued). Falls back to
+    /// `0` if the wallet exposes none (it never reaches here in that case - the gap path would have
+    /// an address available).
+    fn next_external_transparent_index(&self, account_id: AccountUuid) -> u32 {
+        use zcash_client_backend::wallet::Exposure;
+        match self
+            .db_data
+            .get_transparent_receivers(account_id, false, false)
+        {
+            Ok(r) => r
+                .values()
+                .filter(|m| matches!(m.exposure(), Exposure::Exposed { .. }))
+                .filter_map(|m| m.address_index())
+                .map(|i| i.index().saturating_add(1))
+                .max()
+                .unwrap_or(0),
+            Err(_) => 0,
+        }
+    }
+
+    /// One-time startup check: warn if the wallet's transparent recovery window is already nearly
+    /// exhausted (e.g. many addresses handed out ahead of funding and carried across a restart).
+    /// Reuses [`Self::warn_if_gap_low`] over the highest-index exposed external receiver, which
+    /// carries the current gap position. Never fatal - already-exposed addresses can't be un-issued.
+    fn audit_transparent_recovery_window(&self, account_id: AccountUuid) {
+        use zcash_client_backend::wallet::Exposure;
+        let receivers = match self
+            .db_data
+            .get_transparent_receivers(account_id, false, false)
+        {
+            Ok(r) => r,
+            Err(_) => return,
+        };
+        let highest = receivers
+            .into_iter()
+            .filter(|(_, m)| matches!(m.exposure(), Exposure::Exposed { .. }))
+            .filter_map(|(addr, m)| Some((m.address_index()?.index(), addr)))
+            .max_by_key(|(idx, _)| *idx);
+        if let Some((_, taddr)) = highest {
+            self.warn_if_gap_low(account_id, &taddr);
+        }
+    }
+
+    /// Warn (best-effort) when a just-issued transparent address is among the last
+    /// `transparent_gap_warn_threshold` recoverable slots before `getnewaddress` would hit the gap
+    /// limit, so the operator can widen the window before addresses start landing outside it.
+    fn warn_if_gap_low(&self, account_id: AccountUuid, taddr: &TransparentAddress) {
+        use zcash_client_backend::wallet::{Exposure, GapMetadata};
+        let meta = match self
+            .db_data
+            .get_transparent_address_metadata(account_id, taddr)
+        {
+            Ok(Some(m)) => m,
+            _ => return,
+        };
+        if let Exposure::Exposed {
+            gap_metadata:
+                GapMetadata::InGap {
+                    gap_position,
+                    gap_limit,
+                },
+            ..
+        } = meta.exposure()
+        {
+            let remaining = gap_slots_remaining(gap_position, gap_limit);
+            if remaining <= self.transparent_gap_warn_threshold {
+                warn!(
+                    "[{}] transparent recovery window nearly exhausted: {remaining} recoverable \
+                     address slot(s) remain (gap_limit={gap_limit}) before getnewaddress can no \
+                     longer issue an address recoverable from seed. Increase [pools] \
+                     transparent_gap_limit and/or transparent_initial_scan, or fund a lower-index \
+                     address.",
+                    self.name
+                );
+            }
+        }
     }
 
     /// Derive a Unified Address for this wallet's account, backing `z_getaddressforaccount`.
@@ -3888,8 +4059,24 @@ fn enrich_insufficient_funds(db: &WriteDb, policy: ConfirmationsPolicy, err: Rpc
 
 #[cfg(test)]
 mod tests {
+    use super::gap_slots_remaining;
     use super::sanitize_upstream_msg;
     use super::select_transparent_inputs;
+
+    #[test]
+    fn gap_slots_remaining_counts_down_and_saturates() {
+        // First address in a fresh gap of 20: 19 slots remain after it.
+        assert_eq!(gap_slots_remaining(0, 20), 19);
+        // Mid-gap.
+        assert_eq!(gap_slots_remaining(14, 20), 5);
+        // The last allocatable address: no slots remain.
+        assert_eq!(gap_slots_remaining(19, 20), 0);
+        // Beyond the gap (shouldn't happen via the in-window path) saturates at 0, never panics.
+        assert_eq!(gap_slots_remaining(25, 20), 0);
+        assert_eq!(gap_slots_remaining(u32::MAX, 1), 0);
+        // Degenerate gap_limit = 1: the single address leaves nothing.
+        assert_eq!(gap_slots_remaining(0, 1), 0);
+    }
 
     // ZIP-317 standard parameters (mirrors `zip317::FeeRule::standard`), so the selection tests
     // exercise the exact fee the builder will compute.

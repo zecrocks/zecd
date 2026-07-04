@@ -42,7 +42,9 @@ on:
     # one - enables ZECD_REGTEST_STRESS; the weekly cron above leaves the stress test skipping.
     - cron: "33 7 1 * *"
   push:
-    branches: [main, master, "feature/**"]
+    # Mainline only: feature branches (incl. feature/**) are covered by the pull_request trigger
+    # below, so listing them here too would run every job twice on a PR push.
+    branches: [main, master]
     paths:
       - "regtest-harness/**"
       - "src/**"
@@ -92,7 +94,7 @@ jobs:
         image: ${{ github.event_name == 'schedule' && fromJSON('["pinned", "latest"]') || fromJSON('["event"]') }}
         include:
           - suite: zecd
-            tests: --test regtest_e2e --test regtest_funded --test regtest_proving_cache --test regtest_sapling --test regtest_transparent --test regtest_transparent_t2t --test regtest_transparent_gap --test regtest_hang --test regtest_reorg --test regtest_multiwallet --test regtest_restore --test regtest_watchonly
+            tests: --test regtest_e2e --test regtest_funded --test regtest_proving_cache --test regtest_sapling --test regtest_transparent --test regtest_transparent_t2t --test regtest_transparent_gap --test regtest_transparent_recovery_window --test regtest_hang --test regtest_reorg --test regtest_multiwallet --test regtest_restore --test regtest_watchonly
     name: regtest (${{ matrix.suite }}, ${{ matrix.image }})
     steps:
       - uses: actions/checkout@v4

@@ -715,6 +715,13 @@ pub struct ZecdConfig {
     /// The gap e2e uses it to prove a *small* gap plus a large initial scan still recovers a
     /// high-index receive.
     pub transparent_initial_scan: Option<u32>,
+    /// `[pools] transparent_allow_beyond_recovery_window` - when `Some(false)`, `getnewaddress`
+    /// fails closed once the recovery window is exhausted instead of issuing (warn-only) beyond it.
+    /// `None` omits it (zecd defaults to `true`). Only meaningful with `transparent = true`.
+    pub transparent_allow_beyond_recovery_window: Option<bool>,
+    /// `[pools] transparent_gap_warn_threshold` - warn when fewer than this many in-window slots
+    /// remain. `None` omits it (zecd defaults to 5). Only meaningful with `transparent = true`.
+    pub transparent_gap_warn_threshold: Option<u32>,
     /// When `Some`, the spending `default` wallet is created passphrase-encrypted
     /// (`zecd init --encrypt`, passphrase supplied via `ZECD_WALLET_PASSPHRASE`): it starts
     /// locked and needs `walletpassphrase` before sending. `None` = unencrypted (identity model).
@@ -744,6 +751,8 @@ impl ZecdConfig {
             transparent: false,
             transparent_gap_limit: None,
             transparent_initial_scan: None,
+            transparent_allow_beyond_recovery_window: None,
+            transparent_gap_warn_threshold: None,
             encrypt_passphrase: None,
         }
     }
@@ -1497,6 +1506,12 @@ fn write_zecd_toml(datadir: &Path, cfg: &ZecdConfig) -> Result<()> {
             }
             if let Some(n) = cfg.transparent_initial_scan {
                 s.push_str(&format!("transparent_initial_scan = {n}\n"));
+            }
+            if let Some(a) = cfg.transparent_allow_beyond_recovery_window {
+                s.push_str(&format!("transparent_allow_beyond_recovery_window = {a}\n"));
+            }
+            if let Some(t) = cfg.transparent_gap_warn_threshold {
+                s.push_str(&format!("transparent_gap_warn_threshold = {t}\n"));
             }
         }
         s

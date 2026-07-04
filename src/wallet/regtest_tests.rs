@@ -690,6 +690,8 @@ fn offline_actor_cfg(
         transparent_default: false,
         transparent_gap_limit: crate::config::DEFAULT_TRANSPARENT_GAP_LIMIT,
         transparent_initial_scan: 0,
+        transparent_allow_beyond_recovery_window: true,
+        transparent_gap_warn_threshold: 5,
         shutdown,
     };
     (cfg, shutdown_tx)
