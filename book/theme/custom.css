@@ -1,0 +1,42 @@
+/* zecd docs layout tuning.
+   mdBook centers content in a 750px column, which wastes horizontal space and
+   cramps the wide multi-column RPC reference tables (the method index has five
+   columns, one of them free text). Let the content container use most of the
+   viewport so tables have room, but cap running text at a readable measure so
+   prose lines don't stretch. */
+
+:root {
+    --content-max-width: 1600px;
+}
+
+/* Keep prose readable even though the container is wide: cap the measure of the
+   running-text blocks. Tables and code blocks below opt back out to full width. */
+.content main > p,
+.content main > ul,
+.content main > ol,
+.content main > dl,
+.content main > blockquote,
+.content main > h1,
+.content main > h2,
+.content main > h3,
+.content main > h4,
+.content main > h5,
+.content main > h6 {
+    max-width: 82ch;
+}
+
+/* Tables fill the wide container; the free-text column wraps to fit instead of
+   pushing the table off the page. Long unbreakable tokens (inline code) break
+   rather than clip. */
+.content table {
+    width: 100%;
+    table-layout: auto;
+    display: table;
+}
+.content td,
+.content th {
+    overflow-wrap: anywhere;
+}
+.content main > pre {
+    max-width: 100%;
+}

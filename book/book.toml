@@ -1,0 +1,20 @@
+[book]
+title = "zecd"
+description = "A shielded-first Zcash wallet server speaking Bitcoin Core's RPC dialect"
+authors = ["zecrocks"]
+language = "en"
+src = "src"
+
+[output.html]
+default-theme = "light"
+preferred-dark-theme = "navy"
+additional-css = ["theme/custom.css"]
+git-repository-url = "https://github.com/zecrocks/zecd"
+edit-url-template = "https://github.com/zecrocks/zecd/edit/website/book/{path}"
+
+[output.html.search]
+limit-results = 20
+
+[output.html.fold]
+enable = true
+level = 1
