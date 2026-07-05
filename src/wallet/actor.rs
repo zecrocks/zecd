@@ -2425,6 +2425,14 @@ impl WalletActor {
                 let res = self.do_lock();
                 let _ = reply.send(res);
             }
+            WalletCommand::SignMessage {
+                address,
+                message,
+                reply,
+            } => {
+                let res = self.do_sign_message(address, &message);
+                let _ = reply.send(res);
+            }
         }
         false
     }
@@ -2834,6 +2842,54 @@ impl WalletActor {
             .map_err(|e| enrich_insufficient_funds(db, policy, classify_pczt_err(e)))?;
             Ok((pczt, shape, start.elapsed()))
         })
+    }
+
+    /// Sign `message` with the private key of a transparent `address` the wallet owns
+    /// (`signmessage`). The address must already be recorded for the account (its `(scope, index)`
+    /// is read from the wallet DB); the key is derived from the seed exactly as a transparent send
+    /// derives its input keys. Errors: `-13` if the wallet is locked, `-4` if it is watch-only or
+    /// the address is not one of the wallet's own transparent receivers.
+    fn do_sign_message(
+        &mut self,
+        address: TransparentAddress,
+        message: &str,
+    ) -> Result<String, RpcError> {
+        // Match the send path: if an encrypted wallet's unlock elapsed but proactive relock hasn't
+        // fired yet, lock now so a signature can't slip through past the timeout.
+        self.relock_if_expired();
+        let account_id = self.require_account()?;
+        let account_index = self.account_index.ok_or_else(private_keys_disabled)?;
+
+        // The address must be a recorded transparent receiver of this account. librustzcash only
+        // knows the `(scope, index)` for addresses it has exposed/recorded - the same bound the
+        // fully-transparent spend path relies on - so an address the wallet never handed out is
+        // reported as unknown (Bitcoin Core's `-4`).
+        let meta = self
+            .db_data
+            .get_transparent_address_metadata(account_id, &address)
+            .map_err(RpcError::database_internal)?
+            .ok_or_else(|| RpcError::wallet("Unknown address"))?;
+        let (scope, index) = match meta.source() {
+            TransparentAddressSource::Derived {
+                scope,
+                address_index,
+            } => (*scope, *address_index),
+            // Standalone imported keys/scripts only exist with the `transparent-key-import`
+            // feature, which zecd does not enable.
+            #[allow(unreachable_patterns)]
+            _ => return Err(RpcError::wallet("Private key not available")),
+        };
+
+        let usk = seed_guard(&self.seed).derive_usk(self.network, account_index)?;
+        let secret_key = usk
+            .transparent()
+            .derive_secret_key(scope, index)
+            .map_err(|e| RpcError::wallet(format!("transparent key derivation failed: {e}")))?;
+
+        Ok(crate::rpc::signmessage::sign_message_with_key(
+            &secret_key,
+            message,
+        ))
     }
 
     /// Build, prove, and broadcast a send inline (today's behaviour): the whole of phase A→C runs

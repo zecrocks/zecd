@@ -4,6 +4,7 @@ pub mod blockchain;
 pub mod control;
 pub mod network;
 pub mod rawtx;
+pub mod signmessage;
 pub mod util;
 pub mod wallet_methods;
 
@@ -35,6 +36,8 @@ pub const ALL_METHODS: &[&str] = &[
     "getblockheader",
     // Utility
     "validateaddress",
+    "signmessage",
+    "verifymessage",
     "settxfee",
     "estimatesmartfee",
     "estimatefee",
@@ -131,6 +134,8 @@ const MAX_POSITIONAL_ARGS: &[(&str, usize)] = &[
     ("sendmany", 10),
     ("walletpassphrase", 2),
     ("walletlock", 0),
+    ("signmessage", 2),
+    ("verifymessage", 3),
     // Wallet - async operations (zcashd-style)
     ("z_sendmany", 5),
     ("z_getoperationstatus", 1),
@@ -217,6 +222,8 @@ async fn dispatch_zecd(
 
         // Utility
         "validateaddress" => util::validateaddress(state, wallet, req),
+        "signmessage" => signmessage::signmessage(state, wallet, req).await,
+        "verifymessage" => signmessage::verifymessage(state, wallet, req),
         "settxfee" => util::settxfee(req),
         "estimatesmartfee" => util::estimatesmartfee(req),
         "estimatefee" => util::estimatefee(req),

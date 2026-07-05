@@ -113,6 +113,71 @@ async fn regtest_transparent_receive_and_autoshield_spend() {
         .expect("getaddressinfo t-addr");
     assert_eq!(ai["ismine"], json!(true), "own t-addr is ismine: {ai}");
 
+    // signmessage / verifymessage round-trip over the wallet's own transparent address. Signing
+    // exercises the real actor key-derivation path (derive the USK from the seed, then the input
+    // address's secp256k1 key at its recorded (scope, index)); no funding is needed. (Deterministic
+    // - signing is RFC-6979.)
+    let message = "zecd regtest signmessage e2e";
+    let signature = zecd
+        .call("signmessage", json!([taddr, message]))
+        .await
+        .expect("signmessage over own t-addr")
+        .as_str()
+        .expect("signature string")
+        .to_string();
+    assert_eq!(
+        signature.len(),
+        88,
+        "a 65-byte recoverable signature base64-encodes to 88 chars: {signature}"
+    );
+    // The signature verifies for (address, message) and fails for a tampered message.
+    assert_eq!(
+        zecd.call("verifymessage", json!([taddr, signature, message]))
+            .await
+            .expect("verifymessage"),
+        json!(true),
+        "own signature verifies"
+    );
+    assert_eq!(
+        zecd.call(
+            "verifymessage",
+            json!([taddr, signature, "a different message"])
+        )
+        .await
+        .expect("verifymessage wrong message"),
+        json!(false),
+        "signature must not verify against a different message"
+    );
+    // Signing with an address the wallet does not own (a shielded Orchard UA is not even a
+    // transparent address) is rejected -5, before the seed is touched.
+    let orchard_ua = zecd
+        .call("getnewaddress", json!(["", "orchard"]))
+        .await
+        .expect("getnewaddress orchard")
+        .as_str()
+        .expect("ua string")
+        .to_string();
+    let err = zecd
+        .call("signmessage", json!([orchard_ua, message]))
+        .await
+        .expect_err("signmessage rejects a non-transparent address");
+    assert_eq!(
+        err.code(),
+        Some(-5),
+        "signmessage on a shielded address -> -5: {err}"
+    );
+    // Signing with a valid transparent address the wallet does NOT own (the funder's own t-addr,
+    // derived from a different seed) is rejected -4: the wallet has no key for it.
+    let err = zecd
+        .call("signmessage", json!([funder_taddr, message]))
+        .await
+        .expect_err("signmessage rejects an unowned transparent address");
+    assert_eq!(
+        err.code(),
+        Some(-4),
+        "signmessage on an unowned t-addr -> -4: {err}"
+    );
+
     // getwalletinfo surfaces the transparent observability block (the default gap limit is 20).
     let wi = zecd
         .call("getwalletinfo", json!([]))
