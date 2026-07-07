@@ -97,11 +97,26 @@ impl SeedKeeper {
     }
 }
 
-/// Refuse to load an age identity file whose permissions are too permissive - i.e. any access
-/// bit is set for group or other (`mode & 0o077 != 0`). The file holds the secret key that
-/// decrypts the wallet mnemonic, so a world-/group-readable identity leaks the wallet to other
-/// local users. `zecd init` creates it `0600`, but nothing stops a later `chmod`; this re-checks
-/// on every load, mirroring SSH's refusal to use an over-permissive private key.
+/// Refuse to load an age identity from anything but a regular file with owner-only
+/// permissions. The file holds the secret key that decrypts the wallet mnemonic, so:
+///
+/// - **Permissions:** any group/other access bit (`mode & 0o077 != 0`) is rejected, because a
+///   world-/group-readable identity leaks the wallet to other local users. `zecd init` creates
+///   it `0600`, but nothing stops a later `chmod`, so this re-checks on every load, mirroring
+///   SSH's refusal to use an over-permissive private key.
+/// - **File type:** the load target must resolve to a regular file (not a directory, device,
+///   fifo, or socket).
+///
+/// On the symlink question: we deliberately resolve *through* a symlink
+/// (`std::fs::metadata` follows it) rather than rejecting symlinks outright as OpenSSH does.
+/// A Kubernetes Secret/ConfigMap volume presents each mounted file as a symlink into its
+/// `..data/` directory, and zecd supports mounting the age identity as a Secret
+/// (`ZECD_AGE_IDENTITY`), so a hard "regular file only, no symlinks" rule would break that
+/// deployment. Validating the *resolved* target's type and mode keeps the Secret mount working
+/// while still enforcing owner-only access on the real file (a group/other-readable target is
+/// rejected whether or not a symlink points at it). Planting a hostile symlink additionally
+/// requires write access to the identity's parent directory, which is already outside zecd's
+/// trust boundary, and a foreign identity cannot decrypt the operator's own `keys.toml`.
 ///
 /// Best-effort and a no-op on non-unix targets (no POSIX mode bits to inspect).
 pub fn check_identity_file_permissions(identity_path: &Path) -> anyhow::Result<()> {
@@ -110,15 +125,20 @@ pub fn check_identity_file_permissions(identity_path: &Path) -> anyhow::Result<(
         use anyhow::Context as _;
         use std::os::unix::fs::PermissionsExt as _;
 
-        let mode = std::fs::metadata(identity_path)
-            .with_context(|| {
-                format!(
-                    "reading permissions of age identity file {}",
-                    identity_path.display()
-                )
-            })?
-            .permissions()
-            .mode();
+        // `metadata` follows symlinks, so this is the *resolved target's* metadata (see the
+        // Kubernetes-Secret rationale above). A dangling symlink surfaces here as a read error
+        // and fails closed.
+        let meta = std::fs::metadata(identity_path).with_context(|| {
+            format!("reading the age identity file {}", identity_path.display())
+        })?;
+        if !meta.is_file() {
+            anyhow::bail!(
+                "age identity path {path} does not resolve to a regular file; refusing to load \
+                 the wallet's decryption key from an unexpected file type",
+                path = identity_path.display(),
+            );
+        }
+        let mode = meta.permissions().mode();
         if mode & 0o077 != 0 {
             anyhow::bail!(
                 "age identity file {path} has insecure permissions {mode:#o}: it is accessible \
@@ -297,5 +317,48 @@ mod tests {
                 "mode {bad:#o} (group/other-accessible) must be rejected"
             );
         }
+    }
+
+    /// Audit 3.7 file-type + symlink handling: a non-regular file is rejected; a symlink is
+    /// resolved (so a Kubernetes Secret mount works) and its *target's* mode is what's enforced.
+    #[cfg(unix)]
+    #[test]
+    fn check_identity_file_permissions_requires_regular_target() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let dir = tempfile::tempdir().unwrap();
+
+        // A directory at the path is not a regular file -> rejected.
+        let as_dir = dir.path().join("identity_dir");
+        std::fs::create_dir(&as_dir).unwrap();
+        assert!(
+            check_identity_file_permissions(&as_dir).is_err(),
+            "a non-regular file (directory) must be rejected"
+        );
+
+        // A symlink to a 0600 regular file (the k8s-Secret shape) is accepted: we follow the
+        // link and validate the target.
+        let target = dir.path().join("real_identity.txt");
+        std::fs::write(&target, b"# identity\n").unwrap();
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let link = dir.path().join("identity_link.txt");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        check_identity_file_permissions(&link)
+            .expect("a symlink to a 0600 regular file must be accepted (k8s Secret mount)");
+
+        // The mode check applies to the resolved target: widen it and the symlink load refuses.
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(
+            check_identity_file_permissions(&link).is_err(),
+            "a symlink whose target is group/other-readable must be rejected"
+        );
+
+        // A dangling symlink fails closed (read error), never silently loads.
+        let dangling = dir.path().join("dangling.txt");
+        std::os::unix::fs::symlink(dir.path().join("nope"), &dangling).unwrap();
+        assert!(
+            check_identity_file_permissions(&dangling).is_err(),
+            "a dangling symlink must fail closed"
+        );
     }
 }
