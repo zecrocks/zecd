@@ -256,12 +256,12 @@ jobs:
   # lockstep with the harness' NU6_3_ACTIVATION_HEIGHT, zecd's network::regtest(), and devtool's
   # regtest_params().
   regtest-ironwood:
-    # schedule + manual dispatch, plus this ironwood-RC-update branch so iterating here auto-runs the
-    # NU6.3 e2e without a manual dispatch. `head_ref` matches it on the PR trigger (feature branches
-    # run via pull_request, where `github.ref` is the PR merge ref, not the branch); `ref` matches a
-    # direct push. Never on other branches' PRs - the emersonian/* lwd/devtool images are dev
-    # artifacts and must not gate anyone else's CI. Remove this branch keying when ironwood merges.
-    if: ${{ github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' || github.head_ref == 'ironwood' || github.ref == 'refs/heads/ironwood' }}
+    # schedule + manual dispatch, plus the ironwood integration line so ironwood-work PRs auto-run
+    # the NU6.3 e2e without a manual dispatch. `base_ref` matches any PR **into** `ironwood` (its
+    # merge target); `ref` matches a direct push to `ironwood`. Never on unrelated branches' PRs -
+    # the emersonian/* lwd/devtool images are dev artifacts and must not gate anyone else's CI. Drop
+    # this keying (run it everywhere) once ironwood merges to the mainline and those images ship.
+    if: ${{ github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' || github.base_ref == 'ironwood' || github.ref == 'refs/heads/ironwood' }}
     runs-on: ubuntu-latest
     name: regtest (ironwood / NU6.3)
     env:
