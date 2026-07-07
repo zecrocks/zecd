@@ -1081,3 +1081,57 @@ async fn auto_unlock_refuses_foreign_database_at_startup() {
     };
     assert!(err.to_string().contains("does not derive"), "{err}");
 }
+
+/// A getrawtransaction that fails to reach the upstream must not leak the zebra
+/// endpoint (host:port / cookie-file path) in the error returned to the client. The actor here
+/// points at a dead 127.0.0.1:1 endpoint, so the fetch's connect fails; we assert the
+/// client-facing message is the generic string and contains none of the upstream address.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "spawns an actor that loads the bundled prover (slow); offline otherwise"]
+async fn getrawtransaction_error_does_not_leak_upstream_endpoint() {
+    use zcash_protocol::TxId;
+
+    let net = network::regtest();
+    let dir = tempfile::tempdir().unwrap();
+    let wd = dir.path().to_path_buf();
+
+    // A minimal identity-model wallet with a matching account, so the actor starts cleanly and
+    // its binding check passes; sending/unlock are irrelevant to a raw-tx fetch.
+    let identity = age::x25519::Identity::generate();
+    let recipient = identity.to_public();
+    let mnemonic = <Mnemonic<English>>::from_phrase(TEST_PHRASE).unwrap();
+    WalletStore::init_with_mnemonic(
+        &crate::wallet::store::keys_path(&wd),
+        std::iter::once(&recipient as &dyn age::Recipient),
+        &mnemonic,
+        BlockHeight::from_u32(1),
+        net,
+        &test_pinned_ufvk(net),
+    )
+    .unwrap();
+    let mut db = open::init_dbs(net, &wd).unwrap();
+    db.create_account("primary", &test_seed(), &genesis_birthday(), None)
+        .unwrap();
+    drop(db);
+
+    // offline_actor_cfg dials a dead endpoint (127.0.0.1:1), so the on-demand fetch connect fails.
+    let (cfg, _shutdown_tx) = offline_actor_cfg("leak", wd);
+    let (handle, _task) = actor::spawn(cfg).await.unwrap();
+
+    // A txid the wallet doesn't have forces the upstream-fetch path.
+    let err = handle
+        .get_raw_tx(TxId::from_bytes([7u8; 32]))
+        .await
+        .expect_err("fetch against a dead upstream must fail");
+    let msg = err.message.to_lowercase();
+    assert!(
+        !msg.contains("127.0.0.1") && !msg.contains(":1") && !msg.contains("cookie"),
+        "client error must not leak the upstream endpoint: {}",
+        err.message
+    );
+    assert!(
+        msg.contains("upstream node"),
+        "expected the generic upstream message, got: {}",
+        err.message
+    );
+}
