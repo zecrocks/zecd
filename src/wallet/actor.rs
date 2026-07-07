@@ -705,6 +705,18 @@ fn private_keys_disabled() -> RpcError {
     RpcError::wallet("Error: Private keys are disabled for this wallet")
 }
 
+/// Log an internal upstream (zebra) connection/transport failure server-side and return a
+/// generic client-facing `RpcError`. `detail` (the raw error) carries
+/// infrastructure fingerprints - the configured zebra host:port, the cookie-file path from the
+/// connection context - which must never reach the RPC client. Only the operator's logs see it;
+/// the client gets `client_msg`, a fixed generic string. The blanket `From<anyhow::Error>` impl
+/// already scrubs errors that flow through `?`, but these `RpcError::misc(format!(... {e}))`
+/// sites format the error directly, bypassing that funnel, so they scrub here.
+fn upstream_error(name: &str, detail: impl std::fmt::Display, client_msg: &str) -> RpcError {
+    warn!("[{name}] {client_msg}: {detail}");
+    RpcError::misc(client_msg)
+}
+
 /// Map a `get_address_for_index` failure onto an `RpcError`. The reuse case (an exact
 /// diversifier index previously exposed with a *different* receiver set) gets zcashd's exact
 /// `z_getaddressforaccount` wording; everything else is a generic wallet error.
@@ -2483,9 +2495,9 @@ impl WalletActor {
     /// `TxFilter` hash is the txid's internal bytes (per zcash-devtool's enhance).
     async fn fetch_tx_from_upstream(&mut self, txid: TxId) -> Result<Option<RawTx>, RpcError> {
         if self.client.is_none() {
-            self.connect()
-                .await
-                .map_err(|e| RpcError::misc(format!("connect to upstream: {e}")))?;
+            self.connect().await.map_err(|e| {
+                upstream_error(&self.name, e, "could not connect to the upstream node")
+            })?;
         }
         let fetched = {
             let client = self
@@ -2504,9 +2516,13 @@ impl WalletActor {
             })),
             Err(e) => {
                 // Transport failure: drop the dead client so the next op reconnects/fails over.
+                // `mark_disconnected` logs the detail server-side; the client gets a generic
+                // message so the upstream endpoint in `e` is not leaked.
                 self.mark_disconnected(format!("transaction fetch failed: {e}"));
                 self.update_status();
-                Err(RpcError::misc(format!("transaction fetch failed: {e}")))
+                Err(RpcError::misc(
+                    "transaction fetch from the upstream node failed",
+                ))
             }
         }
     }
@@ -2517,9 +2533,9 @@ impl WalletActor {
     /// caller knows the network never accepted the tx.
     async fn do_broadcast(&mut self, data: Vec<u8>) -> Result<(), RpcError> {
         if self.client.is_none() {
-            self.connect()
-                .await
-                .map_err(|e| RpcError::misc(format!("connect to upstream: {e}")))?;
+            self.connect().await.map_err(|e| {
+                upstream_error(&self.name, e, "could not connect to the upstream node")
+            })?;
         }
         let response = {
             let client = self
@@ -2535,9 +2551,13 @@ impl WalletActor {
             Ok(outcome) => outcome,
             Err(e) => {
                 // Transport/deadline failure: drop the client so the next op reconnects/fails over.
+                // `mark_disconnected` logs the detail server-side; the client gets a generic
+                // message so the upstream endpoint in `e` is not leaked.
                 self.mark_disconnected(format!("transaction broadcast failed: {e}"));
                 self.update_status();
-                return Err(RpcError::misc(format!("transaction broadcast failed: {e}")));
+                return Err(RpcError::misc(
+                    "transaction broadcast to the upstream node failed",
+                ));
             }
         };
         let result = classify_broadcast_outcome(&outcome);
