@@ -14,13 +14,14 @@ use tracing::{error, info, warn};
 
 use zcash_client_backend::data_api::wallet::{
     create_pczt_from_proposal, create_proposed_transactions, decrypt_and_store_transaction,
-    extract_and_store_transaction_from_pczt, input_selection::GreedyInputSelector,
+    extract_and_store_transaction_from_pczt,
+    input_selection::{GreedyInputSelector, TransparentSpendPolicy},
     propose_transfer, ConfirmationsPolicy, SpendingKeys,
 };
 use zcash_client_backend::data_api::{
-    Account, AccountBirthday, AccountPurpose, AccountSource, InputSource, SentTransaction,
-    SentTransactionOutput, TransactionDataRequest, TransactionStatus, TransparentOutputFilter,
-    WalletRead, WalletUtxo, WalletWrite,
+    Account, AccountBirthday, AccountPurpose, AccountSource, CoinbaseFilter, InputSource,
+    SentTransaction, SentTransactionOutput, TransactionDataRequest, TransactionStatus, WalletRead,
+    WalletWrite,
 };
 use zcash_client_backend::fees::{
     standard::MultiOutputChangeStrategy, DustOutputPolicy, SplitPolicy, StandardFeeRule,
@@ -37,7 +38,7 @@ use zcash_primitives::transaction::Transaction;
 use zcash_proofs::prover::LocalTxProver;
 use zcash_protocol::consensus::{BlockHeight, BranchId, Parameters};
 use zcash_protocol::value::Zatoshis;
-use zcash_protocol::{PoolType, ShieldedProtocol, TxId};
+use zcash_protocol::{PoolType, ShieldedPool, TxId};
 use zcash_transparent::address::TransparentAddress;
 use zcash_transparent::builder::TransparentSigningSet;
 use zip32::DiversifierIndex;
@@ -80,9 +81,19 @@ impl ProvingKeyCache {
     /// Build the Orchard proving + verifying keys. Expensive (full key generation); call once
     /// at startup, off the async runtime (e.g. under `spawn_blocking`).
     pub fn build() -> Self {
+        // The orchard crate splits `build()` into per-circuit-version keys. `FixedPostNu6_2` is the
+        // current (NU6.2-era) Orchard circuit. `PostNu6_3` is the ironwood circuit - a single
+        // `PostNu6_3` key serves BOTH the Orchard and Ironwood proof steps of a V6 transaction
+        // (devtool's `prove.rs` does the same), so the `ironwood` build uses it for every send. The
+        // ironwood feature is dev-only and targets post-NU6.3 chains, so it never needs the
+        // NU6.2 key; the default (released-equivalent) build stays on `FixedPostNu6_2`.
+        #[cfg(feature = "ironwood")]
+        let circuit = orchard::circuit::OrchardCircuitVersion::PostNu6_3;
+        #[cfg(not(feature = "ironwood"))]
+        let circuit = orchard::circuit::OrchardCircuitVersion::FixedPostNu6_2;
         ProvingKeyCache {
-            orchard_pk: orchard::circuit::ProvingKey::build(),
-            orchard_vk: orchard::circuit::VerifyingKey::build(),
+            orchard_pk: orchard::circuit::ProvingKey::build(circuit),
+            orchard_vk: orchard::circuit::VerifyingKey::build(circuit),
         }
     }
 }
@@ -1919,7 +1930,7 @@ impl WalletActor {
         // *after* the actor's first connect/refresh, so calling `update_chain_tip` here with no
         // account would insert that low range, and a later call can't raise an existing range's
         // floor. So defer it: `maybe_bootstrap_account` calls `update_chain_tip` itself right
-        // after creating the account (birthday now set → the scan floors at the birthday). We
+        // after creating the account (birthday now set -> the scan floors at the birthday). We
         // still record the tip height/hash below so the bootstrap can run.
         let (tip, hash) = if self.account_id.is_some() {
             fetch_and_store_chain_tip(client, &mut self.db_data).await?
@@ -2788,10 +2799,13 @@ impl WalletActor {
     /// Whether sends on this wallet *may* use the cached-Orchard PCZT path (so prove and store are
     /// separable). True for the default Orchard-only wallet with `cache_proving_key` on. A
     /// Sapling-spending wallet (or `cache_proving_key` off) uses the fused path, which has no
-    /// prove/store seam - see [`Self::do_send_fused`]. NB this gates on the *wallet's* pools, not
-    /// the send's recipients: even when this is true, an individual send that pays a Sapling output
-    /// is still diverted to the fused path (`request_pays_sapling_output`), because the cached
-    /// path's extractor is handed no Sapling verifying key.
+    /// prove/store seam - see [`Self::do_send_fused`]. Ironwood (V6) sends also ride this path:
+    /// `create_pczt_from_proposal` builds Ironwood PCZTs (librustzcash#2543), and `prove_sign_pczt`
+    /// carries the paired `create_ironwood_proof` step, so an Ironwood send reuses the cached
+    /// `PostNu6_3` proving key exactly like an Orchard send reuses the `FixedPostNu6_2` key. NB this
+    /// gates on the *wallet's* pools, not the send's recipients: even when this is true, an individual
+    /// send that pays a Sapling output is still diverted to the fused path (`request_pays_sapling_output`),
+    /// because the cached path's extractor is handed no Sapling verifying key.
     fn cached_pczt_path(&self) -> bool {
         self.orchard_keys.is_some() && !self.enabled_pools.contains(Pool::Sapling)
     }
@@ -2839,6 +2853,9 @@ impl WalletActor {
                 &change_strategy,
                 request,
                 policy,
+                // Shielded-only input selection (transparent UTXOs are spent via the separate
+                // lower-level `do_send_transparent` path), matching `do_send_fused`.
+                &TransparentSpendPolicy::ShieldedOnly,
                 None,
             )
             .map_err(|e| enrich_insufficient_funds(db, policy, classify_err(e)))?;
@@ -2853,6 +2870,9 @@ impl WalletActor {
                 account_id,
                 OvkPolicy::Sender,
                 &proposal,
+                // `None` lets librustzcash derive the expiry from the proposal's target height,
+                // matching the fused build path (and the pre-#2412 behaviour).
+                None,
             )
             .map_err(|e| enrich_insufficient_funds(db, policy, classify_pczt_err(e)))?;
             Ok((pczt, shape, start.elapsed()))
@@ -2907,7 +2927,7 @@ impl WalletActor {
         ))
     }
 
-    /// Build, prove, and broadcast a send inline (today's behaviour): the whole of phase A→C runs
+    /// Build, prove, and broadcast a send inline (today's behaviour): the whole of phase A->C runs
     /// on the actor under `block_in_place`, so the actor (and thus sync) is blocked for the whole
     /// proof. `[spend] pipeline_proving` moves the proof off the actor - see
     /// [`Self::begin_or_queue_send`]. Used directly when pipelining is disabled or ineligible.
@@ -2963,7 +2983,7 @@ impl WalletActor {
             return self.do_send_fused(usk, request, policy, privacy).await;
         }
 
-        // Cached-Orchard PCZT path: phase A (select+build) → phase B (prove+sign) → phase C
+        // Cached-Orchard PCZT path: phase A (select+build) -> phase B (prove+sign) -> phase C
         // (store), all on the actor. Each phase is timed so the send-latency log shows where the
         // cost lands on a large, note-fragmented wallet.
         let (pczt, shape, build) = self.build_proposal_and_pczt(request, policy, privacy)?;
@@ -3035,6 +3055,11 @@ impl WalletActor {
                     &change_strategy,
                     request,
                     policy,
+                    // zecd's proposal path funds payments from shielded notes only (transparent
+                    // UTXOs are spent via the separate lower-level `do_send_transparent` path), so
+                    // the input selector must never pull in transparent UTXOs. `ShieldedOnly` is the
+                    // upstream default and preserves the prior fully-shielded selection behavior.
+                    &TransparentSpendPolicy::ShieldedOnly,
                     None,
                 )
                 .map_err(|e| enrich_insufficient_funds(db, policy, classify_err(e)))?;
@@ -3349,14 +3374,14 @@ impl WalletActor {
                 let receivers = db
                     .get_transparent_receivers(account_id, true, true)
                     .map_err(RpcError::database_internal)?;
-                let mut utxos: Vec<WalletUtxo> = Vec::new();
+                let mut utxos = Vec::new();
                 for addr in receivers.keys() {
                     let outs = db
                         .get_spendable_transparent_outputs(
                             addr,
                             target_height,
                             policy,
-                            TransparentOutputFilter::All,
+                            CoinbaseFilter::AllTransparentOutputs,
                         )
                         .map_err(RpcError::database_internal)?;
                     utxos.extend(outs);
@@ -3405,6 +3430,10 @@ impl WalletActor {
                     BuildConfig::Standard {
                         sapling_anchor: None,
                         orchard_anchor: None,
+                        // Upstream `BuildConfig::Standard` now carries `ironwood_anchor`
+                        // unconditionally; this is a transparent-only send (no shielded spends),
+                        // so there's no anchor.
+                        ironwood_anchor: None,
                     },
                 );
 
@@ -4084,6 +4113,22 @@ fn prove_sign_pczt(
     } else {
         prover
     };
+    // Ironwood (V6) proof step. A V6 transaction past NU6.3 carries a separate Ironwood bundle
+    // needing its own proof, produced from the same `PostNu6_3` proving key as the Orchard proof
+    // (mirrors devtool's `pczt/prove.rs`). Only compiled under the `ironwood` feature, whose
+    // `ProvingKeyCache` builds the `PostNu6_3` key. This is the Ironwood send's proving step:
+    // `create_pczt_from_proposal` builds the Ironwood PCZT (librustzcash#2543) and `do_send` routes
+    // the send here (the cached PCZT path), so `requires_ironwood_proof()` is true for a post-NU6.3
+    // Orchard-pool spend and the Ironwood bundle is proved from the cached key - no per-send
+    // `ProvingKey::build()`.
+    #[cfg(feature = "ironwood")]
+    let prover = if prover.requires_ironwood_proof() {
+        prover
+            .create_ironwood_proof(&keys.orchard_pk)
+            .map_err(|e| RpcError::wallet(format!("Ironwood proof generation failed: {e:?}")))?
+    } else {
+        prover
+    };
     let prover = if prover.requires_sapling_proofs() {
         prover
             .create_sapling_proofs(sapling_prover, sapling_prover)
@@ -4116,6 +4161,30 @@ fn prove_sign_pczt(
                 return Err(RpcError::wallet(format!(
                     "Orchard spend signing failed: {e:?}"
                 )))
+            }
+        }
+    }
+    // Spend authorization for the Ironwood (V6) bundle - a separate bundle from Orchard, so its
+    // spends need their own signing pass or `extract_and_store_transaction_from_pczt` fails with
+    // `Ironwood(Extract(MissingSpendAuthSig))`. Ironwood reuses Orchard's spend crypto, so the same
+    // Orchard `ask` signs it; the loop mirrors the Orchard one (skip the dummy-spend
+    // `WrongSpendAuthorizingKey`, stop at `InvalidIndex`). Only reachable under `feature = "ironwood"`
+    // (post-NU6.3, spending an ironwood note); the default build never produces an Ironwood bundle.
+    #[cfg(feature = "ironwood")]
+    {
+        let mut index = 0;
+        loop {
+            match signer.sign_ironwood(index, &ask) {
+                Ok(())
+                | Err(SignerError::IronwoodSign(
+                    orchard::pczt::SignerError::WrongSpendAuthorizingKey,
+                )) => index += 1,
+                Err(SignerError::InvalidIndex) => break,
+                Err(e) => {
+                    return Err(RpcError::wallet(format!(
+                        "Ironwood spend signing failed: {e:?}"
+                    )))
+                }
             }
         }
     }
@@ -4254,26 +4323,40 @@ fn enforce_full_privacy<FeeRuleT, NoteRef>(
 /// since each Orchard action carries one spend and one output (a dummy filling whichever side is
 /// short). Mirrors the count Zallet's `orchard_actions` limit checks. `orchard_outputs` counts
 /// both payment outputs landing in the Orchard pool and Orchard change notes.
+///
+/// Ironwood (V3) actions are Orchard-crypto actions in the separate Ironwood bundle - they carry
+/// the same per-action proving cost, so they count toward this limit exactly like Orchard V2
+/// actions. Past NU6.3 the proposal represents these as the `Ironwood` pool (spends: a V3
+/// `orchard::Note`; outputs/change: `PoolType` Ironwood), so the counts fold both pools together.
+/// This is what the pre-`3e0b8039e` `Note::protocol()` (which reported every orchard-crypto note as
+/// `Orchard`) did implicitly; here we spell it out since `Note::pool()` now splits V3 out as
+/// `Ironwood`. In the default (pre-NU6.3, non-ironwood) build no Ironwood actions exist, so the
+/// Ironwood arm contributes nothing and the count is unchanged.
 fn step_orchard_actions<NoteRef>(
     step: &zcash_client_backend::proposal::Step<NoteRef>,
 ) -> (usize, usize) {
+    let is_orchard_family =
+        |pool: ShieldedPool| matches!(pool, ShieldedPool::Orchard | ShieldedPool::Ironwood);
+    let is_orchard_family_pooltype =
+        |pool: PoolType| matches!(pool, PoolType::Shielded(sp) if is_orchard_family(sp));
+
     let orchard_spends = step
         .shielded_inputs()
         .iter()
         .flat_map(|inputs| inputs.notes().iter())
-        .filter(|note| note.note().protocol() == ShieldedProtocol::Orchard)
+        .filter(|note| is_orchard_family(note.note().pool()))
         .count();
 
     let orchard_outputs = step
         .payment_pools()
         .values()
-        .filter(|&&pool| pool == PoolType::ORCHARD)
+        .filter(|&&pool| is_orchard_family_pooltype(pool))
         .count()
         + step
             .balance()
             .proposed_change()
             .iter()
-            .filter(|change| change.output_pool() == PoolType::ORCHARD)
+            .filter(|change| is_orchard_family_pooltype(change.output_pool()))
             .count();
 
     (orchard_spends, orchard_outputs)
@@ -4481,7 +4564,7 @@ mod tests {
 
     #[test]
     fn transparent_selection_exact_cover_emits_no_change() {
-        // Inputs cover recipient + the no-change fee exactly → no change output.
+        // Inputs cover recipient + the no-change fee exactly -> no change output.
         let total = 50_000_000 + MARGINAL * 2;
         let (n, change, fee, has_change) = select_transparent_inputs(
             &[total],
@@ -4515,7 +4598,7 @@ mod tests {
         .unwrap();
         assert_eq!(n, 2);
         assert!(has_change);
-        // 2-in/2-out → max(2,2)=2 actions.
+        // 2-in/2-out -> max(2,2)=2 actions.
         assert_eq!(fee, MARGINAL * 2);
         assert_eq!(change, 120_000_000 - 100_000_000 - fee);
         assert_eq!(120_000_000, 100_000_000 + change + fee);
@@ -4523,7 +4606,7 @@ mod tests {
 
     #[test]
     fn transparent_selection_fee_scales_with_input_count() {
-        // Three inputs, one recipient + change → 3-in/2-out → max(3,2)=3 actions.
+        // Three inputs, one recipient + change -> 3-in/2-out -> max(3,2)=3 actions.
         let values = [40_000_000, 40_000_000, 40_000_000];
         let (n, change, fee, has_change) = select_transparent_inputs(
             &values,
@@ -4543,7 +4626,7 @@ mod tests {
 
     #[test]
     fn transparent_selection_fee_scales_with_output_count() {
-        // One large input, two recipients + change → 1-in/3-out → max(grace, max(1,3)) = 3 actions.
+        // One large input, two recipients + change -> 1-in/3-out -> max(grace, max(1,3)) = 3 actions.
         let (n, change, fee, has_change) = select_transparent_inputs(
             &[100_000_000],
             40_000_000,    // two recipients summing to 0.4 ZEC...
@@ -4562,7 +4645,7 @@ mod tests {
 
     #[test]
     fn transparent_selection_prices_p2sh_outputs_smaller() {
-        // 17 P2SH recipient outputs (32 bytes each) total 544 bytes → ceil(544/34) = 16 output
+        // 17 P2SH recipient outputs (32 bytes each) total 544 bytes -> ceil(544/34) = 16 output
         // actions, one fewer than the 17 a naive per-output count would charge. This is exactly how
         // the builder's ZIP-317 fee rule sizes them; a count-based formula would mis-fee here.
         const P2SH_OUT: usize = 8 + 1 + 23;
@@ -4577,7 +4660,7 @@ mod tests {
             GRACE,
         )
         .unwrap();
-        // With change: total out = 544 + 34 = 578 → ceil(578/34) = 17 actions; 1 input → fee = 17m.
+        // With change: total out = 544 + 34 = 578 -> ceil(578/34) = 17 actions; 1 input -> fee = 17m.
         assert_eq!(fee, MARGINAL * 17);
     }
 
@@ -4595,7 +4678,7 @@ mod tests {
             Address::Transparent(TransparentAddress::PublicKeyHash([b; 20])).to_zcash_address(&net)
         };
 
-        // Two bare transparent recipients → Some, with amounts preserved in order.
+        // Two bare transparent recipients -> Some, with amounts preserved in order.
         let req = TransactionRequest::new(vec![
             Payment::without_memo(taddr(1), Zatoshis::const_from_u64(50_000_000)),
             Payment::without_memo(taddr(2), Zatoshis::const_from_u64(10_000_000)),
@@ -4863,11 +4946,11 @@ mod tests {
         assert_eq!(orchard_action_overflow(50, 50, 50), None);
         assert_eq!(orchard_action_overflow(10, 50, 50), None);
         assert_eq!(orchard_action_overflow(0, 0, 50), None);
-        // Only outputs overflow → blame outputs.
+        // Only outputs overflow -> blame outputs.
         assert_eq!(orchard_action_overflow(3, 51, 50), Some((51, "outputs")));
-        // Only inputs overflow → blame inputs.
+        // Only inputs overflow -> blame inputs.
         assert_eq!(orchard_action_overflow(80, 2, 50), Some((80, "inputs")));
-        // Both overflow → blame actions (the max).
+        // Both overflow -> blame actions (the max).
         assert_eq!(orchard_action_overflow(60, 70, 50), Some((70, "actions")));
         // A tight cap of 1: a single extra output trips it.
         assert_eq!(orchard_action_overflow(1, 2, 1), Some((2, "outputs")));

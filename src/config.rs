@@ -272,7 +272,7 @@ pub struct BackendConfig {
     /// Treat private / non-globally-routable ranges (RFC1918, link-local, CGNAT, IPv6 unique-local
     /// and link-local) as "local" for the cleartext-credential gate, so a credentialed connect to
     /// a container/LAN zebra is allowed without an override. Default `true` (the self-hosted
-    /// `zebra → zecd` Docker/LAN norm); set `false` for a strict loopback-only posture.
+    /// `zebra -> zecd` Docker/LAN norm); set `false` for a strict loopback-only posture.
     pub rfc1918_is_local: bool,
     /// Escape hatch for the cleartext-credential gate: allow the (plaintext) zebra connection to
     /// carry RPC credentials to *any* host, including globally-routable ones. Off by default; the
@@ -446,13 +446,13 @@ impl SendPrivacy {
         }
     }
 
-    /// Whether this policy permits paying a transparent recipient, which reveals both the
-    /// recipient and the amount on-chain. `AllowRevealedRecipients` and the strictly more
-    /// permissive `AllowFullyTransparent` do; `FullPrivacy` and `AllowRevealedAmounts` reject a
-    /// transparent recipient (the latter opts into revealed *amounts* only). NB
-    /// `AllowFullyTransparent` must be included: it is the top rung of the ladder, so anything a
-    /// lower rung permits it must permit too - omitting it makes `build_payment` reject the very
-    /// t->t sends the policy exists to allow.
+    /// recipient and the amount on-chain. `AllowRevealedRecipients` (pay a transparent recipient
+    /// from shielded notes) and the strictly-more-permissive `AllowFullyTransparent` (additionally
+    /// fund it from transparent UTXOs with kept-transparent change) both do; `FullPrivacy` and
+    /// `AllowRevealedAmounts` reject a transparent recipient (the latter opts into revealed
+    /// *amounts* only). Omitting `AllowFullyTransparent` here would make the fully-transparent send
+    /// path unreachable - the `build_payment` pre-check would `-8`-reject the recipient before the
+    /// t->t spend could run.
     pub fn allows_transparent_recipient(self) -> bool {
         matches!(
             self,
@@ -1521,7 +1521,7 @@ mod tests {
 
     #[test]
     fn orchard_action_limit_defaults_and_parses() {
-        // Absent → the Zallet-matching default of 50.
+        // Absent -> the Zallet-matching default of 50.
         assert_eq!(SpendConfig::default().orchard_action_limit, 50);
         assert_eq!(DEFAULT_ORCHARD_ACTION_LIMIT, 50);
         // Explicit value (including 0, which disables the cap) round-trips.
@@ -1533,7 +1533,7 @@ mod tests {
 
     #[test]
     fn pipeline_proving_defaults_off_and_parses() {
-        // Absent → off (the inline send path, byte-identical to today's behaviour).
+        // Absent -> off (the inline send path, byte-identical to today's behaviour).
         assert!(!SpendConfig::default().pipeline_proving);
         // Explicit value round-trips both ways.
         let f: SpendFile = toml::from_str("pipeline_proving = true").unwrap();
@@ -1610,7 +1610,7 @@ mod tests {
         assert_eq!(f.connect_timeout_secs, Some(5));
         assert_eq!(f.reconnect_base_secs, Some(2));
         assert_eq!(f.reconnect_max_secs, Some(30));
-        // The cleartext-gate knobs default to unset (→ rfc1918_is_local true, remote override
+        // The cleartext-gate knobs default to unset (-> rfc1918_is_local true, remote override
         // false) and parse when present.
         assert_eq!(f.rfc1918_is_local, None);
         assert_eq!(f.allow_remote_cleartext, None);
@@ -1743,7 +1743,7 @@ mod tests {
         let cfg = AppConfig::resolve(&cli).unwrap();
         assert_eq!(cfg.sync.interval_secs, 45);
 
-        // Absent section → the 20s default.
+        // Absent section -> the 20s default.
         std::fs::write(&conf, "datadir = \"/tmp/zecd-x\"\n").unwrap();
         let cli = Cli::parse_from(["zecd", "--conf", conf.to_str().unwrap()]);
         let cfg = AppConfig::resolve(&cli).unwrap();

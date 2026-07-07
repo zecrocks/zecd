@@ -4,7 +4,7 @@
 //! its Bitcoin-Core-style JSON-RPC - `zecd` talks straight to zebrad. There is intentionally
 //! **no `zingo-infra`/`zcash_local_net` dependency**, and no compile-time zebra dependency
 //! either: blocks are mined with zebrad's own Regtest-only `generate` RPC (zebra ≥ 2.0.0),
-//! which runs the template→assemble→submit flow server-side against the node's own network
+//! which runs the template->assemble->submit flow server-side against the node's own network
 //! parameters. The harness is a pure black-box JSON-RPC driver, so it works unmodified against
 //! any zebrad release.
 //!
@@ -46,6 +46,12 @@ pub fn resolve_bin(env_var: &str) -> Option<PathBuf> {
 /// only accrues once NU6 is live - so NU6.1/NU6.2 activate a few blocks in, after a pool exists.
 /// Must match `zecd`'s `network::regtest`.
 const NU6_2_ACTIVATION_HEIGHT: u32 = 4;
+/// Height at which NU6.3 (ironwood) activates on the ironwood regtest chain. Only emitted into the
+/// zebra config for the ironwood tier (stock zebra rejects the `"NU6.3"` key). This value is the
+/// canonical reference for the cross-component schedule: it MUST equal `zecd`'s `network::regtest()`
+/// `nu6_3` height and `devtool`'s `regtest_params()` - a mismatch diverges the NU6.3 consensus
+/// branch id and zebra rejects the tx (loud failure, not silent).
+pub const NU6_3_ACTIVATION_HEIGHT: u32 = 8;
 /// ZIP-271 one-time lockbox disbursement paid in the NU6.1 activation block's coinbase. A P2SH
 /// regtest address and a token amount (<= the pool accrued by [`NU6_2_ACTIVATION_HEIGHT`]).
 const LOCKBOX_DISBURSEMENT_ADDR: &str = "t27eWDgjFYJGVXmzrXeVjnb5J3uXDM9xH9v";
@@ -63,6 +69,9 @@ pub struct Zebrad {
     net_port: u16,
     bin: PathBuf,
     config_path: PathBuf,
+    /// NU6.3 (ironwood) activation height, or `None` for a stock-zebra (non-ironwood) chain.
+    /// Preserved across `restart_with_miner` so the rebuilt config keeps the same schedule.
+    nu6_3_height: Option<u32>,
     _dir: tempfile::TempDir,
 }
 
@@ -105,6 +114,21 @@ impl Zebrad {
     /// Launch `zebrad` mining its coinbase to `miner_address`, so a wallet that controls that
     /// address can spend the matured coinbase (used to fund the Orchard wallet under test).
     pub async fn start_with_miner(bin: &Path, miner_address: &str) -> Result<Zebrad> {
+        Self::start_inner(bin, miner_address, None).await
+    }
+
+    /// Launch `zebrad` on the ironwood regtest chain (NU6.3 active at [`NU6_3_ACTIVATION_HEIGHT`]),
+    /// mining its coinbase to `miner_address`. Requires an ironwood-capable zebrad (the zakura
+    /// image) - stock zebra rejects the `"NU6.3"` activation-height key.
+    pub async fn start_with_miner_ironwood(bin: &Path, miner_address: &str) -> Result<Zebrad> {
+        Self::start_inner(bin, miner_address, Some(NU6_3_ACTIVATION_HEIGHT)).await
+    }
+
+    async fn start_inner(
+        bin: &Path,
+        miner_address: &str,
+        nu6_3_height: Option<u32>,
+    ) -> Result<Zebrad> {
         let dir = tempfile::tempdir().context("create zebrad dir")?;
         let rpc_port = pick_port()?;
         let net_port = pick_port()?;
@@ -117,6 +141,7 @@ impl Zebrad {
                 rpc_port,
                 miner_address,
                 &cache_dir.to_string_lossy(),
+                nu6_3_height,
             ),
         )
         .context("write zebrad.toml")?;
@@ -127,6 +152,7 @@ impl Zebrad {
             net_port,
             bin: bin.to_path_buf(),
             config_path,
+            nu6_3_height,
             _dir: dir,
         };
         zebrad.wait_until_rpc_up().await?;
@@ -163,6 +189,7 @@ impl Zebrad {
                 self.rpc_port,
                 miner_address,
                 &cache_dir.to_string_lossy(),
+                self.nu6_3_height,
             ),
         )
         .context("rewrite zebrad.toml for restart")?;
@@ -209,7 +236,7 @@ impl Zebrad {
     }
 
     /// Mine `n` blocks via zebrad's Regtest-only `generate` RPC (zebra ≥ 2.0.0). Server-side it
-    /// runs the same `getblocktemplate` → assemble → `submitblock` flow zebra's own regtest tests
+    /// runs the same `getblocktemplate` -> assemble -> `submitblock` flow zebra's own regtest tests
     /// use, against the node's own network parameters - so the harness needs no zebra crates and
     /// can't drift from the running node's consensus rules. Regtest disables PoW, so there is no
     /// solving step.
@@ -251,10 +278,22 @@ impl Drop for Zebrad {
 /// zebrad Regtest config for zebra 5.x. Note: no `[mining] debug_like_zcashd` (removed after
 /// 2.x), `disable_pow = true` so submitted blocks need no PoW, and `enable_cookie_auth = false`
 /// so lightwalletd can use the rpcuser/rpcpassword from its `zcash.conf`.
-fn zebrad_toml(net_port: u16, rpc_port: u16, miner_address: &str, cache_dir: &str) -> String {
+fn zebrad_toml(
+    net_port: u16,
+    rpc_port: u16,
+    miner_address: &str,
+    cache_dir: &str,
+    nu6_3_height: Option<u32>,
+) -> String {
     let nu6_2 = NU6_2_ACTIVATION_HEIGHT;
     let lockbox_addr = LOCKBOX_DISBURSEMENT_ADDR;
     let lockbox_amount = LOCKBOX_DISBURSEMENT_ZATS;
+    // NU6.3 (ironwood) activation line, emitted only for the ironwood tier - stock zebra has no
+    // `"NU6.3"` key and rejects an unknown activation-height entry at startup.
+    let nu6_3_line = match nu6_3_height {
+        Some(h) => format!("\"NU6.3\" = {h}\n"),
+        None => String::new(),
+    };
     format!(
         r#"[network]
 network = "Regtest"
@@ -274,7 +313,7 @@ NU5 = 1
 NU6 = 1
 "NU6.1" = {nu6_2}
 "NU6.2" = {nu6_2}
-
+{nu6_3_line}
 # A deferred (lockbox) funding stream so the pool has something to disburse at NU6.1.
 [[network.testnet_parameters.funding_streams]]
 [network.testnet_parameters.funding_streams.height_range]
@@ -435,8 +474,8 @@ abandon abandon abandon art";
 /// funds to the `zecd` wallet under test. Resolve the binary via `$DEVTOOL_BIN`.
 ///
 /// Regtest can't mine a coinbase straight into an Orchard note that `zecd` (Orchard-only) would
-/// see, so this is how we get funds into `zecd`: mine transparent coinbase → mature (101 blocks) →
-/// shield to Orchard → send to `zecd`'s unified address.
+/// see, so this is how we get funds into `zecd`: mine transparent coinbase -> mature (101 blocks) ->
+/// shield to Orchard -> send to `zecd`'s unified address.
 pub struct Funder {
     bin: PathBuf,
     dir: tempfile::TempDir,
@@ -478,15 +517,50 @@ impl Funder {
     /// which needs a real block - `birthday 0/1` requests genesis and is rejected). The funder's
     /// transparent coinbase is detected regardless of birthday.
     pub fn init(bin: &Path, lwd_port: u16) -> Result<Funder> {
+        Self::init_inner(bin, lwd_port, false)
+    }
+
+    /// Initialise the funding wallet on the **ironwood** regtest chain (NU6.3 active). The ironwood
+    /// `zcash-devtool` (`regtest_support` feature) differs from the older standard-tier build on two
+    /// `init` points: (1) `-n regtest` requires an explicit `--activation-heights <TOML>` (persisted
+    /// into the wallet so its per-build consensus branch ID matches the launched zebra), and (2) the
+    /// mnemonic is read from **stdin** (piped) rather than a `--mnemonic` flag (which it no longer
+    /// accepts). [`Funder::init`] keeps the old `--mnemonic`/no-heights shape for the standard tier.
+    pub fn init_ironwood(bin: &Path, lwd_port: u16) -> Result<Funder> {
+        Self::init_inner(bin, lwd_port, true)
+    }
+
+    fn init_inner(bin: &Path, lwd_port: u16, ironwood: bool) -> Result<Funder> {
         let dir = tempfile::tempdir().context("create funder dir")?;
         let funder = Funder {
             bin: bin.to_path_buf(),
             dir,
         };
         let identity = funder.identity();
-        funder.run(
-            "init",
-            &[
+        if ironwood {
+            // Newer devtool: mnemonic piped to stdin, activation heights via file.
+            let heights_path = funder.write_activation_heights()?;
+            let args = [
+                "--name",
+                "funder",
+                "--network",
+                "regtest",
+                "--identity",
+                &identity,
+                "--birthday",
+                "2",
+                "--activation-heights",
+                &heights_path,
+            ];
+            funder.run_with_stdin(
+                "init",
+                &args,
+                Some(lwd_port),
+                &format!("{FUNDER_MNEMONIC}\n"),
+            )?;
+        } else {
+            // Older devtool: mnemonic via `--mnemonic`, no activation heights.
+            let args = [
                 "--name",
                 "funder",
                 "--network",
@@ -497,10 +571,35 @@ impl Funder {
                 FUNDER_MNEMONIC,
                 "--birthday",
                 "2",
-            ],
-            Some(lwd_port),
-        )?;
+            ];
+            funder.run("init", &args, Some(lwd_port))?;
+        }
         Ok(funder)
+    }
+
+    /// Write the `--activation-heights` TOML the ironwood `zcash-devtool` requires for `init`, in the
+    /// `ActivationHeights` schema (one optional height per network upgrade). These MUST match zecd's
+    /// `network::regtest()` and the zebra config the harness launches (`zebrad_toml`): NU5/NU6 from
+    /// height 1, NU6.1/NU6.2 at [`NU6_2_ACTIVATION_HEIGHT`], NU6.3 (Ironwood) at
+    /// [`NU6_3_ACTIVATION_HEIGHT`] - any drift makes the validator reject the funder's transactions.
+    fn write_activation_heights(&self) -> Result<String> {
+        let path = self.dir.path().join("activation-heights.toml");
+        let toml = format!(
+            "overwinter = 1\n\
+             sapling = 1\n\
+             blossom = 1\n\
+             heartwood = 1\n\
+             canopy = 1\n\
+             nu5 = 1\n\
+             nu6 = 1\n\
+             nu6_1 = {nu62}\n\
+             nu6_2 = {nu62}\n\
+             nu6_3 = {nu63}\n",
+            nu62 = NU6_2_ACTIVATION_HEIGHT,
+            nu63 = NU6_3_ACTIVATION_HEIGHT,
+        );
+        std::fs::write(&path, toml).context("write activation-heights.toml")?;
+        Ok(path.to_string_lossy().into_owned())
     }
 
     fn identity(&self) -> String {
@@ -589,6 +688,62 @@ impl Funder {
             .args(&args)
             .output()
             .with_context(|| format!("spawn devtool {subcommand}"))?;
+        if !output.status.success() {
+            bail!(
+                "devtool {subcommand} failed ({}):\nstdout: {}\nstderr: {}",
+                output.status,
+                String::from_utf8_lossy(&output.stdout),
+                tail(&String::from_utf8_lossy(&output.stderr), 30),
+            );
+        }
+        Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+    }
+
+    /// Like [`Funder::run`], but pipes `stdin_data` to the child's stdin (then closes it, signalling
+    /// EOF). Used for the newer devtool `init`, which reads the mnemonic phrase from stdin instead of
+    /// a `--mnemonic` flag when stdin is not a terminal (as under `cargo test`).
+    fn run_with_stdin(
+        &self,
+        subcommand: &str,
+        extra: &[&str],
+        lwd_port: Option<u16>,
+        stdin_data: &str,
+    ) -> Result<String> {
+        use std::io::Write;
+        use std::process::Stdio;
+
+        let mut args: Vec<String> = vec![
+            "wallet".into(),
+            "-w".into(),
+            self.wallet_dir(),
+            subcommand.into(),
+        ];
+        args.extend(extra.iter().map(|s| s.to_string()));
+        if let Some(port) = lwd_port {
+            args.extend([
+                "--server".into(),
+                format!("127.0.0.1:{port}"),
+                "--connection".into(),
+                "direct".into(),
+            ]);
+        }
+        let mut child = Command::new(&self.bin)
+            .args(&args)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .with_context(|| format!("spawn devtool {subcommand}"))?;
+        {
+            let mut stdin = child.stdin.take().context("devtool stdin not piped")?;
+            stdin
+                .write_all(stdin_data.as_bytes())
+                .with_context(|| format!("write stdin to devtool {subcommand}"))?;
+            // Dropping `stdin` here closes the pipe, so the child sees EOF after the phrase.
+        }
+        let output = child
+            .wait_with_output()
+            .with_context(|| format!("wait for devtool {subcommand}"))?;
         if !output.status.success() {
             bail!(
                 "devtool {subcommand} failed ({}):\nstdout: {}\nstderr: {}",
@@ -1483,7 +1638,7 @@ fn write_zecd_toml(datadir: &Path, cfg: &ZecdConfig) -> Result<()> {
         ));
     }
     // Optional [pools] section (multi-pool / Sapling e2e, and/or transparent receiving); omitted
-    // entirely → Orchard-only, no transparent.
+    // entirely -> Orchard-only, no transparent.
     let pools = if cfg.pools.is_some() || cfg.transparent {
         let mut s = String::from("\n[pools]\n");
         if let Some((enabled, receivers)) = &cfg.pools {

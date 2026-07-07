@@ -16,7 +16,7 @@ use std::future::Future;
 use zcash_client_backend::proto::compact_formats::CompactBlock;
 use zcash_client_backend::proto::service;
 use zcash_protocol::consensus::BlockHeight;
-use zcash_protocol::{ShieldedProtocol, TxId};
+use zcash_protocol::{ShieldedPool, TxId};
 
 /// The chain tip as reported by the upstream. `hash` is in internal byte order (reverse of
 /// the familiar display hex); it may be empty if the upstream didn't report one.
@@ -121,7 +121,7 @@ pub trait ChainSource: Send {
     ) -> impl Future<Output = anyhow::Result<service::TreeState>> + Send;
 
     /// Stream the compact blocks for `start..=end` in order (lightwalletd `GetBlockRange`;
-    /// zebra `getblock` + local full-block→CompactBlock conversion).
+    /// zebra `getblock` + local full-block->CompactBlock conversion).
     ///
     /// When `include_transparent` is set, each streamed item also carries the block's transparent
     /// outputs (see [`CompactBlockStream::next`]) so the caller can discover transparent receives
@@ -139,7 +139,7 @@ pub trait ChainSource: Send {
     /// `GetSubtreeRoots`; zebra `z_getsubtreesbyindex`).
     fn subtree_roots(
         &mut self,
-        protocol: ShieldedProtocol,
+        protocol: ShieldedPool,
     ) -> impl Future<Output = anyhow::Result<Vec<SubtreeRootInfo>>> + Send;
 
     /// Upstream identity/liveness (lightwalletd `GetLightdInfo`; zebra `getblockchaininfo`).
@@ -223,7 +223,7 @@ impl ChainSource for AnySource {
 
     async fn subtree_roots(
         &mut self,
-        protocol: ShieldedProtocol,
+        protocol: ShieldedPool,
     ) -> anyhow::Result<Vec<SubtreeRootInfo>> {
         match self {
             AnySource::Zebra(s) => s.subtree_roots(protocol).await,
