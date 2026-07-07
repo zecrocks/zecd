@@ -13,7 +13,7 @@ use zcash_keys::address::{Address, UnifiedAddress};
 use zcash_keys::encoding::AddressCodec as _;
 use zcash_keys::keys::UnifiedFullViewingKey;
 use zcash_primitives::transaction::builder::DEFAULT_TX_EXPIRY_DELTA;
-use zcash_protocol::{ShieldedProtocol, TxId};
+use zcash_protocol::{ShieldedPool, TxId};
 use zip32::{DiversifierIndex, Scope};
 
 use crate::network::ZNetwork;
@@ -24,6 +24,11 @@ use crate::wallet::open::{data_db_path, open_read};
 pub struct BalanceInfo {
     pub orchard_spendable: u64,
     pub sapling_spendable: u64,
+    /// Ironwood (NU6.3, Orchard V3) spendable value. Read from `AccountBalance::ironwood_balance()`,
+    /// which the pinned scan-model librustzcash rev surfaces (the same API devtool reads). 0 until
+    /// NU6.3 activates and the wallet holds ironwood notes.
+    #[cfg(feature = "ironwood")]
+    pub ironwood_spendable: u64,
     /// Spendable transparent (unshielded) value. Spendable here means "usable as an input": zecd
     /// spends transparent UTXOs by auto-shielding them into a shielded send.
     pub transparent_spendable: u64,
@@ -77,9 +82,29 @@ pub fn balance(
                     .unshielded_balance()
                     .change_pending_confirmation()
                     .into_u64();
+            // Ironwood (Orchard V3) balance. The pinned librustzcash ironwood line (the
+            // `dw/ironwood-scan-model` rev zcash-devtool builds against) rolls received ironwood
+            // notes into `AccountBalance::ironwood_balance()`, exactly as devtool's `balance.rs`
+            // reads it; sum it into the spendable/pending/immature buckets like the other pools.
+            #[cfg(feature = "ironwood")]
+            {
+                info.ironwood_spendable += bal.ironwood_balance().spendable_value().into_u64();
+                info.pending += bal
+                    .ironwood_balance()
+                    .value_pending_spendability()
+                    .into_u64();
+                info.immature += bal
+                    .ironwood_balance()
+                    .change_pending_confirmation()
+                    .into_u64();
+            }
         }
         info.total_spendable =
             info.orchard_spendable + info.sapling_spendable + info.transparent_spendable;
+        #[cfg(feature = "ironwood")]
+        {
+            info.total_spendable += info.ironwood_spendable;
+        }
     }
     Ok(info)
 }
@@ -182,6 +207,14 @@ pub struct UnspentNote {
     /// The diversified address the note was received on, when the wallet recorded one
     /// (change/internal notes have none).
     pub address: Option<String>,
+    /// The shielded pool the note is in, as a `v_tx_outputs.output_pool` code: 2 = Sapling,
+    /// 3 = Orchard, 4 = ironwood (NU6.3). Sourced from `v_tx_outputs.output_pool` (the
+    /// `ironwood_pool_code_views` migration tags ironwood outputs 4). Ironwood is a first-class pool
+    /// in the pinned librustzcash line: a received ironwood note lives in `ironwood_received_notes`
+    /// and comes back from `select_unspent_notes` in `ReceivedNotes::ironwood()` (a separate
+    /// accessor from `orchard()`), so `list_unspent` must request `ShieldedPool::Ironwood` and read
+    /// that accessor to surface it. Surfaced as `listunspent`'s `pool`.
+    pub pool: i64,
 }
 
 fn open_conn(wallet_dir: &Path) -> anyhow::Result<Connection> {
@@ -636,7 +669,7 @@ pub fn first_scanned_block(wallet_dir: &Path) -> anyhow::Result<Option<(u32, Str
     Ok(row.map(|(h, hash)| (h, txid_display(&hash))))
 }
 
-/// Whether `display_hash` is a syntactically valid block-hash string (64 hex chars → 32
+/// Whether `display_hash` is a syntactically valid block-hash string (64 hex chars -> 32
 /// bytes). `listsinceblock` uses this to tell a reorged-away cursor (well-formed, whose
 /// `blocks` row `perform_rewind` deleted - worth surviving) from a malformed client argument
 /// (still `-5`).
@@ -688,9 +721,13 @@ pub fn list_unspent(network: ZNetwork, wallet_dir: &Path) -> anyhow::Result<Vec<
     // A negative balance delta means the wallet spent notes in the tx, i.e. it authored it.
     let mut tx_meta: HashMap<String, (Option<u32>, bool)> = HashMap::new();
     // Map (txid, output index) -> receiving address for the shielded outputs the wallet recorded
-    // one for (change/internal notes have none). Spans every shielded pool (2 = Sapling,
-    // 3 = Orchard).
+    // one for (change/internal notes have none), plus -> shielded pool code for every shielded
+    // output (2 = Sapling, 3 = Orchard, 4 = ironwood). The pool map is keyed off
+    // `v_tx_outputs.output_pool` (the valar fork's `ironwood_pool_code_views` migration tags
+    // ironwood 4) rather than the note's protocol, so an ironwood (Orchard V3) note - which
+    // librustzcash returns in `ReceivedNotes::ironwood()` (its own accessor) - is labelled ironwood.
     let mut out_addr: HashMap<(String, u32), String> = HashMap::new();
+    let mut out_pool: HashMap<(String, u32), i64> = HashMap::new();
     {
         let conn = open_conn(wallet_dir)?;
         let mut stmt =
@@ -707,36 +744,54 @@ pub fn list_unspent(network: ZNetwork, wallet_dir: &Path) -> anyhow::Result<Vec<
             tx_meta.insert(txid_display(&txid), (mh, delta < 0));
         }
         let mut stmt = conn.prepare(
-            "SELECT txid, output_index, to_address FROM v_tx_outputs
-             WHERE output_pool IN (2, 3) AND to_address IS NOT NULL",
+            "SELECT txid, output_index, output_pool, to_address FROM v_tx_outputs
+             WHERE output_pool IN (2, 3, 4)",
         )?;
         let rows = stmt.query_map([], |r| {
             Ok((
                 r.get::<_, Vec<u8>>(0)?,
                 r.get::<_, u32>(1)?,
-                r.get::<_, String>(2)?,
+                r.get::<_, i64>(2)?,
+                r.get::<_, Option<String>>(3)?,
             ))
         })?;
         for row in rows {
-            let (txid, idx, addr) = row?;
-            out_addr.insert((txid_display(&txid), idx), addr);
+            let (txid, idx, pool, addr) = row?;
+            let txid = txid_display(&txid);
+            out_pool.insert((txid.clone(), idx), pool);
+            if let Some(addr) = addr {
+                out_addr.insert((txid, idx), addr);
+            }
         }
     }
 
     let mut out = Vec::new();
     // All shielded pools zecd supports; a note only exists if the wallet received it, so querying
     // every pool is safe regardless of which pools are enabled in config.
-    let protocols: Vec<ShieldedProtocol> = crate::pools::Pool::SUPPORTED
+    #[allow(unused_mut)]
+    let mut protocols: Vec<ShieldedPool> = crate::pools::Pool::SUPPORTED
         .iter()
         .filter_map(|p| p.shielded_protocol())
         .collect();
+    // Ironwood (NU6.3, Orchard V3) is a first-class pool in the pinned librustzcash line: its notes
+    // live in the separate `ironwood_received_notes` table and are returned by
+    // `SpendableNotes::ironwood()`, *not* folded into `orchard()`. `select_unspent_notes` only
+    // queries a pool when it appears in `sources`, so an ironwood receive is invisible to
+    // `listunspent` unless we ask for it here (and read `notes.ironwood()` below). It is not a
+    // `Pool::SUPPORTED` member (ironwood has no UA receiver - see `pools.rs`), so add it explicitly.
+    #[cfg(feature = "ironwood")]
+    protocols.push(ShieldedPool::Ironwood);
     for account in db.get_account_ids()? {
         let notes = db.select_unspent_notes(account, &protocols, target_height, &[])?;
         // Both `notes.sapling()` and `notes.orchard()` yield `ReceivedNote`s with the same
         // `txid`/`output_index`/`note_value` surface; collect each into the shared output list.
-        let mut push = |txid: String, vout: u32, value: u64| {
+        // `default_pool` is the note's protocol pool (2 Sapling / 3 Orchard); the per-output
+        // `out_pool` map overrides it so an ironwood (Orchard V3) note is labelled 4.
+        let mut push = |txid: String, vout: u32, value: u64, default_pool: i64| {
             let (mined_height, trusted) = tx_meta.get(&txid).copied().unwrap_or((None, false));
-            let address = out_addr.get(&(txid.clone(), vout)).cloned();
+            let key = (txid.clone(), vout);
+            let address = out_addr.get(&key).cloned();
+            let pool = out_pool.get(&key).copied().unwrap_or(default_pool);
             out.push(UnspentNote {
                 vout,
                 txid,
@@ -744,6 +799,7 @@ pub fn list_unspent(network: ZNetwork, wallet_dir: &Path) -> anyhow::Result<Vec<
                 mined_height,
                 trusted,
                 address,
+                pool,
             });
         };
         for note in notes.sapling() {
@@ -751,14 +807,40 @@ pub fn list_unspent(network: ZNetwork, wallet_dir: &Path) -> anyhow::Result<Vec<
                 .note_value()
                 .map_err(|e| anyhow!("note value: {e:?}"))?
                 .into_u64();
-            push(note.txid().to_string(), note.output_index() as u32, value);
+            push(
+                note.txid().to_string(),
+                note.output_index() as u32,
+                value,
+                2,
+            );
         }
         for note in notes.orchard() {
             let value = note
                 .note_value()
                 .map_err(|e| anyhow!("note value: {e:?}"))?
                 .into_u64();
-            push(note.txid().to_string(), note.output_index() as u32, value);
+            push(
+                note.txid().to_string(),
+                note.output_index() as u32,
+                value,
+                3,
+            );
+        }
+        // Ironwood notes are Orchard-shaped (`ReceivedNote<_, orchard::note::Note>`) but returned in
+        // their own `ironwood()` accessor; label them pool code 4 (the `out_pool` map overrides this
+        // with the recorded `v_tx_outputs.output_pool` when present, which is also 4).
+        #[cfg(feature = "ironwood")]
+        for note in notes.ironwood() {
+            let value = note
+                .note_value()
+                .map_err(|e| anyhow!("note value: {e:?}"))?
+                .into_u64();
+            push(
+                note.txid().to_string(),
+                note.output_index() as u32,
+                value,
+                4,
+            );
         }
     }
 
@@ -777,20 +859,34 @@ pub fn list_unspent(network: ZNetwork, wallet_dir: &Path) -> anyhow::Result<Vec<
         let target = u32::from(chain_height) + 1;
         // Per-pool table/column names differ only in three identifiers (note table, spend table,
         // FK column, and the output-index column), so run the same query shape for each pool.
-        let pools: &[(&str, &str, &str, &str)] = &[
+        #[allow(unused_mut)]
+        let mut pools: Vec<(&str, &str, &str, &str, i64)> = vec![
             (
                 "sapling_received_notes",
                 "sapling_received_note_spends",
                 "sapling_received_note_id",
                 "output_index",
+                2,
             ),
             (
                 "orchard_received_notes",
                 "orchard_received_note_spends",
                 "orchard_received_note_id",
                 "action_index",
+                3,
             ),
         ];
+        // An unmined ironwood note is stored in its own `ironwood_received_notes` table (not
+        // `orchard_received_notes`), so a 0-conf ironwood receive from the mempool stream is only
+        // visible if we query that table too. Same query shape; pool code 4.
+        #[cfg(feature = "ironwood")]
+        pools.push((
+            "ironwood_received_notes",
+            "ironwood_received_note_spends",
+            "ironwood_received_note_id",
+            "action_index",
+            4,
+        ));
         // Both the note's own creating tx and any spending tx are gated by the shared
         // `tx_unexpired_sql` predicate, so this supplement and the rebroadcast set agree with the
         // selector/balances on exactly what "unexpired" means (incl. the unknown-expiry staleness
@@ -799,7 +895,7 @@ pub fn list_unspent(network: ZNetwork, wallet_dir: &Path) -> anyhow::Result<Vec<
         // releases the note again.
         let unexpired_t = tx_unexpired_sql("t");
         let unexpired_stx = tx_unexpired_sql("stx");
-        for (note_table, spend_table, fk_col, index_col) in pools {
+        for (note_table, spend_table, fk_col, index_col, default_pool) in &pools {
             let sql = format!(
                 "SELECT t.txid, rn.{index_col}, rn.value
                  FROM {note_table} rn
@@ -828,7 +924,11 @@ pub fn list_unspent(network: ZNetwork, wallet_dir: &Path) -> anyhow::Result<Vec<
                     continue;
                 }
                 let (mined_height, trusted) = tx_meta.get(&txid).copied().unwrap_or((None, false));
-                let address = out_addr.get(&(txid.clone(), vout)).cloned();
+                let key = (txid.clone(), vout);
+                let address = out_addr.get(&key).cloned();
+                // An unmined ironwood note may not yet have its v_tx_outputs row, so fall back to
+                // the note table's protocol pool (Orchard); it relabels to ironwood once mined.
+                let pool = out_pool.get(&key).copied().unwrap_or(*default_pool);
                 out.push(UnspentNote {
                     vout,
                     txid,
@@ -836,6 +936,7 @@ pub fn list_unspent(network: ZNetwork, wallet_dir: &Path) -> anyhow::Result<Vec<
                     mined_height,
                     trusted,
                     address,
+                    pool,
                 });
             }
         }
@@ -881,6 +982,7 @@ pub fn list_unspent(network: ZNetwork, wallet_dir: &Path) -> anyhow::Result<Vec<
                 mined_height,
                 trusted,
                 address: Some(address),
+                pool: 0, // transparent
             });
         }
     }

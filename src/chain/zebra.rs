@@ -5,7 +5,7 @@
 //! | operation             | zebrad JSON-RPC                                            |
 //! |-----------------------|------------------------------------------------------------|
 //! | `latest_block`        | `getblockchaininfo` (height + best hash)                   |
-//! | `tree_state`          | `z_gettreestate` (finalState hex → protobuf `TreeState`)   |
+//! | `tree_state`          | `z_gettreestate` (finalState hex -> protobuf `TreeState`)   |
 //! | `compact_block_range` | `getblock verbosity=0` (raw block, parsed + compacted      |
 //! |                       | locally) + `getblock verbosity=1` (`trees` sizes)          |
 //! | `subtree_roots`       | `z_getsubtreesbyindex`                                     |
@@ -16,7 +16,7 @@
 //! |                       | closes when `getbestblockhash` changes (lightwalletd       |
 //! |                       | parity: stream-close is the actor's sync-now signal)       |
 //!
-//! The full-block→CompactBlock conversion ([`block_to_compact`]) is the part lightwalletd
+//! The full-block->CompactBlock conversion ([`block_to_compact`]) is the part lightwalletd
 //! otherwise does for us: parse the raw block (`zcash_primitives::block::Block`), then per
 //! transaction extract the trial-decryption fields via librustzcash's own `From` impls
 //! (Sapling nullifier/cmu/epk + 52-byte ciphertext prefix; Orchard nullifier/cmx/epk +
@@ -49,7 +49,7 @@ use zcash_client_backend::proto::compact_formats as pb;
 use zcash_client_backend::proto::service;
 use zcash_primitives::block::Block;
 use zcash_protocol::consensus::BlockHeight;
-use zcash_protocol::{ShieldedProtocol, TxId};
+use zcash_protocol::{ShieldedPool, TxId};
 
 use super::{
     BroadcastOutcome, ChainSource, ChainTip, CompactBlockStream, FetchedTx, MempoolStream,
@@ -175,7 +175,7 @@ pub struct CleartextPolicy {
     /// Treat private / non-globally-routable addresses (RFC1918 `10/172.16/192.168`, link-local,
     /// CGNAT `100.64/10`, IPv6 unique-local `fc00::/7` and link-local `fe80::/10`) as "local", so
     /// a credentialed connect to a container/LAN zebra is allowed without an override. Default
-    /// `true` (matches the self-hosted `zebra → zecd` Docker/LAN norm); set `false` for a strict
+    /// `true` (matches the self-hosted `zebra -> zecd` Docker/LAN norm); set `false` for a strict
     /// loopback-only posture. `[backend] rfc1918_is_local`.
     pub rfc1918_is_local: bool,
     /// Allow credentials over cleartext to *any* host, including globally-routable ones - the
@@ -393,7 +393,7 @@ impl ZebraClient {
     /// The note-commitment-tree sizes after this block, from `getblock verbosity=1`'s
     /// `trees` field - the same place lightwalletd gets `chain_metadata` from. Queried by
     /// hash (not height) so the sizes can't race a reorg against the raw-block fetch.
-    async fn block_trees(&self, hash: &str) -> anyhow::Result<(u32, u32)> {
+    async fn block_trees(&self, hash: &str) -> anyhow::Result<(u32, u32, u32)> {
         let verbose: VerboseBlock = self.call_as("getblock", json!([hash, 1])).await?;
         let trees = verbose.trees.unwrap_or_default();
         // A pool that isn't active yet at this block is reported by zebra as an empty object
@@ -408,6 +408,7 @@ impl ZebraClient {
         Ok((
             trees.sapling.and_then(|t| t.size).unwrap_or(0),
             trees.orchard.and_then(|t| t.size).unwrap_or(0),
+            trees.ironwood.and_then(|t| t.size).unwrap_or(0),
         ))
     }
 }
@@ -431,6 +432,10 @@ struct Trees {
     sapling: Option<TreeSize>,
     #[serde(default)]
     orchard: Option<TreeSize>,
+    // Present only on the zebra ironwood branch (its `trees` gains an ironwood entry). Absent on
+    // stock zebra -> `None` -> size 0, which is correct pre-activation and in the default build.
+    #[serde(default)]
+    ironwood: Option<TreeSize>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -448,6 +453,11 @@ struct TreeStateReply {
     sapling: Option<PoolTreeState>,
     #[serde(default)]
     orchard: Option<PoolTreeState>,
+    // Present only when the upstream serves an ironwood treestate (zebra's ironwood branch). Stock
+    // zebra omits the field, so `Option` + `unwrap_or_default()` yields an empty tree (= pool not
+    // active) - safe to deserialize against either backend.
+    #[serde(default)]
+    ironwood: Option<PoolTreeState>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -521,6 +531,28 @@ impl ZebraSource {
         })
     }
 
+    /// Fetch all completed note-commitment-subtree roots for a zebra pool label
+    /// (`"sapling"`/`"orchard"`/`"ironwood"`) via `z_getsubtreesbyindex` from index 0.
+    async fn subtree_roots_for_pool(&mut self, pool: &str) -> anyhow::Result<Vec<SubtreeRootInfo>> {
+        // start_index 0, no limit: all completed subtrees (what lightwalletd serves).
+        let reply: SubtreesReply = self
+            .client
+            .call_as("z_getsubtreesbyindex", json!([pool, 0]))
+            .await?;
+        reply
+            .subtrees
+            .into_iter()
+            .map(|s| {
+                Ok(SubtreeRootInfo {
+                    // Subtree roots are node hashes, not txids/block hashes: the hex is NOT
+                    // byte-reversed (lightwalletd decodes it verbatim too).
+                    root_hash: hex::decode(&s.root).context("decoding subtree root hex")?,
+                    completing_height: s.end_height,
+                })
+            })
+            .collect()
+    }
+
     #[cfg(test)]
     fn with_mempool_poll(mut self, poll: Duration) -> Self {
         self.mempool_poll = poll;
@@ -567,6 +599,9 @@ impl ChainSource for ZebraSource {
             time: reply.time,
             sapling_tree: reply.sapling.unwrap_or_default().final_state(),
             orchard_tree: reply.orchard.unwrap_or_default().final_state(),
+            // Maps the upstream ironwood treestate when present (zebra's ironwood branch). Empty
+            // (= pool not active) against stock zebra and in the released-mode default build.
+            ironwood_tree: reply.ironwood.unwrap_or_default().final_state(),
         })
     }
 
@@ -587,29 +622,18 @@ impl ChainSource for ZebraSource {
 
     async fn subtree_roots(
         &mut self,
-        protocol: ShieldedProtocol,
+        protocol: ShieldedPool,
     ) -> anyhow::Result<Vec<SubtreeRootInfo>> {
         let pool = match protocol {
-            ShieldedProtocol::Sapling => "sapling",
-            ShieldedProtocol::Orchard => "orchard",
+            ShieldedPool::Sapling => "sapling",
+            ShieldedPool::Orchard => "orchard",
+            // `ShieldedPool` is non-exhaustive at the librustzcash level now that Ironwood is a
+            // variant. Ironwood subtree roots are not pre-seeded (the scan-model upstream builds the
+            // Ironwood tree during `put_blocks`), so nothing calls this arm with Ironwood today; map
+            // the pool name for completeness.
+            ShieldedPool::Ironwood => "ironwood",
         };
-        // start_index 0, no limit: all completed subtrees (what lightwalletd serves).
-        let reply: SubtreesReply = self
-            .client
-            .call_as("z_getsubtreesbyindex", json!([pool, 0]))
-            .await?;
-        reply
-            .subtrees
-            .into_iter()
-            .map(|s| {
-                Ok(SubtreeRootInfo {
-                    // Subtree roots are node hashes, not txids/block hashes: the hex is NOT
-                    // byte-reversed (lightwalletd decodes it verbatim too).
-                    root_hash: hex::decode(&s.root).context("decoding subtree root hex")?,
-                    completing_height: s.end_height,
-                })
-            })
-            .collect()
+        self.subtree_roots_for_pool(pool).await
     }
 
     async fn server_info(&mut self) -> anyhow::Result<ServerInfo> {
@@ -790,7 +814,7 @@ impl ZebraBlockStream {
                 u16::MAX,
             );
         }
-        let (sapling_size, orchard_size) = self
+        let (sapling_size, orchard_size, ironwood_size) = self
             .client
             .block_trees(&block.header().hash().to_string())
             .await?;
@@ -802,11 +826,9 @@ impl ZebraBlockStream {
         } else {
             Vec::new()
         };
+        let compact = block_to_compact(&block, sapling_size, orchard_size, ironwood_size);
         self.next += 1;
-        Ok(Some((
-            block_to_compact(&block, sapling_size, orchard_size),
-            transparent,
-        )))
+        Ok(Some((compact, transparent)))
     }
 }
 
@@ -840,7 +862,12 @@ fn block_transparent_outputs(block: &Block, height: u32) -> Vec<crate::chain::Tr
 /// end-of-block commitment-tree sizes as `chain_metadata`. Like current lightwalletd, every
 /// transaction is included (transparent-only ones simply carry no shielded elements; the
 /// scanner ignores them) and `index` is the tx's position in the block.
-pub fn block_to_compact(block: &Block, sapling_size: u32, orchard_size: u32) -> pb::CompactBlock {
+pub fn block_to_compact(
+    block: &Block,
+    sapling_size: u32,
+    orchard_size: u32,
+    ironwood_size: u32,
+) -> pb::CompactBlock {
     let header = block.header();
     let vtx = block
         .vtx()
@@ -862,12 +889,20 @@ pub fn block_to_compact(block: &Block, sapling_size: u32, orchard_size: u32) -> 
                 .orchard_bundle()
                 .map(|b| b.actions().iter().map(Into::into).collect())
                 .unwrap_or_default(),
+            // Ironwood (V6) bundle actions reuse Orchard's action/note crypto, so the same
+            // `CompactOrchardAction` conversion applies and the scanner reads them. Upstream now
+            // exposes `Transaction::ironwood_bundle()` and the `CompactTx.ironwood_actions` proto
+            // field unconditionally; pre-activation blocks carry no ironwood bundle, so the default
+            // build simply emits an empty list (behavior unchanged) until NU6.3 is active.
+            ironwood_actions: tx
+                .ironwood_bundle()
+                .map(|b| b.actions().iter().map(Into::into).collect())
+                .unwrap_or_default(),
             vin: vec![],
             vout: vec![],
         })
         .collect();
     pb::CompactBlock {
-        proto_version: 0,
         height: u64::from(u32::from(block.claimed_height())),
         hash: header.hash().0.to_vec(),
         prev_hash: header.prev_block.0.to_vec(),
@@ -877,6 +912,9 @@ pub fn block_to_compact(block: &Block, sapling_size: u32, orchard_size: u32) -> 
         chain_metadata: Some(pb::ChainMetadata {
             sapling_commitment_tree_size: sapling_size,
             orchard_commitment_tree_size: orchard_size,
+            // From the block's ironwood tree size (the zebra ironwood branch's `trees` ironwood
+            // entry). 0 pre-activation and on stock zebra - the only case the default build sees.
+            ironwood_commitment_tree_size: ironwood_size,
         }),
     }
 }
@@ -1167,9 +1205,9 @@ mod tests {
         subtrees: Value,
         mempool: Vec<String>,
         raw_txs: HashMap<String, Value>,
-        /// `getaddresstxids` responses keyed by transparent address → display-hex txids.
+        /// `getaddresstxids` responses keyed by transparent address -> display-hex txids.
         addr_txids: HashMap<String, Vec<String>>,
-        /// `getaddressutxos` responses keyed by transparent address → UTXO objects
+        /// `getaddressutxos` responses keyed by transparent address -> UTXO objects
         /// (`{txid, outputIndex, script, satoshis, height}`).
         addr_utxos: HashMap<String, Vec<Value>>,
         /// `Err((code, message))` makes `sendrawtransaction` reject.
@@ -1410,8 +1448,8 @@ mod tests {
 
     /// Regression guard for the tip-advance step of the -25 (already-expired) send fix: a
     /// spend's expiry height is derived from the wallet DB's chain tip, so before building one
-    /// the actor pulls the upstream's *real* tip into the DB and scans up to it (`do_send` →
-    /// `sync_to_tip_for_send` → `fetch_and_store_chain_tip`, then a catch-up scan). This covers
+    /// the actor pulls the upstream's *real* tip into the DB and scans up to it (`do_send` ->
+    /// `sync_to_tip_for_send` -> `fetch_and_store_chain_tip`, then a catch-up scan). This covers
     /// the tip-advance half: the DB starts at a stale height far below the upstream's, and one
     /// call must advance it to the upstream tip (the actor then scans the gap so the anchor is
     /// valid too). If the tip didn't advance, a send would expire against the stale height.
@@ -1628,7 +1666,7 @@ mod tests {
             ],
         });
         let mut src = source_for(fake).await;
-        let roots = src.subtree_roots(ShieldedProtocol::Orchard).await.unwrap();
+        let roots = src.subtree_roots(ShieldedPool::Orchard).await.unwrap();
         assert_eq!(roots.len(), 2);
         // Subtree roots are node hashes: decoded verbatim, never byte-reversed.
         assert_eq!(roots[0].root_hash, vec![0x0a, 0x0b, 0x0c]);

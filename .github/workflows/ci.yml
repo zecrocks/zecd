@@ -105,3 +105,25 @@ jobs:
 
       - name: Check at MSRV
         run: cargo check --all-targets
+
+  # Guards the DEV-ONLY ironwood / NU6.3 build. The default tier above builds the pinned official
+  # zcash/librustzcash RC in released-equivalent mode (NU6.3 inactive); this job clippy-checks the
+  # `ironwood` feature so the ironwood scaffolding (scan/balance/send paths) can't silently bit-rot.
+  # Upstream exposes the ironwood APIs unconditionally, so the feature alone gates zecd's paths - no
+  # `zcash_unstable="nu6.3"` cfg is needed any more (the old valar-fork approach is retired).
+  ironwood:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install protobuf compiler
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Clippy (--features ironwood)
+        run: cargo clippy --features ironwood --all-targets -- -D warnings

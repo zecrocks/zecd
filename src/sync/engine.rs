@@ -41,11 +41,11 @@ use zcash_client_backend::data_api::{
 };
 use zcash_client_backend::wallet::WalletTransparentOutput;
 use zcash_client_sqlite::error::SqliteClientError;
-use zcash_client_sqlite::{chain::BlockMeta, FsBlockDb, FsBlockDbError};
+use zcash_client_sqlite::{chain::BlockMeta, AccountUuid, FsBlockDb, FsBlockDbError};
 use zcash_primitives::merkle_tree::HashSer;
 use zcash_protocol::consensus::BlockHeight;
 use zcash_protocol::value::Zatoshis;
-use zcash_protocol::{ShieldedProtocol, TxId};
+use zcash_protocol::{ShieldedPool, TxId};
 use zcash_transparent::address::TransparentAddress;
 
 use crate::chain::ChainSource;
@@ -61,7 +61,7 @@ pub async fn update_subtree_roots<C: ChainSource>(
     db_data: &mut WriteDb,
 ) -> anyhow::Result<()> {
     let sapling_roots: Vec<CommitmentTreeRoot<sapling::Node>> = client
-        .subtree_roots(ShieldedProtocol::Sapling)
+        .subtree_roots(ShieldedPool::Sapling)
         .await?
         .into_iter()
         .map(|root| {
@@ -75,7 +75,7 @@ pub async fn update_subtree_roots<C: ChainSource>(
     db_data.put_sapling_subtree_roots(0, &sapling_roots)?;
 
     let orchard_roots: Vec<CommitmentTreeRoot<MerkleHashOrchard>> = client
-        .subtree_roots(ShieldedProtocol::Orchard)
+        .subtree_roots(ShieldedPool::Orchard)
         .await?
         .into_iter()
         .map(|root| {
@@ -87,6 +87,13 @@ pub async fn update_subtree_roots<C: ChainSource>(
         })
         .collect::<std::io::Result<_>>()?;
     db_data.put_orchard_subtree_roots(0, &orchard_roots)?;
+
+    // Ironwood has no separate subtree-root seeding pass: the `dw/ironwood-scan-model` upstream
+    // populates the Ironwood note-commitment shardtree directly during `put_blocks` (received
+    // Ironwood notes are stored as blocks are scanned), and it exposes no `put_ironwood_subtree_roots`
+    // API to pre-seed roots from `z_getsubtreesbyindex "ironwood"` the way Sapling/Orchard do. On
+    // the short regtest chain this is equivalent; a from-genesis scan builds the tree. If upstream
+    // later adds an Ironwood subtree-root writer, reinstate a pass here (behind `feature = "ironwood"`).
 
     Ok(())
 }
@@ -105,14 +112,24 @@ pub fn owned_transparent_output(
     value_zat: u64,
     script: Vec<u8>,
     height: Option<u32>,
-) -> Option<WalletTransparentOutput> {
+) -> Option<WalletTransparentOutput<AccountUuid>> {
     use zcash_transparent::address::Script;
     use zcash_transparent::bundle::{OutPoint, TxOut};
     let value = Zatoshis::from_u64(value_zat).ok()?;
     let outpoint = OutPoint::new(*txid.as_ref(), index);
     let txout = TxOut::new(value, Script(zcash_script::script::Code(script)));
-    let output =
-        WalletTransparentOutput::from_parts(outpoint, txout, height.map(BlockHeight::from_u32))?;
+    // The valar fork's `from_parts` takes three extra args (recipient_account,
+    // recipient_key_scope, funding_account); a chain-discovered UTXO doesn't know them, and
+    // `put_received_transparent_utxo` re-derives the owning account, so `None` matches the
+    // released 3-arg behavior. `<AccountUuid>` pins the otherwise-unconstrained account type.
+    let output = WalletTransparentOutput::from_parts(
+        outpoint,
+        txout,
+        height.map(BlockHeight::from_u32),
+        None,
+        None,
+        None,
+    )?;
     addresses
         .contains(output.recipient_address())
         .then_some(output)
@@ -125,7 +142,7 @@ async fn download_blocks<C: ChainSource>(
     db_cache: &mut FsBlockDb,
     scan_range: &ScanRange,
     transparent: Option<&HashSet<TransparentAddress>>,
-) -> anyhow::Result<(Vec<BlockMeta>, Vec<WalletTransparentOutput>)> {
+) -> anyhow::Result<(Vec<BlockMeta>, Vec<WalletTransparentOutput<AccountUuid>>)> {
     info!("[{name}] Fetching {scan_range}");
     let mut stream = client
         .compact_block_range(
@@ -200,7 +217,7 @@ async fn download_chain_state<C: ChainSource>(
 /// worse - a later reorg's `with_blocks` pass would try to open those now-fileless rows and
 /// fail with `NotFound` before the rewind's `truncate_to_height` could run, so the intended
 /// in-place reorg recovery never completed. Because sync processes one batch per call
-/// (download → scan → delete before the next), truncating to just below the batch's lowest
+/// (download -> scan -> delete before the next), truncating to just below the batch's lowest
 /// height removes exactly this batch's rows, so the table never accumulates.
 fn delete_cached_blocks(
     name: &str,
@@ -623,7 +640,6 @@ mod tests {
             ..Default::default()
         };
         let cb = pb::CompactBlock {
-            proto_version: 0,
             height: u64::from(height),
             hash: hash.to_vec(),
             prev_hash: prev.to_vec(),
@@ -633,6 +649,8 @@ mod tests {
             chain_metadata: Some(pb::ChainMetadata {
                 sapling_commitment_tree_size: 0,
                 orchard_commitment_tree_size: orchard_tree_size,
+                // Fabricated-chain test helper: no ironwood notes in these synthetic blocks.
+                ironwood_commitment_tree_size: 0,
             }),
         };
         let meta = BlockMeta {
@@ -651,11 +669,15 @@ mod tests {
     }
 
     fn chain_state(height: u32, hash: [u8; 32], orchard: &OrchardFrontier) -> ChainState {
+        // The pinned scan-model `ChainState::new` takes a 5th ironwood final-tree frontier (ironwood
+        // notes are tracked in a separate shardtree). Empty: the fabricated reorg-test chain has no
+        // ironwood notes.
         ChainState::new(
             BlockHeight::from_u32(height),
             BlockHash(hash),
             Frontier::empty(),
             orchard.clone(),
+            Frontier::empty(),
         )
     }
 

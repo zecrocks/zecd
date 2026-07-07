@@ -5,15 +5,21 @@
 //! Addresses it hands out should include (`default_receivers`). A default receiver may never name
 //! a pool that isn't enabled - that's a configuration error, caught at parse time.
 //!
-//! The [`Pool`] enum is deliberately a zecd-local type rather than `zcash_protocol::ShieldedProtocol`
-//! so that the upcoming **Ironwood** pool can be added as a single new variant: once
-//! `ShieldedProtocol::Ironwood` exists upstream, add `Pool::Ironwood`, fill in its mappings here,
-//! and the compiler's exhaustiveness checks will flag every site that needs a new arm.
+//! The [`Pool`] enum is a zecd-local type rather than `zcash_protocol::ShieldedPool`, and note
+//! that **Ironwood (NU6.3) is NOT a third [`Pool`] here** - even though upstream `ShieldedPool` now
+//! *does* carry an `Ironwood` variant. Upstream models ironwood as **Orchard "V3" notes**: it
+//! reuses Orchard's keys, addresses, and note cryptography, so there is no ironwood UA receiver
+//! typecode. Ironwood notes are *received at ordinary Orchard addresses*; the Orchard/ironwood
+//! distinction lives at the **transaction-bundle / note-version** level (a separate ironwood bundle
+//! in V6 transactions). So ironwood is a *balance + spend* concern, not an
+//! address-generation/receiver concern - it is surfaced in `wallet/read.rs` (balances), the
+//! `v_tx_outputs.output_pool` code 4 (`wallet_methods::pool_name`), and the V6 spend path
+//! (`wallet/actor.rs`), **not** by adding a variant to this enum. Keep `Pool` = {Sapling, Orchard}.
 
 use std::fmt;
 
 use zcash_keys::keys::{ReceiverRequirement, UnifiedAddressRequest};
-use zcash_protocol::{PoolType, ShieldedProtocol};
+use zcash_protocol::{PoolType, ShieldedPool};
 
 /// A value pool that a zecd wallet can receive into and spend from.
 ///
@@ -27,7 +33,8 @@ pub enum Pool {
     Transparent,
     Sapling,
     Orchard,
-    // future: Ironwood - add the variant here, then fill in every `match self` below.
+    // NB: Ironwood is deliberately NOT a variant - it is received at Orchard addresses and handled
+    // as a balance/spend dimension (an Orchard V3 note), not a UA receiver. See the module doc.
 }
 
 impl Pool {
@@ -59,11 +66,11 @@ impl Pool {
     }
 
     /// The librustzcash shielded-protocol identifier for this pool, or `None` for transparent.
-    pub fn shielded_protocol(&self) -> Option<ShieldedProtocol> {
+    pub fn shielded_protocol(&self) -> Option<ShieldedPool> {
         match self {
             Pool::Transparent => None,
-            Pool::Sapling => Some(ShieldedProtocol::Sapling),
-            Pool::Orchard => Some(ShieldedProtocol::Orchard),
+            Pool::Sapling => Some(ShieldedPool::Sapling),
+            Pool::Orchard => Some(ShieldedPool::Orchard),
         }
     }
 
@@ -140,7 +147,7 @@ impl PoolSet {
         Ok(Self { pools: ordered })
     }
 
-    /// Parse a list of config tokens into a validated set (unknown name → error, empty → error).
+    /// Parse a list of config tokens into a validated set (unknown name -> error, empty -> error).
     pub fn parse<S: AsRef<str>>(tokens: &[S]) -> anyhow::Result<Self> {
         if tokens.is_empty() {
             anyhow::bail!("at least one shielded pool is required");
@@ -194,17 +201,18 @@ impl PoolSet {
     }
 
     /// The pool to receive change into when spending. Prefer Orchard (the strongest pool) when
-    /// enabled, else the first enabled pool. (When Ironwood lands, revisit this precedence.)
-    pub fn change_pool(&self) -> ShieldedProtocol {
+    /// enabled, else the first enabled pool. (Ironwood change is an Orchard-V3 note, so it rides
+    /// the Orchard arm here - there is no separate ironwood change pool.)
+    pub fn change_pool(&self) -> ShieldedPool {
         if self.contains(Pool::Orchard) {
-            ShieldedProtocol::Orchard
+            ShieldedPool::Orchard
         } else {
             // Non-empty and shielded-only by construction; fall back to the first enabled pool.
             self.pools
                 .first()
                 .copied()
                 .and_then(|p| p.shielded_protocol())
-                .unwrap_or(ShieldedProtocol::Orchard)
+                .unwrap_or(ShieldedPool::Orchard)
         }
     }
 }
@@ -296,15 +304,15 @@ mod tests {
             PoolSet::parse(&["sapling", "orchard"])
                 .unwrap()
                 .change_pool(),
-            ShieldedProtocol::Orchard
+            ShieldedPool::Orchard
         );
         assert_eq!(
             PoolSet::single(Pool::Orchard).change_pool(),
-            ShieldedProtocol::Orchard
+            ShieldedPool::Orchard
         );
         assert_eq!(
             PoolSet::single(Pool::Sapling).change_pool(),
-            ShieldedProtocol::Sapling
+            ShieldedPool::Sapling
         );
     }
 }

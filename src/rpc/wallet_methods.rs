@@ -49,7 +49,7 @@ pub(crate) fn listwallets(state: &AppState) -> Result<Value, RpcError> {
 ///
 /// `address_type` doubles as a per-call receiver override (zallet's `receiver_types`, expressed as
 /// a single string for Bitcoin-RPC conformance):
-/// - empty / `"unified"` / `"default"` → the wallet's configured `default_receivers`,
+/// - empty / `"unified"` / `"default"` -> the wallet's configured `default_receivers`,
 /// - a single pool name (`"orchard"`, `"sapling"`),
 /// - a comma-separated list (`"sapling,orchard"`).
 ///
@@ -820,12 +820,14 @@ pub(crate) fn listtransactions(
 }
 
 /// The shielded value pool name for a `v_tx_outputs.output_pool` code (zcashd's `pool`
-/// field): 0 = transparent, 2 = Sapling, 3 = Orchard.
+/// field): 0 = transparent, 2 = Sapling, 3 = Orchard, 4 = Ironwood (NU6.3, the
+/// `ironwood_pool_code_views` migration in the valar fork tags ironwood outputs as code 4).
 fn pool_name(pool: i64) -> &'static str {
     match pool {
         0 => "transparent",
         2 => "sapling",
         3 => "orchard",
+        4 => "ironwood",
         _ => "unknown",
     }
 }
@@ -980,11 +982,11 @@ fn received_by_address(
 /// Matching is whole-UA string equality, not receiver-level: round-tripping the exact value
 /// `getnewaddress` returned always works (and sums receipts across all its receivers, which
 /// share one diversifier index), but a re-encoding with a different receiver subset, or a
-/// different UA that merely shares a receiver, is a different string → `-4`/no contribution.
+/// different UA that merely shares a receiver, is a different string -> `-4`/no contribution.
 /// A *spliced* UA (receivers stapled together from different diversifier indices, or one of this
 /// wallet's receivers mixed with a stranger's) is caught earlier by [`read::classify_unified_receivers`]
 /// and rejected with `-5` rather than silently treated as foreign. (The sole sub-receiver case is
-/// the bare-t-address→UA rewrite, inert here since zecd exposes no transparent receivers.)
+/// the bare-t-address->UA rewrite, inert here since zecd exposes no transparent receivers.)
 pub(crate) fn getreceivedbyaddress(
     state: &AppState,
     wallet: Option<&str>,
@@ -1327,6 +1329,9 @@ fn unspent_json(
                 "spendable": true,
                 "solvable": true,
                 "safe": conf > 0 || n.trusted,
+                // Shielded-pool label (zecd extension; Bitcoin Core notes are all transparent):
+                // "sapling" / "orchard" / "ironwood". Lets a shielded client tell the pool apart.
+                "pool": pool_name(n.pool),
             })
         })
         .collect()
@@ -1601,7 +1606,7 @@ fn privacy_from_policy(s: Option<&str>, default: SendPrivacy) -> Result<SendPriv
 }
 
 /// Parse the optional `["opid-...", ...]` argument shared by `z_getoperationstatus` and
-/// `z_getoperationresult`. Absent/null → `None` (all of the wallet's operations); otherwise an
+/// `z_getoperationresult`. Absent/null -> `None` (all of the wallet's operations); otherwise an
 /// array of opid strings - a malformed opid or non-string element is `-8`.
 fn parse_opid_filter(req: &RpcRequest, i: usize) -> Result<Option<Vec<OperationId>>, RpcError> {
     match req.param(i) {
@@ -2174,6 +2179,7 @@ mod tests {
             mined_height: conf_height,
             trusted,
             address: address.map(str::to_string),
+            pool: 3,
         }
     }
 
@@ -2205,6 +2211,25 @@ mod tests {
         let r = unspent_json(&notes, &st, 0, 9_999_999, Some(&f), true);
         assert_eq!(r.len(), 2);
         assert!(r.iter().all(|e| e["address"] == json!("addr-a")));
+    }
+
+    #[test]
+    fn listunspent_surfaces_pool_label() {
+        let st = status(100);
+        let pooled = |pool: i64| read::UnspentNote {
+            txid: "cd".repeat(32),
+            vout: 0,
+            value: 10,
+            mined_height: Some(100),
+            trusted: true,
+            address: None,
+            pool,
+        };
+        let notes = vec![pooled(2), pooled(3), pooled(4)];
+        let r = unspent_json(&notes, &st, 1, 9_999_999, None, true);
+        assert_eq!(r[0]["pool"], json!("sapling"));
+        assert_eq!(r[1]["pool"], json!("orchard"));
+        assert_eq!(r[2]["pool"], json!("ironwood"));
     }
 
     #[test]
@@ -2360,6 +2385,21 @@ mod tests {
         assert!(build_payment(
             &net,
             SendPrivacy::AllowRevealedRecipients,
+            &taddr,
+            &json!(0.1),
+            None,
+            false
+        )
+        .is_ok());
+
+        // AllowFullyTransparent is strictly more permissive than AllowRevealedRecipients, so it
+        // must ALSO accept a transparent recipient - otherwise the `build_payment` pre-check -8s
+        // the recipient and the fully-transparent (t->t) spend path is unreachable. (Regression
+        // guard: the edge-fixes merge left `allows_transparent_recipient` without this rung, which
+        // broke the regtest_transparent_t2t / _sendmany_t2t e2e.)
+        assert!(build_payment(
+            &net,
+            SendPrivacy::AllowFullyTransparent,
             &taddr,
             &json!(0.1),
             None,

@@ -456,9 +456,13 @@ def main() -> int:
     if lu:
         u = lu[0]
         for f in ("txid", "vout", "address", "amount", "confirmations",
-                  "spendable", "solvable", "safe"):
+                  "spendable", "solvable", "safe", "pool"):
             ck(f"utxo has {f}", f in u)
         ck("utxo amount is Decimal", isinstance(u["amount"], decimal.Decimal))
+        # zecd extension: every note is labelled with its shielded pool.
+        ck("utxo pool is a known shielded pool",
+           all(e["pool"] in ("sapling", "orchard", "ironwood") for e in lu),
+           [e["pool"] for e in lu])
     ck("listunspent include_unsafe=false only safe",
        all(e["safe"] for e in rpc.call("listunspent", 0, 9999999, [], False)))
     # A freshly generated address has no notes; the filter validates its entries.

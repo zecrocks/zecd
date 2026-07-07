@@ -19,6 +19,11 @@ name: Regtest E2E
 # notes and times multi-minute sends - so it is gated separately (ZECD_REGTEST_STRESS) and runs
 # ONLY on a monthly cron (1st of the month) or a manual dispatch with the `stress` box ticked.
 # It compiles on every run but skips in seconds otherwise.
+#
+# A separate `regtest-ironwood` job (schedule + manual dispatch, plus the
+# ironwood-on-transparent-fixes branch) builds zecd `--features ironwood` - against the official
+# zcash/librustzcash ironwood RC (no `nu6.3` cfg needed any more) - and runs the NU6.3 receive+send
+# e2e against the ironwood toolchain images - see that job's header.
 
 on:
   workflow_dispatch:
@@ -33,6 +38,18 @@ on:
         default: false
       stress-note-count:
         description: "Notes to build in the stress test (blank = default 256)"
+        required: false
+        default: ""
+      zebra-ironwood-image:
+        description: "Ironwood tier: NU6.3-capable zebrad image (default zfnd/zebra:6.0.0-rc.0); blank = the job default"
+        required: false
+        default: ""
+      lwd-ironwood-image:
+        description: "Ironwood tier: V6-aware lightwalletd image; blank = the job default"
+        required: false
+        default: ""
+      devtool-ironwood-image:
+        description: "Ironwood tier: regtest-aware zcash-devtool image; blank = the job default"
         required: false
         default: ""
   schedule:
@@ -200,11 +217,14 @@ jobs:
           ZECD_STDERR: "1"
           RUST_LOG: "zecd=info,zecd::wallet::actor=debug,zecd::chain=debug"
           # The extended tier (reorg, multiwallet, stop/restore, watch-only) runs on the weekly "big
-          # run" and on manual dispatches; PR/push runs let those tests skip in seconds.
+          # run" and on manual dispatches; all PR/push runs (incl. the ironwood dev branch) let those
+          # tests skip in seconds. The dev branch deliberately does NOT force extended: its reorg
+          # test is timing/finalization-boundary sensitive and flakes, which would redden the PR for
+          # reasons unrelated to the ironwood work and obscure that signal. (It still runs weekly.)
           ZECD_REGTEST_EXTENDED: ${{ (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && '1' || '' }}
           # The heavy note-scaling stress test runs ONLY on the monthly cron (the 1st-of-month
           # schedule) and on a manual dispatch that ticks `stress` - never on push/PR, and not on
-          # the weekly cron. Its note target is `stress-note-count` on dispatch (blank → default 256).
+          # the weekly cron. Its note target is `stress-note-count` on dispatch (blank -> default 256).
           ZECD_REGTEST_STRESS: ${{ (github.event.schedule == '33 7 1 * *' || (github.event_name == 'workflow_dispatch' && inputs.stress)) && '1' || '' }}
           ZECD_STRESS_NOTE_COUNT: ${{ inputs.stress-note-count }}
           # ZEBRAD_BIN / LIGHTWALLETD_BIN are exported by the provisioning step above.
@@ -213,6 +233,107 @@ jobs:
         # --no-fail-fast: run every test binary even if an earlier one fails, so a single flaky
         # test can't mask the results of all the tests ordered after it.
         run: cargo test --locked --manifest-path regtest-harness/Cargo.toml ${{ matrix.tests }} --no-fail-fast -- --nocapture --test-threads=1
+
+      - name: Dump diagnostics on failure
+        if: failure()
+        run: |
+          echo "== disk =="
+          df -h / "$RUNNER_TEMP" || true
+          echo "== zebrad log (last 200 lines) =="
+          tail -n 200 "$RUNNER_TEMP/zebrad.log" 2>/dev/null || echo "(no zebrad log was written)"
+
+  # Ironwood (NU6.3) tier. Builds zecd with the `ironwood` feature (no cfg - the librustzcash pin,
+  # zcash/librustzcash `dw/ironwood-scan-model`, exposes the ironwood wallet APIs unconditionally),
+  # and runs the gated regtest_ironwood receive e2e against the NU6.3 toolchain: the OFFICIAL zebra
+  # ironwood RC (`zfnd/zebra:6.0.0-rc.0`) plus a still-dev V6-aware lightwalletd and a regtest-aware
+  # zcash-devtool funder. It funds zecd post-NU6.3 (auto-routed to an ironwood output) and asserts
+  # zecd labels the received note `pool == "ironwood"`.
+  #
+  # zebra is now an official image, but lwd + devtool are still DEV images (emersonian/*) that may
+  # move or vanish, so this job runs ONLY on the weekly schedule and on manual dispatch - never on
+  # other branches' PRs, so a missing image can't redden PR CI. Bump the image refs in `env` below
+  # (or pass them as dispatch inputs) as the ironwood stack is rebuilt; keep the NU6.3 height (8) in
+  # lockstep with the harness' NU6_3_ACTIVATION_HEIGHT, zecd's network::regtest(), and devtool's
+  # regtest_params().
+  regtest-ironwood:
+    # schedule + manual dispatch, plus this ironwood-RC-update branch so iterating here auto-runs the
+    # NU6.3 e2e without a manual dispatch. `head_ref` matches it on the PR trigger (feature branches
+    # run via pull_request, where `github.ref` is the PR merge ref, not the branch); `ref` matches a
+    # direct push. Never on other branches' PRs - the emersonian/* lwd/devtool images are dev
+    # artifacts and must not gate anyone else's CI. Remove this branch keying when ironwood merges.
+    if: ${{ github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' || github.head_ref == 'ironwood' || github.ref == 'refs/heads/ironwood' }}
+    runs-on: ubuntu-latest
+    name: regtest (ironwood / NU6.3)
+    env:
+      # zebrad is now the OFFICIAL ironwood release candidate on Docker Hub (`zfnd/zebra:6.0.0-rc.0`),
+      # which is NU6.3-capable and accepts the `"NU6.3"` regtest activation-height key - so the dev
+      # `emersonian/zcash-zakura` image is retired. lwd + devtool stay pinned to dev images by
+      # @sha256 digest (their tags are mutable), both rebuilt against the official zebra RC's V6 wire
+      # format: lwd = `emersonian/zcash-lwd-ironwood:360a37d-zr8-nu63` (V6 parser for zebra 6.0.0-rc.0);
+      # devtool = `emersonian/zcash-devtool:cac96846` (== ironwood-valar tip), built with
+      # `regtest_support` so its regtest `init` takes `--activation-heights`; sends+receives ironwood.
+      # A dispatch input can override any of them (e.g. with a `repo:tag`) when the stack is rebuilt;
+      # bump these as the images are rebuilt.
+      ZEBRAD_IRONWOOD_IMAGE: ${{ inputs.zebra-ironwood-image || 'zfnd/zebra:6.0.0-rc.0' }}
+      LWD_IRONWOOD_IMAGE: ${{ inputs.lwd-ironwood-image || 'emersonian/zcash-lwd-ironwood@sha256:5f63b64ed788330ad8fe859fbbb334ceea844cf8a376318e7e25fbd3351b2f9f' }}
+      DEVTOOL_IRONWOOD_IMAGE: ${{ inputs.devtool-ironwood-image || 'emersonian/zcash-devtool@sha256:fd95d8b432f47d3eec6e5f1eca0bdfbb8daa094c28742d230bec3ac47957bd6c' }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install protobuf compiler
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            .
+            regtest-harness
+          # Separate cache key: this build carries the ironwood feature + nu6.3 cfg.
+          key: ironwood
+
+      # zecd must be built with the ironwood feature to scan ironwood notes and report the ironwood
+      # balance/pool. Official upstream (dw/ironwood-scan-model) exposes the ironwood wallet APIs
+      # unconditionally, so no `zcash_unstable="nu6.3"` cfg is needed any more - the feature alone
+      # gates zecd's ironwood paths. (The harness itself needs neither - it only spawns this binary.)
+      - name: Build zecd (release, --features ironwood)
+        run: cargo build --release --features ironwood --bin zecd
+
+      # Extract zebrad + lightwalletd + the devtool funder from the ironwood toolchain images.
+      - name: Provision ironwood zebrad + lightwalletd + devtool from images
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/bin"
+          extract() {
+            img="$1"; name="$2"; out="$RUNNER_TEMP/bin/$name"
+            docker pull -q "$img"
+            cid=$(docker create "$img")
+            rel=$(docker export "$cid" | tar -tf - | grep -m1 -E "(^|/)${name}\$" || true)
+            if [ -z "$rel" ]; then echo "::error::could not locate $name in $img"; docker rm "$cid" >/dev/null; exit 1; fi
+            docker cp "$cid:/$rel" "$out"
+            docker rm "$cid" >/dev/null
+            chmod +x "$out"
+            echo "$name -> $out"; file -b "$out" || true
+          }
+          extract "$ZEBRAD_IRONWOOD_IMAGE" zebrad
+          extract "$LWD_IRONWOOD_IMAGE" lightwalletd
+          extract "$DEVTOOL_IRONWOOD_IMAGE" zcash-devtool
+          echo "ZEBRAD_BIN=$RUNNER_TEMP/bin/zebrad" >> "$GITHUB_ENV"
+          echo "LIGHTWALLETD_BIN=$RUNNER_TEMP/bin/lightwalletd" >> "$GITHUB_ENV"
+          echo "DEVTOOL_BIN=$RUNNER_TEMP/bin/zcash-devtool" >> "$GITHUB_ENV"
+
+      - name: Run ironwood (NU6.3) receive e2e
+        env:
+          ZECD_BIN: ${{ github.workspace }}/target/release/zecd
+          ZECD_REGTEST_IRONWOOD: "1"
+          ZEBRAD_STDERR: ${{ runner.temp }}/zebrad.log
+          # Stream zecd's own logs into the run output (info level) so a failure is diagnosable
+          # without the debug flood that the receive/send bring-up needed.
+          ZECD_STDERR: "1"
+          RUST_LOG: "zecd=info"
+          # ZEBRAD_BIN / LIGHTWALLETD_BIN / DEVTOOL_BIN are exported by the provisioning step.
+        run: cargo test --locked --manifest-path regtest-harness/Cargo.toml --test regtest_ironwood --no-fail-fast -- --nocapture --test-threads=1
 
       - name: Dump diagnostics on failure
         if: failure()

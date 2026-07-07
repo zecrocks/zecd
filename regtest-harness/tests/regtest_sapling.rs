@@ -1,18 +1,24 @@
 //! Multi-pool (Sapling + Orchard) regtest end-to-end: prove that a wallet configured with both
 //! shielded pools generates Sapling-bearing addresses, holds funds in **both** pools at once, and
-//! reports those funds correctly across every balance/history RPC - then spends across pools.
+//! reports those funds correctly across every balance/history RPC - then spends via the turnstile.
 //!
 //! Setup mirrors `regtest_funded.rs`: mine a transparent coinbase to the funder, mature it, shield
 //! it, then send shielded funds to zecd. The difference is that zecd is configured with
 //! `[pools] enabled = ["sapling", "orchard"]`, and we fund **two** receivers - a Sapling-only one
-//! and an Orchard-only one - so the wallet ends up holding one Sapling note and one Orchard note.
-//! That lets us assert that getbalance / getbalances / getwalletinfo / listunspent /
+//! (1 ZEC) and an Orchard-only one (2 ZEC) - so the wallet ends up holding one Sapling note and one
+//! Orchard note. That lets us assert that getbalance / getbalances / getwalletinfo / listunspent /
 //! getreceivedbyaddress all aggregate across pools.
 //!
 //! The funder (zcash-devtool) spends its Orchard notes; sending to a Sapling-only receiver is an
 //! ordinary cross-pool transfer (devtool's `propose_transfer` takes no privacy policy - the same
-//! call zecd uses when it sends Orchard→transparent in `regtest_funded`), so the value simply
+//! call zecd uses when it sends Orchard->transparent in `regtest_funded`), so the value simply
 //! lands as a Sapling note.
+//!
+//! NB: past the `dw/ironwood-scan-model` "select shielded inputs from a single pool group" change,
+//! a single transaction never combines Orchard inputs with Sapling inputs - selection uses one
+//! group (Orchard, or Sapling+Ironwood). So a payment isn't funded by draining both pools; the
+//! Orchard receiver is funded to 2 ZEC (vs Sapling's 1 ZEC) so a 1.5-ZEC payment to the Sapling
+//! receiver still builds - from the Orchard group - as an Orchard->Sapling *turnstile* (phase 8).
 //!
 //! The final phase is the flagship **tri-pool mixed-recipient `sendmany`**: a single v5 transaction
 //! that carries a transparent output AND a Sapling output AND an Orchard output simultaneously,
@@ -215,10 +221,16 @@ async fn regtest_sapling_and_orchard_balances() {
     }
     tokio::time::sleep(Duration::from_secs(3)).await;
 
-    // Fund the ORCHARD receiver first, confirm it, and let the funder's change reconfirm so its
-    // next send has spendable notes.
+    // Fund the ORCHARD receiver first (with 2 ZEC), confirm it, and let the funder's change
+    // reconfirm so its next send has spendable notes. Orchard is funded to *twice* the Sapling
+    // amount on purpose: past the `dw/ironwood-scan-model` "single pool group" change, shielded
+    // inputs are selected from one of two mutually-exclusive groups (Orchard alone, or
+    // Sapling+Ironwood) - Orchard is never combined with Sapling to make up a shortfall. The
+    // asymmetric funding lets a 1.5-ZEC payment to the Sapling-only receiver still build (the
+    // Sapling group's 1 ZEC can't cover it, so selection falls to the 2-ZEC Orchard group,
+    // producing an Orchard->Sapling *turnstile*), which is what phase 8a/8b exercise.
     funder
-        .send(lwd.grpc_port, &orchard_ua, FUND_ZATOSHIS)
+        .send(lwd.grpc_port, &orchard_ua, 2 * FUND_ZATOSHIS)
         .expect("send to zecd's Orchard receiver");
     zebrad
         .generate_blocks(12)
@@ -254,8 +266,8 @@ async fn regtest_sapling_and_orchard_balances() {
         .await
         .expect("confirm Sapling send");
 
-    // 7. Both notes confirmed: the wallet holds 2 ZEC across two pools. Assert EVERY balance RPC
-    //    aggregates across Sapling + Orchard.
+    // 7. Both notes confirmed: the wallet holds 3 ZEC across two pools (2 Orchard + 1 Sapling).
+    //    Assert EVERY balance RPC aggregates across Sapling + Orchard.
     let deadline = Instant::now() + FUND_TIMEOUT;
     loop {
         let bal = zecd
@@ -264,12 +276,12 @@ async fn regtest_sapling_and_orchard_balances() {
             .ok()
             .and_then(|v| v.as_f64())
             .unwrap_or(0.0);
-        if bal >= 2.0 {
+        if bal >= 3.0 {
             break;
         }
         assert!(
             Instant::now() < deadline,
-            "zecd did not reach the combined 2-ZEC balance within {FUND_TIMEOUT:?} (got {bal})"
+            "zecd did not reach the combined 3-ZEC balance within {FUND_TIMEOUT:?} (got {bal})"
         );
         tokio::time::sleep(Duration::from_millis(500)).await;
     }
@@ -281,7 +293,7 @@ async fn regtest_sapling_and_orchard_balances() {
         .expect("getbalance");
     assert_eq!(
         getbalance.as_f64(),
-        Some(2.0),
+        Some(3.0),
         "getbalance sums both pools: {getbalance}"
     );
 
@@ -292,7 +304,7 @@ async fn regtest_sapling_and_orchard_balances() {
         .expect("getbalances");
     assert_eq!(
         getbalances["mine"]["trusted"].as_f64(),
-        Some(2.0),
+        Some(3.0),
         "getbalances.mine.trusted sums both pools: {getbalances}"
     );
     assert_eq!(
@@ -308,7 +320,7 @@ async fn regtest_sapling_and_orchard_balances() {
         .expect("getwalletinfo");
     assert_eq!(
         wi["balance"].as_f64(),
-        Some(2.0),
+        Some(3.0),
         "getwalletinfo.balance: {wi}"
     );
     assert_eq!(
@@ -328,7 +340,8 @@ async fn regtest_sapling_and_orchard_balances() {
         "getunconfirmedbalance is 0: {unconf}"
     );
 
-    // listunspent: two notes (one per pool), summing to 2 ZEC.
+    // listunspent: two notes (one per pool - a 2-ZEC Orchard note and a 1-ZEC Sapling note),
+    // summing to 3 ZEC.
     let lu = zecd
         .call("listunspent", json!([]))
         .await
@@ -341,8 +354,8 @@ async fn regtest_sapling_and_orchard_balances() {
     );
     let total: f64 = notes.iter().filter_map(|n| n["amount"].as_f64()).sum();
     assert!(
-        (total - 2.0).abs() < 1e-8,
-        "listunspent sums to 2 ZEC: {lu}"
+        (total - 3.0).abs() < 1e-8,
+        "listunspent sums to 3 ZEC: {lu}"
     );
 
     // getreceivedbyaddress: each receiver credited exactly its 1 ZEC.
@@ -361,8 +374,8 @@ async fn regtest_sapling_and_orchard_balances() {
         .expect("getreceivedbyaddress orchard");
     assert_eq!(
         recv_orchard.as_f64(),
-        Some(1.0),
-        "Orchard UA credited 1 ZEC: {recv_orchard}"
+        Some(2.0),
+        "Orchard UA credited 2 ZEC: {recv_orchard}"
     );
 
     // History carries both receives.
@@ -378,7 +391,12 @@ async fn regtest_sapling_and_orchard_balances() {
         .count();
     assert!(receives >= 2, "both receives show in history: {txs}");
 
-    // 8. Spend across pools back to the funder. First the wallet must have *scanned* to the chain
+    // 8. Turnstile spends. Past the "single pool group" input-selection change, Orchard inputs are
+    //    never combined with Sapling inputs in one transaction - so a payment isn't funded by
+    //    draining both pools at once; instead selection picks one group (Orchard, preferred when the
+    //    payment targets Orchard) and, when that group's pool differs from the recipient's, produces
+    //    a turnstile output. Both sends below spend the 2-ZEC Orchard note. First the wallet must
+    //    have *scanned* to the chain
     //    tip - note witnesses plus full confirmations - not merely observed the notes at the tip.
     //    `getbalance` reports spendability relative to the chain tip and can run ahead of the scan
     //    on a slow runner, so wait for the scan to catch up before any spend (the other funded
@@ -394,11 +412,12 @@ async fn regtest_sapling_and_orchard_balances() {
         .await
         .expect("zecd scans to the chain tip before spending");
 
-    // 8a. FullPrivacy rejects a cross-pool (turnstile) send. Paying 1.5 ZEC to a Sapling-only
-    //     recipient forces Orchard inputs (the Sapling note is only 1 ZEC), so the proposal spans
-    //     both pools - which reveals the crossed amount and FullPrivacy forbids. This rejection
-    //     happens on the *built proposal* inside the async send, so it surfaces via the
-    //     operation's error (code -8), not synchronously. The default policy permits it (8b).
+    // 8a. FullPrivacy rejects a turnstile send. Paying 1.5 ZEC to a Sapling-only recipient can't be
+    //     funded from the Sapling group (only 1 ZEC), so selection falls to the 2-ZEC Orchard group,
+    //     producing an Orchard->Sapling turnstile output - which reveals the crossed amount and
+    //     FullPrivacy forbids. This rejection happens on the *built proposal* inside the async send,
+    //     so it surfaces via the operation's error (code -8), not synchronously. The default policy
+    //     permits it (8b).
     let fp_opid = zecd
         .call(
             "z_sendmany",
@@ -443,16 +462,20 @@ async fn regtest_sapling_and_orchard_balances() {
     }
     assert!(
         saw_full_privacy_reject,
-        "the FullPrivacy cross-pool send reached the failed state"
+        "the FullPrivacy turnstile send reached the failed state"
     );
 
-    // 8b. The same cross-pool spend under the default policy succeeds (greedy input selection
-    //     draws from both pools; change lands in Orchard, the strongest enabled pool).
+    // 8b. A 1.5-ZEC spend under the default policy succeeds, funded from the 2-ZEC Orchard group.
+    //     Paying the funder's unified address (which has an Orchard receiver) keeps the payment in
+    //     the Orchard pool - no turnstile - with the ~0.5-ZEC change landing back in Orchard (the
+    //     strongest enabled pool), which phase 9's tri-pool send then draws on. (The default policy
+    //     would also permit the turnstile 8a rejected; that permission is covered by the funded
+    //     e2e's transparent-recipient sends.)
     let funder_ua = funder.unified_address().expect("funder unified address");
     let txid = zecd
         .call("sendtoaddress", json!([funder_ua, 1.5]))
         .await
-        .expect("spend across pools");
+        .expect("orchard-funded spend");
     let txid = txid.as_str().expect("txid string").to_string();
     assert_eq!(txid.len(), 64, "sendtoaddress returns a txid: {txid}");
 
