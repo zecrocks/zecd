@@ -221,8 +221,11 @@ zcash_proofs = { git = "https://github.com/zecrocks/librustzcash", rev = "409f34
 zcash_transparent = { git = "https://github.com/zecrocks/librustzcash", rev = "409f349086fa98c24601fcf0789684e29f22b35e" }
 # The `dw/ironwood-scan-model` line (our fork branch above) requires the explicit-checkpoint-retention
 # shardtree APIs (`ensure_retained`/`retained_checkpoints`/`remove_retained_checkpoint`) that aren't in
-# a published shardtree yet, so it patches shardtree + incrementalmerkletree to `zcash/incrementalmerkletree`
-# main by git rev. Mirror the exact rev the branch pins (its own `[patch]`), or `zcash_client_backend`
-# fails to build against the crates.io shardtree. Drop when a shardtree release with these APIs is cut.
-shardtree = { git = "https://github.com/zcash/incrementalmerkletree", rev = "decefc469dbf1e686b20b7e7dcaa7cb4f122125b" }
-incrementalmerkletree = { git = "https://github.com/zcash/incrementalmerkletree", rev = "decefc469dbf1e686b20b7e7dcaa7cb4f122125b" }
+# a published shardtree yet. We pin **our own fork - `zecrocks/incrementalmerkletree`** - rather than
+# `zcash/incrementalmerkletree` main, because upstream `decefc46` panics when it prunes a checkpoint
+# whose position flags need clearing; the fork is `decefc46` + one commit fixing that `clear_flags`
+# checkpoint-pruning panic. Mirror this exact rev on both crates, or `zcash_client_backend` fails to
+# build/run against the crates.io shardtree. Drop both once a shardtree release carrying these APIs
+# and the fix is cut.
+shardtree = { git = "https://github.com/zecrocks/incrementalmerkletree", rev = "6e083a49ef44385cad6b15d4ae1fa9e5e3f6b25d" }
+incrementalmerkletree = { git = "https://github.com/zecrocks/incrementalmerkletree", rev = "6e083a49ef44385cad6b15d4ae1fa9e5e3f6b25d" }
