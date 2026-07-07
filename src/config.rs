@@ -445,9 +445,12 @@ impl SendPrivacy {
     }
 
     /// Whether this policy permits paying a transparent recipient, which reveals both the
-    /// recipient and the amount on-chain. Only `AllowRevealedRecipients` (and the more-permissive
-    /// zcashd policies that map onto it) do; `FullPrivacy` and `AllowRevealedAmounts` reject a
-    /// transparent recipient (the latter opts into revealed *amounts* only).
+    /// recipient and the amount on-chain. `AllowRevealedRecipients` and the strictly more
+    /// permissive `AllowFullyTransparent` do; `FullPrivacy` and `AllowRevealedAmounts` reject a
+    /// transparent recipient (the latter opts into revealed *amounts* only). NB
+    /// `AllowFullyTransparent` must be included: it is the top rung of the ladder, so anything a
+    /// lower rung permits it must permit too - omitting it makes `build_payment` reject the very
+    /// t->t sends the policy exists to allow.
     pub fn allows_transparent_recipient(self) -> bool {
         matches!(
             self,
@@ -1558,6 +1561,17 @@ mod tests {
         assert!(SendPrivacy::parse("NoPrivacy").is_err());
         assert!(SendPrivacy::parse("AllowRevealedSenders").is_err());
         assert!(SendPrivacy::parse("fullprivacy").is_err());
+    }
+
+    #[test]
+    fn allows_transparent_recipient_ladder() {
+        // The two upper rungs permit a transparent recipient; the two private rungs reject it.
+        // Regression guard: `AllowFullyTransparent` (top rung) must be included, or `build_payment`
+        // rejects the very t->t sends the policy exists to allow.
+        assert!(!SendPrivacy::FullPrivacy.allows_transparent_recipient());
+        assert!(!SendPrivacy::AllowRevealedAmounts.allows_transparent_recipient());
+        assert!(SendPrivacy::AllowRevealedRecipients.allows_transparent_recipient());
+        assert!(SendPrivacy::AllowFullyTransparent.allows_transparent_recipient());
     }
 
     #[test]
