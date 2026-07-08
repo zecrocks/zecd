@@ -53,10 +53,10 @@ unknown-git = "deny"
 # Dev-only ironwood / NU6.3 branch exception (see Cargo.toml `[patch.crates-io]` and the project docs):
 # the librustzcash set is patched by git rev to our own fork branch,
 # `zecrocks/librustzcash` `ironwood-scan-model` = upstream `dw/ironwood-scan-model` HEAD + a
-# cherry-pick of the create_pczt Ironwood-build commit from librustzcash#2543. We pin our own fork
+# cherry-pick of the self-send received-note memo backfill (not yet upstream). We pin our own fork
 # (rather than a contributor's) so the branch can't drift out from under us. Swap this back to
-# `https://github.com/zcash/librustzcash` when #2543 (or an equivalent create_pczt Ironwood build)
-# merges into `dw/ironwood-scan-model` and we repin to the merged commit. The branch also requires
+# `https://github.com/zcash/librustzcash` when the self-send memo fix merges into
+# `dw/ironwood-scan-model` and we repin to the merged commit. The branch also requires
 # the explicit-checkpoint-retention shardtree APIs plus a `clear_flags` checkpoint-pruning panic fix,
 # so shardtree + incrementalmerkletree are git-patched to our own fork
 # `zecrocks/incrementalmerkletree` (upstream `decefc46` + one fix commit; mirror the rev the
