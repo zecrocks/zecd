@@ -822,7 +822,7 @@ checksum = "edd0f118536f44f5ccd48bcb8b111bdc3de888b58c74639dfb034a357d0f206d"
 [[package]]
 name = "equihash"
 version = "0.3.0"
-source = "git+https://github.com/zecrocks/librustzcash?rev=409f349086fa98c24601fcf0789684e29f22b35e#409f349086fa98c24601fcf0789684e29f22b35e"
+source = "git+https://github.com/zecrocks/librustzcash?rev=71da9dddc194f8adf003b14c7957d03a4836c3cd#71da9dddc194f8adf003b14c7957d03a4836c3cd"
 dependencies = [
  "blake2b_simd",
  "corez",
@@ -847,7 +847,7 @@ dependencies = [
 [[package]]
 name = "f4jumble"
 version = "0.1.1"
-source = "git+https://github.com/zecrocks/librustzcash?rev=409f349086fa98c24601fcf0789684e29f22b35e#409f349086fa98c24601fcf0789684e29f22b35e"
+source = "git+https://github.com/zecrocks/librustzcash?rev=71da9dddc194f8adf003b14c7957d03a4836c3cd#71da9dddc194f8adf003b14c7957d03a4836c3cd"
 dependencies = [
  "blake2b_simd",
 ]
@@ -2004,7 +2004,7 @@ dependencies = [
 [[package]]
 name = "pczt"
 version = "0.7.0"
-source = "git+https://github.com/zecrocks/librustzcash?rev=409f349086fa98c24601fcf0789684e29f22b35e#409f349086fa98c24601fcf0789684e29f22b35e"
+source = "git+https://github.com/zecrocks/librustzcash?rev=71da9dddc194f8adf003b14c7957d03a4836c3cd#71da9dddc194f8adf003b14c7957d03a4836c3cd"
 dependencies = [
  "blake2b_simd",
  "bls12_381",
@@ -3770,7 +3770,7 @@ checksum = "2fb433233f2df9344722454bc7e96465c9d03bff9d77c248f9e7523fe79585b5"
 [[package]]
 name = "zcash_address"
 version = "0.13.0-pre.0"
-source = "git+https://github.com/zecrocks/librustzcash?rev=409f349086fa98c24601fcf0789684e29f22b35e#409f349086fa98c24601fcf0789684e29f22b35e"
+source = "git+https://github.com/zecrocks/librustzcash?rev=71da9dddc194f8adf003b14c7957d03a4836c3cd#71da9dddc194f8adf003b14c7957d03a4836c3cd"
 dependencies = [
  "bech32 0.11.1",
  "bs58",
@@ -3783,7 +3783,7 @@ dependencies = [
 [[package]]
 name = "zcash_client_backend"
 version = "0.23.0"
-source = "git+https://github.com/zecrocks/librustzcash?rev=409f349086fa98c24601fcf0789684e29f22b35e#409f349086fa98c24601fcf0789684e29f22b35e"
+source = "git+https://github.com/zecrocks/librustzcash?rev=71da9dddc194f8adf003b14c7957d03a4836c3cd#71da9dddc194f8adf003b14c7957d03a4836c3cd"
 dependencies = [
  "base64 0.22.1",
  "bech32 0.11.1",
@@ -3833,7 +3833,7 @@ dependencies = [
 [[package]]
 name = "zcash_client_sqlite"
 version = "0.21.1"
-source = "git+https://github.com/zecrocks/librustzcash?rev=409f349086fa98c24601fcf0789684e29f22b35e#409f349086fa98c24601fcf0789684e29f22b35e"
+source = "git+https://github.com/zecrocks/librustzcash?rev=71da9dddc194f8adf003b14c7957d03a4836c3cd#71da9dddc194f8adf003b14c7957d03a4836c3cd"
 dependencies = [
  "bip32",
  "bitflags",
@@ -3879,7 +3879,7 @@ dependencies = [
 [[package]]
 name = "zcash_encoding"
 version = "0.4.0"
-source = "git+https://github.com/zecrocks/librustzcash?rev=409f349086fa98c24601fcf0789684e29f22b35e#409f349086fa98c24601fcf0789684e29f22b35e"
+source = "git+https://github.com/zecrocks/librustzcash?rev=71da9dddc194f8adf003b14c7957d03a4836c3cd#71da9dddc194f8adf003b14c7957d03a4836c3cd"
 dependencies = [
  "corez",
  "hex",
@@ -3889,7 +3889,7 @@ dependencies = [
 [[package]]
 name = "zcash_keys"
 version = "0.15.0-pre.0"
-source = "git+https://github.com/zecrocks/librustzcash?rev=409f349086fa98c24601fcf0789684e29f22b35e#409f349086fa98c24601fcf0789684e29f22b35e"
+source = "git+https://github.com/zecrocks/librustzcash?rev=71da9dddc194f8adf003b14c7957d03a4836c3cd#71da9dddc194f8adf003b14c7957d03a4836c3cd"
 dependencies = [
  "bech32 0.11.1",
  "bip32",
@@ -3931,7 +3931,7 @@ dependencies = [
 [[package]]
 name = "zcash_primitives"
 version = "0.29.0-pre.0"
-source = "git+https://github.com/zecrocks/librustzcash?rev=409f349086fa98c24601fcf0789684e29f22b35e#409f349086fa98c24601fcf0789684e29f22b35e"
+source = "git+https://github.com/zecrocks/librustzcash?rev=71da9dddc194f8adf003b14c7957d03a4836c3cd#71da9dddc194f8adf003b14c7957d03a4836c3cd"
 dependencies = [
  "blake2b_simd",
  "block-buffer 0.11.0-rc.3",
@@ -3961,7 +3961,7 @@ dependencies = [
 [[package]]
 name = "zcash_proofs"
 version = "0.29.0-pre.0"
-source = "git+https://github.com/zecrocks/librustzcash?rev=409f349086fa98c24601fcf0789684e29f22b35e#409f349086fa98c24601fcf0789684e29f22b35e"
+source = "git+https://github.com/zecrocks/librustzcash?rev=71da9dddc194f8adf003b14c7957d03a4836c3cd#71da9dddc194f8adf003b14c7957d03a4836c3cd"
 dependencies = [
  "bellman",
  "blake2b_simd",
@@ -3983,7 +3983,7 @@ dependencies = [
 [[package]]
 name = "zcash_protocol"
 version = "0.10.0-pre.0"
-source = "git+https://github.com/zecrocks/librustzcash?rev=409f349086fa98c24601fcf0789684e29f22b35e#409f349086fa98c24601fcf0789684e29f22b35e"
+source = "git+https://github.com/zecrocks/librustzcash?rev=71da9dddc194f8adf003b14c7957d03a4836c3cd#71da9dddc194f8adf003b14c7957d03a4836c3cd"
 dependencies = [
  "corez",
  "document-features",
@@ -4021,7 +4021,7 @@ dependencies = [
 [[package]]
 name = "zcash_transparent"
 version = "0.9.0-pre.0"
-source = "git+https://github.com/zecrocks/librustzcash?rev=409f349086fa98c24601fcf0789684e29f22b35e#409f349086fa98c24601fcf0789684e29f22b35e"
+source = "git+https://github.com/zecrocks/librustzcash?rev=71da9dddc194f8adf003b14c7957d03a4836c3cd#71da9dddc194f8adf003b14c7957d03a4836c3cd"
 dependencies = [
  "bip32",
  "bs58",
@@ -4170,7 +4170,7 @@ dependencies = [
 [[package]]
 name = "zip321"
 version = "0.8.0"
-source = "git+https://github.com/zecrocks/librustzcash?rev=409f349086fa98c24601fcf0789684e29f22b35e#409f349086fa98c24601fcf0789684e29f22b35e"
+source = "git+https://github.com/zecrocks/librustzcash?rev=71da9dddc194f8adf003b14c7957d03a4836c3cd#71da9dddc194f8adf003b14c7957d03a4836c3cd"
 dependencies = [
  "base64 0.22.1",
  "nom",

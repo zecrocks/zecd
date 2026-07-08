@@ -1,4 +1,4 @@
-//! Ironwood (NU6.3) regtest end-to-end. Two tests:
+//! Ironwood (NU6.3) regtest end-to-end. Three tests:
 //!   * `regtest_ironwood_receive_and_orchard_send` - zecd **receives an ironwood note**, then
 //!     **spends it** - an ironwood->ironwood send: the wallet's single spendable input is pinned to
 //!     the ironwood pool, and past NU6.3 the payment + change route into the ironwood bundle (the
@@ -6,6 +6,10 @@
 //!     ironwood proof step ran.
 //!   * `regtest_ironwood_sapling_send` - zecd spends a **Sapling** note and produces an **ironwood**
 //!     output (a Sapling->ironwood turnstile), starting from a wallet that held no ironwood note.
+//!   * `regtest_ironwood_receive_memo` - the funder attaches a ZIP-302 text memo to a post-NU6.3
+//!     send, so zecd receives an **ironwood note carrying a memo**. Proves the Ironwood-domain memo
+//!     decryption path (`decrypt_transaction` decrypting the Ironwood bundle) end-to-end: the memo
+//!     is surfaced on the received output (`memoStr`/`memo`) on a note asserted `pool == "ironwood"`.
 //!
 //! Requires the full ironwood toolchain - the official ironwood zebra RC (`zfnd/zebra:6.0.0-rc.0`),
 //! a V6-parsing lightwalletd, an ironwood/regtest-aware `zcash-devtool` funder (its regtest `init`
@@ -605,4 +609,195 @@ async fn regtest_ironwood_sapling_send() {
             .expect("advance chain to confirm the send");
         tokio::time::sleep(Duration::from_secs(2)).await;
     }
+}
+
+/// Ironwood receive **memo**: the funder attaches a ZIP-302 text memo to a post-NU6.3 send, which
+/// auto-routes to an ironwood output, so zecd receives an ironwood note carrying a memo. This is the
+/// end-to-end proof of the Ironwood-domain memo decryption path - `decrypt_transaction` decrypting
+/// the Ironwood bundle (librustzcash `dw/ironwood-scan-model`, "Decrypt Ironwood outputs with the
+/// Ironwood domain"). Compact blocks carry no memos, so surfacing the memo on the *mined* receive
+/// exercises that decryption via the mempool full-tx store and/or the enhancement backfill; the
+/// existing tier only proved memos for the Orchard/Sapling domains (`regtest_funded.rs`), never the
+/// Ironwood one. Asserts the memo (`memoStr` text + `memo` hex) on a note confirmed `pool ==
+/// "ironwood"`.
+#[tokio::test]
+async fn regtest_ironwood_receive_memo() {
+    if std::env::var("ZECD_REGTEST_IRONWOOD").is_err() {
+        eprintln!(
+            "SKIP regtest_ironwood_receive_memo: set ZECD_REGTEST_IRONWOOD=1 (plus the ironwood \
+             ZEBRAD_BIN/LIGHTWALLETD_BIN/DEVTOOL_BIN and an ironwood-built ZECD_BIN) to run the \
+             NU6.3 e2e. The harness still compiled and linked."
+        );
+        return;
+    }
+    let (Some(zebrad_bin), Some(lwd_bin), Some(devtool_bin)) = (
+        resolve_bin("ZEBRAD_BIN"),
+        resolve_bin("LIGHTWALLETD_BIN"),
+        resolve_bin("DEVTOOL_BIN"),
+    ) else {
+        panic!(
+            "ZECD_REGTEST_IRONWOOD=1 but ZEBRAD_BIN/LIGHTWALLETD_BIN/DEVTOOL_BIN are not all set"
+        );
+    };
+
+    /// The ZIP-302 text memo the funder attaches; zecd must surface it on the ironwood receive.
+    const RECEIVE_MEMO: &str = "ironwood memo e2e";
+
+    // 1-4. Bring up an NU6.3 chain, mine + mature the funder's coinbases, and shield into Orchard
+    //      (identical to the other ironwood tests - see their comments).
+    let funder_taddr =
+        Funder::derive_transparent_address(&devtool_bin).expect("derive funder transparent addr");
+    let mut zebrad = Zebrad::start_with_miner_ironwood(&zebrad_bin, &funder_taddr)
+        .await
+        .expect("start ironwood zebrad mining to the funder");
+    zebrad
+        .generate_blocks(FUNDER_COINBASES)
+        .await
+        .expect("mine the funder's coinbases");
+    zebrad
+        .restart_with_miner(TAIL_MINER_ADDRESS)
+        .await
+        .expect("restart zebrad mining to the throwaway address");
+    zebrad
+        .generate_blocks(MATURITY_TAIL)
+        .await
+        .expect("mine the maturity tail");
+    let lwd = Lightwalletd::start(&lwd_bin, zebrad.rpc_port)
+        .await
+        .expect("start lightwalletd");
+    let funder =
+        Funder::init_ironwood(&devtool_bin, lwd.grpc_port).expect("initialise funding wallet");
+    funder.sync(lwd.grpc_port).expect("funder sync (coinbase)");
+    funder
+        .shield(lwd.grpc_port)
+        .expect("shield transparent coinbase into Orchard");
+    zebrad.generate_blocks(6).await.expect("confirm shield");
+    funder.sync(lwd.grpc_port).expect("funder sync (shielded)");
+
+    // 5-6. Start zecd (built --features ironwood) and wait until it is caught up.
+    let cfg = ZecdConfig::new(zebrad.rpc_port, pick_port().expect("pick zecd rpc port"));
+    let zecd = Zecd::start(&cfg)
+        .await
+        .expect("start zecd against ironwood regtest zebra");
+    let zecd_ua = zecd
+        .call("getnewaddress", json!([]))
+        .await
+        .expect("getnewaddress");
+    let zecd_ua = zecd_ua.as_str().expect("address string").to_string();
+    let deadline = Instant::now() + FUND_TIMEOUT;
+    loop {
+        let peers = zecd
+            .call("getpeerinfo", json!([]))
+            .await
+            .expect("getpeerinfo");
+        if peers
+            .as_array()
+            .and_then(|a| a.first())
+            .is_some_and(|p| p["conn_state"] == "ready")
+        {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "zecd never reached conn_state ready before funding: {peers}"
+        );
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+
+    // 7. Fund zecd WITH A MEMO. Post-NU6.3 the funder's `wallet send` auto-routes the Orchard
+    //    payment into an ironwood output, so zecd receives an ironwood note carrying the memo.
+    funder
+        .send_with_memo(lwd.grpc_port, &zecd_ua, FUND_ZATOSHIS, Some(RECEIVE_MEMO))
+        .expect("send funds (with a memo) to zecd (auto-routed to ironwood post-NU6.3)");
+    zebrad
+        .generate_blocks(6)
+        .await
+        .expect("confirm the memo funding send");
+
+    // 8. zecd scans the ironwood note and surfaces the memo. Poll (mining to drive confirmation and
+    //    any enhancement backfill) until BOTH hold: an ironwood note is present in listunspent, and
+    //    the receive in listtransactions decodes the funder's text memo. A memo on the received
+    //    ironwood output can only appear if `decrypt_transaction` decrypted the Ironwood bundle.
+    let memo_hex: String = RECEIVE_MEMO.bytes().map(|b| format!("{b:02x}")).collect();
+    let deadline = Instant::now() + FUND_TIMEOUT;
+    let receive = loop {
+        let tip = zebrad
+            .rpc("getblockcount", json!([]))
+            .await
+            .expect("getblockcount")
+            .as_u64()
+            .expect("tip height");
+        let _ = zecd.wait_until_synced(tip, FUND_TIMEOUT).await;
+
+        let unspent = zecd
+            .call("listunspent", json!([0]))
+            .await
+            .expect("listunspent");
+        let has_ironwood = unspent
+            .as_array()
+            .expect("listunspent array")
+            .iter()
+            .any(|u| u["pool"] == "ironwood");
+
+        let txs = zecd
+            .call("listtransactions", json!([]))
+            .await
+            .expect("listtransactions");
+        let receive = txs
+            .as_array()
+            .expect("listtransactions array")
+            .iter()
+            .find(|t| t["category"] == "receive" && t["memoStr"].as_str() == Some(RECEIVE_MEMO));
+
+        if has_ironwood {
+            if let Some(receive) = receive {
+                break receive.clone();
+            }
+        }
+        assert!(
+            Instant::now() < deadline,
+            "zecd never surfaced the ironwood receive with its memo; has_ironwood={has_ironwood}, \
+             listtransactions={txs}"
+        );
+        zebrad
+            .generate_blocks(2)
+            .await
+            .expect("advance chain to confirm / enhance the memo receive");
+        tokio::time::sleep(Duration::from_secs(2)).await;
+    };
+
+    // The received ironwood output carries the memo: decoded text in `memoStr`, raw ZIP-302 bytes
+    // in `memo` (zcashd's z_viewtransaction field names).
+    assert_eq!(
+        receive["memoStr"].as_str(),
+        Some(RECEIVE_MEMO),
+        "the ironwood receive decodes the funder's text memo: {receive}"
+    );
+    assert_eq!(
+        receive["memo"].as_str(),
+        Some(memo_hex.as_str()),
+        "the ironwood receive carries the memo hex: {receive}"
+    );
+
+    // gettransaction on the receive surfaces the same memo on its receive detail.
+    let recv_txid = receive["txid"]
+        .as_str()
+        .expect("the receive carries a txid")
+        .to_string();
+    let gt_recv = zecd
+        .call("gettransaction", json!([recv_txid]))
+        .await
+        .expect("gettransaction on the ironwood memo receive");
+    let recv_detail = gt_recv["details"]
+        .as_array()
+        .expect("gettransaction details")
+        .iter()
+        .find(|d| d["category"] == "receive")
+        .cloned()
+        .unwrap_or_else(|| panic!("gettransaction details carry the receive: {gt_recv}"));
+    assert_eq!(
+        recv_detail["memoStr"].as_str(),
+        Some(RECEIVE_MEMO),
+        "gettransaction's ironwood receive detail decodes the memo: {recv_detail}"
+    );
 }

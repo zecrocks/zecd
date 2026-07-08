@@ -15,7 +15,7 @@ use tracing::{error, info, warn};
 use zcash_client_backend::data_api::wallet::{
     create_pczt_from_proposal, create_proposed_transactions, decrypt_and_store_transaction,
     extract_and_store_transaction_from_pczt,
-    input_selection::{GreedyInputSelector, TransparentSpendPolicy},
+    input_selection::{GreedyInputSelector, SpendPolicy},
     propose_transfer, ConfirmationsPolicy, SpendingKeys,
 };
 use zcash_client_backend::data_api::{
@@ -2799,12 +2799,38 @@ impl WalletActor {
     /// Whether sends on this wallet use the cached-Orchard PCZT path (so prove and store are
     /// separable). True for the default Orchard-only wallet with `cache_proving_key` on. A
     /// Sapling-spending wallet (or `cache_proving_key` off) uses the fused path, which has no
-    /// prove/store seam - see [`Self::do_send_fused`]. Ironwood (V6) sends also ride this path:
-    /// `create_pczt_from_proposal` builds Ironwood PCZTs (librustzcash#2543), and `prove_sign_pczt`
-    /// carries the paired `create_ironwood_proof` step, so an Ironwood send reuses the cached
-    /// `PostNu6_3` proving key exactly like an Orchard send reuses the `FixedPostNu6_2` key.
+    /// prove/store seam - see [`Self::do_send_fused`]. Also forced off once NU6.3/Ironwood is active
+    /// (see [`Self::ironwood_forces_fused`]): upstream `create_pczt_from_proposal` still rejects a
+    /// built PCZT carrying an Ironwood bundle (`step_uses_ironwood`/`pczt_parts.ironwood.is_some()` ->
+    /// `ProposalNotSupported`), so post-NU6.3 sends ride the fused `create_proposed_transactions`
+    /// path, which upstream fully supports for Ironwood.
     fn cached_pczt_path(&self) -> bool {
-        self.orchard_keys.is_some() && !self.enabled_pools.contains(Pool::Sapling)
+        self.orchard_keys.is_some()
+            && !self.enabled_pools.contains(Pool::Sapling)
+            && !self.ironwood_forces_fused()
+    }
+
+    /// Whether NU6.3/Ironwood is active as of the next block, forcing sends onto the fused build
+    /// path. Post-NU6.3 an Orchard-pool spend routes its payment/change into the Ironwood (V6)
+    /// bundle, which the cached PCZT prove path cannot build - upstream `create_pczt_from_proposal`
+    /// hard-errors on an Ironwood bundle (`ProposalNotSupported`). Upstream's fused
+    /// `create_proposed_transactions` builds and proves Ironwood natively, so Ironwood sends take it.
+    /// TODO(upstream): drop this once `create_pczt_from_proposal` accepts Ironwood bundles - then
+    /// Ironwood sends ride the cached PCZT path and reuse the `PostNu6_3` key (the paired
+    /// `create_ironwood_proof` step in `prove_sign_pczt` is the ready other half).
+    #[cfg(feature = "ironwood")]
+    fn ironwood_forces_fused(&self) -> bool {
+        use zcash_protocol::consensus::{NetworkUpgrade, Parameters};
+        self.tip_height
+            .map(|tip| {
+                self.network
+                    .is_nu_active(NetworkUpgrade::Nu6_3, BlockHeight::from_u32(tip) + 1)
+            })
+            .unwrap_or(false)
+    }
+    #[cfg(not(feature = "ironwood"))]
+    fn ironwood_forces_fused(&self) -> bool {
+        false
     }
 
     /// Whether a send should be pipelined: `[spend] pipeline_proving` on *and* the cached PCZT
@@ -2851,8 +2877,10 @@ impl WalletActor {
                 request,
                 policy,
                 // Shielded-only input selection (transparent UTXOs are spent via the separate
-                // lower-level `do_send_transparent` path), matching `do_send_fused`.
-                &TransparentSpendPolicy::ShieldedOnly,
+                // lower-level `do_send_transparent` path), matching `do_send_fused`. `SpendPolicy`'s
+                // default permits every shielded pool with no transparent spending - the historical
+                // fully-shielded behavior (replaces the removed `TransparentSpendPolicy::ShieldedOnly`).
+                &SpendPolicy::default(),
                 None,
             )
             .map_err(|e| enrich_insufficient_funds(db, policy, classify_err(e)))?;
@@ -3051,9 +3079,10 @@ impl WalletActor {
                     policy,
                     // zecd's proposal path funds payments from shielded notes only (transparent
                     // UTXOs are spent via the separate lower-level `do_send_transparent` path), so
-                    // the input selector must never pull in transparent UTXOs. `ShieldedOnly` is the
-                    // upstream default and preserves the prior fully-shielded selection behavior.
-                    &TransparentSpendPolicy::ShieldedOnly,
+                    // the input selector must never pull in transparent UTXOs. `SpendPolicy::default`
+                    // permits every shielded pool with no transparent spending, preserving the prior
+                    // fully-shielded selection behavior (replaces `TransparentSpendPolicy::ShieldedOnly`).
+                    &SpendPolicy::default(),
                     None,
                 )
                 .map_err(|e| enrich_insufficient_funds(db, policy, classify_err(e)))?;
@@ -4072,11 +4101,15 @@ fn prove_sign_pczt(
     // Ironwood (V6) proof step. A V6 transaction past NU6.3 carries a separate Ironwood bundle
     // needing its own proof, produced from the same `PostNu6_3` proving key as the Orchard proof
     // (mirrors devtool's `pczt/prove.rs`). Only compiled under the `ironwood` feature, whose
-    // `ProvingKeyCache` builds the `PostNu6_3` key. This is the Ironwood send's proving step:
-    // `create_pczt_from_proposal` builds the Ironwood PCZT (librustzcash#2543) and `do_send` routes
-    // the send here (the cached PCZT path), so `requires_ironwood_proof()` is true for a post-NU6.3
-    // Orchard-pool spend and the Ironwood bundle is proved from the cached key - no per-send
-    // `ProvingKey::build()`.
+    // `ProvingKeyCache` builds the `PostNu6_3` key.
+    //
+    // DEAD CODE TODAY (kept intentionally): `do_send` routes every post-NU6.3 send to the fused
+    // `create_proposed_transactions` path (see `ironwood_forces_fused` in `cached_pczt_path`) and
+    // never reaches this PCZT prover for such a tx, because upstream `create_pczt_from_proposal`
+    // rejects Ironwood PCZTs. So `requires_ironwood_proof()` is always false here. This step is the
+    // ready other half: once upstream lets the PCZT path build Ironwood bundles, dropping that gate
+    // routes Ironwood sends back through here - reusing the cached key instead of the fused path's
+    // per-send `ProvingKey::build()`.
     #[cfg(feature = "ironwood")]
     let prover = if prover.requires_ironwood_proof() {
         prover
