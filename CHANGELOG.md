@@ -5,6 +5,11 @@ All notable changes to zecd are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com), and this
 project adheres to [Semantic Versioning](https://semver.org).
 
+## [0.5.0-rc1] - 2026-07-09
+
+### Added
+- Ironwood (NU6.3 / V6) support: receive discovery, balance rollup, `pool == "ironwood"` labelling, and the Ironwood send and proof path, with an NU6.3 regtest end-to-end covering receive, send, and memo decryption. Compiled unconditionally and activated by consensus height - on for testnet, off for mainnet, opt-in on regtest - so no build flag is needed. Pins librustzcash to a working zecrocks fork, to be repointed to mainline before release.
+
 ## [0.4.3] - 2026-07-12
 
 ### Added
@@ -163,6 +168,7 @@ Zcash, backed entirely by librustzcash and running as a light client.
 ### Security
 - Pre-release audit hardening; refuse to start on mainnet with the placeholder RPC password; enforce a 12-character passphrase minimum.
 
+[0.5.0-rc1]: https://github.com/zecrocks/zecd/compare/v0.4.2...v0.5.0-rc1
 [0.4.3]: https://github.com/zecrocks/zecd/compare/v0.4.2...v0.4.3
 [0.4.2]: https://github.com/zecrocks/zecd/compare/v0.4.1...v0.4.2
 [0.4.1]: https://github.com/zecrocks/zecd/compare/v0.4.0...v0.4.1
