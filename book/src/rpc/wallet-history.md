@@ -171,7 +171,10 @@ There is no account or address argument: results span the wallet's single accoun
 ]
 ```
 
-- `pool` is `transparent`, `sapling`, or `orchard`.
+- `pool` is `transparent`, `sapling`, `orchard`, or `ironwood`. `ironwood` appears once NU6.3
+  activates (testnet). Those notes arrive at ordinary Orchard addresses, so `pool` labels the
+  note's bundle, not a distinct receiver. See
+  [Addresses & shielded pools](../guide/addresses.md).
 - `status` is `mined`, `waiting`, or `expired`. zcashd's fourth value `expiringsoon` is never
   emitted.
 - `amountZat` is an integer (zatoshis), negative on sends; `outgoing` is true on the send

@@ -44,9 +44,10 @@ docker compose -f docker-compose.yml -f docker-compose.mainnet.yml up -d
 
 Three things to change before trusting the stack with real funds:
 
-- **Pin Zebra.** The compose file's `zfnd/zebra:5.0.0` tag is an example. Pin to a release
-  you have verified; Zebra's flags can vary between versions. (Zebra tags have no `v`
-  prefix.)
+- **Pin Zebra.** The compose file pins `zfnd/zebra:6.0.0-rc.0` on testnet, because Ironwood
+  (NU6.3) needs an ironwood-capable node; the mainnet overlay pins the stable `zfnd/zebra:5.0.0`,
+  since Ironwood is testnet-only. Both tags are examples. Pin to a release you have verified;
+  Zebra's flags can vary between versions. (Zebra tags have no `v` prefix.)
 - **Set a real RPC password.** The shipped configs use `password = "CHANGE-ME"`. On
   mainnet zecd refuses to start while the `[rpc]` password is still that placeholder
   (case-insensitive): the RPC credential is spend authority. On testnet it starts, but

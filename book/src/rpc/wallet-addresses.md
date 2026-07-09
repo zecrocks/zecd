@@ -30,6 +30,10 @@ on the wallet. `"transparent"` requires `[pools] transparent = true` and cannot 
 with shielded pool names (zecd hands out one receiver type at a time; ZIP-316 forbids a
 transparent-only UA, so the transparent receiver is bare-encoded as `t1...`/`tm...`).
 
+There is no `"ironwood"` receiver. Ironwood notes are received at ordinary Orchard addresses, so
+an Orchard receiver is all a payer needs to send you ironwood funds. See
+[Addresses & shielded pools](../guide/addresses.md).
+
 Transparent addresses come from the gap-limited external chain. Once the recovery window is
 full of unfunded addresses, zecd by default issues past it with a loud log warning (such an
 address may be unrecoverable from seed); with

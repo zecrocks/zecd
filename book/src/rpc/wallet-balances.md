@@ -5,9 +5,10 @@ on short-lived SQLite connections that bypass the wallet actor, so they never bl
 or an in-flight send. For the wire format, auth, and multiwallet `/wallet/<name>` routing, see
 [Conventions & wire format](index.md).
 
-Balances aggregate every pool the wallet holds funds in: Orchard, Sapling, and (when
-[transparent receiving](../guide/transparent.md) is enabled) transparent UTXOs. Amounts are
-bare JSON numbers in decimal ZEC, 8 places, exact (no float drift).
+Balances aggregate every pool the wallet holds funds in: Orchard, Sapling, Ironwood (once NU6.3
+activates; those notes arrive at ordinary Orchard addresses, so no extra receiver is involved),
+and (when [transparent receiving](../guide/transparent.md) is enabled) transparent UTXOs. Amounts
+are bare JSON numbers in decimal ZEC, 8 places, exact (no float drift).
 
 ## getbalance
 

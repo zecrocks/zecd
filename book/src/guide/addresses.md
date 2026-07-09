@@ -37,8 +37,12 @@ enabled = ["sapling", "orchard"]            # pools the wallet receives into and
 default_receivers = ["sapling", "orchard"]  # receivers in the UAs getnewaddress hands out
 ```
 
-- Supported shielded pools are `sapling` and `orchard` (a future *ironwood* pool will slot in as
-  a third name).
+- Supported shielded pools are `sapling` and `orchard`. Ironwood (NU6.3) is **not** a third name
+  here, now or later: upstream models ironwood notes as Orchard "V3" notes that reuse Orchard's
+  keys, addresses, and note cryptography, so there is no ironwood receiver typecode to request or
+  enable. Ironwood notes are received at **ordinary Orchard addresses**; the distinction lives at
+  the transaction-bundle level, and surfaces as `pool == "ironwood"` in balances and history once
+  NU6.3 activates. See [Ironwood (NU6.3) on testnet](../quickstart.md#ironwood-nu63-on-testnet).
 - The default (`[pools]` omitted entirely) is **Orchard-only**.
 - `default_receivers` must be a subset of `enabled`; naming a disabled pool is a startup error.
   `default_receivers` omitted defaults to `enabled`.

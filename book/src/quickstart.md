@@ -176,6 +176,27 @@ spend authority over plaintext HTTP, so front them with TLS or a network policy 
 other hosts. The image build, ARM variant, and `.deb`/systemd routes are covered in
 [Deployment](guide/deployment.md).
 
+## Ironwood (NU6.3) on testnet
+
+Ironwood is compiled in unconditionally: there is no build flag and no `[pools]` entry. zecd
+activates it from consensus height alone, so it is **on for testnet** (NU6.3 at height 4134000)
+and **off for mainnet**, whose protocol carries no NU6.3 height. Regtest opts in via the
+`ZECD_REGTEST_NU63_HEIGHT` environment variable.
+
+Testing it needs an ironwood-capable node. The compose stack's testnet default already pins one
+(`zfnd/zebra:6.0.0-rc.0`); the mainnet overlay stays on the stable Zebra.
+
+Ironwood notes are received at **ordinary Orchard addresses**. Upstream models them as Orchard
+"V3" notes that reuse Orchard's keys, addresses, and note cryptography, so there is no ironwood
+receiver to request and nothing to enable in `[pools]`. What differs is the note's transaction
+bundle. Once NU6.3 activates, received notes report `pool == "ironwood"` in `getbalance`,
+`listtransactions`, and `gettransaction`, and post-NU6.3 sends build through the fused
+transaction builder, skipping the cached Orchard proving key, so each send takes a few extra
+seconds.
+
+Ironwood ships in the `0.5.0-rc1` release candidate, which pins librustzcash to a working
+zecrocks fork. That pin moves to mainline librustzcash before the final release.
+
 ## Where to go next
 
 - [Configuration](configuration.md): every TOML section and key, CLI flags, environment
