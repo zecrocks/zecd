@@ -218,13 +218,12 @@ zcash_client_sqlite = { git = "https://github.com/zecrocks/librustzcash", rev = 
 zcash_primitives = { git = "https://github.com/zecrocks/librustzcash", rev = "71da9dddc194f8adf003b14c7957d03a4836c3cd" }
 zcash_proofs = { git = "https://github.com/zecrocks/librustzcash", rev = "71da9dddc194f8adf003b14c7957d03a4836c3cd" }
 zcash_transparent = { git = "https://github.com/zecrocks/librustzcash", rev = "71da9dddc194f8adf003b14c7957d03a4836c3cd" }
-# The `dw/ironwood-scan-model` line (our fork branch above) requires the explicit-checkpoint-retention
-# shardtree APIs (`ensure_retained`/`retained_checkpoints`/`remove_retained_checkpoint`) that aren't in
-# a published shardtree yet. We pin **our own fork - `zecrocks/incrementalmerkletree`** - rather than
-# `zcash/incrementalmerkletree` main, because upstream `decefc46` panics when it prunes a checkpoint
-# whose position flags need clearing; the fork is `decefc46` + one commit fixing that `clear_flags`
-# checkpoint-pruning panic. Mirror this exact rev on both crates, or `zcash_client_backend` fails to
-# build/run against the crates.io shardtree. Drop both once a shardtree release carrying these APIs
-# and the fix is cut.
-shardtree = { git = "https://github.com/zecrocks/incrementalmerkletree", rev = "6e083a49ef44385cad6b15d4ae1fa9e5e3f6b25d" }
-incrementalmerkletree = { git = "https://github.com/zecrocks/incrementalmerkletree", rev = "6e083a49ef44385cad6b15d4ae1fa9e5e3f6b25d" }
+# The ironwood librustzcash line requires the explicit-checkpoint-retention shardtree APIs
+# (`ensure_retained`/`retained_checkpoints`/`remove_retained_checkpoint`) plus the `clear_flags`
+# checkpoint-pruning panic fix, neither of which is in a published shardtree yet. Upstream
+# `zcash/incrementalmerkletree` **main** now carries both (the panic fix landed upstream - no longer
+# needs our `zecrocks/incrementalmerkletree` fork), so pin both crates to upstream main by git rev.
+# Mirror this exact rev on both crates. Drop once a shardtree release carrying these APIs and the fix
+# is cut.
+shardtree = { git = "https://github.com/zcash/incrementalmerkletree", rev = "7b23adb67044d2a9f4a68759f1e6340c3fc4735a" }
+incrementalmerkletree = { git = "https://github.com/zcash/incrementalmerkletree", rev = "7b23adb67044d2a9f4a68759f1e6340c3fc4735a" }
