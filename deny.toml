@@ -58,11 +58,12 @@ unknown-git = "deny"
 # `https://github.com/zcash/librustzcash` when the self-send memo fix merges into
 # `dw/ironwood-scan-model` and we repin to the merged commit. The branch also requires
 # the explicit-checkpoint-retention shardtree APIs plus a `clear_flags` checkpoint-pruning panic fix,
-# so shardtree + incrementalmerkletree are git-patched to our own fork
-# `zecrocks/incrementalmerkletree` (upstream `decefc46` + one fix commit; mirror the rev the
-# `[patch]` pins). `orchard` resolves from crates.io (0.15.0-pre.x). Drop both git sources when the
-# ironwood wallet crates + a shardtree release with these APIs and the fix land on crates.io.
+# so shardtree + incrementalmerkletree are git-patched to `zcash/incrementalmerkletree` main (which now
+# carries both - the panic fix landed upstream, so our `zecrocks/incrementalmerkletree` fork is no
+# longer needed; mirror the rev the `[patch]` pins). `orchard` resolves from crates.io (0.15.0-pre.x).
+# Drop both git sources when the ironwood wallet crates + a shardtree release with these APIs and the
+# fix land on crates.io.
 allow-git = [
     "https://github.com/zecrocks/librustzcash",
-    "https://github.com/zecrocks/incrementalmerkletree",
+    "https://github.com/zcash/incrementalmerkletree",
 ]

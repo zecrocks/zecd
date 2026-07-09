@@ -1534,7 +1534,7 @@ checksum = "b9e0384b61958566e926dc50660321d12159025e767c18e043daf26b70104c39"
 [[package]]
 name = "incrementalmerkletree"
 version = "0.8.2"
-source = "git+https://github.com/zecrocks/incrementalmerkletree?rev=6e083a49ef44385cad6b15d4ae1fa9e5e3f6b25d#6e083a49ef44385cad6b15d4ae1fa9e5e3f6b25d"
+source = "git+https://github.com/zcash/incrementalmerkletree?rev=7b23adb67044d2a9f4a68759f1e6340c3fc4735a#7b23adb67044d2a9f4a68759f1e6340c3fc4735a"
 dependencies = [
  "either",
 ]
@@ -2789,7 +2789,7 @@ dependencies = [
 [[package]]
 name = "shardtree"
 version = "0.6.2"
-source = "git+https://github.com/zecrocks/incrementalmerkletree?rev=6e083a49ef44385cad6b15d4ae1fa9e5e3f6b25d#6e083a49ef44385cad6b15d4ae1fa9e5e3f6b25d"
+source = "git+https://github.com/zcash/incrementalmerkletree?rev=7b23adb67044d2a9f4a68759f1e6340c3fc4735a#7b23adb67044d2a9f4a68759f1e6340c3fc4735a"
 dependencies = [
  "bitflags",
  "either",
