@@ -16,7 +16,9 @@
 
 services:
   zebra:
-    image: zfnd/zebra:6.0.0                 # pin to a verified release (zebra tags have no 'v' prefix)
+    # Ironwood (NU6.3) needs an ironwood-capable zebrad; testnet activates NU6.3 at height 4134000.
+    # Mainnet pins back to a stable release (see docker-compose.mainnet.yml).
+    image: zfnd/zebra:6.0.0-rc.0            # pin to a verified release (zebra tags have no 'v' prefix)
     restart: unless-stopped
     command: ["zebrad", "-c", "/etc/zebra/zebrad.toml", "start"]
     volumes:

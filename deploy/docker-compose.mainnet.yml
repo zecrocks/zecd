@@ -1,6 +1,7 @@
 # Mainnet override for the self-hosted stack. The base docker-compose.yml is testnet by default;
-# this override swaps each service's config file for its mainnet variant. Ports and wiring are
-# unchanged, so the same workflow applies - just add `-f docker-compose.mainnet.yml`:
+# this override swaps each service's config file for its mainnet variant and pins zebra back to a
+# stable release. Ports and wiring are unchanged, so the same workflow applies - just add
+# `-f docker-compose.mainnet.yml`:
 #
 #   docker compose -f docker-compose.yml -f docker-compose.mainnet.yml up -d zebra
 #   docker compose -f docker-compose.yml -f docker-compose.mainnet.yml run --rm zecd init --wallet default
@@ -11,6 +12,9 @@
 
 services:
   zebra:
+    # Ironwood (NU6.3) is testnet-only, so mainnet stays on the stable zebra release instead of the
+    # ironwood release candidate the testnet stack pins.
+    image: zfnd/zebra:5.0.0
     volumes:
       - ./zebrad.mainnet.toml:/etc/zebra/zebrad.toml:ro
 
