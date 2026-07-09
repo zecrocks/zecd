@@ -17,9 +17,14 @@ fn connected(state: &AppState) -> bool {
 /// zecd's own version in Bitcoin Core's numeric encoding (major*10000 + minor*100 + patch),
 /// derived from Cargo.toml so it can't drift from the crate version.
 fn version_number() -> u64 {
-    let mut parts = env!("CARGO_PKG_VERSION")
-        .split('.')
-        .map(|p| p.parse::<u64>().unwrap_or(0));
+    // Each component's leading digit run, so a pre-release suffix (e.g. "0-rc0") still encodes.
+    let mut parts = env!("CARGO_PKG_VERSION").split('.').map(|p| {
+        p.split(|c: char| !c.is_ascii_digit())
+            .next()
+            .unwrap_or("")
+            .parse::<u64>()
+            .unwrap_or(0)
+    });
     let major = parts.next().unwrap_or(0);
     let minor = parts.next().unwrap_or(0);
     let patch = parts.next().unwrap_or(0);
@@ -89,15 +94,17 @@ mod tests {
     fn version_number_encodes_cargo_version() {
         let v = super::version_number();
         assert!(v > 0, "version must encode to a nonzero number");
-        // 0.1.0 -> 100, 1.2.3 -> 10203; sanity-check the arithmetic shape.
-        assert_eq!(
-            v % 100,
-            env!("CARGO_PKG_VERSION")
-                .split('.')
-                .nth(2)
-                .unwrap()
-                .parse::<u64>()
-                .unwrap()
-        );
+        // 0.1.0 -> 100, 1.2.3 -> 10203; sanity-check the arithmetic shape. The patch component
+        // may carry a pre-release suffix (e.g. "0-rc0"), so compare against its leading digit run.
+        let patch: u64 = env!("CARGO_PKG_VERSION")
+            .split('.')
+            .nth(2)
+            .unwrap()
+            .split(|c: char| !c.is_ascii_digit())
+            .next()
+            .unwrap()
+            .parse()
+            .unwrap();
+        assert_eq!(v % 100, patch);
     }
 }
