@@ -117,16 +117,13 @@ mimalloc = ["dep:mimalloc"]
 # mitigations that swapping out musl's `malloc-ng` would otherwise drop. `mimalloc` (non-secure)
 # remains available for anyone who wants the last few percent. See FINDINGS.md.
 mimalloc-secure = ["mimalloc", "mimalloc/secure"]
-# Ironwood (NU6.3 / V6). DEV-ONLY: builds against the official zcash/librustzcash rev that
-# zcash-devtool's `ironwood-valar` branch uses (see `[patch.crates-io]`). Gates zecd's own ironwood
-# paths: the `PostNu6_3` proving key + the ironwood proof step in the send path, the NU6.3 regtest
-# activation height, and `pool == "ironwood"` labelling. Build with just `cargo build --features
-# ironwood` - upstream exposes the ironwood types unconditionally, so NO `--cfg zcash_unstable="nu6.3"`
-# RUSTFLAG is needed (unlike the old valar fork). The default build (feature off) stays
-# released-equivalent: NU6.3 is inactive and no ironwood paths run. Sends and receives both work on
-# the pinned rev (matching zcash-devtool's ironwood-valar), via `AccountBalance::ironwood_balance()`
-# for receives and the ironwood proof step for sends.
-ironwood = []
+# NB: Ironwood (NU6.3 / V6) is **no longer a cargo feature** - it is compiled unconditionally (this
+# RC branch pins the ironwood librustzcash line, which exposes the ironwood APIs unconditionally).
+# Activation is purely consensus-height driven via `is_nu_active(NetworkUpgrade::Nu6_3, ...)`: OFF on
+# mainnet (protocol has no NU6.3 height), ON on testnet at height 4_134_000, and opt-in on regtest
+# via the `ZECD_REGTEST_NU63_HEIGHT` env var (the ironwood harness sets it to 8; the standard harness
+# leaves it unset). So ironwood is "always built, testnet-on, mainnet-off" with no build flag. This
+# is an RC posture - the real release will pin published crates.io librustzcash instead of the git rev.
 
 [dev-dependencies]
 tempfile = "3"

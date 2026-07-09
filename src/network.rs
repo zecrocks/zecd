@@ -84,16 +84,17 @@ pub fn regtest() -> ZNetwork {
     // live. This must match the regtest chain the harness/zebra run (regtest-harness's
     // NU6_2_ACTIVATION_HEIGHT) so zecd commits transactions to the right consensus branch id.
     let nu62 = Some(BlockHeight::from_u32(4));
-    // NU6.3 (ironwood) is only activated on the regtest chain for the ironwood build: the ironwood
-    // harness configures zebra with NU6.3 at `NU6_3_ACTIVATION_HEIGHT` (8), while the standard
-    // harness leaves it unset. Upstream now carries `nu6_3` as a stable (non-cfg-gated) field, so
-    // we set its *value* per build rather than gate the field's existence - the height must match
-    // zebra's `configured_activation_heights.nu6_3` and the harness so zecd commits transactions to
-    // the right consensus branch id.
-    #[cfg(feature = "ironwood")]
-    let nu63 = Some(BlockHeight::from_u32(8));
-    #[cfg(not(feature = "ironwood"))]
-    let nu63 = None;
+    // NU6.3 (ironwood) activation on the regtest chain is opt-in via `ZECD_REGTEST_NU63_HEIGHT`.
+    // Ironwood is always compiled now, so the *code* is unconditional; only the regtest activation
+    // height is a knob: the ironwood harness configures zebra with NU6.3 at that height (8) and sets
+    // this env var so zecd commits to the matching consensus branch id, while the standard harness
+    // leaves it unset (no NU6.3) to match its stock zebra. (Real networks get their heights from the
+    // pinned protocol - NU6.3 is unset on mainnet and 4_134_000 on testnet - so this only affects
+    // regtest.) An unset/unparseable value means no NU6.3, exactly like the old default build.
+    let nu63 = std::env::var("ZECD_REGTEST_NU63_HEIGHT")
+        .ok()
+        .and_then(|s| s.parse::<u32>().ok())
+        .map(BlockHeight::from_u32);
     ZNetwork::Regtest(LocalNetwork {
         overwinter: h,
         sapling: h,

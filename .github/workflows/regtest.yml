@@ -293,12 +293,11 @@ jobs:
           # Separate cache key: this build carries the ironwood feature + nu6.3 cfg.
           key: ironwood
 
-      # zecd must be built with the ironwood feature to scan ironwood notes and report the ironwood
-      # balance/pool. Official upstream (dw/ironwood-scan-model) exposes the ironwood wallet APIs
-      # unconditionally, so no `zcash_unstable="nu6.3"` cfg is needed any more - the feature alone
-      # gates zecd's ironwood paths. (The harness itself needs neither - it only spawns this binary.)
-      - name: Build zecd (release, --features ironwood)
-        run: cargo build --release --features ironwood --bin zecd
+      # zecd compiles the ironwood scan/balance/pool/send paths unconditionally now (no cargo
+      # feature) - this is a plain release build. NU6.3 activation on the regtest chain is turned on
+      # for the zecd process below via the `ZECD_REGTEST_NU63_HEIGHT` env var (see the e2e step).
+      - name: Build zecd (release)
+        run: cargo build --release --bin zecd
 
       # Extract zebrad + lightwalletd + the devtool funder from the ironwood toolchain images.
       - name: Provision ironwood zebrad + lightwalletd + devtool from images
@@ -327,6 +326,10 @@ jobs:
         env:
           ZECD_BIN: ${{ github.workspace }}/target/release/zecd
           ZECD_REGTEST_IRONWOOD: "1"
+          # Activate NU6.3 at height 8 on the regtest chain for the zecd process (matches the zebra
+          # the ironwood harness configures). Ironwood is always compiled; this env var is what turns
+          # its activation on for regtest. The standard regtest tier leaves it unset (no NU6.3).
+          ZECD_REGTEST_NU63_HEIGHT: "8"
           ZEBRAD_STDERR: ${{ runner.temp }}/zebrad.log
           # Stream zecd's own logs into the run output (info level) so a failure is diagnosable
           # without the debug flood that the receive/send bring-up needed.

@@ -13,8 +13,9 @@
 //!
 //! Requires the full ironwood toolchain - the official ironwood zebra RC (`zfnd/zebra:6.0.0-rc.0`),
 //! a V6-parsing lightwalletd, an ironwood/regtest-aware `zcash-devtool` funder (its regtest `init`
-//! is given `--activation-heights` via [`Funder::init_ironwood`]), and a `zecd` built
-//! `--features ironwood` (no `--cfg` needed - upstream exposes the ironwood APIs unconditionally).
+//! is given `--activation-heights` via [`Funder::init_ironwood`]), and a plain-release `zecd`
+//! (ironwood is compiled unconditionally now - no cargo feature) with `ZECD_REGTEST_NU63_HEIGHT=8`
+//! in its environment so NU6.3 activates at height 8 on the regtest chain (matching zebra).
 //! Gated behind `ZECD_REGTEST_IRONWOOD=1` (its own CI tier) so it never runs against the stock-zebra
 //! funded tier - there `Zebrad::start_with_miner_ironwood`'s `"NU6.3"` activation-height key would
 //! be rejected at startup.
@@ -108,7 +109,7 @@ async fn regtest_ironwood_receive_and_orchard_send() {
     zebrad.generate_blocks(6).await.expect("confirm shield");
     funder.sync(lwd.grpc_port).expect("funder sync (shielded)");
 
-    // 5. zecd (built --features ironwood) against zebra; get its unified address.
+    // 5. zecd (ironwood compiled unconditionally) against zebra; get its unified address.
     let cfg = ZecdConfig::new(zebrad.rpc_port, pick_port().expect("pick zecd rpc port"));
     let zecd = Zecd::start(&cfg)
         .await
@@ -192,7 +193,7 @@ async fn regtest_ironwood_receive_and_orchard_send() {
     // The balance eventually reflects the ironwood receive once the note clears the confirmation
     // policy. A foreign (received) note isn't spendable until `untrusted_confirmations` (ZIP-315:
     // 10), so `getbalance` reads 0 right after the note first appears at 0-conf in `listunspent`
-    // above - keep mining until it confirms into the balance. A `--features ironwood` zecd sums
+    // above - keep mining until it confirms into the balance. A zecd (ironwood always compiled) sums
     // `ironwood_balance()`, and the note is a V3 output `orchard_balance()` excludes, so a non-zero
     // balance here is the ironwood value.
     let deadline = Instant::now() + FUND_TIMEOUT;
@@ -674,7 +675,7 @@ async fn regtest_ironwood_receive_memo() {
     zebrad.generate_blocks(6).await.expect("confirm shield");
     funder.sync(lwd.grpc_port).expect("funder sync (shielded)");
 
-    // 5-6. Start zecd (built --features ironwood) and wait until it is caught up.
+    // 5-6. Start zecd (ironwood compiled unconditionally) and wait until it is caught up.
     let cfg = ZecdConfig::new(zebrad.rpc_port, pick_port().expect("pick zecd rpc port"));
     let zecd = Zecd::start(&cfg)
         .await
