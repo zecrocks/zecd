@@ -26,8 +26,8 @@ pub struct BalanceInfo {
     pub sapling_spendable: u64,
     /// Ironwood (NU6.3, Orchard V3) spendable value. Read from `AccountBalance::ironwood_balance()`,
     /// which the pinned scan-model librustzcash rev surfaces (the same API devtool reads). 0 until
-    /// NU6.3 activates and the wallet holds ironwood notes.
-    #[cfg(feature = "ironwood")]
+    /// NU6.3 activates and the wallet holds ironwood notes - so 0 on mainnet, and on testnet until
+    /// NU6.3 activates at height 4_134_000.
     pub ironwood_spendable: u64,
     /// Spendable transparent (unshielded) value. Spendable here means "usable as an input": zecd
     /// spends transparent UTXOs by auto-shielding them into a shielded send.
@@ -86,25 +86,21 @@ pub fn balance(
             // `dw/ironwood-scan-model` rev zcash-devtool builds against) rolls received ironwood
             // notes into `AccountBalance::ironwood_balance()`, exactly as devtool's `balance.rs`
             // reads it; sum it into the spendable/pending/immature buckets like the other pools.
-            #[cfg(feature = "ironwood")]
-            {
-                info.ironwood_spendable += bal.ironwood_balance().spendable_value().into_u64();
-                info.pending += bal
-                    .ironwood_balance()
-                    .value_pending_spendability()
-                    .into_u64();
-                info.immature += bal
-                    .ironwood_balance()
-                    .change_pending_confirmation()
-                    .into_u64();
-            }
+            // (0 pre-NU6.3, so a no-op on mainnet / pre-activation testnet.)
+            info.ironwood_spendable += bal.ironwood_balance().spendable_value().into_u64();
+            info.pending += bal
+                .ironwood_balance()
+                .value_pending_spendability()
+                .into_u64();
+            info.immature += bal
+                .ironwood_balance()
+                .change_pending_confirmation()
+                .into_u64();
         }
-        info.total_spendable =
-            info.orchard_spendable + info.sapling_spendable + info.transparent_spendable;
-        #[cfg(feature = "ironwood")]
-        {
-            info.total_spendable += info.ironwood_spendable;
-        }
+        info.total_spendable = info.orchard_spendable
+            + info.sapling_spendable
+            + info.transparent_spendable
+            + info.ironwood_spendable;
     }
     Ok(info)
 }
@@ -779,7 +775,7 @@ pub fn list_unspent(network: ZNetwork, wallet_dir: &Path) -> anyhow::Result<Vec<
     // queries a pool when it appears in `sources`, so an ironwood receive is invisible to
     // `listunspent` unless we ask for it here (and read `notes.ironwood()` below). It is not a
     // `Pool::SUPPORTED` member (ironwood has no UA receiver - see `pools.rs`), so add it explicitly.
-    #[cfg(feature = "ironwood")]
+    // Harmless pre-NU6.3: the ironwood note table is simply empty on mainnet / pre-activation testnet.
     protocols.push(ShieldedPool::Ironwood);
     for account in db.get_account_ids()? {
         let notes = db.select_unspent_notes(account, &protocols, target_height, &[])?;
@@ -829,7 +825,6 @@ pub fn list_unspent(network: ZNetwork, wallet_dir: &Path) -> anyhow::Result<Vec<
         // Ironwood notes are Orchard-shaped (`ReceivedNote<_, orchard::note::Note>`) but returned in
         // their own `ironwood()` accessor; label them pool code 4 (the `out_pool` map overrides this
         // with the recorded `v_tx_outputs.output_pool` when present, which is also 4).
-        #[cfg(feature = "ironwood")]
         for note in notes.ironwood() {
             let value = note
                 .note_value()
@@ -878,8 +873,7 @@ pub fn list_unspent(network: ZNetwork, wallet_dir: &Path) -> anyhow::Result<Vec<
         ];
         // An unmined ironwood note is stored in its own `ironwood_received_notes` table (not
         // `orchard_received_notes`), so a 0-conf ironwood receive from the mempool stream is only
-        // visible if we query that table too. Same query shape; pool code 4.
-        #[cfg(feature = "ironwood")]
+        // visible if we query that table too. Same query shape; pool code 4. Empty pre-NU6.3.
         pools.push((
             "ironwood_received_notes",
             "ironwood_received_note_spends",

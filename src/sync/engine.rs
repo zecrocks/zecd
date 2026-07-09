@@ -93,7 +93,7 @@ pub async fn update_subtree_roots<C: ChainSource>(
     // Ironwood notes are stored as blocks are scanned), and it exposes no `put_ironwood_subtree_roots`
     // API to pre-seed roots from `z_getsubtreesbyindex "ironwood"` the way Sapling/Orchard do. On
     // the short regtest chain this is equivalent; a from-genesis scan builds the tree. If upstream
-    // later adds an Ironwood subtree-root writer, reinstate a pass here (behind `feature = "ironwood"`).
+    // later adds an Ironwood subtree-root writer, reinstate a pass here (gated on NU6.3 being active).
 
     Ok(())
 }

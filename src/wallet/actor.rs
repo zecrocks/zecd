@@ -82,14 +82,12 @@ impl ProvingKeyCache {
     /// at startup, off the async runtime (e.g. under `spawn_blocking`).
     pub fn build() -> Self {
         // The orchard crate splits `build()` into per-circuit-version keys. `FixedPostNu6_2` is the
-        // current (NU6.2-era) Orchard circuit. `PostNu6_3` is the ironwood circuit - a single
-        // `PostNu6_3` key serves BOTH the Orchard and Ironwood proof steps of a V6 transaction
-        // (devtool's `prove.rs` does the same), so the `ironwood` build uses it for every send. The
-        // ironwood feature is dev-only and targets post-NU6.3 chains, so it never needs the
-        // NU6.2 key; the default (released-equivalent) build stays on `FixedPostNu6_2`.
-        #[cfg(feature = "ironwood")]
-        let circuit = orchard::circuit::OrchardCircuitVersion::PostNu6_3;
-        #[cfg(not(feature = "ironwood"))]
+        // current (NU6.2-era) Orchard circuit. The cached-proving-key PCZT path only ever proves
+        // **V5 Orchard** sends: post-NU6.3 sends route to the fused `create_proposed_transactions`
+        // path (see `ironwood_forces_fused`), which builds its own `PostNu6_3` key via `LocalTxProver`.
+        // So this cache never proves a V6/Ironwood bundle and `FixedPostNu6_2` is always correct here,
+        // on every network (mainnet, testnet pre-4.134M, and post-NU6.3 chains where the cache goes
+        // unused). Reclaim `PostNu6_3` here only if the PCZT path is ever taught to build Ironwood.
         let circuit = orchard::circuit::OrchardCircuitVersion::FixedPostNu6_2;
         ProvingKeyCache {
             orchard_pk: orchard::circuit::ProvingKey::build(circuit),
@@ -2821,7 +2819,6 @@ impl WalletActor {
     /// TODO(upstream): drop this once `create_pczt_from_proposal` accepts Ironwood bundles - then
     /// Ironwood sends ride the cached PCZT path and reuse the `PostNu6_3` key (the paired
     /// `create_ironwood_proof` step in `prove_sign_pczt` is the ready other half).
-    #[cfg(feature = "ironwood")]
     fn ironwood_forces_fused(&self) -> bool {
         use zcash_protocol::consensus::{NetworkUpgrade, Parameters};
         self.tip_height
@@ -2830,10 +2827,6 @@ impl WalletActor {
                     .is_nu_active(NetworkUpgrade::Nu6_3, BlockHeight::from_u32(tip) + 1)
             })
             .unwrap_or(false)
-    }
-    #[cfg(not(feature = "ironwood"))]
-    fn ironwood_forces_fused(&self) -> bool {
-        false
     }
 
     /// Whether a send should be pipelined: `[spend] pipeline_proving` on *and* the cached PCZT
@@ -4150,11 +4143,10 @@ fn prove_sign_pczt(
     // DEAD CODE TODAY (kept intentionally): `do_send` routes every post-NU6.3 send to the fused
     // `create_proposed_transactions` path (see `ironwood_forces_fused` in `cached_pczt_path`) and
     // never reaches this PCZT prover for such a tx, because upstream `create_pczt_from_proposal`
-    // rejects Ironwood PCZTs. So `requires_ironwood_proof()` is always false here. This step is the
-    // ready other half: once upstream lets the PCZT path build Ironwood bundles, dropping that gate
-    // routes Ironwood sends back through here - reusing the cached key instead of the fused path's
-    // per-send `ProvingKey::build()`.
-    #[cfg(feature = "ironwood")]
+    // rejects Ironwood PCZTs. So `requires_ironwood_proof()` is always false here (the branch is
+    // dead but compiled). This step is the ready other half: once upstream lets the PCZT path build
+    // Ironwood bundles, dropping the `ironwood_forces_fused` gate routes Ironwood sends back through
+    // here - reusing the cached key instead of the fused path's per-send `ProvingKey::build()`.
     let prover = if prover.requires_ironwood_proof() {
         prover
             .create_ironwood_proof(&keys.orchard_pk)
@@ -4201,9 +4193,9 @@ fn prove_sign_pczt(
     // spends need their own signing pass or `extract_and_store_transaction_from_pczt` fails with
     // `Ironwood(Extract(MissingSpendAuthSig))`. Ironwood reuses Orchard's spend crypto, so the same
     // Orchard `ask` signs it; the loop mirrors the Orchard one (skip the dummy-spend
-    // `WrongSpendAuthorizingKey`, stop at `InvalidIndex`). Only reachable under `feature = "ironwood"`
-    // (post-NU6.3, spending an ironwood note); the default build never produces an Ironwood bundle.
-    #[cfg(feature = "ironwood")]
+    // `WrongSpendAuthorizingKey`, stop at `InvalidIndex`). Dead but compiled: the PCZT path never
+    // produces an Ironwood bundle (post-NU6.3 sends route to the fused path via
+    // `ironwood_forces_fused`), so the loop finds no ironwood spends and exits immediately.
     {
         let mut index = 0;
         loop {
