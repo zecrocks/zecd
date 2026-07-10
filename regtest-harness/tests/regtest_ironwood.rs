@@ -119,6 +119,21 @@ async fn regtest_ironwood_receive_and_orchard_send() {
         .await
         .expect("getnewaddress");
     let zecd_ua = zecd_ua.as_str().expect("address string").to_string();
+    // `getnewaddress` must NEVER return an empty response, and must stay a valid unified address
+    // even with NU6.3/ironwood active on this chain and an Orchard-only receiver config: ironwood
+    // has no distinct UA receiver (it reuses the Orchard receiver - a post-NU6.3 Orchard-address
+    // output is simply an ironwood V3 *note*), so the address derives from the account UFVK exactly
+    // as it does pre-NU6.3. A `None`/failed derivation would surface as a JSON-RPC *error*, never an
+    // empty success string. Assert it here so a regression fails at the call with a clear message
+    // rather than later as a downstream funding timeout. (`u`/`utest`/`uregtest` all start with `u`.)
+    assert!(
+        !zecd_ua.is_empty(),
+        "getnewaddress returned an empty address on an NU6.3-active chain (Orchard-only config)"
+    );
+    assert!(
+        zecd_ua.starts_with('u'),
+        "getnewaddress returned a non-unified address on an NU6.3-active chain: {zecd_ua:?}"
+    );
 
     // 6. Wait until zecd is fully caught up.
     let deadline = Instant::now() + FUND_TIMEOUT;
@@ -685,6 +700,21 @@ async fn regtest_ironwood_receive_memo() {
         .await
         .expect("getnewaddress");
     let zecd_ua = zecd_ua.as_str().expect("address string").to_string();
+    // `getnewaddress` must NEVER return an empty response, and must stay a valid unified address
+    // even with NU6.3/ironwood active on this chain and an Orchard-only receiver config: ironwood
+    // has no distinct UA receiver (it reuses the Orchard receiver - a post-NU6.3 Orchard-address
+    // output is simply an ironwood V3 *note*), so the address derives from the account UFVK exactly
+    // as it does pre-NU6.3. A `None`/failed derivation would surface as a JSON-RPC *error*, never an
+    // empty success string. Assert it here so a regression fails at the call with a clear message
+    // rather than later as a downstream funding timeout. (`u`/`utest`/`uregtest` all start with `u`.)
+    assert!(
+        !zecd_ua.is_empty(),
+        "getnewaddress returned an empty address on an NU6.3-active chain (Orchard-only config)"
+    );
+    assert!(
+        zecd_ua.starts_with('u'),
+        "getnewaddress returned a non-unified address on an NU6.3-active chain: {zecd_ua:?}"
+    );
     let deadline = Instant::now() + FUND_TIMEOUT;
     loop {
         let peers = zecd
