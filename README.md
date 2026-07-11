@@ -825,6 +825,16 @@ lockfile to delete: if the error appears and no zecd is running, just retry. The
 `zecd export-ufvk` is exempt (it only reads the wallet DB), so you can export a UFVK while the
 daemon is running.
 
+> **The datadir must be host-local.** The lock is an OS advisory lock, enforced by the local
+> kernel, so it only guards against a second zecd on the *same host*. It does **not** span hosts:
+> on a network filesystem shared read-write by two machines (NFS, SMB, a Kubernetes
+> `ReadWriteMany` volume), each host's kernel grants the lock independently, so two zecd on
+> different hosts could both write the same wallet DB and corrupt it. Put the datadir on a local
+> disk, or on a volume mounted so exactly one node can write it (Kubernetes `ReadWriteOnce`), and
+> never share it read-write across hosts. For diagnostics the lockfile records the holder's
+> `hostname:pid`. There is no cross-host guard today; a shared-storage deployment would need a
+> host-independent lease (in the DB or an external lock service), which is not implemented.
+
 ## Security
 
 Three key-custody models - the first two mirror bitcoind's unencrypted/encrypted wallet states,
