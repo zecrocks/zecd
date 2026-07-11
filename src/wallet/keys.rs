@@ -319,7 +319,7 @@ mod tests {
         }
     }
 
-    /// Audit 3.7 file-type + symlink handling: a non-regular file is rejected; a symlink is
+    /// File-type and symlink handling: a non-regular file is rejected; a symlink is
     /// resolved (so a Kubernetes Secret mount works) and its *target's* mode is what's enforced.
     #[cfg(unix)]
     #[test]

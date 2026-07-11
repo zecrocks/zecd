@@ -1048,7 +1048,7 @@ async fn auto_unlock_refuses_foreign_database_at_startup() {
     assert!(err.to_string().contains("does not derive"), "{err}");
 }
 
-/// Audit 3.13: a getrawtransaction that fails to reach the upstream must not leak the zebra
+/// A getrawtransaction that fails to reach the upstream must not leak the zebra
 /// endpoint (host:port / cookie-file path) in the error returned to the client. The actor here
 /// points at a dead 127.0.0.1:1 endpoint, so the fetch's connect fails; we assert the
 /// client-facing message is the generic string and contains none of the upstream address.
