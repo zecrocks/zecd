@@ -147,6 +147,15 @@ fn snapshot(state: &AppState) -> Snapshot {
             if !st.scanning && st.pending_enhancements > 0 {
                 any_enhancing = true;
             }
+            // The block-height gap between the tip and the last fully-scanned height - the
+            // meaningful "how far behind" signal. Surfaced on every wallet regardless of the
+            // configured readiness mode, so an operator on `readiness = "connected"` (which reports
+            // ready before the scan finishes) can still see how stale the wallet's reads may be.
+            // `null` until both heights are known.
+            let scan_lag = match (st.chain_tip, st.fully_scanned) {
+                (Some(tip), Some(scanned)) => Some(tip.saturating_sub(scanned)),
+                _ => None,
+            };
             wallets.insert(
                 name,
                 json!({
@@ -156,6 +165,7 @@ fn snapshot(state: &AppState) -> Snapshot {
                     "conn_state": st.conn_state.as_str(),
                     "chain_tip": st.chain_tip,
                     "fully_scanned": st.fully_scanned,
+                    "scan_lag": scan_lag,
                     "birthday": st.birthday,
                     "scan_progress": st.scan_progress,
                     "scanning": st.scanning,

@@ -146,18 +146,24 @@ it reveals the wallet's entire transaction graph, though it cannot spend.
 ## Monitoring
 
 - `GET /healthz` (health port, default 9233) - liveness.
-- `GET /readyz` - readiness, gated by `[health] readiness`. In `"connected"` mode
-  (default) it's 200 as soon as zebra is connected and its tip is past the wallet's
-  birthday - it does NOT wait for the scan to finish, so it stays ready (no flapping)
-  while the wallet catches up. In `"synced"` mode it's 200 only once connected,
-  within `[health] max_scan_lag` blocks of the tip, AND with the transaction-enhancement
-  backlog drained (see below). When 503, the body's `reason` distinguishes `upstream_down`
-  (zebra unreachable - page someone) from `syncing` (normal block catch-up), `enhancing`
-  (scanned to tip, still backfilling memos), and `actor_down` (a dead writer - restart
-  the process).
+- `GET /readyz` - readiness, gated by `[health] readiness`. In `"synced"` mode
+  (**default**) it's 200 only once connected, within `[health] max_scan_lag` blocks of the
+  tip, AND with the transaction-enhancement backlog drained (see below) - so a client
+  routed by readiness never sees an empty or stale balance/history as authoritative while
+  the wallet is still scanning. **Keep this default for any balance-sensitive deployment**
+  (an exchange, an accounting integration): a from-birthday restore or fresh sync stays 503
+  until it has actually caught up to its own funds. In `"connected"` mode it's 200 as soon as
+  zebra is connected and its tip is past the wallet's birthday - it does NOT wait for the scan
+  to finish, so it stays ready (no flapping) while the wallet catches up, but reads may lag the
+  tip; choose it only when reachability matters more than balance freshness, and watch the
+  per-wallet `scan_lag` to see how far behind reads may be. When 503, the body's `reason`
+  distinguishes `upstream_down` (zebra unreachable - page someone) from `syncing` (normal block
+  catch-up), `enhancing` (scanned to tip, still backfilling memos), and `actor_down` (a dead
+  writer - restart the process).
 - `GET /status` - per-wallet sync state, active upstream endpoint, `conn_state`
-  (`down` | `syncing` | `ready`), and `pending_enhancements` (the enhancement backlog).
-  Alert if `conn_state` stays `down`.
+  (`down` | `syncing` | `ready`), `scan_lag` (the `chain_tip - fully_scanned` block gap - how
+  far behind reads may be, reported in both readiness modes), and `pending_enhancements` (the
+  enhancement backlog). Alert if `conn_state` stays `down`.
 - **Enhancement backlog (`pending_enhancements`).** The compact-block scan reaching the
   tip (`scan_progress: 1.0`, `scanning: false` for the block scan) is NOT "ready to serve
   full history". Compact blocks carry no memos, so a per-transaction enhancement pass then

@@ -197,8 +197,9 @@ format = "text"                  # "text" | "json" (structured, for log aggregat
 enabled = true
 bind = "127.0.0.1"               # set 0.0.0.0 for Kubernetes/LB probes
 port = 9233
-readiness = "connected"          # "connected" (ready when the backend is live, past birthday)
-                                 # or "synced" (ready only once scanned to near the tip)
+readiness = "synced"             # default; ready only once scanned to near the tip, so reads
+                                 # are never stale. "connected" = ready when the backend is live
+                                 # (past birthday) but the scan may still be catching up.
 max_scan_lag = 4                 # "synced" mode: max chain_tip - fully_scanned block gap
 ```
 
@@ -268,18 +269,23 @@ With `[health] enabled` (default), zecd serves unauthenticated probes on a separ
 
 - `GET /healthz`: liveness. `200 ok` while the process is running.
 - `GET /readyz`: readiness. `200`/`503`, gated by `[health] readiness`:
-  - `"connected"` (default): ready as soon as the backend is connected and its chain tip is past
-    the wallet's birthday height (a sanity check that we're on the right, live network). It does
+  - `"synced"` (**default**): ready only once every wallet is connected, within
+    `[health] max_scan_lag` blocks of the chain tip, **and** with an empty transaction-enhancement
+    backlog. Strict - a from-birthday restore stays not-ready until it has scanned to its own funds
+    *and* finished backfilling memos (see below). This is the default so a client routed by
+    readiness never sees an empty or stale balance/history as authoritative while the wallet is
+    still scanning: an exchange or any balance-sensitive deployment should keep it.
+  - `"connected"`: ready as soon as the backend is connected and its chain tip is past the
+    wallet's birthday height (a sanity check that we're on the right, live network). It does
     **not** wait for the wallet to finish scanning, so RPC clients can reach zecd while it catches
-    up and readiness doesn't flap during a long sync - reads may lag the tip until caught up.
-  - `"synced"`: ready only once every wallet is connected, within `[health] max_scan_lag`
-    blocks of the chain tip, **and** with an empty transaction-enhancement backlog. Strict - a
-    from-birthday restore stays not-ready until it has scanned to its own funds *and* finished
-    backfilling memos (see below).
+    up and readiness doesn't flap during a long sync - but reads may lag the tip until caught up.
+    Choose this only when reachability matters more than balance freshness; the per-wallet
+    `scan_lag` in the JSON body (and `/status`) shows how far behind reads may be.
 
-  Body is JSON with per-wallet detail; when not ready it carries a `reason` (`"upstream_down"`,
-  `"actor_down"`, `"enhancing"`, or `"syncing"`) so alerting can tell an unreachable zebra apart
-  from a dead writer, from backfilling memos, from normal block catch-up.
+  Body is JSON with per-wallet detail (including `scan_lag`, the `chain_tip - fully_scanned` block
+  gap); when not ready it carries a `reason` (`"upstream_down"`, `"actor_down"`, `"enhancing"`, or
+  `"syncing"`) so alerting can tell an unreachable zebra apart from a dead writer, from backfilling
+  memos, from normal block catch-up.
 - `GET /status`: JSON snapshot of per-wallet sync state, including the active `server` endpoint,
   `conn_state` (`down` | `syncing` | `ready`), and the per-wallet `pending_enhancements` count.
   `getpeerinfo` reflects the same active upstream.
