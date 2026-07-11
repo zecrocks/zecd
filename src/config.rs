@@ -109,12 +109,14 @@ impl Default for PoolsConfig {
 pub enum ReadinessMode {
     /// Ready only once the wallet has actually scanned to (near) the chain tip: connected and
     /// within `max_scan_lag` blocks of the tip. Strict - a from-birthday restore stays "not
-    /// ready" until it catches up. Use when a client must not see stale balances/history.
+    /// ready" until it catches up. **This is the default**: a client must not see an empty or
+    /// stale balance/history as authoritative while the wallet is still scanning.
     Synced,
     /// Ready as soon as the backend is connected and its chain tip is past the wallet's birthday
     /// (a cheap sanity check that we're talking to the right, live network). Does NOT wait for
     /// the wallet to finish scanning, so RPC clients can reach zecd while it catches up - at the
-    /// cost of reads possibly lagging the tip. Avoids readiness flapping during long scans.
+    /// cost of reads possibly lagging the tip. Avoids readiness flapping during long scans. Opt in
+    /// (`readiness = "connected"`) only when reachability matters more than balance freshness.
     Connected,
 }
 
@@ -928,14 +930,17 @@ impl AppConfig {
                 .parse()
                 .context("parsing health bind address")?,
             port: health_file.port.unwrap_or(defaults.health_port),
-            // Default to "connected": be generous about how synced we are so RPC clients can
-            // reach zecd in most situations, and avoid readiness flapping during long scans.
+            // Default to "synced": `/readyz` reports ready only once the wallet has actually
+            // scanned to (near) the tip, so a client routed by readiness never sees an empty or
+            // stale balance/history as authoritative during initial sync or a `--restore` (audit
+            // 3.15). Deployments that prefer reachability-over-freshness - reaching zecd while it
+            // catches up, at the cost of possibly-lagging reads - can set `readiness = "connected"`.
             readiness: health_file
                 .readiness
                 .as_deref()
                 .map(ReadinessMode::parse)
                 .transpose()?
-                .unwrap_or(ReadinessMode::Connected),
+                .unwrap_or(ReadinessMode::Synced),
             max_scan_lag: health_file.max_scan_lag.unwrap_or(4),
         };
 
@@ -1328,6 +1333,30 @@ mod tests {
         let cfg = AppConfig::resolve(&cli).unwrap();
         assert!(!cfg.backend.rfc1918_is_local);
         assert!(cfg.backend.allow_remote_cleartext);
+    }
+
+    #[test]
+    fn readiness_defaults_to_synced_and_is_overridable() {
+        use clap::Parser as _;
+        // Absent [health] readiness resolves to Synced: `/readyz` waits for the scan so a client
+        // routed by readiness never trusts an empty/stale balance mid-sync.
+        let cli = Cli::parse_from(["zecd"]);
+        let cfg = AppConfig::resolve(&cli).unwrap();
+        assert_eq!(cfg.health.readiness, ReadinessMode::Synced);
+
+        // A [health] block that omits `readiness` still defaults to Synced...
+        let dir = tempfile::tempdir().unwrap();
+        let conf = dir.path().join("zecd.toml");
+        std::fs::write(&conf, "[health]\nport = 9999\n").unwrap();
+        let cli = Cli::parse_from(["zecd", "--conf", conf.to_str().unwrap()]);
+        let cfg = AppConfig::resolve(&cli).unwrap();
+        assert_eq!(cfg.health.readiness, ReadinessMode::Synced);
+
+        // ...and the lenient mode is still opt-in from the file.
+        std::fs::write(&conf, "[health]\nreadiness = \"connected\"\n").unwrap();
+        let cli = Cli::parse_from(["zecd", "--conf", conf.to_str().unwrap()]);
+        let cfg = AppConfig::resolve(&cli).unwrap();
+        assert_eq!(cfg.health.readiness, ReadinessMode::Connected);
     }
 
     #[test]
