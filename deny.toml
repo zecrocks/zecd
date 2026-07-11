@@ -51,19 +51,16 @@ wildcards = "deny"
 unknown-registry = "deny"
 unknown-git = "deny"
 # Dev-only ironwood / NU6.3 branch exception (see Cargo.toml `[patch.crates-io]` and the project docs):
-# the librustzcash set is patched by git rev to our own fork branch,
-# `zecrocks/librustzcash` `ironwood-scan-model` = upstream `dw/ironwood-scan-model` HEAD + a
-# cherry-pick of the self-send received-note memo backfill (not yet upstream). We pin our own fork
-# (rather than a contributor's) so the branch can't drift out from under us. Swap this back to
-# `https://github.com/zcash/librustzcash` when the self-send memo fix merges into
-# `dw/ironwood-scan-model` and we repin to the merged commit. The branch also requires
+# the librustzcash set is patched by git rev to upstream `zcash/librustzcash`
+# `dw/ironwood-scan-model` - a plain upstream pin, no fork. The ironwood wallet crates
+# (client_backend/client_sqlite/pczt/zip321/encoding) aren't published to crates.io yet, so the whole
+# `[patch]` set is git-pinned by rev; repin to crates.io once they publish. The branch also requires
 # the explicit-checkpoint-retention shardtree APIs plus a `clear_flags` checkpoint-pruning panic fix,
 # so shardtree + incrementalmerkletree are git-patched to `zcash/incrementalmerkletree` main (which now
-# carries both - the panic fix landed upstream, so our `zecrocks/incrementalmerkletree` fork is no
-# longer needed; mirror the rev the `[patch]` pins). `orchard` resolves from crates.io (0.15.0-pre.x).
-# Drop both git sources when the ironwood wallet crates + a shardtree release with these APIs and the
-# fix land on crates.io.
+# carries both; mirror the rev the `[patch]` pins). `orchard` resolves from crates.io (0.15.0-pre.x).
+# Drop both git sources when the ironwood wallet crates + a shardtree release with these APIs land on
+# crates.io.
 allow-git = [
-    "https://github.com/zecrocks/librustzcash",
+    "https://github.com/zcash/librustzcash",
     "https://github.com/zcash/incrementalmerkletree",
 ]

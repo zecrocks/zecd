@@ -139,41 +139,42 @@ incrementalmerkletree = "0.8"
 #    reproducible Docker builds) stop being a per-build coin flip. Remove when an `age` release
 #    depends on i18n-embed-fl 0.10+.
 #
-# 2. librustzcash -> the OFFICIAL zcash/librustzcash repo (replacing the old valargroup fork). The
-#    ironwood / NU6.3 leaf crates are published to crates.io as release candidates
-#    (`zcash_primitives 0.29.0-pre.0`, `orchard 0.15.0-pre.2`, `zcash_protocol 0.10.0-pre.0`,
+# 2. librustzcash → the OFFICIAL zcash/librustzcash repo, pinned by **git rev** to the ironwood /
+#    NU6.3 line (`dw/ironwood-scan-model` HEAD, rev `1105d8203`; zcash/librustzcash#2539) - the same
+#    ironwood line the confirmed-working reference wallet **zcash-devtool** builds against. This is a
+#    **plain upstream pin: zecd no longer carries a librustzcash fork.** (Previously it pinned
+#    `zecrocks/librustzcash` = this rev + one cherry-pick, "Backfill received-note memos for own
+#    self-sends". That cherry-pick was DROPPED here to move off the fork - see below - and is being
+#    submitted upstream separately.) The ironwood leaf crates are published to crates.io as release
+#    candidates (`zcash_primitives 0.29.0-pre.0`, `orchard 0.15.0-pre.2`, `zcash_protocol 0.10.0-pre.0`,
 #    `zcash_keys 0.15.0-pre.0`, `zcash_address 0.13.0-pre.0`, `zcash_transparent 0.9.0-pre.0`,
-#    `zcash_proofs 0.29.0-pre.0`), so `orchard` comes straight from crates.io (no git patch). But
-#    the wallet crates zecd leans on (`zcash_client_backend`/`zcash_client_sqlite`) and their
-#    siblings (`pczt`/`zip321`/`zcash_encoding`) are NOT yet published with the ironwood changes.
-#    `main` itself still has the wallet-side ironwood work unfinished (`client_sqlite` has
-#    `ShieldedPool::Ironwood => todo!(...)`), so we track upstream's **`dw/ironwood-scan-model`**
-#    line (zcash/librustzcash#2539), the same ironwood line the confirmed-working reference wallet
-#    **zcash-devtool** (`ironwood-valar`) builds against. To avoid depending on a contributor's fork
-#    staying current, zecd pins **our own fork branch - `zecrocks/librustzcash` `ironwood-scan-model`**
-#    - which is the current upstream `dw/ironwood-scan-model` HEAD **plus one cherry-pick of a commit it
-#    still lacks**: "Backfill received-note memos for own self-sends" - a `zcash_client_sqlite`
-#    `put_blocks` pass that re-decrypts the wallet's own mined txs and fills a received note's NULL
-#    memo. Needed because a shielded payment to one's own address is a `Recipient::External` (no
-#    received note at send time), the block scanner later creates the note with a NULL memo (compact
-#    outputs carry none), and the enhancement step that would backfill it is skipped for the wallet's
-#    own txs (their raw bytes are pre-stored -> classified Status-only). **This bites Ironwood hardest,
-#    where every write is a self-send** - so without it, a memo on an Ironwood *send* is silently lost.
-#    To maintain the branch: rebase this cherry-pick onto the latest upstream `dw/ironwood-scan-model`,
-#    push, bump the rev below; **drop it and repin straight to upstream once the self-send memo fix
-#    merges.** Two earlier cherry-picks were retired at this rebase: the `ironwood_tree_retained_checkpoints`
-#    table (librustzcash#2554) is now upstream, and the create_pczt Ironwood-build (librustzcash#2543)
-#    is intentionally NOT carried - upstream `create_pczt_from_proposal` still rejects Ironwood PCZTs
-#    (`step_uses_ironwood`), so zecd routes **Ironwood sends through the fused `create_proposed_transactions`
-#    path** (which upstream fully supports), via the `ironwood_forces_fused` gate in `actor.rs`. That
-#    trades the cached proving key for ~4.5 s/send keygen on Ironwood sends; drop the gate to reclaim
-#    the PCZT path once upstream removes its `step_uses_ironwood` guard.
+#    `zcash_proofs 0.29.0-pre.0`), so `orchard` comes straight from crates.io (no git patch); but the
+#    wallet crates (`zcash_client_backend`/`zcash_client_sqlite`/`pczt`/`zip321`/`zcash_encoding`) are
+#    NOT yet published with the ironwood changes, so the whole librustzcash set stays git-pinned to the
+#    rev above. Repin straight to crates.io once the ironwood wallet crates are published.
+#
+#    **Dropped cherry-pick - self-send memo backfill (fe9c4144).** It added a `zcash_client_sqlite`
+#    `put_blocks` pass that re-decrypts the wallet's own mined txs to fill a received note's NULL memo:
+#    a shielded self-payment is a `Recipient::External` (no received note at send time), the block
+#    scanner later creates the note with a NULL memo (compact outputs carry none), and enhancement
+#    skips the wallet's own txs (raw pre-stored → Status-only). The regtest suite showed this gap is
+#    **narrow and self-healing**: the live mempool path fills the memo on the authoring node in the
+#    common case, and a from-seed restore (no pre-stored raw → enhancement runs) recovers it - so it
+#    only bites the *authoring* node when the mempool missed its own self-send, and a rescan fixes it.
+#    Guarded by an ironwood-tier regtest that forces the block-scan-only path (send → stop → mine while
+#    down → restart same datadir); that test FAILS on this fork-free pin and PASSES with the cherry-pick,
+#    which is why it lives on a branch that carries the fix. Once the fix merges upstream, bump the rev.
+#    Not carried either: the create_pczt Ironwood-build (librustzcash#2543) - upstream
+#    `create_pczt_from_proposal` at this rev still rejects Ironwood PCZTs (`step_uses_ironwood`), so
+#    zecd routes **Ironwood sends through the fused `create_proposed_transactions` path** via the
+#    `ironwood_forces_fused` gate in `actor.rs` (~4.5 s/send keygen; drop the gate to reclaim the PCZT
+#    cache once upstream removes its guard).
 #    The upstream line carries the rest of the ironwood API zecd uses: ironwood receive **memos**
 #    (`decrypt_transaction` decrypts the Ironwood bundle), `ironwood_balance`, `Note::pool()`, the
-#    ironwood `ChainState`, and (for the fused send path) native Ironwood build+prove. NB the branch
+#    ironwood `ChainState`, and (for the fused send path) native Ironwood build+prove. NB the line
 #    pins **orchard `0.15.0-pre.2`** and needs the explicit-checkpoint-retention **shardtree** APIs plus
 #    a `clear_flags` checkpoint-pruning panic fix, so shardtree + incrementalmerkletree are git-patched
-#    below to **our own fork `zecrocks/incrementalmerkletree`** (upstream `decefc46` + that fix).
+#    below to **upstream `zcash/incrementalmerkletree`** (main, rev `7b23adb6`) - also not a fork.
 #
 #    This rev **includes `00c789f9`** ("Select shielded inputs from a single pool group"): shielded
 #    inputs are selected from one of two mutually-exclusive groups - {Orchard} or {Sapling+Ironwood},
@@ -204,25 +205,26 @@ i18n-embed-fl = { path = "vendor/i18n-embed-fl" }
 # equihash + f4jumble are leaf crates in the librustzcash workspace that the patched crates depend
 # on; patch them to the same rev so a git-workspace sibling can't clash with a crates.io copy (matches
 # zcash-devtool's ironwood-valar patch set).
-equihash = { git = "https://github.com/zecrocks/librustzcash", rev = "71da9dddc194f8adf003b14c7957d03a4836c3cd" }
-f4jumble = { git = "https://github.com/zecrocks/librustzcash", rev = "71da9dddc194f8adf003b14c7957d03a4836c3cd" }
-zcash_address = { git = "https://github.com/zecrocks/librustzcash", rev = "71da9dddc194f8adf003b14c7957d03a4836c3cd" }
-zcash_encoding = { git = "https://github.com/zecrocks/librustzcash", rev = "71da9dddc194f8adf003b14c7957d03a4836c3cd" }
-zcash_protocol = { git = "https://github.com/zecrocks/librustzcash", rev = "71da9dddc194f8adf003b14c7957d03a4836c3cd" }
-zip321 = { git = "https://github.com/zecrocks/librustzcash", rev = "71da9dddc194f8adf003b14c7957d03a4836c3cd" }
-pczt = { git = "https://github.com/zecrocks/librustzcash", rev = "71da9dddc194f8adf003b14c7957d03a4836c3cd" }
-zcash_keys = { git = "https://github.com/zecrocks/librustzcash", rev = "71da9dddc194f8adf003b14c7957d03a4836c3cd" }
-zcash_client_backend = { git = "https://github.com/zecrocks/librustzcash", rev = "71da9dddc194f8adf003b14c7957d03a4836c3cd" }
-zcash_client_sqlite = { git = "https://github.com/zecrocks/librustzcash", rev = "71da9dddc194f8adf003b14c7957d03a4836c3cd" }
-zcash_primitives = { git = "https://github.com/zecrocks/librustzcash", rev = "71da9dddc194f8adf003b14c7957d03a4836c3cd" }
-zcash_proofs = { git = "https://github.com/zecrocks/librustzcash", rev = "71da9dddc194f8adf003b14c7957d03a4836c3cd" }
-zcash_transparent = { git = "https://github.com/zecrocks/librustzcash", rev = "71da9dddc194f8adf003b14c7957d03a4836c3cd" }
+equihash = { git = "https://github.com/zcash/librustzcash", rev = "1105d8203eb595c28c39929fba65569de9696851" }
+f4jumble = { git = "https://github.com/zcash/librustzcash", rev = "1105d8203eb595c28c39929fba65569de9696851" }
+zcash_address = { git = "https://github.com/zcash/librustzcash", rev = "1105d8203eb595c28c39929fba65569de9696851" }
+zcash_encoding = { git = "https://github.com/zcash/librustzcash", rev = "1105d8203eb595c28c39929fba65569de9696851" }
+zcash_protocol = { git = "https://github.com/zcash/librustzcash", rev = "1105d8203eb595c28c39929fba65569de9696851" }
+zip321 = { git = "https://github.com/zcash/librustzcash", rev = "1105d8203eb595c28c39929fba65569de9696851" }
+pczt = { git = "https://github.com/zcash/librustzcash", rev = "1105d8203eb595c28c39929fba65569de9696851" }
+zcash_keys = { git = "https://github.com/zcash/librustzcash", rev = "1105d8203eb595c28c39929fba65569de9696851" }
+zcash_client_backend = { git = "https://github.com/zcash/librustzcash", rev = "1105d8203eb595c28c39929fba65569de9696851" }
+zcash_client_sqlite = { git = "https://github.com/zcash/librustzcash", rev = "1105d8203eb595c28c39929fba65569de9696851" }
+zcash_primitives = { git = "https://github.com/zcash/librustzcash", rev = "1105d8203eb595c28c39929fba65569de9696851" }
+zcash_proofs = { git = "https://github.com/zcash/librustzcash", rev = "1105d8203eb595c28c39929fba65569de9696851" }
+zcash_transparent = { git = "https://github.com/zcash/librustzcash", rev = "1105d8203eb595c28c39929fba65569de9696851" }
 # The ironwood librustzcash line requires the explicit-checkpoint-retention shardtree APIs
 # (`ensure_retained`/`retained_checkpoints`/`remove_retained_checkpoint`) plus the `clear_flags`
-# checkpoint-pruning panic fix, neither of which is in a published shardtree yet. Upstream
-# `zcash/incrementalmerkletree` **main** now carries both (the panic fix landed upstream - no longer
-# needs our `zecrocks/incrementalmerkletree` fork), so pin both crates to upstream main by git rev.
-# Mirror this exact rev on both crates. Drop once a shardtree release carrying these APIs and the fix
-# is cut.
+# checkpoint-pruning panic fix. Both are in upstream `zcash/incrementalmerkletree` **main** but not
+# in a published shardtree release compatible with this line (the librustzcash rev requires
+# `shardtree ^0.6.2`; published 0.6.2 lacks the APIs and 0.7.0 breaks that req), so pin both crates
+# to upstream main by git rev - **upstream, not a fork.** Mirror this exact rev on both crates. Drop
+# once a shardtree release carrying these APIs lands within the `^0.6` line (or the librustzcash line
+# moves to `shardtree 0.7`).
 shardtree = { git = "https://github.com/zcash/incrementalmerkletree", rev = "7b23adb67044d2a9f4a68759f1e6340c3fc4735a" }
 incrementalmerkletree = { git = "https://github.com/zcash/incrementalmerkletree", rev = "7b23adb67044d2a9f4a68759f1e6340c3fc4735a" }
