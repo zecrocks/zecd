@@ -29,9 +29,10 @@ use zcash_client_backend::proto::service;
 use zcash_client_backend::wallet::OvkPolicy;
 use zcash_client_sqlite::error::SqliteClientError;
 use zcash_client_sqlite::{AccountUuid, FsBlockDb};
+use zcash_keys::address::Address;
 use zcash_primitives::transaction::Transaction;
 use zcash_proofs::prover::LocalTxProver;
-use zcash_protocol::consensus::{BlockHeight, BranchId};
+use zcash_protocol::consensus::{BlockHeight, BranchId, Parameters};
 use zcash_protocol::value::Zatoshis;
 use zcash_protocol::{PoolType, ShieldedProtocol, TxId};
 use zip32::DiversifierIndex;
@@ -1964,10 +1965,13 @@ impl WalletActor {
         }
     }
 
-    /// Whether sends on this wallet use the cached-Orchard PCZT path (so prove and store are
+    /// Whether sends on this wallet *may* use the cached-Orchard PCZT path (so prove and store are
     /// separable). True for the default Orchard-only wallet with `cache_proving_key` on. A
     /// Sapling-spending wallet (or `cache_proving_key` off) uses the fused path, which has no
-    /// prove/store seam - see [`Self::do_send_fused`].
+    /// prove/store seam - see [`Self::do_send_fused`]. NB this gates on the *wallet's* pools, not
+    /// the send's recipients: even when this is true, an individual send that pays a Sapling output
+    /// is still diverted to the fused path (`request_pays_sapling_output`), because the cached
+    /// path's extractor is handed no Sapling verifying key.
     fn cached_pczt_path(&self) -> bool {
         self.orchard_keys.is_some() && !self.enabled_pools.contains(Pool::Sapling)
     }
@@ -2067,7 +2071,10 @@ impl WalletActor {
         // note selection; the synchronous sends pass `None` and use the configured policy.
         let policy = confirmations.unwrap_or(self.confirmations_policy);
 
-        if !self.cached_pczt_path() {
+        // The cached-Orchard PCZT path can't finalize a Sapling output: its extractor is handed no
+        // Sapling verifying key. A send to a Sapling-only recipient therefore takes the fused path,
+        // which proves and verifies Sapling outputs itself.
+        if !self.cached_pczt_path() || request_pays_sapling_output(&self.network, &request) {
             return self.do_send_fused(usk, request, policy, privacy).await;
         }
 
@@ -2201,7 +2208,10 @@ impl WalletActor {
         privacy: SendPrivacy,
         reply: oneshot::Sender<Result<TxId, RpcError>>,
     ) {
-        if !self.pipeline_eligible() {
+        // A Sapling-output send can't ride the pipeline either (it commits via the same PCZT
+        // extractor that has no Sapling verifying key). Route it through `do_send`, which diverts
+        // it to the fused path.
+        if !self.pipeline_eligible() || request_pays_sapling_output(&self.network, &request) {
             let res = self.do_send(request, confirmations, privacy).await;
             let _ = reply.send(res);
             return;
@@ -2831,6 +2841,37 @@ fn now_unix() -> i64 {
         .as_secs() as i64
 }
 
+/// Whether any recipient in `request` forces a **Sapling output**: a shielded address carrying a
+/// Sapling receiver but *no* Orchard receiver (a bare `zs…`, or a UA whose only shielded receiver
+/// is Sapling). This is the sole way a send on the Orchard-only cached PCZT path produces a PCZT
+/// with a non-empty Sapling bundle - spends are always Orchard and change goes to Orchard (Sapling
+/// isn't an enabled pool on that path, or `cached_pczt_path` is already false). The PCZT extractor
+/// (`extract_and_store_transaction_from_pczt`) rejects such a bundle without a Sapling *verifying*
+/// key, and the cached path passes none - so `do_send`/`begin_or_queue_send` divert these sends to
+/// the fused `create_proposed_transactions` path, which builds, proves, and verifies Sapling
+/// outputs itself. A dual Orchard+Sapling UA is deliberately *not* flagged: an Orchard-only wallet
+/// routes the payment to the UA's Orchard receiver, so no Sapling output is produced. Keyed off the
+/// recipient address (not the built proposal) so the routing decision is made before any build; on
+/// this path that is equivalent, since a Sapling-only recipient is the only Sapling-output source.
+fn request_pays_sapling_output(net: &ZNetwork, request: &TransactionRequest) -> bool {
+    let net_type = net.network_type();
+    request.payments().values().any(|p| {
+        match p
+            .recipient_address()
+            .clone()
+            .convert_if_network::<Address>(net_type)
+        {
+            Ok(addr) => {
+                crate::address::has_shielded_receiver(&addr)
+                    && !crate::address::has_orchard_receiver(&addr)
+            }
+            // Unparseable on this network (already rejected at the RPC layer): don't reroute; the
+            // normal build path surfaces the error.
+            Err(_) => false,
+        }
+    })
+}
+
 /// Prove (Orchard, plus Sapling outputs if any) and sign the Orchard spends with the account's
 /// key, returning the signed PCZT ready to extract+store. This is the **pure-CPU** half of a PCZT
 /// send (phase B): it touches no DB, so it can run off the single-writer actor (see
@@ -2896,10 +2937,15 @@ fn prove_sign_pczt(
 
 /// Finalize + persist a proven, signed PCZT (phase C): records the tx, its spends/change, and
 /// marks inputs spent - the same wallet bookkeeping `create_proposed_transactions` does. A DB
-/// write, so it runs on the single-writer actor. The cached verifying key avoids regenerating it
-/// per send; no Sapling verifying key is needed since zecd never produces Sapling spends. `N` (the
-/// note-ref type) is otherwise unconstrained here - it only appears in the error type - so pin it
-/// to our `WalletDb`'s note ref, as `error::ProposalError` does for the fused path.
+/// write, so it runs on the single-writer actor. The cached Orchard verifying key avoids
+/// regenerating it per send. The Sapling verifying key is `None` because this path is only reached
+/// for sends with **no Sapling output** - the extractor rejects a Sapling bundle without one, so
+/// `do_send`/`begin_or_queue_send` divert any send to a Sapling-only recipient to the fused path
+/// before reaching here (the guard is `request_pays_sapling_output`). Note this is
+/// about Sapling *outputs*, not spends: zecd never spends Sapling notes on this path, but a send
+/// can still *pay* a Sapling recipient. `N` (the note-ref type) is otherwise unconstrained here -
+/// it only appears in the error type - so pin it to our `WalletDb`'s note ref, as
+/// `error::ProposalError` does for the fused path.
 fn store_pczt(
     db: &mut WriteDb,
     pczt: pczt::Pczt,
@@ -3271,6 +3317,76 @@ mod tests {
         assert!(
             ensure_dir_writable(&file.join("sub")).is_err(),
             "a non-directory parent must fail the writability probe"
+        );
+    }
+
+    /// The cached-Orchard PCZT extractor is handed no Sapling verifying key, so a send that pays a
+    /// Sapling output must be diverted to the fused path. `request_pays_sapling_output`
+    /// is that routing predicate: it flags a bare Sapling recipient (a Sapling-only UA too), but not
+    /// an Orchard recipient or a dual Orchard+Sapling UA - an Orchard-only wallet pays such a UA on
+    /// its Orchard receiver, producing no Sapling output. Without the divert,
+    /// `extract_and_store_transaction_from_pczt` rejects the PCZT and the send fails after proving.
+    #[test]
+    fn request_pays_sapling_output_flags_only_sapling_only_recipients() {
+        use super::request_pays_sapling_output;
+        use crate::network::ZNetwork;
+        use zcash_address::ZcashAddress;
+        use zcash_keys::address::{Address, UnifiedAddress};
+        use zcash_keys::keys::{ReceiverRequirement::*, UnifiedAddressRequest, UnifiedSpendingKey};
+        use zcash_protocol::value::Zatoshis;
+        use zip32::{AccountId, DiversifierIndex};
+        use zip321::{Payment, TransactionRequest};
+
+        let net = ZNetwork::Test;
+        // A UA carrying both shielded receivers (Sapling + Orchard), no transparent.
+        let both = UnifiedAddressRequest::unsafe_custom(Require, Require, Omit);
+        let ufvk = UnifiedSpendingKey::from_seed(&net, &[7u8; 32], AccountId::ZERO)
+            .unwrap()
+            .to_unified_full_viewing_key();
+        let (ua, _) = ufvk.find_address(DiversifierIndex::new(), both).unwrap();
+
+        // Three recipient shapes built from that one address's receivers.
+        let sapling_only = Address::Sapling(ua.sapling().cloned().unwrap());
+        let orchard_only = Address::Unified(
+            UnifiedAddress::from_receivers(ua.orchard().cloned(), None, None).unwrap(),
+        );
+        let dual = Address::Unified(ua.clone());
+
+        // A one-payment request paying `addr` 1 ZEC.
+        let request_to = |addr: &Address| {
+            let zaddr = ZcashAddress::try_from_encoded(&addr.encode(&net)).unwrap();
+            let payment = Payment::without_memo(zaddr, Zatoshis::const_from_u64(100_000_000));
+            TransactionRequest::new(vec![payment]).unwrap()
+        };
+
+        assert!(
+            request_pays_sapling_output(&net, &request_to(&sapling_only)),
+            "a bare Sapling recipient forces a Sapling output → must divert to the fused path"
+        );
+        assert!(
+            !request_pays_sapling_output(&net, &request_to(&orchard_only)),
+            "an Orchard recipient stays on the cached PCZT path"
+        );
+        assert!(
+            !request_pays_sapling_output(&net, &request_to(&dual)),
+            "a dual Orchard+Sapling UA is paid on its Orchard receiver → no Sapling output"
+        );
+
+        // A multi-recipient send diverts if *any* payment forces a Sapling output.
+        let mixed = TransactionRequest::new(vec![
+            Payment::without_memo(
+                ZcashAddress::try_from_encoded(&orchard_only.encode(&net)).unwrap(),
+                Zatoshis::const_from_u64(1),
+            ),
+            Payment::without_memo(
+                ZcashAddress::try_from_encoded(&sapling_only.encode(&net)).unwrap(),
+                Zatoshis::const_from_u64(1),
+            ),
+        ])
+        .unwrap();
+        assert!(
+            request_pays_sapling_output(&net, &mixed),
+            "one Sapling recipient among several diverts the whole send"
         );
     }
 
