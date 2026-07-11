@@ -73,6 +73,16 @@ For a cloud deployment: put `keys.toml` (and `identity.txt`, if used) in a read-
 and point `ZECD_KEYS_FILE` / `ZECD_AGE_IDENTITY` at the mount. `blocks/` is always disposable -
 excluding it from any image/volume snapshot is the single biggest space win.
 
+> **The data directory must be host-local.** zecd's single-instance lock on `<datadir>/.lock` is
+> an OS advisory lock enforced by the *local* kernel, so it only prevents a second zecd on the
+> *same host*. It does **not** span hosts: a datadir on a network filesystem shared read-write by
+> two machines (NFS, SMB, a Kubernetes `ReadWriteMany` volume) can be locked independently by each
+> host's kernel, so two zecd on different hosts could both write the wallet DB and corrupt it. Keep
+> the datadir on a local disk or a single-writer volume (Kubernetes `ReadWriteOnce`), and never
+> share it read-write across hosts - the `keys.toml`/`identity.txt` Secret can be mounted read-only
+> by many pods, but each pod needs its **own** writable datadir. The lockfile records the holder's
+> `hostname:pid` for diagnostics. No cross-host lease is implemented.
+
 ### Bootstrapping a disposable data directory
 
 With `[keys] bootstrap_from_keys` (default on), an empty data directory next to a present
