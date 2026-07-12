@@ -183,8 +183,8 @@ activates it from consensus height alone, so it is **on for testnet** (NU6.3 at 
 and **off for mainnet**, whose protocol carries no NU6.3 height. Regtest opts in via the
 `ZECD_REGTEST_NU63_HEIGHT` environment variable.
 
-Testing it needs an ironwood-capable node. The compose stack's testnet default already pins one
-(`zfnd/zebra:6.0.0-rc.0`); the mainnet overlay stays on the stable Zebra.
+Testing it needs an ironwood-capable node; Zebra 6.0.0 is one (it activates Ironwood at the
+network's activation height). The compose stack pins `zfnd/zebra:6.0.0` for both networks.
 
 Ironwood notes are received at **ordinary Orchard addresses**. Upstream models them as Orchard
 "V3" notes that reuse Orchard's keys, addresses, and note cryptography, so there is no ironwood
