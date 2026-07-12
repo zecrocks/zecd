@@ -4,8 +4,10 @@ version = "0.4.2"
 edition = "2021"
 rust-version = "1.88"
 license = "MIT OR Apache-2.0"
-publish = false
+publish = true
 description = "A Bitcoin-Core-style JSON-RPC server for Orchard-only Zcash, built on librustzcash"
+repository = "https://github.com/zecrocks/zecd"
+homepage = "https://zecd.org"
 
 [[bin]]
 name = "zecd"
