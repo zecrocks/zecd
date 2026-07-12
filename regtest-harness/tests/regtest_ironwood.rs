@@ -11,7 +11,7 @@
 //!     decryption path (`decrypt_transaction` decrypting the Ironwood bundle) end-to-end: the memo
 //!     is surfaced on the received output (`memoStr`/`memo`) on a note asserted `pool == "ironwood"`.
 //!
-//! Requires the full ironwood toolchain - the official ironwood zebra RC (`zfnd/zebra:6.0.0-rc.0`),
+//! Requires the full ironwood toolchain - the official ironwood zebra release (`zfnd/zebra:6.0.0`),
 //! a V6-parsing lightwalletd, an ironwood/regtest-aware `zcash-devtool` funder (its regtest `init`
 //! is given `--activation-heights` via [`Funder::init_ironwood`]), and a plain-release `zecd`
 //! (ironwood is compiled unconditionally now - no cargo feature) with `ZECD_REGTEST_NU63_HEIGHT=8`
