@@ -71,7 +71,7 @@ on:
 # environment variables as config overrides and exits with "unknown field" on ones it doesn't
 # recognise. (The harness also scrubs ZEBRA_* before spawning zebrad, as a second line of defence.)
 env:
-  ZEBRAD_IMAGE_PINNED: "5.0.0"
+  ZEBRAD_IMAGE_PINNED: "6.0.0"
 
 concurrency:
   group: regtest-${{ github.event_name }}-${{ github.ref }}
