@@ -5,6 +5,21 @@ All notable changes to zecd are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com), and this
 project adheres to [Semantic Versioning](https://semver.org).
 
+## [0.4.3] - 2026-07-12
+
+### Added
+- Published on crates.io: install with `cargo install zecd`. Registry builds are not bit-reproducible; the Docker images remain so.
+
+### Changed
+- `/readyz` now defaults to "synced" readiness (ready only once the wallet has scanned to near the tip and drained the enhancement backlog) and surfaces a per-wallet `scan_lag`; set `readiness = "connected"` for the old reachability-only behavior.
+- The example Docker Compose stack pins `zfnd/zebra:6.0.0`.
+
+### Fixed
+- A send that pays a Sapling output is routed to the fused build path, since the cached-proving-key path has no Sapling verifying key.
+
+### Security
+- Document that the single-instance datadir lock is host-local (it does not span hosts over a network filesystem) and stamp the lockfile with its holder.
+
 ## [0.4.2] - 2026-07-07
 
 ### Fixed
@@ -32,6 +47,21 @@ project adheres to [Semantic Versioning](https://semver.org).
 ### Changed
 - `z_sendmany`'s privacy policy gains a fourth rung, `AllowFullyTransparent`, permitting fully-transparent sends; transparent recipients remain rejected under stricter policies.
 - Transparent addresses are always issued as bare t-addresses, never embedded in a unified address.
+
+## [0.3.4] - 2026-07-12
+
+### Added
+- Published on crates.io: install with `cargo install zecd`. Registry builds are not bit-reproducible; the Docker images remain so.
+
+### Changed
+- `/readyz` now defaults to "synced" readiness (ready only once the wallet has scanned to near the tip and drained the enhancement backlog) and surfaces a per-wallet `scan_lag`; set `readiness = "connected"` for the old reachability-only behavior.
+- The example Docker Compose stack pins `zfnd/zebra:6.0.0`.
+
+### Fixed
+- A send that pays a Sapling output is routed to the fused build path, since the cached-proving-key path has no Sapling verifying key.
+
+### Security
+- Document that the single-instance datadir lock is host-local (it does not span hosts over a network filesystem) and stamp the lockfile with its holder.
 
 ## [0.3.3] - 2026-07-06
 
@@ -133,9 +163,11 @@ Zcash, backed entirely by librustzcash and running as a light client.
 ### Security
 - Pre-release audit hardening; refuse to start on mainnet with the placeholder RPC password; enforce a 12-character passphrase minimum.
 
+[0.4.3]: https://github.com/zecrocks/zecd/compare/v0.4.2...v0.4.3
 [0.4.2]: https://github.com/zecrocks/zecd/compare/v0.4.1...v0.4.2
 [0.4.1]: https://github.com/zecrocks/zecd/compare/v0.4.0...v0.4.1
 [0.4.0]: https://github.com/zecrocks/zecd/compare/v0.3.2...v0.4.0
+[0.3.4]: https://github.com/zecrocks/zecd/compare/v0.3.3...v0.3.4
 [0.3.3]: https://github.com/zecrocks/zecd/compare/v0.3.2...v0.3.3
 [0.3.2]: https://github.com/zecrocks/zecd/compare/v0.3.1...v0.3.2
 [0.3.1]: https://github.com/zecrocks/zecd/compare/v0.3.0...v0.3.1
