@@ -5,6 +5,12 @@ All notable changes to zecd are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com), and this
 project adheres to [Semantic Versioning](https://semver.org).
 
+## [0.5.0-rc2] - 2026-07-12
+
+### Changed
+- librustzcash is repointed from the interim zecrocks fork to the upstream zcash/librustzcash ironwood line; its fixes have landed upstream, so the fork is no longer needed.
+- Rebased onto 0.4.3, so the ironwood line now carries every 0.4.x maintenance fix through 0.4.3 (Sapling-output fused-path routing, the `/readyz` "synced" default with per-wallet `scan_lag`, and the host-local datadir-lock documentation).
+
 ## [0.5.0-rc1] - 2026-07-09
 
 ### Added
@@ -168,6 +174,7 @@ Zcash, backed entirely by librustzcash and running as a light client.
 ### Security
 - Pre-release audit hardening; refuse to start on mainnet with the placeholder RPC password; enforce a 12-character passphrase minimum.
 
+[0.5.0-rc2]: https://github.com/zecrocks/zecd/compare/v0.5.0-rc1...v0.5.0-rc2
 [0.5.0-rc1]: https://github.com/zecrocks/zecd/compare/v0.4.2...v0.5.0-rc1
 [0.4.3]: https://github.com/zecrocks/zecd/compare/v0.4.2...v0.4.3
 [0.4.2]: https://github.com/zecrocks/zecd/compare/v0.4.1...v0.4.2
