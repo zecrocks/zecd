@@ -41,7 +41,7 @@ on:
         required: false
         default: ""
       zebra-ironwood-image:
-        description: "Ironwood tier: NU6.3-capable zebrad image (default zfnd/zebra:6.0.0-rc.0); blank = the job default"
+        description: "Ironwood tier: NU6.3-capable zebrad image (default zfnd/zebra:6.0.0); blank = the job default"
         required: false
         default: ""
       lwd-ironwood-image:
@@ -245,7 +245,7 @@ jobs:
   # Ironwood (NU6.3) tier. Builds zecd with the `ironwood` feature (no cfg - the librustzcash pin,
   # zcash/librustzcash `dw/ironwood-scan-model`, exposes the ironwood wallet APIs unconditionally),
   # and runs the gated regtest_ironwood receive e2e against the NU6.3 toolchain: the OFFICIAL zebra
-  # ironwood RC (`zfnd/zebra:6.0.0-rc.0`) plus a still-dev V6-aware lightwalletd and a regtest-aware
+  # ironwood release (`zfnd/zebra:6.0.0`) plus a still-dev V6-aware lightwalletd and a regtest-aware
   # zcash-devtool funder. It funds zecd post-NU6.3 (auto-routed to an ironwood output) and asserts
   # zecd labels the received note `pool == "ironwood"`.
   #
@@ -265,16 +265,16 @@ jobs:
     runs-on: ubuntu-latest
     name: regtest (ironwood / NU6.3)
     env:
-      # zebrad is now the OFFICIAL ironwood release candidate on Docker Hub (`zfnd/zebra:6.0.0-rc.0`),
+      # zebrad is now the OFFICIAL ironwood-capable release on Docker Hub (`zfnd/zebra:6.0.0`),
       # which is NU6.3-capable and accepts the `"NU6.3"` regtest activation-height key - so the dev
       # `emersonian/zcash-zakura` image is retired. lwd + devtool stay pinned to dev images by
       # @sha256 digest (their tags are mutable), both rebuilt against the official zebra RC's V6 wire
-      # format: lwd = `emersonian/zcash-lwd-ironwood:360a37d-zr8-nu63` (V6 parser for zebra 6.0.0-rc.0);
+      # format: lwd = `emersonian/zcash-lwd-ironwood:360a37d-zr8-nu63` (V6 parser for zebra 6.0.0);
       # devtool = `emersonian/zcash-devtool:cac96846` (== ironwood-valar tip), built with
       # `regtest_support` so its regtest `init` takes `--activation-heights`; sends+receives ironwood.
       # A dispatch input can override any of them (e.g. with a `repo:tag`) when the stack is rebuilt;
       # bump these as the images are rebuilt.
-      ZEBRAD_IRONWOOD_IMAGE: ${{ inputs.zebra-ironwood-image || 'zfnd/zebra:6.0.0-rc.0' }}
+      ZEBRAD_IRONWOOD_IMAGE: ${{ inputs.zebra-ironwood-image || 'zfnd/zebra:6.0.0' }}
       LWD_IRONWOOD_IMAGE: ${{ inputs.lwd-ironwood-image || 'emersonian/zcash-lwd-ironwood@sha256:5f63b64ed788330ad8fe859fbbb334ceea844cf8a376318e7e25fbd3351b2f9f' }}
       DEVTOOL_IRONWOOD_IMAGE: ${{ inputs.devtool-ironwood-image || 'emersonian/zcash-devtool@sha256:fd95d8b432f47d3eec6e5f1eca0bdfbb8daa094c28742d230bec3ac47957bd6c' }}
     steps:
