@@ -66,6 +66,7 @@ fn read_secret_file(path: &std::path::Path) -> anyhow::Result<String> {
 pub struct AppConfig {
     pub network: ZNetwork,
     pub datadir: PathBuf,
+    pub walletnotify: Option<String>,
     pub default_wallet: String,
     pub wallets: BTreeMap<String, WalletEntry>,
     pub backend: BackendConfig,
@@ -501,6 +502,7 @@ impl SpendConfig {
 struct ConfigFile {
     network: Option<String>,
     datadir: Option<PathBuf>,
+    walletnotify: Option<String>,
     default_wallet: Option<String>,
     #[serde(default)]
     wallets: BTreeMap<String, WalletFile>,
@@ -663,6 +665,10 @@ pub struct Cli {
     /// Use testnet (overrides config `network`).
     #[arg(long)]
     pub testnet: bool,
+
+    /// Command to execute when a wallet transaction comes in.
+    #[arg(long, value_name = "CMD")]
+    pub walletnotify: Option<String>,
 
     /// Use regtest - a local zebra regtest chain (overrides config `network`).
     #[arg(long)]
@@ -830,6 +836,8 @@ impl AppConfig {
             .default_wallet
             .clone()
             .unwrap_or_else(|| "default".to_string());
+
+        let walletnotify = cli.walletnotify.clone().or(file.walletnotify);
 
         // keys.toml location override (so the encrypted seed can be a mounted Secret, separate
         // from the disposable datadir). The global `[keys] keys_file` / `ZECD_KEYS_FILE` /
@@ -1094,6 +1102,7 @@ impl AppConfig {
         Ok(AppConfig {
             network,
             datadir,
+            walletnotify,
             default_wallet,
             wallets,
             backend,

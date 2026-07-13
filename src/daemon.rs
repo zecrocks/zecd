@@ -140,6 +140,7 @@ pub async fn run(config: AppConfig) -> anyhow::Result<()> {
             transparent_allow_beyond_recovery_window: entry
                 .transparent_allow_beyond_recovery_window,
             transparent_gap_warn_threshold: entry.transparent_gap_warn_threshold,
+            walletnotify: config.walletnotify.clone(),
             shutdown: shutdown_tx.subscribe(),
         };
         match actor::spawn(actor_cfg).await {

@@ -318,6 +318,7 @@ pub struct ActorConfig {
     /// Warn when fewer than this many in-window transparent address slots remain. Only used when
     /// `transparent_enabled`.
     pub transparent_gap_warn_threshold: u32,
+    pub walletnotify: Option<String>,
     /// Flips to `true` on Ctrl-C/`stop`; the actor exits its loop (between sync batches)
     /// so the `WalletDb` is dropped cleanly before the process ends.
     pub shutdown: watch::Receiver<bool>,
@@ -358,6 +359,7 @@ struct WalletActor {
     /// Warn when fewer than this many in-window transparent address slots remain before generation
     /// would hit the gap limit.
     transparent_gap_warn_threshold: u32,
+    walletnotify: Option<String>,
     /// The wallet's exposed transparent receiving + change addresses, as a membership set for the
     /// block-scan / mempool receive matcher. Transient (rebuilt from the DB, respects the stateless
     /// invariant). librustzcash never asks us to scan our *receiving* transparent addresses for
@@ -695,6 +697,7 @@ pub async fn spawn(
         transparent_initial_scan: cfg.transparent_initial_scan,
         transparent_allow_beyond_recovery_window: cfg.transparent_allow_beyond_recovery_window,
         transparent_gap_warn_threshold: cfg.transparent_gap_warn_threshold,
+        walletnotify: cfg.walletnotify.clone(),
         transparent_scripts: None,
         transparent_set_dirty: true,
         transparent_preexposed: false,
@@ -1533,6 +1536,7 @@ impl WalletActor {
                             &tx,
                             mined,
                         )?;
+                        self.trigger_walletnotify(&tx.txid().to_string());
                     }
                 }
             }
@@ -1575,6 +1579,7 @@ impl WalletActor {
                                 &tx,
                                 mined,
                             )?;
+                            self.trigger_walletnotify(&tx.txid().to_string());
                         }
                     }
                 }
@@ -1869,6 +1874,9 @@ impl WalletActor {
                 // decrypt stored it or we just recorded a transparent receive from it.
                 let txid_hex = txid.to_string();
                 let ours = t_recorded > 0 || super::read::tx_exists(&self.wallet_dir, &txid_hex);
+                if ours {
+                    self.trigger_walletnotify(&txid_hex);
+                }
                 tracing::debug!(
                     "[{}] processed mempool tx {txid} (ours={ours}, transparent_receives={t_recorded})",
                     self.name
@@ -2040,6 +2048,19 @@ impl WalletActor {
         }
         self.update_status();
         Ok(outcome.worked)
+    }
+
+    fn trigger_walletnotify(&self, txid_hex: &str) {
+        if let Some(cmd) = &self.walletnotify {
+            let replaced = cmd.replace("%s", txid_hex);
+            tracing::info!("[{}] walletnotify: executing {}", self.name, replaced);
+            std::thread::spawn(move || {
+                let _ = std::process::Command::new("sh")
+                    .arg("-c")
+                    .arg(&replaced)
+                    .spawn();
+            });
+        }
     }
 
     /// Rebuild [`Self::transparent_scripts`] from the account's exposed transparent receivers
