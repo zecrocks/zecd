@@ -5,6 +5,11 @@ All notable changes to zecd are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com), and this
 project adheres to [Semantic Versioning](https://semver.org).
 
+## [0.5.0-rc3] - 2026-07-13
+
+### Changed
+- The librustzcash crates are now consumed from crates.io - the wallet crates as release candidates (`zcash_client_backend 0.24.0-rc.1`, `zcash_client_sqlite 0.22.0-rc.1`, `pczt 0.8.0-rc.1`, `zip321 0.9.0-rc.1`) and the rest as finals - instead of a pinned git revision, so a build no longer pulls any git dependency.
+
 ## [0.5.0-rc2] - 2026-07-12
 
 ### Changed
@@ -174,6 +179,7 @@ Zcash, backed entirely by librustzcash and running as a light client.
 ### Security
 - Pre-release audit hardening; refuse to start on mainnet with the placeholder RPC password; enforce a 12-character passphrase minimum.
 
+[0.5.0-rc3]: https://github.com/zecrocks/zecd/compare/v0.5.0-rc2...v0.5.0-rc3
 [0.5.0-rc2]: https://github.com/zecrocks/zecd/compare/v0.5.0-rc1...v0.5.0-rc2
 [0.5.0-rc1]: https://github.com/zecrocks/zecd/compare/v0.4.2...v0.5.0-rc1
 [0.4.3]: https://github.com/zecrocks/zecd/compare/v0.4.2...v0.4.3
