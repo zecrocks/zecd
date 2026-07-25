@@ -721,6 +721,9 @@ pub enum Command {
     /// Generate a salted bitcoind-style `[rpc] auth` credential line (no external
     /// `rpcauth.py` needed), then exit.
     Rpcauth(RpcauthArgs),
+    /// Print the annotated example configuration file to stdout (or `--output-file`), then
+    /// exit. Redirect it to `<datadir>/zecd.toml` and edit to taste.
+    ExampleConfig(ExampleConfigArgs),
     /// Run the JSON-RPC daemon (default).
     Run,
 }
@@ -766,6 +769,18 @@ pub struct RpcauthArgs {
 
     /// Password to hash. If omitted, a strong random password is generated and printed once.
     pub password: Option<String>,
+}
+
+#[derive(Debug, clap::Args)]
+pub struct ExampleConfigArgs {
+    /// Write the config here instead of stdout. `-` also means stdout. Refuses to overwrite an
+    /// existing file unless `--force`.
+    #[arg(short = 'o', long, value_name = "FILE")]
+    pub output_file: Option<PathBuf>,
+
+    /// Overwrite `--output-file` if it already exists.
+    #[arg(long)]
+    pub force: bool,
 }
 
 #[derive(Debug, clap::Args)]
@@ -1906,6 +1921,9 @@ mod tests {
         // drift as the schema evolves).
         toml::from_str::<ConfigFile>(include_str!("../zecd.example.toml"))
             .expect("zecd.example.toml");
+        // What `zecd example-config` emits must be loadable by the same binary that emitted it.
+        toml::from_str::<ConfigFile>(crate::example_config::EXAMPLE_CONFIG)
+            .expect("example-config output");
         toml::from_str::<ConfigFile>(include_str!("../deploy/zecd.toml"))
             .expect("deploy/zecd.toml");
         toml::from_str::<ConfigFile>(include_str!("../deploy/zecd.mainnet.toml"))

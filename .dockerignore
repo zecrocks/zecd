@@ -8,3 +8,5 @@
 !rust-toolchain.toml
 !src
 !vendor
+# `example-config` embeds this with include_str!, so the build needs it in the context.
+!zecd.example.toml

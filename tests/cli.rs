@@ -507,3 +507,148 @@ fn export_ufvk_is_not_blocked_by_the_datadir_lock() {
         "export-ufvk must not be blocked by the datadir lock; stderr: {stderr}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// example-config
+// ---------------------------------------------------------------------------
+
+/// The default mode: emit the annotated config on stdout, byte-for-byte, with nothing else
+/// mixed in - so `zecd example-config > zecd.toml` is a usable starting config.
+#[test]
+fn example_config_prints_the_annotated_config_to_stdout() {
+    let out = run_with_timeout(
+        {
+            let mut c = zecd();
+            c.arg("example-config");
+            c
+        },
+        Duration::from_secs(10),
+    );
+    assert!(out.status.success(), "stderr: {}", stderr_of(&out));
+    let stdout = String::from_utf8(out.stdout).expect("utf-8 config");
+    assert_eq!(
+        stdout,
+        zecd::example_config::EXAMPLE_CONFIG,
+        "stdout must be exactly the shipped example config"
+    );
+    assert!(stdout.contains("[backend]") && stdout.contains("# Network:"));
+}
+
+/// The command exists to bootstrap a config, so it must not require one - nor a datadir, a
+/// wallet, or a reachable chain backend. This is the regression guard for dispatching it
+/// before `AppConfig::resolve`: a config that makes `resolve` *fail* must still not stop it.
+#[test]
+fn example_config_works_without_a_usable_config() {
+    // No datadir at all.
+    let out = run_with_timeout(
+        {
+            let mut c = zecd();
+            c.arg("example-config");
+            c
+        },
+        Duration::from_secs(10),
+    );
+    assert!(out.status.success(), "stderr: {}", stderr_of(&out));
+
+    // A datadir whose zecd.toml would be rejected by `resolve` (deny_unknown_fields).
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("zecd.toml"), "[rpc]\nbogus_field = 1\n").unwrap();
+    let out = run_with_timeout(
+        {
+            let mut c = zecd();
+            c.args(["--datadir", dir.path().to_str().unwrap(), "example-config"]);
+            c
+        },
+        Duration::from_secs(10),
+    );
+    assert!(
+        out.status.success(),
+        "a broken config must not block generating a good one; stderr: {}",
+        stderr_of(&out)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        zecd::example_config::EXAMPLE_CONFIG
+    );
+}
+
+/// `-o` writes the file; a second run refuses rather than discarding a live config, and
+/// `--force` is the documented way through.
+#[test]
+fn example_config_output_file_refuses_to_clobber_without_force() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("zecd.toml");
+    let path_str = path.to_str().unwrap().to_owned();
+
+    let out = run_with_timeout(
+        {
+            let mut c = zecd();
+            c.args(["example-config", "-o", &path_str]);
+            c
+        },
+        Duration::from_secs(10),
+    );
+    assert!(out.status.success(), "stderr: {}", stderr_of(&out));
+    assert_eq!(
+        std::fs::read_to_string(&path).unwrap(),
+        zecd::example_config::EXAMPLE_CONFIG
+    );
+    assert!(
+        out.stdout.is_empty(),
+        "with -o, stdout stays empty (the confirmation goes to stderr)"
+    );
+
+    // Edit it, then prove a re-run leaves the edit alone.
+    std::fs::write(&path, "network = \"main\"\n").unwrap();
+    let out = run_with_timeout(
+        {
+            let mut c = zecd();
+            c.args(["example-config", "-o", &path_str]);
+            c
+        },
+        Duration::from_secs(10),
+    );
+    assert_eq!(out.status.code(), Some(1));
+    assert!(
+        stderr_of(&out).contains("--force"),
+        "stderr: {}",
+        stderr_of(&out)
+    );
+    assert_eq!(
+        std::fs::read_to_string(&path).unwrap(),
+        "network = \"main\"\n",
+        "the existing config must survive"
+    );
+
+    let out = run_with_timeout(
+        {
+            let mut c = zecd();
+            c.args(["example-config", "-o", &path_str, "--force"]);
+            c
+        },
+        Duration::from_secs(10),
+    );
+    assert!(out.status.success(), "stderr: {}", stderr_of(&out));
+    assert_eq!(
+        std::fs::read_to_string(&path).unwrap(),
+        zecd::example_config::EXAMPLE_CONFIG
+    );
+}
+
+#[test]
+fn help_lists_example_config_subcommand() {
+    let out = run_with_timeout(
+        {
+            let mut c = zecd();
+            c.arg("--help");
+            c
+        },
+        Duration::from_secs(10),
+    );
+    assert!(out.status.success());
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("example-config"),
+        "help should list example-config: {stdout}"
+    );
+}

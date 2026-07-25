@@ -26,6 +26,13 @@ async fn main() -> anyhow::Result<()> {
         return zecd::server::auth::run_rpcauth(args);
     }
 
+    // `example-config` likewise: it emits a *starting* config, so it must work when there is no
+    // config yet - resolving one first would reject the very situation the command exists for
+    // (no `zecd.toml`, or one whose placeholders `resolve` refuses on mainnet).
+    if let Some(Command::ExampleConfig(args)) = &cli.command {
+        return zecd::example_config::run(args);
+    }
+
     let config = AppConfig::resolve(&cli)?;
     daemon::init_tracing(&config.log);
     // Disable core dumps + ptrace before any seed is decrypted (best-effort; see hardening).

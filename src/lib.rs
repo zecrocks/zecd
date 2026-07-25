@@ -9,6 +9,7 @@ pub mod chain;
 pub mod config;
 pub mod daemon;
 pub mod error;
+pub mod example_config;
 pub mod hardening;
 pub mod health;
 pub mod init;
