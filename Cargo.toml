@@ -80,20 +80,20 @@ zcash_encoding = "0.4"
 # and the received-by-address read paths; zecd's own wallets never expose transparent receivers.
 # `pczt` exposes `create_pczt_from_proposal` / `extract_and_store_transaction_from_pczt`, the
 # build/prove/store seam that lets the proving step take a cached Orchard proving key.
-zcash_client_backend = { version = "0.24.0-rc.1", features = ["orchard", "transparent-inputs", "pczt"] }
-zcash_client_sqlite = { version = "0.22.0-rc.1", features = ["unstable", "orchard", "serde", "transparent-inputs"] }
-zcash_keys = { version = "0.15", features = ["unstable", "orchard"] }
-zcash_primitives = "0.29"
-zcash_proofs = { version = "0.29", features = ["bundled-prover"] }
+zcash_client_backend = { version = "0.24.0-rc.4", features = ["orchard", "transparent-inputs", "pczt"] }
+zcash_client_sqlite = { version = "0.22.0-rc.4", features = ["unstable", "orchard", "serde", "transparent-inputs"] }
+zcash_keys = { version = "0.16", features = ["unstable", "orchard"] }
+zcash_primitives = "0.30"
+zcash_proofs = { version = "0.30", features = ["bundled-prover"] }
 zcash_protocol = { version = "0.10", features = ["local-consensus"] }
-zcash_transparent = "0.9"
+zcash_transparent = "0.10"
 # Script asm rendering + standard-script solver for `getrawtransaction` (already in the
 # tree via zcash_transparent; same crate Zallet uses for this).
 zcash_script = "0.4.5"
 sapling = { package = "sapling-crypto", version = "0.7" }
 # PCZT roles (Prover/Signer) for the cached-proving-key send path. Versions track the
-# zcash_client_backend `pczt` feature's own pin (0.8.0-rc.1).
-pczt = { version = "0.8.0-rc.1", default-features = false, features = ["prover", "signer", "orchard", "sapling"] }
+# zcash_client_backend `pczt` feature's own pin (0.9.1).
+pczt = { version = "0.9.1", default-features = false, features = ["prover", "signer", "orchard", "sapling"] }
 zip32 = "0.2"
 zip321 = "0.9.0-rc.1"
 libc = "0.2.186"

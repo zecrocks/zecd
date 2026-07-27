@@ -16,9 +16,9 @@
 
 services:
   zebra:
-    # Zebra 6.0.0 activates ironwood (NU6.3) at the network's activation height (see zebra's source
+    # Zebra 6.x activates ironwood (NU6.3) at the network's activation height (see zebra's source
     # and release notes). The mainnet overlay reuses this image.
-    image: zfnd/zebra:6.0.0                 # pin to a verified release (zebra tags have no 'v' prefix)
+    image: zfnd/zebra:6.2.2                 # pin to a verified release (zebra tags have no 'v' prefix)
     restart: unless-stopped
     command: ["zebrad", "-c", "/etc/zebra/zebrad.toml", "start"]
     volumes:

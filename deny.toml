@@ -5,14 +5,6 @@ all-features = true
 version = 2
 yanked = "deny"
 ignore = [
-    # `time` <0.3.47 DoS via stack exhaustion when *parsing* untrusted datetime
-    # strings. We cannot upgrade: zcash_client_backend 0.23.0 pins
-    # `time-core = "=0.1.2"`, which forces time 0.3.37 (0.3.47 needs time-core
-    # 0.1.8). Our dependency path uses `time` for timestamp arithmetic only -
-    # no parsing of untrusted input - so exposure is nil. Drop this ignore when
-    # the librustzcash line is next upgraded. (Same exception as
-    # .cargo/audit.toml, for local `cargo audit` runs.)
-    "RUSTSEC-2026-0009",
     # proc-macro-error2 is unmaintained. It is a build-time proc-macro
     # dependency only (no runtime code path), pulled in transitively by
     # orchard (via getset) and age (via i18n-embed-fl); there is no
@@ -50,17 +42,6 @@ wildcards = "deny"
 [sources]
 unknown-registry = "deny"
 unknown-git = "deny"
-# Dev-only ironwood / NU6.3 branch exception (see Cargo.toml `[patch.crates-io]` and the project docs):
-# the librustzcash set is patched by git rev to upstream `zcash/librustzcash`
-# `dw/ironwood-scan-model` - a plain upstream pin, no fork. The ironwood wallet crates
-# (client_backend/client_sqlite/pczt/zip321/encoding) aren't published to crates.io yet, so the whole
-# `[patch]` set is git-pinned by rev; repin to crates.io once they publish. The branch also requires
-# the explicit-checkpoint-retention shardtree APIs plus a `clear_flags` checkpoint-pruning panic fix,
-# so shardtree + incrementalmerkletree are git-patched to `zcash/incrementalmerkletree` main (which now
-# carries both; mirror the rev the `[patch]` pins). `orchard` resolves from crates.io (0.15.0-pre.x).
-# Drop both git sources when the ironwood wallet crates + a shardtree release with these APIs land on
-# crates.io.
-allow-git = [
-    "https://github.com/zcash/librustzcash",
-    "https://github.com/zcash/incrementalmerkletree",
-]
+# No git sources: the whole librustzcash/ironwood set (including shardtree +
+# incrementalmerkletree) now resolves from crates.io, so there is no `allow-git`
+# exception to carry. Re-add one only if a dependency ever needs a git pin again.

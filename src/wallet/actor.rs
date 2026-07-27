@@ -15,7 +15,7 @@ use tracing::{error, info, warn};
 use zcash_client_backend::data_api::wallet::{
     create_pczt_from_proposal, create_proposed_transactions, decrypt_and_store_transaction,
     extract_and_store_transaction_from_pczt,
-    input_selection::{GreedyInputSelector, SpendPolicy},
+    input_selection::{GreedyInputSelector, LockFilter, SpendPolicy},
     propose_transfer, ConfirmationsPolicy, SpendingKeys,
 };
 use zcash_client_backend::data_api::{
@@ -32,7 +32,7 @@ use zcash_client_backend::wallet::{OvkPolicy, Recipient, TransparentAddressSourc
 use zcash_client_sqlite::error::SqliteClientError;
 use zcash_client_sqlite::{AccountUuid, FsBlockDb};
 use zcash_keys::address::Address;
-use zcash_primitives::transaction::builder::{BuildConfig, Builder};
+use zcash_primitives::transaction::builder::{BuildConfig, Builder, BundlePadding};
 use zcash_primitives::transaction::fees::zip317::FeeRule as Zip317FeeRule;
 use zcash_primitives::transaction::Transaction;
 use zcash_proofs::prover::LocalTxProver;
@@ -2879,6 +2879,10 @@ impl WalletActor {
                 // default permits every shielded pool with no transparent spending - the historical
                 // fully-shielded behavior (replaces the removed `TransparentSpendPolicy::ShieldedOnly`).
                 &SpendPolicy::default(),
+                // No input locking: zecd serializes sends through the single-writer actor, so
+                // there is no concurrent proposer to race for inputs.
+                None,
+                // `None` builds at the transaction version implied by the target height.
                 None,
             )
             .map_err(|e| enrich_insufficient_funds(db, policy, classify_err(e)))?;
@@ -2896,9 +2900,9 @@ impl WalletActor {
                 // `None` lets librustzcash derive the expiry from the proposal's target height,
                 // matching the fused build path (and the pre-#2412 behaviour).
                 None,
-                // The change strategy above uses padded (default) Orchard bundles, so the bundle
-                // type must be `DEFAULT` to match (see `with_unpadded_orchard_pool_bundles`).
-                orchard::builder::BundleType::DEFAULT,
+                // The change strategy above uses padded (default) Orchard bundles, so the
+                // padding must be `DEFAULT` to match (see `with_unpadded_orchard_pool_bundles`).
+                BundlePadding::DEFAULT,
             )
             .map_err(|e| enrich_insufficient_funds(db, policy, classify_pczt_err(e)))?;
             Ok((pczt, shape, start.elapsed()))
@@ -3087,6 +3091,10 @@ impl WalletActor {
                     // permits every shielded pool with no transparent spending, preserving the prior
                     // fully-shielded selection behavior (replaces `TransparentSpendPolicy::ShieldedOnly`).
                     &SpendPolicy::default(),
+                    // No input locking: zecd serializes sends through the single-writer actor,
+                    // so there is no concurrent proposer to race for inputs.
+                    None,
+                    // `None` builds at the transaction version implied by the target height.
                     None,
                 )
                 .map_err(|e| enrich_insufficient_funds(db, policy, classify_err(e)))?;
@@ -3105,6 +3113,9 @@ impl WalletActor {
                     &SpendingKeys::from_unified_spending_key(usk),
                     OvkPolicy::Sender,
                     &proposal,
+                    // `None` keeps the builder-derived expiry from the proposal's target
+                    // height, matching the PCZT path.
+                    None,
                 )
                 .map_err(|e| enrich_insufficient_funds(db, policy, classify_err(e)))?;
                 if txids.len() > 1 {
@@ -3408,6 +3419,8 @@ impl WalletActor {
                             target_height,
                             policy,
                             CoinbaseFilter::AllTransparentOutputs,
+                            // zecd never locks inputs, so lock state can't exclude anything.
+                            LockFilter::Unfiltered,
                         )
                         .map_err(RpcError::database_internal)?;
                     utxos.extend(outs);
@@ -3460,7 +3473,8 @@ impl WalletActor {
                         // unconditionally; this is a transparent-only send (no shielded spends),
                         // so there's no anchor.
                         ironwood_anchor: None,
-                        orchard_pool_bundle_type: orchard::builder::BundleType::DEFAULT,
+                        orchard_padding: BundlePadding::DEFAULT,
+                        ironwood_padding: BundlePadding::DEFAULT,
                     },
                 );
 

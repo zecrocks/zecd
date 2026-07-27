@@ -7,6 +7,7 @@ use std::path::Path;
 use anyhow::anyhow;
 use rusqlite::{named_params, Connection, OptionalExtension};
 use uuid::Uuid;
+use zcash_client_backend::data_api::wallet::input_selection::LockFilter;
 use zcash_client_backend::data_api::wallet::ConfirmationsPolicy;
 use zcash_client_backend::data_api::{Account as _, InputSource, WalletRead};
 use zcash_keys::address::{Address, UnifiedAddress};
@@ -778,7 +779,13 @@ pub fn list_unspent(network: ZNetwork, wallet_dir: &Path) -> anyhow::Result<Vec<
     // Harmless pre-NU6.3: the ironwood note table is simply empty on mainnet / pre-activation testnet.
     protocols.push(ShieldedPool::Ironwood);
     for account in db.get_account_ids()? {
-        let notes = db.select_unspent_notes(account, &protocols, target_height, &[])?;
+        let notes = db.select_unspent_notes(
+            account,
+            &protocols,
+            target_height,
+            &[],
+            LockFilter::Unfiltered,
+        )?;
         // Both `notes.sapling()` and `notes.orchard()` yield `ReceivedNote`s with the same
         // `txid`/`output_index`/`note_value` surface; collect each into the shared output list.
         // `default_pool` is the note's protocol pool (2 Sapling / 3 Orchard); the per-output

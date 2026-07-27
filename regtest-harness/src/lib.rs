@@ -275,7 +275,7 @@ impl Drop for Zebrad {
     }
 }
 
-/// zebrad Regtest config for zebra 5.x. Note: no `[mining] debug_like_zcashd` (removed after
+/// zebrad Regtest config for zebra 6.x. Note: no `[mining] debug_like_zcashd` (removed after
 /// 2.x), `disable_pow = true` so submitted blocks need no PoW, and `enable_cookie_auth = false`
 /// so lightwalletd can use the rpcuser/rpcpassword from its `zcash.conf`.
 fn zebrad_toml(

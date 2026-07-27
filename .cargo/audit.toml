@@ -2,9 +2,7 @@
 # whose deny.toml documents the same advisory exceptions).
 
 [advisories]
-# RUSTSEC-2026-0009: `time` <0.3.47 DoS via stack exhaustion when *parsing* untrusted
-# datetime strings. We cannot upgrade: zcash_client_backend 0.23.0 pins `time-core = "=0.1.2"`,
-# which forces time 0.3.37 (0.3.47 needs time-core 0.1.8). Our dependency path uses `time`
-# for timestamp arithmetic only - no parsing of untrusted input - so exposure is nil.
-# Drop this ignore when the librustzcash line is next upgraded.
-ignore = ["RUSTSEC-2026-0009"]
+# No advisory exceptions are currently needed: RUSTSEC-2026-0009 (`time` <0.3.47) was
+# dropped when the librustzcash 0.24-rc line removed the `time-core = "=0.1.2"` pin that
+# had held `time` back at 0.3.37.
+ignore = []
