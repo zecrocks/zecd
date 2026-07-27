@@ -20,8 +20,8 @@ name: Regtest E2E
 # ONLY on a monthly cron (1st of the month) or a manual dispatch with the `stress` box ticked.
 # It compiles on every run but skips in seconds otherwise.
 #
-# A separate `regtest-ironwood` job (schedule + manual dispatch, plus the
-# ironwood-on-transparent-fixes branch) builds zecd `--features ironwood` - against the official
+# A separate `regtest-ironwood` job (schedule + manual dispatch, plus the mainline) builds zecd
+# with the ironwood scan/send paths - which are compiled unconditionally now - against the official
 # zcash/librustzcash ironwood RC (no `nu6.3` cfg needed any more) - and runs the NU6.3 receive+send
 # e2e against the ironwood toolchain images - see that job's header.
 
@@ -256,12 +256,14 @@ jobs:
   # lockstep with the harness' NU6_3_ACTIVATION_HEIGHT, zecd's network::regtest(), and devtool's
   # regtest_params().
   regtest-ironwood:
-    # schedule + manual dispatch, plus the ironwood integration line so ironwood-work PRs auto-run
-    # the NU6.3 e2e without a manual dispatch. `base_ref` matches any PR **into** `ironwood` (its
-    # merge target); `ref` matches a direct push to `ironwood`. Never on unrelated branches' PRs -
-    # the emersonian/* lwd/devtool images are dev artifacts and must not gate anyone else's CI. Drop
-    # this keying (run it everywhere) once ironwood merges to the mainline and those images ship.
-    if: ${{ github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' || github.base_ref == 'ironwood' || github.ref == 'refs/heads/ironwood' }}
+    # schedule + manual dispatch, plus the mainline so trunk-bound work auto-runs the NU6.3 e2e
+    # without a manual dispatch. `base_ref` matches any PR **into** `main`; `ref` matches a direct
+    # push to `main`. (Both clauses named `ironwood` while that was the integration line; the
+    # ironwood work sits on the trunk now, so retargeting preserves the original intent.) Still
+    # never on unrelated branches' PRs - a PR into a feature branch does not pull in the
+    # emersonian/* lwd/devtool images, which remain dev artifacts. Once those images ship, the
+    # keying can be dropped entirely so the tier runs everywhere.
+    if: ${{ github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' || github.base_ref == 'main' || github.ref == 'refs/heads/main' }}
     runs-on: ubuntu-latest
     name: regtest (ironwood / NU6.3)
     env:
