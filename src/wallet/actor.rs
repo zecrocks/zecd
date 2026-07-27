@@ -163,13 +163,16 @@ fn sync_error_retry_deadline(now: Instant) -> Instant {
 const ENHANCE_BATCH: usize = 16;
 
 /// Whether a [`TransactionDataRequest`] is one zecd can actually service (and therefore one that
-/// counts toward the enhancement backlog). `TransactionsInvolvingAddress` needs a transparent-txid
-/// query the `ChainSource` trait has no source for, so it's skipped - and deliberately *not*
-/// counted, since it never drains and would otherwise pin the backlog above zero forever.
+/// counts toward the enhancement backlog). All three variants drain: `GetStatus`/`Enhancement` via
+/// `fetch_full_tx`, and `TransactionsInvolvingAddress` via the transparent address-index query
+/// (`fetch_transparent_txids` + `notify_address_checked`), which converges once the address is
+/// recorded as checked, so it doesn't pin the backlog above zero.
 fn is_serviceable_request(req: &TransactionDataRequest) -> bool {
     matches!(
         req,
-        TransactionDataRequest::GetStatus(_) | TransactionDataRequest::Enhancement(_)
+        TransactionDataRequest::GetStatus(_)
+            | TransactionDataRequest::Enhancement(_)
+            | TransactionDataRequest::TransactionsInvolvingAddress(_)
     )
 }
 
@@ -4945,15 +4948,20 @@ mod tests {
         );
     }
 
-    /// The enhancement backlog counts only requests zecd can actually service: full-tx
-    /// `Enhancement` and `GetStatus`. The transparent-address variant (which zecd has no source
-    /// for and skips) must be excluded, or it would pin `pending_enhancements` above zero forever
-    /// and a wallet would never report ready.
+    /// The enhancement backlog counts the requests zecd can actually service, which is all three
+    /// variants: `Enhancement`/`GetStatus` via a full-tx fetch, and the transparent-address
+    /// variant via the address-index query. A variant zecd could not drain would have to be
+    /// excluded, or it would pin `pending_enhancements` above zero forever and a wallet would
+    /// never report ready.
     #[test]
     fn serviceable_request_classification() {
         use super::is_serviceable_request;
-        use zcash_client_backend::data_api::TransactionDataRequest;
+        use zcash_client_backend::data_api::{
+            OutputStatusFilter, TransactionDataRequest, TransactionStatusFilter,
+        };
+        use zcash_protocol::consensus::BlockHeight;
         use zcash_protocol::TxId;
+        use zcash_transparent::address::TransparentAddress;
 
         let txid = TxId::from_bytes([7u8; 32]);
         assert!(is_serviceable_request(
@@ -4962,6 +4970,17 @@ mod tests {
         assert!(is_serviceable_request(&TransactionDataRequest::GetStatus(
             txid
         )));
+        assert!(
+            is_serviceable_request(&TransactionDataRequest::transactions_involving_address(
+                TransparentAddress::PublicKeyHash([9u8; 20]),
+                BlockHeight::from_u32(1),
+                Some(BlockHeight::from_u32(100)),
+                None,
+                TransactionStatusFilter::All,
+                OutputStatusFilter::All,
+            )),
+            "the transparent address-index query drains, so it counts toward the backlog"
+        );
     }
 
     /// FullPrivacy's single-pool rule: violated by any transparent component, or by touching
