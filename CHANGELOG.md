@@ -5,6 +5,26 @@ All notable changes to zecd are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com), and this
 project adheres to [Semantic Versioning](https://semver.org).
 
+## [0.5.0] - 2026-07-28
+
+The 0.5.0 line, released as `0.5.0-rc1` through `0.5.0-rc4` and unchanged since `0.5.0-rc4`.
+Everything below is relative to 0.4.3; the release-candidate sections that follow are kept for
+history.
+
+### Added
+- Ironwood (NU6.3 / V6) support: receive discovery, balance rollup, `pool == "ironwood"` labelling, and the Ironwood send and proof path, with an NU6.3 regtest end-to-end covering receive, send, and memo decryption. Compiled unconditionally and activated by consensus height - on for testnet, off for mainnet, opt-in on regtest - so no build flag is needed.
+- `zecd example-config` prints the annotated example configuration, to stdout or to a file with `-o` (which refuses to overwrite an existing one without `--force`), so a starting config no longer has to be found in a source tree.
+
+### Changed
+- The librustzcash crates are consumed from crates.io rather than a pinned git revision, so a build pulls no git dependency: the wallet crates as ironwood release candidates (`zcash_client_backend 0.24.0-rc.4`, `zcash_client_sqlite 0.22.0-rc.4`) and the rest as finals, with `pczt` at 0.9.1.
+- The pinned zebra release is 6.2.2, for CI, the ironwood regtest tier, and the Docker compose stack.
+
+### Fixed
+- Spends of the wallet's own transparent outputs are now discovered. zecd left librustzcash's address-index data requests, the ones that find those spends, out of the enhancement drain, so they went unanswered.
+
+### Security
+- The `RUSTSEC-2026-0009` advisory exception is gone. The newer dependency line no longer holds `time` back, so the advisory is fixed rather than excepted. `spin` also moves off the yanked 0.9.8.
+
 ## [0.5.0-rc4] - 2026-07-27
 
 ### Added
@@ -194,6 +214,7 @@ Zcash, backed entirely by librustzcash and running as a light client.
 ### Security
 - Pre-release audit hardening; refuse to start on mainnet with the placeholder RPC password; enforce a 12-character passphrase minimum.
 
+[0.5.0]: https://github.com/zecrocks/zecd/compare/v0.4.3...v0.5.0
 [0.5.0-rc4]: https://github.com/zecrocks/zecd/compare/v0.5.0-rc3...v0.5.0-rc4
 [0.5.0-rc3]: https://github.com/zecrocks/zecd/compare/v0.5.0-rc2...v0.5.0-rc3
 [0.5.0-rc2]: https://github.com/zecrocks/zecd/compare/v0.5.0-rc1...v0.5.0-rc2
