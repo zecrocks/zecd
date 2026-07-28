@@ -2,8 +2,17 @@
 
 zecd is configured by a TOML file plus Bitcoin-Core-style CLI flags and a handful of
 environment variables. This page is the complete reference: every TOML section and key with
-its type, default, and semantics, plus the CLI flags and environment variables. The
-`zecd.example.toml` file in the repository root is a fully commented starting point.
+its type, default, and semantics, plus the CLI flags and environment variables.
+
+For a fully commented starting point, ask the binary for one:
+
+```sh
+zecd example-config > ./data/zecd.toml
+```
+
+`zecd example-config` prints the annotated `zecd.example.toml` that ships with zecd, so you
+do not need a source checkout to get it: it works the same from a release tarball, a `.deb`,
+or a container. See [Subcommands](#subcommands) for `--output-file` and `--force`.
 
 ## File location and precedence
 
@@ -201,13 +210,15 @@ Flags use Bitcoin-Core-style names and always win over the corresponding TOML ke
 Running `zecd` with no subcommand (or `zecd run`) starts the daemon. The global flags above
 are accepted on every invocation and must precede the subcommand (`zecd --datadir ./data
 --testnet init`). `init` and `export-ufvk` honor the datadir/network/keys flags; the RPC
-flags are inert for them. `rpcauth` runs before config resolution and ignores all of them.
+flags are inert for them. `rpcauth` and `example-config` run before config resolution and
+ignore all of them, so they work when there is no config file yet.
 
 | Subcommand | Flags | Description |
 |------------|-------|-------------|
 | `init` | `--wallet <NAME>` (default `default`), `--restore`, `--mnemonic-file <FILE>`, `--encrypt`, `--ufvk <UFVK>`, `--birthday <HEIGHT>` | Create and initialize a wallet, then exit. `--restore` reads the mnemonic from `ZECD_MNEMONIC`, else `--mnemonic-file`, else stdin. `--encrypt` reads the passphrase from `ZECD_WALLET_PASSPHRASE`, else prompts. `--ufvk` creates a watch-only wallet and conflicts with `--restore`/`--encrypt`. `--birthday` defaults to the current chain tip for new wallets; a restore without it scans from Sapling activation. |
 | `export-ufvk` | `--wallet <NAME>` (default `default`) | Print a wallet's Unified Full Viewing Key (reads the wallet DB; no identity/passphrase needed, and not blocked by a running daemon's datadir lock). |
 | `rpcauth <username> [password]` | | Generate a salted `[rpc] auth` credential line. Omitting the password generates a strong random one, printed once. Needs no datadir or config. |
+| `example-config` | `-o, --output-file <FILE>`, `--force` | Print the annotated example config, then exit. Goes to stdout by default (`-o -` is the same), so it can be redirected or piped. With `-o <FILE>` it writes there instead and refuses to overwrite an existing file unless `--force`; the "wrote example config to ..." confirmation goes to stderr, so stdout carries config text and nothing else in every mode. The output is the shipped `zecd.example.toml`, byte for byte. Needs no datadir or config. |
 | `run` | | Run the JSON-RPC daemon (the default when no subcommand is given). |
 
 ## Environment variables

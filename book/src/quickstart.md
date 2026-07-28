@@ -98,6 +98,16 @@ and history fill in as the scan catches up. Default RPC ports are **8232** (main
 bitcoind-style salted credentials from `--rpcauth` (generate one with `zecd rpcauth <user>`).
 The full flag and config reference is in [Configuration](configuration.md).
 
+The steps above pass everything on the command line, so no config file is needed to get
+started. For a persistent setup, have zecd write you a commented one to edit:
+
+```sh
+zecd example-config -o ./data/zecd.toml
+```
+
+It refuses to overwrite an existing file unless you pass `--force`, so it is safe to run
+against a live deployment's datadir.
+
 On mainnet, zecd refuses to start while `[rpc] password` is still the example placeholder
 `CHANGE-ME`.
 
