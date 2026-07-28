@@ -20,7 +20,7 @@ use std::time::{Duration, Instant};
 
 use serde_json::json;
 use zecd_regtest_harness::{
-    pick_port, resolve_bin, Funder, Lightwalletd, Zebrad, Zecd, ZecdConfig,
+    attach_backend, pick_port, resolve_bin, Funder, Lightwalletd, Zebrad, Zecd, ZecdConfig,
 };
 
 const FUNDER_COINBASES: u32 = 120;
@@ -78,6 +78,9 @@ async fn regtest_fully_transparent_spend_keeps_change_transparent() {
     let mut cfg = ZecdConfig::new(zebrad.rpc_port, pick_port().expect("pick zecd rpc port"));
     cfg.transparent = true;
     cfg.privacy_policy = Some("AllowFullyTransparent".to_string());
+    let _zecd_lwd = attach_backend(&mut cfg, zebrad.rpc_port)
+        .await
+        .expect("attach zecd backend");
     let zecd = Zecd::start(&cfg)
         .await
         .expect("start zecd with fully-transparent spending");

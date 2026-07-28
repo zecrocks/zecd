@@ -9,10 +9,14 @@ default_wallet = "default"
 dir = "/var/lib/zecd/default"
 
 [backend]
-# The co-located zebra full node's JSON-RPC (zebra:// = direct to zebrad, no lightwalletd).
+# The co-located zebra full node's JSON-RPC (zebra:// = direct to zebrad).
 server = "zebra://zebra:18234"
 # For a MAINNET deployment, set network = "main" above and the mainnet RPC port:
 # server = "zebra://zebra:8234"
+# LIGHT MODE alternative - skip the co-located zebra entirely and use the public zec.rocks
+# lightwalletd over TLS (match the endpoint to `network` above):
+# server = "https://testnet.zec.rocks:443"   # network = "test"
+# server = "https://zec.rocks:443"           # network = "main"
 connect_timeout_secs = 10
 reconnect_base_secs = 1
 reconnect_max_secs = 60

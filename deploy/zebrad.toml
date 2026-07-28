@@ -4,9 +4,10 @@
 network = "Testnet"
 
 [rpc]
-# Expose JSON-RPC on the compose network for zecd. 18234 is the port zecd's
-# default `server = "zebra"` expects on testnet (8234 on mainnet; zebra ships with RPC
-# disabled, so there is no upstream default to follow). Keep this off any public interface.
+# Expose JSON-RPC on the compose network for zecd. 18234 is the port zecd's default
+# `server` expects on testnet (`zebra://127.0.0.1:18234`; 8234 on mainnet - zebra ships with
+# RPC disabled, so there is no upstream default to follow). Keep this off any public
+# interface.
 listen_addr = "0.0.0.0:18234"
 # The compose network is private and zecd authenticates with user/password or not at all,
 # so the cookie file isn't shared between containers.

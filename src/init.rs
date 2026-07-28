@@ -126,6 +126,7 @@ pub async fn run(config: &AppConfig, args: &InitArgs) -> anyhow::Result<()> {
                 .pools
                 .transparent_allow_beyond_recovery_window,
             transparent_gap_warn_threshold: config.pools.transparent_gap_warn_threshold,
+            transparent_offline_sweep: config.pools.transparent_offline_sweep,
         });
     let keys_path = entry.keys_path();
     let enabled_pools = entry.pools.clone();
@@ -211,7 +212,7 @@ pub async fn run(config: &AppConfig, args: &InitArgs) -> anyhow::Result<()> {
         AtRest::Identity(ensure_identity(&identity_path).await?)
     };
 
-    // init is a one-shot interactive command that dials the configured zebra endpoint once.
+    // init is a one-shot interactive command that dials the configured upstream once.
     let mut server = backend::resolve(&config.backend.server, network)?;
     backend::apply_zebra_auth(&mut server, &config.zebra.auth());
     backend::apply_cleartext_policy(
@@ -221,6 +222,7 @@ pub async fn run(config: &AppConfig, args: &InitArgs) -> anyhow::Result<()> {
             allow_remote_cleartext: config.backend.allow_remote_cleartext,
         },
     );
+    backend::apply_tls(&mut server, config.backend.tls, config.backend.tls_roots);
     let mut client = server
         .connect_timeout(Duration::from_secs(config.backend.connect_timeout_secs))
         .await
@@ -410,6 +412,7 @@ pub fn export_ufvk(config: &AppConfig, args: &ExportUfvkArgs) -> anyhow::Result<
                 .pools
                 .transparent_allow_beyond_recovery_window,
             transparent_gap_warn_threshold: config.pools.transparent_gap_warn_threshold,
+            transparent_offline_sweep: config.pools.transparent_offline_sweep,
         });
     let keys_path = entry.keys_path();
     let wallet_dir = entry.dir;
@@ -782,6 +785,7 @@ mod tests {
                 transparent_initial_scan: 0,
                 transparent_allow_beyond_recovery_window: true,
                 transparent_gap_warn_threshold: 5,
+                transparent_offline_sweep: true,
             },
         );
         wallets.insert(
@@ -797,6 +801,7 @@ mod tests {
                 transparent_initial_scan: 0,
                 transparent_allow_beyond_recovery_window: true,
                 transparent_gap_warn_threshold: 5,
+                transparent_offline_sweep: true,
             },
         );
 
@@ -842,6 +847,7 @@ mod tests {
                     transparent_initial_scan: 0,
                     transparent_allow_beyond_recovery_window: true,
                     transparent_gap_warn_threshold: 5,
+                    transparent_offline_sweep: true,
                 },
             );
         }

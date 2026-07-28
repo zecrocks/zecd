@@ -16,10 +16,23 @@ use zcash_client_backend::data_api::wallet::ConfirmationsPolicy;
 use crate::network::ZNetwork;
 use crate::pools::{Pool, PoolSet};
 
-/// Default chain upstream: a local zebrad's JSON-RPC (`zebra://127.0.0.1:8234` on mainnet,
-/// `zebra://127.0.0.1:18234` on testnet/regtest - see `backend::ZEBRA_RPC_PORT_*`). A zebrad
-/// on another host/port is set via `[backend] server = "zebra://host:port"`.
-pub const DEFAULT_SERVER: &str = "zebra";
+/// Default chain upstream: a local zebrad's JSON-RPC. Endpoints are always written out in full
+/// (there is no shorthand alias for a particular server), so the default is just the token an
+/// operator would type themselves, and a zebrad on another host/port is the same form with a
+/// different authority: `[backend] server = "zebra://host:port"`. The ports must stay in
+/// lockstep with `backend::ZEBRA_RPC_PORT_*` (pinned by
+/// `backend::tests::default_server_resolves_to_local_zebrad_per_network`).
+pub const DEFAULT_SERVER_MAIN: &str = "zebra://127.0.0.1:8234";
+pub const DEFAULT_SERVER_TEST: &str = "zebra://127.0.0.1:18234";
+
+/// The built-in `server` token for `network`, used when neither `--server` nor `[backend]
+/// server` is set.
+pub fn default_server(network: ZNetwork) -> &'static str {
+    match network {
+        ZNetwork::Main => DEFAULT_SERVER_MAIN,
+        ZNetwork::Test | ZNetwork::Regtest(_) => DEFAULT_SERVER_TEST,
+    }
+}
 
 /// Binary configuration defaults (config file, datadir, ports).
 pub struct BinaryDefaults {
@@ -46,11 +59,15 @@ pub const ZECD_DEFAULTS: BinaryDefaults = BinaryDefaults {
 };
 
 /// Resolve the upstream `server` token by precedence: CLI `--server` > file `server` >
-/// built-in default (a local zebrad).
-fn select_server_token(cli_server: Option<String>, file_server: Option<String>) -> String {
+/// built-in default (a local zebrad, per network).
+fn select_server_token(
+    cli_server: Option<String>,
+    file_server: Option<String>,
+    network: ZNetwork,
+) -> String {
     cli_server
         .or(file_server)
-        .unwrap_or_else(|| DEFAULT_SERVER.to_string())
+        .unwrap_or_else(|| default_server(network).to_string())
 }
 
 /// Read a single secret (e.g. the RPC password) from a file, trimming a trailing newline/CR
@@ -130,6 +147,19 @@ pub struct PoolsConfig {
     /// start landing outside the window. `0` warns only on actual exhaustion. Only meaningful when
     /// `transparent_enabled`.
     pub transparent_gap_warn_threshold: u32,
+    /// **Light-backend offline-window sweep** (default on). On a lightwalletd upstream whose
+    /// compact blocks omit transparent data, a transparent output that was received *and* spent
+    /// while zecd was offline is invisible to both the UTXO refresh (it is no longer unspent) and
+    /// the mempool stream (long gone) - only a per-address history query can recover it. With this
+    /// set, each startup sweeps every exposed transparent address over the offline window
+    /// (`GetTaddressTxids` from the last-scanned height to the tip; the full history on a fresh
+    /// restore), making history identical to a zebra-backed wallet. Costs one upstream query per
+    /// exposed address once per startup - for a large `transparent_initial_scan` set this is the
+    /// slow path the startup warning describes. Disabling it skips the sweep: balances stay
+    /// correct, but received-and-spent-while-offline transparent history may be missing on a light
+    /// backend. Ignored (no sweep needed) on zebra, and on a lightwalletd new enough to include
+    /// transparent data in compact blocks. Only meaningful when `transparent_enabled`.
+    pub transparent_offline_sweep: bool,
 }
 
 /// Default external transparent gap limit. Above librustzcash's built-in 10 to give a safer margin
@@ -155,6 +185,7 @@ impl Default for PoolsConfig {
             transparent_initial_scan: 0,
             transparent_allow_beyond_recovery_window: DEFAULT_TRANSPARENT_ALLOW_BEYOND,
             transparent_gap_warn_threshold: DEFAULT_TRANSPARENT_GAP_WARN_THRESHOLD,
+            transparent_offline_sweep: true,
         }
     }
 }
@@ -246,6 +277,9 @@ pub struct WalletEntry {
     /// This wallet's remaining-slot warning threshold
     /// (see [`PoolsConfig::transparent_gap_warn_threshold`]).
     pub transparent_gap_warn_threshold: u32,
+    /// Whether this wallet sweeps its transparent address history over the offline window on a
+    /// light backend (see [`PoolsConfig::transparent_offline_sweep`]).
+    pub transparent_offline_sweep: bool,
 }
 
 impl WalletEntry {
@@ -260,8 +294,9 @@ impl WalletEntry {
 
 #[derive(Debug, Clone)]
 pub struct BackendConfig {
-    /// The upstream server token: `zebra` (a local zebrad, the default) or
-    /// `zebra://host:port` / `host:port`.
+    /// The upstream server token, always an explicit endpoint: `zebra://host:port` (a zebrad
+    /// JSON-RPC server - the default is a local one, see [`default_server`]) or a lightwalletd
+    /// endpoint (`https://host[:port]` / `http://host:port` / bare `host:port`).
     pub server: String,
     /// Per-attempt dial timeout (seconds) for connecting to the backend endpoint.
     pub connect_timeout_secs: u64,
@@ -280,6 +315,14 @@ pub struct BackendConfig {
     /// Set this only when the hop to a remote zebra is secured out-of-band (SSH/WireGuard tunnel,
     /// private overlay).
     pub allow_remote_cleartext: bool,
+    /// lightwalletd TLS mode: `None` ("auto", the default) uses the locality heuristic
+    /// (loopback/private plaintext, public TLS); `Some(true/false)` forces it. Ignored by
+    /// `zebra://` endpoints (always plaintext) and overridden per-endpoint by an explicit
+    /// `https://`/`http://` scheme.
+    pub tls: Option<bool>,
+    /// Which root certificates lightwalletd TLS trusts (`native` = OS store, the default;
+    /// `webpki` = the embedded Mozilla bundle).
+    pub tls_roots: crate::backend::TlsRoots,
 }
 
 /// `[zebra]` - credentials for the `zebra://host:port` endpoint (direct-to-zebrad mode).
@@ -554,6 +597,8 @@ struct WalletFile {
     transparent_allow_beyond_recovery_window: Option<bool>,
     /// Override the global `[pools] transparent_gap_warn_threshold` for this wallet.
     transparent_gap_warn_threshold: Option<u32>,
+    /// Override the global `[pools] transparent_offline_sweep` for this wallet.
+    transparent_offline_sweep: Option<bool>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -565,6 +610,10 @@ struct BackendFile {
     reconnect_max_secs: Option<u64>,
     rfc1918_is_local: Option<bool>,
     allow_remote_cleartext: Option<bool>,
+    /// lightwalletd TLS mode: `auto` (default) / `yes` / `no`.
+    tls: Option<String>,
+    /// lightwalletd TLS root store: `native` (default) / `webpki`.
+    tls_roots: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -642,6 +691,8 @@ struct PoolsFile {
     transparent_allow_beyond_recovery_window: Option<bool>,
     /// Warn when fewer than this many in-window transparent address slots remain.
     transparent_gap_warn_threshold: Option<u32>,
+    /// Sweep transparent address history over the offline window on a light backend (default on).
+    transparent_offline_sweep: Option<bool>,
 }
 
 // ---------------------------------------------------------------------------
@@ -693,7 +744,9 @@ pub struct Cli {
     #[arg(long = "rpcauth", value_name = "USER:SALT$HASH")]
     pub rpc_auth: Vec<String>,
 
-    /// Chain upstream: `zebra` (local zebrad, the default) or `zebra://host:port`.
+    /// Chain upstream, spelled out in full: `zebra://host:port` (a zebrad JSON-RPC server;
+    /// defaults to the local one) or a lightwalletd endpoint (`https://host[:port]`,
+    /// `http://host:port`, `host:port`).
     #[arg(long, value_name = "SERVER")]
     pub server: Option<String>,
 
@@ -880,6 +933,7 @@ impl AppConfig {
                 transparent_initial_scan,
                 transparent_allow_beyond_recovery_window,
                 transparent_gap_warn_threshold,
+                transparent_offline_sweep,
             ) = resolve_wallet_pools(
                 name,
                 w.pools.as_deref(),
@@ -890,6 +944,7 @@ impl AppConfig {
                 w.transparent_initial_scan,
                 w.transparent_allow_beyond_recovery_window,
                 w.transparent_gap_warn_threshold,
+                w.transparent_offline_sweep,
                 &pools,
             )?;
             wallets.insert(
@@ -905,6 +960,7 @@ impl AppConfig {
                     transparent_initial_scan,
                     transparent_allow_beyond_recovery_window,
                     transparent_gap_warn_threshold,
+                    transparent_offline_sweep,
                 },
             );
         }
@@ -922,6 +978,7 @@ impl AppConfig {
                 transparent_allow_beyond_recovery_window: pools
                     .transparent_allow_beyond_recovery_window,
                 transparent_gap_warn_threshold: pools.transparent_gap_warn_threshold,
+                transparent_offline_sweep: pools.transparent_offline_sweep,
             });
 
         let backend_file = file.backend.unwrap_or(BackendFile {
@@ -931,8 +988,10 @@ impl AppConfig {
             reconnect_max_secs: None,
             rfc1918_is_local: None,
             allow_remote_cleartext: None,
+            tls: None,
+            tls_roots: None,
         });
-        let server = select_server_token(cli.server.clone(), backend_file.server);
+        let server = select_server_token(cli.server.clone(), backend_file.server, network);
         let reconnect_base_secs = backend_file.reconnect_base_secs.unwrap_or(1).max(1);
         let backend = BackendConfig {
             server,
@@ -944,6 +1003,16 @@ impl AppConfig {
                 .max(reconnect_base_secs),
             rfc1918_is_local: backend_file.rfc1918_is_local.unwrap_or(true),
             allow_remote_cleartext: backend_file.allow_remote_cleartext.unwrap_or(false),
+            tls: match backend_file.tls.as_deref() {
+                Some(mode) => crate::backend::parse_tls_mode(mode).context("[backend] tls")?,
+                None => None,
+            },
+            tls_roots: match backend_file.tls_roots.as_deref() {
+                Some(roots) => {
+                    crate::backend::TlsRoots::parse(roots).context("[backend] tls_roots")?
+                }
+                None => crate::backend::TlsRoots::default(),
+            },
         };
 
         let zebra_file = file.zebra.unwrap_or_default();
@@ -1155,6 +1224,9 @@ fn resolve_global_pools(file: Option<&PoolsFile>) -> anyhow::Result<PoolsConfig>
     let transparent_gap_warn_threshold = file
         .and_then(|f| f.transparent_gap_warn_threshold)
         .unwrap_or(DEFAULT_TRANSPARENT_GAP_WARN_THRESHOLD);
+    let transparent_offline_sweep = file
+        .and_then(|f| f.transparent_offline_sweep)
+        .unwrap_or(true);
     validate_transparent_flags(
         "[pools]",
         transparent_enabled,
@@ -1170,6 +1242,7 @@ fn resolve_global_pools(file: Option<&PoolsFile>) -> anyhow::Result<PoolsConfig>
         transparent_initial_scan,
         transparent_allow_beyond_recovery_window,
         transparent_gap_warn_threshold,
+        transparent_offline_sweep,
     })
 }
 
@@ -1208,8 +1281,9 @@ fn resolve_wallet_pools(
     transparent_initial_scan: Option<u32>,
     transparent_allow_beyond_recovery_window: Option<bool>,
     transparent_gap_warn_threshold: Option<u32>,
+    transparent_offline_sweep: Option<bool>,
     global: &PoolsConfig,
-) -> anyhow::Result<(PoolSet, PoolSet, bool, bool, u32, u32, bool, u32)> {
+) -> anyhow::Result<(PoolSet, PoolSet, bool, bool, u32, u32, bool, u32, bool)> {
     let enabled = match pools {
         Some(tokens) => {
             PoolSet::parse(tokens).with_context(|| format!("[wallets.{name}] pools"))?
@@ -1242,6 +1316,8 @@ fn resolve_wallet_pools(
         .unwrap_or(global.transparent_allow_beyond_recovery_window);
     let transparent_gap_warn_threshold =
         transparent_gap_warn_threshold.unwrap_or(global.transparent_gap_warn_threshold);
+    let transparent_offline_sweep =
+        transparent_offline_sweep.unwrap_or(global.transparent_offline_sweep);
     validate_transparent_flags(
         &format!("[wallets.{name}]"),
         transparent_enabled,
@@ -1257,6 +1333,7 @@ fn resolve_wallet_pools(
         transparent_initial_scan,
         transparent_allow_beyond_recovery_window,
         transparent_gap_warn_threshold,
+        transparent_offline_sweep,
     ))
 }
 
@@ -1337,10 +1414,12 @@ mod tests {
             transparent_initial_scan: 0,
             transparent_allow_beyond_recovery_window: DEFAULT_TRANSPARENT_ALLOW_BEYOND,
             transparent_gap_warn_threshold: DEFAULT_TRANSPARENT_GAP_WARN_THRESHOLD,
+            transparent_offline_sweep: true,
         };
-        let (enabled, receivers, _, _, _, _, _, _) =
-            resolve_wallet_pools("w", None, None, None, None, None, None, None, None, &global)
-                .unwrap();
+        let (enabled, receivers, _, _, _, _, _, _, _) = resolve_wallet_pools(
+            "w", None, None, None, None, None, None, None, None, None, &global,
+        )
+        .unwrap();
         assert_eq!(enabled, global.enabled);
         assert_eq!(receivers, global.default_receivers);
     }
@@ -1350,9 +1429,10 @@ mod tests {
         // A wallet that narrows its pools but doesn't set receivers must not inherit the global
         // receivers (which could name a now-disabled pool) - it receives into all it enabled.
         let global = PoolsConfig::default(); // orchard-only
-        let (enabled, receivers, _, _, _, _, _, _) = resolve_wallet_pools(
+        let (enabled, receivers, _, _, _, _, _, _, _) = resolve_wallet_pools(
             "w",
             Some(&s(&["sapling"])),
+            None,
             None,
             None,
             None,
@@ -1374,6 +1454,7 @@ mod tests {
             "hot",
             Some(&s(&["orchard"])),
             Some(&s(&["sapling"])),
+            None,
             None,
             None,
             None,
@@ -1454,7 +1535,7 @@ mod tests {
 
         // Per-wallet override of the flags + gap limit + initial scan depth + recovery-window knobs.
         let global = PoolsConfig::default();
-        let (_, _, te, td, gap, init, allow_beyond, warn_thresh) = resolve_wallet_pools(
+        let (_, _, te, td, gap, init, allow_beyond, warn_thresh, sweep) = resolve_wallet_pools(
             "w",
             None,
             None,
@@ -1464,6 +1545,7 @@ mod tests {
             Some(500),
             Some(false),
             Some(2),
+            Some(false),
             &global,
         )
         .unwrap();
@@ -1478,18 +1560,22 @@ mod tests {
             warn_thresh, 2,
             "per-wallet transparent_gap_warn_threshold override"
         );
+        assert!(!sweep, "per-wallet transparent_offline_sweep override");
 
         // Per-wallet knobs inherit the global values when unset.
         let global = PoolsConfig {
             transparent_allow_beyond_recovery_window: false,
             transparent_gap_warn_threshold: 9,
+            transparent_offline_sweep: false,
             ..PoolsConfig::default()
         };
-        let (_, _, _, _, _, _, allow_beyond, warn_thresh) =
-            resolve_wallet_pools("w", None, None, None, None, None, None, None, None, &global)
-                .unwrap();
+        let (_, _, _, _, _, _, allow_beyond, warn_thresh, sweep) = resolve_wallet_pools(
+            "w", None, None, None, None, None, None, None, None, None, &global,
+        )
+        .unwrap();
         assert!(!allow_beyond, "inherits global allow_beyond");
         assert_eq!(warn_thresh, 9, "inherits global warn threshold");
+        assert!(!sweep, "inherits global transparent_offline_sweep");
     }
 
     #[test]
@@ -1596,18 +1682,42 @@ mod tests {
 
     #[test]
     fn server_token_precedence() {
+        let net = ZNetwork::Main;
         // CLI wins over the file `server`.
         assert_eq!(
-            select_server_token(Some("cli:1".into()), Some("str:1".into())),
+            select_server_token(Some("cli:1".into()), Some("str:1".into()), net),
             "cli:1".to_string()
         );
         // The file `server` is used when there's no CLI flag.
         assert_eq!(
-            select_server_token(None, Some("str:1".into())),
+            select_server_token(None, Some("str:1".into()), net),
             "str:1".to_string()
         );
-        // Nothing configured -> built-in default (a local zebrad).
-        assert_eq!(select_server_token(None, None), DEFAULT_SERVER.to_string());
+        // Nothing configured -> built-in default (a local zebrad), per network.
+        assert_eq!(
+            select_server_token(None, None, ZNetwork::Main),
+            DEFAULT_SERVER_MAIN.to_string()
+        );
+        for net in [ZNetwork::Test, crate::network::regtest()] {
+            assert_eq!(
+                select_server_token(None, None, net),
+                DEFAULT_SERVER_TEST.to_string()
+            );
+        }
+    }
+
+    #[test]
+    fn the_default_server_is_a_fully_spelled_out_endpoint() {
+        // The default is not a privileged alias - it must parse under the same grammar every
+        // user-supplied token does, so nothing special-cases it downstream.
+        for net in [ZNetwork::Main, ZNetwork::Test, crate::network::regtest()] {
+            let token = default_server(net);
+            assert!(
+                token.starts_with("zebra://"),
+                "the default must name its endpoint in full, got {token}"
+            );
+            crate::backend::resolve(token, net).expect("the default must be a valid token");
+        }
     }
 
     #[test]

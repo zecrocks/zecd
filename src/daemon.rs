@@ -112,6 +112,30 @@ pub async fn run(config: AppConfig) -> anyhow::Result<()> {
                 allow_remote_cleartext: config.backend.allow_remote_cleartext,
             },
         );
+        backend::apply_tls(&mut server, config.backend.tls, config.backend.tls_roots);
+        // A light backend answers transparent-address queries one gRPC round-trip at a time
+        // (legacy servers: one GetTaddressTxids per address for the offline sweep and spend
+        // detection, chunked GetAddressUtxos polling over the whole exposed set), so a large
+        // pre-exposed window or gap limit turns startup - and, for funded addresses,
+        // steady-state - into hours of per-address queries. ~1,000 addresses is where one
+        // refresh chunk fills and a funded-set check cycle stops fitting inside a block
+        // interval against a public server.
+        const LIGHT_TRANSPARENT_ADDR_WARN: u32 = 1_000;
+        if server.kind() == backend::ServerKind::Lightwalletd
+            && entry.transparent_enabled
+            && (entry.transparent_initial_scan >= LIGHT_TRANSPARENT_ADDR_WARN
+                || entry.transparent_gap_limit >= LIGHT_TRANSPARENT_ADDR_WARN)
+        {
+            tracing::warn!(
+                "[{name}] transparent_initial_scan = {} / transparent_gap_limit = {} on a \
+                 lightwalletd backend: startup (including the offline-window history sweep) \
+                 and transparent discovery will be VERY slow - each exposed address costs \
+                 upstream queries. Running your own zebra (server = \"zebra\") is strongly \
+                 recommended for wallets tracking this many transparent addresses",
+                entry.transparent_initial_scan,
+                entry.transparent_gap_limit,
+            );
+        }
         let actor_cfg = ActorConfig {
             name: name.clone(),
             network: config.network,
@@ -140,6 +164,7 @@ pub async fn run(config: AppConfig) -> anyhow::Result<()> {
             transparent_allow_beyond_recovery_window: entry
                 .transparent_allow_beyond_recovery_window,
             transparent_gap_warn_threshold: entry.transparent_gap_warn_threshold,
+            transparent_offline_sweep: entry.transparent_offline_sweep,
             shutdown: shutdown_tx.subscribe(),
         };
         match actor::spawn(actor_cfg).await {

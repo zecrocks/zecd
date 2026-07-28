@@ -246,7 +246,7 @@ need a rollback path (stop the daemon before copying).
       human-operated wallets, `zecd init --encrypt` so spending requires a verified
       `walletpassphrase` with an enforced timeout.
 - [ ] Mnemonic + birthday recorded offline; restore procedure tested on testnet.
-- [ ] Local zebra full node configured (`server = "zebra"` or `zebra://host:port`);
+- [ ] Local zebra full node configured (`server = "zebra://host:port"`);
       Docker images pinned to verified releases.
 - [ ] `/readyz` wired into your orchestrator with a `startupProbe` covering initial
       sync; alerts on `upstream_down`.

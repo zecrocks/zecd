@@ -89,6 +89,14 @@ on:
 # recognise. (The harness also scrubs ZEBRA_* before spawning zebrad, as a second line of defence.)
 env:
   ZEBRAD_IMAGE_PINNED: "6.2.2"
+  # The released lightwalletd image (the funder's backend on the zebra legs, and the
+  # LEGACY server for the light-mode sweep leg - it predates the versioned lightwallet
+  # protocol, exercising zecd's address-index fallback paths).
+  LIGHTWALLETD_IMAGE_PINNED: "electriccoinco/lightwalletd:v0.4.19"
+  # zcash/lightwalletd master, built from source for the light-mode (zecd-lwd) legs: it
+  # carries the early versioned-protocol + Ironwood support ahead of the next release.
+  # Bump to the release tag once it ships.
+  LIGHTWALLETD_MASTER_SHA: "ed911e238c3c9776e2b48c5f8cc6edfd5c925c13"
 
 concurrency:
   group: regtest-${{ github.event_name }}-${{ github.ref }}
@@ -107,11 +115,19 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        suite: [zecd]
+        suite: [zecd, zecd-lwd]
         image: ${{ github.event_name == 'schedule' && fromJSON('["pinned", "latest"]') || fromJSON('["event"]') }}
         include:
           - suite: zecd
             tests: --test regtest_e2e --test regtest_funded --test regtest_proving_cache --test regtest_sapling --test regtest_transparent --test regtest_transparent_t2t --test regtest_transparent_sendmany_t2t --test regtest_transparent_gap --test regtest_transparent_preexpose_responsive --test regtest_transparent_recovery_window --test regtest_hang --test regtest_reorg --test regtest_multiwallet --test regtest_restore --test regtest_watchonly
+          # Light mode: the same funded/conformance flow plus the transparent suites (incl. the
+          # regtest_transparent_gap regression trap) rerun with zecd on a lightwalletd upstream
+          # (ZECD_REGTEST_BACKEND=lwd), and the dedicated regtest_lwd e2e (equivalence vs a
+          # zebra-backed twin, outage/reconnect, the offline-window sweep on both server
+          # generations). A parallel leg, so PR wall-time is unchanged.
+          - suite: zecd-lwd
+            backend: lwd
+            tests: --test regtest_lwd --test regtest_funded --test regtest_transparent --test regtest_transparent_t2t --test regtest_transparent_sendmany_t2t --test regtest_transparent_gap
     name: regtest (${{ matrix.suite }}, ${{ matrix.image }})
     steps:
       - uses: actions/checkout@v4
@@ -198,9 +214,37 @@ jobs:
             echo "$name -> $out"; file -b "$out" || true
           }
           extract "zfnd/zebra:$ZEBRAD_IMAGE_TAG" zebrad
-          extract electriccoinco/lightwalletd:v0.4.19 lightwalletd
+          extract "$LIGHTWALLETD_IMAGE_PINNED" lightwalletd
           echo "ZEBRAD_BIN=$RUNNER_TEMP/bin/zebrad" >> "$GITHUB_ENV"
           echo "LIGHTWALLETD_BIN=$RUNNER_TEMP/bin/lightwalletd" >> "$GITHUB_ENV"
+
+      # Light-mode leg only: build lightwalletd from zcash/lightwalletd master (early
+      # versioned-protocol + Ironwood support; swap LIGHTWALLETD_MASTER_SHA for the release tag
+      # once it ships). The master build becomes the primary LIGHTWALLETD_BIN for this leg -
+      # funder and zecd alike - while the released image stays available as the LEGACY server
+      # for regtest_lwd's pre-versioned-protocol sweep leg.
+      - name: Cache the master-built lightwalletd
+        if: matrix.backend == 'lwd'
+        id: lwd-master-bin
+        uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}/bin/lightwalletd-master
+          key: lwd-master-bin-${{ runner.os }}-${{ env.LIGHTWALLETD_MASTER_SHA }}
+
+      - name: Build lightwalletd from master
+        if: matrix.backend == 'lwd' && steps.lwd-master-bin.outputs.cache-hit != 'true'
+        run: |
+          set -euo pipefail
+          git clone https://github.com/zcash/lightwalletd.git "$RUNNER_TEMP/lightwalletd-src"
+          git -C "$RUNNER_TEMP/lightwalletd-src" checkout "$LIGHTWALLETD_MASTER_SHA"
+          (cd "$RUNNER_TEMP/lightwalletd-src" && go build -o "$RUNNER_TEMP/bin/lightwalletd-master" .)
+          file -b "$RUNNER_TEMP/bin/lightwalletd-master" || true
+
+      - name: Select the light-mode binaries
+        if: matrix.backend == 'lwd'
+        run: |
+          echo "LIGHTWALLETD_BIN=$RUNNER_TEMP/bin/lightwalletd-master" >> "$GITHUB_ENV"
+          echo "LIGHTWALLETD_LEGACY_BIN=$RUNNER_TEMP/bin/lightwalletd" >> "$GITHUB_ENV"
 
       # The funded test also runs scripts/conformance.py (python3, stdlib-only) against the
       # live daemon, so the full Bitcoin-Core wire-format suite is exercised here in CI.
@@ -227,7 +271,11 @@ jobs:
           # the weekly cron. Its note target is `stress-note-count` on dispatch (blank -> default 256).
           ZECD_REGTEST_STRESS: ${{ (github.event.schedule == '33 7 1 * *' || (github.event_name == 'workflow_dispatch' && inputs.stress)) && '1' || '' }}
           ZECD_STRESS_NOTE_COUNT: ${{ inputs.stress-note-count }}
-          # ZEBRAD_BIN / LIGHTWALLETD_BIN are exported by the provisioning step above.
+          # Light mode: the zecd-lwd leg reruns the opted-in suites with zecd on a dedicated
+          # lightwalletd upstream instead of zebrad's JSON-RPC (empty = zebra, the default).
+          ZECD_REGTEST_BACKEND: ${{ matrix.backend || '' }}
+          # ZEBRAD_BIN / LIGHTWALLETD_BIN (and LIGHTWALLETD_LEGACY_BIN on the lwd leg) are
+          # exported by the provisioning steps above.
         # --locked: build against the committed lock. Single-threaded: two zebrad+lightwalletd
         # stacks plus Orchard proving would contend badly on a 2-core runner.
         # --no-fail-fast: run every test binary even if an earlier one fails, so a single flaky
@@ -338,6 +386,21 @@ jobs:
           ZECD_STDERR: "1"
           RUST_LOG: "zecd=info"
           # ZEBRAD_BIN / LIGHTWALLETD_BIN / DEVTOOL_BIN are exported by the provisioning step.
+        run: cargo test --locked --manifest-path regtest-harness/Cargo.toml --test regtest_ironwood --no-fail-fast -- --nocapture --test-threads=1
+
+      # The same NU6.3 receive e2e, but with zecd in LIGHT MODE on the V6-aware lightwalletd
+      # (ZECD_REGTEST_BACKEND=lwd) - CI proof that ironwood receives flow through a
+      # lightwalletd upstream (compact blocks with ironwood actions + ironwood tree state over
+      # gRPC), not just zebra's JSON-RPC.
+      - name: Run ironwood (NU6.3) receive e2e - light mode
+        env:
+          ZECD_BIN: ${{ github.workspace }}/target/release/zecd
+          ZECD_REGTEST_IRONWOOD: "1"
+          ZECD_REGTEST_BACKEND: "lwd"
+          ZECD_REGTEST_NU63_HEIGHT: "8"
+          ZEBRAD_STDERR: ${{ runner.temp }}/zebrad.log
+          ZECD_STDERR: "1"
+          RUST_LOG: "zecd=info"
         run: cargo test --locked --manifest-path regtest-harness/Cargo.toml --test regtest_ironwood --no-fail-fast -- --nocapture --test-threads=1
 
       - name: Dump diagnostics on failure

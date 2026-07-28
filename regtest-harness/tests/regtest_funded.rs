@@ -39,7 +39,7 @@ use std::time::{Duration, Instant};
 
 use serde_json::json;
 use zecd_regtest_harness::{
-    pick_port, resolve_bin, Funder, Lightwalletd, Zebrad, Zecd, ZecdConfig,
+    attach_backend, pick_port, resolve_bin, Funder, Lightwalletd, Zebrad, Zecd, ZecdConfig,
 };
 
 /// Coinbase blocks mined to the funder up front. zebra finalizes blocks deeper than
@@ -137,9 +137,14 @@ async fn regtest_funded_orchard_receive() {
     // run. The inline PCZT path stays covered by regtest_proving_cache, the fused path by
     // regtest_sapling, so all three send paths are exercised across the funded tier.
     cfg.pipeline_proving = Some(true);
+    // `ZECD_REGTEST_BACKEND=lwd` reruns this whole suite with zecd on a dedicated lightwalletd
+    // (light mode) instead of zebra's JSON-RPC; the funder keeps its own lightwalletd above.
+    let zecd_lwd = attach_backend(&mut cfg, zebrad.rpc_port)
+        .await
+        .expect("attach zecd backend");
     let mut zecd = Zecd::start(&cfg)
         .await
-        .expect("start zecd against regtest zebra");
+        .expect("start zecd against the regtest upstream");
     let zecd_ua = zecd
         .call("getnewaddress", json!([]))
         .await
@@ -564,9 +569,14 @@ async fn regtest_funded_orchard_receive() {
         .await
         .expect("scan the change-maturity blocks");
 
-    // Hang the upstream (SIGSTOP zebra), then send: the wallet must commit and return the txid
-    // even though the broadcast can't reach anyone - recovery is the rebroadcast loop's job.
+    // Hang the upstream (SIGSTOP zebra - and, in light mode, zecd's lightwalletd too, so the
+    // hop zecd actually talks to is the hung one), then send: the wallet must commit and
+    // return the txid even though the broadcast can't reach anyone - recovery is the
+    // rebroadcast loop's job.
     zebrad.pause().expect("SIGSTOP zebra (outage)");
+    if let Some(lwd) = &zecd_lwd {
+        lwd.pause().expect("SIGSTOP zecd's lightwalletd (outage)");
+    }
     let txid_outage = zecd
         .call("sendtoaddress", json!([funder_ua, 0.1]))
         .await
@@ -638,6 +648,10 @@ async fn regtest_funded_orchard_receive() {
     // Upstream recovers: zecd reconnects (1-2s backoff), the rebroadcast pass (2s interval)
     // re-submits the tx, and mining confirms it.
     zebrad.resume().expect("SIGCONT zebra (recovery)");
+    if let Some(lwd) = &zecd_lwd {
+        lwd.resume()
+            .expect("SIGCONT zecd's lightwalletd (recovery)");
+    }
     mine_until_confirmed(&zebrad, &zecd, &txid_outage, "outage send after recovery").await;
 
     // /readyz returns to 200 once the wallet is reconnected and caught up again.
@@ -1309,6 +1323,9 @@ async fn regtest_funded_orchard_receive() {
     );
     watch_cfg.ufvk = Some(ufvk);
     watch_cfg.birthday = Some(2);
+    let _watch_lwd = attach_backend(&mut watch_cfg, zebrad.rpc_port)
+        .await
+        .expect("attach watch-only backend");
     let watch_only = Zecd::start(&watch_cfg)
         .await
         .expect("start the watch-only wallet");

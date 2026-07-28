@@ -5,6 +5,16 @@ All notable changes to zecd are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com), and this
 project adheres to [Semantic Versioning](https://semver.org).
 
+## [Unreleased]
+
+### Added
+- Light mode: zecd can run against a lightwalletd server instead of a local zebrad, so a full node is no longer required. `[backend] server` accepts `https://host[:port]`, `http://host:port`, and a bare `host:port` for lightwalletd, alongside `zebra://host:port` for a full node, with `[backend] tls` and `tls_roots` controlling TLS. Plaintext toward a non-local host is still refused unless `allow_remote_cleartext`.
+- Transparent discovery on a lightwalletd whose compact blocks carry no transparent data, so behavior matches the zebra backend: a UTXO refresh on each chain-tip advance, plus a startup sweep of each exposed address's history over the window zecd was down, which recovers an output both received and spent while it was offline. Opt out with `[pools] transparent_offline_sweep = false`. Both are inert on zebra and on a lightwalletd that does carry transparent data.
+- A startup warning when a large transparent address set is paired with a light backend, where per-address gRPC costs make sync slow, recommending a local zebra instead.
+
+### Changed
+- Breaking: `[backend] server` no longer accepts the bare `zebra` alias. Every value now names an explicit host and port, so what is configured is exactly what zecd dials. The default is unchanged in effect - `zebra://127.0.0.1:8234` on mainnet, `zebra://127.0.0.1:18234` on testnet and regtest - and a config still saying `server = "zebra"` fails at startup with a message naming the endpoint that replaces it.
+
 ## [0.5.0-rc4] - 2026-07-27
 
 ### Added

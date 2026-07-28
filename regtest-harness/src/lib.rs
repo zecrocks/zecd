@@ -461,6 +461,37 @@ impl Drop for Lightwalletd {
     }
 }
 
+/// Whether the zecd under test should use a lightwalletd upstream ("light mode") instead of
+/// zebrad - the `ZECD_REGTEST_BACKEND=lwd` convention, used by the CI lwd matrix leg to rerun
+/// the opted-in suites against the light backend.
+pub fn zecd_backend_is_lwd() -> bool {
+    std::env::var("ZECD_REGTEST_BACKEND")
+        .is_ok_and(|v| v.eq_ignore_ascii_case("lwd") || v.eq_ignore_ascii_case("lightwalletd"))
+}
+
+/// Point `cfg` at the backend selected by `ZECD_REGTEST_BACKEND`: in lwd mode, spawn a
+/// **dedicated** lightwalletd for the zecd under test (separate from the funder's instance, so
+/// fault-injection against zecd's upstream never stalls the funder) and wire its gRPC port
+/// into the config; in zebra mode (the default), leave the config pointing at zebrad. The
+/// returned supervisor must be kept alive for the daemon's lifetime; killing/pausing it is the
+/// light-mode analog of pausing zebrad.
+pub async fn attach_backend(
+    cfg: &mut ZecdConfig,
+    zebrad_rpc_port: u16,
+) -> Result<Option<Lightwalletd>> {
+    if !zecd_backend_is_lwd() {
+        return Ok(None);
+    }
+    let bin = resolve_bin("LIGHTWALLETD_BIN").ok_or_else(|| {
+        anyhow::anyhow!(
+            "ZECD_REGTEST_BACKEND=lwd needs $LIGHTWALLETD_BIN (the lightwalletd binary)"
+        )
+    })?;
+    let lwd = Lightwalletd::start(&bin, zebrad_rpc_port).await?;
+    cfg.lightwalletd_grpc_port = Some(lwd.grpc_port);
+    Ok(Some(lwd))
+}
+
 // =============================== funder (zcash-devtool) ===============================
 
 /// A valid 24-word BIP-39 test mnemonic (the canonical all-zero-entropy vector). Regtest only - it
@@ -809,11 +840,16 @@ pub struct Zecd {
     _datadir: tempfile::TempDir,
 }
 
-/// How `zecd` should reach the regtest chain (a local zebrad's JSON-RPC) and what RPC
-/// port/creds to expose.
+/// How `zecd` should reach the regtest chain (a local zebrad's JSON-RPC, or a lightwalletd in
+/// front of it) and what RPC port/creds to expose.
 pub struct ZecdConfig {
-    /// zebrad JSON-RPC port zecd connects to (`zebra://127.0.0.1:<port>`).
+    /// zebrad JSON-RPC port zecd connects to (`zebra://127.0.0.1:<port>`) when
+    /// `lightwalletd_grpc_port` is unset.
     pub zebra_rpc_port: u16,
+    /// When set, zecd connects to this local lightwalletd gRPC port instead of zebrad
+    /// (`server = "http://127.0.0.1:<port>"` - light mode over the harness's plaintext
+    /// lightwalletd). See [`attach_backend`] for the `ZECD_REGTEST_BACKEND` convention.
+    pub lightwalletd_grpc_port: Option<u16>,
     pub rpc_port: u16,
     pub rpc_user: String,
     pub rpc_password: String,
@@ -889,6 +925,7 @@ impl ZecdConfig {
     pub fn new(zebra_rpc_port: u16, rpc_port: u16) -> ZecdConfig {
         ZecdConfig {
             zebra_rpc_port,
+            lightwalletd_grpc_port: None,
             rpc_port,
             rpc_user: "user".to_string(),
             rpc_password: "pass".to_string(),
@@ -1596,8 +1633,12 @@ fn export_ufvk_from_datadir(datadir: &Path, wallet: &str) -> Result<String> {
 }
 
 fn write_zecd_toml(datadir: &Path, cfg: &ZecdConfig) -> Result<()> {
-    // zecd is zebra-only: the single upstream is a local zebrad JSON-RPC endpoint.
-    let server = format!("zebra://127.0.0.1:{}", cfg.zebra_rpc_port);
+    // The single upstream: a local zebrad JSON-RPC endpoint (full mode), or - when
+    // `lightwalletd_grpc_port` is set - a local plaintext lightwalletd (light mode).
+    let server = match cfg.lightwalletd_grpc_port {
+        Some(grpc_port) => format!("http://127.0.0.1:{grpc_port}"),
+        None => format!("zebra://127.0.0.1:{}", cfg.zebra_rpc_port),
+    };
     // Optional `[spend]` knobs: `cache_proving_key` (the proving-key-cache benchmark) and
     // `privacy_policy` (the fully-transparent spend e2e). Emit the section if either is set.
     let spend_section = if cfg.cache_proving_key.is_some()

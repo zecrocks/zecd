@@ -34,7 +34,7 @@ use std::time::{Duration, Instant};
 
 use serde_json::json;
 use zecd_regtest_harness::{
-    pick_port, resolve_bin, Funder, Lightwalletd, Zebrad, Zecd, ZecdConfig,
+    attach_backend, pick_port, resolve_bin, Funder, Lightwalletd, Zebrad, Zecd, ZecdConfig,
 };
 
 /// Coinbase blocks mined to the funder up front (see `regtest_funded.rs` for the finalization
@@ -110,7 +110,10 @@ async fn regtest_ironwood_receive_and_orchard_send() {
     funder.sync(lwd.grpc_port).expect("funder sync (shielded)");
 
     // 5. zecd (ironwood compiled unconditionally) against zebra; get its unified address.
-    let cfg = ZecdConfig::new(zebrad.rpc_port, pick_port().expect("pick zecd rpc port"));
+    let mut cfg = ZecdConfig::new(zebrad.rpc_port, pick_port().expect("pick zecd rpc port"));
+    let _zecd_lwd = attach_backend(&mut cfg, zebrad.rpc_port)
+        .await
+        .expect("attach zecd backend");
     let zecd = Zecd::start(&cfg)
         .await
         .expect("start zecd against ironwood regtest zebra");
@@ -472,6 +475,9 @@ async fn regtest_ironwood_sapling_send() {
         vec!["sapling".into(), "orchard".into()],
         vec!["sapling".into(), "orchard".into()],
     ));
+    let _zecd_lwd = attach_backend(&mut cfg, zebrad.rpc_port)
+        .await
+        .expect("attach zecd backend");
     let zecd = Zecd::start(&cfg)
         .await
         .expect("start zecd with sapling+orchard against ironwood zebra");
@@ -691,7 +697,10 @@ async fn regtest_ironwood_receive_memo() {
     funder.sync(lwd.grpc_port).expect("funder sync (shielded)");
 
     // 5-6. Start zecd (ironwood compiled unconditionally) and wait until it is caught up.
-    let cfg = ZecdConfig::new(zebrad.rpc_port, pick_port().expect("pick zecd rpc port"));
+    let mut cfg = ZecdConfig::new(zebrad.rpc_port, pick_port().expect("pick zecd rpc port"));
+    let _zecd_lwd = attach_backend(&mut cfg, zebrad.rpc_port)
+        .await
+        .expect("attach zecd backend");
     let zecd = Zecd::start(&cfg)
         .await
         .expect("start zecd against ironwood regtest zebra");

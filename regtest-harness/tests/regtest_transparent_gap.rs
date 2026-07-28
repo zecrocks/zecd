@@ -27,7 +27,7 @@ use std::time::{Duration, Instant};
 
 use serde_json::json;
 use zecd_regtest_harness::{
-    pick_port, resolve_bin, Funder, Lightwalletd, Zebrad, Zecd, ZecdConfig,
+    attach_backend, pick_port, resolve_bin, Funder, Lightwalletd, Zebrad, Zecd, ZecdConfig,
 };
 
 const FUNDER_COINBASES: u32 = 120;
@@ -94,6 +94,9 @@ async fn regtest_transparent_gap_limit_bounds_restore_recovery() {
     let zecd_rpc = pick_port().expect("pick zecd rpc port");
     let mut cfg = ZecdConfig::new(zebrad.rpc_port, zecd_rpc);
     cfg.transparent = true;
+    let _zecd_lwd = attach_backend(&mut cfg, zebrad.rpc_port)
+        .await
+        .expect("attach zecd backend");
     let zecd = Zecd::start(&cfg)
         .await
         .expect("start the authoring zecd with transparent receiving");
@@ -173,6 +176,9 @@ async fn regtest_transparent_gap_limit_bounds_restore_recovery() {
     miss_cfg.transparent_gap_limit = Some(SMALL_GAP);
     miss_cfg.restore_mnemonic = Some(mnemonic.clone());
     miss_cfg.birthday = Some(pre_fund_height);
+    let _miss_lwd = attach_backend(&mut miss_cfg, zebrad.rpc_port)
+        .await
+        .expect("attach miss-restore backend");
     let miss = Zecd::start(&miss_cfg)
         .await
         .expect("restore zecd with a too-small transparent gap limit");
@@ -198,6 +204,9 @@ async fn regtest_transparent_gap_limit_bounds_restore_recovery() {
     find_cfg.transparent_gap_limit = Some(LARGE_GAP);
     find_cfg.restore_mnemonic = Some(mnemonic.clone());
     find_cfg.birthday = Some(pre_fund_height);
+    let _find_lwd = attach_backend(&mut find_cfg, zebrad.rpc_port)
+        .await
+        .expect("attach find-restore backend");
     let find = Zecd::start(&find_cfg)
         .await
         .expect("restore zecd with a sufficient transparent gap limit");
@@ -228,6 +237,9 @@ async fn regtest_transparent_gap_limit_bounds_restore_recovery() {
     a18_cfg.transparent_initial_scan = Some(LARGE_GAP); // but pre-exposes past the funded index
     a18_cfg.restore_mnemonic = Some(mnemonic);
     a18_cfg.birthday = Some(pre_fund_height);
+    let _a18_lwd = attach_backend(&mut a18_cfg, zebrad.rpc_port)
+        .await
+        .expect("attach a18-restore backend");
     let a18 = Zecd::start(&a18_cfg)
         .await
         .expect("restore zecd with a small gap + large initial scan depth");

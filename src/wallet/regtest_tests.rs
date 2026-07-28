@@ -670,7 +670,9 @@ fn offline_actor_cfg(
         network: net,
         wallet_dir,
         keys_path,
-        server: backend::resolve("127.0.0.1:1", net).unwrap(),
+        // Explicitly a zebra endpoint: since light mode returned, a bare host:port resolves
+        // to lightwalletd. Port 1 never answers - these actors are offline by construction.
+        server: backend::resolve("zebra://127.0.0.1:1", net).unwrap(),
         sync_interval: Duration::from_secs(60),
         rebroadcast_interval: Duration::from_secs(60),
         connect_timeout: Duration::from_millis(150),
@@ -692,6 +694,7 @@ fn offline_actor_cfg(
         transparent_initial_scan: 0,
         transparent_allow_beyond_recovery_window: true,
         transparent_gap_warn_threshold: 5,
+        transparent_offline_sweep: true,
         shutdown,
     };
     (cfg, shutdown_tx)

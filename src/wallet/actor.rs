@@ -46,7 +46,7 @@ use zip321::TransactionRequest;
 
 use crate::backend::Server;
 use crate::backoff::Backoff;
-use crate::chain::{AnySource, BroadcastOutcome, ChainSource, MempoolStream};
+use crate::chain::{AnySource, BroadcastOutcome, ChainSource, MempoolStream, TxEvidence};
 use crate::config::SendPrivacy;
 use crate::error::{codes, RpcError};
 use crate::network::ZNetwork;
@@ -142,6 +142,16 @@ struct SendCompletion {
 const PREPARE_TIMEOUT: Duration = Duration::from_secs(60);
 /// Unary calls (broadcast, tip refresh, tx fetch) on the live channel.
 const UNARY_RPC_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Timeout for one legacy-light-backend transparent UTXO refresh (`get_address_utxos` over the
+/// full exposed set - internally chunked, so a large set means several upstream round-trips
+/// under this single budget).
+const TRANSPARENT_REFRESH_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// Addresses swept per caught-up pass by the light-backend offline-window sweep - one upstream
+/// round-trip each, so this bounds how long a sweep pass can hold the actor before queued
+/// commands are serviced again.
+const SWEEP_ADDRS_PER_PASS: usize = 16;
 /// Minimum spacing between retries after a sync error, so a persistent failure (e.g. an
 /// unrecoverable reorg) can't spin the actor loop at full speed reconnecting and re-failing.
 const SYNC_ERROR_RETRY_INTERVAL: Duration = Duration::from_secs(2);
@@ -165,7 +175,7 @@ const ENHANCE_BATCH: usize = 16;
 /// Whether a [`TransactionDataRequest`] is one zecd can actually service (and therefore one that
 /// counts toward the enhancement backlog). All three variants drain: `GetStatus`/`Enhancement` via
 /// `fetch_full_tx`, and `TransactionsInvolvingAddress` via the transparent address-index query
-/// (`fetch_transparent_txids` + `notify_address_checked`), which converges once the address is
+/// (`fetch_transparent_tx_evidence` + `notify_address_checked`), which converges once the address is
 /// recorded as checked, so it doesn't pin the backlog above zero.
 fn is_serviceable_request(req: &TransactionDataRequest) -> bool {
     matches!(
@@ -321,6 +331,10 @@ pub struct ActorConfig {
     /// Warn when fewer than this many in-window transparent address slots remain. Only used when
     /// `transparent_enabled`.
     pub transparent_gap_warn_threshold: u32,
+    /// On a light backend whose block scan can't cover transparent data, sweep each exposed
+    /// transparent address's history over the offline window once per startup (default on) -
+    /// see `[pools] transparent_offline_sweep`. Only used when `transparent_enabled`.
+    pub transparent_offline_sweep: bool,
     /// Flips to `true` on Ctrl-C/`stop`; the actor exits its loop (between sync batches)
     /// so the `WalletDb` is dropped cleanly before the process ends.
     pub shutdown: watch::Receiver<bool>,
@@ -380,6 +394,25 @@ struct WalletActor {
     /// heartbeat log and the `getwalletinfo`/`/status` surfaces. `None` until the first chunk;
     /// stays `Some` once started so an operator can poll the completed count too.
     transparent_preexpose: Option<PreexposeProgress>,
+    /// Whether the offline-window sweep is enabled (`[pools] transparent_offline_sweep`,
+    /// default on). Only consulted on a backend whose block scan can't cover transparent data.
+    transparent_offline_sweep: bool,
+    /// Lower bound of the light-backend offline-window sweep: the last height the block scan had
+    /// covered *before* this session's sync (the birthday on a fresh restore). Captured at spawn -
+    /// once the loop catches up, the scanned tip no longer records where the offline window began.
+    transparent_sweep_start: u32,
+    /// The sweep's pending address queue (a snapshot of the exposed set, encoded). `None` means
+    /// "(re)build on the next sweep pass" - after a drain, the rebuild diffs against
+    /// `transparent_swept` so addresses newly exposed by a swept-up receive (gap extension) are
+    /// swept too; an empty diff is convergence.
+    transparent_sweep_queue: Option<Vec<String>>,
+    /// Addresses already swept this run (bare encodings). Transient, like the sweep itself.
+    transparent_swept: HashSet<String>,
+    /// One-shot latch: the sweep finished (or was skipped) for this process run.
+    transparent_sweep_done: bool,
+    /// Chain tip at the last legacy-light-backend UTXO refresh, so the refresh runs at most once
+    /// per tip advance rather than on every caught-up pass.
+    last_utxo_refresh_height: Option<u32>,
     /// Transient first-seen times for unmined txs, shared with the read-path handle. Stamped when
     /// the mempool stream first stores an unmined tx; pruned once the tx mines. Never persisted
     /// (zecd is stateless). See [`crate::wallet::FirstSeen`].
@@ -561,6 +594,19 @@ pub async fn spawn(
     // Bitcoin Core's encrypted-wallet behavior). A watch-only wallet has no seed anywhere, so
     // the whole unlock machinery is moot for it.
     let birthday = u32::from(st.birthday);
+    // The offline-window sweep's lower bound (see `transparent_sweep_start`): captured before the
+    // sync loop runs, while the scanned tip still marks where this session's offline window began.
+    let transparent_sweep_start = match db_data.block_max_scanned() {
+        Ok(Some(meta)) => u32::from(meta.block_height()),
+        Ok(None) => birthday,
+        Err(e) => {
+            warn!(
+                "[{}] reading last-scanned height for the offline sweep: {e}; using the birthday",
+                cfg.name
+            );
+            birthday
+        }
+    };
     let mut seed = SeedKeeper::locked();
     if watch_only {
         info!(
@@ -702,6 +748,12 @@ pub async fn spawn(
         transparent_set_dirty: true,
         transparent_preexposed: false,
         transparent_preexpose: None,
+        transparent_offline_sweep: cfg.transparent_offline_sweep,
+        transparent_sweep_start,
+        transparent_sweep_queue: None,
+        transparent_swept: HashSet::new(),
+        transparent_sweep_done: false,
+        last_utxo_refresh_height: None,
         first_seen: first_seen.clone(),
         account_id,
         account_index,
@@ -1095,9 +1147,12 @@ impl WalletActor {
                             // pull the full data (memos, …) for transactions seen only as compact
                             // blocks, and (re)subscribe to incoming mempool txs for 0-conf visibility.
                             // (Transparent receives are discovered by the block scan itself - see
-                            // `sync_step` - and at 0-conf by the mempool path below; no separate
-                            // per-address `getaddressutxos` pass is needed.)
+                            // `sync_step` - and at 0-conf by the mempool path below. On a legacy
+                            // light backend whose block scan can't carry transparent data, the
+                            // refresh + offline-sweep steps below stand in for the block scan.)
                             self.maybe_rebroadcast().await;
+                            self.refresh_transparent_utxos().await;
+                            let more_sweep = self.transparent_sweep_step().await;
                             // Drain one bounded batch of the enhancement backlog. Keep `more_work`
                             // set while requests remain so the loop keeps draining (servicing queued
                             // commands and republishing the shrinking backlog between batches)
@@ -1108,7 +1163,7 @@ impl WalletActor {
                             // actor (and all wallet writes) down.
                             let more_enhance = self.enhance_step_caught().await;
                             self.ensure_mempool_stream().await;
-                            more_work = more_enhance;
+                            more_work = more_enhance || more_sweep;
                         }
                     }
                     Err(e) => {
@@ -1558,28 +1613,19 @@ impl WalletActor {
                 };
                 if start <= as_of {
                     tracing::debug!(
-                        "[{}] TIA: getaddresstxids addr={address} range={start}..={as_of}",
+                        "[{}] TIA: address-txid query addr={address} range={start}..={as_of}",
                         self.name
                     );
-                    let txids = self
-                        .fetch_transparent_txids(vec![address], start, as_of)
+                    let evidence = self
+                        .fetch_transparent_tx_evidence(vec![address], start, as_of)
                         .await
                         .map_err(|e| anyhow!("{e}"))?;
                     tracing::debug!(
-                        "[{}] TIA: getaddresstxids returned {} txid(s)",
+                        "[{}] TIA: address-txid query returned {} item(s)",
                         self.name,
-                        txids.len()
+                        evidence.len()
                     );
-                    for txid in txids {
-                        if let Some((tx, mined)) = self.fetch_full_tx(txid, chain_tip).await? {
-                            decrypt_and_store_transaction(
-                                &self.network,
-                                &mut self.db_data,
-                                &tx,
-                                mined,
-                            )?;
-                        }
-                    }
+                    self.store_tx_evidence(evidence, chain_tip).await?;
                 }
                 // Record the address as checked up to `as_of` (the inclusive end), whether or not
                 // any txs were found, so the request converges instead of being re-emitted every
@@ -1589,6 +1635,269 @@ impl WalletActor {
             }
         }
         Ok(())
+    }
+
+    /// Store every transaction named by a batch of [`TxEvidence`] (from a transparent
+    /// address-history query): parse-or-fetch, `decrypt_and_store_transaction`, and run the
+    /// transparent receive matcher. Shared by the TIA servicing arm and the offline-window sweep.
+    ///
+    /// The receive matcher runs belt-and-braces: librustzcash's `store_decrypted_tx` attributes
+    /// transparent outputs against the `addresses` table itself on this line, but
+    /// `record_tx_transparent_receives` is byte-for-byte the path the block scan and mempool use,
+    /// and `put_received_transparent_utxo` is idempotent - so recording here guarantees a swept
+    /// receive lands identically to one the block scan would have found.
+    async fn store_tx_evidence(
+        &mut self,
+        evidence: Vec<TxEvidence>,
+        chain_tip: BlockHeight,
+    ) -> anyhow::Result<()> {
+        for item in evidence {
+            let (tx, mined) = match item {
+                // zebra: txid only - fetch the full tx before storing.
+                TxEvidence::Txid(txid) => match self.fetch_full_tx(txid, chain_tip).await? {
+                    Some(found) => found,
+                    None => continue,
+                },
+                // lightwalletd: `GetTaddressTxids` already streamed the full raw tx - parse and
+                // store it directly, no re-fetch.
+                TxEvidence::Raw(raw) => {
+                    let mined = raw.mined_height.map(BlockHeight::from_u32);
+                    let tx = Transaction::read(
+                        &raw.data[..],
+                        BranchId::for_height(&self.network, mined.unwrap_or(chain_tip)),
+                    )?;
+                    (tx, mined)
+                }
+            };
+            decrypt_and_store_transaction(&self.network, &mut self.db_data, &tx, mined)?;
+            self.record_tx_transparent_receives(&tx, mined);
+        }
+        Ok(())
+    }
+
+    /// Legacy-light-backend transparent **receive** discovery: when the connected backend's block
+    /// scan can't carry transparent outputs ([`ChainSource::block_scan_covers_transparent`] is
+    /// `false` - a lightwalletd predating the versioned protocol), poll the upstream address index
+    /// (`GetAddressUtxos`) over every exposed transparent address once per chain-tip advance and
+    /// record any UTXO paying us. This is `zcash_client_backend::sync::refresh_utxos` transplanted
+    /// onto the actor; the zebra backend (and a versioned-protocol lightwalletd) discovers the
+    /// same receives from the block scan itself, so this is a no-op there.
+    ///
+    /// Best-effort: a failed query logs, drops the client (transport contract), and retries on
+    /// the next caught-up pass.
+    async fn refresh_transparent_utxos(&mut self) {
+        if !self.transparent_enabled {
+            return;
+        }
+        let Some(account_id) = self.account_id else {
+            return;
+        };
+        match self.client.as_ref() {
+            Some(client) if !client.block_scan_covers_transparent() => {}
+            _ => return,
+        }
+        let Some(tip) = self.tip_height else {
+            return;
+        };
+        if self.last_utxo_refresh_height == Some(tip) {
+            return;
+        }
+        if self.transparent_set_dirty {
+            self.rebuild_transparent_set(account_id);
+        }
+        let addresses: Vec<String> = {
+            use zcash_keys::encoding::AddressCodec as _;
+            let Some(set) = self.transparent_scripts.as_ref() else {
+                return;
+            };
+            set.iter().map(|a| a.encode(&self.network)).collect()
+        };
+        if addresses.is_empty() {
+            self.last_utxo_refresh_height = Some(tip);
+            return;
+        }
+        // Below this height everything is already known (librustzcash derives it from the
+        // gap-limit bookkeeping), so the query only covers what's new.
+        let start = match self.db_data.utxo_query_height(account_id) {
+            Ok(h) => u32::from(h),
+            Err(e) => {
+                warn!("[{}] utxo_query_height: {e}", self.name);
+                return;
+            }
+        };
+        let count = addresses.len();
+        let utxos = {
+            let Some(client) = self.client.as_mut() else {
+                return;
+            };
+            match tokio::time::timeout(
+                TRANSPARENT_REFRESH_TIMEOUT,
+                client.get_address_utxos(addresses, start),
+            )
+            .await
+            .map_err(|_| anyhow!("timed out after {TRANSPARENT_REFRESH_TIMEOUT:?}"))
+            .and_then(|r| r)
+            {
+                Ok(utxos) => utxos,
+                Err(e) => {
+                    self.mark_disconnected(format!("transparent UTXO refresh failed: {e}"));
+                    self.update_status();
+                    return;
+                }
+            }
+        };
+        let mut recorded = 0usize;
+        {
+            let Some(addresses) = self.transparent_scripts.as_ref() else {
+                return;
+            };
+            for u in utxos {
+                let Some(output) = engine::owned_transparent_output(
+                    addresses,
+                    u.txid,
+                    u.index,
+                    u.value_zat,
+                    u.script,
+                    u.height,
+                ) else {
+                    continue;
+                };
+                match self.db_data.put_received_transparent_utxo(&output) {
+                    Ok(_) => recorded += 1,
+                    Err(e) => warn!("[{}] recording refreshed transparent UTXO: {e}", self.name),
+                }
+            }
+        }
+        if recorded > 0 {
+            info!(
+                "[{}] transparent UTXO refresh: {recorded} UTXO(s) recorded across {count} address(es)",
+                self.name
+            );
+            // A recorded receive may have extended the gap (exposing new indices) - rebuild the
+            // set so the next refresh/scan pass covers them.
+            self.transparent_set_dirty = true;
+        }
+        self.last_utxo_refresh_height = Some(tip);
+    }
+
+    /// One bounded pass of the light-backend **offline-window sweep** (`[pools]
+    /// transparent_offline_sweep`, default on): query each exposed transparent address's history
+    /// (`GetTaddressTxids`) over `transparent_sweep_start..=tip` - the range the block scan
+    /// covered while zecd was offline - and store every transaction found. This is what recovers
+    /// a transparent output that was received *and spent* while zecd was down: the UTXO refresh
+    /// can't see it (no longer unspent) and the mempool stream never saw it, but a zebra-backed
+    /// wallet's block scan would have - so without this, history would differ across backends.
+    ///
+    /// Runs once per process start, chunked ([`SWEEP_ADDRS_PER_PASS`] addresses per caught-up
+    /// pass, one upstream round-trip each) so a large exposed set can't freeze the actor; queued
+    /// commands are serviced between passes. After the queue drains it re-diffs the exposed set
+    /// against what was swept - a swept-up receive can extend the gap and expose new addresses -
+    /// and converges when the diff is empty. Returns `true` while sweep work remains.
+    async fn transparent_sweep_step(&mut self) -> bool {
+        if !self.transparent_enabled || self.transparent_sweep_done {
+            return false;
+        }
+        let Some(account_id) = self.account_id else {
+            return false;
+        };
+        match self.client.as_ref() {
+            // A block scan that carries transparent data already covered the offline window.
+            Some(client) if client.block_scan_covers_transparent() => {
+                self.transparent_sweep_done = true;
+                return false;
+            }
+            Some(_) => {}
+            None => return false,
+        }
+        if !self.transparent_offline_sweep {
+            info!(
+                "[{}] transparent offline sweep disabled ([pools] transparent_offline_sweep = \
+                 false): transparent history received-and-spent while offline will be missing \
+                 on this light backend (balances are unaffected)",
+                self.name
+            );
+            self.transparent_sweep_done = true;
+            return false;
+        }
+        let Some(tip) = self.tip_height else {
+            return false;
+        };
+        let start = self.transparent_sweep_start.max(1);
+        if start > tip {
+            self.transparent_sweep_done = true;
+            return false;
+        }
+        // (Re)build the queue from the exposed set, minus what's already swept. An empty diff
+        // after a drain is convergence.
+        if self.transparent_sweep_queue.is_none() {
+            if self.transparent_set_dirty {
+                self.rebuild_transparent_set(account_id);
+            }
+            let pending: Vec<String> = {
+                use zcash_keys::encoding::AddressCodec as _;
+                let Some(set) = self.transparent_scripts.as_ref() else {
+                    self.transparent_sweep_done = true;
+                    return false;
+                };
+                set.iter()
+                    .map(|a| a.encode(&self.network))
+                    .filter(|a| !self.transparent_swept.contains(a))
+                    .collect()
+            };
+            if pending.is_empty() {
+                if !self.transparent_swept.is_empty() {
+                    info!(
+                        "[{}] transparent offline sweep complete: {} address(es) over blocks \
+                         {start}..={tip}",
+                        self.name,
+                        self.transparent_swept.len()
+                    );
+                }
+                self.transparent_sweep_done = true;
+                return false;
+            }
+            info!(
+                "[{}] transparent offline sweep: {} address(es) to check over blocks \
+                 {start}..={tip}",
+                self.name,
+                pending.len()
+            );
+            self.transparent_sweep_queue = Some(pending);
+        }
+        let mut queue = self.transparent_sweep_queue.take().unwrap_or_default();
+        let chunk_at = queue.len().saturating_sub(SWEEP_ADDRS_PER_PASS);
+        let chunk = queue.split_off(chunk_at);
+        for address in chunk {
+            match self
+                .fetch_transparent_tx_evidence(vec![address.clone()], start, tip)
+                .await
+            {
+                Ok(evidence) => {
+                    if let Err(e) = self
+                        .store_tx_evidence(evidence, BlockHeight::from_u32(tip))
+                        .await
+                    {
+                        warn!(
+                            "[{}] offline sweep: storing txs for {address}: {e}",
+                            self.name
+                        );
+                    }
+                    self.transparent_swept.insert(address);
+                }
+                Err(e) => {
+                    // Transport failure (the client is already dropped): requeue and retry the
+                    // address on a later pass, once reconnected.
+                    warn!("[{}] offline sweep: querying {address}: {e}", self.name);
+                    queue.push(address);
+                    self.transparent_sweep_queue = Some(queue);
+                    return true;
+                }
+            }
+        }
+        // A drained queue goes back to `None` so the next pass re-diffs the (possibly grown)
+        // exposed set - the convergence check above.
+        self.transparent_sweep_queue = (!queue.is_empty()).then_some(queue);
+        true
     }
 
     /// Match a transaction's transparent outputs against the wallet's exposed transparent address
@@ -3756,15 +4065,16 @@ impl WalletActor {
         }
     }
 
-    /// Query the upstream for all txids touching a transparent address in `[start, end]`
-    /// (`getaddresstxids`). A transport failure drops the client (so the next op reconnects) and
-    /// surfaces as `Err`; an unseen address simply yields an empty list.
-    async fn fetch_transparent_txids(
+    /// Query the upstream for evidence of every tx touching a transparent address in
+    /// `[start, end]` (zebra `getaddresstxids`; lightwalletd `GetTaddressTxids`). A transport
+    /// failure drops the client (so the next op reconnects) and surfaces as `Err`; an unseen
+    /// address simply yields an empty list.
+    async fn fetch_transparent_tx_evidence(
         &mut self,
         addresses: Vec<String>,
         start: u32,
         end: u32,
-    ) -> Result<Vec<TxId>, RpcError> {
+    ) -> Result<Vec<TxEvidence>, RpcError> {
         if self.client.is_none() {
             self.connect().await.map_err(|e| {
                 upstream_error(&self.name, e, "could not connect to the upstream node")
@@ -3777,10 +4087,10 @@ impl WalletActor {
                 .ok_or_else(|| RpcError::misc("not connected to upstream"))?;
             tokio::time::timeout(
                 UNARY_RPC_TIMEOUT,
-                client.transparent_txids(addresses, start, end),
+                client.transparent_tx_evidence(addresses, start, end),
             )
             .await
-            .map_err(|_| anyhow!("getaddresstxids timed out after {UNARY_RPC_TIMEOUT:?}"))
+            .map_err(|_| anyhow!("address-txid query timed out after {UNARY_RPC_TIMEOUT:?}"))
             .and_then(|r| r)
         };
         match result {

@@ -32,19 +32,46 @@ dir = "./data/default"
 # keys_file = "/secrets/keys.toml"
 
 [backend]
-# The chain upstream is a LOCAL zebrad's JSON-RPC. The default is "zebra": shorthand for
-# "zebra://127.0.0.1:8234" on mainnet / "zebra://127.0.0.1:18234" on testnet (zebrad ships
-# with RPC disabled, so set its `rpc.listen_addr` to that port; the zcashd-convention ports
-# 8232/18232 belong to zecd's own RPC). See [zebra] below for credentials. Use
-# "zebra://host:port" for a zebrad on another host/port.
-server = "zebra"
+# The chain upstream: a LOCAL zebrad's JSON-RPC ("full mode", the default and the
+# recommendation), or a lightwalletd gRPC server ("light mode" - no fully synced local
+# zebra needed). Every form names an explicit host:port - there are no shorthand aliases
+# for particular servers.
+#
+#   server = "zebra://host:port"   # a zebrad's JSON-RPC. Unset, this defaults to
+#                                  # "zebra://127.0.0.1:8234" on mainnet / ":18234" on
+#                                  # testnet+regtest (zebrad ships with RPC disabled, so set
+#                                  # its `rpc.listen_addr` to that port; the zcashd-convention
+#                                  # ports 8232/18232 belong to zecd's own RPC). See [zebra]
+#                                  # below for credentials.
+#   server = "https://host[:port]" # any lightwalletd, TLS (port defaults to 443). The public
+#                                  # zec.rocks fleet is "https://zec.rocks:443" (mainnet) /
+#                                  # "https://testnet.zec.rocks:443" (testnet).
+#   server = "http://host:port"    # a lightwalletd without TLS - allowed toward
+#                                  # loopback/private hosts; refused toward public ones unless
+#                                  # allow_remote_cleartext below.
+#   server = "host:port"           # a lightwalletd; TLS decided by locality (loopback/private
+#                                  # plaintext, public TLS), overridable with `tls` below.
+#
+# Light-mode notes: prefer running your own zebra when the wallet tracks many transparent
+# addresses (a light backend answers transparent-address queries per address - see
+# transparent_offline_sweep in [pools]); Ironwood (NU6.3) data requires a lightwalletd new
+# enough to serve the versioned lightwallet protocol.
+# (this file is network = "test" above, hence the testnet port)
+server = "zebra://127.0.0.1:18234"
 # Per-attempt dial timeout (seconds) so a hung/black-holed endpoint can't stall sync.
 connect_timeout_secs = 10
 # Reconnect backoff (seconds): start at base, double up to max, with full jitter.
 reconnect_base_secs = 1
 reconnect_max_secs = 60
+# lightwalletd TLS mode: "auto" (default - locality heuristic), "yes", or "no". An explicit
+# https:// or http:// scheme on `server` wins over this. zebra:// endpoints ignore it
+# (always plaintext HTTP, local-only by policy).
+# tls = "auto"
+# Which roots lightwalletd TLS trusts: "native" (OS store, honors SSL_CERT_FILE - default)
+# or "webpki" (embedded Mozilla bundle, for minimal containers).
+# tls_roots = "native"
 
-# Credentials for the "zebra" / "zebra://host:port" endpoints above. Omit the whole section
+# Credentials for a "zebra://host:port" endpoint above. Omit the whole section
 # when zebrad runs with `enable_cookie_auth = false`. A cookie file wins over user/password
 # and is re-read on every reconnect (zebrad regenerates it at startup).
 # [zebra]
@@ -220,6 +247,17 @@ default_receivers = ["orchard"]
 # in-window address slots remain, giving you lead time to widen the limits before addresses start
 # landing outside the recovery window.
 # transparent_gap_warn_threshold = 5
+#
+# transparent_offline_sweep (default true) - LIGHT MODE ONLY (a lightwalletd upstream whose compact
+# blocks omit transparent data; a no-op on zebra and on versioned-protocol lightwalletd). On each
+# startup, sweep every exposed transparent address's history (one GetTaddressTxids per address) over
+# the window zecd was offline - the only way to recover a transparent output that was received AND
+# spent while zecd was down (it is no longer unspent, so the UTXO refresh can't see it). Keeps
+# history identical to a zebra-backed wallet. Cost: one upstream query per exposed address per
+# startup - with a large transparent_initial_scan this is slow (zecd warns at startup; run your own
+# zebra instead). Setting it to false skips the sweep: balances stay correct, but
+# received-and-spent-while-offline transparent history may be missing.
+# transparent_offline_sweep = true
 
 [sync]
 # How often to poll zebra for new blocks (seconds).
