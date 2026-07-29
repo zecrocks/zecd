@@ -32,6 +32,7 @@ use prost::Message;
 use tokio::fs::File;
 use tokio::io::AsyncWriteExt;
 use tracing::{info, warn};
+use zcash_client_backend::data_api::wallet::decrypt_and_store_transaction;
 use zcash_client_backend::data_api::{
     chain::{
         error::Error as ChainError, scan_cached_blocks, BlockSource, ChainState, CommitmentTreeRoot,
@@ -98,6 +99,17 @@ pub async fn update_subtree_roots<C: ChainSource>(
     Ok(())
 }
 
+/// A block-scan-matched transparent receive: the attributable output plus, when it came from a
+/// block's coinbase transaction, that full transaction. The coinbase tx is stored alongside the
+/// receive (`decrypt_and_store_transaction`) so `zcash_client_sqlite` records
+/// `transactions.tx_index = 0` - without it the UTXO would be misclassified as non-coinbase
+/// (`IFNULL(tx_index, 1)`), escaping both the 100-block maturity clause and the
+/// `CoinbaseFilter::CoinbaseOnly` selection `z_shieldcoinbase` relies on.
+pub struct MatchedTransparentReceive {
+    pub output: WalletTransparentOutput<AccountUuid>,
+    pub coinbase_tx: Option<std::sync::Arc<zcash_primitives::transaction::Transaction>>,
+}
+
 /// Build a [`WalletTransparentOutput`] for `utxo` iff its recipient address is one of the
 /// wallet's exposed transparent addresses (`addresses`). Returns `None` for an output paying
 /// someone else, or one whose script isn't a recognized p2pkh/p2sh (librustzcash can't attribute
@@ -142,7 +154,7 @@ async fn download_blocks<C: ChainSource>(
     db_cache: &mut FsBlockDb,
     scan_range: &ScanRange,
     transparent: Option<&HashSet<TransparentAddress>>,
-) -> anyhow::Result<(Vec<BlockMeta>, Vec<WalletTransparentOutput<AccountUuid>>)> {
+) -> anyhow::Result<(Vec<BlockMeta>, Vec<MatchedTransparentReceive>)> {
     info!("[{name}] Fetching {scan_range}");
     let mut stream = client
         .compact_block_range(
@@ -184,7 +196,10 @@ async fn download_blocks<C: ChainSource>(
                     u.script,
                     u.height,
                 ) {
-                    received.push(output);
+                    received.push(MatchedTransparentReceive {
+                        output,
+                        coinbase_tx: u.coinbase_tx,
+                    });
                 }
             }
         }
@@ -513,14 +528,36 @@ pub async fn sync_one_batch<C: ChainSource>(
     // idempotent, so re-recording across overlapping passes is harmless.
     let mut transparent_recorded = 0;
     if !outcome.reorged {
-        for output in &received {
+        let mut coinbase_stored: HashSet<TxId> = HashSet::new();
+        for matched in &received {
+            let output = &matched.output;
             match db_data.put_received_transparent_utxo(output) {
                 Ok(_) => transparent_recorded += 1,
-                Err(e) => warn!(
-                    "[{name}] recording transparent receive {}:{} failed: {e}",
-                    output.outpoint().txid(),
-                    output.outpoint().n(),
-                ),
+                Err(e) => {
+                    warn!(
+                        "[{name}] recording transparent receive {}:{} failed: {e}",
+                        output.outpoint().txid(),
+                        output.outpoint().n(),
+                    );
+                    continue;
+                }
+            }
+            // A coinbase receive also stores its full transaction, so the wallet DB learns
+            // `tx_index = 0` (`put_tx_data` derives it from `Bundle::is_coinbase`). This is what
+            // makes librustzcash's 100-block coinbase-maturity clause and `CoinbaseFilter`
+            // partition apply to the UTXO - recorded bare, it would count as non-coinbase and be
+            // offered for spending while immature. Once per coinbase tx, not per output.
+            if let Some(tx) = &matched.coinbase_tx {
+                if coinbase_stored.insert(tx.txid()) {
+                    if let Err(e) =
+                        decrypt_and_store_transaction(params, db_data, tx, output.mined_height())
+                    {
+                        warn!(
+                            "[{name}] storing coinbase tx {} for a matched receive failed: {e}",
+                            tx.txid()
+                        );
+                    }
+                }
             }
         }
         if transparent_recorded > 0 {

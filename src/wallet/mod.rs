@@ -16,7 +16,11 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use tokio::sync::{mpsc, oneshot, watch};
+use zcash_address::ZcashAddress;
 use zcash_client_backend::data_api::wallet::ConfirmationsPolicy;
+use zcash_client_backend::fees::StandardFeeRule;
+use zcash_client_backend::proposal::Proposal;
+use zcash_protocol::memo::MemoBytes;
 use zcash_protocol::TxId;
 use zcash_transparent::address::TransparentAddress;
 use zip32::DiversifierIndex;
@@ -151,6 +155,34 @@ pub enum ReceiverRequest {
     Transparent,
 }
 
+/// The source-address selector for `z_shieldcoinbase` (zcashd's `fromaddress` argument).
+#[derive(Clone, Debug)]
+pub enum ShieldCoinbaseFrom {
+    /// zcashd's `"*"`: sweep coinbase UTXOs from every transparent receiver the wallet has
+    /// exposed. Safe for zecd (one account per wallet), unlike a cross-account wildcard.
+    AnyTaddr,
+    /// A single wallet-owned transparent address.
+    Address(TransparentAddress),
+}
+
+/// The synchronous half of `z_shieldcoinbase`: the built shielding proposal plus the pre-flight
+/// selection stats zcashd reports in the RPC's immediate response (`shieldingUTXOs`,
+/// `shieldingValue`, `remainingUTXOs`, `remainingValue` - the latter two being the mature
+/// coinbase UTXOs left *un*selected by the proposal's `limit`/block-space cap). The proposal is
+/// executed afterwards on a detached async operation, mirroring zcashd's flow: the selection is
+/// fixed at call time, the proving/broadcast happens under the returned opid.
+pub struct ShieldCoinbasePlan {
+    /// The shielding proposal (`propose_shielding_coinbase`: coinbase-only inputs, a single
+    /// shielded payment of `input_total - fee`, **no change in any pool**).
+    pub proposal: Proposal<StandardFeeRule, std::convert::Infallible>,
+    pub shielding_utxos: u64,
+    /// Zatoshis selected for shielding (input total, before the fee).
+    pub shielding_value: u64,
+    pub remaining_utxos: u64,
+    /// Zatoshis of mature coinbase UTXOs left unselected.
+    pub remaining_value: u64,
+}
+
 /// Commands sent from RPC handlers to the per-wallet actor (the sole DB writer).
 pub enum WalletCommand {
     GetNewAddress {
@@ -206,6 +238,25 @@ pub enum WalletCommand {
         address: TransparentAddress,
         message: String,
         reply: oneshot::Sender<Result<String, RpcError>>,
+    },
+    /// Build a `z_shieldcoinbase` proposal (coinbase-only inputs → one shielded payment, no
+    /// change) and return it with the pre-flight selection stats. Fast (SQL + fee math); the
+    /// synchronous half of the RPC. Requires an unlocked spending wallet, like a send.
+    ProposeShieldCoinbase {
+        from: ShieldCoinbaseFrom,
+        to_address: ZcashAddress,
+        memo: Option<MemoBytes>,
+        /// Cap on the number of coinbase UTXOs to select (highest-value first); `None` selects
+        /// as many as fit the block-space bound (zcashd's `limit = 0`).
+        limit: Option<usize>,
+        reply: oneshot::Sender<Result<ShieldCoinbasePlan, RpcError>>,
+    },
+    /// Prove, store, and broadcast a previously-built `z_shieldcoinbase` proposal (the async
+    /// half, run under the operation's opid). Serializes with every other send on the actor, so
+    /// the selected UTXOs can't be double-spent by a concurrent send.
+    ExecuteShieldCoinbase {
+        proposal: Box<Proposal<StandardFeeRule, std::convert::Infallible>>,
+        reply: oneshot::Sender<Result<TxId, RpcError>>,
     },
 }
 
@@ -348,6 +399,36 @@ impl WalletHandle {
             request,
             confirmations,
             privacy,
+            reply,
+        })
+        .await
+    }
+
+    /// Build a `z_shieldcoinbase` proposal + pre-flight stats (the RPC's synchronous half).
+    pub async fn propose_shield_coinbase(
+        &self,
+        from: ShieldCoinbaseFrom,
+        to_address: ZcashAddress,
+        memo: Option<MemoBytes>,
+        limit: Option<usize>,
+    ) -> Result<ShieldCoinbasePlan, RpcError> {
+        self.dispatch(|reply| WalletCommand::ProposeShieldCoinbase {
+            from,
+            to_address,
+            memo,
+            limit,
+            reply,
+        })
+        .await
+    }
+
+    /// Prove, store, and broadcast a `z_shieldcoinbase` proposal (the async half).
+    pub async fn execute_shield_coinbase(
+        &self,
+        proposal: Proposal<StandardFeeRule, std::convert::Infallible>,
+    ) -> Result<TxId, RpcError> {
+        self.dispatch(|reply| WalletCommand::ExecuteShieldCoinbase {
+            proposal: Box::new(proposal),
             reply,
         })
         .await

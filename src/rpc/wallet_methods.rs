@@ -1320,7 +1320,7 @@ fn unspent_json(
                 && filter.is_none_or(|f| n.address.as_ref().is_some_and(|a| f.contains(a)))
         })
         .map(|(conf, n)| {
-            json!({
+            let mut entry = json!({
                 "txid": n.txid,
                 "vout": n.vout,
                 "address": n.address.clone().unwrap_or_default(),
@@ -1332,7 +1332,14 @@ fn unspent_json(
                 // Shielded-pool label (zecd extension; Bitcoin Core notes are all transparent):
                 // "sapling" / "orchard" / "ironwood". Lets a shielded client tell the pool apart.
                 "pool": pool_name(n.pool),
-            })
+            });
+            // zcashd `listunspent`: transparent entries carry `generated` - true iff the output
+            // was produced by a coinbase transaction. Immature coinbase outputs never reach here
+            // (the read query excludes them, matching Core's `AvailableCoins`).
+            if n.pool == 0 {
+                entry["generated"] = json!(n.generated);
+            }
+            entry
         })
         .collect()
 }
@@ -1765,6 +1772,183 @@ pub(crate) fn z_sendmany(
     Ok(Value::String(opid))
 }
 
+/// zcashd's default `limit` for `z_shieldcoinbase` (`SHIELD_COINBASE_DEFAULT_LIMIT`): at most
+/// this many coinbase UTXOs are selected when the caller doesn't pass a limit.
+const SHIELD_COINBASE_DEFAULT_LIMIT: usize = 50;
+
+/// `z_shieldcoinbase "fromaddress" "tozaddress" ( fee ) ( limit ) ( memo ) ( privacyPolicy )` -
+/// sweep mature transparent **coinbase** UTXOs into a single shielded output (zcashd's RPC,
+/// zcashd's response shape). Consensus requires a transaction spending a transparent coinbase
+/// output to have no transparent outputs at all, so this - coinbase inputs → one shielded
+/// payment of `input_total - fee`, **no change** - is the only way zecd spends coinbase funds;
+/// the regular send paths exclude them from selection outright.
+///
+/// The UTXO selection (and the returned `shieldingUTXOs`/`remainingUTXOs` stats) is fixed
+/// synchronously, like zcashd; the proving/broadcast then runs under the returned `opid`
+/// (`z_getoperationstatus`/`z_getoperationresult`, result `{txid}`).
+pub(crate) async fn z_shieldcoinbase(
+    state: &AppState,
+    wallet: Option<&str>,
+    req: &RpcRequest,
+) -> Result<Value, RpcError> {
+    let handle = state.registry.get(wallet)?.clone();
+
+    // fromaddress (arg 0): a wallet-owned taddr, or "*" for all of the wallet's taddrs. (zcashd's
+    // wildcard spans its whole legacy keypool; zecd has one account per wallet, so the sweep
+    // cannot correlate unrelated accounts.)
+    let fromaddress = req.require_str(0, "z_shieldcoinbase requires a fromaddress")?;
+    let from = if fromaddress == "*" {
+        crate::wallet::ShieldCoinbaseFrom::AnyTaddr
+    } else {
+        match crate::address::decode_on_network(&handle.network, fromaddress) {
+            Some(zcash_keys::address::Address::Transparent(t)) => {
+                crate::wallet::ShieldCoinbaseFrom::Address(t)
+            }
+            _ => {
+                return Err(RpcError::invalid_address_or_key(
+                    "Invalid from address: should be a taddr or \"*\".",
+                ))
+            }
+        }
+    };
+
+    // toaddress (arg 1): must parse for this network and carry a shielded receiver - the whole
+    // point is that the destination is shielded (`propose_shielding_coinbase` re-enforces this).
+    // An unparseable toaddress is zcashd's -8 "unknown address format" (unlike fromaddress,
+    // which is -5), matching its z_shieldcoinbase exactly.
+    let toaddress = req.require_str(1, "z_shieldcoinbase requires a toaddress")?;
+    let to_addr =
+        crate::address::parse_recipient_on_network(&handle.network, toaddress).map_err(|_| {
+            RpcError::invalid_parameter(format!(
+                "Invalid parameter, unknown address format: {toaddress}"
+            ))
+        })?;
+    let receives_shielded = crate::address::decode_on_network(&handle.network, toaddress)
+        .is_some_and(|a| crate::address::has_shielded_receiver(&a));
+    if !receives_shielded {
+        return Err(RpcError::invalid_parameter(format!(
+            "Invalid parameter, toaddress must have a shielded receiver \
+             (coinbase funds must be shielded when spent): {toaddress}"
+        )));
+    }
+
+    // fee (arg 2): ZIP-317 only - an explicit fee is rejected, never silently applied (same as
+    // z_sendmany).
+    if req.param(2).is_some_and(param_engaged) {
+        return Err(RpcError::invalid_parameter(
+            "fee is not supported (fees are ZIP-317, computed by the wallet)",
+        ));
+    }
+
+    // limit (arg 3): max number of coinbase UTXOs to select, highest-value first. zcashd's
+    // default is 50; 0 means "as many as fit in the transaction" (the block-space cap).
+    let limit = match req.param(3) {
+        None | Some(Value::Null) => Some(SHIELD_COINBASE_DEFAULT_LIMIT),
+        Some(v) => {
+            let n = v.as_i64().ok_or_else(|| {
+                RpcError::invalid_parameter("Invalid parameter, limit must be an integer")
+            })?;
+            if n < 0 {
+                return Err(RpcError::invalid_parameter(
+                    "Limit on maximum number of utxos cannot be negative",
+                ));
+            }
+            if n == 0 {
+                None
+            } else {
+                Some(n as usize)
+            }
+        }
+    };
+
+    // memo (arg 4): optional hex-encoded memo for the shielded output (zcashd convention).
+    let memo = match req.param(4) {
+        None | Some(Value::Null) => None,
+        Some(Value::String(s)) if s.is_empty() => None,
+        Some(Value::String(s)) => {
+            let bytes = hex::decode(s).map_err(|_| {
+                RpcError::invalid_parameter(
+                    "Invalid parameter, expected memo data in hexadecimal format.",
+                )
+            })?;
+            Some(MemoBytes::from_bytes(&bytes).map_err(|_| {
+                RpcError::invalid_parameter(
+                    "Invalid parameter, memo is longer than the maximum allowed 512 bytes.",
+                )
+            })?)
+        }
+        Some(_) => return Err(RpcError::type_error("memo must be a hex string")),
+    };
+
+    // privacyPolicy (arg 5): accepted for zcashd compatibility. Shielding coinbase necessarily
+    // reveals the source addresses and amounts (the transparent inputs are public), so policies
+    // that forbid revealing senders are rejected up front; everything looser is a no-op here.
+    if let Some(v) = req.param(5) {
+        if !matches!(v, Value::Null) {
+            let name = v
+                .as_str()
+                .ok_or_else(|| RpcError::invalid_parameter("privacyPolicy must be a string"))?;
+            match name {
+                "AllowRevealedSenders"
+                | "AllowLinkingAccountAddresses"
+                | "AllowRevealedRecipients"
+                | "AllowFullyTransparent"
+                | "NoPrivacy" => {}
+                "FullPrivacy" | "AllowRevealedAmounts" | "LegacyCompat" => {
+                    return Err(RpcError::invalid_parameter(format!(
+                        "The specified privacy policy, {name}, does not permit shielding \
+                         coinbase funds (which reveals the source addresses). Use \
+                         \"AllowRevealedSenders\" or a weaker policy."
+                    )));
+                }
+                other => {
+                    return Err(RpcError::invalid_parameter(format!(
+                        "Unknown privacy policy: {other}"
+                    )));
+                }
+            }
+        }
+    }
+
+    // The synchronous half: build the proposal on the actor (fast - SQL + fee math; no
+    // proving). A locked wallet, an unknown source address, or "no coinbase funds" all fail
+    // here, synchronously, like zcashd.
+    let plan = handle
+        .propose_shield_coinbase(from, to_addr, memo, limit)
+        .await?;
+
+    let context = ContextInfo::new(
+        "z_shieldcoinbase",
+        json!({
+            "fromaddress": fromaddress,
+            "toaddress": toaddress,
+        }),
+    );
+
+    let shielding_value = plan.shielding_value;
+    let remaining_utxos = plan.remaining_utxos;
+    let remaining_value = plan.remaining_value;
+    let shielding_utxos = plan.shielding_utxos;
+
+    // The async half: prove + store + broadcast under an opid, funnelled through the actor
+    // like every send (so it serializes with them - no double-spend surface).
+    let exec_handle = handle.clone();
+    let opid = state
+        .operations
+        .try_insert(&handle.name, Some(context), async move {
+            let txid = exec_handle.execute_shield_coinbase(plan.proposal).await?;
+            Ok::<Value, RpcError>(json!({ "txid": txid.to_string() }))
+        })?;
+
+    Ok(json!({
+        "remainingUTXOs": remaining_utxos,
+        "remainingValue": zats_to_value(remaining_value),
+        "shieldingUTXOs": shielding_utxos,
+        "shieldingValue": zats_to_value(shielding_value),
+        "opid": opid,
+    }))
+}
+
 /// `z_getoperationstatus ([opid, ...])` - status objects for the wallet's async operations
 /// (all of them when no array is given). Non-destructive; well-formed-but-unknown ids are
 /// silently omitted, a malformed id is `-8`.
@@ -2180,6 +2364,7 @@ mod tests {
             trusted,
             address: address.map(str::to_string),
             pool: 3,
+            generated: false,
         }
     }
 
@@ -2224,6 +2409,7 @@ mod tests {
             trusted: true,
             address: None,
             pool,
+            generated: false,
         };
         let notes = vec![pooled(2), pooled(3), pooled(4)];
         let r = unspent_json(&notes, &st, 1, 9_999_999, None, true);

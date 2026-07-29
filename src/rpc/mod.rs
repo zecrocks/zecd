@@ -67,6 +67,7 @@ pub const ALL_METHODS: &[&str] = &[
     "walletlock",
     // Wallet - async operations (zcashd-style)
     "z_sendmany",
+    "z_shieldcoinbase",
     "z_getoperationstatus",
     "z_getoperationresult",
     "z_listoperationids",
@@ -138,6 +139,7 @@ const MAX_POSITIONAL_ARGS: &[(&str, usize)] = &[
     ("verifymessage", 3),
     // Wallet - async operations (zcashd-style)
     ("z_sendmany", 5),
+    ("z_shieldcoinbase", 6),
     ("z_getoperationstatus", 1),
     ("z_getoperationresult", 1),
     ("z_listoperationids", 1),
@@ -257,6 +259,7 @@ async fn dispatch_zecd(
 
         // Wallet - async operations (zcashd-style; the send itself runs on a background task)
         "z_sendmany" => wallet_methods::z_sendmany(state, wallet, req),
+        "z_shieldcoinbase" => wallet_methods::z_shieldcoinbase(state, wallet, req).await,
         "z_getoperationstatus" => wallet_methods::z_getoperationstatus(state, wallet, req),
         "z_getoperationresult" => wallet_methods::z_getoperationresult(state, wallet, req),
         "z_listoperationids" => wallet_methods::z_listoperationids(state, wallet, req),

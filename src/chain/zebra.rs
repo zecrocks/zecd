@@ -747,6 +747,12 @@ impl ChainSource for ZebraSource {
                 value_zat: e.satoshis,
                 script: hex::decode(&e.script).context("getaddressutxos script hex")?,
                 height: Some(e.height),
+                // `getaddressutxos` carries no coinbase marker (the same gap the upstream
+                // FIXME on `excluding_immature_coinbase_outputs` notes for lightwalletd's
+                // GetAddressUtxos); a consumer of this path would need the enhancement pass
+                // to backfill `tx_index`. The block-scan receive path - the one zecd actually
+                // records receives from - tags coinbase outputs itself.
+                coinbase_tx: None,
             });
         }
         Ok(out)
@@ -843,6 +849,13 @@ fn block_transparent_outputs(block: &Block, height: u32) -> Vec<crate::chain::Tr
             continue;
         };
         let txid = tx.txid();
+        // Tag each coinbase output with its full parsed transaction (shared via one `Arc` per
+        // block): the sync engine must store the tx itself for a matched coinbase receive, so
+        // `zcash_client_sqlite` records `tx_index = 0` - the signal its coinbase-maturity and
+        // `CoinbaseFilter` SQL keys on (see `TransparentUtxo::coinbase_tx`).
+        let coinbase_tx = bundle
+            .is_coinbase()
+            .then(|| std::sync::Arc::new(tx.clone()));
         for (index, txout) in bundle.vout.iter().enumerate() {
             out.push(crate::chain::TransparentUtxo {
                 txid,
@@ -850,6 +863,7 @@ fn block_transparent_outputs(block: &Block, height: u32) -> Vec<crate::chain::Tr
                 value_zat: u64::from(txout.value()),
                 script: txout.script_pubkey().0 .0.clone(),
                 height: Some(height),
+                coinbase_tx: coinbase_tx.clone(),
             });
         }
     }
@@ -1829,6 +1843,18 @@ mod tests {
                 &u.txid.as_ref()[..],
                 &internal(BLOCK_415000_COINBASE_TXID)[..]
             );
+            // Coinbase outputs carry their full parsed transaction, so the sync engine can store
+            // it and have `zcash_client_sqlite` record `tx_index = 0` - the datum every coinbase
+            // rule (100-block maturity, `CoinbaseFilter`) keys on for a matched receive.
+            let tx = u
+                .coinbase_tx
+                .as_ref()
+                .expect("a coinbase output is tagged with its transaction");
+            assert_eq!(&tx.txid().as_ref()[..], &u.txid.as_ref()[..]);
+            assert!(tx
+                .transparent_bundle()
+                .expect("coinbase has a transparent bundle")
+                .is_coinbase());
         }
 
         assert!(stream.next().await.unwrap().is_none(), "range exhausted");

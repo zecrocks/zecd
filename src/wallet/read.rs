@@ -53,11 +53,17 @@ pub fn balance(
     let db = open_read(network, wallet_dir)?;
     let mut info = BalanceInfo::default();
     if let Some(summary) = db.get_wallet_summary(policy)? {
+        let target_height = u32::from(summary.chain_tip_height()) + 1;
         for bal in summary.account_balances().values() {
             info.orchard_spendable += bal.orchard_balance().spendable_value().into_u64();
             info.sapling_spendable += bal.sapling_balance().spendable_value().into_u64();
-            // Transparent (unshielded) value: spendable via auto-shielding. Immature coinbase and
-            // unconfirmed UTXOs ride in the same pending/immature buckets as shielded value.
+            // Transparent (unshielded) value, spendable as an input (`z_shieldcoinbase` /
+            // fully-transparent send). NB the upstream buckets apply no coinbase-maturity rule
+            // (`add_transparent_account_balances` has no `tx_index` clause), so an immature
+            // coinbase UTXO lands in `spendable_value` here despite being unspendable for 100
+            // blocks; the reclassification below moves that value into the `immature` bucket,
+            // matching Bitcoin Core (`getbalance` excludes it, `getwalletinfo.immature_balance`
+            // carries it).
             info.transparent_spendable += bal.unshielded_balance().spendable_value().into_u64();
             info.pending += bal
                 .orchard_balance()
@@ -98,12 +104,55 @@ pub fn balance(
                 .change_pending_confirmation()
                 .into_u64();
         }
+        // Reclassify immature coinbase value out of the upstream buckets (see above) into
+        // `immature`, where Bitcoin Core reports coinbase value until it matures. Upstream
+        // (since 0.24.0-rc.4) already applies the maturity rule to the *spendable* bucket -
+        // immature coinbase rides in `value_pending_spendability` - so drain the
+        // immature-coinbase total from `pending` first and touch `transparent_spendable` only
+        // as a clamped fallback (it holds no immature coinbase on the current upstream; the
+        // fallback guards against the bucketing shifting again across RCs, which it already
+        // did once between rc.1 and rc.4).
+        let immature_coinbase = immature_coinbase_zats(wallet_dir, target_height)?;
+        let from_pending = immature_coinbase.min(info.pending);
+        let from_spendable = (immature_coinbase - from_pending).min(info.transparent_spendable);
+        info.pending -= from_pending;
+        info.transparent_spendable -= from_spendable;
+        info.immature += from_spendable + from_pending;
         info.total_spendable = info.orchard_spendable
             + info.sapling_spendable
             + info.transparent_spendable
             + info.ironwood_spendable;
     }
     Ok(info)
+}
+
+/// Unspent, mined, **immature** coinbase value (`tx_index == 0`, fewer than 100 confirmations
+/// at `target_height`). Mirrors the coinbase-maturity clause of `zcash_client_sqlite`'s
+/// `get_spendable_transparent_outputs` (which the balance queries lack) so `balance` can
+/// reclassify the immature value.
+fn immature_coinbase_zats(wallet_dir: &Path, target_height: u32) -> anyhow::Result<u64> {
+    let conn = open_conn(wallet_dir)?;
+    let unexpired_stx = tx_unexpired_sql("stx");
+    let sql = format!(
+        "SELECT IFNULL(SUM(txo.value_zat), 0)
+         FROM transparent_received_outputs txo
+         JOIN transactions t ON t.id_tx = txo.transaction_id
+         WHERE t.mined_height IS NOT NULL
+           AND IFNULL(t.tx_index, 1) == 0
+           AND :target_height - t.mined_height < 100
+           AND txo.id NOT IN (
+               SELECT s.transparent_received_output_id
+               FROM transparent_received_output_spends s
+               JOIN transactions stx ON stx.id_tx = s.transaction_id
+               WHERE {unexpired_stx}
+           )"
+    );
+    let total: i64 = conn.query_row(
+        &sql,
+        named_params! { ":target_height": target_height },
+        |r| r.get(0),
+    )?;
+    Ok(u64::try_from(total).unwrap_or(0))
 }
 
 /// Number of transactions in the wallet (for `getwalletinfo.txcount`).
@@ -212,6 +261,13 @@ pub struct UnspentNote {
     /// accessor from `orchard()`), so `list_unspent` must request `ShieldedPool::Ironwood` and read
     /// that accessor to surface it. Surfaced as `listunspent`'s `pool`.
     pub pool: i64,
+    /// Whether the output was produced by a coinbase transaction (`transactions.tx_index == 0`),
+    /// zcashd `listunspent`'s `generated` flag. Always `false` for shielded notes (a shielded
+    /// coinbase note spends like any other note, so nothing hinges on labeling it). Immature
+    /// coinbase UTXOs (< 100 confirmations) are excluded from the listing entirely, matching
+    /// Bitcoin Core/zcashd (`AvailableCoins` skips them); their value shows as `immature`
+    /// balance until they mature.
+    pub generated: bool,
 }
 
 fn open_conn(wallet_dir: &Path) -> anyhow::Result<Connection> {
@@ -803,6 +859,7 @@ pub fn list_unspent(network: ZNetwork, wallet_dir: &Path) -> anyhow::Result<Vec<
                 trusted,
                 address,
                 pool,
+                generated: false,
             });
         };
         for note in notes.sapling() {
@@ -938,6 +995,7 @@ pub fn list_unspent(network: ZNetwork, wallet_dir: &Path) -> anyhow::Result<Vec<
                     trusted,
                     address,
                     pool,
+                    generated: false,
                 });
             }
         }
@@ -951,11 +1009,21 @@ pub fn list_unspent(network: ZNetwork, wallet_dir: &Path) -> anyhow::Result<Vec<
         // against `seen`.
         let unexpired_t = tx_unexpired_sql("t");
         let unexpired_stx = tx_unexpired_sql("stx");
+        // Coinbase handling mirrors `zcash_client_sqlite`'s spendability SQL: an output is
+        // coinbase iff its tx's recorded block index is 0 (`IFNULL(tx_index, 1)` - unknown
+        // defaults to non-coinbase), and an *immature* coinbase output (< 100 confirmations at
+        // the target height) is excluded from the listing, matching Bitcoin Core/zcashd's
+        // `AvailableCoins`. Mature coinbase outputs are listed with `generated = true`.
         let sql = format!(
-            "SELECT t.txid, txo.output_index, txo.value_zat, txo.address
+            "SELECT t.txid, txo.output_index, txo.value_zat, txo.address,
+                    (IFNULL(t.tx_index, 1) == 0) AS generated
              FROM transparent_received_outputs txo
              JOIN transactions t ON t.id_tx = txo.transaction_id
              WHERE (t.mined_height IS NOT NULL OR ({unexpired_t}))
+               AND NOT (
+                   IFNULL(t.tx_index, 1) == 0
+                   AND :target_height - t.mined_height < 100
+               )
                AND txo.id NOT IN (
                    SELECT s.transparent_received_output_id
                    FROM transparent_received_output_spends s
@@ -970,10 +1038,11 @@ pub fn list_unspent(network: ZNetwork, wallet_dir: &Path) -> anyhow::Result<Vec<
                 r.get::<_, u32>(1)?,
                 r.get::<_, i64>(2)?,
                 r.get::<_, String>(3)?,
+                r.get::<_, bool>(4)?,
             ))
         })?;
         for row in rows {
-            let (txid, vout, value, address) = row?;
+            let (txid, vout, value, address, generated) = row?;
             let txid = txid_display(&txid);
             let (mined_height, trusted) = tx_meta.get(&txid).copied().unwrap_or((None, false));
             out.push(UnspentNote {
@@ -984,6 +1053,7 @@ pub fn list_unspent(network: ZNetwork, wallet_dir: &Path) -> anyhow::Result<Vec<
                 trusted,
                 address: Some(address),
                 pool: 0, // transparent
+                generated,
             });
         }
     }

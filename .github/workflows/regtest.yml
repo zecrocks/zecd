@@ -111,7 +111,7 @@ jobs:
         image: ${{ github.event_name == 'schedule' && fromJSON('["pinned", "latest"]') || fromJSON('["event"]') }}
         include:
           - suite: zecd
-            tests: --test regtest_e2e --test regtest_funded --test regtest_proving_cache --test regtest_sapling --test regtest_transparent --test regtest_transparent_t2t --test regtest_transparent_sendmany_t2t --test regtest_transparent_gap --test regtest_transparent_preexpose_responsive --test regtest_transparent_recovery_window --test regtest_hang --test regtest_reorg --test regtest_multiwallet --test regtest_restore --test regtest_watchonly
+            tests: --test regtest_e2e --test regtest_funded --test regtest_proving_cache --test regtest_sapling --test regtest_transparent --test regtest_transparent_t2t --test regtest_transparent_sendmany_t2t --test regtest_transparent_gap --test regtest_transparent_preexpose_responsive --test regtest_transparent_recovery_window --test regtest_coinbase --test regtest_hang --test regtest_reorg --test regtest_multiwallet --test regtest_restore --test regtest_watchonly
     name: regtest (${{ matrix.suite }}, ${{ matrix.image }})
     steps:
       - uses: actions/checkout@v4
@@ -227,6 +227,12 @@ jobs:
           # the weekly cron. Its note target is `stress-note-count` on dispatch (blank -> default 256).
           ZECD_REGTEST_STRESS: ${{ (github.event.schedule == '33 7 1 * *' || (github.event_name == 'workflow_dispatch' && inputs.stress)) && '1' || '' }}
           ZECD_STRESS_NOTE_COUNT: ${{ inputs.stress-note-count }}
+          # The shielded-coinbase e2e needs a zebrad whose block template builds valid shielded
+          # coinbase (zebra >= 6.0.0; 5.0.0's Orchard coinbase proof fails its own validation),
+          # and self-skips otherwise. The pinned image (6.2.2) and `latest` both have the
+          # capability, so a skip is a failure everywhere except a manual dispatch that names a
+          # custom (possibly older) image - guards against the test silently never running.
+          ZECD_REGTEST_REQUIRE_SHIELDED_COINBASE: ${{ (github.event_name != 'workflow_dispatch' || inputs.zebra-image == '') && '1' || '' }}
           # ZEBRAD_BIN / LIGHTWALLETD_BIN are exported by the provisioning step above.
         # --locked: build against the committed lock. Single-threaded: two zebrad+lightwalletd
         # stacks plus Orchard proving would contend badly on a 2-core runner.

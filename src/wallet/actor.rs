@@ -2457,6 +2457,22 @@ impl WalletActor {
                 let res = self.do_sign_message(address, &message);
                 let _ = reply.send(res);
             }
+            WalletCommand::ProposeShieldCoinbase {
+                from,
+                to_address,
+                memo,
+                limit,
+                reply,
+            } => {
+                let res = self
+                    .do_propose_shield_coinbase(from, to_address, memo, limit)
+                    .await;
+                let _ = reply.send(res);
+            }
+            WalletCommand::ExecuteShieldCoinbase { proposal, reply } => {
+                let res = self.do_execute_shield_coinbase(*proposal).await;
+                let _ = reply.send(res);
+            }
         }
         false
     }
@@ -3410,7 +3426,13 @@ impl WalletActor {
                     })?;
 
                 // Gather spendable transparent UTXOs across every exposed receiver (external +
-                // internal/change), filtered for confirmations/coinbase-maturity/dust by the policy.
+                // internal/change), filtered for confirmations by the policy. Coinbase UTXOs are
+                // excluded outright (`NonCoinbaseOnly`): consensus on mainnet/testnet requires a
+                // transaction spending a transparent coinbase output to have an empty `vout`
+                // (`bad-txns-coinbase-spend-has-transparent-outputs`), and this path always
+                // produces transparent outputs - recipient(s) plus kept-transparent change. The
+                // only legal route for coinbase funds is `z_shieldcoinbase` (coinbase →
+                // shielded, no change), after which they spend as ordinary shielded notes.
                 let receivers = db
                     .get_transparent_receivers(account_id, true, true)
                     .map_err(RpcError::database_internal)?;
@@ -3421,7 +3443,7 @@ impl WalletActor {
                             addr,
                             target_height,
                             policy,
-                            CoinbaseFilter::AllTransparentOutputs,
+                            CoinbaseFilter::NonCoinbaseOnly,
                             // zecd never locks inputs, so lock state can't exclude anything.
                             LockFilter::Unfiltered,
                         )
@@ -3626,6 +3648,207 @@ impl WalletActor {
 
         self.broadcast_committed(txid, raw).await?;
         self.update_status();
+        Ok(txid)
+    }
+
+    /// Build a `z_shieldcoinbase` proposal: mature (100+ conf) **coinbase** transparent UTXOs
+    /// from the requested source addresses, swept into one shielded payment of
+    /// `input_total - fee` with **no change in any pool** (a shielded change output would leak
+    /// the sender's total selected-coinbase value, since the transparent input values are
+    /// public). The coinbase-only restriction and the shielded-recipient requirement are both
+    /// enforced by `propose_shielding_coinbase` at the API boundary; the 100-block maturity
+    /// comes from `zcash_client_sqlite`'s selection SQL (keyed on `tx_index = 0`, which the
+    /// sync engine records for block-scanned coinbase receives).
+    ///
+    /// This is the fast synchronous half (SQL + fee math - no proving); the returned proposal
+    /// is executed later under the RPC's opid via `do_execute_shield_coinbase`. Between the two
+    /// another send could in principle spend a selected UTXO; execution then fails cleanly on
+    /// the operation (the same race zcashd's select-then-async-execute flow has).
+    async fn do_propose_shield_coinbase(
+        &mut self,
+        from: crate::wallet::ShieldCoinbaseFrom,
+        to_address: zcash_address::ZcashAddress,
+        memo: Option<zcash_protocol::memo::MemoBytes>,
+        limit: Option<usize>,
+    ) -> Result<crate::wallet::ShieldCoinbasePlan, RpcError> {
+        use zcash_client_backend::data_api::wallet::propose_shielding_coinbase;
+
+        // Fail a locked or watch-only wallet synchronously (zcashd errors before returning an
+        // opid); the derived key is dropped - execution re-derives its own.
+        self.relock_if_expired();
+        let account_index = self.account_index.ok_or_else(private_keys_disabled)?;
+        let _ = seed_guard(&self.seed).derive_usk(self.network, account_index)?;
+
+        // Same tip catch-up as a send: the proposal's target height (and thus the eventual tx's
+        // expiry) must come from the real chain tip, not a lagging scanned height.
+        self.sync_to_tip_for_send().await;
+
+        let account_id = self.require_account()?;
+        let net = self.network;
+        let db = &mut self.db_data;
+
+        let receivers = db
+            .get_transparent_receivers(account_id, true, true)
+            .map_err(RpcError::database_internal)?;
+        let from_addrs: Vec<TransparentAddress> = match from {
+            crate::wallet::ShieldCoinbaseFrom::AnyTaddr => receivers.keys().copied().collect(),
+            crate::wallet::ShieldCoinbaseFrom::Address(t) => {
+                if !receivers.contains_key(&t) {
+                    return Err(RpcError::invalid_address_or_key(
+                        "Invalid from address, no payment source found for address.",
+                    ));
+                }
+                vec![t]
+            }
+        };
+
+        let (target_height, _anchor) = db
+            .get_target_and_anchor_heights(std::num::NonZeroU32::MIN)
+            .map_err(RpcError::database_internal)?
+            .ok_or_else(|| {
+                RpcError::wallet("wallet has no chain tip yet; cannot build a transaction")
+            })?;
+
+        // Pre-flight: every *mature* coinbase UTXO the sources hold (the maturity clause rides
+        // in the SQL). `remainingUTXOs`/`remainingValue` are computed by subtracting the
+        // proposal's selection from this set, mirroring zallet/zcashd.
+        let mut eligible_count = 0u64;
+        let mut eligible_value = 0u64;
+        for addr in &from_addrs {
+            let outs = db
+                .get_spendable_transparent_outputs(
+                    addr,
+                    target_height,
+                    // Maturity (100 blocks) dominates any confirmations floor, so MIN is safe
+                    // here - matching `propose_shielding_coinbase`'s own internal choice.
+                    ConfirmationsPolicy::MIN,
+                    CoinbaseFilter::CoinbaseOnly,
+                    // zecd never locks inputs, so lock state can't exclude anything.
+                    LockFilter::Unfiltered,
+                )
+                .map_err(RpcError::database_internal)?;
+            for utxo in outs {
+                eligible_count += 1;
+                eligible_value += u64::from(utxo.txout().value());
+            }
+        }
+        if eligible_count == 0 {
+            return Err(RpcError::insufficient_funds(
+                "Could not find any coinbase funds to shield.",
+            ));
+        }
+
+        let proposal = propose_shielding_coinbase::<_, _, _, _, Infallible>(
+            db,
+            &net,
+            &GreedyInputSelector::new(),
+            &StandardFeeRule::Zip317,
+            Zatoshis::ZERO,
+            &from_addrs,
+            to_address,
+            memo,
+            limit,
+            // zecd does not lock inputs: the single-writer actor already serializes every
+            // send/shield, so a competing spend of the selected UTXOs can't be built
+            // concurrently (an operation racing a later send fails cleanly instead).
+            None,
+        )
+        .map_err(|e| {
+            use zcash_client_backend::data_api::error::Error as WalletError;
+            match &e {
+                WalletError::InsufficientFunds {
+                    available,
+                    required,
+                } => RpcError::insufficient_funds(format!(
+                    "Insufficient coinbase funds: {} zatoshis available, {} required \
+                     (including fee)",
+                    u64::from(*available),
+                    u64::from(*required),
+                )),
+                _ => {
+                    let s = e.to_string();
+                    if s.to_lowercase().contains("insufficient") {
+                        RpcError::insufficient_funds(s)
+                    } else {
+                        RpcError::wallet(s)
+                    }
+                }
+            }
+        })?;
+
+        let (shielding_utxos, shielding_value) = {
+            let inputs = proposal.steps().head.transparent_inputs();
+            (
+                inputs.len() as u64,
+                inputs
+                    .iter()
+                    .map(|i| u64::from(i.txout().value()))
+                    .sum::<u64>(),
+            )
+        };
+
+        Ok(crate::wallet::ShieldCoinbasePlan {
+            proposal,
+            shielding_utxos,
+            shielding_value,
+            remaining_utxos: eligible_count.saturating_sub(shielding_utxos),
+            remaining_value: eligible_value.saturating_sub(shielding_value),
+        })
+    }
+
+    /// Execute a `z_shieldcoinbase` proposal: prove, sign (transparent inputs + shielded
+    /// outputs), store (which locks the spent UTXOs against double-spend and keeps the raw bytes
+    /// for the rebroadcast loop), and broadcast. Runs on the actor under the operation's opid,
+    /// serialized with every other send. Uses the fused `create_proposed_transactions` path -
+    /// coinbase shielding is rare enough that the per-send proving-key rebuild is acceptable.
+    async fn do_execute_shield_coinbase(
+        &mut self,
+        proposal: Proposal<StandardFeeRule, Infallible>,
+    ) -> Result<TxId, RpcError> {
+        self.relock_if_expired();
+        let account_index = self.account_index.ok_or_else(private_keys_disabled)?;
+        let usk = seed_guard(&self.seed).derive_usk(self.network, account_index)?;
+
+        let net = self.network;
+        let prover: &LocalTxProver = &self.prover;
+        let db = &mut self.db_data;
+        let (txid, raw): (TxId, Vec<u8>) =
+            tokio::task::block_in_place(move || -> Result<_, RpcError> {
+                // The `Infallible` turbofish parameters pin the phantom input-selection and
+                // change-strategy error types (this proposal was built without either).
+                let txids = create_proposed_transactions::<_, _, Infallible, _, Infallible, _>(
+                    db,
+                    &net,
+                    prover,
+                    prover,
+                    &SpendingKeys::from_unified_spending_key(usk),
+                    OvkPolicy::Sender,
+                    &proposal,
+                    // `None` keeps the builder-derived expiry from the proposal's target
+                    // height, matching the fused send path.
+                    None,
+                )
+                .map_err(|e| {
+                    let s = e.to_string();
+                    if s.to_lowercase().contains("insufficient") {
+                        RpcError::insufficient_funds(s)
+                    } else {
+                        RpcError::wallet(s)
+                    }
+                })?;
+                if txids.len() > 1 {
+                    return Err(RpcError::wallet(
+                        "multi-transaction proposals are not supported",
+                    ));
+                }
+                let txid = *txids.first();
+                let raw = read_raw_tx(db, txid)?;
+                Ok((txid, raw))
+            })?;
+
+        self.broadcast_committed(txid, raw).await?;
+        self.update_status();
+        info!("[{}] z_shieldcoinbase broadcast {txid}", self.name);
         Ok(txid)
     }
 

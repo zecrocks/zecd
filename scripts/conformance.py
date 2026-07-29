@@ -751,6 +751,58 @@ def main() -> int:
         ck("z_sendmany non-integer minconf raises", False)
     except JSONRPCException as e:
         ck("z_sendmany non-integer minconf -> code -3", e.code == -3, e.code)
+    # z_shieldcoinbase (zcashd's coinbase-sweeping async op). All of these reject before any
+    # operation is spawned, so they move no money. The final well-formed call fails -6 ("Could
+    # not find any coinbase funds to shield.") on a wallet holding no mature coinbase - or -13
+    # if the wallet happens to be locked - never a success here.
+    try:
+        rpc.call("z_shieldcoinbase")
+        ck("z_shieldcoinbase no args raises", False)
+    except JSONRPCException as e:
+        ck("z_shieldcoinbase no args -> code -1", e.code == -1, e.code)
+    try:
+        # fromaddress must be a taddr or "*"; a shielded/invalid one is -5 (zcashd's
+        # RPC_INVALID_ADDRESS_OR_KEY).
+        rpc.call("z_shieldcoinbase", addr, addr)
+        ck("z_shieldcoinbase shielded fromaddress raises", False)
+    except JSONRPCException as e:
+        ck("z_shieldcoinbase shielded fromaddress -> code -5", e.code == -5, e.code)
+    try:
+        # toaddress that doesn't parse is zcashd's -8 "unknown address format".
+        rpc.call("z_shieldcoinbase", "*", "not-an-address")
+        ck("z_shieldcoinbase bad toaddress raises", False)
+    except JSONRPCException as e:
+        ck("z_shieldcoinbase bad toaddress -> code -8", e.code == -8, e.code)
+    try:
+        # An explicit fee is ZIP-317 -8, like every other send.
+        rpc.call("z_shieldcoinbase", "*", addr, 0.0001)
+        ck("z_shieldcoinbase fee raises", False)
+    except JSONRPCException as e:
+        ck("z_shieldcoinbase fee -> code -8", e.code == -8, e.code)
+    try:
+        # zcashd: "Limit on maximum number of utxos cannot be negative".
+        rpc.call("z_shieldcoinbase", "*", addr, None, -1)
+        ck("z_shieldcoinbase negative limit raises", False)
+    except JSONRPCException as e:
+        ck("z_shieldcoinbase negative limit -> code -8", e.code == -8, e.code)
+    try:
+        rpc.call("z_shieldcoinbase", "*", addr, None, None, None, "Bogus")
+        ck("z_shieldcoinbase unknown privacyPolicy raises", False)
+    except JSONRPCException as e:
+        ck("z_shieldcoinbase unknown privacyPolicy -> code -8", e.code == -8, e.code)
+    try:
+        # Shielding coinbase reveals the source addresses, so FullPrivacy is contradictory.
+        rpc.call("z_shieldcoinbase", "*", addr, None, None, None, "FullPrivacy")
+        ck("z_shieldcoinbase FullPrivacy raises", False)
+    except JSONRPCException as e:
+        ck("z_shieldcoinbase FullPrivacy -> code -8", e.code == -8, e.code)
+    try:
+        # Well-formed, but this wallet holds no mature coinbase: -6 (or -13 while locked).
+        rpc.call("z_shieldcoinbase", "*", addr)
+        ck("z_shieldcoinbase without coinbase raises", False)
+    except JSONRPCException as e:
+        ck("z_shieldcoinbase without coinbase -> code -6/-13",
+           e.code in (-6, -13), e.code)
     try:
         # A malformed opid is -8; a well-formed-but-unknown one is silently omitted (below).
         rpc.call("z_getoperationstatus", ["not-an-opid"])

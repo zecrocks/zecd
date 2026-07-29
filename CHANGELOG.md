@@ -5,6 +5,16 @@ All notable changes to zecd are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com), and this
 project adheres to [Semantic Versioning](https://semver.org).
 
+## [Unreleased]
+
+### Added
+- Coinbase spending: zecd can spend block rewards mined to its own addresses. Transparent coinbase is swept with `z_shieldcoinbase` into a single shielded output once it reaches the 100-block maturity, which is the only shape consensus permits - a transaction spending transparent coinbase may carry no transparent output at all, not even change. It takes zcashd's signature and returns zcashd's `{remainingUTXOs, remainingValue, shieldingUTXOs, shieldingValue, opid}` shape, and runs as an async operation. Shielded coinbase (ZIP-213) needs no special handling and spends as an ordinary note.
+- `listunspent` tags transparent entries with zcashd's `generated` flag and, like Bitcoin Core's `AvailableCoins`, excludes immature coinbase; that value is reported as `getwalletinfo.immature_balance` until it matures.
+
+### Fixed
+- A received coinbase output is now recorded as coinbase, so the maturity rule actually applies to it. It had been stored without the marker that identifies a coinbase transaction, letting such a UTXO count as spendable straight away.
+- Transparent-to-transparent sends exclude coinbase inputs from selection. That path always creates transparent outputs, so spending coinbase through it would have been rejected by consensus.
+
 ## [0.5.0] - 2026-07-28
 
 The 0.5.0 line, released as `0.5.0-rc1` through `0.5.0-rc4` and unchanged since `0.5.0-rc4`.

@@ -54,6 +54,15 @@ pub struct TransparentUtxo {
     pub script: Vec<u8>,
     /// The height at which the output was mined, or `None` for a mempool (0-conf) output.
     pub height: Option<u32>,
+    /// The full coinbase transaction this output belongs to, when it is a coinbase output
+    /// (`None` for all non-coinbase outputs). The block scan already holds the parsed block, so
+    /// this costs nothing extra; the sync engine stores it via `decrypt_and_store_transaction`
+    /// when the output pays the wallet, which is what records `transactions.tx_index = 0` - the
+    /// datum `zcash_client_sqlite` keys **every** coinbase rule on (the 100-block maturity clause
+    /// and the `CoinbaseFilter` partition in `get_spendable_transparent_outputs`). Recorded via
+    /// `put_received_transparent_utxo` alone, a coinbase UTXO would be silently misclassified as
+    /// non-coinbase (spendable while immature, invisible to `z_shieldcoinbase`).
+    pub coinbase_tx: Option<std::sync::Arc<zcash_primitives::transaction::Transaction>>,
 }
 
 /// Upstream identity, used by the wrong-chain guard. `chain_name` follows zcashd's
