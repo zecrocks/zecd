@@ -5,7 +5,7 @@ All notable changes to zecd are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com), and this
 project adheres to [Semantic Versioning](https://semver.org).
 
-## [Unreleased]
+## [0.5.1-rc1] - 2026-07-28
 
 ### Added
 - Coinbase spending: zecd can spend block rewards mined to its own addresses. Transparent coinbase is swept with `z_shieldcoinbase` into a single shielded output once it reaches the 100-block maturity, which is the only shape consensus permits - a transaction spending transparent coinbase may carry no transparent output at all, not even change. It takes zcashd's signature and returns zcashd's `{remainingUTXOs, remainingValue, shieldingUTXOs, shieldingValue, opid}` shape, and runs as an async operation. Shielded coinbase (ZIP-213) needs no special handling and spends as an ordinary note.
@@ -224,6 +224,7 @@ Zcash, backed entirely by librustzcash and running as a light client.
 ### Security
 - Pre-release audit hardening; refuse to start on mainnet with the placeholder RPC password; enforce a 12-character passphrase minimum.
 
+[0.5.1-rc1]: https://github.com/zecrocks/zecd/compare/v0.5.0...v0.5.1-rc1
 [0.5.0]: https://github.com/zecrocks/zecd/compare/v0.4.3...v0.5.0
 [0.5.0-rc4]: https://github.com/zecrocks/zecd/compare/v0.5.0-rc3...v0.5.0-rc4
 [0.5.0-rc3]: https://github.com/zecrocks/zecd/compare/v0.5.0-rc2...v0.5.0-rc3
