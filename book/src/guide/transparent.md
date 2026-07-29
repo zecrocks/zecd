@@ -106,6 +106,45 @@ twice: it is recovered on a from-seed restore via the internal gap chain, and th
 recognize the internal key scope as change and hide it, while a deliberate payment to one of
 your own *external* t-addresses stays visible as a send+receive pair, matching Bitcoin Core.
 
+## Coinbase: shielding is the only way to spend it
+
+Transparent coinbase (a block reward or fee paid to one of the wallet's t-addresses) is a
+special case, and the rule comes from consensus, not from zecd's policy: a transaction that
+spends a transparent coinbase output may not have **any** transparent output, change included.
+There is therefore no valid t-to-t coinbase spend to build, and the whole selected value must
+move into a single shielded output.
+
+[`z_shieldcoinbase`](../rpc/async-operations.md#z_shieldcoinbase) is the method that does it:
+it sweeps mature transparent coinbase UTXOs into one shielded output at `toaddress`, which
+must have a shielded receiver. It is asynchronous in zcashd's style, returning an opid that
+`z_getoperationstatus` / `z_getoperationresult` resolve. The shielded payment is exactly
+`input_total - fee`, with no change in any pool: emitting shielded change would leak how much
+coinbase the wallet chose to sweep. Use the `limit` argument (default 50) to sweep in stages.
+
+```sh
+curl -s --user "$RPCUSER:$RPCPASS" --data-binary \
+  '{"jsonrpc":"1.0","id":"doc","method":"z_shieldcoinbase","params":["*","u1..."]}' \
+  http://127.0.0.1:8232/
+# {"result":{"remainingUTXOs":0,"remainingValue":0.00000000,"shieldingUTXOs":3,
+#            "shieldingValue":9.37500000,"opid":"opid-..."},"error":null,"id":"doc"}
+```
+
+The surrounding behavior follows from the same rule:
+
+- **Maturity is the standard 100 blocks**, enforced during input selection. Immature coinbase
+  is excluded from [`listunspent`](../rpc/wallet-history.md#listunspent) entirely (Bitcoin
+  Core's `AvailableCoins` behavior), and its value is reported in
+  `getwalletinfo.immature_balance` rather than counted as spendable.
+- **`listunspent` marks it.** Transparent entries carry zcashd's `generated` boolean, `true`
+  when the output came from a coinbase transaction.
+- **The regular send paths skip it.** The transparent-to-transparent spend above always
+  produces transparent outputs, so it never selects a coinbase input; nothing you do with
+  `sendtoaddress`/`sendmany`/`z_sendmany` can build a consensus-invalid coinbase spend by
+  accident.
+- **Shielded coinbase (ZIP-213) needs none of this.** A block reward mined directly to a
+  shielded address has no maturity rule and no spend restriction, so those notes are ordinary
+  Orchard notes and spend through the normal send methods.
+
 ## The gap limit: transparent recovery is bounded
 
 zecd is [stateless](../design/statelessness.md): everything on disk must be rebuildable from the
@@ -174,9 +213,10 @@ already near or over the window, giving lead time to widen `transparent_gap_limi
 
 ## Not implemented
 
-- **Auto-shielding.** Received transparent UTXOs are not automatically shielded into Orchard, and
-  a transparent receive cannot fund a shielded send. Transparent funds can be spent
-  transparently (under `AllowFullyTransparent`) or left in place.
+- **Auto-shielding.** Ordinary (non-coinbase) transparent UTXOs are not automatically shielded
+  into Orchard, and such a receive cannot fund a shielded send. Those funds can be spent
+  transparently (under `AllowFullyTransparent`) or left in place. Coinbase is the exception,
+  and it is explicit rather than automatic: `z_shieldcoinbase` (above).
 - **Mixed inputs.** Transparent UTXOs and shielded notes cannot fund a single send together.
 - **Address-index reconciliation.** No periodic cross-check of exposed addresses against Zebra's
   transparent address index to backfill receives the forward-only scan missed.

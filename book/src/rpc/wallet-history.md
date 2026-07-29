@@ -384,6 +384,16 @@ enabled pools) plus, for transparent-enabled wallets, every unspent transparent 
 - `address` is the receiving diversified address when the wallet recorded one. Change and
   internal notes report `""`, which an `addresses` filter never matches, so a filtered call
   naturally excludes change.
+- **`generated`** rides on transparent entries, carrying zcashd's meaning: `true` when the
+  output came from a coinbase transaction, `false` otherwise. Shielded notes have no such
+  field. **Immature coinbase is not listed at all**: a coinbase UTXO with fewer than 100
+  confirmations is excluded from `listunspent` entirely, matching Bitcoin Core's
+  `AvailableCoins`, and its value is reported in
+  [`getwalletinfo.immature_balance`](wallet-addresses.md#getwalletinfo) until it matures. A
+  mature coinbase entry does appear, but consensus forbids spending it into any transparent
+  output, so the only way to spend it is
+  [`z_shieldcoinbase`](async-operations.md#z_shieldcoinbase); the ordinary send paths never
+  select it. See [Transparent support](../guide/transparent.md).
 - `safe` is `true` for confirmed outputs and for unconfirmed outputs whose creating
   transaction the wallet itself authored (its own change); a foreign output surfaced at
   0-conf by the mempool stream is `safe: false`. `include_unsafe: false` hides those.
@@ -406,10 +416,13 @@ enabled pools) plus, for transparent-enabled wallets, every unspent transparent 
 **vs Bitcoin Core:** same arguments and filtering; entries omit `label`, `scriptPubKey`,
 `redeemScript`, `desc`, and `parent_descs` (shielded notes have no script form).
 `query_options` is accepted but has no effect, where Core applies `minimumAmount` and
-friends. The synthesized note outpoints are the largest semantic difference; see
+friends. `generated` is an addition (Core carries it on `gettransaction`, not here), but the
+immature-coinbase exclusion follows Core's `AvailableCoins` exactly. The synthesized note
+outpoints are the largest semantic difference; see
 [Compatibility boundary](../compatibility.md).
 
 **vs zcashd:** zcashd splits this surface into `listunspent` (transparent) and
 `z_listunspent` (shielded, with `pool`/`outindex`/`memo`/`change` per note). zecd merges both
 into one Core-shaped list; for pool and memo detail use
-[`z_listtransactions`](#z_listtransactions).
+[`z_listtransactions`](#z_listtransactions). The `generated` flag on transparent entries is
+zcashd's, with zcashd's meaning.

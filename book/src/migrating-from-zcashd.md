@@ -37,7 +37,7 @@ and where it intentionally diverges) is in [Compatibility boundary](compatibilit
 | **Validator + wallet in one process**: zcashd validates the chain, indexes it, speaks P2P, and serves the wallet | **Wallet server over a separate full node**: zecd is wallet-only and talks JSON-RPC to a self-hosted [Zebra](design/zebra-backend.md) node (`zebra://host:port`, local-only plaintext). No P2P, no mining or chain-index RPC |
 | **Many address kinds**: transparent `t1…`, Sprout, Sapling `zs…`, plus ZIP-316 unified accounts (`z_getnewaccount` + `z_getaddressforaccount`) | **One account per wallet, diversified Unified Addresses**: every `getnewaddress` returns a fresh diversified UA of the wallet's single account (Orchard receiver by default). All addresses derive from the seed; see [Addresses & shielded pools](guide/addresses.md) |
 | **Sprout + Sapling + transparent pools** | **Orchard by default**; Sapling is opt-in via `[pools]`, transparent receive/spend is opt-in via `[pools] transparent` ([Transparent support](guide/transparent.md)). **No Sprout support at all**: move any Sprout funds with zcashd itself before decommissioning it |
-| **Fee arguments**: `z_sendmany`/`z_mergetoaddress`/`z_shieldcoinbase` accept an explicit `fee` (default `null` = ZIP-317); `settxfee` works | **ZIP-317 only, never client-settable**: the wallet computes the fee at build time. An explicit numeric `fee` on `z_sendmany` is rejected `-8` (`null` is fine); `settxfee` always returns `-8`; `subtractfeefromamount`/`fee_rate` on sends are `-8` |
+| **Fee arguments**: `z_sendmany`/`z_mergetoaddress`/`z_shieldcoinbase` accept an explicit `fee` (default `null` = ZIP-317); `settxfee` works | **ZIP-317 only, never client-settable**: the wallet computes the fee at build time. An explicit numeric `fee` on `z_sendmany`/`z_shieldcoinbase` is rejected `-8` (`null` is fine); `settxfee` always returns `-8`; `subtractfeefromamount`/`fee_rate` on sends are `-8` |
 | **Zcash's error numbering** (Zcash `rpc/protocol.h`), e.g. `-18` = `RPC_WALLET_BACKUP_REQUIRED` | **Bitcoin Core's numbering** (Core `rpc/protocol.h`), e.g. `-18` = `RPC_WALLET_NOT_FOUND` (unknown `/wallet/<name>`). This is the one numeric collision zecd actually emits, and only from multiwallet routing, which zcashd lacks; tooling that hard-codes Zcash's numbering should know. The money-path codes (`-4`/`-5`/`-6`/`-8`/`-13` through `-17`/`-20`/`-26`) are identical across zcashd, Core, and zecd. See [Conventions & wire format](rpc/index.md) |
 | **Per-key import/export**: `z_exportkey`, `z_importkey`, `dumpprivkey`, `importprivkey`, `z_exportwallet`, `backupwallet` | **Seed-only, no key import by design**: every address derives from the wallet mnemonic; the backup *is* the mnemonic (plus config). See [Stateless & recoverable](design/statelessness.md) |
 | **Stateful bookkeeping**: labels/"accounts", `sent_notes` UA echo | **Stateless**: no label store (label methods are `-32601`), outgoing history shows the single receiver actually paid, identically before and after a from-seed restore |
@@ -89,7 +89,7 @@ return method-not-found (`-32601`, HTTP 404).
 | `z_sendmany` | `z_sendmany` | Same syntax and async opid flow. Differences: `fromaddress` must be one of this wallet's own addresses (`ANY_TADDR` or a foreign address → `-5`); explicit numeric `fee` → `-8` (pass `null` or omit); `privacyPolicy` maps onto zecd's [four-rung ladder](design/privacy.md), and `LegacyCompat` (or omitted) uses the configured `[spend] privacy_policy` default rather than zcashd's UA-dependent rule; at most 16 unfinished operations per wallet, beyond which new calls are `-4` |
 | `sendtoaddress`, `sendmany` | `sendtoaddress`, `sendmany` | Synchronous bitcoind-style sends: build, prove, broadcast, return the txid. Extra trailing hex `memo` parameter on `sendtoaddress`. See [Sending](rpc/sending.md) |
 | `z_getoperationstatus` / `z_getoperationresult` / `z_listoperationids` | same | Same semantics, including destructive one-shot `z_getoperationresult`. Wallet-scoped and in-memory (lost on restart, as in zcashd) |
-| `z_shieldcoinbase` | not supported | No auto-shielding path yet: a transparent receive can only be spent transparently (opt-in) or left in place. See [Known limitations](limitations.md) |
+| `z_shieldcoinbase` | `z_shieldcoinbase` | Same signature, same response shape (`remainingUTXOs`/`remainingValue`/`shieldingUTXOs`/`shieldingValue`/`opid`), same opid flow. Difference: an explicit numeric `fee` is rejected `-8` (pass `null` or omit). Sweeps mature transparent coinbase into one shielded output, no change in any pool; `toaddress` must have a shielded receiver. See [Async operations](rpc/async-operations.md#z_shieldcoinbase) |
 | `z_mergetoaddress` | not supported | |
 | `z_setmigration` / `z_getmigrationstatus` | not supported | The Sapling-migration machinery has no zecd counterpart |
 | `z_converttex` | not supported | |
@@ -193,6 +193,7 @@ For code that drives zcashd today:
 8. **Confirmation assumptions**: zecd's default spend policy is ZIP-315 (3 trusted / 10
    untrusted) rather than a flat `minconf=10`; pass `minconf` explicitly where your logic
    depends on it.
-9. **Removed surface**: audit for calls to key import/export, wallet export, shielding
-   (`z_shieldcoinbase`/`z_mergetoaddress`), migration, and label RPCs; replace with the
-   alternatives in the [mapping table](#rpc-mapping) or remove.
+9. **Removed surface**: audit for calls to key import/export, wallet export, note merging
+   (`z_mergetoaddress`), migration, and label RPCs; replace with the alternatives in the
+   [mapping table](#rpc-mapping) or remove. `z_shieldcoinbase` carries over unchanged apart
+   from the fee argument.

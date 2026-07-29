@@ -223,7 +223,10 @@ and full transaction data), not just during the block scan.
 ```
 
 - `balance`/`unconfirmed_balance`/`immature_balance`: decimal ZEC, 8 places, under the
-  wallet's [confirmations policy](wallet-balances.md).
+  wallet's [confirmations policy](wallet-balances.md). `immature_balance` carries transparent
+  coinbase that has not yet reached the 100-block maturity. It is never counted as spendable
+  and never appears in [`listunspent`](wallet-history.md#listunspent); once mature the value
+  becomes shieldable with [`z_shieldcoinbase`](async-operations.md#z_shieldcoinbase).
 - `keypoolsize` is always `1` and `keypoolsize_hd_internal` always `0`: addresses are
   diversified on demand from the account key; there is no key pool.
 - `paytxfee` is always `0` (fees are ZIP-317, never client-settable).

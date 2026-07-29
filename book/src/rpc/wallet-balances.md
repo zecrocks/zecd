@@ -89,8 +89,10 @@ object.
 - `trusted`: spendable under the wallet's confirmations policy; equals `getbalance`.
 - `untrusted_pending`: received but not yet spendable under the policy; equals
   `getunconfirmedbalance`. Incoming 0-conf payments seen by the mempool stream land here.
-- `immature`: change awaiting confirmation (zecd has no mining, so this is not coinbase
-  maturity as in Core; unconfirmed change from your own sends reports here).
+- `immature`: change awaiting confirmation; unconfirmed change from your own sends reports
+  here. For transparent coinbase held below the 100-block maturity, see
+  [`getwalletinfo.immature_balance`](wallet-addresses.md#getwalletinfo) and
+  [Transparent support](../guide/transparent.md).
 - `lastprocessedblock` (Core 26+): the fully-scanned block the balances are anchored to, the
   same anchor as `getblockcount`. Omitted while the wallet has not yet scanned a block.
 
@@ -168,7 +170,7 @@ spendability.
 | -3 | Non-numeric `minconf` |
 
 **vs Bitcoin Core**: same signature, same `-4 Address not found in wallet` for a foreign
-address. `include_immature_coinbase` is ignored (zecd wallets hold no coinbase).
+address. `include_immature_coinbase` is accepted and ignored.
 
 **vs zcashd**: zcashd's `getreceivedbyaddress` covers transparent addresses only; shielded
 receipts are enumerated per-note by `z_listreceivedbyaddress` (a list, not a total). zcashd's

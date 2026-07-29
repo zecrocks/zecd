@@ -1,6 +1,6 @@
 # Method index: zecd vs bitcoind vs zcashd
 
-Every RPC method zecd dispatches (43 methods, the `ALL_METHODS` table in `src/rpc/mod.rs`),
+Every RPC method zecd dispatches (44 methods, the `ALL_METHODS` table in `src/rpc/mod.rs`),
 compared against Bitcoin Core master and zcashd. Each method name links to its full reference
 entry.
 
@@ -56,7 +56,7 @@ is covered in [Conventions & wire format](index.md).
 | [z_listtransactions](wallet-history.md#z_listtransactions) | n/a | n/a (no equivalent; `listtransactions` is transparent-only) | zcashd-style per-output history vocabulary (no `account` arg) |
 | [listsinceblock](wallet-history.md#listsinceblock) | ✓ | same name, differs (transparent history only) | Cursor pattern; `removed` always `[]`; a malformed cursor answers `-5`, a reorged-away cursor re-lists from the earliest scanned block |
 | [gettransaction](wallet-history.md#gettransaction) | ✓ | same name, differs (`z_viewtransaction` for shielded detail) | `amount`/`fee`/`confirmations`/`details`/`hex`; foreign tx hex fetched from Zebra on demand |
-| [listunspent](wallet-history.md#listunspent) | ✓ | same name, differs (transparent UTXOs; `z_listunspent` for notes) | One entry per unspent note; synthesized `txid`/`vout`; `address` empty for change |
+| [listunspent](wallet-history.md#listunspent) | ✓ | same name, differs (transparent UTXOs; `z_listunspent` for notes) | One entry per unspent note; synthesized `txid`/`vout`; `address` empty for change; transparent entries carry zcashd's `generated` flag and immature coinbase is omitted |
 | [getreceivedbyaddress](wallet-balances.md#getreceivedbyaddress) | ✓ | same name, differs (transparent; `z_listreceivedbyaddress` for shielded) | Totals over diversified receiving addresses; change never counted |
 | [listreceivedbyaddress](wallet-balances.md#listreceivedbyaddress) | ✓ | same name, differs (transparent) | `listreceivedbyaddress 0 true` enumerates every generated address; each entry's `label` is `""` |
 | [listwallets](wallet-addresses.md#listwallets) | ✓ | n/a (single wallet) | Names from `[wallets.<name>]` config |
@@ -68,6 +68,7 @@ is covered in [Conventions & wire format](index.md).
 | [walletlock](wallet-addresses.md#walletlock) | ✓ | ✓ | Zeroizes the seed immediately, even mid-proof; unencrypted wallet `-15` |
 | **Async operations** | | | |
 | [z_sendmany](async-operations.md#z_sendmany) | n/a | ✓ | Async: returns an opid, proves/broadcasts in the background; `fromaddress` must be the wallet's own (`ANY_TADDR` rejected `-5`); explicit `fee` answers `-8` |
+| [z_shieldcoinbase](async-operations.md#z_shieldcoinbase) | n/a | ✓ | Async: sweeps mature transparent coinbase into one shielded output, no change in any pool; `toaddress` must have a shielded receiver; explicit `fee` answers `-8`; nothing mature to shield answers `-6` |
 | [z_getoperationstatus](async-operations.md#z_getoperationstatus) | n/a | ✓ | Non-destructive status objects; wallet-scoped |
 | [z_getoperationresult](async-operations.md#z_getoperationresult) | n/a | ✓ | Finished operations only; destructive one-shot reap, matching zcashd |
 | [z_listoperationids](async-operations.md#z_listoperationids) | n/a | ✓ | The wallet's operation ids; optional status filter |

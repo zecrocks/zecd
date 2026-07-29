@@ -1,8 +1,8 @@
 # Sending
 
 Reference for the synchronous send methods `sendtoaddress` and `sendmany`. For the
-asynchronous zcashd-style send (`z_sendmany` and the operation-tracking trio), see
-[async operations](async-operations.md).
+asynchronous zcashd-style methods (`z_sendmany`, `z_shieldcoinbase`, and the
+operation-tracking trio), see [async operations](async-operations.md).
 
 ## Send semantics
 
@@ -45,6 +45,16 @@ funding":
 Insufficient funds: 0 zatoshis spendable, 10001000 required (including fee);
 awaiting confirmations: 0 zatoshis incoming, 49990000 zatoshis change
 ```
+
+**Coinbase inputs are never selected here.** Consensus forbids a transaction that spends a
+transparent coinbase output from having any transparent output, change included, so the
+transparent-to-transparent path (which always writes transparent outputs) skips coinbase
+UTXOs entirely; selecting one would build a consensus-invalid transaction. Mature transparent
+coinbase is spendable only by shielding it with
+[`z_shieldcoinbase`](async-operations.md#z_shieldcoinbase), which moves the whole selected
+value into a single shielded output. Coinbase below the 100-block maturity is not spendable
+at all: it is excluded from [`listunspent`](wallet-history.md#listunspent) and reported in
+[`getwalletinfo.immature_balance`](wallet-addresses.md#getwalletinfo).
 
 **Privacy policy is enforced per recipient.** Under the wallet's configured
 `[spend] privacy_policy` (default `AllowRevealedRecipients`), a recipient with no shielded

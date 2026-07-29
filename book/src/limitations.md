@@ -20,9 +20,13 @@ a transparent recipient with the change kept transparent, but only under the exp
 `AllowFullyTransparent` [privacy policy](design/privacy.md). Two directions are not
 implemented:
 
-- **No auto-shielding.** Received transparent UTXOs are not automatically shielded into
-  Orchard, so a transparent receive cannot feed a shielded send. librustzcash's
+- **No auto-shielding.** Ordinary (non-coinbase) transparent UTXOs are not automatically
+  shielded into Orchard, so such a receive cannot feed a shielded send. librustzcash's
   `propose_shielding` exists and wiring it into a caught-up sync pass is the planned path.
+  Coinbase already has an explicit
+  route, [`z_shieldcoinbase`](rpc/async-operations.md#z_shieldcoinbase), because consensus
+  leaves it no other one: a transaction spending transparent coinbase may not have any
+  transparent output, change included.
 - **No mixed inputs.** Transparent UTXOs and shielded notes cannot fund a single send
   together.
 

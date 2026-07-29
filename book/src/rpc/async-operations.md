@@ -1,16 +1,17 @@
 # Async operations
 
-Reference for `z_sendmany` and the operation-tracking trio `z_getoperationstatus` /
-`z_getoperationresult` / `z_listoperationids`. These four methods adopt
-zcashd's asynchronous send model: they match zcashd's syntax, status shapes, and
+Reference for `z_sendmany`, `z_shieldcoinbase`, and the operation-tracking trio
+`z_getoperationstatus` / `z_getoperationresult` / `z_listoperationids`. These five methods
+adopt zcashd's asynchronous send model: they match zcashd's syntax, status shapes, and
 state strings, so clients written for zcashd's `z_sendmany` work unchanged. For synchronous
 sends in Bitcoin Core's dialect, see [Sending](sending.md).
 
 ## The operation model
 
-`z_sendmany` validates its arguments, then returns an operation id (`opid-` followed by a
-UUID, identical to zcashd) immediately. The transaction is selected, proved, and
-broadcast on a background task; its outcome is fetched later through the tracking methods.
+`z_sendmany` and `z_shieldcoinbase` validate their arguments, then return an operation id
+(`opid-` followed by a UUID, identical to zcashd) immediately. The transaction is selected,
+proved, and broadcast on a background task; its outcome is fetched later through the tracking
+methods.
 The background task still funnels through the wallet's single-writer actor, so an async send
 cannot double-spend against a concurrent `sendtoaddress` (see
 [Architecture](../design/architecture.md)).
@@ -136,6 +137,96 @@ while True:
 rpc.z_getoperationresult([opid])   # reap it
 ```
 
+## z_shieldcoinbase
+
+```
+z_shieldcoinbase "fromaddress" "toaddress" ( fee ) ( limit ) ( "memo" ) ( privacyPolicy )
+```
+
+Sweep the wallet's mature transparent coinbase UTXOs into a single shielded output. Returns
+an opid immediately; the txid or error surfaces through the tracking methods, exactly as with
+`z_sendmany`.
+
+**Why this method exists at all.** Zcash consensus forbids a transaction that spends a
+transparent coinbase output from having *any* transparent output, change included. A coinbase
+spend therefore cannot pay a t-address and cannot keep transparent change: the whole selected
+value has to land in one shielded output. That is not a shape the ordinary send methods can
+produce, so shielding is the only way to spend transparent coinbase, and this is the method
+that does it. The regular transparent-to-transparent path never selects coinbase inputs for
+the same reason (see [Sending](sending.md)).
+
+**No change, in any pool.** The shielded payment is exactly `input_total - fee`. Emitting
+shielded change instead would leak how much coinbase the wallet chose to sweep, so the
+selected value is moved whole. Sweep in stages with `limit` if you do not want it all in one
+note.
+
+**Maturity.** Transparent coinbase must reach the standard 100-block maturity before it can
+be shielded; the bound is enforced during input selection. Immature coinbase is excluded from
+[`listunspent`](wallet-history.md#listunspent) and reported in
+[`getwalletinfo.immature_balance`](wallet-addresses.md#getwalletinfo) until it matures.
+
+Shielded coinbase (ZIP-213), a block reward mined directly to a shielded address, needs none
+of this: it has no maturity rule and no spend restriction, so those notes spend as ordinary
+Orchard notes through the normal send methods.
+
+**Parameters**
+
+| # | Name | Type | Default | Description |
+|---|------|------|---------|-------------|
+| 1 | fromaddress | string | required | A transparent address of this wallet, or `"*"` for all of them. |
+| 2 | toaddress | string | required | Where the swept value lands. Must have a shielded receiver; a transparent-only destination is `-8`, since a coinbase spend may not create a transparent output. |
+| 3 | fee | null | null | Must be omitted or `null`. Fees are always ZIP-317, computed by the wallet; any explicit value is `-8`. |
+| 4 | limit | number | 50 | Maximum UTXOs to shield in this transaction. `0` means no caller limit: shield as many as fit under the block-space cap. |
+| 5 | memo | string (hex) | omitted | Hex-encoded ZIP-302 memo carried on the shielded output. |
+| 6 | privacyPolicy | string | wallet policy | Same names as [`z_sendmany`](#z_sendmany). Shielding necessarily reveals the transparent senders being swept, so a policy that forbids revealing senders is `-8`. |
+
+**Result**
+
+```json
+{
+  "remainingUTXOs": 12,
+  "remainingValue": 3.75000000,
+  "shieldingUTXOs": 50,
+  "shieldingValue": 15.62500000,
+  "opid": "opid-9c2f0d61-1c2b-4f3e-9a3e-2d4b8c7a5e10"
+}
+```
+
+- `shieldingUTXOs` / `shieldingValue`: what this operation is sweeping.
+- `remainingUTXOs` / `remainingValue`: mature coinbase left over because `limit` or the
+  block-space cap cut the selection short. Non-zero means call again once this operation
+  finishes.
+- `opid`: feed it to `z_getoperationstatus` / `z_getoperationresult`.
+
+As with `z_sendmany`, only argument validation fails synchronously; proving and broadcast
+failures surface in the operation's `error` object.
+
+**Errors** (synchronous)
+
+| Code | When |
+|------|------|
+| -1 | `fromaddress` or `toaddress` missing |
+| -3 | An argument is the wrong JSON type |
+| -5 | An address is undecodable, or for the wrong network |
+| -6 | No mature coinbase to shield |
+| -8 | `toaddress` has no shielded receiver; explicit `fee`; a `privacyPolicy` that forbids revealing senders, or an unknown one |
+
+**vs Bitcoin Core**: no equivalent; Core has no shielded pool and no asynchronous RPC model.
+
+**vs zcashd**: same signature, same response shape, same opid model. The one difference is
+the fee: zcashd accepts an explicit `fee` amount, zecd rejects any explicit value with `-8`
+and always charges the ZIP-317 conventional fee. The wallet-scoping and eviction properties
+of the operation registry described above apply here as they do to `z_sendmany`.
+
+**Example**
+
+```sh
+curl -u u:p -d '{
+  "jsonrpc": "1.0", "id": 1, "method": "z_shieldcoinbase",
+  "params": ["*", "u1abc..."]
+}' http://127.0.0.1:8232/
+```
+
 ## z_getoperationstatus
 
 ```
@@ -193,10 +284,10 @@ Non-destructive: operations stay in memory.
 **vs Bitcoin Core**: no equivalent.
 
 **vs zcashd**: same shape and sort order. zcashd's view is node-wide and includes its other
-async operation types (`z_shieldcoinbase`, `z_mergetoaddress`, the Sapling migration); zecd
-only ever has `z_sendmany` operations, scoped to the routed wallet. zcashd silently ignores a
-malformed opid string; zecd rejects it with `-8`. zcashd reports
-`execution_secs` as a fractional number; zecd reports whole seconds.
+async operation types (`z_mergetoaddress`, the Sapling migration); zecd only ever has
+`z_sendmany` and `z_shieldcoinbase` operations, scoped to the routed wallet. zcashd silently
+ignores a malformed opid string; zecd rejects it with `-8`. zcashd reports `execution_secs` as
+a fractional number; zecd reports whole seconds.
 
 ## z_getoperationresult
 
