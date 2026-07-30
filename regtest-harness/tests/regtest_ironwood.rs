@@ -1,4 +1,4 @@
-//! Ironwood (NU6.3) regtest end-to-end. Three tests:
+//! Ironwood (NU6.3) regtest end-to-end. Four tests:
 //!   * `regtest_ironwood_receive_and_orchard_send` - zecd **receives an ironwood note**, then
 //!     **spends it** - an ironwood->ironwood send: the wallet's single spendable input is pinned to
 //!     the ironwood pool, and past NU6.3 the payment + change route into the ironwood bundle (the
@@ -10,6 +10,10 @@
 //!     send, so zecd receives an **ironwood note carrying a memo**. Proves the Ironwood-domain memo
 //!     decryption path (`decrypt_transaction` decrypting the Ironwood bundle) end-to-end: the memo
 //!     is surfaced on the received output (`memoStr`/`memo`) on a note asserted `pool == "ironwood"`.
+//!   * `regtest_ironwood_self_send_memo_via_block_scan` - ironwood **self-send memo coverage** across
+//!     a stop/mine-while-down/respawn: an ironwood self-payment's memo still round-trips on the
+//!     receive side after a restart. Coverage, **not** a fix-guard - it is green with and without the
+//!     dropped self-send memo cherry-pick (see the test's own doc for the verified why).
 //!
 //! Requires the full ironwood toolchain - the official ironwood zebra release (`zfnd/zebra:6.0.0`),
 //! a V6-parsing lightwalletd, an ironwood/regtest-aware `zcash-devtool` funder (its regtest `init`
@@ -830,5 +834,274 @@ async fn regtest_ironwood_receive_memo() {
         recv_detail["memoStr"].as_str(),
         Some(RECEIVE_MEMO),
         "gettransaction's ironwood receive detail decodes the memo: {recv_detail}"
+    );
+}
+
+/// Ironwood **self-send memo coverage** across a stop/restart: send a memo to one of the wallet's
+/// own ironwood addresses, tear zecd down, mine while it is down, respawn on the same datadir, and
+/// assert the receive side still surfaces the memo (`memoStr`/`memo`) on `gettransaction`.
+///
+/// NB - this is *coverage*, not a fix-guard. It was written to prove that upstream's
+/// `zcash_client_sqlite` **needs** the dropped "Backfill received-note memos for own self-sends"
+/// cherry-pick; PR #136 (this exact test on fix-less upstream) proved it does **not** - the test is
+/// green with *and* without that cherry-pick, so the fix is redundant for zecd's flow and was
+/// abandoned rather than upstreamed. The reason it survives, verified by reading upstream:
+///   * A shielded self-payment is a `Recipient::External` (external OVK): no received note exists at
+///     send time; only a `sent_notes` row carries the memo. The compact-block scan later materialises
+///     the received note with a **NULL** memo, and `queue_tx_retrieval` classifies the wallet's own
+///     (raw-pre-stored) txs `Status`, so enhancement never re-decrypts them. `v_received_outputs.memo`
+///     is the received note's own memo with no coalesce from the linked sent note.
+///   * So the received-note memo is filled only by `decrypt_and_store_transaction` on the *full* tx -
+///     which zecd does via the **mempool 0-conf path** (`store_mempool_tx`) in normal operation, and
+///     via **enhancement** on a from-seed restore (fresh DB → no pre-stored raw → an `Enhancement`
+///     request, not `Status`). The dropped `put_blocks` backfill only ever covered the residual case
+///     of an *authoring* node whose mempool never saw its own self-send *and* is never restored -
+///     genuinely narrow and self-healing (a rescan/restore fixes it).
+///
+/// This test's stop → mine-while-down → respawn does *not* reliably isolate that residual case (the
+/// mempool/decrypt paths still fill the memo), which is exactly why it stays green here. It is kept
+/// as end-to-end proof that an ironwood self-send memo round-trips across a restart; post-NU6.3 every
+/// self-payment lands in the Ironwood bundle, so it exercises the Ironwood-domain decrypt path.
+#[tokio::test]
+async fn regtest_ironwood_self_send_memo_via_block_scan() {
+    if std::env::var("ZECD_REGTEST_IRONWOOD").is_err() {
+        eprintln!(
+            "SKIP regtest_ironwood_self_send_memo_via_block_scan: set ZECD_REGTEST_IRONWOOD=1 (plus \
+             the ironwood ZEBRAD_BIN/LIGHTWALLETD_BIN/DEVTOOL_BIN and an ironwood-built ZECD_BIN) to \
+             run the NU6.3 e2e. The harness still compiled and linked."
+        );
+        return;
+    }
+    let (Some(zebrad_bin), Some(lwd_bin), Some(devtool_bin)) = (
+        resolve_bin("ZEBRAD_BIN"),
+        resolve_bin("LIGHTWALLETD_BIN"),
+        resolve_bin("DEVTOOL_BIN"),
+    ) else {
+        panic!(
+            "ZECD_REGTEST_IRONWOOD=1 but ZEBRAD_BIN/LIGHTWALLETD_BIN/DEVTOOL_BIN are not all set"
+        );
+    };
+
+    /// The ZIP-302 text memo zecd attaches to its own self-send; asserted on the received side
+    /// after the restart, under this test's mempool-denied timing.
+    const SELF_MEMO: &str = "ironwood self-send memo";
+    /// Hex of `SELF_MEMO`, as `sendtoaddress`'s trailing memo argument wants it.
+    const SELF_MEMO_HEX: &str = "69726f6e776f6f642073656c662d73656e64206d656d6f";
+    /// The self-send value (ZEC). Comfortably below the funded 1 ZEC note minus the ZIP-317 fee.
+    const SELF_SEND_ZEC: f64 = 0.3;
+
+    // 1-4. Bring up an NU6.3 chain and shield the funder into Orchard (identical to the other
+    //      ironwood tests - see their comments).
+    let funder_taddr =
+        Funder::derive_transparent_address(&devtool_bin).expect("derive funder transparent addr");
+    let mut zebrad = Zebrad::start_with_miner_ironwood(&zebrad_bin, &funder_taddr)
+        .await
+        .expect("start ironwood zebrad mining to the funder");
+    zebrad
+        .generate_blocks(FUNDER_COINBASES)
+        .await
+        .expect("mine the funder's coinbases");
+    zebrad
+        .restart_with_miner(TAIL_MINER_ADDRESS)
+        .await
+        .expect("restart zebrad mining to the throwaway address");
+    zebrad
+        .generate_blocks(MATURITY_TAIL)
+        .await
+        .expect("mine the maturity tail");
+    let lwd = Lightwalletd::start(&lwd_bin, zebrad.rpc_port)
+        .await
+        .expect("start lightwalletd");
+    let funder =
+        Funder::init_ironwood(&devtool_bin, lwd.grpc_port).expect("initialise funding wallet");
+    funder.sync(lwd.grpc_port).expect("funder sync (coinbase)");
+    funder
+        .shield(lwd.grpc_port)
+        .expect("shield transparent coinbase into Orchard");
+    zebrad.generate_blocks(6).await.expect("confirm shield");
+    funder.sync(lwd.grpc_port).expect("funder sync (shielded)");
+
+    // 5. Start zecd and wait until it reports a ready upstream.
+    let cfg = ZecdConfig::new(zebrad.rpc_port, pick_port().expect("pick zecd rpc port"));
+    let mut zecd = Zecd::start(&cfg)
+        .await
+        .expect("start zecd against ironwood regtest zebra");
+    let zecd_ua = zecd
+        .call("getnewaddress", json!([]))
+        .await
+        .expect("getnewaddress")
+        .as_str()
+        .expect("address string")
+        .to_string();
+    let deadline = Instant::now() + FUND_TIMEOUT;
+    loop {
+        let peers = zecd
+            .call("getpeerinfo", json!([]))
+            .await
+            .expect("getpeerinfo");
+        if peers
+            .as_array()
+            .and_then(|a| a.first())
+            .is_some_and(|p| p["conn_state"] == "ready")
+        {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "zecd never reached conn_state ready before funding: {peers}"
+        );
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+
+    // 6. Fund zecd with an ironwood note and mine until it is *spendable* (a received/untrusted note
+    //    needs `untrusted_confirmations` - ZIP-315: 10 - before `getbalance` counts it).
+    funder
+        .send(lwd.grpc_port, &zecd_ua, FUND_ZATOSHIS)
+        .expect("fund zecd (auto-routed to ironwood post-NU6.3)");
+    zebrad
+        .generate_blocks(6)
+        .await
+        .expect("confirm the funding");
+    let want_spendable = (FUND_ZATOSHIS as f64) / 1e8 - 0.01;
+    let deadline = Instant::now() + FUND_TIMEOUT;
+    loop {
+        let tip = zebrad
+            .rpc("getblockcount", json!([]))
+            .await
+            .expect("getblockcount")
+            .as_u64()
+            .expect("tip height");
+        let _ = zecd.wait_until_synced(tip, FUND_TIMEOUT).await;
+        let balance = zecd
+            .call("getbalance", json!([]))
+            .await
+            .expect("getbalance")
+            .as_f64()
+            .expect("balance number");
+        if balance >= want_spendable {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "zecd's ironwood note never became spendable (balance {balance}, want ~{want_spendable})"
+        );
+        zebrad
+            .generate_blocks(2)
+            .await
+            .expect("advance chain to make the note spendable");
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
+
+    // 7. zecd self-sends to a fresh OWN address, carrying a memo. `sendtoaddress`'s trailing memo
+    //    argument (after Bitcoin Core's comment/comment_to and the unused fee/verbose slots) rides
+    //    the same positional shape as `regtest_funded.rs`. The send stores its raw bytes and
+    //    broadcasts; post-NU6.3 the payment routes into the Ironwood bundle.
+    let self_ua = zecd
+        .call("getnewaddress", json!([]))
+        .await
+        .expect("getnewaddress for the self-send")
+        .as_str()
+        .expect("self address string")
+        .to_string();
+    let self_txid = zecd
+        .call(
+            "sendtoaddress",
+            json!([
+                self_ua,
+                SELF_SEND_ZEC,
+                "",
+                "",
+                null,
+                null,
+                null,
+                null,
+                null,
+                null,
+                null,
+                SELF_MEMO_HEX
+            ]),
+        )
+        .await
+        .expect("ironwood self-send succeeds")
+        .as_str()
+        .expect("self-send txid")
+        .to_string();
+
+    // 8. Deny the mempool path: tear zecd down *immediately* (no awaits between the send and the
+    //    stop, so its ~2s poller has no chance to decrypt-and-store the still-unmined self-send),
+    //    keeping the datadir - and its pre-stored raw for `self_txid` - intact.
+    zecd.stop_keeping_datadir()
+        .await
+        .expect("stop zecd, keeping its datadir");
+
+    // 9. Mine the self-send WHILE zecd is down, so the tx is confirmed and gone from the mempool
+    //    before zecd runs again - it can now be discovered only by scanning the mined block.
+    zebrad
+        .generate_blocks(6)
+        .await
+        .expect("mine + confirm the self-send while zecd is stopped");
+
+    // 10. Respawn on the same datadir. zecd rescans the block carrying the self-send: the compact
+    //     scan materialises the received note NULL-memo, and - the raw tx being pre-stored from the
+    //     send - `queue_tx_retrieval` classifies it `Status`, so enhancement does not re-decrypt it.
+    //     The memo nevertheless lands (see this test's doc), which is what step 11 asserts.
+    zecd.respawn()
+        .await
+        .expect("respawn zecd on the kept datadir");
+
+    // 11. Poll until zecd surfaces the self-send's receive side WITH its memo. Advancing the chain
+    //     drives the scan forward; the tx is already mined, so nothing here re-introduces it to the
+    //     mempool. A timeout means an ironwood self-send's memo stopped reaching the receive side
+    //     across a restart - the coverage this test provides.
+    let deadline = Instant::now() + FUND_TIMEOUT;
+    let recv_detail = loop {
+        let tip = zebrad
+            .rpc("getblockcount", json!([]))
+            .await
+            .expect("getblockcount")
+            .as_u64()
+            .expect("tip height");
+        let _ = zecd.wait_until_synced(tip, FUND_TIMEOUT).await;
+
+        let gt = zecd
+            .call("gettransaction", json!([self_txid]))
+            .await
+            .expect("gettransaction on the self-send");
+        let recv = gt["details"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .find(|d| d["category"] == "receive" && d["memoStr"].as_str() == Some(SELF_MEMO))
+            .cloned();
+        if let Some(recv) = recv {
+            break recv;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "zecd never surfaced the self-send's receive memo after the restart: {gt}"
+        );
+        zebrad
+            .generate_blocks(2)
+            .await
+            .expect("advance chain to drive the scan");
+        tokio::time::sleep(Duration::from_secs(2)).await;
+    };
+
+    // The self-send's received output is to our own address and carries both memo encodings -
+    // decoded text in `memoStr`, raw ZIP-302 bytes in `memo` - after a restart across the mining.
+    assert_eq!(
+        recv_detail["address"].as_str(),
+        Some(self_ua.as_str()),
+        "the self-send receive is to our own address: {recv_detail}"
+    );
+    assert_eq!(
+        recv_detail["memoStr"].as_str(),
+        Some(SELF_MEMO),
+        "the self-send receive decodes its memo after the restart: {recv_detail}"
+    );
+    assert_eq!(
+        recv_detail["memo"].as_str(),
+        Some(SELF_MEMO_HEX),
+        "the self-send receive carries the memo hex after the restart: {recv_detail}"
     );
 }
