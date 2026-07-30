@@ -1,5 +1,6 @@
 //! The library behind the **`zecd`** binary: a Bitcoin-Core-style JSON-RPC server for
-//! Orchard-only Zcash. The binary is a thin CLI wrapper around [`daemon::run`].
+//! shielded and transparent Zcash (Ironwood, Orchard, Sapling, plus opt-in t-addresses).
+//! The binary is a thin CLI wrapper around [`daemon::run`].
 
 pub mod address;
 pub mod amount;

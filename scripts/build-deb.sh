@@ -42,7 +42,7 @@ install -D -m 0644 "$REPO_ROOT/README.md"               "$STAGE/usr/share/doc/ze
 # systemd unit (installed, not enabled - the admin opts in with `systemctl enable zecd`).
 install -D -m 0644 /dev/stdin "$STAGE/lib/systemd/system/zecd.service" <<'UNIT'
 [Unit]
-Description=zecd - Bitcoin-Core-style JSON-RPC server for Orchard-only Zcash
+Description=zecd - Bitcoin-Core-style JSON-RPC server for shielded-first Zcash
 Documentation=https://github.com/zecrocks/zecd
 After=network-online.target
 Wants=network-online.target
@@ -105,10 +105,11 @@ Installed-Size: ${INSTALLED_SIZE}
 Section: net
 Priority: optional
 Homepage: https://github.com/zecrocks/zecd
-Description: Bitcoin-Core-style JSON-RPC server for Orchard-only Zcash
+Description: Bitcoin-Core-style JSON-RPC server for shielded and transparent Zcash
  zecd speaks bitcoind's JSON-RPC dialect (method names, response shapes, error
- codes, HTTP auth) and maps it onto Orchard-shielded Zcash operations, built on
- librustzcash. It runs against a local zebrad or a lightwalletd backend.
+ codes, HTTP auth) and maps it onto shielded Zcash operations (Ironwood, Orchard
+ and Sapling, plus opt-in transparent), built on librustzcash. It runs against
+ a local zebrad.
 CONTROL
 
 # conffiles: none under /etc - the example config ships read-only under /usr/share/doc.

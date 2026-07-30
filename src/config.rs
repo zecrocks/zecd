@@ -648,7 +648,7 @@ struct PoolsFile {
 // CLI
 // ---------------------------------------------------------------------------
 
-/// `zecd` - a Bitcoin-Core-style JSON-RPC server for Orchard-only Zcash.
+/// `zecd` - a Bitcoin-Core-style JSON-RPC server for shielded-first Zcash.
 #[derive(Debug, Parser)]
 #[command(name = "zecd", version)]
 pub struct Cli {

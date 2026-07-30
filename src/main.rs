@@ -1,4 +1,4 @@
-//! `zecd` - a Bitcoin-Core-style JSON-RPC server for Orchard-only Zcash.
+//! `zecd` - a Bitcoin-Core-style JSON-RPC server for shielded-first Zcash.
 
 use clap::Parser;
 

@@ -27,7 +27,7 @@ pub(crate) fn uptime(state: &AppState) -> Result<Value, RpcError> {
 /// method table is the reference).
 pub(crate) fn help() -> Result<Value, RpcError> {
     Ok(Value::String(
-        "zecd: a Bitcoin-Core-style JSON-RPC server for Orchard-only Zcash. \
+        "zecd: a Bitcoin-Core-style JSON-RPC server for shielded-first Zcash. \
          Supported methods include getblockchaininfo, getnetworkinfo, getwalletinfo, \
          getnewaddress, z_getaddressforaccount, getbalance, sendtoaddress, sendmany, \
          listtransactions, gettransaction, validateaddress. See the README for the full list \
