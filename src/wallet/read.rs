@@ -483,7 +483,7 @@ pub fn received_tx_records(
     let mut stmt = conn.prepare(
         "SELECT v.txid, v.mined_height, v.expired_unmined,
                 o.to_address, o.value, o.is_change, o.to_account_uuid, o.output_pool,
-                o.recipient_key_scope
+                o.recipient_key_scope, v.tx_index
          FROM v_transactions v
          JOIN v_tx_outputs o ON o.txid = v.txid
          WHERE (:addr IS NULL OR o.to_address = :addr)
@@ -497,6 +497,9 @@ pub fn received_tx_records(
             row.get::<_, Vec<u8>>(0)?,
             row.get::<_, Option<u32>>(1)?,
             row.get::<_, bool>(2)?,
+            // `tx_index` identifies a coinbase tx (block index 0), which the aggregation needs
+            // for the transparent coinbase-maturity exclusion.
+            row.get::<_, Option<u32>>(9)?,
             TxOutputRecord {
                 // `output_index`/`from_account`/`memo` are unused by the aggregation; `pool`
                 // is carried through so the record is the same shape [`load_outputs`] produces.
@@ -516,7 +519,7 @@ pub fn received_tx_records(
     let mut order: Vec<Vec<u8>> = Vec::new();
     let mut by_txid: HashMap<Vec<u8>, TxRecord> = HashMap::new();
     for r in rows {
-        let (txid, mined_height, expired_unmined, out) = r?;
+        let (txid, mined_height, expired_unmined, tx_index, out) = r?;
         let rec = by_txid.entry(txid.clone()).or_insert_with(|| {
             order.push(txid.clone());
             TxRecord {
@@ -527,7 +530,7 @@ pub fn received_tx_records(
                 fee_paid: None,
                 block_time: None,
                 expired_unmined,
-                tx_index: None,
+                tx_index,
                 block_hash: None,
                 created_time: None,
                 outputs: Vec::new(),

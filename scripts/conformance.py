@@ -417,6 +417,25 @@ def main() -> int:
         ck("fresh entry amount 0", fresh.get("amount") == 0, repr(fresh.get("amount")))
         ck("fresh entry confirmations 0", fresh.get("confirmations") == 0, repr(fresh.get("confirmations")))
         ck("fresh entry no txids", fresh.get("txids") == [], repr(fresh.get("txids")))
+    # include_immature_coinbase (Core's 3rd/5th parameter). This wallet holds no coinbase, so
+    # the flag must be accepted on both methods and change nothing; the maturity behaviour it
+    # governs is exercised live in the coinbase regtest e2e.
+    recv_imm = rpc.call("getreceivedbyaddress", addr, 1, True)
+    ck("getreceivedbyaddress include_immature_coinbase is Decimal",
+       isinstance(recv_imm, decimal.Decimal), repr(recv_imm))
+    ck("no coinbase -> include_immature_coinbase changes nothing", recv_imm == recv)
+    lra_imm = rpc.call("listreceivedbyaddress", 1, True, False, None, True)
+    ck("listreceivedbyaddress include_immature_coinbase is list", isinstance(lra_imm, list))
+    ck("no coinbase -> listed entries unchanged", lra_imm == lra)
+    # address_filter (Core's 4th parameter, pushed into SQL like getreceivedbyaddress's
+    # address): with include_empty the filtered call returns exactly the one address; without
+    # it an unused address yields an empty list, not an error.
+    lra_f = rpc.call("listreceivedbyaddress", 1, True, False, addr)
+    ck("address_filter returns exactly the filtered address",
+       [e.get("address") for e in lra_f] == [addr], repr(lra_f))
+    lra_f_used = rpc.call("listreceivedbyaddress", 1, False, False, addr)
+    ck("address_filter on an unused address without include_empty is empty",
+       lra_f_used == [], repr(lra_f_used))
     try:
         rpc.call("getreceivedbyaddress", "not-an-address")
         ck("invalid address raises", False)

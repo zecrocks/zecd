@@ -202,6 +202,54 @@ async fn regtest_transparent_coinbase_shield_and_spend() {
         "immature coinbase must not appear in listunspent: {unspent}"
     );
 
+    // 4b. The received-by aggregations apply the same maturity rule as the balance buckets:
+    //     by default an immature transparent coinbase is NOT counted as received (Core parity -
+    //     a reorg can still revoke it), and `include_immature_coinbase` opts the value back in.
+    let recv = zecd
+        .call("getreceivedbyaddress", json!([taddr]))
+        .await
+        .expect("getreceivedbyaddress while immature")
+        .as_f64()
+        .expect("received number");
+    assert_eq!(
+        recv, 0.0,
+        "immature coinbase must not count as received by default"
+    );
+    let recv_imm = zecd
+        .call("getreceivedbyaddress", json!([taddr, 1, true]))
+        .await
+        .expect("getreceivedbyaddress include_immature_coinbase")
+        .as_f64()
+        .expect("received number");
+    assert!(
+        (recv_imm - immature).abs() < 1e-8,
+        "include_immature_coinbase counts the immature value ({recv_imm} vs {immature})"
+    );
+    let lra = zecd
+        .call("listreceivedbyaddress", json!([1, false]))
+        .await
+        .expect("listreceivedbyaddress while immature");
+    assert!(
+        lra.as_array().is_some_and(|e| !e
+            .iter()
+            .any(|x| x["address"].as_str() == Some(taddr.as_str()))),
+        "an all-immature address is not listed by default: {lra}"
+    );
+    let lra_imm = zecd
+        .call(
+            "listreceivedbyaddress",
+            json!([1, false, false, null, true]),
+        )
+        .await
+        .expect("listreceivedbyaddress include_immature_coinbase");
+    assert!(
+        lra_imm.as_array().is_some_and(|e| e
+            .iter()
+            .any(|x| x["address"].as_str() == Some(taddr.as_str())
+                && (x["amount"].as_f64().unwrap_or(0.0) - immature).abs() < 1e-8)),
+        "include_immature_coinbase lists the address with the immature total: {lra_imm}"
+    );
+
     // 5. Immature: nothing may spend it. The t→t send has no eligible UTXO at all, and
     //    z_shieldcoinbase finds no *mature* coinbase.
     let err = zecd
@@ -267,6 +315,32 @@ async fn regtest_transparent_coinbase_shield_and_spend() {
     assert!(
         info["immature_balance"].as_f64().expect("immature_balance") > 0.0,
         "the still-immature tail coinbases stay in immature_balance: {info}"
+    );
+
+    // 7b. Received-by tracks the maturity boundary: the default now counts exactly the mature
+    //     set (the same value listunspent/getbalance surface), while include_immature_coinbase
+    //     additionally counts the still-immature tail - strictly more.
+    let recv_mature = zecd
+        .call("getreceivedbyaddress", json!([taddr]))
+        .await
+        .expect("getreceivedbyaddress once mature")
+        .as_f64()
+        .expect("received number");
+    assert!(
+        (recv_mature - coinbase_total).abs() < 1e-8,
+        "the matured coinbase value counts as received by default ({recv_mature} vs \
+         {coinbase_total})"
+    );
+    let recv_all = zecd
+        .call("getreceivedbyaddress", json!([taddr, 1, true]))
+        .await
+        .expect("getreceivedbyaddress include_immature_coinbase once mature")
+        .as_f64()
+        .expect("received number");
+    assert!(
+        recv_all > recv_mature,
+        "include_immature_coinbase additionally counts the immature tail ({recv_all} vs \
+         {recv_mature})"
     );
 
     // 8. Mature but still coinbase: the regular transparent spend path must refuse it -
@@ -505,6 +579,19 @@ async fn regtest_shielded_coinbase_receive_and_spend() {
         info["immature_balance"].as_f64(),
         Some(0.0),
         "shielded coinbase has no immature bucket: {info}"
+    );
+    // The received-by aggregation likewise applies no maturity rule to shielded coinbase: the
+    // full received total counts at depths far below 100 (its transparent-coinbase counterpart
+    // reports 0 at the same depth - the pool-scoping of the exclusion, asserted live).
+    let recv = zecd
+        .call("getreceivedbyaddress", json!([own_ua]))
+        .await
+        .expect("getreceivedbyaddress on the shielded-coinbase UA")
+        .as_f64()
+        .expect("received number");
+    assert!(
+        (recv - coinbase_total).abs() < 1e-8,
+        "shielded coinbase counts as received with no maturity gate ({recv} vs {coinbase_total})"
     );
 
     // 5. Spend one - far inside the 100-block window that would gate a *transparent* coinbase.

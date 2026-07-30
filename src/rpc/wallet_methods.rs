@@ -947,14 +947,28 @@ pub(crate) fn z_listtransactions(
     Ok(Value::Array(entries))
 }
 
+/// Coinbase maturity depth: a transparent coinbase output is immature below 100 confirmations
+/// (consensus forbids spending it, and Bitcoin Core's received-by aggregations exclude it unless
+/// `include_immature_coinbase`). Mirrors the `< 100` clause of [`read`]'s balance/listunspent
+/// coinbase SQL, which in turn mirrors `zcash_client_sqlite`'s spendability query - keep the
+/// three in lockstep. Shielded coinbase (ZIP-213) has no maturity rule and is never excluded.
+const COINBASE_MATURITY: i64 = 100;
+
 /// Aggregate wallet-received outputs (non-change, paying one of our accounts) per address,
 /// counting only transactions with at least `minconf` confirmations. Returns
 /// `(amount_zats, confirmations_of_most_recent_counted_tx, txids)` keyed by address.
 /// Conflicted txs report -1 confirmations and so never meet `minconf >= 0`.
+///
+/// Unless `include_immature_coinbase`, an immature **transparent** coinbase output (pool 0 in a
+/// `tx_index == 0` transaction, fewer than [`COINBASE_MATURITY`] confirmations) is excluded,
+/// matching Bitcoin Core: the value is not spendable yet (`getbalance` reports it as
+/// `immature_balance`), so counting it as received would overstate income that a chain reorg
+/// can still revoke. Shielded coinbase notes (ZIP-213) carry no maturity rule and always count.
 fn received_by_address(
     txs: &[read::TxRecord],
     st: &SyncStatus,
     minconf: i64,
+    include_immature_coinbase: bool,
 ) -> HashMap<String, (u64, i64, Vec<String>)> {
     let mut map: HashMap<String, (u64, i64, Vec<String>)> = HashMap::new();
     for tx in txs {
@@ -962,8 +976,12 @@ fn received_by_address(
         if conf < minconf {
             continue;
         }
+        let coinbase = tx.tx_index == Some(0);
         for out in &tx.outputs {
             if out.is_internal_change() || out.to_account.is_none() {
+                continue;
+            }
+            if !include_immature_coinbase && coinbase && out.pool == 0 && conf < COINBASE_MATURITY {
                 continue;
             }
             let Some(addr) = &out.to_address else {
@@ -978,8 +996,10 @@ fn received_by_address(
     map
 }
 
-/// `getreceivedbyaddress <address> [minconf]` - total received by one of the wallet's own
-/// addresses, in transactions with at least `minconf` confirmations.
+/// `getreceivedbyaddress <address> [minconf] [include_immature_coinbase]` - total received by
+/// one of the wallet's own addresses, in transactions with at least `minconf` confirmations.
+/// Immature transparent coinbase value is excluded unless `include_immature_coinbase` (Core's
+/// default-false third parameter); see [`received_by_address`].
 ///
 /// Matching is whole-UA string equality, not receiver-level: round-tripping the exact value
 /// `getnewaddress` returned always works (and sums receipts across all its receivers, which
@@ -998,6 +1018,7 @@ pub(crate) fn getreceivedbyaddress(
 ) -> Result<Value, RpcError> {
     let addr = req.require_str(0, "getreceivedbyaddress requires an address")?;
     let minconf = depth_param(req.param(1), "minconf", 1)?;
+    let include_immature_coinbase = req.param(2).and_then(|v| v.as_bool()).unwrap_or(false);
     let handle = state.registry.get(wallet)?;
     if !crate::address::validate(&handle.network, addr).is_valid {
         return Err(RpcError::invalid_address_or_key(format!(
@@ -1016,16 +1037,24 @@ pub(crate) fn getreceivedbyaddress(
     // Push the single-address filter into SQL (sublinear) rather than scanning the whole
     // history; the aggregation then sees only this address's outputs.
     let txs = read::received_tx_records(&handle.dir, Some(addr))?;
-    let total = received_by_address(&txs, &st, minconf)
+    let total = received_by_address(&txs, &st, minconf, include_immature_coinbase)
         .remove(addr)
         .map(|(amt, _, _)| amt)
         .unwrap_or(0);
     Ok(zats_to_value(total))
 }
 
-/// `listreceivedbyaddress [minconf] [include_empty] [include_watchonly] [address_filter]` -
-/// per-address received totals with the txids that paid them. There is no watch-only
-/// support, so `include_watchonly` is accepted and ignored.
+/// `listreceivedbyaddress [minconf] [include_empty] [include_watchonly] [address_filter]
+/// [include_immature_coinbase]` - per-address received totals with the txids that paid them.
+/// There is no watch-only support, so `include_watchonly` is accepted and ignored. Immature
+/// transparent coinbase value is excluded unless `include_immature_coinbase` (Core's
+/// default-false fifth parameter); see [`received_by_address`].
+///
+/// `address_filter` is pushed into SQL exactly as `getreceivedbyaddress` pushes its address
+/// (the [`read::received_tx_records`] filter), so a filtered call loads only that address's
+/// outputs instead of scanning the whole history and discarding the rest. The unfiltered
+/// call necessarily loads everything - it is a full-history aggregation, like Bitcoin Core's.
+/// The in-loop filter below still runs to prune the `include_empty` address universe.
 pub(crate) fn listreceivedbyaddress(
     state: &AppState,
     wallet: Option<&str>,
@@ -1034,13 +1063,14 @@ pub(crate) fn listreceivedbyaddress(
     let minconf = depth_param(req.param(0), "minconf", 1)?;
     let include_empty = req.param(1).and_then(|v| v.as_bool()).unwrap_or(false);
     let address_filter = req.param(3).and_then(|v| v.as_str()).map(str::to_string);
+    let include_immature_coinbase = req.param(4).and_then(|v| v.as_bool()).unwrap_or(false);
     let handle = state.registry.get(wallet)?;
     let st = handle.status();
-    let txs = read::received_tx_records(&handle.dir, None)?;
-    let mut received = received_by_address(&txs, &st, minconf);
+    let txs = read::received_tx_records(&handle.dir, address_filter.as_deref())?;
+    let mut received = received_by_address(&txs, &st, minconf, include_immature_coinbase);
 
-    // The address universe: everything that received, plus (with include_empty) every
-    // address the wallet has ever generated.
+    // The address universe: everything that received (already restricted by the pushed-down
+    // filter), plus (with include_empty) every address the wallet has ever generated.
     let mut addrs: BTreeSet<String> = received.keys().cloned().collect();
     if include_empty {
         addrs.extend(read::all_addresses(handle.network, &handle.dir));
@@ -2917,13 +2947,59 @@ mod tests {
                 vec![out(true, true, 11, Some("a"), true)],
             ), // change: skipped
         ];
-        let m = received_by_address(&txs, &st, 1);
+        let m = received_by_address(&txs, &st, 1, false);
         let (amt, conf, txids) = m.get("a").cloned().unwrap();
         assert_eq!(amt, 150);
         assert_eq!(conf, 1); // confirmations of the most recent counted tx
         assert_eq!(txids.len(), 2);
         // minconf 0 picks up the unmined receive but still never the expired/change outputs.
-        assert_eq!(received_by_address(&txs, &st, 0).get("a").unwrap().0, 157);
+        assert_eq!(
+            received_by_address(&txs, &st, 0, false).get("a").unwrap().0,
+            157
+        );
+    }
+
+    #[test]
+    fn received_by_address_applies_transparent_coinbase_maturity() {
+        // Tip at 100 (status() scans to `fully_scanned`), so a tx mined at height h has
+        // `100 - h + 1` confirmations: mined at 50 -> 51 conf (immature), at 1 -> 100 conf
+        // (exactly mature - the `< 100` boundary mirrors the balance/listunspent SQL).
+        let st = status(100);
+        let t_out = |value, addr: &str| TxOutputRecord {
+            pool: 0,
+            ..out(false, true, value, Some(addr), false)
+        };
+        let coinbase = |mined, outputs| TxRecord {
+            tx_index: Some(0),
+            ..tx(Some(mined), false, None, outputs)
+        };
+        let txs = vec![
+            // Immature transparent coinbase (51 conf): excluded by default.
+            coinbase(50, vec![t_out(100, "a")]),
+            // Exactly-mature transparent coinbase (100 conf): counted by default.
+            coinbase(1, vec![t_out(30, "a")]),
+            // Immature *shielded* coinbase (ZIP-213, pool from `out()` = 3): no maturity rule,
+            // counted by default at any depth.
+            coinbase(50, vec![out(false, true, 7, Some("a"), false)]),
+            // An ordinary (non-coinbase) transparent receive at low depth: never excluded.
+            tx(Some(90), false, None, vec![t_out(5, "a")]),
+        ];
+        assert_eq!(
+            received_by_address(&txs, &st, 1, false).get("a").unwrap().0,
+            42
+        );
+        // include_immature_coinbase counts the immature transparent coinbase too.
+        assert_eq!(
+            received_by_address(&txs, &st, 1, true).get("a").unwrap().0,
+            142
+        );
+        // minconf still applies on top of the maturity override: at minconf 60 only the
+        // 100-conf coinbase survives (both height-50 txs sit at 51 conf, the ordinary receive
+        // at 11).
+        assert_eq!(
+            received_by_address(&txs, &st, 60, true).get("a").unwrap().0,
+            30
+        );
     }
 
     #[test]

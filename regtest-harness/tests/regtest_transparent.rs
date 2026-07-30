@@ -352,6 +352,23 @@ async fn regtest_transparent_receive_and_autoshield_spend() {
                 && (e["amount"].as_f64().unwrap_or(0.0) - 1.0).abs() < 1e-8)),
         "listreceivedbyaddress lists the t-address with its 1 ZEC: {lra}"
     );
+    // The address_filter parameter, against an address with actual funds behind it: the
+    // filtered call (pushed into SQL) returns exactly the one entry with the same total.
+    let lra_f = zecd
+        .call("listreceivedbyaddress", json!([1, false, false, taddr]))
+        .await
+        .expect("listreceivedbyaddress address_filter");
+    let entries = lra_f.as_array().expect("filtered list");
+    assert_eq!(
+        entries.len(),
+        1,
+        "the filter returns exactly the one address: {lra_f}"
+    );
+    assert!(
+        entries[0]["address"].as_str() == Some(taddr.as_str())
+            && (entries[0]["amount"].as_f64().unwrap_or(0.0) - 1.0).abs() < 1e-8,
+        "the filtered entry carries the funded t-address and its 1 ZEC: {lra_f}"
+    );
 
     // The opt-in gate: this wallet runs under the DEFAULT privacy policy (AllowRevealedRecipients),
     // so a fully-transparent spend is refused. librustzcash's `propose_transfer` funds payments from
