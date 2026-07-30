@@ -10,7 +10,9 @@
 use std::time::Duration;
 
 use serde_json::json;
-use zecd_regtest_harness::{extended_enabled, pick_port, resolve_bin, Zebrad, Zecd, ZecdConfig};
+use zecd_regtest_harness::{
+    extended_enabled, pick_port, resolve_node_bin, RegtestNode, Zebrad, Zecd, ZecdConfig,
+};
 
 const INITIAL_BLOCKS: u32 = 10;
 const SYNC_TIMEOUT: Duration = Duration::from_secs(120);
@@ -27,10 +29,11 @@ async fn regtest_multiwallet_routing_and_isolation() {
         );
         return;
     }
-    let Some(zebrad_bin) = resolve_bin("ZEBRAD_BIN") else {
+    let Some(zebrad_bin) = resolve_node_bin() else {
         eprintln!(
-            "SKIP regtest_multiwallet_routing_and_isolation: set ZEBRAD_BIN \
-             (see README.md). The harness still compiled and linked."
+            "SKIP regtest_multiwallet_routing_and_isolation: set {} \
+             (see README.md). The harness still compiled and linked.",
+            RegtestNode::from_env().bin_env()
         );
         return;
     };
@@ -176,10 +179,11 @@ async fn regtest_second_spending_wallet_refused_at_init() {
         );
         return;
     }
-    let Some(zebrad_bin) = resolve_bin("ZEBRAD_BIN") else {
+    let Some(zebrad_bin) = resolve_node_bin() else {
         eprintln!(
-            "SKIP regtest_second_spending_wallet_refused_at_init: set ZEBRAD_BIN \
-             (see README.md). The harness still compiled and linked."
+            "SKIP regtest_second_spending_wallet_refused_at_init: set {} \
+             (see README.md). The harness still compiled and linked.",
+            RegtestNode::from_env().bin_env()
         );
         return;
     };

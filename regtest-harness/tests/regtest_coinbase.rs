@@ -123,6 +123,10 @@ async fn balance_zec(zecd: &Zecd) -> f64 {
 
 #[tokio::test]
 async fn regtest_transparent_coinbase_shield_and_spend() {
+    // Coinbase tests are zebra-only in CI: the harness leaves ZEBRAD_BIN unset on the zakura leg,
+    // so this skips there. (zecd drives zakura fine and zakura *can* build a shielded coinbase, but
+    // the transparent-coinbase maturity+shield flow was flaky against zakura in local testing, so
+    // the suite is scoped to zebra to keep the zakura leg reliably green - revisit if wanted.)
     let Some(zebrad_bin) = resolve_bin("ZEBRAD_BIN") else {
         eprintln!(
             "SKIP regtest_transparent_coinbase_shield_and_spend: set ZEBRAD_BIN to run the \
@@ -469,6 +473,7 @@ async fn regtest_transparent_coinbase_shield_and_spend() {
 
 #[tokio::test]
 async fn regtest_shielded_coinbase_receive_and_spend() {
+    // Zebra-only in CI (ZEBRAD_BIN unset on the zakura leg -> skips there); see the sibling test.
     let Some(zebrad_bin) = resolve_bin("ZEBRAD_BIN") else {
         eprintln!(
             "SKIP regtest_shielded_coinbase_receive_and_spend: set ZEBRAD_BIN to run the \

@@ -16,7 +16,9 @@
 use std::time::Duration;
 
 use serde_json::json;
-use zecd_regtest_harness::{extended_enabled, pick_port, resolve_bin, Zebrad, Zecd, ZecdConfig};
+use zecd_regtest_harness::{
+    extended_enabled, pick_port, resolve_node_bin, RegtestNode, Zebrad, Zecd, ZecdConfig,
+};
 
 const INITIAL_BLOCKS: u32 = 10;
 const SYNC_TIMEOUT: Duration = Duration::from_secs(120);
@@ -30,10 +32,11 @@ async fn regtest_watch_only_ufvk() {
         );
         return;
     }
-    let Some(zebrad_bin) = resolve_bin("ZEBRAD_BIN") else {
+    let Some(zebrad_bin) = resolve_node_bin() else {
         eprintln!(
-            "SKIP regtest_watch_only_ufvk: set ZEBRAD_BIN (see \
-             README.md). The harness still compiled and linked."
+            "SKIP regtest_watch_only_ufvk: set {} (see \
+             README.md). The harness still compiled and linked.",
+            RegtestNode::from_env().bin_env()
         );
         return;
     };

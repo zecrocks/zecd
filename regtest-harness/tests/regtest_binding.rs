@@ -13,7 +13,9 @@ use std::process::{Command, Stdio};
 use std::time::Duration;
 
 use serde_json::json;
-use zecd_regtest_harness::{pick_port, resolve_bin, zecd_bin, Zebrad, Zecd, ZecdConfig};
+use zecd_regtest_harness::{
+    pick_port, resolve_node_bin, zecd_bin, RegtestNode, Zebrad, Zecd, ZecdConfig,
+};
 
 /// Blocks mined before launching zecd. Regtest mining is cheap (PoW disabled).
 const INITIAL_BLOCKS: u32 = 10;
@@ -44,10 +46,11 @@ fn strip_pin(keys_toml: &Path) {
 
 #[tokio::test]
 async fn regtest_account_binding() {
-    let Some(zebrad_bin) = resolve_bin("ZEBRAD_BIN") else {
+    let Some(zebrad_bin) = resolve_node_bin() else {
         eprintln!(
-            "SKIP regtest_account_binding: set ZEBRAD_BIN to run the live e2e (see README.md). \
-             The harness still compiled and linked."
+            "SKIP regtest_account_binding: set {} to run the live e2e (see README.md). \
+             The harness still compiled and linked.",
+            RegtestNode::from_env().bin_env()
         );
         return;
     };

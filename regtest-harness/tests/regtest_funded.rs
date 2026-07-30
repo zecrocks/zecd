@@ -39,7 +39,8 @@ use std::time::{Duration, Instant};
 
 use serde_json::json;
 use zecd_regtest_harness::{
-    pick_port, resolve_bin, Funder, Lightwalletd, Zebrad, Zecd, ZecdConfig,
+    pick_port, resolve_bin, resolve_node_bin, Funder, Lightwalletd, RegtestNode, Zebrad, Zecd,
+    ZecdConfig,
 };
 
 /// Coinbase blocks mined to the funder up front. zebra finalizes blocks deeper than
@@ -72,13 +73,14 @@ const ENCRYPT_PASSPHRASE: &str = "regtest-pass";
 #[tokio::test]
 async fn regtest_funded_orchard_receive() {
     let (Some(zebrad_bin), Some(lwd_bin), Some(devtool_bin)) = (
-        resolve_bin("ZEBRAD_BIN"),
+        resolve_node_bin(),
         resolve_bin("LIGHTWALLETD_BIN"),
         resolve_bin("DEVTOOL_BIN"),
     ) else {
         eprintln!(
-            "SKIP regtest_funded_orchard_receive: set ZEBRAD_BIN, LIGHTWALLETD_BIN and DEVTOOL_BIN \
-             to run the funded e2e (see README.md). The harness still compiled and linked."
+            "SKIP regtest_funded_orchard_receive: set {}, LIGHTWALLETD_BIN and DEVTOOL_BIN \
+             to run the funded e2e (see README.md). The harness still compiled and linked.",
+            RegtestNode::from_env().bin_env()
         );
         return;
     };

@@ -22,7 +22,8 @@ use std::time::{Duration, Instant};
 
 use serde_json::json;
 use zecd_regtest_harness::{
-    pick_port, resolve_bin, Funder, Lightwalletd, Zebrad, Zecd, ZecdConfig,
+    pick_port, resolve_bin, resolve_node_bin, Funder, Lightwalletd, RegtestNode, Zebrad, Zecd,
+    ZecdConfig,
 };
 
 const FUNDER_COINBASES: u32 = 120;
@@ -34,14 +35,15 @@ const FUND_TIMEOUT: Duration = Duration::from_secs(240);
 #[tokio::test]
 async fn regtest_transparent_receive_and_autoshield_spend() {
     let (Some(zebrad_bin), Some(lwd_bin), Some(devtool_bin)) = (
-        resolve_bin("ZEBRAD_BIN"),
+        resolve_node_bin(),
         resolve_bin("LIGHTWALLETD_BIN"),
         resolve_bin("DEVTOOL_BIN"),
     ) else {
         eprintln!(
-            "SKIP regtest_transparent_receive_and_autoshield_spend: set ZEBRAD_BIN, \
+            "SKIP regtest_transparent_receive_and_autoshield_spend: set {}, \
              LIGHTWALLETD_BIN and DEVTOOL_BIN to run the transparent e2e (see README.md). The \
-             harness still compiled."
+             harness still compiled.",
+            RegtestNode::from_env().bin_env()
         );
         return;
     };

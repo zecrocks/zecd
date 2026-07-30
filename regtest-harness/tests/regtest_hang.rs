@@ -15,7 +15,7 @@
 use std::time::{Duration, Instant};
 
 use serde_json::json;
-use zecd_regtest_harness::{pick_port, resolve_bin, Zebrad, Zecd, ZecdConfig};
+use zecd_regtest_harness::{pick_port, resolve_node_bin, RegtestNode, Zebrad, Zecd, ZecdConfig};
 
 const INITIAL_BLOCKS: u32 = 8;
 const SYNC_TIMEOUT: Duration = Duration::from_secs(120);
@@ -26,10 +26,11 @@ const DETECT_TIMEOUT: Duration = Duration::from_secs(90);
 
 #[tokio::test]
 async fn regtest_hung_upstream_detected_and_recovered() {
-    let Some(zebrad_bin) = resolve_bin("ZEBRAD_BIN") else {
+    let Some(zebrad_bin) = resolve_node_bin() else {
         eprintln!(
-            "SKIP regtest_hung_upstream_detected_and_recovered: set ZEBRAD_BIN \
-             (see README.md). The harness still compiled and linked."
+            "SKIP regtest_hung_upstream_detected_and_recovered: set {} \
+             (see README.md). The harness still compiled and linked.",
+            RegtestNode::from_env().bin_env()
         );
         return;
     };

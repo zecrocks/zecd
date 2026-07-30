@@ -21,7 +21,8 @@ use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
 use zecd_regtest_harness::{
-    pick_port, resolve_bin, Funder, Lightwalletd, Zebrad, Zecd, ZecdConfig,
+    pick_port, resolve_bin, resolve_node_bin, Funder, Lightwalletd, RegtestNode, Zebrad, Zecd,
+    ZecdConfig,
 };
 
 /// See `regtest_funded.rs` for the coinbase-maturity dance these encode.
@@ -91,13 +92,14 @@ async fn timed_sends(zecd: &Zecd, zebrad: &Zebrad, to_ua: &str, n: u32) -> Vec<D
 #[tokio::test]
 async fn regtest_proving_key_cache_benchmark() {
     let (Some(zebrad_bin), Some(lwd_bin), Some(devtool_bin)) = (
-        resolve_bin("ZEBRAD_BIN"),
+        resolve_node_bin(),
         resolve_bin("LIGHTWALLETD_BIN"),
         resolve_bin("DEVTOOL_BIN"),
     ) else {
         eprintln!(
-            "SKIP regtest_proving_key_cache_benchmark: set ZEBRAD_BIN, LIGHTWALLETD_BIN and \
-             DEVTOOL_BIN to run it (see README.md). The harness still compiled and linked."
+            "SKIP regtest_proving_key_cache_benchmark: set {}, LIGHTWALLETD_BIN and \
+             DEVTOOL_BIN to run it (see README.md). The harness still compiled and linked.",
+            RegtestNode::from_env().bin_env()
         );
         return;
     };

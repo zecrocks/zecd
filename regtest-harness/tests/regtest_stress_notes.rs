@@ -30,8 +30,8 @@ use std::time::{Duration, Instant};
 
 use serde_json::json;
 use zecd_regtest_harness::{
-    pick_port, resolve_bin, stress_enabled, stress_note_count, Funder, Lightwalletd, Zebrad, Zecd,
-    ZecdConfig,
+    pick_port, resolve_bin, resolve_node_bin, stress_enabled, stress_note_count, Funder,
+    Lightwalletd, RegtestNode, Zebrad, Zecd, ZecdConfig,
 };
 
 /// Coinbases mined to the funder, then aged past maturity - same single-chain shaping as the
@@ -69,13 +69,14 @@ async fn regtest_stress_many_notes() {
         return;
     }
     let (Some(zebrad_bin), Some(lwd_bin), Some(devtool_bin)) = (
-        resolve_bin("ZEBRAD_BIN"),
+        resolve_node_bin(),
         resolve_bin("LIGHTWALLETD_BIN"),
         resolve_bin("DEVTOOL_BIN"),
     ) else {
         eprintln!(
-            "SKIP regtest_stress_many_notes: set ZEBRAD_BIN, LIGHTWALLETD_BIN and DEVTOOL_BIN \
-             to run the stress e2e (see README.md)."
+            "SKIP regtest_stress_many_notes: set {}, LIGHTWALLETD_BIN and DEVTOOL_BIN \
+             to run the stress e2e (see README.md).",
+            RegtestNode::from_env().bin_env()
         );
         return;
     };

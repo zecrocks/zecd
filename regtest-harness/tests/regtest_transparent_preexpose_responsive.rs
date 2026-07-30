@@ -27,7 +27,7 @@
 use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
-use zecd_regtest_harness::{pick_port, resolve_bin, Zebrad, Zecd, ZecdConfig};
+use zecd_regtest_harness::{pick_port, resolve_node_bin, RegtestNode, Zebrad, Zecd, ZecdConfig};
 
 /// Deep enough that pre-exposure takes well over ten seconds on CI hardware (derivation is
 /// CPU-bound at ~1k addr/s), giving dozens of probe ticks inside the window - but not so deep the
@@ -52,10 +52,11 @@ const PREEXPOSE_TIMEOUT: Duration = Duration::from_secs(240);
 
 #[tokio::test]
 async fn regtest_transparent_preexpose_stays_responsive() {
-    let Some(zebrad_bin) = resolve_bin("ZEBRAD_BIN") else {
+    let Some(zebrad_bin) = resolve_node_bin() else {
         eprintln!(
-            "SKIP regtest_transparent_preexpose_stays_responsive: set ZEBRAD_BIN to run the \
-             transparent pre-exposure responsiveness e2e (see README.md)."
+            "SKIP regtest_transparent_preexpose_stays_responsive: set {} to run the \
+             transparent pre-exposure responsiveness e2e (see README.md).",
+            RegtestNode::from_env().bin_env()
         );
         return;
     };

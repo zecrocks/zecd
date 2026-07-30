@@ -17,7 +17,9 @@
 use std::time::{Duration, Instant};
 
 use serde_json::json;
-use zecd_regtest_harness::{pick_port, resolve_bin, RpcError, Zebrad, Zecd, ZecdConfig};
+use zecd_regtest_harness::{
+    pick_port, resolve_node_bin, RegtestNode, RpcError, Zebrad, Zecd, ZecdConfig,
+};
 
 const TAIL_MINER_ADDRESS: &str = "t27eWDgjFYJGVXmzrXeVjnb5J3uXDM9xH9v";
 const READY_TIMEOUT: Duration = Duration::from_secs(120);
@@ -29,10 +31,11 @@ const BEYOND: u32 = 3;
 
 #[tokio::test]
 async fn regtest_transparent_recovery_window_hard_stop_and_allow_beyond() {
-    let Some(zebrad_bin) = resolve_bin("ZEBRAD_BIN") else {
+    let Some(zebrad_bin) = resolve_node_bin() else {
         eprintln!(
-            "SKIP regtest_transparent_recovery_window_hard_stop_and_allow_beyond: set ZEBRAD_BIN \
-             to run the transparent recovery-window e2e (see README.md)."
+            "SKIP regtest_transparent_recovery_window_hard_stop_and_allow_beyond: set {} \
+             to run the transparent recovery-window e2e (see README.md).",
+            RegtestNode::from_env().bin_env()
         );
         return;
     };

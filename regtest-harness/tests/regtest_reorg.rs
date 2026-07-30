@@ -21,7 +21,8 @@ use std::time::{Duration, Instant};
 
 use serde_json::json;
 use zecd_regtest_harness::{
-    extended_enabled, pick_port, resolve_bin, Funder, Zebrad, Zecd, ZecdConfig,
+    extended_enabled, pick_port, resolve_bin, resolve_node_bin, Funder, RegtestNode, Zebrad, Zecd,
+    ZecdConfig,
 };
 
 /// The original chain. Must exceed zebra's finality depth (99) so a finalized prefix
@@ -48,12 +49,12 @@ async fn regtest_reorg_rewinds_and_follows() {
         );
         return;
     }
-    let (Some(zebrad_bin), Some(devtool_bin)) =
-        (resolve_bin("ZEBRAD_BIN"), resolve_bin("DEVTOOL_BIN"))
+    let (Some(zebrad_bin), Some(devtool_bin)) = (resolve_node_bin(), resolve_bin("DEVTOOL_BIN"))
     else {
         eprintln!(
-            "SKIP regtest_reorg_rewinds_and_follows: set ZEBRAD_BIN and DEVTOOL_BIN \
-             (see README.md). The harness still compiled and linked."
+            "SKIP regtest_reorg_rewinds_and_follows: set {} and DEVTOOL_BIN \
+             (see README.md). The harness still compiled and linked.",
+            RegtestNode::from_env().bin_env()
         );
         return;
     };

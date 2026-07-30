@@ -62,6 +62,66 @@ pub fn resolve_bin(env_var: &str) -> Option<PathBuf> {
         .filter(|p| p.is_file())
 }
 
+/// Which zebrad-dialect node the live tier drives, selected by the `ZECD_REGTEST_NODE`
+/// environment variable. Both nodes speak the same Bitcoin-Core-style JSON-RPC dialect, accept
+/// the same regtest config, and mine via the same Regtest-only `generate` RPC, so the harness
+/// code path is *identical* - only the binary (and the env var pointing at it) differs. This is
+/// what makes the harness a true black-box driver: `zecd` can't tell the two apart.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RegtestNode {
+    /// The Zcash Foundation's `zebrad` (the default). Binary from `$ZEBRAD_BIN`.
+    Zebra,
+    /// `zakurad` - Zakura, a performance-oriented `zebrad` fork that keeps zebra's RPC and
+    /// config surface (<https://github.com/zakura-core/zakura>). Binary from `$ZAKURAD_BIN`.
+    Zakura,
+}
+
+impl RegtestNode {
+    /// Resolve the node from `ZECD_REGTEST_NODE` (case-insensitive; default [`RegtestNode::Zebra`]).
+    /// An unrecognised value falls back to zebra with a warning so a typo can't silently pick the
+    /// wrong backend.
+    pub fn from_env() -> RegtestNode {
+        match std::env::var("ZECD_REGTEST_NODE") {
+            Ok(v) => match v.trim().to_ascii_lowercase().as_str() {
+                "" | "zebra" | "zebrad" => RegtestNode::Zebra,
+                "zakura" | "zakurad" => RegtestNode::Zakura,
+                other => {
+                    eprintln!(
+                        "WARN ZECD_REGTEST_NODE={other:?} is not recognised; \
+                         defaulting to zebra (valid: zebra, zakura)"
+                    );
+                    RegtestNode::Zebra
+                }
+            },
+            Err(_) => RegtestNode::Zebra,
+        }
+    }
+
+    /// The env var holding this node's binary path (`ZEBRAD_BIN` / `ZAKURAD_BIN`).
+    pub fn bin_env(self) -> &'static str {
+        match self {
+            RegtestNode::Zebra => "ZEBRAD_BIN",
+            RegtestNode::Zakura => "ZAKURAD_BIN",
+        }
+    }
+
+    /// A short human label (`zebra` / `zakura`) for skip messages and diagnostics.
+    pub fn label(self) -> &'static str {
+        match self {
+            RegtestNode::Zebra => "zebra",
+            RegtestNode::Zakura => "zakura",
+        }
+    }
+}
+
+/// Resolve the [selected node](RegtestNode::from_env)'s binary (`$ZEBRAD_BIN` or `$ZAKURAD_BIN`),
+/// returning `None` if unset or missing so callers can skip the live test cleanly. This is the
+/// backend-agnostic replacement for `resolve_bin("ZEBRAD_BIN")`: the default is zebra, and setting
+/// `ZECD_REGTEST_NODE=zakura` points the whole suite at `zakurad` instead.
+pub fn resolve_node_bin() -> Option<PathBuf> {
+    resolve_bin(RegtestNode::from_env().bin_env())
+}
+
 // =============================== zebrad (Regtest validator) ===============================
 
 /// Height at which NU6.1 and NU6.2 activate on our regtest chain. NU5/NU6 are active from genesis;
@@ -84,7 +144,9 @@ const LOCKBOX_DISBURSEMENT_ZATS: u64 = 1;
 /// to control the coinbase (the unfunded e2e). Funded flows pass the funding wallet's own address.
 const DEFAULT_MINER_ADDRESS: &str = "t27eWDgjFYJGVXmzrXeVjnb5J3uXDM9xH9v";
 
-/// A running `zebrad` Regtest node.
+/// A running `zebrad`-dialect Regtest node. Drives whichever binary the caller passes - the
+/// Zcash Foundation's `zebrad` or Zakura's `zakurad` (see [`RegtestNode`]) - the same way: both
+/// take the same regtest config and mine via the same Regtest-only `generate` RPC.
 pub struct Zebrad {
     child: Child,
     /// JSON-RPC port (cookie auth disabled so zecd can connect).
@@ -111,12 +173,14 @@ fn spawn_zebrad(bin: &Path, config_path: &Path) -> Result<Child> {
         None => (Stdio::null(), Stdio::null()),
     };
     let mut cmd = Command::new(bin);
-    // zebrad reads `ZEBRA_*` environment variables as config overrides (config-rs), and an
-    // unrelated variable like `ZEBRA_TAG` in a CI job makes it exit at startup with
-    // "Configuration error: unknown field". Scrub the prefix so the harness only ever
-    // configures zebrad through the config file it writes.
+    // zebrad/zakurad read `ZEBRA_*` (resp. `ZAKURA_*`) environment variables as config overrides
+    // (config-rs), and an unrelated variable like `ZEBRA_TAG` in a CI job makes the node exit at
+    // startup with "Configuration error: unknown field". Scrub both prefixes so the harness only
+    // ever configures the node through the config file it writes. (`ZEBRAD_BIN`/`ZAKURAD_BIN`
+    // don't match - no trailing underscore after the prefix - so the binary selectors survive.)
     for (key, _) in std::env::vars_os() {
-        if key.to_string_lossy().starts_with("ZEBRA_") {
+        let key_str = key.to_string_lossy();
+        if key_str.starts_with("ZEBRA_") || key_str.starts_with("ZAKURA_") {
             cmd.env_remove(key);
         }
     }
