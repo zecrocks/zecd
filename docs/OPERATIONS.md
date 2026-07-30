@@ -224,6 +224,44 @@ consequences:
 - Balances and `getblockcount` can dip while the rewound range rescans; `/status` shows
   `scanning` during the catch-up.
 
+## Stuck sync: a repeating `sync error`
+
+A healthy wallet's sync errors are transient (an upstream restart, a reorg racing a batch). The
+pathological case is the **same** error repeating on every paced retry while the tip pulls away
+(`/status` `scan_lag` growing, `/readyz` 503) - e.g.:
+
+```
+sync error: Wallet(PutBlocksCommitmentTree { pool: Sapling, block_range: ..., error: Insert(Conflict(...)) })
+```
+
+zecd diagnoses the two known causes and says so in the log:
+
+- **Unsupported network upgrade (outdated zecd).** At every connect zecd compares the upgrades
+  zebra reports (`getblockchaininfo.upgrades`/`consensus`) against the consensus branch IDs this
+  build understands. A *pending* unknown upgrade logs a warning ahead of activation - update
+  zecd before that height; an *active* one logs an error naming the upgrade, its branch ID and
+  activation height, and each sync failure under it is attributed to it. The fix is updating to
+  the latest zecd release; if you are already on the latest, report it at
+  <https://forum.zcashcommunity.com>.
+- **Corrupt wallet database.** If the upstream serves blocks fine but the wallet database keeps
+  failing to apply them - the same apply-side error on 3+ consecutive passes, with no upgrade in
+  play - the database itself is the suspect (restarts and version upgrades will re-hit it). The
+  log points at the rebuild:
+
+  ```sh
+  zecd stop                                  # rescan refuses while the daemon holds the datadir
+  zecd --datadir /var/lib/zecd rescan --wallet default   # --yes to skip the prompt
+  # start the daemon again
+  ```
+
+  `rescan` deletes only the wallet database and block cache; `keys.toml` (seed, network,
+  birthday, UFVK pin) is kept, so the next start rebuilds the account from the seed and rescans
+  from the wallet birthday - all funds and history are re-derived from the chain (zecd persists
+  nothing a from-seed restore couldn't rebuild). Budget the same sync time as a server restore;
+  `/readyz` stays 503 until it catches up. For an encrypted wallet the rebuild starts at the
+  first `walletpassphrase`; a watch-only wallet has no seed to rebuild from - recreate it with
+  `zecd init --ufvk` instead.
+
 ## Upgrades
 
 1. `zecd stop` (or SIGINT) - graceful: in-flight requests finish, new ones get 503.

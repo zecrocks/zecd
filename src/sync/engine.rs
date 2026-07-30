@@ -55,6 +55,26 @@ use crate::wallet::open::{block_path, WriteDb};
 
 const BATCH_SIZE: u32 = 10_000;
 
+/// A wallet-side failure applying an already-downloaded batch (the scan/commit stage of
+/// [`sync_one_batch`]): the upstream served the range fine, but scanning it into the local
+/// wallet database failed - e.g. `Wallet(PutBlocksCommitmentTree { .. Insert(Conflict(..)) })`
+/// from an inconsistent on-disk note-commitment tree, or blocks past a network upgrade this
+/// build cannot parse. Wrapped as a distinct type (recoverable via `anyhow`'s `downcast_ref`)
+/// so the actor can tell this class apart from transport failures: reconnecting can fix a
+/// transport error, but a *persistent* apply failure at the same range means the local
+/// database cannot accept valid chain data, and the actor escalates its log guidance
+/// accordingly (unsupported upgrade → update zecd; otherwise → `zecd rescan`).
+#[derive(Debug)]
+pub struct WalletApplyError(pub String);
+
+impl std::fmt::Display for WalletApplyError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for WalletApplyError {}
+
 /// Download Sapling + Orchard note-commitment subtree roots and hand them to the wallet.
 /// Run once at startup (and cheaply repeatable).
 pub async fn update_subtree_roots<C: ChainSource>(
@@ -307,8 +327,9 @@ fn perform_rewind(
                 Err(SqliteClientError::RequestedRewindInvalid { .. }) => Err(anyhow!(
                     "unrecoverable reorg at {at_height}: no note-commitment-tree checkpoint \
                      with a scanned block exists below the conflict (requested rewind to \
-                     {requested}); restore the wallet from its mnemonic into a fresh \
-                     directory (`zecd init --restore`) to resync from the wallet birthday"
+                     {requested}); stop the daemon and run `zecd rescan --wallet {name}` to \
+                     rebuild the wallet database from the seed (keys.toml is kept) and resync \
+                     from the wallet birthday"
                 )),
                 Err(e) => Err(e.into()),
             }
@@ -425,7 +446,10 @@ fn scan_blocks(
                 reorged: false,
             })
         }
-        Err(e) => Err(anyhow!("{:?}", e)),
+        // Any other scan failure is an apply-side error: the blocks arrived, the wallet DB
+        // couldn't absorb them. Typed so the actor's persistent-failure diagnostics can
+        // distinguish it from a transport error (see [`WalletApplyError`]).
+        Err(e) => Err(anyhow::Error::new(WalletApplyError(format!("{e:?}")))),
     }
 }
 

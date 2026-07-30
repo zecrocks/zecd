@@ -46,7 +46,9 @@ use zip321::TransactionRequest;
 
 use crate::backend::Server;
 use crate::backoff::Backoff;
-use crate::chain::{AnySource, BroadcastOutcome, ChainSource, MempoolStream};
+use crate::chain::{
+    AnySource, BroadcastOutcome, ChainSource, MempoolStream, ServerInfo, UnsupportedUpgrade,
+};
 use crate::config::SendPrivacy;
 use crate::error::{codes, RpcError};
 use crate::network::ZNetwork;
@@ -145,6 +147,70 @@ const UNARY_RPC_TIMEOUT: Duration = Duration::from_secs(30);
 /// Minimum spacing between retries after a sync error, so a persistent failure (e.g. an
 /// unrecoverable reorg) can't spin the actor loop at full speed reconnecting and re-failing.
 const SYNC_ERROR_RETRY_INTERVAL: Duration = Duration::from_secs(2);
+
+/// How many consecutive *identical* apply-side sync failures before the log escalates from the
+/// raw error to wallet-database recovery guidance. A one-off apply error can be transient (a
+/// reorg racing the batch); the same error failing this many paced retries in a row is the
+/// stuck loop an operator otherwise stares at for thousands of iterations with no hint.
+const PERSISTENT_SYNC_ERROR_THRESHOLD: u32 = 3;
+
+/// The operator action line for an unsupported-network-upgrade condition. One place, so the
+/// connect-time announcement and the sync-error attribution can't drift apart.
+const UPGRADE_GUIDANCE: &str = "Update to the latest zecd release; if you are already on the \
+     latest release, please report this at https://forum.zcashcommunity.com";
+
+/// Build the recovery guidance (if any) to append to a failed sync pass's log line.
+///
+/// Only *apply-side* failures ([`engine::WalletApplyError`]: the upstream served the blocks,
+/// committing them to the wallet DB failed) are ever attributed - a transport failure is fixed
+/// by reconnecting, and telling an operator to rebuild their wallet over a zebra outage would
+/// be actively harmful. Within that class:
+///  * an unsupported network upgrade already ruling the chain explains the failure outright
+///    (the scan is hitting post-activation blocks this build cannot parse), so it is named
+///    immediately - this is the "old zecd after NU6.3 activated" loop; and
+///  * otherwise, once the same error has repeated [`PERSISTENT_SYNC_ERROR_THRESHOLD`] times,
+///    the wallet database itself is the prime suspect (e.g. a shardtree `Insert(Conflict)`
+///    that no restart or version upgrade clears), and the guidance points at the
+///    `zecd rescan` rebuild.
+///
+/// Pure so it is unit-testable without a [`WalletActor`]; the actor supplies the streak and
+/// the already-relevant upgrade (active, or pending with an activation height at/below the
+/// upstream tip).
+fn sync_failure_hint(
+    apply_side: bool,
+    streak: u32,
+    wallet: &str,
+    upgrade: Option<&UnsupportedUpgrade>,
+) -> Option<String> {
+    if !apply_side {
+        return None;
+    }
+    if let Some(u) = upgrade {
+        let height = u
+            .activation_height
+            .map(|h| format!(", activated at height {h}"))
+            .unwrap_or_default();
+        return Some(format!(
+            "likely cause: this zecd build does not support network upgrade '{}' (consensus \
+             branch 0x{:08x}{height}), so blocks past its activation cannot be scanned. \
+             {UPGRADE_GUIDANCE}",
+            sanitize_upstream_msg(&u.name),
+            u.branch_id,
+        ));
+    }
+    if streak >= PERSISTENT_SYNC_ERROR_THRESHOLD {
+        return Some(format!(
+            "the same error has now failed {streak} consecutive sync passes: the upstream is \
+             serving blocks but the wallet database cannot apply them, which restarting or \
+             upgrading zecd will not fix if the database itself is inconsistent. Stop the \
+             daemon and run `zecd rescan --wallet {wallet}` to rebuild the wallet database \
+             from the seed (keys.toml is kept; funds and history are re-derived by rescanning \
+             from the wallet birthday). If this looks like a zecd bug, please report it at \
+             https://forum.zcashcommunity.com"
+        ));
+    }
+    None
+}
 
 /// The reconnect deadline to set after a sync error: a fixed floor past `now`. Extracted as a
 /// free function (rather than inlined into the run loop) so the pacing is unit-testable without
@@ -518,6 +584,19 @@ struct WalletActor {
     /// For an encrypted wallet that's currently unlocked: when the seed auto-relocks. Re-running
     /// `walletpassphrase` overwrites it (resetting the timer); `walletlock` clears it.
     unlock_until: Option<Instant>,
+    /// Network upgrades the connected upstream reports whose consensus branch IDs this build
+    /// does not recognize (captured at each connect from `getblockchaininfo`; see
+    /// [`crate::chain::unsupported_upgrades`]). An *active* entry means the chain is already
+    /// governed by rules this build can't scan under - the cause behind an otherwise-mysterious
+    /// stuck sync loop - and a *pending* one is the advance warning to update zecd before
+    /// activation. Drives the connect-time announcements and the sync-error attribution.
+    unsupported_upgrades: Vec<UnsupportedUpgrade>,
+    /// The display text of the most recent sync error, and how many consecutive sync passes
+    /// have failed with exactly it. Reset on any successful pass. A growing streak of the
+    /// *same* apply-side error is the "this will not fix itself" signal that escalates the log
+    /// from the raw error to recovery guidance (see [`sync_failure_hint`]).
+    last_sync_error: Option<String>,
+    sync_error_streak: u32,
     /// Serviceable transaction-data requests already attempted in the current enhancement drain.
     /// Mirrors zcash-devtool/zkv's per-pass `satisfied` set, but carried across `enhance_step`
     /// batches so a request the upstream can't satisfy (left in the DB after servicing) is
@@ -799,6 +878,9 @@ pub async fn spawn(
         encrypted,
         watch_only,
         unlock_until: None,
+        unsupported_upgrades: Vec::new(),
+        last_sync_error: None,
+        sync_error_streak: 0,
         enhance_satisfied: std::collections::BTreeSet::new(),
         enhance_progress: None,
         shutdown: cfg.shutdown,
@@ -1156,6 +1238,9 @@ impl WalletActor {
                 }
                 match self.sync_step_caught().await {
                     Ok(worked) => {
+                        // A successful pass ends any failure streak (see `note_sync_error`).
+                        self.last_sync_error = None;
+                        self.sync_error_streak = 0;
                         if worked {
                             more_work = true;
                             // New blocks were scanned, which may add or re-satisfy enhancement
@@ -1193,7 +1278,13 @@ impl WalletActor {
                         // the backoff-paced deadline at a fixed minimum so even a base-delay
                         // backoff (or a near-zero jitter draw) still caps this to one attempt per
                         // interval; a transient error just costs this small delay.
-                        self.mark_disconnected(format!("sync error: {e}"));
+                        //
+                        // `note_sync_error` tracks the failure streak and appends recovery
+                        // guidance when the failure is diagnosable: an unsupported network
+                        // upgrade (update zecd / report on the forum) or a persistent
+                        // wallet-database apply error (`zecd rescan`).
+                        let reason = self.note_sync_error(&e);
+                        self.mark_disconnected(reason);
                         self.reconnect_at = self
                             .reconnect_at
                             .max(sync_error_retry_deadline(Instant::now()));
@@ -1419,6 +1510,66 @@ impl WalletActor {
         }
     }
 
+    /// Announce, once per connection, every upstream-reported network upgrade this build does
+    /// not recognize. An *active* one is an error - the scan will fail at (or is already
+    /// failing past) its activation, and nothing but a newer zecd fixes that - while a
+    /// *pending* one is the advance warning that lets an operator update before the network
+    /// switches, instead of discovering the gap later as a stuck sync loop.
+    fn log_unsupported_upgrades(&self) {
+        for u in &self.unsupported_upgrades {
+            let name = sanitize_upstream_msg(&u.name);
+            let height = u
+                .activation_height
+                .map(|h| h.to_string())
+                .unwrap_or_else(|| "unknown".to_string());
+            if u.active {
+                error!(
+                    "[{}] the upstream chain has activated network upgrade '{name}' (consensus \
+                     branch 0x{:08x}, activation height {height}) which this zecd build does \
+                     not support: block scanning cannot proceed past the activation. \
+                     {UPGRADE_GUIDANCE}",
+                    self.name, u.branch_id
+                );
+            } else {
+                warn!(
+                    "[{}] the upstream reports network upgrade '{name}' (consensus branch \
+                     0x{:08x}) activating at height {height}, which this zecd build does not \
+                     support: syncing will stop there. {UPGRADE_GUIDANCE}",
+                    self.name, u.branch_id
+                );
+            }
+        }
+    }
+
+    /// Record a failed sync pass and build the disconnect reason for it: the raw error, plus
+    /// [`sync_failure_hint`]'s recovery guidance when the failure is diagnosable (an
+    /// unsupported network upgrade, or a persistently-repeating wallet-database error). The
+    /// streak only counts consecutive passes failing with the *same* display text - a changing
+    /// error means the wallet is moving (e.g. through distinct reorg stages), not stuck.
+    fn note_sync_error(&mut self, e: &anyhow::Error) -> String {
+        let msg = format!("sync error: {e}");
+        if self.last_sync_error.as_deref() == Some(msg.as_str()) {
+            self.sync_error_streak = self.sync_error_streak.saturating_add(1);
+        } else {
+            self.last_sync_error = Some(msg.clone());
+            self.sync_error_streak = 1;
+        }
+        // An upgrade is "in play" once active per the upstream, or once its announced
+        // activation height is at/below the tip we've seen (the status is a snapshot from
+        // connect time and can go stale across the boundary).
+        let upgrade = self.unsupported_upgrades.iter().find(|u| {
+            u.active
+                || u.activation_height
+                    .zip(self.tip_height)
+                    .is_some_and(|(h, tip)| h <= tip)
+        });
+        let apply_side = e.downcast_ref::<engine::WalletApplyError>().is_some();
+        match sync_failure_hint(apply_side, self.sync_error_streak, &self.name, upgrade) {
+            Some(hint) => format!("{msg} ({hint})"),
+            None => msg,
+        }
+    }
+
     /// Connect to the upstream zebrad endpoint. On success, store the client (after the
     /// subtree-root health check). On failure, leave `self.client` as `None` and return the
     /// error. The backoff is *not* reset here: a connect that immediately fails post-connection
@@ -1434,7 +1585,7 @@ impl WalletActor {
         self.client = Some(client);
         let client = self.client.as_mut().expect("just set");
         // A reachable-but-unhealthy upstream can still fail here; treat that as a failed connect.
-        if let Err(e) = prepare_client(
+        match prepare_client(
             client,
             &mut self.db_data,
             self.network,
@@ -1443,9 +1594,19 @@ impl WalletActor {
         )
         .await
         {
-            warn!("[{}] health check failed on {}: {e}", self.name, describe);
-            self.client = None;
-            return Err(e);
+            Err(e) => {
+                warn!("[{}] health check failed on {}: {e}", self.name, describe);
+                self.client = None;
+                return Err(e);
+            }
+            Ok(info) => {
+                // Refresh the outdated-build detection from what this upstream reports and
+                // announce any gap once per connection (a persistent apply failure reconnects
+                // on the paced retry, so an active gap stays visible in the log alongside each
+                // "sync error" it causes).
+                self.unsupported_upgrades = crate::chain::unsupported_upgrades(&info);
+                self.log_unsupported_upgrades();
+            }
         }
         // NB: do not call `update_status()` here - `get_wallet_summary`'s progress
         // estimator underflows if invoked before the chain tip is set (see `refresh_tip`).
@@ -4313,14 +4474,14 @@ async fn prepare_client<C: ChainSource>(
     network: ZNetwork,
     roots_synced: &mut bool,
     budget: Duration,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<ServerInfo> {
     tokio::time::timeout(budget, async {
-        verify_server_network(client, network).await?;
+        let info = verify_server_network(client, network).await?;
         if !*roots_synced {
             engine::update_subtree_roots(client, db_data).await?;
             *roots_synced = true;
         }
-        Ok::<(), anyhow::Error>(())
+        Ok::<ServerInfo, anyhow::Error>(info)
     })
     .await
     .map_err(|_| anyhow!("upstream health check timed out after {budget:?}"))?
@@ -4332,11 +4493,12 @@ async fn prepare_client<C: ChainSource>(
 /// apart from here - and the guard's job is ensuring a mainnet wallet never scans a test
 /// chain (or vice versa). A definitive cross is a hard error so the caller fails over to
 /// the next candidate; an unrecognized name is only a warning, since not every server
-/// reports one.
+/// reports one. On success the fetched [`ServerInfo`] is returned so the caller can also
+/// inspect the upstream's reported network upgrades (the outdated-build detector).
 async fn verify_server_network<C: ChainSource>(
     client: &mut C,
     network: ZNetwork,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<ServerInfo> {
     let info = client.server_info().await?;
     match chain_name_is_main(&info.chain_name) {
         Some(server_is_main) => {
@@ -4354,7 +4516,7 @@ async fn verify_server_network<C: ChainSource>(
             info.chain_name
         ),
     }
-    Ok(())
+    Ok(info)
 }
 
 /// Classify a lightwalletd `chain_name` as mainnet (`Some(true)`), a test chain
@@ -5265,6 +5427,67 @@ mod tests {
         );
         // The deadline is strictly in the future of the error, so the idle loop waits.
         assert!(deadline > now);
+    }
+
+    /// The sync-failure diagnostics ladder (`sync_failure_hint`): transport failures are never
+    /// attributed (reconnecting genuinely fixes those, and telling an operator to rebuild a
+    /// wallet over a zebra outage would be harmful); an apply-side failure under an active
+    /// unsupported network upgrade is attributed immediately (the "old zecd after activation"
+    /// loop); and an apply-side failure that keeps repeating with no upgrade in play points at
+    /// the `zecd rescan` database rebuild - each with the operator action (update / rescan /
+    /// forum report) spelled out in the message.
+    #[test]
+    fn sync_failure_hint_attributes_only_diagnosable_failures() {
+        use super::{sync_failure_hint, PERSISTENT_SYNC_ERROR_THRESHOLD};
+        use crate::chain::UnsupportedUpgrade;
+
+        let upgrade = UnsupportedUpgrade {
+            branch_id: 0xdead_beef,
+            name: "NU-Future".to_string(),
+            activation_height: Some(4_100_000),
+            active: true,
+        };
+
+        // Transport-class failures: no hint, no matter the streak or upgrade state.
+        assert_eq!(sync_failure_hint(false, 100, "default", None), None);
+        assert_eq!(
+            sync_failure_hint(false, 100, "default", Some(&upgrade)),
+            None
+        );
+
+        // Apply-side + unsupported upgrade: attributed on the very first failure, naming the
+        // upgrade, its branch ID and height, and the update-or-report action.
+        let hint = sync_failure_hint(true, 1, "default", Some(&upgrade))
+            .expect("an active unsupported upgrade explains the failure immediately");
+        assert!(hint.contains("NU-Future"), "{hint}");
+        assert!(hint.contains("0xdeadbeef"), "{hint}");
+        assert!(hint.contains("4100000"), "{hint}");
+        assert!(hint.contains("latest zecd release"), "{hint}");
+        assert!(hint.contains("forum.zcashcommunity.com"), "{hint}");
+
+        // Apply-side, no upgrade: quiet below the persistence threshold (a one-off apply error
+        // can be a reorg racing the batch)...
+        assert_eq!(
+            sync_failure_hint(true, PERSISTENT_SYNC_ERROR_THRESHOLD - 1, "default", None),
+            None
+        );
+        // ...and at the threshold, the wallet database is the prime suspect: point at the
+        // keys-preserving `zecd rescan` rebuild (naming the wallet) and the forum.
+        let hint = sync_failure_hint(true, PERSISTENT_SYNC_ERROR_THRESHOLD, "burner", None)
+            .expect("a persistent apply failure escalates to recovery guidance");
+        assert!(hint.contains("zecd rescan --wallet burner"), "{hint}");
+        assert!(hint.contains("keys.toml is kept"), "{hint}");
+        assert!(hint.contains("forum.zcashcommunity.com"), "{hint}");
+
+        // An upstream-supplied upgrade name is operator-trusted, not wire-trusted: control
+        // characters are stripped before it is echoed into the log line.
+        let hostile = UnsupportedUpgrade {
+            name: "NU\x1b[2J\x07-Evil".to_string(),
+            ..upgrade
+        };
+        let hint = sync_failure_hint(true, 1, "default", Some(&hostile)).expect("still hints");
+        assert!(hint.contains("NU[2J-Evil"), "{hint}");
+        assert!(!hint.contains('\x1b'), "control chars stripped: {hint:?}");
     }
 
     /// The launch-time data-directory writability probe: succeeds on a fresh writable dir

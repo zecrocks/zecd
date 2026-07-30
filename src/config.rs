@@ -724,6 +724,11 @@ pub enum Command {
     /// Print the annotated example configuration file to stdout (or `--output-file`), then
     /// exit. Redirect it to `<datadir>/zecd.toml` and edit to taste.
     ExampleConfig(ExampleConfigArgs),
+    /// Rebuild a wallet whose database is broken: delete the wallet database (keys.toml and
+    /// the seed are kept) so the next daemon start recreates the account from the seed and
+    /// rescans the chain from the wallet birthday, re-deriving all funds and history. Refuses
+    /// to run while the daemon holds the data directory.
+    Rescan(RescanArgs),
     /// Run the JSON-RPC daemon (default).
     Run,
 }
@@ -788,6 +793,17 @@ pub struct ExportUfvkArgs {
     /// Wallet name (selects <datadir>/<name>).
     #[arg(long, default_value = "default")]
     pub wallet: String,
+}
+
+#[derive(Debug, clap::Args)]
+pub struct RescanArgs {
+    /// Wallet name (selects <datadir>/<name>).
+    #[arg(long, default_value = "default")]
+    pub wallet: String,
+
+    /// Skip the interactive confirmation prompt (for non-interactive/automated recovery).
+    #[arg(long)]
+    pub yes: bool,
 }
 
 impl AppConfig {

@@ -9,7 +9,8 @@
 //! | `compact_block_range` | `getblock verbosity=0` (raw block, parsed + compacted      |
 //! |                       | locally) + `getblock verbosity=1` (`trees` sizes)          |
 //! | `subtree_roots`       | `z_getsubtreesbyindex`                                     |
-//! | `server_info`         | `getblockchaininfo` (`chain`)                              |
+//! | `server_info`         | `getblockchaininfo` (`chain`, `upgrades`, `consensus` -    |
+//! |                       | the latter two feed the outdated-build detector)           |
 //! | `broadcast_tx`        | `sendrawtransaction`                                       |
 //! | `fetch_tx`            | `getrawtransaction verbose=1`                              |
 //! | `subscribe_mempool`   | `getrawmempool` + `getrawtransaction`, polled; the stream  |
@@ -53,7 +54,7 @@ use zcash_protocol::{ShieldedPool, TxId};
 
 use super::{
     BroadcastOutcome, ChainSource, ChainTip, CompactBlockStream, FetchedTx, MempoolStream,
-    ServerInfo, SubtreeRootInfo,
+    ServerInfo, SubtreeRootInfo, UpgradeInfo, UpgradeStatus,
 };
 use crate::network::ZNetwork;
 
@@ -418,6 +419,80 @@ struct BlockchainInfo {
     chain: String,
     blocks: u32,
     bestblockhash: String,
+    /// Keyed by the upgrade's consensus branch ID in hex. Feeds the outdated-build detector
+    /// (`chain::unsupported_upgrades`); defaulted so an upstream that omits the field (or a
+    /// minimal fake) still parses - absence just disables the detection.
+    #[serde(default)]
+    upgrades: std::collections::HashMap<String, UpgradeEntry>,
+    #[serde(default)]
+    consensus: Option<ConsensusBranchIds>,
+}
+
+/// One `getblockchaininfo.upgrades` value: `{ "name": ..., "activationheight": ...,
+/// "status": "pending"|"active" }` (zcashd additionally reports `"disabled"`). Every field is
+/// defaulted - a partially-shaped entry from an unusual upstream must not fail the whole
+/// `getblockchaininfo` parse, which `latest_block`/`server_info` (and thus connect) ride on.
+#[derive(Debug, Deserialize)]
+struct UpgradeEntry {
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(rename = "activationheight", default)]
+    activation_height: Option<u32>,
+    #[serde(default)]
+    status: Option<String>,
+}
+
+/// `getblockchaininfo.consensus`: the branch IDs (hex) in force at the chain tip and for the
+/// next block.
+#[derive(Debug, Deserialize)]
+struct ConsensusBranchIds {
+    #[serde(default)]
+    chaintip: Option<String>,
+    #[serde(default)]
+    nextblock: Option<String>,
+}
+
+/// A consensus branch ID as `getblockchaininfo` spells it: bare hex, no `0x` prefix.
+fn parse_branch_id(hex_str: &str) -> Option<u32> {
+    u32::from_str_radix(hex_str.trim(), 16).ok()
+}
+
+/// Convert a `getblockchaininfo` reply into the trait-level [`ServerInfo`]. Upgrade-map keys
+/// that don't parse as branch-ID hex are dropped (there is nothing to compare them against);
+/// the entries are sorted by activation height (then branch ID) so downstream logging is
+/// deterministic despite the map's random iteration order.
+fn server_info_from(info: BlockchainInfo) -> ServerInfo {
+    let mut upgrades: Vec<UpgradeInfo> = info
+        .upgrades
+        .into_iter()
+        .filter_map(|(key, entry)| {
+            let branch_id = parse_branch_id(&key)?;
+            Some(UpgradeInfo {
+                branch_id,
+                name: entry.name.unwrap_or_else(|| "unknown upgrade".to_string()),
+                activation_height: entry.activation_height,
+                status: match entry.status.as_deref() {
+                    Some("active") => UpgradeStatus::Active,
+                    Some("pending") => UpgradeStatus::Pending,
+                    _ => UpgradeStatus::Other,
+                },
+            })
+        })
+        .collect();
+    upgrades.sort_by_key(|u| (u.activation_height.unwrap_or(u32::MAX), u.branch_id));
+    let (tip_branch_id, next_block_branch_id) = match &info.consensus {
+        Some(c) => (
+            c.chaintip.as_deref().and_then(parse_branch_id),
+            c.nextblock.as_deref().and_then(parse_branch_id),
+        ),
+        None => (None, None),
+    };
+    ServerInfo {
+        chain_name: info.chain,
+        upgrades,
+        tip_branch_id,
+        next_block_branch_id,
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -638,9 +713,7 @@ impl ChainSource for ZebraSource {
 
     async fn server_info(&mut self) -> anyhow::Result<ServerInfo> {
         let info = self.client.blockchain_info().await?;
-        Ok(ServerInfo {
-            chain_name: info.chain,
-        })
+        Ok(server_info_from(info))
     }
 
     async fn broadcast_tx(&mut self, data: Vec<u8>) -> anyhow::Result<BroadcastOutcome> {
@@ -1232,6 +1305,11 @@ mod tests {
         send_error_object: Option<Value>,
         /// Authorization header values observed, in order.
         seen_auth: Vec<Option<String>>,
+        /// When set, `getblockchaininfo` includes these as its `upgrades` / `consensus`
+        /// fields (both omitted by default, like a minimal upstream - the parser must not
+        /// depend on them).
+        upgrades: Option<Value>,
+        consensus: Option<Value>,
     }
 
     impl Fake {
@@ -1251,6 +1329,8 @@ mod tests {
                 send: Ok("00".repeat(32)),
                 send_error_object: None,
                 seen_auth: Vec::new(),
+                upgrades: None,
+                consensus: None,
             }
         }
     }
@@ -1279,11 +1359,20 @@ mod tests {
             }))
         };
         match method.as_str() {
-            "getblockchaininfo" => reply(json!({
-                "chain": fake.chain,
-                "blocks": fake.blocks,
-                "bestblockhash": fake.best,
-            })),
+            "getblockchaininfo" => {
+                let mut body = json!({
+                    "chain": fake.chain,
+                    "blocks": fake.blocks,
+                    "bestblockhash": fake.best,
+                });
+                if let Some(u) = &fake.upgrades {
+                    body["upgrades"] = u.clone();
+                }
+                if let Some(c) = &fake.consensus {
+                    body["consensus"] = c.clone();
+                }
+                reply(body)
+            }
             "getbestblockhash" => reply(json!(fake.best)),
             "getblock" => {
                 let key = params[0].as_str().unwrap_or_default().to_string();
@@ -1458,6 +1547,54 @@ mod tests {
 
         let info = src.server_info().await.unwrap();
         assert_eq!(info.chain_name, "main");
+        // A minimal upstream reply (no `upgrades`/`consensus` fields, like this fake's
+        // default) must still parse - the detection is best-effort, never a hard dependency.
+        assert!(info.upgrades.is_empty());
+        assert_eq!(info.tip_branch_id, None);
+        assert_eq!(info.next_block_branch_id, None);
+    }
+
+    /// `server_info` parses zebra's `getblockchaininfo.upgrades` map (keys are consensus
+    /// branch IDs in hex) and the `consensus` branch IDs - the raw material for the
+    /// outdated-build detector (`chain::unsupported_upgrades`). Entries come back sorted by
+    /// activation height (the map's iteration order is random), a non-hex key is dropped, and
+    /// a partially-shaped entry still parses with defaults.
+    #[tokio::test]
+    async fn server_info_parses_upgrades_and_consensus_branch_ids() {
+        let fake = Arc::new(Mutex::new(Fake::new()));
+        fake.lock().unwrap().upgrades = Some(json!({
+            // Realistic zebra entries, deliberately inserted out of height order.
+            "c8e71055": { "name": "NU6", "activationheight": 2726400, "status": "active" },
+            "c2d6d0b4": { "name": "NU5", "activationheight": 1687104, "status": "active" },
+            "deadbeef": { "name": "NU-Future", "activationheight": 4900000, "status": "pending" },
+            // A key that isn't branch-ID hex has nothing to compare against: dropped.
+            "not-hex": { "name": "Bogus", "activationheight": 1, "status": "active" },
+            // A shape-degraded entry (no name/height/status) still parses.
+            "0badcafe": {},
+        }));
+        fake.lock().unwrap().consensus = Some(json!({
+            "chaintip": "c8e71055",
+            "nextblock": "c8e71055",
+        }));
+        let mut src = source_for(fake).await;
+
+        let info = src.server_info().await.unwrap();
+        let ids: Vec<u32> = info.upgrades.iter().map(|u| u.branch_id).collect();
+        assert_eq!(
+            ids,
+            vec![0xc2d6_d0b4, 0xc8e7_1055, 0xdead_beef, 0x0bad_cafe],
+            "sorted by activation height, heightless entries last, non-hex key dropped"
+        );
+        assert_eq!(info.upgrades[0].name, "NU5");
+        assert_eq!(info.upgrades[0].activation_height, Some(1_687_104));
+        assert_eq!(info.upgrades[0].status, UpgradeStatus::Active);
+        assert_eq!(info.upgrades[2].status, UpgradeStatus::Pending);
+        // The degraded entry defaults rather than failing the parse.
+        assert_eq!(info.upgrades[3].name, "unknown upgrade");
+        assert_eq!(info.upgrades[3].activation_height, None);
+        assert_eq!(info.upgrades[3].status, UpgradeStatus::Other);
+        assert_eq!(info.tip_branch_id, Some(0xc8e7_1055));
+        assert_eq!(info.next_block_branch_id, Some(0xc8e7_1055));
     }
 
     /// Regression guard for the tip-advance step of the -25 (already-expired) send fix: a

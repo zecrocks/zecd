@@ -15,7 +15,7 @@ use std::future::Future;
 
 use zcash_client_backend::proto::compact_formats::CompactBlock;
 use zcash_client_backend::proto::service;
-use zcash_protocol::consensus::BlockHeight;
+use zcash_protocol::consensus::{BlockHeight, BranchId};
 use zcash_protocol::{ShieldedPool, TxId};
 
 /// The chain tip as reported by the upstream. `hash` is in internal byte order (reverse of
@@ -67,9 +67,106 @@ pub struct TransparentUtxo {
 
 /// Upstream identity, used by the wrong-chain guard. `chain_name` follows zcashd's
 /// `getblockchaininfo.chain` / lightwalletd's `chain_name`: `"main"`, `"test"`, `"regtest"`.
+///
+/// The upgrade fields feed the outdated-build detector ([`unsupported_upgrades`]): the node
+/// reached its chain tip by validating every activated upgrade, so what *it* reports is the
+/// authoritative list of consensus rules this wallet must understand to scan that chain. All
+/// three are best-effort - an upstream that doesn't report them yields an empty list / `None`,
+/// which simply disables the detection (never an error).
 #[derive(Clone, Debug)]
 pub struct ServerInfo {
     pub chain_name: String,
+    /// The network upgrades the upstream node knows of (`getblockchaininfo.upgrades`), sorted
+    /// by activation height. Empty when the upstream doesn't report them.
+    pub upgrades: Vec<UpgradeInfo>,
+    /// Consensus branch ID in force at the upstream's chain tip
+    /// (`getblockchaininfo.consensus.chaintip`).
+    pub tip_branch_id: Option<u32>,
+    /// Consensus branch ID the next mined block will follow
+    /// (`getblockchaininfo.consensus.nextblock`). Differs from the tip's only on the last
+    /// pre-activation block.
+    pub next_block_branch_id: Option<u32>,
+}
+
+/// One `getblockchaininfo.upgrades` entry, as the upstream reports it.
+#[derive(Clone, Debug)]
+pub struct UpgradeInfo {
+    /// The upgrade's consensus branch ID (the map key, parsed from hex).
+    pub branch_id: u32,
+    /// The upstream's display name for the upgrade (e.g. `"NU6.3"`). Operator-trusted text -
+    /// sanitize before echoing it into logs or errors.
+    pub name: String,
+    /// The height the upgrade activates (or activated) at, when reported.
+    pub activation_height: Option<u32>,
+    pub status: UpgradeStatus,
+}
+
+/// A `getblockchaininfo.upgrades` entry's `status`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum UpgradeStatus {
+    /// Announced with a future activation height.
+    Pending,
+    /// In force at the upstream's chain tip.
+    Active,
+    /// Anything else the upstream reports (zcashd's `"disabled"`, unrecognized strings).
+    Other,
+}
+
+/// A network upgrade the upstream chain follows (or is about to follow) whose consensus branch
+/// ID this zecd build does not recognize - the "this zecd is outdated" signal. When the NU6.3
+/// (ironwood) upgrade activated, builds that predated it kept fetching post-activation blocks
+/// they could not apply and looped on the same sync error forever with no explanation; this is
+/// the datum that lets the actor say *why* instead.
+#[derive(Clone, Debug)]
+pub struct UnsupportedUpgrade {
+    pub branch_id: u32,
+    /// Upstream-reported name, or `"unknown upgrade"` when only a bare branch ID was seen.
+    pub name: String,
+    pub activation_height: Option<u32>,
+    /// Whether the upgrade is already in force at the upstream tip (as opposed to pending at a
+    /// future height).
+    pub active: bool,
+}
+
+/// The network upgrades the upstream reports that this build's librustzcash does not recognize
+/// (its [`BranchId`] enumeration is the complete set of consensus rules this build can scan
+/// under). Only `active`/`pending` entries count - a disabled upgrade will never rule the
+/// chain. The `consensus` branch IDs are a belt over the upgrades map: an unrecognized branch
+/// ruling the tip (or the very next block) is reported as an active unsupported upgrade even
+/// if the upgrades map omitted it.
+pub fn unsupported_upgrades(info: &ServerInfo) -> Vec<UnsupportedUpgrade> {
+    let known = |id: u32| BranchId::try_from(id).is_ok();
+    let mut out: Vec<UnsupportedUpgrade> = info
+        .upgrades
+        .iter()
+        .filter(|u| matches!(u.status, UpgradeStatus::Active | UpgradeStatus::Pending))
+        .filter(|u| !known(u.branch_id))
+        .map(|u| UnsupportedUpgrade {
+            branch_id: u.branch_id,
+            name: u.name.clone(),
+            activation_height: u.activation_height,
+            active: u.status == UpgradeStatus::Active,
+        })
+        .collect();
+    for id in [info.tip_branch_id, info.next_block_branch_id]
+        .into_iter()
+        .flatten()
+    {
+        if !known(id) {
+            match out.iter_mut().find(|u| u.branch_id == id) {
+                // The chain is already (or imminently) governed by these rules; a map entry
+                // still marked pending is promoted so callers treat it with active severity.
+                Some(u) => u.active = true,
+                None => out.push(UnsupportedUpgrade {
+                    branch_id: id,
+                    name: "unknown upgrade".to_string(),
+                    activation_height: None,
+                    active: true,
+                }),
+            }
+        }
+    }
+    out
 }
 
 /// The upstream's verdict on a broadcast transaction. `error_code == 0` means accepted;
@@ -317,5 +414,113 @@ impl MempoolStream {
         match self {
             MempoolStream::Zebra(s) => s.message().await,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn info(upgrades: Vec<UpgradeInfo>, tip: Option<u32>, next: Option<u32>) -> ServerInfo {
+        ServerInfo {
+            chain_name: "main".to_string(),
+            upgrades,
+            tip_branch_id: tip,
+            next_block_branch_id: next,
+        }
+    }
+
+    fn upgrade(branch_id: u32, name: &str, height: u32, status: UpgradeStatus) -> UpgradeInfo {
+        UpgradeInfo {
+            branch_id,
+            name: name.to_string(),
+            activation_height: Some(height),
+            status,
+        }
+    }
+
+    /// NU6 (0xc8e71055) and NU5 (0xc2d6d0b4) are branch IDs every supported build knows;
+    /// 0xdeadbeef stands in for a future upgrade this build predates.
+    const KNOWN_NU5: u32 = 0xc2d6_d0b4;
+    const KNOWN_NU6: u32 = 0xc8e7_1055;
+    const FUTURE: u32 = 0xdead_beef;
+
+    /// A fully-recognized upgrade list (the healthy steady state) reports nothing, whatever the
+    /// statuses - the detector must never cry wolf on a chain this build fully understands.
+    #[test]
+    fn all_known_upgrades_are_supported() {
+        let i = info(
+            vec![
+                upgrade(KNOWN_NU5, "NU5", 1_687_104, UpgradeStatus::Active),
+                upgrade(KNOWN_NU6, "NU6", 2_726_400, UpgradeStatus::Active),
+            ],
+            Some(KNOWN_NU6),
+            Some(KNOWN_NU6),
+        );
+        assert!(unsupported_upgrades(&i).is_empty());
+    }
+
+    /// An upstream that doesn't report upgrades at all (empty map, no consensus IDs) disables
+    /// the detection rather than erroring or guessing.
+    #[test]
+    fn absent_upgrade_data_reports_nothing() {
+        assert!(unsupported_upgrades(&info(vec![], None, None)).is_empty());
+    }
+
+    /// The core outdated-build case: the upstream lists an upgrade whose branch ID this build's
+    /// `BranchId` cannot parse. Active and pending entries are both reported (pending is the
+    /// advance warning that lets an operator update *before* the network switches); a
+    /// disabled/other entry is not - it will never rule the chain.
+    #[test]
+    fn unknown_branch_ids_are_reported_with_their_status() {
+        let i = info(
+            vec![
+                upgrade(KNOWN_NU6, "NU6", 2_726_400, UpgradeStatus::Active),
+                upgrade(FUTURE, "NU-Future", 4_100_000, UpgradeStatus::Active),
+                upgrade(0xfeed_f00d, "NU-Later", 5_000_000, UpgradeStatus::Pending),
+                upgrade(0x0bad_cafe, "NU-Disabled", 0, UpgradeStatus::Other),
+            ],
+            None,
+            None,
+        );
+        let got = unsupported_upgrades(&i);
+        assert_eq!(got.len(), 2, "active + pending unknown, never disabled");
+        assert!(got[0].active && got[0].branch_id == FUTURE);
+        assert_eq!(got[0].name, "NU-Future");
+        assert_eq!(got[0].activation_height, Some(4_100_000));
+        assert!(!got[1].active && got[1].branch_id == 0xfeed_f00d);
+    }
+
+    /// The consensus branch IDs are the belt over the upgrades map: an unrecognized branch
+    /// ruling the tip is reported as active-unsupported even when the map omitted it entirely.
+    #[test]
+    fn unknown_tip_branch_is_reported_without_a_map_entry() {
+        let i = info(vec![], Some(FUTURE), Some(FUTURE));
+        let got = unsupported_upgrades(&i);
+        assert_eq!(got.len(), 1, "one entry, not one per consensus field");
+        assert!(got[0].active);
+        assert_eq!(got[0].branch_id, FUTURE);
+        assert_eq!(got[0].name, "unknown upgrade");
+    }
+
+    /// A pending map entry whose branch ID already rules the next block is promoted to active
+    /// severity: the wallet is about to fetch blocks it cannot apply, so "update before height
+    /// H" would be stale advice.
+    #[test]
+    fn next_block_branch_promotes_a_pending_entry_to_active() {
+        let i = info(
+            vec![upgrade(
+                FUTURE,
+                "NU-Future",
+                4_100_000,
+                UpgradeStatus::Pending,
+            )],
+            Some(KNOWN_NU6),
+            Some(FUTURE),
+        );
+        let got = unsupported_upgrades(&i);
+        assert_eq!(got.len(), 1);
+        assert!(got[0].active, "imminent activation is active severity");
+        assert_eq!(got[0].name, "NU-Future", "the map entry's name is kept");
     }
 }

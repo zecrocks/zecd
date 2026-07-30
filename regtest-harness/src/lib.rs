@@ -23,11 +23,34 @@ use std::time::{Duration, Instant};
 use anyhow::{anyhow, bail, Context, Result};
 use serde_json::{json, Value};
 
-/// Pick an unused loopback TCP port (bind `:0`, read the port, release it). Racy by nature, but
-/// fine for a single-threaded test run.
+/// Pick an unused loopback TCP port for a daemon to bind later.
+///
+/// Deliberately NOT `bind(":0")`-and-release: `:0` hands out ports from the kernel's *ephemeral*
+/// range (32768-60999 on Linux), where any concurrent outbound connection - zebra↔zecd RPC,
+/// reqwest clients, the mempool poller - can grab the released port before its real owner binds
+/// it. That race cost a CI run (zecd's health server lost its pre-picked port to a client socket
+/// and the run continued without health endpoints). Instead, probe sequentially from a
+/// PID-seeded offset in a range *below* the ephemeral floor, which client sockets never touch;
+/// the cursor never re-probes a handed-out port within a process, so back-to-back picks can't
+/// collide with each other either.
 pub fn pick_port() -> Result<u16> {
-    let listener = TcpListener::bind("127.0.0.1:0").context("bind ephemeral port")?;
-    Ok(listener.local_addr()?.port())
+    use std::sync::atomic::{AtomicU16, Ordering};
+    const LO: u16 = 20000;
+    const SPAN: u16 = 12000; // 20000..32000, all below the 32768 ephemeral floor
+    static CURSOR: AtomicU16 = AtomicU16::new(u16::MAX); // sentinel: unseeded
+    let mut off = CURSOR.load(Ordering::Relaxed);
+    if off == u16::MAX {
+        off = (std::process::id() % u32::from(SPAN)) as u16;
+    }
+    for _ in 0..SPAN {
+        let port = LO + (off % SPAN);
+        off = off.wrapping_add(1) % SPAN;
+        if TcpListener::bind(("127.0.0.1", port)).is_ok() {
+            CURSOR.store(off, Ordering::Relaxed);
+            return Ok(port);
+        }
+    }
+    bail!("no free loopback port in {LO}..{}", LO + SPAN)
 }
 
 /// Resolve a required external binary from `$<env_var>`, returning `None` if unset or missing so
@@ -1717,4 +1740,24 @@ port = {health_port}
     );
     std::fs::write(datadir.join("zecd.toml"), toml)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pick_port_stays_below_the_ephemeral_floor_and_binds() {
+        let mut last = None;
+        for _ in 0..8 {
+            let port = pick_port().expect("pick a port");
+            assert!(
+                (20000..32000).contains(&port),
+                "picked port {port} outside the non-ephemeral probe range"
+            );
+            assert_ne!(Some(port), last, "cursor must advance between picks");
+            let _hold = TcpListener::bind(("127.0.0.1", port)).expect("picked port is bindable");
+            last = Some(port);
+        }
+    }
 }

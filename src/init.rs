@@ -19,7 +19,7 @@ use zcash_protocol::consensus::{BlockHeight, NetworkUpgrade, Parameters};
 
 use crate::backend;
 use crate::chain::ChainSource as _;
-use crate::config::{AppConfig, ExportUfvkArgs, InitArgs, WalletEntry};
+use crate::config::{AppConfig, ExportUfvkArgs, InitArgs, RescanArgs, WalletEntry};
 use crate::network::ZNetwork;
 use crate::pools::{Pool, PoolSet};
 use crate::wallet::keys;
@@ -103,18 +103,16 @@ fn read_restore_mnemonic(args: &InitArgs) -> anyhow::Result<Mnemonic<English>> {
     Ok(<Mnemonic<English>>::from_phrase(&phrase)?)
 }
 
-pub async fn run(config: &AppConfig, args: &InitArgs) -> anyhow::Result<()> {
-    // Single-instance guard: take the exclusive datadir lock before creating any wallet, held
-    // until `init` returns. This refuses an `init` against a datadir a running daemon (or another
-    // `init`) already owns, rather than racing it. See `crate::lock`.
-    let _datadir_lock = crate::lock::lock_datadir(&config.datadir)?;
-
-    let entry: WalletEntry = config
+/// Resolve the [`WalletEntry`] for `wallet`: the configured `[wallets.<name>]` entry, or the
+/// default layout (`<datadir>/<name>`, global pool settings) for a wallet the config doesn't
+/// name - exactly the entry the daemon would build for it.
+fn resolve_wallet_entry(config: &AppConfig, wallet: &str) -> WalletEntry {
+    config
         .wallets
-        .get(&args.wallet)
+        .get(wallet)
         .cloned()
         .unwrap_or_else(|| WalletEntry {
-            dir: config.datadir.join(&args.wallet),
+            dir: config.datadir.join(wallet),
             keys_file: None,
             pools: config.pools.enabled.clone(),
             default_receivers: config.pools.default_receivers.clone(),
@@ -126,7 +124,16 @@ pub async fn run(config: &AppConfig, args: &InitArgs) -> anyhow::Result<()> {
                 .pools
                 .transparent_allow_beyond_recovery_window,
             transparent_gap_warn_threshold: config.pools.transparent_gap_warn_threshold,
-        });
+        })
+}
+
+pub async fn run(config: &AppConfig, args: &InitArgs) -> anyhow::Result<()> {
+    // Single-instance guard: take the exclusive datadir lock before creating any wallet, held
+    // until `init` returns. This refuses an `init` against a datadir a running daemon (or another
+    // `init`) already owns, rather than racing it. See `crate::lock`.
+    let _datadir_lock = crate::lock::lock_datadir(&config.datadir)?;
+
+    let entry = resolve_wallet_entry(config, &args.wallet);
     let keys_path = entry.keys_path();
     let enabled_pools = entry.pools.clone();
     // Create the account under the wallet's external transparent gap limit (only when transparent
@@ -393,24 +400,7 @@ pub async fn run(config: &AppConfig, args: &InitArgs) -> anyhow::Result<()> {
 /// is stored for scanning anyway), so this works for locked and passphrase-encrypted wallets
 /// alike and never touches spending material. Offline: no upstream connection is made.
 pub fn export_ufvk(config: &AppConfig, args: &ExportUfvkArgs) -> anyhow::Result<()> {
-    let entry: WalletEntry = config
-        .wallets
-        .get(&args.wallet)
-        .cloned()
-        .unwrap_or_else(|| WalletEntry {
-            dir: config.datadir.join(&args.wallet),
-            keys_file: None,
-            pools: config.pools.enabled.clone(),
-            default_receivers: config.pools.default_receivers.clone(),
-            transparent_enabled: config.pools.transparent_enabled,
-            transparent_default: config.pools.transparent_default,
-            transparent_gap_limit: config.pools.transparent_gap_limit,
-            transparent_initial_scan: config.pools.transparent_initial_scan,
-            transparent_allow_beyond_recovery_window: config
-                .pools
-                .transparent_allow_beyond_recovery_window,
-            transparent_gap_warn_threshold: config.pools.transparent_gap_warn_threshold,
-        });
+    let entry = resolve_wallet_entry(config, &args.wallet);
     let keys_path = entry.keys_path();
     let wallet_dir = entry.dir;
 
@@ -452,6 +442,149 @@ pub fn export_ufvk(config: &AppConfig, args: &ExportUfvkArgs) -> anyhow::Result<
     );
     println!("{}", ufvk.encode(&config.network));
     Ok(())
+}
+
+/// `zecd rescan`: the recovery path for a broken wallet database - e.g. a persistent
+/// `PutBlocksCommitmentTree`/shardtree-conflict sync error that repeats at the same block range
+/// across restarts and version upgrades (the daemon's sync-error log points here when it
+/// detects that pattern). Deletes the wallet's *database* files while **keeping** `keys.toml`
+/// (seed, network, birthday, UFVK pin), so the next daemon start takes the existing
+/// empty-data-directory bootstrap path: it recreates the account from the seed and rescans the
+/// chain from the wallet birthday, re-deriving all funds and history. This is safe by zecd's
+/// statelessness invariant - everything in the database is rebuildable from seed + chain.
+pub fn rescan(config: &AppConfig, args: &RescanArgs) -> anyhow::Result<()> {
+    // Same single-instance guard as `init`: refuses while the daemon (or another writer) owns
+    // the datadir, so the database can't be deleted out from under a live wallet.
+    let _datadir_lock = crate::lock::lock_datadir(&config.datadir)?;
+
+    let entry = resolve_wallet_entry(config, &args.wallet);
+    let removed = rescan_wallet(
+        config.network,
+        &args.wallet,
+        &entry.keys_path(),
+        &entry.dir,
+        |st| {
+            if args.yes {
+                return Ok(true);
+            }
+            eprintln!(
+                "This deletes the wallet database for '{}' at {} (keys.toml and the seed are \
+                 kept).\nOn the next start zecd rebuilds the account from the seed and rescans \
+                 from the wallet birthday ({}), which re-derives all funds and history but can \
+                 take a while.\nType 'yes' to continue:",
+                args.wallet,
+                entry.dir.display(),
+                u32::from(st.birthday)
+            );
+            let mut line = String::new();
+            std::io::stdin().read_line(&mut line)?;
+            Ok(line.trim() == "yes")
+        },
+    )?;
+
+    if removed.is_empty() {
+        eprintln!(
+            "Wallet '{}' has no database files at {}; nothing to delete. The next daemon start \
+             will build it fresh from keys.toml.",
+            args.wallet,
+            entry.dir.display()
+        );
+    } else {
+        eprintln!(
+            "Wallet '{}' database removed ({}).",
+            args.wallet,
+            removed.join(", ")
+        );
+    }
+    let st = WalletStore::read(&entry.keys_path())?;
+    eprintln!(
+        "Start zecd and it will rebuild the account from keys.toml and rescan from birthday {} \
+         (requires [keys] bootstrap_from_keys, which is on by default).{}",
+        u32::from(st.birthday),
+        if st.is_encrypted() {
+            "\nThis wallet is passphrase-encrypted: the rebuild starts at the first \
+             `walletpassphrase` after the daemon is up."
+        } else {
+            ""
+        }
+    );
+    Ok(())
+}
+
+/// The checks + deletion behind [`rescan`], factored so it is unit-testable without an
+/// [`AppConfig`] or stdin. `confirm` is consulted (with the parsed `keys.toml`) after
+/// validation and before anything is deleted; returning `false` aborts cleanly.
+///
+/// Refusals, in order: an uninitialized wallet (no `keys.toml` - deleting the database would
+/// destroy the only record of the wallet), a network mismatch (the rebuilt scan would run on
+/// the wrong chain), and a watch-only wallet (no seed to rebuild from - the daemon's bootstrap
+/// path cannot recreate a view-only account, so the recovery there is a fresh
+/// `init --ufvk`). Returns the database files/directories actually removed. Idempotent: an
+/// already-wiped wallet succeeds with an empty list.
+fn rescan_wallet(
+    network: ZNetwork,
+    wallet: &str,
+    keys_path: &Path,
+    wallet_dir: &Path,
+    confirm: impl FnOnce(&WalletStore) -> anyhow::Result<bool>,
+) -> anyhow::Result<Vec<String>> {
+    if !WalletStore::exists(keys_path) {
+        return Err(anyhow!(
+            "wallet '{}' is not initialized ({} missing); there is no database to rebuild - \
+             run `zecd init` to create a wallet",
+            wallet,
+            keys_path.display()
+        ));
+    }
+    let st = WalletStore::read(keys_path)?;
+    if st.network != network {
+        return Err(anyhow!(
+            "wallet '{}' is a {} wallet, but the configuration selects {}",
+            wallet,
+            st.network.name(),
+            network.name()
+        ));
+    }
+    if !st.has_seed() {
+        return Err(anyhow!(
+            "wallet '{}' is watch-only (keys.toml holds no seed), so the daemon cannot rebuild \
+             its account from keys.toml alone. Delete the wallet directory and recreate it with \
+             `zecd init --wallet {} --ufvk <key> --birthday <height>` (export the key from the \
+             spending wallet with `zecd export-ufvk`) instead.",
+            wallet,
+            wallet
+        ));
+    }
+    if !confirm(&st)? {
+        return Err(anyhow!("rescan aborted (expected 'yes')"));
+    }
+
+    // The wallet database and the compact-block cache (`open::init_dbs` recreates all of these
+    // on the next start). `keys.toml` - which may live outside the wallet dir via `keys_file` -
+    // and the datadir-level `identity.txt` are deliberately untouched.
+    let mut removed = Vec::new();
+    for file in [
+        "data.sqlite",
+        "data.sqlite-wal",
+        "data.sqlite-shm",
+        "blockmeta.sqlite",
+        "blockmeta.sqlite-wal",
+        "blockmeta.sqlite-shm",
+    ] {
+        let path = wallet_dir.join(file);
+        match std::fs::remove_file(&path) {
+            Ok(()) => removed.push(file.to_string()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(anyhow!("removing {}: {e}", path.display())),
+        }
+    }
+    let blocks = wallet_dir.join("blocks");
+    match std::fs::remove_dir_all(&blocks) {
+        Ok(()) => removed.push("blocks/".to_string()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(anyhow!("removing {}: {e}", blocks.display())),
+    }
+    Ok(removed)
 }
 
 /// Refuse to initialize into a wallet database that already contains an account. `init` only
@@ -852,6 +985,102 @@ mod tests {
             existing_spending_wallet(net, &wallets, "default"),
             None,
             "watch-only siblings never trip the single-spending-wallet guard"
+        );
+    }
+
+    /// The `zecd rescan` core: on an initialized spending wallet it deletes exactly the
+    /// database files (data.sqlite + the compact-block cache) and keeps `keys.toml` - the
+    /// state the daemon's empty-datadir bootstrap path then rebuilds from - and it is
+    /// idempotent (a second run finds nothing to delete and still succeeds).
+    #[test]
+    fn rescan_wipes_the_database_but_keeps_keys_toml() {
+        let net = network::regtest();
+        let dir = tempfile::tempdir().unwrap();
+        make_spending_wallet(dir.path());
+        // The compact-block cache dir, as a running daemon would have left it.
+        std::fs::create_dir_all(dir.path().join("blocks")).unwrap();
+        std::fs::write(dir.path().join("blocks").join("100-aa-bb.compact"), b"x").unwrap();
+        let keys_path = crate::wallet::store::keys_path(dir.path());
+        assert!(open::data_db_path(dir.path()).exists());
+
+        let removed = rescan_wallet(net, "default", &keys_path, dir.path(), |st| {
+            // The confirmation sees the parsed store (the prompt shows its birthday).
+            assert_eq!(u32::from(st.birthday), 1);
+            Ok(true)
+        })
+        .expect("rescan an initialized spending wallet");
+        assert!(removed.contains(&"data.sqlite".to_string()), "{removed:?}");
+        assert!(removed.contains(&"blocks/".to_string()), "{removed:?}");
+        assert!(!open::data_db_path(dir.path()).exists(), "database deleted");
+        assert!(!dir.path().join("blocks").exists(), "block cache deleted");
+        assert!(
+            WalletStore::exists(&keys_path),
+            "keys.toml (the rebuild source) must survive"
+        );
+        // Idempotent: nothing left to delete, still succeeds (recovery can be retried).
+        let removed = rescan_wallet(net, "default", &keys_path, dir.path(), |_| Ok(true))
+            .expect("re-running rescan is not an error");
+        assert!(removed.is_empty(), "{removed:?}");
+
+        // The daemon's bootstrap gate: an account-less database with keys.toml present is the
+        // exact state `wallet::actor::spawn` rebuilds from.
+        let db = open::init_dbs(net, dir.path()).expect("fresh dbs re-initialize");
+        assert!(
+            db.get_account_ids().expect("account ids").is_empty(),
+            "the rebuilt database starts account-less (bootstrap recreates it from the seed)"
+        );
+    }
+
+    /// `rescan`'s refusals: an uninitialized wallet (no keys.toml means no rebuild source), a
+    /// watch-only wallet (no seed - the bootstrap path can't recreate a view-only account), a
+    /// network mismatch, and a declined confirmation - each before anything is deleted.
+    #[test]
+    fn rescan_refuses_unrebuildable_wallets_and_declined_confirmation() {
+        let net = network::regtest();
+
+        // Uninitialized: no keys.toml.
+        let empty = tempfile::tempdir().unwrap();
+        let err = rescan_wallet(
+            net,
+            "default",
+            &crate::wallet::store::keys_path(empty.path()),
+            empty.path(),
+            |_| Ok(true),
+        )
+        .expect_err("no keys.toml, nothing to rebuild from");
+        assert!(err.to_string().contains("not initialized"), "{err}");
+
+        // Watch-only: keys.toml holds no seed, so point at `init --ufvk` instead.
+        let watch = tempfile::tempdir().unwrap();
+        make_watch_only_wallet(watch.path());
+        let watch_keys = crate::wallet::store::keys_path(watch.path());
+        let err = rescan_wallet(net, "w", &watch_keys, watch.path(), |_| Ok(true))
+            .expect_err("a watch-only wallet cannot be rebuilt from keys.toml");
+        assert!(err.to_string().contains("watch-only"), "{err}");
+        assert!(err.to_string().contains("--ufvk"), "{err}");
+        assert!(
+            open::data_db_path(watch.path()).exists(),
+            "refusal must not delete anything"
+        );
+
+        // Network mismatch: the regtest wallet under a mainnet config would rescan the wrong
+        // chain.
+        let spend = tempfile::tempdir().unwrap();
+        make_spending_wallet(spend.path());
+        let spend_keys = crate::wallet::store::keys_path(spend.path());
+        let err = rescan_wallet(ZNetwork::Main, "default", &spend_keys, spend.path(), |_| {
+            Ok(true)
+        })
+        .expect_err("network mismatch is refused");
+        assert!(err.to_string().contains("configuration selects"), "{err}");
+
+        // Declined confirmation aborts before deletion.
+        let err = rescan_wallet(net, "default", &spend_keys, spend.path(), |_| Ok(false))
+            .expect_err("a declined confirmation aborts");
+        assert!(err.to_string().contains("aborted"), "{err}");
+        assert!(
+            open::data_db_path(spend.path()).exists(),
+            "nothing deleted on abort"
         );
     }
 

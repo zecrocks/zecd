@@ -509,6 +509,69 @@ fn export_ufvk_is_not_blocked_by_the_datadir_lock() {
 }
 
 // ---------------------------------------------------------------------------
+// rescan
+// ---------------------------------------------------------------------------
+
+/// `rescan` deletes the wallet database, so like `init` it must take the datadir lock and
+/// refuse while a daemon (or another writer) owns the directory - the guard that keeps the
+/// database from being wiped out from under a live wallet.
+#[test]
+fn rescan_refuses_when_datadir_is_already_locked() {
+    let dir = tempfile::tempdir().unwrap();
+    let _held = zecd::lock::lock_datadir(dir.path()).expect("acquire the datadir lock");
+
+    let out = run_with_timeout(
+        {
+            let mut c = zecd();
+            c.args([
+                "--datadir",
+                dir.path().to_str().unwrap(),
+                "--regtest",
+                "rescan",
+                "--yes",
+            ]);
+            c
+        },
+        Duration::from_secs(10),
+    );
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "rescan against a locked datadir should refuse; stderr: {}",
+        stderr_of(&out)
+    );
+    assert!(
+        stderr_of(&out).contains("already running"),
+        "stderr: {}",
+        stderr_of(&out)
+    );
+}
+
+/// An uninitialized wallet has no `keys.toml` - the only record the rebuild would run from -
+/// so `rescan` refuses rather than deleting whatever is there.
+#[test]
+fn rescan_refuses_an_uninitialized_wallet() {
+    let dir = tempfile::tempdir().unwrap();
+    let out = run_with_timeout(
+        {
+            let mut c = zecd();
+            c.args([
+                "--datadir",
+                dir.path().to_str().unwrap(),
+                "--regtest",
+                "rescan",
+                "--yes",
+            ]);
+            c
+        },
+        Duration::from_secs(10),
+    );
+    let stderr = stderr_of(&out);
+    assert_eq!(out.status.code(), Some(1), "stderr: {stderr}");
+    assert!(stderr.contains("not initialized"), "stderr: {stderr}");
+}
+
+// ---------------------------------------------------------------------------
 // example-config
 // ---------------------------------------------------------------------------
 
