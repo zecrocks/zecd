@@ -206,6 +206,23 @@ async fn regtest_transparent_coinbase_shield_and_spend() {
         "immature coinbase must not appear in listunspent: {unspent}"
     );
 
+    // 4a. The getbalances extension: `mine.coinbase` is the *mature* (shieldable) coinbase
+    //     value, so while everything is immature it stays zero - the value rides in
+    //     `mine.immature` until the maturity boundary.
+    let gb = zecd
+        .call("getbalances", json!([]))
+        .await
+        .expect("getbalances");
+    assert_eq!(
+        gb["mine"]["coinbase"].as_f64(),
+        Some(0.0),
+        "immature coinbase is not yet shieldable: {gb}"
+    );
+    assert!(
+        (gb["mine"]["immature"].as_f64().expect("mine.immature") - immature).abs() < 1e-8,
+        "getbalances.mine.immature matches getwalletinfo.immature_balance: {gb}"
+    );
+
     // 4b. The received-by aggregations apply the same maturity rule as the balance buckets:
     //     by default an immature transparent coinbase is NOT counted as received (Core parity -
     //     a reorg can still revoke it), and `include_immature_coinbase` opts the value back in.
@@ -261,6 +278,10 @@ async fn regtest_transparent_coinbase_shield_and_spend() {
         .await
         .expect_err("t->t send of immature coinbase must fail");
     assert_eq!(err.code(), Some(-6), "expected -6, got {err}");
+    assert!(
+        !err.to_string().contains("z_shieldcoinbase"),
+        "no coinbase is mature yet, so the -6 must not point at z_shieldcoinbase: {err}"
+    );
     let err = zecd
         .call("z_shieldcoinbase", json!(["*", own_ua]))
         .await
@@ -321,6 +342,32 @@ async fn regtest_transparent_coinbase_shield_and_spend() {
         "the still-immature tail coinbases stay in immature_balance: {info}"
     );
 
+    // 7a. The balance breakout follows the maturity flip: `mine.coinbase` now reports exactly
+    //     the mature set - which here is the *whole* trusted balance, telling a caller that
+    //     none of it can move without `z_shieldcoinbase`. `getwalletinfo`'s transparent block
+    //     mirrors the same number.
+    let gb = zecd
+        .call("getbalances", json!([]))
+        .await
+        .expect("getbalances");
+    let shieldable = gb["mine"]["coinbase"].as_f64().expect("mine.coinbase");
+    assert!(
+        (shieldable - coinbase_total).abs() < 1e-8,
+        "mine.coinbase reports the mature coinbase value ({shieldable} vs {coinbase_total}): \
+         {gb}"
+    );
+    assert!(
+        (gb["mine"]["trusted"].as_f64().expect("mine.trusted") - shieldable).abs() < 1e-8,
+        "the whole trusted balance is coinbase here: {gb}"
+    );
+    let mirrored = info["transparent"]["coinbase_balance"]
+        .as_f64()
+        .expect("transparent.coinbase_balance");
+    assert!(
+        (mirrored - coinbase_total).abs() < 1e-8,
+        "getwalletinfo.transparent.coinbase_balance mirrors mine.coinbase: {info}"
+    );
+
     // 7b. Received-by tracks the maturity boundary: the default now counts exactly the mature
     //     set (the same value listunspent/getbalance surface), while include_immature_coinbase
     //     additionally counts the still-immature tail - strictly more.
@@ -355,6 +402,12 @@ async fn regtest_transparent_coinbase_shield_and_spend() {
         .await
         .expect_err("t->t send must never select coinbase UTXOs");
     assert_eq!(err.code(), Some(-6), "expected -6, got {err}");
+    // The -6 is self-diagnosing: the wallet's whole spendable balance is mature coinbase, so
+    // the error must say so and name the one path that can move it.
+    assert!(
+        err.to_string().contains("z_shieldcoinbase"),
+        "the -6 names z_shieldcoinbase when mature coinbase is the blocker: {err}"
+    );
 
     // 9. z_shieldcoinbase with a limit: shield the two highest-value coinbases, leaving the rest.
     let res = zecd

@@ -4,7 +4,7 @@
 use std::collections::{HashSet, VecDeque};
 use std::convert::Infallible;
 use std::num::NonZeroUsize;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -3182,6 +3182,7 @@ impl WalletActor {
         let net = self.network;
         let change_pool = self.enabled_pools.change_pool();
         let orchard_action_limit = self.orchard_action_limit;
+        let wallet_dir = self.wallet_dir.clone();
         let db = &mut self.db_data;
         tokio::task::block_in_place(move || -> Result<_, RpcError> {
             let start = Instant::now();
@@ -3215,7 +3216,7 @@ impl WalletActor {
                 // `None` builds at the transaction version implied by the target height.
                 None,
             )
-            .map_err(|e| enrich_insufficient_funds(db, policy, classify_err(e)))?;
+            .map_err(|e| enrich_insufficient_funds(db, &wallet_dir, policy, classify_err(e)))?;
             if privacy == SendPrivacy::FullPrivacy {
                 enforce_full_privacy(&proposal)?;
             }
@@ -3235,7 +3236,9 @@ impl WalletActor {
                 // action floor, which is what the change strategy above costed against.
                 BundlePadding::DEFAULT,
             )
-            .map_err(|e| enrich_insufficient_funds(db, policy, classify_pczt_err(e)))?;
+            .map_err(|e| {
+                enrich_insufficient_funds(db, &wallet_dir, policy, classify_pczt_err(e))
+            })?;
             Ok((pczt, shape, start.elapsed()))
         })
     }
@@ -3393,6 +3396,7 @@ impl WalletActor {
         let orchard_action_limit = self.orchard_action_limit;
         let account_id = self.require_account()?;
         let prover: &LocalTxProver = &self.prover;
+        let wallet_dir = self.wallet_dir.clone();
         let db = &mut self.db_data;
         let (txid, raw, shape, build, prove): (TxId, Vec<u8>, SendShape, Duration, Duration) =
             tokio::task::block_in_place(move || -> Result<_, RpcError> {
@@ -3428,7 +3432,7 @@ impl WalletActor {
                     // `None` builds at the transaction version implied by the target height.
                     None,
                 )
-                .map_err(|e| enrich_insufficient_funds(db, policy, classify_err(e)))?;
+                .map_err(|e| enrich_insufficient_funds(db, &wallet_dir, policy, classify_err(e)))?;
                 if privacy == SendPrivacy::FullPrivacy {
                     enforce_full_privacy(&proposal)?;
                 }
@@ -3448,7 +3452,7 @@ impl WalletActor {
                     // height, matching the PCZT path.
                     None,
                 )
-                .map_err(|e| enrich_insufficient_funds(db, policy, classify_err(e)))?;
+                .map_err(|e| enrich_insufficient_funds(db, &wallet_dir, policy, classify_err(e)))?;
                 if txids.len() > 1 {
                     return Err(RpcError::wallet(
                         "multi-transaction proposals are not supported",
@@ -3721,6 +3725,7 @@ impl WalletActor {
         // `self.prover` is an `Arc<LocalTxProver>` (shared for the pipeline); the transaction
         // builder wants `&LocalTxProver`, so deref-coerce through the Arc.
         let prover: &LocalTxProver = &self.prover;
+        let wallet_dir = self.wallet_dir.clone();
         let db = &mut self.db_data;
 
         let (txid, raw): (TxId, Vec<u8>) =
@@ -3763,9 +3768,21 @@ impl WalletActor {
                     utxos.extend(outs);
                 }
                 if utxos.is_empty() {
-                    return Err(RpcError::insufficient_funds(
-                        "Insufficient funds: 0 spendable transparent UTXOs",
-                    ));
+                    // Distinguish "no transparent funds at all" from "only coinbase": the wallet
+                    // may hold mature coinbase UTXOs that `listunspent`/`getbalance` display as
+                    // spendable, so a bare "0 spendable" here would contradict what the caller
+                    // just read. Same query as `getbalances.mine.coinbase`.
+                    let coinbase =
+                        super::read::mature_coinbase_zats(&wallet_dir, u32::from(target_height))
+                            .unwrap_or(0);
+                    return Err(RpcError::insufficient_funds(if coinbase > 0 {
+                        format!(
+                            "Insufficient funds: 0 spendable non-coinbase transparent UTXOs; {}",
+                            coinbase_hint(coinbase)
+                        )
+                    } else {
+                        "Insufficient funds: 0 spendable transparent UTXOs".to_string()
+                    }));
                 }
                 // Greedy: spend the largest UTXOs first to minimize the input count (and the fee).
                 utxos.sort_by_key(|u| std::cmp::Reverse(u.value()));
@@ -3791,9 +3808,20 @@ impl WalletActor {
                         grace,
                     )
                     .ok_or_else(|| {
-                        RpcError::insufficient_funds(
-                        "Insufficient funds: transparent UTXOs do not cover the amount plus fee",
-                    )
+                        // As above: excluded mature coinbase may be exactly what the caller
+                        // expected to cover the shortfall, so name it.
+                        let coinbase = super::read::mature_coinbase_zats(
+                            &wallet_dir,
+                            u32::from(target_height),
+                        )
+                        .unwrap_or(0);
+                        let mut msg = "Insufficient funds: transparent UTXOs do not cover the \
+                                       amount plus fee"
+                            .to_string();
+                        if coinbase > 0 {
+                            msg = format!("{msg}; {}", coinbase_hint(coinbase));
+                        }
+                        RpcError::insufficient_funds(msg)
                     })?;
                 utxos.truncate(n_selected);
                 let selected = utxos;
@@ -5026,7 +5054,12 @@ fn classify_err(e: crate::error::ProposalError) -> RpcError {
 /// safe: a `-6` means a proposal actually ran, which implies the chain tip is set (the
 /// `get_wallet_summary` progress-estimator underflow guarded against in `update_status`
 /// can't fire), and a failed lookup just leaves the message unenriched.
-fn enrich_insufficient_funds(db: &WriteDb, policy: ConfirmationsPolicy, err: RpcError) -> RpcError {
+fn enrich_insufficient_funds(
+    db: &WriteDb,
+    wallet_dir: &Path,
+    policy: ConfirmationsPolicy,
+    err: RpcError,
+) -> RpcError {
     if err.code != codes::RPC_WALLET_INSUFFICIENT_FUNDS {
         return err;
     }
@@ -5052,14 +5085,34 @@ fn enrich_insufficient_funds(db: &WriteDb, policy: ConfirmationsPolicy, err: Rpc
                 .change_pending_confirmation()
                 .into_u64();
     }
-    if incoming == 0 && change == 0 {
+    // Mature coinbase reads as spendable balance (`getbalance` counts it) but no regular send
+    // can select it - without a hint, "wallet says X, send says 0 spendable" is a dead end the
+    // caller can't diagnose. Same number as `getbalances.mine.coinbase` (both read
+    // `mature_coinbase_zats`); best-effort - a failed lookup just leaves the hint off.
+    let target_height = u32::from(summary.chain_tip_height()) + 1;
+    let coinbase = super::read::mature_coinbase_zats(wallet_dir, target_height).unwrap_or(0);
+    if incoming == 0 && change == 0 && coinbase == 0 {
         return err;
     }
-    RpcError::insufficient_funds(format!(
-        "{}; awaiting confirmations: {incoming} zatoshis incoming, {change} zatoshis change \
- - these become spendable as blocks arrive",
-        err.message
-    ))
+    let mut msg = err.message;
+    if incoming > 0 || change > 0 {
+        msg = format!(
+            "{msg}; awaiting confirmations: {incoming} zatoshis incoming, {change} zatoshis change \
+ - these become spendable as blocks arrive"
+        );
+    }
+    if coinbase > 0 {
+        msg = format!("{msg}; {}", coinbase_hint(coinbase));
+    }
+    RpcError::insufficient_funds(msg)
+}
+
+/// The mature-coinbase `-6` hint, worded identically everywhere it appears (the proposal-path
+/// enrichment above and the fully-transparent selection failures in `do_send_transparent`):
+/// consensus lets a transparent coinbase output move only in a fully-shielded transaction, so
+/// the one actionable next step is `z_shieldcoinbase`.
+fn coinbase_hint(zats: u64) -> String {
+    format!("{zats} zatoshis are mature coinbase, spendable only via z_shieldcoinbase")
 }
 
 #[cfg(test)]
@@ -5777,17 +5830,28 @@ mod tests {
 
         let other = RpcError::wallet("some other failure");
         assert_eq!(
-            super::enrich_insufficient_funds(&db, Default::default(), other.clone()).message,
+            super::enrich_insufficient_funds(&db, dir.path(), Default::default(), other.clone())
+                .message,
             other.message
         );
 
         let bare = RpcError::insufficient_funds("Insufficient funds: 0 zatoshis spendable");
-        let out = super::enrich_insufficient_funds(&db, Default::default(), bare.clone());
+        let out =
+            super::enrich_insufficient_funds(&db, dir.path(), Default::default(), bare.clone());
         assert_eq!(out.code, codes::RPC_WALLET_INSUFFICIENT_FUNDS);
         assert_eq!(
             out.message, bare.message,
-            "no pending balance, so no enrichment"
+            "no pending balance and no mature coinbase, so no enrichment"
         );
+    }
+
+    /// The mature-coinbase hint must name the value and the one actionable next step - the
+    /// regtest coinbase e2e asserts the live `-6` carries this exact marker.
+    #[test]
+    fn coinbase_hint_names_z_shieldcoinbase() {
+        let hint = super::coinbase_hint(1_250);
+        assert!(hint.contains("1250 zatoshis"), "{hint}");
+        assert!(hint.contains("z_shieldcoinbase"), "{hint}");
     }
 
     /// `sendrawtransaction`'s upstream verdict must follow Bitcoin Core's exact codes:

@@ -38,7 +38,24 @@ pub struct BalanceInfo {
     pub pending: u64,
     /// Change awaiting confirmation.
     pub immature: u64,
+    /// Unspent, **mature** transparent coinbase value - a subset of [`Self::transparent_spendable`]
+    /// (and so of [`Self::total_spendable`]), broken out because it is spendable only via
+    /// `z_shieldcoinbase`: consensus requires a transaction spending a transparent coinbase
+    /// output to have an empty `vout`, so the regular send paths exclude coinbase from selection
+    /// outright. Surfaced as `getbalances.mine.coinbase` and
+    /// `getwalletinfo.transparent.coinbase_balance` so a caller can tell how much of `trusted`
+    /// needs shielding before it can move. Always 0 for shielded (ZIP-213) coinbase, which has
+    /// no maturity or spend restriction.
+    pub mature_coinbase: u64,
 }
+
+/// Coinbase maturity depth in blocks: consensus forbids spending a transparent coinbase output
+/// with fewer than this many confirmations (and even then only into a fully-shielded
+/// transaction - see `z_shieldcoinbase`). The single source for the maturity clause: the
+/// balance/listunspent SQL here and the received-by aggregations in `rpc/wallet_methods.rs`
+/// all key on it, mirroring the clause in `zcash_client_sqlite`'s
+/// `get_spendable_transparent_outputs`. Shielded coinbase (ZIP-213) has no maturity rule.
+pub const COINBASE_MATURITY: u32 = 100;
 
 /// Aggregate balances via `get_wallet_summary` (mirrors devtool's `balance.rs`), under the
 /// given confirmations policy. Callers pass the wallet's configured policy
@@ -118,6 +135,10 @@ pub fn balance(
         info.pending -= from_pending;
         info.transparent_spendable -= from_spendable;
         info.immature += from_spendable + from_pending;
+        // The mature-coinbase breakout (see the field docs). Clamped to the transparent bucket
+        // so it is a subset of `trusted` by construction even if the upstream bucketing shifts.
+        info.mature_coinbase =
+            mature_coinbase_zats(wallet_dir, target_height)?.min(info.transparent_spendable);
         info.total_spendable = info.orchard_spendable
             + info.sapling_spendable
             + info.transparent_spendable
@@ -126,20 +147,38 @@ pub fn balance(
     Ok(info)
 }
 
-/// Unspent, mined, **immature** coinbase value (`tx_index == 0`, fewer than 100 confirmations
-/// at `target_height`). Mirrors the coinbase-maturity clause of `zcash_client_sqlite`'s
-/// `get_spendable_transparent_outputs` (which the balance queries lack) so `balance` can
-/// reclassify the immature value.
+/// Unspent, mined, **immature** coinbase value (`tx_index == 0`, fewer than
+/// [`COINBASE_MATURITY`] confirmations at `target_height`). Mirrors the coinbase-maturity
+/// clause of `zcash_client_sqlite`'s `get_spendable_transparent_outputs` (which the balance
+/// queries lack) so `balance` can reclassify the immature value.
 fn immature_coinbase_zats(wallet_dir: &Path, target_height: u32) -> anyhow::Result<u64> {
+    coinbase_zats(wallet_dir, target_height, false)
+}
+
+/// Unspent, mined, **mature** coinbase value - the other side of the maturity split. Backs
+/// [`BalanceInfo::mature_coinbase`] and the actor's `-6` enrichment (the "spendable only via
+/// z_shieldcoinbase" hint), so the number a failed send reports is the same one `getbalances`
+/// shows.
+pub fn mature_coinbase_zats(wallet_dir: &Path, target_height: u32) -> anyhow::Result<u64> {
+    coinbase_zats(wallet_dir, target_height, true)
+}
+
+/// Sum unspent, mined coinbase value on the requested side of the [`COINBASE_MATURITY`]
+/// boundary. An output is coinbase iff its tx's recorded block index is 0 (`IFNULL(tx_index,
+/// 1)` - unknown defaults to *non*-coinbase, so a bare UTXO row can't masquerade as coinbase),
+/// and it is suppressed by a spend only while the spending tx is still live (mined or
+/// unexpired), mirroring the `listunspent` query below.
+fn coinbase_zats(wallet_dir: &Path, target_height: u32, mature: bool) -> anyhow::Result<u64> {
     let conn = open_conn(wallet_dir)?;
     let unexpired_stx = tx_unexpired_sql("stx");
+    let maturity_cmp = if mature { ">=" } else { "<" };
     let sql = format!(
         "SELECT IFNULL(SUM(txo.value_zat), 0)
          FROM transparent_received_outputs txo
          JOIN transactions t ON t.id_tx = txo.transaction_id
          WHERE t.mined_height IS NOT NULL
            AND IFNULL(t.tx_index, 1) == 0
-           AND :target_height - t.mined_height < 100
+           AND :target_height - t.mined_height {maturity_cmp} {COINBASE_MATURITY}
            AND txo.id NOT IN (
                SELECT s.transparent_received_output_id
                FROM transparent_received_output_spends s
@@ -972,9 +1011,10 @@ pub fn list_unspent(network: ZNetwork, wallet_dir: &Path) -> anyhow::Result<Vec<
         let unexpired_stx = tx_unexpired_sql("stx");
         // Coinbase handling mirrors `zcash_client_sqlite`'s spendability SQL: an output is
         // coinbase iff its tx's recorded block index is 0 (`IFNULL(tx_index, 1)` - unknown
-        // defaults to non-coinbase), and an *immature* coinbase output (< 100 confirmations at
-        // the target height) is excluded from the listing, matching Bitcoin Core/zcashd's
-        // `AvailableCoins`. Mature coinbase outputs are listed with `generated = true`.
+        // defaults to non-coinbase), and an *immature* coinbase output (fewer than
+        // `COINBASE_MATURITY` confirmations at the target height) is excluded from the listing,
+        // matching Bitcoin Core/zcashd's `AvailableCoins`. Mature coinbase outputs are listed
+        // with `generated = true`.
         let sql = format!(
             "SELECT t.txid, txo.output_index, txo.value_zat, txo.address,
                     (IFNULL(t.tx_index, 1) == 0) AS generated
@@ -983,7 +1023,7 @@ pub fn list_unspent(network: ZNetwork, wallet_dir: &Path) -> anyhow::Result<Vec<
              WHERE (t.mined_height IS NOT NULL OR ({unexpired_t}))
                AND NOT (
                    IFNULL(t.tx_index, 1) == 0
-                   AND :target_height - t.mined_height < 100
+                   AND :target_height - t.mined_height < {COINBASE_MATURITY}
                )
                AND txo.id NOT IN (
                    SELECT s.transparent_received_output_id
@@ -1455,5 +1495,89 @@ mod tests {
                 .unwrap();
             assert_eq!(got, *expected, "case {i}: ({m:?}, {e:?}, {mo})");
         }
+    }
+
+    /// The immature/mature coinbase split must partition unspent coinbase value exactly at the
+    /// `COINBASE_MATURITY` boundary (`target_height - mined_height >= 100` is mature), default
+    /// an unknown `tx_index` to non-coinbase, and suppress spent outputs - the invariants the
+    /// balance reclassification, the `getbalances.mine.coinbase` extension, and the actor's
+    /// `-6` hint all ride on.
+    #[test]
+    fn coinbase_zats_splits_on_the_maturity_boundary() {
+        let dir = tempfile::tempdir().unwrap();
+        let conn =
+            rusqlite::Connection::open(crate::wallet::open::data_db_path(dir.path())).unwrap();
+        // The minimal slice of the zcash_client_sqlite schema the query touches.
+        conn.execute_batch(
+            "CREATE TABLE transactions(
+                 id_tx INTEGER PRIMARY KEY,
+                 mined_height INTEGER,
+                 tx_index INTEGER,
+                 expiry_height INTEGER,
+                 min_observed_height INTEGER);
+             CREATE TABLE transparent_received_outputs(
+                 id INTEGER PRIMARY KEY,
+                 transaction_id INTEGER,
+                 value_zat INTEGER);
+             CREATE TABLE transparent_received_output_spends(
+                 transparent_received_output_id INTEGER,
+                 transaction_id INTEGER);",
+        )
+        .unwrap();
+        let target: u32 = 200;
+        // (id, mined_height, tx_index, value): a coinbase exactly at the boundary (mature), one
+        // confirmation short of it (immature), a non-coinbase, an unknown-index tx (defaults to
+        // non-coinbase), an unmined coinbase (ignored), and a spent mature coinbase (suppressed).
+        let m = i64::from(target) - i64::from(super::COINBASE_MATURITY);
+        let rows: &[(i64, Option<i64>, Option<i64>, i64)] = &[
+            (1, Some(m), Some(0), 1_000),      // mature: conf == COINBASE_MATURITY
+            (2, Some(m + 1), Some(0), 200),    // immature: one short
+            (3, Some(1), Some(1), 40_000),     // non-coinbase: never counted
+            (4, Some(1), None, 5_000),         // unknown tx_index: defaults to non-coinbase
+            (5, None, Some(0), 600_000),       // unmined: never counted
+            (6, Some(m - 50), Some(0), 7_000), // mature but spent below: suppressed
+        ];
+        for (id, mined, tx_index, value) in rows {
+            conn.execute(
+                "INSERT INTO transactions(id_tx, mined_height, tx_index, expiry_height,
+                                          min_observed_height)
+                 VALUES (?1, ?2, ?3, 0, 1)",
+                rusqlite::params![id, mined, tx_index],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO transparent_received_outputs(id, transaction_id, value_zat)
+                 VALUES (?1, ?1, ?2)",
+                rusqlite::params![id, value],
+            )
+            .unwrap();
+        }
+        // Spend output 6 with a mined (live) tx, so it is suppressed from both sides.
+        conn.execute(
+            "INSERT INTO transactions(id_tx, mined_height, tx_index, expiry_height,
+                                      min_observed_height)
+             VALUES (100, ?1, 1, 0, 1)",
+            rusqlite::params![m - 40],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO transparent_received_output_spends(transparent_received_output_id,
+                                                            transaction_id)
+             VALUES (6, 100)",
+            [],
+        )
+        .unwrap();
+        drop(conn);
+
+        assert_eq!(
+            super::mature_coinbase_zats(dir.path(), target).unwrap(),
+            1_000,
+            "mature = the boundary coinbase only (spent one suppressed)"
+        );
+        assert_eq!(
+            super::immature_coinbase_zats(dir.path(), target).unwrap(),
+            200,
+            "immature = the one-short coinbase only"
+        );
     }
 }

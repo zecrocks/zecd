@@ -219,6 +219,16 @@ def main() -> int:
     for f in ("trusted", "untrusted_pending", "immature"):
         ck(f"mine.{f} is Decimal", isinstance(mine.get(f), decimal.Decimal), repr(mine.get(f)))
     ck("mine.trusted == getbalance", mine.get("trusted") == bal)
+    # zecd extension: mine.coinbase is the portion of trusted that is mature transparent
+    # coinbase - spendable only via z_shieldcoinbase, so it is broken out for callers to see
+    # how much of trusted cannot move through the regular send paths. A subset of trusted (not
+    # a fourth bucket): the Core triple still totals the wallet. This wallet holds no coinbase,
+    # so the value is zero; the populated case is asserted by the regtest coinbase e2e.
+    ck("mine.coinbase is Decimal", isinstance(mine.get("coinbase"), decimal.Decimal),
+       repr(mine.get("coinbase")))
+    ck("mine.coinbase is a subset of trusted",
+       decimal.Decimal(0) <= mine.get("coinbase") <= mine.get("trusted"),
+       repr(mine.get("coinbase")))
 
     print("== addresses ==")
     # zecd is stateless: getnewaddress takes no label (a label would be off-chain state with no

@@ -343,6 +343,12 @@ pub(crate) fn getunconfirmedbalance(
 /// object is always omitted: like Bitcoin Core's descriptor wallets, a zecd watch-only
 /// (UFVK) wallet reports its funds under `mine` (the addresses are the wallet's own; only
 /// signing is impossible).
+///
+/// `mine.coinbase` is a zecd extension: the portion of `trusted` that is mature transparent
+/// coinbase, which the regular send paths can never select (consensus requires a coinbase
+/// spend to have an empty `vout`) - it moves only via `z_shieldcoinbase`. A *subset* of
+/// `trusted`, not a fourth bucket, so `trusted + untrusted_pending + immature` still totals
+/// the wallet exactly as Bitcoin Core clients expect.
 pub(crate) fn getbalances(state: &AppState, wallet: Option<&str>) -> Result<Value, RpcError> {
     let handle = state.registry.get(wallet)?;
     let info = read::balance(handle.network, &handle.dir, handle.confirmations)?;
@@ -351,6 +357,7 @@ pub(crate) fn getbalances(state: &AppState, wallet: Option<&str>) -> Result<Valu
             "trusted": zats_to_value(info.total_spendable),
             "untrusted_pending": zats_to_value(info.pending),
             "immature": zats_to_value(info.immature),
+            "coinbase": zats_to_value(info.mature_coinbase),
         },
     });
     // `lastprocessedblock` (Bitcoin Core 26+): the block the balances are anchored to -
@@ -415,6 +422,9 @@ pub(crate) fn getwalletinfo(state: &AppState, wallet: Option<&str>) -> Result<Va
             "enabled": true,
             "default": handle.transparent_default,
             "gap_limit": handle.transparent_gap_limit,
+            // Mature coinbase value awaiting `z_shieldcoinbase` - a subset of `balance` that
+            // no regular send can select (the same number as `getbalances.mine.coinbase`).
+            "coinbase_balance": zats_to_value(info.mature_coinbase),
         });
         // Initial-sync progress (pre-exposing `transparent_initial_scan` external addresses),
         // so an operator can poll the fill rather than scrape the log. Present only while the
@@ -947,12 +957,13 @@ pub(crate) fn z_listtransactions(
     Ok(Value::Array(entries))
 }
 
-/// Coinbase maturity depth: a transparent coinbase output is immature below 100 confirmations
-/// (consensus forbids spending it, and Bitcoin Core's received-by aggregations exclude it unless
-/// `include_immature_coinbase`). Mirrors the `< 100` clause of [`read`]'s balance/listunspent
-/// coinbase SQL, which in turn mirrors `zcash_client_sqlite`'s spendability query - keep the
-/// three in lockstep. Shielded coinbase (ZIP-213) has no maturity rule and is never excluded.
-const COINBASE_MATURITY: i64 = 100;
+/// Coinbase maturity depth as the aggregations compare it (confirmation counts are `i64` here).
+/// The value itself is [`read::COINBASE_MATURITY`], the single source shared with the
+/// balance/listunspent SQL; consensus forbids spending a transparent coinbase output below it,
+/// so Bitcoin Core's received-by aggregations exclude such value unless
+/// `include_immature_coinbase`. Shielded coinbase (ZIP-213) has no maturity rule and is never
+/// excluded.
+const COINBASE_MATURITY: i64 = read::COINBASE_MATURITY as i64;
 
 /// Aggregate wallet-received outputs (non-change, paying one of our accounts) per address,
 /// counting only transactions with at least `minconf` confirmations. Returns
