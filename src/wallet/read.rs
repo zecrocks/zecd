@@ -313,34 +313,15 @@ fn tx_unexpired_sql(alias: &str) -> String {
     )
 }
 
-/// Map from an address row's canonical encoding (`addresses.address`, a unified address) to
-/// its transparent receiver, for the wallet's transparent-capable addresses. Used to report
-/// received transparent outputs under the t-address the payer actually paid: the
-/// `v_tx_outputs.to_address` column carries the *unified* encoding of the receiving address
-/// row, but callers may query by the bare t-address. Empty for wallets whose addresses have
-/// no transparent receiver (zecd's), making the rewrite a no-op there.
-fn transparent_receiver_map(conn: &Connection) -> anyhow::Result<HashMap<String, String>> {
-    let mut stmt = conn.prepare(
-        "SELECT address, cached_transparent_receiver_address
-         FROM addresses
-         WHERE cached_transparent_receiver_address IS NOT NULL",
-    )?;
-    let rows = stmt.query_map([], |row| {
-        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-    })?;
-    let mut map = HashMap::new();
-    for r in rows {
-        let (ua, taddr) = r?;
-        map.insert(ua, taddr);
-    }
-    Ok(map)
-}
-
-fn load_outputs(
-    conn: &Connection,
-    txid: &[u8],
-    taddr_map: &HashMap<String, String>,
-) -> anyhow::Result<Vec<TxOutputRecord>> {
+/// Loads a transaction's outputs from `v_tx_outputs`.
+///
+/// A received transparent output is reported at the transparent receiver itself: since
+/// `zcash_client_sqlite` 0.22.0-rc.6 the view's received arm resolves pool 0 through
+/// `addresses.cached_transparent_receiver_address` rather than the enclosing unified address,
+/// and prefers the recipient recorded at construction time for outputs the wallet created. So
+/// `to_address` is already the address observably paid on chain, and zecd does no rewriting of
+/// its own (it used to map the unified encoding back to the t-address here).
+fn load_outputs(conn: &Connection, txid: &[u8]) -> anyhow::Result<Vec<TxOutputRecord>> {
     let mut stmt = conn.prepare(
         "SELECT output_pool, output_index, from_account_uuid, to_account_uuid,
                 to_address, value, is_change, recipient_key_scope, memo
@@ -362,15 +343,7 @@ fn load_outputs(
     })?;
     let mut out = Vec::new();
     for r in rows {
-        let mut rec = r?;
-        // A *received* transparent output (pool 0) was necessarily paid to the address row's
-        // transparent receiver; report the t-address rather than the row's unified encoding.
-        if rec.pool == 0 && rec.to_account.is_some() {
-            if let Some(taddr) = rec.to_address.as_ref().and_then(|a| taddr_map.get(a)) {
-                rec.to_address = Some(taddr.clone());
-            }
-        }
-        out.push(rec);
+        out.push(r?);
     }
     Ok(out)
 }
@@ -472,10 +445,9 @@ pub fn query_transactions(wallet_dir: &Path, q: &TxQuery) -> anyhow::Result<Vec<
     for r in rows {
         pending.push(r?);
     }
-    let taddr_map = transparent_receiver_map(&conn)?;
     let mut records = Vec::with_capacity(pending.len());
     for (txid, mut rec) in pending {
-        rec.outputs = load_outputs(&conn, &txid, &taddr_map)?;
+        rec.outputs = load_outputs(&conn, &txid)?;
         records.push(rec);
     }
     Ok(records)
@@ -497,22 +469,14 @@ pub fn list_transactions(wallet_dir: &Path) -> anyhow::Result<Vec<TxRecord>> {
 /// existing - and tested - `received_by_address` logic produces identical output.
 ///
 /// `address_filter` (display encoding) is pushed into SQL for `getreceivedbyaddress`, which
-/// asks about a single address: only its outputs are loaded. The transparent-receiver rewrite
-/// (a no-op for zecd, which exposes no transparent receivers) matches [`load_outputs`] so a
-/// bare t-address filter aggregates the same as through the full path.
+/// asks about a single address: only its outputs are loaded. It is compared against
+/// `v_tx_outputs.to_address` as given - a received transparent output is stored under its bare
+/// t-address (see [`load_outputs`]), so a t-address filter matches the stored rows directly.
 pub fn received_tx_records(
     wallet_dir: &Path,
     address_filter: Option<&str>,
 ) -> anyhow::Result<Vec<TxRecord>> {
     let conn = open_conn(wallet_dir)?;
-    let taddr_map = transparent_receiver_map(&conn)?;
-    // The filter may be a bare t-address; map it back to the unified encoding stored in
-    // `v_tx_outputs.to_address` so the pushed-down predicate matches the stored rows.
-    let ua_for_taddr: HashMap<&str, &str> = taddr_map
-        .iter()
-        .map(|(ua, t)| (t.as_str(), ua.as_str()))
-        .collect();
-    let stored_filter = address_filter.map(|a| ua_for_taddr.get(a).copied().unwrap_or(a));
     // Order by the same `sort_height` (oldest-first) as `list_transactions`, so the per-address
     // `txids` list `listreceivedbyaddress` emits is in the identical order it was before this
     // flat path replaced the full N+1 load.
@@ -528,15 +492,14 @@ pub fn received_tx_records(
                 CASE WHEN v.expiry_height == 0 THEN NULL ELSE v.expiry_height END
             ) ASC NULLS LAST",
     )?;
-    let rows = stmt.query_map(named_params! { ":addr": stored_filter }, |row| {
+    let rows = stmt.query_map(named_params! { ":addr": address_filter }, |row| {
         Ok((
             row.get::<_, Vec<u8>>(0)?,
             row.get::<_, Option<u32>>(1)?,
             row.get::<_, bool>(2)?,
             TxOutputRecord {
                 // `output_index`/`from_account`/`memo` are unused by the aggregation; `pool`
-                // is read because it gates the transparent-receiver rewrite below (it must be
-                // the real pool, exactly as `load_outputs` does - not a hardcoded 0).
+                // is carried through so the record is the same shape [`load_outputs`] produces.
                 pool: row.get(7)?,
                 output_index: 0,
                 from_account: None,
@@ -553,12 +516,7 @@ pub fn received_tx_records(
     let mut order: Vec<Vec<u8>> = Vec::new();
     let mut by_txid: HashMap<Vec<u8>, TxRecord> = HashMap::new();
     for r in rows {
-        let (txid, mined_height, expired_unmined, mut out) = r?;
-        if out.pool == 0 && out.to_account.is_some() {
-            if let Some(t) = out.to_address.as_ref().and_then(|a| taddr_map.get(a)) {
-                out.to_address = Some(t.clone());
-            }
-        }
+        let (txid, mined_height, expired_unmined, out) = r?;
         let rec = by_txid.entry(txid.clone()).or_insert_with(|| {
             order.push(txid.clone());
             TxRecord {
@@ -601,7 +559,7 @@ pub fn get_transaction(
     };
     let (txid, mut rec) = tx_from_row(row)?;
     drop(rows);
-    rec.outputs = load_outputs(&conn, &txid, &transparent_receiver_map(&conn)?)?;
+    rec.outputs = load_outputs(&conn, &txid)?;
     // Fetch the raw transaction bytes for `gettransaction.hex` via the public `WalletRead` API
     // (mirroring the actor's `do_get_raw_tx`) instead of reading librustzcash's internal
     // `transactions.raw` column directly: this yields the canonical consensus serialization off

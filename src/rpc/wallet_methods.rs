@@ -985,8 +985,10 @@ fn received_by_address(
 /// different UA that merely shares a receiver, is a different string -> `-4`/no contribution.
 /// A *spliced* UA (receivers stapled together from different diversifier indices, or one of this
 /// wallet's receivers mixed with a stranger's) is caught earlier by [`read::classify_unified_receivers`]
-/// and rejected with `-5` rather than silently treated as foreign. (The sole sub-receiver case is
-/// the bare-t-address->UA rewrite, inert here since zecd exposes no transparent receivers.)
+/// and rejected with `-5` rather than silently treated as foreign. A **bare transparent address**
+/// is its own key, not a sub-receiver query against the UA enclosing it: a transparent receive is
+/// recorded under the t-address that was paid, so asking about the t-address returns it and asking
+/// about the enclosing UA returns only that UA's shielded receipts.
 pub(crate) fn getreceivedbyaddress(
     state: &AppState,
     wallet: Option<&str>,

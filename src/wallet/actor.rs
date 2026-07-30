@@ -2919,8 +2919,9 @@ impl WalletActor {
                 // `None` lets librustzcash derive the expiry from the proposal's target height,
                 // matching the fused build path (and the pre-#2412 behaviour).
                 None,
-                // The change strategy above uses padded (default) Orchard bundles, so the
-                // padding must be `DEFAULT` to match (see `with_unpadded_orchard_pool_bundles`).
+                // Selects the padding of the Orchard bundle only; the Ironwood bundle's is
+                // derived from the proposal. The Orchard bundle is always padded to the default
+                // action floor, which is what the change strategy above costed against.
                 BundlePadding::DEFAULT,
             )
             .map_err(|e| enrich_insufficient_funds(db, policy, classify_pczt_err(e)))?;

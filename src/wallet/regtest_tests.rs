@@ -216,8 +216,7 @@ fn regtest_wallet_lifecycle() {
     assert!(read::unmined_raw_txs(wallet_dir, 1)
         .expect("unmined_raw_txs")
         .is_empty());
-    // received_tx_records also exercises transparent_receiver_map (the `addresses` table); both
-    // the unfiltered and address-filtered shapes run.
+    // received_tx_records runs in both the unfiltered and address-filtered shapes.
     assert!(read::received_tx_records(wallet_dir, None)
         .expect("received_tx_records")
         .is_empty());

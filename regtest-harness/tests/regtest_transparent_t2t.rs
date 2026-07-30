@@ -385,6 +385,53 @@ async fn regtest_fully_transparent_spend_keeps_change_transparent() {
         "an intentional self-send shows a receive at the own address: {gt_self}"
     );
 
+    // 14. The received-by aggregations agree with the change/self-send classification above. At
+    //     this point the wallet has received on exactly two external t-addresses (the 1-ZEC
+    //     funding at `taddr`, the 0.05 self-payment at `own_addr`) and holds three
+    //     internal-chain change outputs (from the two funder payments and the self-send). The
+    //     aggregation keys on the recipient key scope recorded in `v_tx_outputs`, so this pins
+    //     down both directions: internal change must NOT be credited as received (a change
+    //     address leaking in here would misreport wallet income), and the deliberate external
+    //     self-payment MUST be. Spending the funding UTXO must not reduce what `taddr` received.
+    let recv_taddr = zecd
+        .call("getreceivedbyaddress", json!([taddr]))
+        .await
+        .expect("getreceivedbyaddress on the funded t-addr")
+        .as_f64()
+        .expect("received number");
+    assert!(
+        (recv_taddr - 1.0).abs() < 1e-8,
+        "the funded t-addr still shows the full 1 ZEC received after spending it: {recv_taddr}"
+    );
+    let recv_own = zecd
+        .call("getreceivedbyaddress", json!([own_addr]))
+        .await
+        .expect("getreceivedbyaddress on the self-send address")
+        .as_f64()
+        .expect("received number");
+    assert!(
+        (recv_own - 0.05).abs() < 1e-8,
+        "the self-payment is credited to the own external address: {recv_own}"
+    );
+    let lra = zecd
+        .call("listreceivedbyaddress", json!([1, false]))
+        .await
+        .expect("listreceivedbyaddress");
+    let mut listed: Vec<&str> = lra
+        .as_array()
+        .expect("listreceivedbyaddress array")
+        .iter()
+        .filter_map(|e| e["address"].as_str())
+        .collect();
+    listed.sort_unstable();
+    let mut expected = [taddr.as_str(), own_addr.as_str()];
+    expected.sort_unstable();
+    assert_eq!(
+        listed, expected,
+        "exactly the two external receive addresses are listed - no change address, no foreign \
+         recipient: {lra}"
+    );
+
     lwd.stop();
     drop(zecd);
     // `zebrad` and `funder` clean up on drop.

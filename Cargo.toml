@@ -80,8 +80,8 @@ zcash_encoding = "0.4"
 # and the received-by-address read paths; zecd's own wallets never expose transparent receivers.
 # `pczt` exposes `create_pczt_from_proposal` / `extract_and_store_transaction_from_pczt`, the
 # build/prove/store seam that lets the proving step take a cached Orchard proving key.
-zcash_client_backend = { version = "0.24.0-rc.4", features = ["orchard", "transparent-inputs", "pczt"] }
-zcash_client_sqlite = { version = "0.22.0-rc.4", features = ["unstable", "orchard", "serde", "transparent-inputs"] }
+zcash_client_backend = { version = "0.24.0-rc.6", features = ["orchard", "transparent-inputs", "pczt"] }
+zcash_client_sqlite = { version = "0.22.0-rc.6", features = ["unstable", "orchard", "serde", "transparent-inputs"] }
 zcash_keys = { version = "0.16", features = ["unstable", "orchard"] }
 zcash_primitives = "0.30"
 zcash_proofs = { version = "0.30", features = ["bundled-prover"] }
@@ -136,10 +136,10 @@ incrementalmerkletree = "0.8"
 # Dependency notes.
 #
 # The ironwood / NU6.3 librustzcash line is now consumed **straight from crates.io** - the leaf
-# crates as finals (`zcash_primitives`/`zcash_proofs 0.29.0`, `orchard 0.15.0`, `zcash_protocol
-# 0.10.0`, `zcash_keys 0.15.0`, `zcash_address 0.13.0`, `zcash_transparent 0.9.0`) and the wallet
-# crates as release candidates (`zcash_client_backend 0.24.0-rc.1`, `zcash_client_sqlite
-# 0.22.0-rc.1`, `pczt 0.8.0-rc.1`, `zip321 0.9.0-rc.1`), published 2026-07-12. This replaced the
+# crates as finals (`zcash_primitives`/`zcash_proofs 0.30.0`, `orchard 0.15.0`, `zcash_protocol
+# 0.10`, `zcash_keys 0.16`, `zcash_address 0.13.0`, `zcash_transparent 0.10.0`) and the wallet
+# crates as release candidates (`zcash_client_backend 0.24.0-rc.6`, `zcash_client_sqlite
+# 0.22.0-rc.6`, `pczt 0.9.1`, `zip321 0.9.0-rc.1`). This replaced the
 # previous all-or-nothing `[patch.crates-io]` git pin of the whole librustzcash workspace to the
 # `dw/ironwood-scan-model` rev `1105d8203` (zcash/librustzcash#2539), which existed only because the
 # wallet crates had no ironwood release yet. The shardtree/incrementalmerkletree git pins went with

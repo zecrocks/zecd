@@ -3,7 +3,9 @@
 //! (the mempool poller matches the tx's transparent outputs against the wallet's address set, the
 //! same way it trial-decrypts shielded outputs) and then **confirmed** once mined (the block scan
 //! matches each block's transparent outputs), and reports the receive across the
-//! balance/listunspent/is_mine RPCs. **Spending** received transparent funds (which requires
+//! balance/listunspent/is_mine RPCs and the received-by aggregations (which must credit it under
+//! the bare t-address, not the unified address enclosing that receiver). **Spending** received
+//! transparent funds (which requires
 //! shielding them first) is not yet implemented and is out of scope here - see the note at the end
 //! of the test. Finally it guards the matcher's address-set refresh: a payment to an address issued
 //! *beyond* the recovery window must still be discovered, which only holds if issuing the address
@@ -323,6 +325,32 @@ async fn regtest_transparent_receive_and_autoshield_spend() {
     assert!(
         (utxo["amount"].as_f64().unwrap_or(0.0) - 1.0).abs() < 1e-8,
         "the UTXO holds 1 ZEC: {lu}"
+    );
+
+    // The received-by aggregations credit the receive under the *bare t-address* the payer
+    // actually paid, not the unified address enclosing that receiver. This is the guard for the
+    // address encoding `v_tx_outputs.to_address` reports a transparent receive at: zecd pushes
+    // the single-address filter down into SQL, so a mismatch between the filter encoding and the
+    // stored encoding silently reports zero received rather than erroring.
+    let received = zecd
+        .call("getreceivedbyaddress", json!([taddr]))
+        .await
+        .expect("getreceivedbyaddress t-addr");
+    assert_eq!(
+        received.as_f64(),
+        Some(1.0),
+        "getreceivedbyaddress credits the bare t-address: {received}"
+    );
+    let lra = zecd
+        .call("listreceivedbyaddress", json!([1, false]))
+        .await
+        .expect("listreceivedbyaddress");
+    assert!(
+        lra.as_array().is_some_and(|entries| entries
+            .iter()
+            .any(|e| e["address"].as_str() == Some(taddr.as_str())
+                && (e["amount"].as_f64().unwrap_or(0.0) - 1.0).abs() < 1e-8)),
+        "listreceivedbyaddress lists the t-address with its 1 ZEC: {lra}"
     );
 
     // The opt-in gate: this wallet runs under the DEFAULT privacy policy (AllowRevealedRecipients),
