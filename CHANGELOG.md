@@ -5,6 +5,21 @@ All notable changes to zecd are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com), and this
 project adheres to [Semantic Versioning](https://semver.org).
 
+## [0.5.1-rc2] - 2026-07-30
+
+### Added
+- `zecd rescan` rebuilds a wallet whose database has become unusable: it deletes the database only, keeping `keys.toml` and the seed, so the next start recreates the account from the seed and rescans from the birthday. It takes the datadir lock the way `init` does and so refuses to run against a live daemon.
+- A stuck sync now says why it is stuck. zecd compares the network upgrades the node reports against the consensus rules it knows, warning ahead of an unknown pending upgrade and erroring on an active one, and it distinguishes a failure where the upstream served the blocks from one where the wallet database could not apply them.
+
+### Changed
+- `getreceivedbyaddress` and `listreceivedbyaddress` honor `include_immature_coinbase`, excluding immature transparent coinbase from their totals unless it is set, as Bitcoin Core does. Shielded coinbase has no maturity rule and always counts.
+- The librustzcash wallet crates move to `zcash_client_backend 0.24.0-rc.6` and `zcash_client_sqlite 0.22.0-rc.6`.
+
+### Fixed
+- A wallet restoring from its birthday no longer crawls through transparent spend detection. The requests that find those spends arrive in roughly 40-block windows, each queueing its successor, so one reused address could take thousands of sequential queries across a long restore; they are now serviced through to the chain tip in one query. Anyone restoring a transparent wallet on 0.5.0 or 0.5.1-rc1 would have seen this as a `pending_enhancements` count sitting flat for far longer than the block scan itself.
+- `getwalletinfo.scanning.progress` reflects the whole scan rather than reading 1.0 from the start, and `scanning` no longer flips to false partway through a restore.
+- An enhancement request whose start height is beyond the chain tip is skipped rather than reported as checked, which had aborted the whole enhancement pass on every retry until the funding transaction was mined.
+
 ## [0.5.1-rc1] - 2026-07-28
 
 ### Added
@@ -224,6 +239,7 @@ Zcash, backed entirely by librustzcash and running as a light client.
 ### Security
 - Pre-release audit hardening; refuse to start on mainnet with the placeholder RPC password; enforce a 12-character passphrase minimum.
 
+[0.5.1-rc2]: https://github.com/zecrocks/zecd/compare/v0.5.1-rc1...v0.5.1-rc2
 [0.5.1-rc1]: https://github.com/zecrocks/zecd/compare/v0.5.0...v0.5.1-rc1
 [0.5.0]: https://github.com/zecrocks/zecd/compare/v0.4.3...v0.5.0
 [0.5.0-rc4]: https://github.com/zecrocks/zecd/compare/v0.5.0-rc3...v0.5.0-rc4
