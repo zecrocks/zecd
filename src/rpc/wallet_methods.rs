@@ -372,10 +372,12 @@ pub(crate) fn getwalletinfo(state: &AppState, wallet: Option<&str>) -> Result<Va
     let st = handle.status();
     // `scanning` stays truthy while a transaction-enhancement backlog drains, not just during the
     // block scan: the wallet has reached the tip but is still backfilling memos/full tx data, so it
-    // isn't yet serving complete history. `progress` is the block-scan ratio (1.0 once the scan is
-    // caught up); the backlog itself is an open-ended count, surfaced on `/status` and factored into
-    // readiness rather than squeezed into this [0,1] field. Matches Bitcoin Core's shape (an object
-    // while scanning, `false` when idle).
+    // isn't yet serving complete history. `progress` is the height-based block-scan ratio
+    // (fully-scanned height over the birthday..tip range - honest for the whole scan, unlike the
+    // note-weighted upstream ratio it replaced, which read 1.0 from the start of a restore); it
+    // holds at 1.0 through the enhancement drain, whose backlog is an open-ended count surfaced on
+    // `/status` and factored into readiness rather than squeezed into this [0,1] field. Matches
+    // Bitcoin Core's shape (an object while scanning, `false` when idle).
     let scanning = if st.scanning || st.pending_enhancements > 0 {
         json!({ "duration": 0, "progress": st.scan_progress })
     } else {

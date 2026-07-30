@@ -162,6 +162,28 @@ fn sync_error_retry_deadline(now: Instant) -> Instant {
 /// one. At ~0.3s/request this is a few seconds of work per batch.
 const ENHANCE_BATCH: usize = 16;
 
+/// How often to emit an enhancement-drain progress heartbeat (throttled by wall time, like the
+/// transparent pre-exposure heartbeat). The `pending_enhancements` count alone can sit flat for
+/// a long drain even while requests are being serviced continuously - e.g. before
+/// `TransactionsInvolvingAddress` requests were serviced through to the tip, each serviced
+/// window immediately spawned its successor, so the snapshot count measured the number of
+/// in-progress address crawls, not the remaining work, and a half-hour drain read as a stall.
+/// The heartbeat makes forward progress visible in the log regardless of how the count moves.
+const ENHANCE_LOG_INTERVAL: Duration = Duration::from_secs(30);
+
+/// Progress of the current enhancement drain, for the time-throttled heartbeat. Transient and
+/// per-drain: reset whenever the drain completes or a sync batch does work (which clears
+/// `enhance_satisfied`, the serviced-count baseline).
+struct EnhanceProgress {
+    /// When this drain began.
+    started: Instant,
+    /// Last heartbeat time (throttle clock).
+    last_log: Instant,
+    /// Requests serviced (`enhance_satisfied.len()`) at the last heartbeat, so the logged rate
+    /// is a short rolling window rather than a drifting cumulative average.
+    last_log_count: usize,
+}
+
 /// Whether a [`TransactionDataRequest`] is one zecd can actually service (and therefore one that
 /// counts toward the enhancement backlog). All three variants drain: `GetStatus`/`Enhancement` via
 /// `fetch_full_tx`, and `TransactionsInvolvingAddress` via the transparent address-index query
@@ -174,6 +196,51 @@ fn is_serviceable_request(req: &TransactionDataRequest) -> bool {
             | TransactionDataRequest::Enhancement(_)
             | TransactionDataRequest::TransactionsInvolvingAddress(_)
     )
+}
+
+/// The inclusive block range `(start, end)` to actually check when servicing a
+/// `TransactionsInvolvingAddress` request, given the request's `block_range_start` and the
+/// current chain tip - or `None` when there is nothing checkable yet.
+///
+/// librustzcash windows its transparent spend-detection requests to roughly one tx-expiry delta
+/// (~40 blocks) past the last height each address was verified unspent at, and re-emits the next
+/// window only after `notify_address_checked` records the previous one. Serviced literally, that
+/// walks a restored wallet's UTXO from its funding height to the tip one window at a time -
+/// thousands of sequential `getaddresstxids` round trips per address on a deep restore (~3300 on
+/// a 135k-block range), which made the enhancement drain take several times longer than the block
+/// scan itself. The window exists for lightwalletd-style servers (bounded queries, per-request
+/// decorrelation via `request_at`); zebra's always-on address index serves any range in one
+/// indexed call, and the upstream docs explicitly permit a trusted chain-data source to ignore
+/// the decorrelation constraint. So zecd checks straight through to the chain tip in one query.
+///
+/// The start is clamped to 1 (zebra cannot serve genesis). `None` - nothing checkable - happens
+/// when the start is beyond the tip, e.g. a spend-search request whose funding tx is still
+/// unmined (librustzcash emits those with `block_range_start` = the generation-time tip and a
+/// windowed end beyond it); the caller must then skip `notify_address_checked` entirely, since
+/// notifying any height the backend's `as_of == block_range_end - 1` consistency check would
+/// accept would claim a check that never ran.
+fn tia_check_range(block_range_start: u32, chain_tip: u32) -> Option<(u32, u32)> {
+    let start = block_range_start.max(1);
+    (start <= chain_tip).then_some((start, chain_tip))
+}
+
+/// Height-based block-scan progress in `[0, 1]`: how much of the wallet's scan range
+/// (birthday..chain tip) `fully_scanned` has covered.
+///
+/// This deliberately does NOT use librustzcash's note-weighted `progress().scan()` ratio: that
+/// ratio is computed over the *tip-priority* scan range, so on a from-birthday restore it reads
+/// 1.0 from the very first status update while the lower-priority historical ranges - the actual
+/// hours of scanning - are still climbing `fully_scanned`. Surfacing it as
+/// `getwalletinfo.scanning.progress` invited operators to report a scan complete that had barely
+/// begun (the same trap `/readyz` avoids by gating on the height gap; see `HealthConfig`). The
+/// height ratio moves in lockstep with the block counter, so it is honest for the whole scan.
+/// An empty range (tip at or below the birthday - a fresh wallet) is complete, not `0/0`.
+fn scan_progress_ratio(birthday: u32, fully_scanned: u32, chain_tip: u32) -> f64 {
+    let total = chain_tip.saturating_sub(birthday);
+    if total == 0 {
+        return 1.0;
+    }
+    (f64::from(fully_scanned.saturating_sub(birthday)) / f64::from(total)).clamp(0.0, 1.0)
 }
 
 /// At bootstrap, warn when the derived scan floor lands more than one note-commitment-tree
@@ -458,6 +525,9 @@ struct WalletActor {
     /// sync batch does work (new blocks may add or re-satisfy requests). Entries removed from the
     /// DB by librustzcash on success simply never reappear.
     enhance_satisfied: std::collections::BTreeSet<TransactionDataRequest>,
+    /// Heartbeat state for the current enhancement drain (see [`ENHANCE_LOG_INTERVAL`]).
+    /// `None` when no drain is in progress.
+    enhance_progress: Option<EnhanceProgress>,
     /// Graceful-shutdown signal (see [`ActorConfig::shutdown`]).
     shutdown: watch::Receiver<bool>,
 }
@@ -730,6 +800,7 @@ pub async fn spawn(
         watch_only,
         unlock_until: None,
         enhance_satisfied: std::collections::BTreeSet::new(),
+        enhance_progress: None,
         shutdown: cfg.shutdown,
     };
 
@@ -1088,8 +1159,10 @@ impl WalletActor {
                         if worked {
                             more_work = true;
                             // New blocks were scanned, which may add or re-satisfy enhancement
-                            // requests - start the next drain from a clean slate.
+                            // requests - start the next drain from a clean slate. The heartbeat
+                            // resets with it (its serviced count is `enhance_satisfied.len()`).
                             self.enhance_satisfied.clear();
+                            self.enhance_progress = None;
                         } else {
                             // Caught up: give any unmined wallet txs another shot at the mempool,
                             // pull the full data (memos, …) for transactions seen only as compact
@@ -1430,6 +1503,44 @@ impl WalletActor {
         }
     }
 
+    /// Emit an enhancement-drain progress heartbeat, throttled to one line per
+    /// [`ENHANCE_LOG_INTERVAL`]. The serviced count is `enhance_satisfied.len()` (requests
+    /// attempted this drain); `pending` is the serviceable backlog still in hand. Logged because
+    /// the `pending_enhancements` *count* is a snapshot of a queue whose total size isn't knowable
+    /// up front (servicing a request can enqueue successors), so a flat reading between polls does
+    /// not distinguish steady progress from a stall - the heartbeat does.
+    fn maybe_log_enhance_progress(&mut self, pending: usize) {
+        let now = Instant::now();
+        let Some(progress) = self.enhance_progress.as_mut() else {
+            // Drain just started: arm the throttle without logging, so short drains stay quiet.
+            self.enhance_progress = Some(EnhanceProgress {
+                started: now,
+                last_log: now,
+                last_log_count: self.enhance_satisfied.len(),
+            });
+            return;
+        };
+        let window = now.duration_since(progress.last_log);
+        if window < ENHANCE_LOG_INTERVAL {
+            return;
+        }
+        let done = self.enhance_satisfied.len();
+        let did = done.saturating_sub(progress.last_log_count);
+        let rate = if window.as_secs_f64() > 0.0 {
+            did as f64 / window.as_secs_f64()
+        } else {
+            0.0
+        };
+        info!(
+            "[{}] enhancement drain in progress: {done} request(s) serviced in {:.0}s \
+             ({rate:.1}/s), {pending} pending",
+            self.name,
+            progress.started.elapsed().as_secs_f64(),
+        );
+        progress.last_log = now;
+        progress.last_log_count = done;
+    }
+
     /// Service one bounded batch of the wallet's pending transaction-data requests - the
     /// "enhancement" step. `scan_cached_blocks` records these
     /// (`WalletRead::transaction_data_requests`) while scanning compact blocks, which carry no
@@ -1480,6 +1591,11 @@ impl WalletActor {
             .into_iter()
             .filter(|r| is_serviceable_request(r) && !self.enhance_satisfied.contains(r))
             .collect();
+        if pending.is_empty() {
+            self.enhance_progress = None;
+        } else {
+            self.maybe_log_enhance_progress(pending.len());
+        }
         let mut handled = 0usize;
         for req in &pending {
             // Bail promptly on Ctrl-C/`stop` rather than fetching out the rest of a long backlog.
@@ -1547,45 +1663,73 @@ impl WalletActor {
             // checked up to the range end so librustzcash stops re-requesting it.
             TransactionDataRequest::TransactionsInvolvingAddress(addr_req) => {
                 use zcash_keys::encoding::AddressCodec as _;
-                let address = addr_req.address().encode(&self.network);
-                let chain_tip_u32 = u32::from(chain_tip);
-                let start = u32::from(addr_req.block_range_start()).max(1);
-                // librustzcash's `block_range_end` is exclusive; clamp the inclusive query/checked
-                // height to the chain tip (or the tip itself when the request is open-ended).
-                let as_of = match addr_req.block_range_end() {
-                    Some(end_excl) => u32::from(end_excl).saturating_sub(1).min(chain_tip_u32),
-                    None => chain_tip_u32,
+                // Check the address straight through to the chain tip, extending past the
+                // request's own ~40-block windowed end - see [`tia_check_range`] for why (one
+                // indexed zebra query replaces thousands of sequential window round trips per
+                // address on a deep restore). `None` means nothing is checkable yet (a
+                // spend-search request whose funding tx is still unmined): skip the query AND
+                // the notification - notifying would claim a check that never ran (and the
+                // backend's `as_of == block_range_end - 1` consistency check would reject any
+                // honest height anyway, aborting the whole pass). The request stays in the DB
+                // for a later pass; `enhance_step` marks it attempted for this drain, so it
+                // can't spin the batch loop or pin the backlog count above zero.
+                let Some((start, as_of)) = tia_check_range(
+                    u32::from(addr_req.block_range_start()),
+                    u32::from(chain_tip),
+                ) else {
+                    return Ok(());
                 };
-                if start <= as_of {
-                    tracing::debug!(
-                        "[{}] TIA: getaddresstxids addr={address} range={start}..={as_of}",
-                        self.name
-                    );
-                    let txids = self
-                        .fetch_transparent_txids(vec![address], start, as_of)
-                        .await
-                        .map_err(|e| anyhow!("{e}"))?;
-                    tracing::debug!(
-                        "[{}] TIA: getaddresstxids returned {} txid(s)",
-                        self.name,
-                        txids.len()
-                    );
-                    for txid in txids {
-                        if let Some((tx, mined)) = self.fetch_full_tx(txid, chain_tip).await? {
-                            decrypt_and_store_transaction(
-                                &self.network,
-                                &mut self.db_data,
-                                &tx,
-                                mined,
-                            )?;
-                        }
+                let address = addr_req.address().encode(&self.network);
+                tracing::debug!(
+                    "[{}] TIA: getaddresstxids addr={address} range={start}..={as_of}",
+                    self.name
+                );
+                let txids = self
+                    .fetch_transparent_txids(vec![address], start, as_of)
+                    .await
+                    .map_err(|e| anyhow!("{e}"))?;
+                tracing::debug!(
+                    "[{}] TIA: getaddresstxids returned {} txid(s)",
+                    self.name,
+                    txids.len()
+                );
+                for txid in txids {
+                    // The extended range can cover a whole restore's history for a heavily
+                    // reused address, so bail between fetches on Ctrl-C/`stop` rather than
+                    // fetching it out. Nothing is notified below, so the request is simply
+                    // re-serviced on the next run; each already-stored tx is kept.
+                    if *self.shutdown.borrow() {
+                        return Err(anyhow!("shutdown during address check"));
+                    }
+                    if let Some((tx, mined)) = self.fetch_full_tx(txid, chain_tip).await? {
+                        decrypt_and_store_transaction(
+                            &self.network,
+                            &mut self.db_data,
+                            &tx,
+                            mined,
+                        )?;
                     }
                 }
                 // Record the address as checked up to `as_of` (the inclusive end), whether or not
                 // any txs were found, so the request converges instead of being re-emitted every
-                // caught-up pass.
+                // caught-up pass. The backend insists the notified height equal the request's
+                // `block_range_end - 1`, so rebuild the request over the range actually checked
+                // (`notify_address_checked` reads only the address and the heights, and the
+                // extended claim is truthful - the query above covered the whole range).
+                let TransactionDataRequest::TransactionsInvolvingAddress(checked) =
+                    TransactionDataRequest::transactions_involving_address(
+                        addr_req.address(),
+                        addr_req.block_range_start(),
+                        Some(BlockHeight::from_u32(as_of + 1)),
+                        addr_req.request_at(),
+                        addr_req.tx_status_filter().clone(),
+                        addr_req.output_status_filter().clone(),
+                    )
+                else {
+                    unreachable!("transactions_involving_address builds that variant");
+                };
                 self.db_data
-                    .notify_address_checked(addr_req.clone(), BlockHeight::from_u32(as_of))?;
+                    .notify_address_checked(checked, BlockHeight::from_u32(as_of))?;
             }
         }
         Ok(())
@@ -2286,19 +2430,25 @@ impl WalletActor {
         } else {
             None
         };
-        let (fully_scanned, scan_progress, scanning) = match summary {
-            Some(s) => {
-                let scanned = Some(u32::from(s.fully_scanned_height()));
-                let scan = s.progress().scan();
-                let denom = *scan.denominator();
-                let ratio = if denom == 0 {
-                    1.0
-                } else {
-                    (*scan.numerator() as f64 / denom as f64).clamp(0.0, 1.0)
-                };
-                (scanned, ratio, ratio < 1.0)
+        // `scanning` and `scan_progress` are height-based (`fully_scanned` vs the chain tip), NOT
+        // librustzcash's note-weighted `progress().scan()` ratio - that ratio covers only the
+        // tip-priority range and reads 1.0 while historical ranges are still scanning (see
+        // [`scan_progress_ratio`]), which previously flipped `scanning` false mid-restore: the
+        // status RPCs (`getwalletinfo.scanning`, `initialblockdownload`, `getpeerinfo.syncing`)
+        // reported the scan done hours early, and `pending_enhancements` was measured (one DB
+        // read per status update) throughout the scan it was designed to skip.
+        let (fully_scanned, scan_progress, scanning) = match (summary, self.tip_height) {
+            (Some(s), Some(tip)) => {
+                let scanned = u32::from(s.fully_scanned_height());
+                (
+                    Some(scanned),
+                    scan_progress_ratio(self.birthday, scanned, tip),
+                    scanned < tip,
+                )
             }
-            None => (None, 0.0, true),
+            // `summary` is only computed once a tip is known, so this is the "no summary yet"
+            // arm either way: heights unknown, conservatively still scanning.
+            _ => (None, 0.0, true),
         };
 
         // The enhancement backlog is the work that remains *after* the block scan reaches the tip
@@ -4788,6 +4938,47 @@ mod tests {
         let (pct, _, eta) = preexpose_progress_stats(1_000, 1_000, 1_000, 30.0);
         assert_eq!(pct, 100.0);
         assert_eq!(eta, "~0s");
+    }
+
+    #[test]
+    fn tia_check_range_extends_to_tip_and_skips_unmined() {
+        use super::tia_check_range;
+        // The windowed request (start + ~40 blocks) is extended straight to the tip: one query
+        // instead of thousands of sequential windows on a deep restore.
+        assert_eq!(
+            tia_check_range(4_080_346, 4_215_261),
+            Some((4_080_346, 4_215_261))
+        );
+        // Start at the tip: a single-block check.
+        assert_eq!(
+            tia_check_range(4_215_261, 4_215_261),
+            Some((4_215_261, 4_215_261))
+        );
+        // Genesis is unservable (zebra can't parse block 0); the start clamps to 1.
+        assert_eq!(tia_check_range(0, 100), Some((1, 100)));
+        // Start beyond the tip (spend-search for a still-unmined funding tx): nothing checkable,
+        // and the caller must not notify - the old code notified anyway and tripped the backend's
+        // `as_of == block_range_end - 1` check, aborting the enhancement pass every time.
+        assert_eq!(tia_check_range(101, 100), None);
+    }
+
+    #[test]
+    fn scan_progress_ratio_tracks_height_not_note_weight() {
+        use super::scan_progress_ratio;
+        // Mid-restore: 50 of 100 blocks past the birthday scanned = 0.5 (the note-weighted
+        // upstream ratio would already read 1.0 here - the bug this helper replaces).
+        let mid = scan_progress_ratio(1_000, 1_050, 1_100);
+        assert!((mid - 0.5).abs() < 1e-9, "mid {mid}");
+        // Scan start and completion.
+        assert_eq!(scan_progress_ratio(1_000, 1_000, 1_100), 0.0);
+        assert_eq!(scan_progress_ratio(1_000, 1_100, 1_100), 1.0);
+        // Fresh wallet (tip at/below the birthday): nothing to scan is complete, not 0/0.
+        assert_eq!(scan_progress_ratio(1_000, 1_000, 1_000), 1.0);
+        assert_eq!(scan_progress_ratio(1_000, 999, 999), 1.0);
+        // Clamped: a scanned height past the tip (transient) or below the birthday never leaves
+        // [0, 1].
+        assert_eq!(scan_progress_ratio(1_000, 1_200, 1_100), 1.0);
+        assert_eq!(scan_progress_ratio(1_000, 900, 1_100), 0.0);
     }
 
     #[test]

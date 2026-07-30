@@ -87,10 +87,15 @@ pub struct SyncStatus {
     /// sanity-check the upstream's tip against it without a DB read.
     pub birthday: Option<u32>,
     pub best_block_hash: Option<String>,
-    /// Scan progress in `[0, 1]`. This is the *block scan* (compact-block) progress only; it
+    /// Scan progress in `[0, 1]`: the height-based fraction of the wallet's scan range
+    /// (birthday..chain tip) that `fully_scanned` has covered - NOT librustzcash's note-weighted
+    /// ratio, which reads 1.0 from the start of a from-birthday restore (see
+    /// `actor::scan_progress_ratio`). This is the *block scan* (compact-block) progress only; it
     /// reaches 1.0 when the scan catches up to the tip, which can be well before the wallet is
     /// ready to serve full history - see `pending_enhancements`.
     pub scan_progress: f64,
+    /// True while the block scan lags the chain tip (`fully_scanned < chain_tip`, or either
+    /// height still unknown).
     pub scanning: bool,
     /// Pending transaction-enhancement requests: the per-transaction full-tx fetches that backfill
     /// memos (and full transparent data) for transactions the wallet only ever saw as compact
