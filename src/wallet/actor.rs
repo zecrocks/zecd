@@ -67,33 +67,48 @@ use crate::wallet::{
 const TARGET_NOTE_COUNT: usize = 4;
 const MIN_SPLIT_OUTPUT_VALUE: u64 = 10_000_000; // 0.1 ZEC
 
-/// The Orchard proving + verifying keys, built once and shared (read-only) across every wallet
-/// actor via `Arc`. These are wallet-independent (they're the Orchard circuit's keys), and
+/// The Orchard (+ Ironwood) proving/verifying keys, built once and shared (read-only) across
+/// every wallet actor via `Arc`. These are wallet-independent (they're the circuit's keys), and
 /// `ProvingKey::build()` is a full `keygen_vk`+`keygen_pk` - seconds of work - so the fused
 /// librustzcash send path (which rebuilds the proving key on *every* transaction) pays that
-/// cost per send. Building it here once and feeding it to the PCZT prove path eliminates that
-/// per-send overhead (the `[spend] cache_proving_key` knob, default on). The verifying key is
-/// kept too so the PCZT extract step doesn't regenerate it each send.
+/// cost per send. Building them here once and feeding them to the PCZT prove path eliminates that
+/// per-send overhead (the `[spend] cache_proving_key` knob, default on). The Orchard verifying key
+/// is kept too so the PCZT extract step doesn't regenerate it each non-Ironwood send.
+///
+/// Two circuit versions exist (orchard `bundle.rs`): a **V2 Orchard** bundle uses `FixedPostNu6_2`,
+/// a **V3 Ironwood** bundle uses `PostNu6_3`, and `Bundle::create_proof` rejects a key whose circuit
+/// version doesn't match the bundle. A post-NU6.3 send from an Orchard-pool wallet carries *both*
+/// bundles (V2 spends of legacy Orchard notes + V3 Ironwood outputs/change), so both proving keys
+/// are needed. NU6.3 is activated on **both mainnet (height 3_428_143) and testnet (4_134_000)**,
+/// so `ironwood_pk` is built on both; it is `None` only where the network carries no NU6.3
+/// activation height at all - in practice a regtest chain started without
+/// `ZECD_REGTEST_NU63_HEIGHT` - where the PostNu6_3 keygen would be ~4.5 s of wasted startup for a
+/// key no send can use.
 pub struct ProvingKeyCache {
+    /// `FixedPostNu6_2` proving key - proves the V2 Orchard bundle.
     orchard_pk: orchard::circuit::ProvingKey,
+    /// `FixedPostNu6_2` verifying key - verifies the V2 Orchard bundle in the extract step.
     orchard_vk: orchard::circuit::VerifyingKey,
+    /// `PostNu6_3` proving key - proves the V3 Ironwood bundle. `None` only when the network has
+    /// no NU6.3 activation height at all (so no send produces an Ironwood bundle); mainnet and
+    /// testnet both have one. See [`ProvingKeyCache::build`].
+    ironwood_pk: Option<orchard::circuit::ProvingKey>,
 }
 
 impl ProvingKeyCache {
-    /// Build the Orchard proving + verifying keys. Expensive (full key generation); call once
-    /// at startup, off the async runtime (e.g. under `spawn_blocking`).
-    pub fn build() -> Self {
-        // The orchard crate splits `build()` into per-circuit-version keys. `FixedPostNu6_2` is the
-        // current (NU6.2-era) Orchard circuit. The cached-proving-key PCZT path only ever proves
-        // **V5 Orchard** sends: post-NU6.3 sends route to the fused `create_proposed_transactions`
-        // path (see `ironwood_forces_fused`), which builds its own `PostNu6_3` key via `LocalTxProver`.
-        // So this cache never proves a V6/Ironwood bundle and `FixedPostNu6_2` is always correct here,
-        // on every network (mainnet, testnet pre-4.134M, and post-NU6.3 chains where the cache goes
-        // unused). Reclaim `PostNu6_3` here only if the PCZT path is ever taught to build Ironwood.
-        let circuit = orchard::circuit::OrchardCircuitVersion::FixedPostNu6_2;
+    /// Build the cached proving/verifying keys. Expensive (full key generation); call once at
+    /// startup, off the async runtime (e.g. under `spawn_blocking`). `build_ironwood` also builds
+    /// the `PostNu6_3` proving key (another ~4.5 s) for the Ironwood bundle; pass it iff the network
+    /// has a NU6.3 activation height - **true on both mainnet and testnet**, and on regtest only
+    /// when `ZECD_REGTEST_NU63_HEIGHT` is set - so only a NU6.3-less regtest chain skips a keygen
+    /// it can't use.
+    pub fn build(build_ironwood: bool) -> Self {
+        use orchard::circuit::{OrchardCircuitVersion, ProvingKey, VerifyingKey};
         ProvingKeyCache {
-            orchard_pk: orchard::circuit::ProvingKey::build(circuit),
-            orchard_vk: orchard::circuit::VerifyingKey::build(circuit),
+            orchard_pk: ProvingKey::build(OrchardCircuitVersion::FixedPostNu6_2),
+            orchard_vk: VerifyingKey::build(OrchardCircuitVersion::FixedPostNu6_2),
+            ironwood_pk: build_ironwood
+                .then(|| ProvingKey::build(OrchardCircuitVersion::PostNu6_3)),
         }
     }
 }
@@ -3127,38 +3142,16 @@ impl WalletActor {
     /// Whether sends on this wallet *may* use the cached-Orchard PCZT path (so prove and store are
     /// separable). True for the default Orchard-only wallet with `cache_proving_key` on. A
     /// Sapling-spending wallet (or `cache_proving_key` off) uses the fused path, which has no
-    /// prove/store seam - see [`Self::do_send_fused`]. Also forced off once NU6.3/Ironwood is active
-    /// (see [`Self::ironwood_forces_fused`]): post-NU6.3 sends ride the fused
-    /// `create_proposed_transactions` path, which is validated end-to-end for Ironwood.
+    /// prove/store seam - see [`Self::do_send_fused`]. Ironwood (post-NU6.3) sends now ride this
+    /// path too: `create_pczt_from_proposal` builds the Ironwood bundle, `prove_sign_pczt` proves it
+    /// from the cached `PostNu6_3` key, and the extract step verifies it (see [`store_pczt`]).
     ///
-    /// NB this gates on the *wallet's* pools (and consensus), not the send's recipients: even when
-    /// this is true, an individual send that pays a Sapling output is still diverted to the fused
-    /// path (`request_pays_sapling_output`), because the cached path's extractor is handed no
-    /// Sapling verifying key.
+    /// NB this gates on the *wallet's* pools, not the send's recipients: even when this is true, an
+    /// individual send that pays a Sapling output is still diverted to the fused path
+    /// (`request_pays_sapling_output`), because the cached path's extractor is handed no Sapling
+    /// verifying key.
     fn cached_pczt_path(&self) -> bool {
-        self.orchard_keys.is_some()
-            && !self.enabled_pools.contains(Pool::Sapling)
-            && !self.ironwood_forces_fused()
-    }
-
-    /// Whether NU6.3/Ironwood is active as of the next block, forcing sends onto the fused build
-    /// path. Post-NU6.3 an Orchard-pool spend routes its payment/change into the Ironwood (V6)
-    /// bundle. Historically the gate was mandatory - the git-pinned `create_pczt_from_proposal`
-    /// hard-errored on an Ironwood bundle (`ProposalNotSupported`). The published
-    /// `zcash_client_backend 0.24.0-rc.1` now BUILDS Ironwood PCZTs (librustzcash#2543 landed), so
-    /// the gate is a conservative choice, not an upstream constraint: the fused
-    /// `create_proposed_transactions` path is the one validated end-to-end by the ironwood regtest
-    /// tier. TODO: drop this once the cached PCZT path (build -> `prove_sign_pczt` with the
-    /// `PostNu6_3` key + `create_ironwood_proof` (the ready other half) -> extract) is validated
-    /// against an NU6.3-active chain; Ironwood sends then reclaim the cached-proving-key speedup.
-    fn ironwood_forces_fused(&self) -> bool {
-        use zcash_protocol::consensus::{NetworkUpgrade, Parameters};
-        self.tip_height
-            .map(|tip| {
-                self.network
-                    .is_nu_active(NetworkUpgrade::Nu6_3, BlockHeight::from_u32(tip) + 1)
-            })
-            .unwrap_or(false)
+        self.orchard_keys.is_some() && !self.enabled_pools.contains(Pool::Sapling)
     }
 
     /// Whether a send should be pipelined: `[spend] pipeline_proving` on *and* the cached PCZT
@@ -3353,6 +3346,8 @@ impl WalletActor {
         let (pczt, shape, build) = self.build_proposal_and_pczt(request, policy, privacy)?;
         let keys = self.orchard_keys.clone().expect("cached path");
         let prover = self.prover.clone();
+        // Copied out before the `self.db_data` borrow below; `ZNetwork` is `Copy`.
+        let network = self.network;
         let db = &mut self.db_data;
         let (txid, raw, prove, store): (TxId, Vec<u8>, Duration, Duration) =
             tokio::task::block_in_place(move || -> Result<_, RpcError> {
@@ -3360,7 +3355,7 @@ impl WalletActor {
                 let signed = prove_sign_pczt(pczt, &usk, &prover, &keys)?;
                 let prove = p0.elapsed();
                 let s0 = Instant::now();
-                let txid = store_pczt(db, signed, &keys)?;
+                let txid = store_pczt(db, network, signed, &keys)?;
                 let raw = read_raw_tx(db, txid)?;
                 Ok((txid, raw, prove, s0.elapsed()))
             })?;
@@ -3654,12 +3649,14 @@ impl WalletActor {
             .orchard_keys
             .clone()
             .expect("pipeline requires cached keys");
+        // Copied out before the `self.db_data` borrow below; `ZNetwork` is `Copy`.
+        let network = self.network;
         let db = &mut self.db_data;
         let _ = policy; // store rarely surfaces -6; kept for symmetry with the inline path.
         let (txid, raw, store): (TxId, Vec<u8>, Duration) =
             tokio::task::block_in_place(move || -> Result<_, RpcError> {
                 let s0 = Instant::now();
-                let txid = store_pczt(db, signed, &keys)?;
+                let txid = store_pczt(db, network, signed, &keys)?;
                 let raw = read_raw_tx(db, txid)?;
                 Ok((txid, raw, s0.elapsed()))
             })?;
@@ -4721,21 +4718,22 @@ fn prove_sign_pczt(
     } else {
         prover
     };
-    // Ironwood (V6) proof step. A V6 transaction past NU6.3 carries a separate Ironwood bundle
-    // needing its own proof, produced from the same `PostNu6_3` proving key as the Orchard proof
-    // (mirrors devtool's `pczt/prove.rs`).
-    //
-    // DEAD CODE TODAY (kept intentionally): `do_send` routes every post-NU6.3 send to the fused
-    // `create_proposed_transactions` path (see `ironwood_forces_fused` in `cached_pczt_path`) and
-    // never reaches this PCZT prover for such a tx. So `requires_ironwood_proof()` is always false
-    // here (the branch is dead but compiled). This step is the ready other half: upstream's
-    // published RC now builds Ironwood PCZTs (librustzcash#2543), so dropping the
-    // `ironwood_forces_fused` gate - once the cached path is validated on an NU6.3-active chain -
-    // routes Ironwood sends back through here, reusing the cached key instead of the fused path's
-    // per-send `ProvingKey::build()`.
+    // Ironwood (V6) proof step. A post-NU6.3 transaction carries a separate Ironwood bundle needing
+    // its own proof (mirrors devtool's `pczt/prove.rs`). The Ironwood bundle uses the
+    // **`PostNu6_3`** circuit (orchard `bundle.rs`), so it must be proved with the `PostNu6_3` key -
+    // `Bundle::create_proof` rejects a `FixedPostNu6_2` key here. That key is
+    // `ProvingKeyCache::ironwood_pk`, built at startup whenever the network can activate NU6.3 (so
+    // it is always present when `requires_ironwood_proof()` is true; its absence would mean NU6.3
+    // fired without the cache expecting it, which is a bug worth surfacing).
     let prover = if prover.requires_ironwood_proof() {
+        let ironwood_pk = keys.ironwood_pk.as_ref().ok_or_else(|| {
+            RpcError::wallet(
+                "Ironwood proof required but the PostNu6_3 proving key was not built \
+                 (NU6.3 not expected on this network)",
+            )
+        })?;
         prover
-            .create_ironwood_proof(&keys.orchard_pk)
+            .create_ironwood_proof(ironwood_pk)
             .map_err(|e| RpcError::wallet(format!("Ironwood proof generation failed: {e:?}")))?
     } else {
         prover
@@ -4779,9 +4777,8 @@ fn prove_sign_pczt(
     // spends need their own signing pass or `extract_and_store_transaction_from_pczt` fails with
     // `Ironwood(Extract(MissingSpendAuthSig))`. Ironwood reuses Orchard's spend crypto, so the same
     // Orchard `ask` signs it; the loop mirrors the Orchard one (skip the dummy-spend
-    // `WrongSpendAuthorizingKey`, stop at `InvalidIndex`). Dead but compiled: the PCZT path never
-    // produces an Ironwood bundle (post-NU6.3 sends route to the fused path via
-    // `ironwood_forces_fused`), so the loop finds no ironwood spends and exits immediately.
+    // `WrongSpendAuthorizingKey`, stop at `InvalidIndex`). A pre-NU6.3 send has no Ironwood bundle,
+    // so `sign_ironwood(0, ..)` returns `InvalidIndex` immediately and the loop is a no-op.
     {
         let mut index = 0;
         loop {
@@ -4804,27 +4801,86 @@ fn prove_sign_pczt(
 
 /// Finalize + persist a proven, signed PCZT (phase C): records the tx, its spends/change, and
 /// marks inputs spent - the same wallet bookkeeping `create_proposed_transactions` does. A DB
-/// write, so it runs on the single-writer actor. The cached Orchard verifying key avoids
-/// regenerating it per send. The Sapling verifying key is `None` because this path is only reached
-/// for sends with **no Sapling output** - the extractor rejects a Sapling bundle without one, so
-/// `do_send`/`begin_or_queue_send` divert any send to a Sapling-only recipient to the fused path
-/// before reaching here (the guard is `request_pays_sapling_output`). Note this is about Sapling
-/// *outputs*, not spends: zecd never spends Sapling notes on this path, but a send can still *pay*
-/// a Sapling recipient. `N` (the note-ref type) is otherwise unconstrained here - it only appears
-/// in the error type - so pin it to our `WalletDb`'s note ref, as `error::ProposalError` does for
-/// the fused path.
+/// write, so it runs on the single-writer actor. The Sapling verifying key is `None` because this
+/// path is only reached for sends with **no Sapling output** - the extractor rejects a Sapling
+/// bundle without one, so `do_send`/`begin_or_queue_send` divert any send to a Sapling-only
+/// recipient to the fused path before reaching here (the guard is `request_pays_sapling_output`).
+/// Note this is about Sapling *outputs*, not spends: zecd never spends Sapling notes on this path,
+/// but a send can still *pay* a Sapling recipient. `N` (the note-ref type) is otherwise
+/// unconstrained here - it only appears in the error type - so pin it to our `WalletDb`'s note ref,
+/// as `error::ProposalError` does for the fused path.
+///
+/// Orchard verifying key: the extractor verifies *both* the Orchard and the Ironwood bundles with
+/// the single `orchard_vk` argument, but they use different circuit versions (`FixedPostNu6_2` vs
+/// `PostNu6_3`), so a single cached VK can't cover a post-NU6.3 send that carries both bundles. So
+/// pass `None` whenever the PCZT actually has an Ironwood bundle: the extractor then rebuilds the
+/// correct verifying key *per bundle* from each bundle's own version (a `VerifyingKey::build` per
+/// bundle - the cheaper `keygen_vk`, and only on Ironwood sends). A pre-NU6.3 send has only a
+/// `FixedPostNu6_2` Orchard bundle, so it reuses the cached `orchard_vk` and rebuilds nothing.
 fn store_pczt(
     db: &mut WriteDb,
+    network: ZNetwork,
     pczt: pczt::Pczt,
     keys: &ProvingKeyCache,
 ) -> Result<TxId, RpcError> {
-    extract_and_store_transaction_from_pczt::<_, zcash_client_sqlite::ReceivedNoteId>(
-        db,
-        pczt,
-        None,
-        Some(&keys.orchard_vk),
+    let has_ironwood = !pczt.ironwood().actions().is_empty();
+    let orchard_vk = if has_ironwood {
+        None
+    } else {
+        Some(&keys.orchard_vk)
+    };
+    let txid = extract_and_store_transaction_from_pczt::<_, zcash_client_sqlite::ReceivedNoteId>(
+        db, pczt, None, orchard_vk,
     )
-    .map_err(|e| RpcError::wallet(format!("storing transaction failed: {e}")))
+    .map_err(|e| RpcError::wallet(format!("storing transaction failed: {e}")))?;
+    if has_ironwood {
+        backfill_ironwood_memos(db, network, txid);
+    }
+    Ok(txid)
+}
+
+/// Record the memos on an Ironwood send's own outputs, which [`store_pczt`]'s extract step does
+/// not write.
+///
+/// `extract_and_store_transaction_from_pczt` builds its `SentTransaction` outputs from the
+/// transaction's **Sapling and Orchard** bundles only - it has no Ironwood handling at all
+/// (`zcash_client_backend 0.24.0-rc.6`), unlike the fused `create_proposed_transaction`, which
+/// does record them. Post-NU6.3 a send's payment and change ride the **Ironwood** bundle, so on
+/// the PCZT path those outputs reach the DB with no `sent_notes` row, and with it no memo. Nothing
+/// downstream repairs that on the authoring node: the compact block scan later materializes the
+/// notes but compact outputs carry no memos, and the enhancement pass that would re-decrypt the
+/// full transaction skips it (the raw bytes were pre-stored by the send, so `queue_tx_retrieval`
+/// classifies it `Status`-only). The memo is therefore lost from *both* sides of the sender's
+/// history - the outgoing record and, for a self-send, the receive - until a from-seed restore or
+/// rescan recovers it via enhancement.
+///
+/// So re-decrypt the just-stored transaction with the wallet's own keys, exactly as the mempool
+/// path does for the same transaction shape: that fills the received notes' memos and OVK-decrypts
+/// the outgoing ones. Cheap next to the proof (one trial decrypt of a transaction already known to
+/// be ours) and only on Ironwood sends, so pre-NU6.3 sends are untouched.
+///
+/// Best-effort: the transaction is already stored and about to broadcast, so a failure here costs
+/// a memo, not a send - it is logged, not propagated.
+///
+/// TODO(upstream): drop this once `extract_and_store_transaction_from_pczt` harvests the Ironwood
+/// bundle like the fused builder does.
+fn backfill_ironwood_memos(db: &mut WriteDb, network: ZNetwork, txid: TxId) {
+    let tx = match db.get_transaction(txid) {
+        Ok(Some(tx)) => tx,
+        Ok(None) => {
+            warn!("ironwood memo backfill: transaction {txid} missing from the wallet DB");
+            return;
+        }
+        Err(e) => {
+            warn!("ironwood memo backfill: could not read transaction {txid}: {e}");
+            return;
+        }
+    };
+    // The send is unmined at this point (it has not even broadcast yet), so pass no mined height -
+    // the same call the mempool path makes for an unmined transaction.
+    if let Err(e) = decrypt_and_store_transaction(&network, db, &tx, None) {
+        warn!("ironwood memo backfill failed for {txid}: {e}");
+    }
 }
 
 /// A send's size, for the latency log line. Proving cost scales with `orchard_actions`; a large,

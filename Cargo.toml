@@ -121,10 +121,12 @@ mimalloc = ["dep:mimalloc"]
 mimalloc-secure = ["mimalloc", "mimalloc/secure"]
 # NB: Ironwood (NU6.3 / V6) is **no longer a cargo feature** - it is compiled unconditionally (the
 # published ironwood librustzcash line exposes the ironwood APIs unconditionally).
-# Activation is purely consensus-height driven via `is_nu_active(NetworkUpgrade::Nu6_3, ...)`: OFF on
-# mainnet (protocol has no NU6.3 height), ON on testnet at height 4_134_000, and opt-in on regtest
-# via the `ZECD_REGTEST_NU63_HEIGHT` env var (the ironwood harness sets it to 8; the standard harness
-# leaves it unset). So ironwood is "always built, testnet-on, mainnet-off" with no build flag. The
+# Activation is purely consensus-height driven via `is_nu_active(NetworkUpgrade::Nu6_3, ...)`: LIVE
+# on mainnet at height 3_428_143 and on testnet at 4_134_000 (both carried by `zcash_protocol`), and
+# opt-in on regtest via the `ZECD_REGTEST_NU63_HEIGHT` env var (the ironwood harness sets it to 8;
+# the standard harness leaves it unset, so that chain stays pre-NU6.3). So ironwood is "always
+# built, live on both public networks" with no build flag - a mainnet send past 3_428_143 is an
+# ironwood send. The
 # wallet crates are pinned to crates.io **release candidates** (see the version reqs above); move to
 # the finals when they publish.
 
@@ -156,11 +158,11 @@ incrementalmerkletree = "0.8"
 #   the authoring node; a from-seed restore recovers it via enhancement) - it only bites the
 #   authoring node when the mempool missed its own self-send, and a rescan fixes it. Re-check when
 #   bumping to the next RC/final.
-# - **Ironwood sends route through the fused `create_proposed_transactions` path** via the
-#   `ironwood_forces_fused` gate in `actor.rs` (~4.5 s/send keygen). NB the published RC now BUILDS
-#   Ironwood PCZTs (librustzcash#2543 landed - the old git rev rejected them), so the gate is a
-#   conservative choice, not an upstream constraint; drop it (and reclaim the PCZT proving-key cache)
-#   once the cached path is validated against an NU6.3-active chain.
+# - **Ironwood sends route through the cached-key PCZT path.** The published RC BUILDS Ironwood
+#   PCZTs (librustzcash#2543 landed - the old git rev rejected them), so the `ironwood_forces_fused`
+#   gate in `actor.rs` is gone and post-NU6.3 sends no longer pay the fused path's ~4.5 s/send
+#   keygen. `ProvingKeyCache` caches both circuit keys (`FixedPostNu6_2` for the V2 Orchard bundle,
+#   `PostNu6_3` for the V3 Ironwood bundle); see the send-proving-path notes in the project docs.
 # - **Single-pool-group input selection** (upstream `00c789f9`): shielded inputs come from one of
 #   two mutually-exclusive groups - {Orchard} or {Sapling+Ironwood}, never mixed - the NU6.3
 #   migration model (past NU6.3 a new Orchard-address output becomes an ironwood V3 note, so Orchard

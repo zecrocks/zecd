@@ -5,6 +5,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use tracing::{error, info, warn};
+use zcash_protocol::consensus::{NetworkUpgrade, Parameters};
 
 use crate::backend;
 use crate::config::{self, AppConfig};
@@ -78,9 +79,25 @@ pub async fn run(config: AppConfig) -> anyhow::Result<()> {
     // across every actor, so each send reuses the cached key instead of rebuilding it per
     // transaction. Built off the async runtime; on by default (`[spend] cache_proving_key`).
     let orchard_keys = if config.spend.cache_proving_key {
-        info!("building Orchard proving key (cached for all sends)");
+        // Also build the PostNu6_3 (Ironwood) proving key when this network can activate NU6.3, so
+        // post-NU6.3 sends prove the Ironwood bundle from the cache instead of rebuilding a key per
+        // send. NU6.3 is live on mainnet (3_428_143) and testnet (4_134_000), so both build it and
+        // pay the extra ~4.5 s at startup; only a regtest chain without `ZECD_REGTEST_NU63_HEIGHT`
+        // skips a keygen no send there could use.
+        let build_ironwood = config
+            .network
+            .activation_height(NetworkUpgrade::Nu6_3)
+            .is_some();
+        info!(
+            "building Orchard proving key{} (cached for all sends)",
+            if build_ironwood {
+                " + Ironwood (PostNu6_3) proving key"
+            } else {
+                ""
+            }
+        );
         Some(Arc::new(
-            tokio::task::spawn_blocking(actor::ProvingKeyCache::build)
+            tokio::task::spawn_blocking(move || actor::ProvingKeyCache::build(build_ironwood))
                 .await
                 .map_err(|e| anyhow::anyhow!("failed to build Orchard proving key: {e}"))?,
         ))
