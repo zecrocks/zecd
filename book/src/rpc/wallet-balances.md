@@ -149,7 +149,7 @@ with a stranger's) is rejected with `-5` rather than silently treated as foreign
 |---|------|------|---------|-------------|
 | 1 | address | string | required | An address belonging to this wallet (UA or bare transparent). |
 | 2 | minconf | number | 1 | Count only transactions with at least this many confirmations. 0 includes unmined receipts. Expired or conflicted transactions report -1 confirmations and are never counted at `minconf` >= 0. |
-| 3 | include_immature_coinbase | any | ignored | Accepted for Bitcoin Core arity compatibility, ignored. |
+| 3 | include_immature_coinbase | bool | false | Also count transparent coinbase that has not reached the 100-block maturity. Shielded coinbase has no maturity rule and always counts. |
 
 Unlike `getbalance`, `minconf` 0 is meaningful here: this method totals receipts, not
 spendability.
@@ -170,7 +170,8 @@ spendability.
 | -3 | Non-numeric `minconf` |
 
 **vs Bitcoin Core**: same signature, same `-4 Address not found in wallet` for a foreign
-address. `include_immature_coinbase` is accepted and ignored.
+address, and the same treatment of `include_immature_coinbase`: immature transparent coinbase
+is left out of the total unless it is set.
 
 **vs zcashd**: zcashd's `getreceivedbyaddress` covers transparent addresses only; shielded
 receipts are enumerated per-note by `z_listreceivedbyaddress` (a list, not a total). zcashd's
@@ -197,7 +198,7 @@ from-seed restore, handed-out addresses that were never funded are forgotten (ze
 | 2 | include_empty | bool | false | Also list generated addresses that have received nothing. |
 | 3 | include_watchonly | any | ignored | Accepted, ignored (deprecated and unused in Core master too). |
 | 4 | address_filter | string | none | Return only the entry for this exact address string. |
-| 5 | include_immature_coinbase | any | ignored | Accepted, ignored. |
+| 5 | include_immature_coinbase | bool | false | Also count transparent coinbase below the 100-block maturity, as in `getreceivedbyaddress`. |
 
 **Result**
 

@@ -193,6 +193,34 @@ bitcoind). Treat `-5` as "cursor invalid": re-baseline with a parameterless `lis
 dedupe by txid, and store the fresh `lastblock`. See
 [Wallet: history & unspent](../rpc/wallet-history.md).
 
+## Recovering a stuck sync
+
+A sync that fails, retries, and fails again on the same block is reported with the cause
+rather than left as a bare error. There are two shapes, and they need different responses.
+
+**An unsupported network upgrade.** At every connect zecd compares the upgrades the node
+reports against the consensus rules the build knows. An unknown *pending* upgrade logs a
+warning ahead of its activation height, which is your notice to upgrade zecd before then. An
+unknown *active* one logs an error naming it, and sync failures under it are attributed to
+the outdated build. The fix is to upgrade zecd; if you are already on the latest release,
+report it at <https://forum.zcashcommunity.com>.
+
+**A wallet database that cannot apply otherwise-valid blocks.** If the upstream is serving
+blocks and the failure is in applying them (a commitment-tree conflict, say), no amount of
+retrying or upgrading will clear it, because the damage is local. Rebuild the database:
+
+```sh
+# Stop the daemon first: rescan takes the datadir lock and will refuse otherwise.
+zecd --datadir ./data rescan --wallet default
+```
+
+That deletes the wallet database only. `keys.toml` and the seed are kept, and the next start
+recreates the account from the seed and rescans from the wallet birthday, re-deriving every
+balance and all history from the chain. Nothing is lost that a seed restore could not rebuild,
+which is the same guarantee described in [Stateless & recoverable](../design/statelessness.md);
+the cost is the rescan time. Pass `--yes` to skip the confirmation prompt in automated
+recovery.
+
 ## Upgrades
 
 1. Stop with SIGINT or SIGTERM (both are graceful: in-flight requests finish, new ones get
