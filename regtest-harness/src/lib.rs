@@ -23,6 +23,37 @@ use std::time::{Duration, Instant};
 use anyhow::{anyhow, bail, Context, Result};
 use serde_json::{json, Value};
 
+/// The default loopback port window probed by [`pick_port`]: 20000..32000, entirely below the
+/// 32768 ephemeral floor. Narrowed per process by `ZECD_REGTEST_PORT_LO`/`_SPAN` - see
+/// [`port_window`].
+const DEFAULT_PORT_LO: u16 = 20000;
+const DEFAULT_PORT_SPAN: u16 = 12000;
+
+/// The loopback port window this process probes, as `(lo, span)`.
+///
+/// Defaults to the whole non-ephemeral range. `ZECD_REGTEST_PORT_LO` and `ZECD_REGTEST_PORT_SPAN`
+/// narrow it to a slice, which is how several harness test binaries run **concurrently**: the CI
+/// driver (`run-tests.sh`) hands each one a disjoint slice, so two processes can never probe the
+/// same port. Without that, [`pick_port`]'s probe-then-release-then-bind-later pattern leaves a
+/// window in which a sibling process binds the port between our probe and its real owner's bind -
+/// harmless when the binaries run one at a time (as they did when this was written), a flake
+/// source the moment they overlap.
+fn port_window() -> (u16, u16) {
+    fn from_env(var: &str) -> Option<u16> {
+        std::env::var(var)
+            .ok()?
+            .trim()
+            .parse()
+            .ok()
+            .filter(|v| *v > 0)
+    }
+    let lo = from_env("ZECD_REGTEST_PORT_LO").unwrap_or(DEFAULT_PORT_LO);
+    let span = from_env("ZECD_REGTEST_PORT_SPAN").unwrap_or(DEFAULT_PORT_SPAN);
+    // Never let a bad slice push the window into (or past) the ephemeral range.
+    let span = span.min(32768u16.saturating_sub(lo));
+    (lo, span)
+}
+
 /// Pick an unused loopback TCP port for a daemon to bind later.
 ///
 /// Deliberately NOT `bind(":0")`-and-release: `:0` hands out ports from the kernel's *ephemeral*
@@ -33,24 +64,32 @@ use serde_json::{json, Value};
 /// PID-seeded offset in a range *below* the ephemeral floor, which client sockets never touch;
 /// the cursor never re-probes a handed-out port within a process, so back-to-back picks can't
 /// collide with each other either.
+///
+/// Every probe claims its index with a single `fetch_add`, which is what makes concurrent callers
+/// safe. An earlier version loaded the cursor, probed, and stored the advanced value as three
+/// separate operations - fine while the harness ran one test at a time, but two threads would then
+/// read the same cursor value, probe the same port, both find it bindable (neither has bound it
+/// yet - that happens later, in the daemon) and both return it. The second daemon to start died
+/// with `Address already in use`. An atomic read-modify-write per attempt gives every caller a
+/// distinct index, and because the counter only ever moves forward no thread can re-probe a port
+/// another one is still holding un-bound.
 pub fn pick_port() -> Result<u16> {
-    use std::sync::atomic::{AtomicU16, Ordering};
-    const LO: u16 = 20000;
-    const SPAN: u16 = 12000; // 20000..32000, all below the 32768 ephemeral floor
-    static CURSOR: AtomicU16 = AtomicU16::new(u16::MAX); // sentinel: unseeded
-    let mut off = CURSOR.load(Ordering::Relaxed);
-    if off == u16::MAX {
-        off = (std::process::id() % u32::from(SPAN)) as u16;
+    use std::sync::atomic::{AtomicU32, Ordering};
+    use std::sync::OnceLock;
+    let (lo, span) = port_window();
+    if span == 0 {
+        bail!("empty loopback port window at {lo}");
     }
-    for _ in 0..SPAN {
-        let port = LO + (off % SPAN);
-        off = off.wrapping_add(1) % SPAN;
+    static CURSOR: OnceLock<AtomicU32> = OnceLock::new();
+    let cursor = CURSOR.get_or_init(|| AtomicU32::new(std::process::id()));
+    for _ in 0..span {
+        let off = cursor.fetch_add(1, Ordering::Relaxed);
+        let port = lo + (off % u32::from(span)) as u16;
         if TcpListener::bind(("127.0.0.1", port)).is_ok() {
-            CURSOR.store(off, Ordering::Relaxed);
             return Ok(port);
         }
     }
-    bail!("no free loopback port in {LO}..{}", LO + SPAN)
+    bail!("no free loopback port in {lo}..{}", lo + span)
 }
 
 /// Resolve a required external binary from `$<env_var>`, returning `None` if unset or missing so
@@ -1823,5 +1862,45 @@ mod tests {
             let _hold = TcpListener::bind(("127.0.0.1", port)).expect("picked port is bindable");
             last = Some(port);
         }
+    }
+
+    /// Concurrent callers must never be handed the same port. This is the shape that broke the
+    /// tier when the harness first ran a binary's two tests side by side: both stacks got the
+    /// same port from `pick_port`, and the second daemon to bind it died with `Address already
+    /// in use`. Ports are held (not released) until every thread has picked, which is what the
+    /// real callers do - they hand the port to a daemon that binds it moments later.
+    #[test]
+    fn concurrent_picks_never_collide() {
+        const THREADS: usize = 8;
+        const PER_THREAD: usize = 16;
+        let picked = std::sync::Mutex::new(Vec::new());
+        std::thread::scope(|scope| {
+            for _ in 0..THREADS {
+                scope.spawn(|| {
+                    let mut held = Vec::new();
+                    for _ in 0..PER_THREAD {
+                        let port = pick_port().expect("pick a port");
+                        held.push((port, TcpListener::bind(("127.0.0.1", port))));
+                    }
+                    picked.lock().unwrap().extend(held);
+                });
+            }
+        });
+        let picked = picked.into_inner().unwrap();
+        assert_eq!(picked.len(), THREADS * PER_THREAD);
+        for (port, bound) in &picked {
+            assert!(bound.is_ok(), "port {port} was handed out twice");
+        }
+        let unique: std::collections::HashSet<u16> = picked.iter().map(|(p, _)| *p).collect();
+        assert_eq!(unique.len(), picked.len(), "duplicate ports handed out");
+    }
+
+    #[test]
+    fn port_window_defaults_to_the_whole_non_ephemeral_range() {
+        // No env set in this process (the parallel driver sets it per test *binary*, and the unit
+        // tests run in the lib target, which the driver never slices).
+        let (lo, span) = port_window();
+        assert_eq!((lo, span), (DEFAULT_PORT_LO, DEFAULT_PORT_SPAN));
+        assert!(u32::from(lo) + u32::from(span) <= 32768);
     }
 }

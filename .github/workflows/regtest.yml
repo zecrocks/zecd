@@ -107,7 +107,13 @@ concurrency:
 
 jobs:
   regtest:
-    runs-on: ubuntu-latest
+    # An 8-vCPU/32GiB org runner, because this tier is ~18 independent node+wallet stacks and the
+    # default 2-core runner can only ever run them one at a time (measured: 3-way concurrency on
+    # 2 cores is 22m21s against a 22m34s serial baseline - no gain whatsoever). On 8 cores the same
+    # work is 5m42s. Overridable via the `REGTEST_RUNNER` repo variable (Settings > Secrets and
+    # variables > Actions > Variables) - set it to `ubuntu-latest` to fall back to the stock runner,
+    # and drop `REGTEST_JOBS` to 1 with it.
+    runs-on: ${{ vars.REGTEST_RUNNER || 'ubuntu-latest-8-cores' }}
     # NB: new harness test files must be added to the HARNESS_TESTS env list above (it enumerates
     # --test targets; nothing runs them implicitly).
     #
@@ -126,6 +132,16 @@ jobs:
     name: regtest (${{ matrix.node }}, ${{ matrix.image }})
     steps:
       - uses: actions/checkout@v4
+
+      # What this leg actually got. Recorded because the tier's wall clock is now a function of
+      # the runner's cores and RAM (see REGTEST_JOBS below), so a run whose timings look wrong is
+      # first a question of what hardware it landed on.
+      - name: Report runner hardware
+        run: |
+          echo "runner:  ${{ runner.name }}"
+          echo "cores:   $(nproc)"
+          echo "memory:  $(free -g | awk '/^Mem:/ {print $2}') GiB"
+          df -h / | tail -1
 
       - name: Install protobuf compiler
         run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
@@ -252,9 +268,10 @@ jobs:
           # Select the backend for this matrix leg (zebra/zakura); the harness resolves the node
           # binary from the matching env var (ZEBRAD_BIN / ZAKURAD_BIN, exported above).
           ZECD_REGTEST_NODE: ${{ matrix.node }}
-          # Capture the node's logs so a startup failure is diagnosable from the CI run. The
-          # harness's log hook is named ZEBRAD_STDERR for both backends (a harness convention).
-          ZEBRAD_STDERR: ${{ runner.temp }}/node.log
+          # NB the node's logs (ZEBRAD_STDERR - the harness's hook name for both backends) are set
+          # per test binary by run-tests.sh, into REGTEST_LOG_DIR below; with several stacks live
+          # at once a single shared file would just be the last writer's. The driver tails the log
+          # of any binary that fails.
           # Stream zecd's own logs into the job output (the harness inherits its stdio; combined
           # with `--nocapture` below they appear in the run log). Focus debug on the transparent
           # receive paths (mempool attribution, the getaddresstxids enhancement) so the volume
@@ -282,19 +299,43 @@ jobs:
           ZECD_REGTEST_REQUIRE_SHIELDED_COINBASE: ${{ (github.event_name != 'workflow_dispatch' || inputs.zebra-image == '') && '1' || '' }}
           # The node binary (ZEBRAD_BIN/ZAKURAD_BIN) and LIGHTWALLETD_BIN (zebra leg only) are
           # exported by the provisioning step above.
-        # --locked: build against the committed lock. Single-threaded: a node+lightwalletd stack
-        # plus Orchard proving would contend badly on a 2-core runner.
-        # --no-fail-fast: run every test binary even if an earlier one fails, so a single flaky
-        # test can't mask the results of all the tests ordered after it.
-        run: cargo test --locked --manifest-path regtest-harness/Cargo.toml ${{ env.HARNESS_TESTS }} --no-fail-fast -- --nocapture --test-threads=1
+          #
+          # How many test binaries run at once. Each one is a whole zebrad(+lightwalletd)+zecd
+          # stack that spends most of its wall clock waiting on that stack rather than burning
+          # CPU, so the tier overlaps well - but only as far as the runner has cores and RAM for
+          # it. Raise REGTEST_JOBS in lockstep with REGTEST_RUNNER, never past it: an oversubscribed
+          # runner does not just run slower, it pushes the harness's sync/confirmation waits past
+          # their timeouts and turns into flakes. The per-binary wall-clock table the driver prints
+          # at the end of the step is the tuning input.
+          #
+          # 6 on 8 vCPU was measured, not guessed: 6 -> 5m42s, 8 -> 6m04s, 12 -> 6m07s. Past 6 it
+          # gets *slower*, because the tier is no longer bounded by total work but by its longest
+          # single binary (regtest_coinbase), and extra concurrency only adds contention around it.
+          # Going further means splitting that binary, not raising this number - and note that
+          # REGTEST_TEST_THREADS=2, which does exactly that, was tried and reverted: it reached
+          # 4m18s but failed both attempts, the second time in regtest_sapling
+          # ("getunconfirmedbalance is 0: 3.0"), a one-test binary that was simply starved by the
+          # extra load. A minute is not worth a flaky tier.
+          REGTEST_JOBS: ${{ vars.REGTEST_JOBS || 6 }}
+          REGTEST_LOG_DIR: ${{ runner.temp }}/regtest-logs
+        # run-tests.sh builds the binaries once (--locked, against the committed lock) and then
+        # runs them REGTEST_JOBS at a time, each in its own slice of the loopback port range. It
+        # always runs every binary - the old `--no-fail-fast`, so one flaky test can't mask the
+        # rest - and exits non-zero if any failed.
+        run: regtest-harness/run-tests.sh ${{ env.HARNESS_TESTS }}
 
+      # run-tests.sh already replays each failing binary's output and tails its node log, so this
+      # only adds what it can't know about: the machine's state, and whether a binary died so
+      # early it left nothing behind.
       - name: Dump diagnostics on failure
         if: failure()
         run: |
           echo "== disk =="
           df -h / "$RUNNER_TEMP" || true
-          echo "== node log (${{ matrix.node }}, last 200 lines) =="
-          tail -n 200 "$RUNNER_TEMP/node.log" 2>/dev/null || echo "(no node log was written)"
+          echo "== memory =="
+          free -g || true
+          echo "== captured logs (${{ matrix.node }}) =="
+          ls -la "$RUNNER_TEMP/regtest-logs" 2>/dev/null || echo "(no logs were written)"
 
   # Ironwood (NU6.3) tier. Builds zecd with the `ironwood` feature (no cfg - the librustzcash pin,
   # zcash/librustzcash `dw/ironwood-scan-model`, exposes the ironwood wallet APIs unconditionally),
@@ -318,7 +359,11 @@ jobs:
     # emersonian/* lwd/devtool images, which remain dev artifacts. Once those images ship, the
     # keying can be dropped entirely so the tier runs everywhere.
     if: ${{ github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' || github.base_ref == 'main' || github.ref == 'refs/heads/main' }}
-    runs-on: ubuntu-latest
+    # Same runner as the tier above. This job runs a single test binary, so it gets nothing from
+    # REGTEST_JOBS - but its release build and its Orchard proving are both parallel, and with the
+    # zebra leg down to ~8 min this job (12m13s on a 2-core runner) is what the workflow now waits
+    # on. Left on the stock runner it would simply become the new ceiling.
+    runs-on: ${{ vars.REGTEST_RUNNER || 'ubuntu-latest-8-cores' }}
     name: regtest (ironwood / NU6.3)
     env:
       # zebrad is now the OFFICIAL ironwood-capable release on Docker Hub (`zfnd/zebra:6.2.2`),
