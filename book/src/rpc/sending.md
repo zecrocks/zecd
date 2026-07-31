@@ -56,6 +56,12 @@ value into a single shielded output. Coinbase below the 100-block maturity is no
 at all: it is excluded from [`listunspent`](wallet-history.md#listunspent) and reported in
 [`getwalletinfo.immature_balance`](wallet-addresses.md#getwalletinfo).
 
+Because that value still counts toward `getbalance`, the `-6` insufficient-funds message names
+the mature-coinbase amount and points at `z_shieldcoinbase`, so a balance the wallet reports but
+refuses to spend explains itself. The same amount is readable as
+[`getbalances.mine.coinbase`](wallet-balances.md#getbalances) and
+[`getwalletinfo.transparent.coinbase_balance`](wallet-addresses.md#getwalletinfo).
+
 **Privacy policy is enforced per recipient.** Under the wallet's configured
 `[spend] privacy_policy` (default `AllowRevealedRecipients`), a recipient with no shielded
 receiver (a bare `t1`/`t3` address) is rejected up front with `-8` when the policy is

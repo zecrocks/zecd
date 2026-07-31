@@ -44,8 +44,10 @@ that batches all exposed addresses into Zebra's always-on transparent address in
 (`getaddressbalance`/`getaddressutxos`) to cross-check the scanned balance and backfill
 anything missed, kept off the per-block hot path. Workaround today: set `[pools]
 transparent_initial_scan` to your issuance high-water mark so the whole issued range is
-pre-exposed before scanning, and size `transparent_gap_limit` to your maximum
-outstanding-unfunded address count. See [transparent support](guide/transparent.md).
+pre-exposed before scanning, and keep `transparent_gap_limit` small, covering only the addresses
+you have handed out that are still unfunded. Depth belongs to the initial scan, not the gap: the
+gap window is re-derived on every recorded receive, so a large one stalls the scan (zecd warns
+above 1000 and logs an error above 10000). See [transparent support](guide/transparent.md).
 
 ## One account per wallet
 

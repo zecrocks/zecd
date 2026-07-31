@@ -48,7 +48,7 @@ is covered in [Conventions & wire format](index.md).
 | [sendrawtransaction](rawtx.md#sendrawtransaction) | ✓ | ✓ | Broadcasts caller-built bytes through Zebra; `maxfeerate` ignored |
 | **Wallet: reads** | | | |
 | [getbalance](wallet-balances.md#getbalance) | ✓ | same name, differs (transparent-only; `z_getbalanceforaccount` for shielded) | Spendable balance under the ZIP-315 confirmations policy; explicit `minconf` overrides it per call |
-| [getbalances](wallet-balances.md#getbalances) | ✓ | n/a (`z_getbalanceforaccount`, `z_gettotalbalance`) | `mine.trusted/untrusted_pending/immature` plus `lastprocessedblock`; no `watchonly` object |
+| [getbalances](wallet-balances.md#getbalances) | ✓ | n/a (`z_getbalanceforaccount`, `z_gettotalbalance`) | `mine.trusted/untrusted_pending/immature` plus a `mine.coinbase` extension (mature transparent coinbase, a subset of `trusted`) and `lastprocessedblock`; no `watchonly` object |
 | [getunconfirmedbalance](wallet-balances.md#getunconfirmedbalance) | *removed* | same name, differs (transparent-only) | Incoming funds below the confirmations policy, including 0-conf via the mempool stream |
 | [getwalletinfo](wallet-addresses.md#getwalletinfo) | ✓ | ✓ | bitcoind shape; `scanning` progress, `unlocked_until` when encrypted, `private_keys_enabled:false` when watch-only |
 | [getaddressinfo](wallet-addresses.md#getaddressinfo) | ✓ | n/a (`validateaddress` / `z_validateaddress`) | `ismine` is cryptographic (viewing-key attribution); `labels` always `[]`; `iswatchonly` always false, as in Core master |

@@ -77,7 +77,8 @@ object.
   "mine": {
     "trusted": 1.25000000,
     "untrusted_pending": 0.10000000,
-    "immature": 0.05000000
+    "immature": 0.05000000,
+    "coinbase": 0.00000000
   },
   "lastprocessedblock": {
     "hash": "00000000012f2e9d7a9ba447d1da6a2c31ec26bd8d0a55a259d3ab1741e5cdcc",
@@ -93,12 +94,26 @@ object.
   here. For transparent coinbase held below the 100-block maturity, see
   [`getwalletinfo.immature_balance`](wallet-addresses.md#getwalletinfo) and
   [Transparent support](../guide/transparent.md).
+- `coinbase` (extension): the unspent **mature** transparent coinbase value, a subset of
+  `trusted` by construction (see below).
 - `lastprocessedblock` (Core 26+): the fully-scanned block the balances are anchored to, the
   same anchor as `getblockcount`. Omitted while the wallet has not yet scanned a block.
 
+**Why `coinbase` is broken out.** Mature transparent coinbase is spendable value and counts
+toward `trusted`, but no ordinary send can select it: consensus requires a transaction that
+spends transparent coinbase to have *no* transparent output at all, so the wallet's coin
+selection skips those UTXOs. Without the field, `getbalance` could report funds that
+`sendtoaddress` then refused to spend, with nothing in the API explaining the difference. The
+same value is mirrored at
+[`getwalletinfo.transparent.coinbase_balance`](wallet-addresses.md#getwalletinfo), and the `-6`
+insufficient-funds message on the [send methods](sending.md) names the mature-coinbase amount and
+points at shielding (`z_shieldcoinbase`) as the route that can move it.
+
 **vs Bitcoin Core**: same shape minus Core master's `mine.nonmempool` and the optional
-`mine.used` (zecd has no avoid-reuse flag). Core's legacy `watchonly` object is likewise gone
-from Core master; zecd never emits it.
+`mine.used` (zecd has no avoid-reuse flag), plus the `coinbase` extension. The Core triple still
+totals the wallet (`coinbase` is a subset of `trusted`, not a fourth bucket), so a client reading
+only `trusted`/`untrusted_pending`/`immature` is unaffected. Core's legacy `watchonly` object is
+likewise gone from Core master; zecd never emits it.
 
 **vs zcashd**: no equivalent. The nearest is `z_gettotalbalance`, which splits
 `transparent`/`private`/`total` rather than trusted/pending.

@@ -101,6 +101,14 @@ outputs, signed with the account's derived transparent keys, then recorded throu
 sent-transaction path (spent UTXOs are locked against double-spend and the transaction rides the
 rebroadcast loop).
 
+**Transparent coinbase is not selectable.** Consensus requires a transaction that spends
+transparent coinbase to have no transparent output at all, so coin selection skips those UTXOs
+even once they mature: a t-to-t send cannot pay a recipient and return change from them. Mature
+coinbase still counts as spendable value, so it is reported on its own as
+[`getbalances.mine.coinbase`](../rpc/wallet-balances.md#getbalances) and
+`getwalletinfo.transparent.coinbase_balance`, and an insufficient-funds `-6` names the amount
+rather than leaving the gap between balance and send unexplained.
+
 **Change** is routed to the wallet's **internal (change) transparent chain**, which matters
 twice: it is recovered on a from-seed restore via the internal gap chain, and the history RPCs
 recognize the internal key scope as change and hide it, while a deliberate payment to one of
@@ -154,27 +162,73 @@ rediscovers them only within the **external transparent gap limit**: the standar
 mechanism, made sharper by statelessness (there is no persisted keypool to fall back on).
 
 Mechanically, recovery is bounded by which addresses are *exposed* (present in the matcher's
-address set). On restore, librustzcash pre-exposes external indices `0..gap_limit`; each funded
-index found extends the window to `funded_index + gap_limit`; a run of `gap_limit` consecutive
-unfunded indices ends the chain. A payment to index N is recovered **iff** N is exposed.
+address set). The window is anchored at the wallet's **issuance frontier**, the highest of:
+
+1. the last funded external index,
+2. the highest index `getnewaddress` has handed out, and
+3. the `transparent_initial_scan` floor.
+
+Indices from the frontier up to `frontier + transparent_gap_limit` are exposed, and a payment to
+index N is discovered **iff** N is exposed. A funded index (or a fresh issuance) advances the
+frontier and drags the window up with it, as in any HD wallet. The block-scan and mempool matcher
+carries that window as an **in-memory gap lookahead**: `transparent_gap_limit` addresses derived
+past the frontier, written to the wallet database only when a payment to one actually arrives. A
+wide gap therefore costs derivation, not stored rows.
 
 `[pools] transparent_gap_limit` (default **20**, applied only to transparent-enabled wallets;
-librustzcash's own default is 10) sets the external window. If you hand out addresses ahead of
-funding (one per invoice, most never paid), size it to at least your maximum number of
-outstanding-unfunded addresses, or a restore can silently miss a later payment to a high,
-sparsely-funded index. Transparent **change** consumes the internal chain and is recovered via
-the internal gap (librustzcash's default internal window; zecd only varies the external limit).
+librustzcash's own default is 10) sets the external window. Transparent **change** consumes the
+internal chain and is recovered via the internal gap (librustzcash's default internal window;
+zecd only varies the external limit).
+
+### The gap limit composes with `transparent_initial_scan`
+
+Because the `transparent_initial_scan` floor is one of the frontier's three inputs, the two knobs
+add rather than compete. A from-seed restore has forgotten which addresses were handed out (that
+is what statelessness means), and before the scan finds a funded index it has no funded index
+either, so its frontier starts at the floor. The recovery horizon of a stateless restore is
+therefore:
+
+```
+transparent_initial_scan + transparent_gap_limit
+```
+
+The window used to be measured from the last *funded* index alone, and the floor did not count.
+An operator who pre-exposed, say, 70 000 addresses with `transparent_initial_scan` had to inflate
+`transparent_gap_limit` to ~71 000 before `getnewaddress` would keep issuing recoverable
+addresses: every issuance past the floor otherwise tripped the gap limit, was warned about as
+potentially unrecoverable, and genuinely was unrecoverable from seed. That workaround is no
+longer needed, and for the reason in the next section it is now actively discouraged.
+
+### Sizing `transparent_gap_limit`: keep it small
+
+**Size the gap limit to the addresses you have handed out that are still unfunded, and no
+further.** Deep restore coverage is what `transparent_initial_scan` is for: a one-time
+pre-exposure, not a per-receive cost.
+
+The reason is that the window is re-derived on the receive path. Recording a transparent receive
+regenerates the **entire** gap window (a full unified-address derivation per index), and repeats
+that regeneration once per already-recorded output of the same transaction. At roughly 1200
+derivations per second, a 71 000-wide window costs about a minute per received UTXO, and
+quadratically more for a multi-output transaction, all of it on the wallet's single-writer actor
+inside the sync batch. In the field (a zecd 0.5.1-rc2 report) this presented as a restore that
+appeared to stall: one core pegged, block scan frozen for hours.
+
+zecd audits the configured value at startup: above **1000** (a gap limit already costing ~1s of
+derivation per recorded receive) it logs a warning, and above **10000** (worst case past ~10s per
+receive) it logs an error. Neither is a hard failure, and the daemon starts either way: the value
+stays the operator's choice, and what it costs is performance, not correctness.
 
 ## Large pre-generated runs: `transparent_initial_scan`
 
 A big gap limit is the wrong tool when you pre-generate *many* addresses: the gap is a *sliding*
-window kept `gap_limit` past every funded address forever, so an exchange that assigns 10 000
-addresses and sizes the gap to match scans 10 000 addresses past each receive, indefinitely.
+window kept `gap_limit` past the frontier forever, so an exchange that assigns 10 000 addresses
+and sizes the gap to match re-derives 10 000 addresses on every recorded receive, indefinitely.
 
 Instead set `[pools] transparent_initial_scan = N` to pre-expose external indices `0..N` **once**
 at startup/restore, so the block-scan matcher covers the whole issued range regardless of the
 (small) steady-state `gap_limit`. Set `N` to your issuance high-water mark and keep
-`transparent_gap_limit` small.
+`transparent_gap_limit` small: the floor raises the frontier, so issuance continues past `N` with
+a normal-sized gap and stays recoverable to `N + transparent_gap_limit`.
 
 Pre-exposure is **incremental and non-blocking**: it must complete before the block scan (a
 restore only finds a high funded index if that index was exposed first), but per-index derivation
@@ -208,8 +262,9 @@ into an operator choice:
 
 Independently, `transparent_gap_warn_threshold` (default **5**) makes `getnewaddress` warn as the
 last few in-window slots are consumed, and a one-time startup audit re-warns if a wallet is
-already near or over the window, giving lead time to widen `transparent_gap_limit` /
-`transparent_initial_scan` (or get a lower index funded) before addresses land outside it.
+already near or over the window, giving lead time before addresses land outside it. The lead time
+is best spent raising `transparent_initial_scan` (or getting a lower index funded), not inflating
+`transparent_gap_limit`, for the per-receive derivation reason above.
 
 ## Not implemented
 

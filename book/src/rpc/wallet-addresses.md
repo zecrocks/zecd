@@ -239,9 +239,15 @@ and full transaction data), not just during the block scan.
   auto-relocks, or `0` while locked. Absent on unencrypted and watch-only wallets.
 - `transparent` (extension): present only when `[pools] transparent = true`, so a
   shielded-only wallet's shape is unchanged. `{"enabled": true, "default": <bool>,
-  "gap_limit": <n>}`, plus, when `transparent_initial_scan` is set, an `initial_sync`
-  object `{"exposed": <n>, "total": <n>, "complete": <bool>}` for polling the
-  address pre-exposure. See [Transparent support](../guide/transparent.md).
+  "gap_limit": <n>, "coinbase_balance": <amount>}`, plus, when `transparent_initial_scan`
+  is set, an `initial_sync` object `{"exposed": <n>, "total": <n>, "complete": <bool>}`
+  for polling the address pre-exposure. See
+  [Transparent support](../guide/transparent.md).
+- `transparent.coinbase_balance` (extension): the unspent **mature** transparent coinbase
+  value, the same number as [`getbalances.mine.coinbase`](wallet-balances.md#getbalances).
+  It is already inside `balance`, and is reported separately because no ordinary send can
+  select it: consensus forbids a transaction spending transparent coinbase from having any
+  transparent output.
 
 **vs Bitcoin Core**: `walletversion` 169900 and `format: "sqlite"` match Core's values.
 Core master has dropped the `balance`/`unconfirmed_balance`/`immature_balance`/`paytxfee`

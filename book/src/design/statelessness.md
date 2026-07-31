@@ -107,12 +107,15 @@ trial-decryption with the viewing key, which needs no prior knowledge of which a
 issued; every note the account ever received is found by scanning.
 
 Transparent funds (opt-in, off by default) are recoverable only within the configured window:
-a from-seed restore rediscovers a transparent receive only if its address index falls within
-`transparent_gap_limit` of the last funded index, or is pre-exposed by
-`transparent_initial_scan`. Transparent change consumes the internal gap chain under the same
-limit. This is the standard HD-wallet gap limitation, made sharper by statelessness (zecd does
-not persist an issued-address high-water mark for you). Sizing guidance and the full mechanism
-are in the [transparent guide](../guide/transparent.md).
+the gap window is anchored at the wallet's issuance frontier (the highest of the last funded
+index, the highest index handed out, and the `transparent_initial_scan` floor), and a restore
+knows neither the funded nor the handed-out indices until it scans. Its horizon is therefore
+`transparent_initial_scan + transparent_gap_limit`, extended as scanning finds funded indices.
+Transparent change consumes the internal gap chain under the same limit. This is the standard
+HD-wallet gap limitation, made sharper by statelessness (zecd does not persist an issued-address
+high-water mark for you), which is why depth belongs to `transparent_initial_scan` rather than
+to an inflated gap limit. Sizing guidance and the full mechanism are in the
+[transparent guide](../guide/transparent.md).
 
 ## Restore-deterministic outgoing history
 
