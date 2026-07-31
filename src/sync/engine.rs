@@ -23,7 +23,7 @@
 //! its docs. Do not "simplify" this module down to what `sync::run` does: that version
 //! wedges.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 use anyhow::anyhow;
@@ -48,6 +48,7 @@ use zcash_protocol::consensus::BlockHeight;
 use zcash_protocol::value::Zatoshis;
 use zcash_protocol::{ShieldedPool, TxId};
 use zcash_transparent::address::TransparentAddress;
+use zip32::DiversifierIndex;
 
 use crate::chain::ChainSource;
 use crate::network::ZNetwork;
@@ -123,6 +124,60 @@ pub async fn update_subtree_roots<C: ChainSource>(
     // later adds an Ironwood subtree-root writer, reinstate a pass here (gated on NU6.3 being active).
 
     Ok(())
+}
+
+/// The wallet's transparent receive-matching set: every *recorded* receiver (an `addresses` row -
+/// exposed receiving/change addresses plus librustzcash's funded-anchored gap rows) together with
+/// an in-memory **gap lookahead**: the next `transparent_gap_limit` external indices past the
+/// issuance frontier (`max(transparent_initial_scan, highest exposed external index + 1)`),
+/// derived from the account's external incoming viewing key but never written to the database.
+///
+/// The lookahead is what makes `transparent_gap_limit` compose with `transparent_initial_scan`
+/// as a BIP-44-style gap. librustzcash anchors its gap window at the last *funded* index only,
+/// so without this a from-seed restore with `initial_scan = 70_000, gap_limit = 1_000` would
+/// cover exactly `0..70_000`, and a receive at index 70_500 (issued after the floor was declared)
+/// could only be recovered by inflating the gap limit to 71_000. With the lookahead the matcher
+/// always covers `gap_limit` indices past the frontier; a match on a lookahead address records
+/// its `addresses` row first (see [`record_lookahead_address`]), which exposes the index and
+/// slides the frontier on the next rebuild - the same funded-chain extension BIP-44 recovery
+/// performs past the last used address.
+pub struct TransparentMatcher {
+    /// The account a lookahead match is recorded against.
+    pub account: AccountUuid,
+    /// Membership set for matching: recorded receivers plus the lookahead addresses.
+    pub all: HashSet<TransparentAddress>,
+    /// Lookahead addresses (a subset of `all`) that have no `addresses` row yet, keyed to their
+    /// external child index so a match can record the row via `get_address_for_index`.
+    pub lookahead: HashMap<TransparentAddress, u32>,
+}
+
+impl TransparentMatcher {
+    /// The external child index behind `address` when it is a not-yet-recorded lookahead
+    /// address; `None` for a recorded receiver (which needs no row created before recording
+    /// a receive against it).
+    pub fn lookahead_index(&self, address: &TransparentAddress) -> Option<u32> {
+        self.lookahead.get(address).copied()
+    }
+}
+
+/// Record the `addresses` row for a lookahead-matched external index (via
+/// `get_address_for_index`, the same primitive the A18 pre-exposure and beyond-gap issuance
+/// use). `put_received_transparent_utxo` rejects an output paying an address without a row
+/// (`AddressNotRecognized`), so this must run before a lookahead match is recorded. Exposing
+/// the index here is correct bookkeeping: `Exposed` covers addresses the wallet handed out
+/// *or has seen funded on-chain*, and this is the latter.
+pub fn record_lookahead_address(
+    db_data: &mut WriteDb,
+    account: AccountUuid,
+    index: u32,
+) -> Result<(), SqliteClientError> {
+    db_data
+        .get_address_for_index(
+            account,
+            DiversifierIndex::from(index),
+            crate::pools::transparent_extraction_request(),
+        )
+        .map(|_| ())
 }
 
 /// A block-scan-matched transparent receive: the attributable output plus, when it came from a
@@ -470,10 +525,11 @@ pub struct BatchOutcome {
 /// Process at most one batch of work. `worked` is `true` if a batch was scanned (caller should
 /// call again), `false` if there are no pending scan ranges (wallet is caught up).
 ///
-/// `transparent` is the wallet's exposed transparent address set when transparent receiving is
+/// `transparent` is the wallet's transparent receive matcher when transparent receiving is
 /// enabled (`None` for shielded-only wallets, which skips transparent extraction entirely). When
 /// present, each scanned block's transparent outputs are matched against it and recorded as
-/// receives via `put_received_transparent_utxo` after the shielded scan succeeds.
+/// receives via `put_received_transparent_utxo` after the shielded scan succeeds; a match on a
+/// gap-lookahead address records its `addresses` row first ([`record_lookahead_address`]).
 pub async fn sync_one_batch<C: ChainSource>(
     name: &str,
     client: &mut C,
@@ -481,7 +537,7 @@ pub async fn sync_one_batch<C: ChainSource>(
     wallet_dir: &Path,
     db_cache: &mut FsBlockDb,
     db_data: &mut WriteDb,
-    transparent: Option<&HashSet<TransparentAddress>>,
+    transparent: Option<&TransparentMatcher>,
 ) -> anyhow::Result<BatchOutcome> {
     let scan_ranges = db_data.suggest_scan_ranges()?;
     tracing::debug!(
@@ -516,8 +572,15 @@ pub async fn sync_one_batch<C: ChainSource>(
         }
     };
 
-    let (block_meta, received) =
-        download_blocks(name, client, wallet_dir, db_cache, &scan_range, transparent).await?;
+    let (block_meta, received) = download_blocks(
+        name,
+        client,
+        wallet_dir,
+        db_cache,
+        &scan_range,
+        transparent.map(|m| &m.all),
+    )
+    .await?;
 
     // Fetch the prior block's chain state and scan. Anything that fails here must still clean up
     // the just-downloaded cache files, so the result is captured and the delete runs regardless.
@@ -563,6 +626,19 @@ pub async fn sync_one_batch<C: ChainSource>(
         let mut record_last_log = record_started;
         for matched in &received {
             let output = &matched.output;
+            // A gap-lookahead match has no `addresses` row yet; record (and thereby expose) it
+            // first, or the receive below would be rejected as `AddressNotRecognized`.
+            if let Some(matcher) = transparent {
+                if let Some(index) = matcher.lookahead_index(output.recipient_address()) {
+                    if let Err(e) = record_lookahead_address(db_data, matcher.account, index) {
+                        warn!(
+                            "[{name}] recording lookahead transparent address at index {index} \
+                             failed: {e}"
+                        );
+                        continue;
+                    }
+                }
+            }
             // Recording a receive is CPU-bound out of proportion to its size: librustzcash's
             // gap maintenance re-derives the wallet's entire external gap window on every
             // recorded transparent output (and again for each already-recorded output of the

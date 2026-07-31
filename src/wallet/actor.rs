@@ -1,7 +1,7 @@
 //! The per-wallet actor: the single owner/writer of the `WalletDb`, running the sync loop
 //! and serving writer commands (address generation, sends, lock/unlock) from RPC handlers.
 
-use std::collections::{HashSet, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::convert::Infallible;
 use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
@@ -500,6 +500,10 @@ struct WalletActor {
     transparent_enabled: bool,
     /// Whether a no-argument `getnewaddress` returns a bare transparent address.
     transparent_default: bool,
+    /// External transparent gap limit: how far past the issuance frontier (and past each funded
+    /// index) receive discovery looks. Together with `transparent_initial_scan` it defines the
+    /// stateless-restore recovery horizon `initial_scan + gap_limit`.
+    transparent_gap_limit: u32,
     /// Initial transparent scan depth: pre-expose external indices `0..N` once so the receive
     /// scan covers them. `0` = off.
     transparent_initial_scan: u32,
@@ -509,15 +513,16 @@ struct WalletActor {
     /// Warn when fewer than this many in-window transparent address slots remain before generation
     /// would hit the gap limit.
     transparent_gap_warn_threshold: u32,
-    /// The wallet's exposed transparent receiving + change addresses, as a membership set for the
-    /// block-scan / mempool receive matcher. Transient (rebuilt from the DB, respects the stateless
-    /// invariant). librustzcash never asks us to scan our *receiving* transparent addresses for
-    /// incoming funds (only to find spends of UTXOs we already hold), so zecd owns receive
-    /// discovery: it matches each scanned block's (and each mempool tx's) transparent outputs
-    /// against this set. Matching is O(outputs) with an O(1) membership test, independent of the
-    /// set's size - what lets an exchange track ~100k addresses without per-address requests.
-    /// `None` until first built; rebuilt lazily when `transparent_set_dirty`.
-    transparent_scripts: Option<HashSet<TransparentAddress>>,
+    /// The wallet's transparent receive matcher: the recorded receiving + change addresses plus
+    /// the in-memory gap lookahead past the issuance frontier (see
+    /// [`engine::TransparentMatcher`]). Transient (rebuilt from the DB + viewing key, respects the
+    /// stateless invariant). librustzcash never asks us to scan our *receiving* transparent
+    /// addresses for incoming funds (only to find spends of UTXOs we already hold), so zecd owns
+    /// receive discovery: it matches each scanned block's (and each mempool tx's) transparent
+    /// outputs against this set. Matching is O(outputs) with an O(1) membership test, independent
+    /// of the set's size - what lets an exchange track ~100k addresses without per-address
+    /// requests. `None` until first built; rebuilt lazily when `transparent_set_dirty`.
+    transparent_scripts: Option<engine::TransparentMatcher>,
     /// Set when the exposed-address set may have grown (a recorded receive can extend the
     /// transparent gap, exposing new indices), so the next sync pass rebuilds `transparent_scripts`
     /// before matching. `transparent_preexposed` flips once `0..transparent_initial_scan` has been
@@ -660,8 +665,14 @@ pub async fn spawn(
         // a stateless rebuild rediscovers transparent funds only within `gap_limit` of the last
         // funded address.
         info!(
-            "[{}] transparent receiving enabled (default_address={}, external_gap_limit={})",
-            cfg.name, cfg.transparent_default, cfg.transparent_gap_limit
+            "[{}] transparent receiving enabled (default_address={}, external_gap_limit={}, \
+             initial_scan={}, recovery_horizon={})",
+            cfg.name,
+            cfg.transparent_default,
+            cfg.transparent_gap_limit,
+            cfg.transparent_initial_scan,
+            cfg.transparent_initial_scan
+                .saturating_add(cfg.transparent_gap_limit)
         );
         // A wide window is a per-receive cost, not just a restore-scan bound: librustzcash's gap
         // maintenance re-derives the whole window every time a transparent receive is recorded
@@ -889,6 +900,7 @@ pub async fn spawn(
         default_receivers: cfg.default_receivers.clone(),
         transparent_enabled: cfg.transparent_enabled,
         transparent_default: cfg.transparent_default,
+        transparent_gap_limit: cfg.transparent_gap_limit,
         transparent_initial_scan: cfg.transparent_initial_scan,
         transparent_allow_beyond_recovery_window: cfg.transparent_allow_beyond_recovery_window,
         transparent_gap_warn_threshold: cfg.transparent_gap_warn_threshold,
@@ -1226,24 +1238,20 @@ fn gap_slots_remaining(gap_position: u32, gap_limit: u32) -> u32 {
     gap_limit.saturating_sub(gap_position.saturating_add(1))
 }
 
-/// Recoverable transparent address slots remaining, counting the A18 pre-exposure floor as well
-/// as librustzcash's gap window: a restore re-exposes external indices
-/// `0..transparent_initial_scan` unconditionally, so successors of an address issued at
-/// `addr_index` stay recoverable up to that floor even when the gap window itself is (nearly)
-/// consumed. Without the floor, a wallet configured the intended A18 way (small gap limit, large
-/// initial scan) warned "recovery window nearly exhausted" on issuance it could in fact recover -
-/// noise that in the field pushed an operator to silence it by raising `transparent_gap_limit`
-/// above `transparent_initial_scan`, the configuration whose per-receive window regeneration
-/// stalls restores (see `config::TRANSPARENT_GAP_LIMIT_SEVERE`).
-fn recoverable_slots_remaining(
-    gap_position: u32,
-    gap_limit: u32,
-    addr_index: Option<u32>,
-    initial_scan: u32,
-) -> u32 {
-    let in_window = gap_slots_remaining(gap_position, gap_limit);
-    let below_floor = addr_index.map_or(0, |i| initial_scan.saturating_sub(i.saturating_add(1)));
-    in_window.max(below_floor)
+/// Recoverable address slots remaining under the stateless-restore recovery horizon
+/// (`transparent_initial_scan + transparent_gap_limit`) after issuing the address at external
+/// child index `index`. The horizon is the floor-anchored half of restore coverage: a from-seed
+/// restore pre-exposes `0..initial_scan` and its gap lookahead extends `gap_limit` past that
+/// frontier, so indices below the horizon are recoverable regardless of funding. (Funding then
+/// slides the frontier further - that half is librustzcash's funded-anchored window and is
+/// accounted separately via `GapMetadata::InGap`.) Counting the horizon alongside the window in
+/// `warn_if_gap_low` is load-bearing noise control: without it, a wallet configured the intended
+/// A18 way (small gap limit, large initial scan) warned "recovery window nearly exhausted" on
+/// issuance it could in fact recover - noise that in the field pushed an operator to silence it
+/// by raising `transparent_gap_limit` above `transparent_initial_scan`, the configuration whose
+/// per-receive window regeneration stalls restores (see `config::TRANSPARENT_GAP_LIMIT_SEVERE`).
+fn horizon_slots_remaining(horizon: u32, index: u32) -> u32 {
+    horizon.saturating_sub(index.saturating_add(1))
 }
 
 /// Render a tree-state frontier (the hex-encoded `final_state` from a `tree_state` reply) for
@@ -1985,34 +1993,52 @@ impl WalletActor {
             return 0;
         }
         let h = height.map(u32::from);
-        // Build the owned outputs while holding the (immutable) address-set borrow, then record
-        // them with `&mut self.db_data` - keeping the two borrows from overlapping.
-        let outputs: Vec<_> = {
-            let Some(addresses) = self.transparent_scripts.as_ref() else {
+        // Build the owned outputs (each with its gap-lookahead index, if the matched address has
+        // no `addresses` row yet) while holding the (immutable) matcher borrow, then record them
+        // with `&mut self.db_data` - keeping the two borrows from overlapping.
+        let (account, outputs): (AccountUuid, Vec<_>) = {
+            let Some(matcher) = self.transparent_scripts.as_ref() else {
                 return 0;
             };
             let Some(bundle) = tx.transparent_bundle() else {
                 return 0;
             };
             let txid = tx.txid();
-            bundle
+            let outputs = bundle
                 .vout
                 .iter()
                 .enumerate()
                 .filter_map(|(index, txout)| {
                     engine::owned_transparent_output(
-                        addresses,
+                        &matcher.all,
                         txid,
                         index as u32,
                         u64::from(txout.value()),
                         txout.script_pubkey().0 .0.clone(),
                         h,
                     )
+                    .map(|o| {
+                        let lookahead = matcher.lookahead_index(o.recipient_address());
+                        (o, lookahead)
+                    })
                 })
-                .collect()
+                .collect();
+            (matcher.account, outputs)
         };
         let mut recorded = 0;
-        for output in outputs {
+        for (output, lookahead) in outputs {
+            // A gap-lookahead match must record its `addresses` row first (see
+            // `engine::record_lookahead_address`), or the put below rejects the output.
+            if let Some(index) = lookahead {
+                if let Err(e) = engine::record_lookahead_address(&mut self.db_data, account, index)
+                {
+                    warn!(
+                        "[{}] recording lookahead transparent address at index {index} failed: {e}",
+                        self.name
+                    );
+                    continue;
+                }
+            }
             match self.db_data.put_received_transparent_utxo(&output) {
                 Ok(_) => recorded += 1,
                 Err(e) => warn!(
@@ -2415,27 +2441,101 @@ impl WalletActor {
         Ok(outcome.worked)
     }
 
-    /// Rebuild [`Self::transparent_scripts`] from the account's exposed transparent receivers
-    /// (external + internal/change). Cheap relative to a sync batch and only run when the set may
-    /// have changed (`transparent_set_dirty`), so an exchange with ~100k addresses pays the query
-    /// once per gap extension, not once per scanned block.
+    /// Rebuild [`Self::transparent_scripts`] from the account's recorded transparent receivers
+    /// (external + internal/change) plus the in-memory gap lookahead: the next
+    /// `transparent_gap_limit` external indices past the issuance frontier
+    /// (`max(transparent_initial_scan, highest exposed external index + 1)`), derived from the
+    /// account's external incoming viewing key without touching the database (see
+    /// [`engine::TransparentMatcher`]). The lookahead is what makes the gap limit compose with
+    /// `transparent_initial_scan` - a receive within one gap of the frontier is discovered (and
+    /// recorded, which slides the frontier) even though librustzcash's own gap window only
+    /// extends past *funded* indices. Cheap relative to a sync batch and only run when the set
+    /// may have changed (`transparent_set_dirty`), so an exchange with ~100k addresses pays the
+    /// query once per gap extension, not once per scanned block.
     fn rebuild_transparent_set(&mut self, account_id: AccountUuid) {
-        match self
+        let receivers = match self
             .db_data
             .get_transparent_receivers(account_id, true, false)
         {
-            Ok(receivers) => {
-                let set: HashSet<TransparentAddress> = receivers.into_keys().collect();
-                tracing::debug!(
-                    "[{}] transparent address set rebuilt: {} exposed receiver(s)",
-                    self.name,
-                    set.len()
-                );
-                self.transparent_scripts = Some(set);
-                self.transparent_set_dirty = false;
+            Ok(r) => r,
+            Err(e) => {
+                warn!("[{}] rebuilding transparent address set: {e}", self.name);
+                return;
             }
-            Err(e) => warn!("[{}] rebuilding transparent address set: {e}", self.name),
+        };
+        let mut all: HashSet<TransparentAddress> = receivers.into_keys().collect();
+        // The frontier and the already-recorded external indices come from one external-only
+        // metadata query: recorded indices are skipped below without deriving them, so the
+        // lookahead's per-rebuild derivation cost is bounded by the indices librustzcash has
+        // NOT already materialized (its funded-anchored window is generated in full at account
+        // creation) - a legacy wide-gap config doesn't re-derive its whole window here on every
+        // rebuild, only the sliver past it.
+        use zcash_client_backend::wallet::Exposure;
+        let external = match self
+            .db_data
+            .get_transparent_receivers(account_id, false, false)
+        {
+            Ok(r) => r,
+            Err(e) => {
+                warn!("[{}] rebuilding transparent address set: {e}", self.name);
+                return;
+            }
+        };
+        let mut recorded_external: HashSet<u32> = HashSet::new();
+        let mut frontier = self.transparent_initial_scan;
+        for meta in external.values() {
+            if let Some(i) = meta.address_index() {
+                let index = i.index();
+                recorded_external.insert(index);
+                if matches!(meta.exposure(), Exposure::Exposed { .. }) {
+                    frontier = frontier.max(index.saturating_add(1));
+                }
+            }
         }
+        let mut lookahead = HashMap::new();
+        if let Some(ivk) = self.external_transparent_ivk(account_id) {
+            use zcash_transparent::keys::{IncomingViewingKey as _, NonHardenedChildIndex};
+            for index in frontier..frontier.saturating_add(self.transparent_gap_limit) {
+                // Only addresses without a DB row belong in the lookahead map - a recorded
+                // receiver (e.g. a librustzcash-generated funded-window gap row) is already in
+                // `all` and needs no row created at match time, so skip the derivation too.
+                if recorded_external.contains(&index) {
+                    continue;
+                }
+                let Some(child) = NonHardenedChildIndex::from_index(index) else {
+                    break;
+                };
+                // A non-derivable child index yields no address at all (matching upstream's
+                // behavior of skipping it); the gap window just has one fewer member.
+                if let Ok(addr) = ivk.derive_address(child) {
+                    if all.insert(addr) {
+                        lookahead.insert(addr, index);
+                    }
+                }
+            }
+        }
+        tracing::debug!(
+            "[{}] transparent address set rebuilt: {} receiver(s) ({} gap-lookahead from index {frontier})",
+            self.name,
+            all.len(),
+            lookahead.len()
+        );
+        self.transparent_scripts = Some(engine::TransparentMatcher {
+            account: account_id,
+            all,
+            lookahead,
+        });
+        self.transparent_set_dirty = false;
+    }
+
+    /// The account's external transparent incoming viewing key (for deriving the gap-lookahead
+    /// addresses), or `None` when the account's UIVK carries no transparent component.
+    fn external_transparent_ivk(
+        &self,
+        account_id: AccountUuid,
+    ) -> Option<zcash_transparent::keys::ExternalIvk> {
+        let account = self.db_data.get_account(account_id).ok()??;
+        account.uivk().transparent().clone()
     }
 
     /// Rebuild the wallet account from `keys.toml` on an empty data directory (the bootstrap
@@ -2946,40 +3046,52 @@ impl WalletActor {
                  not support a transparent receiver"
                     .to_string(),
             )),
-            // librustzcash fails closed once the recovery window (`gap_limit` consecutive unfunded
-            // addresses) is full. With the operator's opt-in we issue past it anyway, warning that
-            // such an address may be unrecoverable from seed; otherwise surface an actionable error.
-            Err(SqliteClientError::ReachedGapLimit(..))
-                if self.transparent_allow_beyond_recovery_window =>
-            {
+            // librustzcash fails closed once its funded-anchored gap window (`gap_limit`
+            // consecutive unfunded addresses) is full. That window is not the whole recovery
+            // story - the `initial_scan + gap_limit` horizon covers the floor-anchored half - so
+            // classification (recoverable / warn / fail closed) happens in the beyond-gap path.
+            Err(SqliteClientError::ReachedGapLimit(..)) => {
                 self.new_transparent_address_beyond_gap(account_id)
             }
-            Err(SqliteClientError::ReachedGapLimit(..)) => Err(RpcError::wallet(
-                "transparent address gap limit reached: the recovery window is full of unfunded \
-                 addresses, so no new address is recoverable from seed. Raise [pools] \
-                 transparent_initial_scan past your issuance high-water mark (preferred - a \
-                 large transparent_gap_limit makes every recorded transparent receive re-derive \
-                 the whole window), fund a lower-index address, or set \
-                 transparent_allow_beyond_recovery_window = true to issue beyond the window \
-                 anyway."
-                    .to_string(),
-            )),
             Err(e) => Err(RpcError::wallet(format!("address generation failed: {e}"))),
         }
     }
 
-    /// Issue a transparent receiving address **beyond** the recovery window, used when
-    /// `get_next_available_address` hit the gap limit and the operator has opted in via
-    /// `transparent_allow_beyond_recovery_window`. librustzcash's gap reservation refuses such an
-    /// address, so we expose the next sequential external index directly via `get_address_for_index`
-    /// (the same primitive the initial sync uses). An address at an index a from-seed restore
-    /// won't re-expose (i.e. `>= transparent_initial_scan`, with no nearby funding to extend the
-    /// gap) may be unrecoverable, so it is warned about loudly.
+    /// Issue a transparent receiving address past librustzcash's funded-anchored gap window
+    /// (`get_next_available_address` hit `ReachedGapLimit`), classifying the next sequential
+    /// external index against the stateless-restore **recovery horizon**
+    /// `transparent_initial_scan + transparent_gap_limit`:
+    ///
+    ///   * `next < horizon` - recoverable from seed (a restore pre-exposes `0..initial_scan` and
+    ///     its gap lookahead matches `gap_limit` indices past that frontier), so the address is
+    ///     issued quietly regardless of `transparent_allow_beyond_recovery_window`, with a
+    ///     near-exhaustion warning as the horizon fills;
+    ///   * `next >= horizon` - only funding can make the index reachable on a restore, so with
+    ///     the operator's opt-in it is issued with a loud warning, and otherwise the call fails
+    ///     closed with an actionable error.
+    ///
+    /// Either way the index is exposed directly via `get_address_for_index` (the same primitive
+    /// the A18 initial sync uses), since librustzcash's gap reservation refuses it.
     fn new_transparent_address_beyond_gap(
         &mut self,
         account_id: AccountUuid,
     ) -> Result<String, RpcError> {
         let next = self.next_external_transparent_index(account_id);
+        let horizon = self
+            .transparent_initial_scan
+            .saturating_add(self.transparent_gap_limit);
+        if next >= horizon && !self.transparent_allow_beyond_recovery_window {
+            return Err(RpcError::wallet(format!(
+                "transparent address gap limit reached: the next external index ({next}) is \
+                 beyond the recovery horizon (transparent_initial_scan + transparent_gap_limit \
+                 = {horizon}), so it would not be recoverable from seed. Raise [pools] \
+                 transparent_initial_scan to your issuance high-water mark (preferred - a \
+                 large transparent_gap_limit makes every recorded transparent receive \
+                 re-derive the whole window), fund a lower-index address, or set \
+                 transparent_allow_beyond_recovery_window = true to issue beyond the horizon \
+                 anyway."
+            )));
+        }
         let request = crate::pools::transparent_extraction_request();
         let div = DiversifierIndex::from(next);
         let ua = self
@@ -2990,21 +3102,30 @@ impl WalletActor {
                 RpcError::wallet(format!("Error: no address at diversifier index {next}."))
             })?;
         let taddr = transparent_receiver(&ua)?;
-        // A restore re-exposes external indices `0..transparent_initial_scan`, so an index below
-        // that floor stays recoverable even though it's past the steady-state generation gap.
-        if next < self.transparent_initial_scan {
+        if next < horizon {
             info!(
-                "[{}] issued transparent address at external index {next}, past the steady-state \
-                 gap but still within transparent_initial_scan ({}) - recoverable from seed.",
-                self.name, self.transparent_initial_scan
+                "[{}] issued transparent address at external index {next}, past the \
+                 funded-anchored gap window but within the recovery horizon ({horizon}) - \
+                 recoverable from seed.",
+                self.name
             );
+            let remaining = horizon_slots_remaining(horizon, next);
+            if remaining <= self.transparent_gap_warn_threshold {
+                warn!(
+                    "[{}] transparent recovery horizon nearly exhausted: {remaining} recoverable \
+                     address slot(s) remain (transparent_initial_scan + transparent_gap_limit = \
+                     {horizon}). Raise [pools] transparent_initial_scan to your issuance \
+                     high-water mark before handing out more addresses.",
+                    self.name
+                );
+            }
         } else {
             warn!(
                 "[{}] issued transparent address at external index {next}, OUTSIDE the \
-                 stateless-restore recovery window. Funds received here may be UNRECOVERABLE \
-                 from seed unless you raise [pools] transparent_initial_scan past this index \
-                 (preferred - a large transparent_gap_limit makes every recorded transparent \
-                 receive re-derive the whole window). (permitted by \
+                 stateless-restore recovery horizon ({horizon}). Funds received here may be \
+                 UNRECOVERABLE from seed unless you raise [pools] transparent_initial_scan \
+                 past this index (preferred - a large transparent_gap_limit makes every \
+                 recorded transparent receive re-derive the whole window). (permitted by \
                  transparent_allow_beyond_recovery_window = true)",
                 self.name
             );
@@ -3058,8 +3179,12 @@ impl WalletActor {
     }
 
     /// Warn (best-effort) when a just-issued transparent address is among the last
-    /// `transparent_gap_warn_threshold` recoverable slots before `getnewaddress` would hit the gap
-    /// limit, so the operator can widen the window before addresses start landing outside it.
+    /// `transparent_gap_warn_threshold` recoverable slots before `getnewaddress` would leave the
+    /// recovery coverage, so the operator can widen it before addresses start landing outside.
+    /// Coverage is the larger of the two restore mechanisms at this index: librustzcash's
+    /// funded-anchored gap window (`GapMetadata::InGap`) and the floor-anchored recovery horizon
+    /// (`transparent_initial_scan + transparent_gap_limit`) - a wallet whose pre-exposed floor
+    /// fills the funded window (0 in-window slots) is still fine while the horizon has room.
     fn warn_if_gap_low(&self, account_id: AccountUuid, taddr: &TransparentAddress) {
         use zcash_client_backend::wallet::{Exposure, GapMetadata};
         let meta = match self
@@ -3078,23 +3203,25 @@ impl WalletActor {
             ..
         } = meta.exposure()
         {
-            // Count the A18 pre-exposure floor as recoverable headroom alongside the gap window,
-            // so an intended small-gap + large-initial-scan wallet isn't warned on every
-            // issuance it can in fact recover (see [`recoverable_slots_remaining`]).
-            let remaining = recoverable_slots_remaining(
-                gap_position,
-                gap_limit,
-                meta.address_index().map(|i| i.index()),
-                self.transparent_initial_scan,
-            );
+            // Count the recovery horizon as headroom alongside the gap window, so an intended
+            // small-gap + large-initial-scan wallet isn't warned on every issuance it can in
+            // fact recover (see [`horizon_slots_remaining`]).
+            let horizon = self
+                .transparent_initial_scan
+                .saturating_add(self.transparent_gap_limit);
+            let in_window = gap_slots_remaining(gap_position, gap_limit);
+            let under_horizon = meta
+                .address_index()
+                .map_or(0, |i| horizon_slots_remaining(horizon, i.index()));
+            let remaining = in_window.max(under_horizon);
             if remaining <= self.transparent_gap_warn_threshold {
                 warn!(
                     "[{}] transparent recovery window nearly exhausted: {remaining} recoverable \
-                     address slot(s) remain (gap_limit={gap_limit}) before getnewaddress can no \
-                     longer issue an address recoverable from seed. Raise [pools] \
-                     transparent_initial_scan past your issuance high-water mark (preferred - a \
-                     large transparent_gap_limit makes every recorded transparent receive \
-                     re-derive the whole window), or fund a lower-index address.",
+                     address slot(s) remain (gap_limit={gap_limit}, recovery horizon={horizon}) \
+                     before getnewaddress can no longer issue an address recoverable from seed. \
+                     Raise [pools] transparent_initial_scan past your issuance high-water mark \
+                     (preferred - a large transparent_gap_limit makes every recorded transparent \
+                     receive re-derive the whole window), or fund a lower-index address.",
                     self.name
                 );
             }
@@ -5237,6 +5364,7 @@ fn coinbase_hint(zats: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::gap_slots_remaining;
+    use super::horizon_slots_remaining;
     use super::preexpose_progress_stats;
     use super::sanitize_upstream_msg;
     use super::select_transparent_inputs;
@@ -5331,23 +5459,21 @@ mod tests {
     }
 
     #[test]
-    fn recoverable_slots_remaining_counts_the_initial_scan_floor() {
-        use super::recoverable_slots_remaining;
-        // No initial scan configured: identical to the raw gap-window accounting.
-        assert_eq!(recoverable_slots_remaining(14, 20, Some(100), 0), 5);
-        // The A18 shape: the gap window is exhausted, but issuance at index 100 with a 10000
-        // floor still has 9899 recoverable successors - no warning noise on every address.
-        assert_eq!(
-            recoverable_slots_remaining(19, 20, Some(100), 10_000),
-            9_899
-        );
-        // At the floor's edge the window accounting takes back over.
-        assert_eq!(recoverable_slots_remaining(14, 20, Some(9_999), 10_000), 5);
-        assert_eq!(recoverable_slots_remaining(19, 20, Some(9_999), 10_000), 0);
-        // Unknown index: the floor contributes nothing (fall back to the window).
-        assert_eq!(recoverable_slots_remaining(19, 20, None, 10_000), 0);
-        // Whichever bound leaves more headroom wins.
-        assert_eq!(recoverable_slots_remaining(0, 20, Some(18), 20), 19);
+    fn horizon_slots_remaining_counts_down_and_saturates() {
+        // The exchange shape: initial_scan 70_000 + gap 1_000 -> horizon 71_000. Issuing
+        // the first floor index (70_000) leaves 999 recoverable slots - no warning noise on
+        // every address, the misconfiguration bait behind the 0.5.1-rc2 field report.
+        assert_eq!(horizon_slots_remaining(71_000, 70_000), 999);
+        // The last in-horizon index leaves nothing.
+        assert_eq!(horizon_slots_remaining(71_000, 70_999), 0);
+        // At or past the horizon: saturates to 0 (the beyond-horizon warn/fail-closed case).
+        assert_eq!(horizon_slots_remaining(71_000, 71_000), 0);
+        assert_eq!(horizon_slots_remaining(71_000, 80_000), 0);
+        // No floor configured: the horizon is just the gap limit, anchored at index 0.
+        assert_eq!(horizon_slots_remaining(20, 0), 19);
+        assert_eq!(horizon_slots_remaining(20, 19), 0);
+        // Overflow-safe at the top of the index space.
+        assert_eq!(horizon_slots_remaining(u32::MAX, u32::MAX), 0);
     }
 
     // ZIP-317 standard parameters (mirrors `zip317::FeeRule::standard`), so the selection tests

@@ -19,6 +19,12 @@
 //! Indices are small/explicit for CI speed, but the mechanism is identical at index 999 of 1000 -
 //! you size the gap limit to your maximum outstanding-unfunded address count.
 //!
+//! It then proves the **horizon composition** (the knobs compose instead of the gap having to
+//! swallow the floor): on the small-gap + `transparent_initial_scan` restore, `getnewaddress`
+//! keeps issuing at the floor index without error, a payment there is received live, and a final
+//! from-seed restore with the **same** small-gap config recovers it via the matcher's gap
+//! lookahead - the `initial_scan = 70000, gap_limit = 1000` exchange shape at CI-sized indices.
+//!
 //! Skips cleanly unless `ZEBRAD_BIN`/`LIGHTWALLETD_BIN`/`DEVTOOL_BIN` are all set. Standard tier:
 //! it's the load-bearing guard for the (recently-broken) transparent receive-discovery path plus
 //! the gap-limit / initial-scan logic, so it runs on every regtest CI run rather than only the weekly tier.
@@ -228,7 +234,7 @@ async fn regtest_transparent_gap_limit_bounds_restore_recovery() {
     a18_cfg.transparent = true;
     a18_cfg.transparent_gap_limit = Some(SMALL_GAP); // too small on its own (step 7 missed)
     a18_cfg.transparent_initial_scan = Some(LARGE_GAP); // but pre-exposes past the funded index
-    a18_cfg.restore_mnemonic = Some(mnemonic);
+    a18_cfg.restore_mnemonic = Some(mnemonic.clone());
     a18_cfg.birthday = Some(pre_fund_height);
     let a18 = Zecd::start(&a18_cfg)
         .await
@@ -255,8 +261,76 @@ async fn regtest_transparent_gap_limit_bounds_restore_recovery() {
         "initial_scan recovers the high-index receive despite the small gap: {a18_balance}"
     );
 
-    lwd.stop();
+    // 10. Horizon composition - the gap anchors at the initial_scan floor rather than the floor
+    //     having to fit inside the gap. On the A18 wallet (gap = 3, initial_scan = 25, all of
+    //     0..25 pre-exposed and unfunded above index 8) librustzcash's own funded-anchored window
+    //     is exhausted, so before the gap lookahead this getnewaddress landed beyond every
+    //     recovery mechanism: issued with an "UNRECOVERABLE" warning, and a from-seed restore
+    //     really did miss funds sent to it. Now the floor index is within the recovery horizon
+    //     (initial_scan + gap_limit = 28): it issues cleanly, receives live, and - the
+    //     load-bearing assertion - a fresh restore with the SAME small-gap config recovers it via
+    //     the matcher's in-memory lookahead of gap_limit indices past the floor.
+    let floor_addr = a18
+        .call("getnewaddress", json!(["", "transparent"]))
+        .await
+        .expect("getnewaddress at the initial_scan floor (within the recovery horizon)")
+        .as_str()
+        .expect("address string")
+        .to_string();
+    assert!(
+        floor_addr.starts_with("tm"),
+        "bare t-addr expected, got {floor_addr}"
+    );
+    assert!(
+        !addresses.contains(&floor_addr),
+        "the floor address must be a fresh index, not a reissue of the authoring run: {floor_addr}"
+    );
+    funder
+        .send(lwd.grpc_port, &floor_addr, FUND_ZATOSHIS)
+        .expect("send to the floor-index transparent address");
+    zebrad
+        .generate_blocks(12)
+        .await
+        .expect("confirm the floor-index receive");
+    let tip2 = zebrad
+        .rpc("getblockcount", json!([]))
+        .await
+        .expect("zebra getblockcount after the floor funding")
+        .as_u64()
+        .expect("height");
+    wait_for_balance_at_least(&a18, 2.0, FUND_TIMEOUT).await;
     drop(a18);
+
+    // 11. The from-seed proof: same small gap, same initial_scan - the floor-index receive sits at
+    //     index >= initial_scan, so only the gap lookahead past the floor can recover it.
+    let mut horizon_cfg = ZecdConfig::new(zebrad.rpc_port, pick_port().expect("pick rpc port"));
+    horizon_cfg.transparent = true;
+    horizon_cfg.transparent_gap_limit = Some(SMALL_GAP);
+    horizon_cfg.transparent_initial_scan = Some(LARGE_GAP);
+    horizon_cfg.restore_mnemonic = Some(mnemonic);
+    horizon_cfg.birthday = Some(pre_fund_height);
+    let horizon = Zecd::start(&horizon_cfg)
+        .await
+        .expect("restore zecd with the same small gap + initial scan (horizon config)");
+    horizon
+        .wait_until_synced(tip2, FUND_TIMEOUT)
+        .await
+        .expect("the horizon restore scans to the tip");
+    wait_for_balance_at_least(&horizon, 2.0, FUND_TIMEOUT).await;
+    let horizon_balance = horizon
+        .call("getbalance", json!([]))
+        .await
+        .expect("getbalance on the horizon instance")
+        .as_f64()
+        .expect("balance number");
+    assert!(
+        (horizon_balance - 2.0).abs() < 1e-8,
+        "the gap lookahead past the initial_scan floor recovers the floor-index receive \
+         (expected 2 ZEC = high-index + floor-index): {horizon_balance}"
+    );
+
+    lwd.stop();
+    drop(horizon);
     // `zebrad` and `funder` clean up on drop.
 }
 
