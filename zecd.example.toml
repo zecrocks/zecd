@@ -188,13 +188,17 @@ default_receivers = ["orchard"]
 # transparent = false
 # transparent_default = false
 #
-# transparent_gap_limit (default 20) is the stateless-restore safety margin for transparent: how
-# far past the last FUNDED receiving address a rebuilt wallet keeps scanning the node's address
-# index before giving up. Unlike shielded funds (always recoverable by note trial-decryption),
-# transparent funds are only rediscovered on restore within this window. If you pre-generate many
-# addresses ahead of funding (e.g. one per invoice, most never paid), set this to at least your
-# maximum number of outstanding-unfunded addresses, or a restore may miss a later payment to a
-# high-index address. Higher = more address-index queries per restore/scan.
+# transparent_gap_limit (default 20; values above 1000 are warned about, above 10000 loudly) is
+# the stateless-restore safety margin for
+# transparent: how far past the last FUNDED receiving address a rebuilt wallet keeps scanning the
+# node's address index before giving up. Unlike shielded funds (always recoverable by note
+# trial-decryption), transparent funds are only rediscovered on restore within this window. If you
+# pre-generate many addresses ahead of funding (e.g. one per invoice, most never paid), set this to
+# at least your maximum number of outstanding-unfunded addresses, or a restore may miss a later
+# payment to a high-index address. KEEP IT SMALL: every transparent receive the scan records
+# re-derives the entire window (one address derivation per index, repeated per output of a
+# multi-output transaction), so a wide window costs seconds-to-minutes of CPU per received UTXO
+# and can stall a restore. For deep coverage use transparent_initial_scan below instead.
 # transparent_gap_limit = 20
 #
 # transparent_initial_scan (default 0 = off) is the better tool when you hand out MANY addresses
@@ -212,8 +216,8 @@ default_receivers = ["orchard"]
 # such an address. The default (true) issues the address anyway and logs a loud warning that funds
 # received there may be UNRECOVERABLE from seed. Set it to false to instead FAIL the call with an
 # actionable error - fail-closed, so funds can never land on an unrecoverable address. Either way,
-# widen transparent_gap_limit / transparent_initial_scan (or get a lower index funded) to move the
-# window forward.
+# raise transparent_initial_scan past your issuance high-water mark (or get a lower index funded)
+# to move the window forward - prefer that over widening transparent_gap_limit (see its cost note).
 # transparent_allow_beyond_recovery_window = true
 #
 # transparent_gap_warn_threshold (default 5) - getnewaddress logs a warning once fewer than this many

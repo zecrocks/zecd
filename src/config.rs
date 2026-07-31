@@ -136,6 +136,28 @@ pub struct PoolsConfig {
 /// for typical sparse issuance, while keeping restore scans cheap.
 pub const DEFAULT_TRANSPARENT_GAP_LIMIT: u32 = 20;
 
+/// Hard upper bound on `transparent_gap_limit`, enforced at config validation. The gap window is
+/// not just a scan bound: librustzcash's gap maintenance re-derives the ENTIRE window - a full
+/// unified-address derivation per index - every time a transparent receive is recorded
+/// (`put_received_transparent_utxo` -> `update_gap_limits`), and repeats that regeneration once
+/// per already-recorded output of the same transaction. At the measured ~1.2k derivations/s a
+/// 71000-wide window costs about a minute per received UTXO (quadratically more for multi-output
+/// transactions), all on the single-writer actor inside the sync batch - in the field this
+/// presented as a restore "stalled" >100x, one core pegged, with the block scan frozen for hours
+/// (zecd 0.5.1-rc2 report, 2026-07-30). Deep restore coverage belongs to
+/// `transparent_initial_scan` (a one-time pre-exposure, not a per-receive cost); the gap limit
+/// only needs to cover outstanding unfunded handed-out addresses. Above 10 000 the worst-case
+/// per-receive cost passes ~10s, far beyond any sane outstanding-handout count - but the value
+/// stays the operator's choice: the daemon starts anyway and logs at error level (an
+/// operator-facing knob is never a hard failure when the misconfiguration only costs
+/// performance).
+pub const TRANSPARENT_GAP_LIMIT_SEVERE: u32 = 10_000;
+
+/// Soft bound on `transparent_gap_limit` above which the daemon logs a startup warning (see
+/// [`TRANSPARENT_GAP_LIMIT_SEVERE`] for the cost mechanism): ~1s of address derivation per
+/// recorded transparent receive, more for multi-output transactions.
+pub const TRANSPARENT_GAP_LIMIT_COSTLY: u32 = 1_000;
+
 /// Default for `transparent_allow_beyond_recovery_window`: permissive (warn, don't block), matching
 /// the Bitcoin-RPC promise that `getnewaddress` keeps handing out addresses.
 pub const DEFAULT_TRANSPARENT_ALLOW_BEYOND: bool = true;
@@ -1191,7 +1213,10 @@ fn resolve_global_pools(file: Option<&PoolsFile>) -> anyhow::Result<PoolsConfig>
 
 /// `transparent_default` makes a bare t-address the no-argument `getnewaddress` default, so it
 /// only makes sense when transparent receiving is enabled at all. The gap limit must be at least 1
-/// (0 would scan no addresses and recover nothing on restore).
+/// (0 would scan no addresses and recover nothing on restore). There is deliberately no upper
+/// bound here: a very wide window is an operator's (costly) choice, warned about loudly at actor
+/// spawn ([`TRANSPARENT_GAP_LIMIT_COSTLY`] / [`TRANSPARENT_GAP_LIMIT_SEVERE`]) rather than
+/// rejected.
 fn validate_transparent_flags(
     ctx: &str,
     transparent_enabled: bool,
@@ -1442,6 +1467,23 @@ mod tests {
         };
         assert!(resolve_global_pools(Some(&f)).is_err());
 
+        // A pathologically wide gap limit is rejected with guidance toward the A18 knob:
+        // recording each transparent receive re-derives the whole window, so a huge window
+        // stalls restores (the 0.5.1-rc2 field report ran transparent_gap_limit = 71000), but
+        // the width is the operator's choice: it parses fine and is warned about at actor spawn
+        // (error-level above TRANSPARENT_GAP_LIMIT_SEVERE), never rejected.
+        let f = PoolsFile {
+            transparent: Some(true),
+            transparent_gap_limit: Some(71_000),
+            ..Default::default()
+        };
+        assert_eq!(
+            resolve_global_pools(Some(&f))
+                .unwrap()
+                .transparent_gap_limit,
+            71_000
+        );
+
         // transparent_default without transparent is rejected.
         let f = PoolsFile {
             transparent_default: Some(true),
@@ -1506,6 +1548,39 @@ mod tests {
                 .unwrap();
         assert!(!allow_beyond, "inherits global allow_beyond");
         assert_eq!(warn_thresh, 9, "inherits global warn threshold");
+
+        // A very wide per-wallet gap-limit override is likewise accepted (warned about at spawn,
+        // not rejected); only 0 is invalid.
+        let global = PoolsConfig::default();
+        let (_, _, _, _, gap, _, _, _) = resolve_wallet_pools(
+            "w",
+            None,
+            None,
+            Some(true),
+            None,
+            Some(TRANSPARENT_GAP_LIMIT_SEVERE + 1),
+            None,
+            None,
+            None,
+            &global,
+        )
+        .unwrap();
+        assert_eq!(gap, TRANSPARENT_GAP_LIMIT_SEVERE + 1);
+        let err = resolve_wallet_pools(
+            "w",
+            None,
+            None,
+            Some(true),
+            None,
+            Some(0),
+            None,
+            None,
+            None,
+            &global,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("at least 1"), "{err}");
     }
 
     #[test]

@@ -55,6 +55,12 @@ use crate::wallet::open::{block_path, WriteDb};
 
 const BATCH_SIZE: u32 = 10_000;
 
+/// How often (at most) to log progress while recording a batch's matched transparent receives.
+/// Normally the whole loop is milliseconds and never logs; each recorded receive re-derives the
+/// wallet's transparent gap window, so under a wide `transparent_gap_limit` a single batch can
+/// legitimately take minutes and this heartbeat is what distinguishes it from a hang.
+const TRANSPARENT_RECORD_LOG_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
+
 /// A wallet-side failure applying an already-downloaded batch (the scan/commit stage of
 /// [`sync_one_batch`]): the upstream served the range fine, but scanning it into the local
 /// wallet database failed - e.g. `Wallet(PutBlocksCommitmentTree { .. Insert(Conflict(..)) })`
@@ -553,9 +559,21 @@ pub async fn sync_one_batch<C: ChainSource>(
     let mut transparent_recorded = 0;
     if !outcome.reorged {
         let mut coinbase_stored: HashSet<TxId> = HashSet::new();
+        let record_started = std::time::Instant::now();
+        let mut record_last_log = record_started;
         for matched in &received {
             let output = &matched.output;
-            match db_data.put_received_transparent_utxo(output) {
+            // Recording a receive is CPU-bound out of proportion to its size: librustzcash's
+            // gap maintenance re-derives the wallet's entire external gap window on every
+            // recorded transparent output (and again for each already-recorded output of the
+            // same transaction). Under the default gap limit this is sub-millisecond, but a
+            // wide window (warned about via `TRANSPARENT_GAP_LIMIT_SEVERE`) turns each put
+            // into seconds of derivation, so run it under `block_in_place` like the block scan -
+            // and emit a throttled progress line so a slow pass reads as gap maintenance at
+            // work rather than a silent multi-minute stall (a 71000-wide window in the field
+            // froze a restore for an hour with no log output between batches).
+            let put = tokio::task::block_in_place(|| db_data.put_received_transparent_utxo(output));
+            match put {
                 Ok(_) => transparent_recorded += 1,
                 Err(e) => {
                     warn!(
@@ -565,6 +583,18 @@ pub async fn sync_one_batch<C: ChainSource>(
                     );
                     continue;
                 }
+            }
+            if record_last_log.elapsed() >= TRANSPARENT_RECORD_LOG_INTERVAL {
+                info!(
+                    "[{name}] recording transparent receives from block scan: {}/{} in {:.0}s \
+                     (each receive re-derives the transparent gap window; keep [pools] \
+                     transparent_gap_limit small and use transparent_initial_scan for restore \
+                     depth)",
+                    transparent_recorded,
+                    received.len(),
+                    record_started.elapsed().as_secs_f64(),
+                );
+                record_last_log = std::time::Instant::now();
             }
             // A coinbase receive also stores its full transaction, so the wallet DB learns
             // `tx_index = 0` (`put_tx_data` derives it from `Bundle::is_coinbase`). This is what

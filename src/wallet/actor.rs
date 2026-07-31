@@ -663,6 +663,36 @@ pub async fn spawn(
             "[{}] transparent receiving enabled (default_address={}, external_gap_limit={})",
             cfg.name, cfg.transparent_default, cfg.transparent_gap_limit
         );
+        // A wide window is a per-receive cost, not just a restore-scan bound: librustzcash's gap
+        // maintenance re-derives the whole window every time a transparent receive is recorded
+        // (see `config::TRANSPARENT_GAP_LIMIT_SEVERE`). The width stays the operator's choice
+        // (never a startup failure), but past the severe bound the cost is a near-certain
+        // stalled restore, so it logs at error level - the 0.5.1-rc2 field stall ran 71000.
+        if cfg.transparent_gap_limit > crate::config::TRANSPARENT_GAP_LIMIT_SEVERE {
+            error!(
+                "[{}] transparent_gap_limit = {} will effectively STALL restores and slow every \
+                 incoming transparent payment: recording one transparent receive re-derives the \
+                 entire gap window (roughly {}s of address derivation per received UTXO, \
+                 repeated per output of a multi-output transaction - a restore that discovers \
+                 dozens of UTXOs grinds for hours on one core with no log output). Use a small \
+                 gap limit plus [pools] transparent_initial_scan (a one-time pre-exposure with \
+                 no per-receive cost) for deep restore coverage instead. Starting anyway.",
+                cfg.name,
+                cfg.transparent_gap_limit,
+                cfg.transparent_gap_limit / 1200
+            );
+        } else if cfg.transparent_gap_limit > crate::config::TRANSPARENT_GAP_LIMIT_COSTLY {
+            warn!(
+                "[{}] transparent_gap_limit = {} is unusually large: every transparent receive \
+                 recorded by the scan re-derives the entire gap window (roughly {}s of address \
+                 derivation per received UTXO, repeated per output of a multi-output \
+                 transaction). Prefer a small gap limit plus [pools] transparent_initial_scan \
+                 for deep restore coverage.",
+                cfg.name,
+                cfg.transparent_gap_limit,
+                cfg.transparent_gap_limit / 1200
+            );
+        }
     }
     let db_cache = open::open_fsblockdb(&cfg.wallet_dir)?;
     let st = store::WalletStore::read(&cfg.keys_path)?;
@@ -1194,6 +1224,26 @@ fn transparent_receiver(
 /// `GapMetadata::InGap` accounting: `gap_limit - (gap_position + 1)`.
 fn gap_slots_remaining(gap_position: u32, gap_limit: u32) -> u32 {
     gap_limit.saturating_sub(gap_position.saturating_add(1))
+}
+
+/// Recoverable transparent address slots remaining, counting the A18 pre-exposure floor as well
+/// as librustzcash's gap window: a restore re-exposes external indices
+/// `0..transparent_initial_scan` unconditionally, so successors of an address issued at
+/// `addr_index` stay recoverable up to that floor even when the gap window itself is (nearly)
+/// consumed. Without the floor, a wallet configured the intended A18 way (small gap limit, large
+/// initial scan) warned "recovery window nearly exhausted" on issuance it could in fact recover -
+/// noise that in the field pushed an operator to silence it by raising `transparent_gap_limit`
+/// above `transparent_initial_scan`, the configuration whose per-receive window regeneration
+/// stalls restores (see `config::TRANSPARENT_GAP_LIMIT_SEVERE`).
+fn recoverable_slots_remaining(
+    gap_position: u32,
+    gap_limit: u32,
+    addr_index: Option<u32>,
+    initial_scan: u32,
+) -> u32 {
+    let in_window = gap_slots_remaining(gap_position, gap_limit);
+    let below_floor = addr_index.map_or(0, |i| initial_scan.saturating_sub(i.saturating_add(1)));
+    in_window.max(below_floor)
 }
 
 /// Render a tree-state frontier (the hex-encoded `final_state` from a `tree_state` reply) for
@@ -2906,10 +2956,12 @@ impl WalletActor {
             }
             Err(SqliteClientError::ReachedGapLimit(..)) => Err(RpcError::wallet(
                 "transparent address gap limit reached: the recovery window is full of unfunded \
-                 addresses, so no new address is recoverable from seed. Increase [pools] \
-                 transparent_gap_limit and/or transparent_initial_scan, fund a lower-index \
-                 address, or set transparent_allow_beyond_recovery_window = true to issue beyond \
-                 the window anyway."
+                 addresses, so no new address is recoverable from seed. Raise [pools] \
+                 transparent_initial_scan past your issuance high-water mark (preferred - a \
+                 large transparent_gap_limit makes every recorded transparent receive re-derive \
+                 the whole window), fund a lower-index address, or set \
+                 transparent_allow_beyond_recovery_window = true to issue beyond the window \
+                 anyway."
                     .to_string(),
             )),
             Err(e) => Err(RpcError::wallet(format!("address generation failed: {e}"))),
@@ -2949,9 +3001,11 @@ impl WalletActor {
         } else {
             warn!(
                 "[{}] issued transparent address at external index {next}, OUTSIDE the \
-                 stateless-restore recovery window. Funds received here may be UNRECOVERABLE from \
-                 seed unless you raise [pools] transparent_gap_limit / transparent_initial_scan. \
-                 (permitted by transparent_allow_beyond_recovery_window = true)",
+                 stateless-restore recovery window. Funds received here may be UNRECOVERABLE \
+                 from seed unless you raise [pools] transparent_initial_scan past this index \
+                 (preferred - a large transparent_gap_limit makes every recorded transparent \
+                 receive re-derive the whole window). (permitted by \
+                 transparent_allow_beyond_recovery_window = true)",
                 self.name
             );
         }
@@ -3024,14 +3078,23 @@ impl WalletActor {
             ..
         } = meta.exposure()
         {
-            let remaining = gap_slots_remaining(gap_position, gap_limit);
+            // Count the A18 pre-exposure floor as recoverable headroom alongside the gap window,
+            // so an intended small-gap + large-initial-scan wallet isn't warned on every
+            // issuance it can in fact recover (see [`recoverable_slots_remaining`]).
+            let remaining = recoverable_slots_remaining(
+                gap_position,
+                gap_limit,
+                meta.address_index().map(|i| i.index()),
+                self.transparent_initial_scan,
+            );
             if remaining <= self.transparent_gap_warn_threshold {
                 warn!(
                     "[{}] transparent recovery window nearly exhausted: {remaining} recoverable \
                      address slot(s) remain (gap_limit={gap_limit}) before getnewaddress can no \
-                     longer issue an address recoverable from seed. Increase [pools] \
-                     transparent_gap_limit and/or transparent_initial_scan, or fund a lower-index \
-                     address.",
+                     longer issue an address recoverable from seed. Raise [pools] \
+                     transparent_initial_scan past your issuance high-water mark (preferred - a \
+                     large transparent_gap_limit makes every recorded transparent receive \
+                     re-derive the whole window), or fund a lower-index address.",
                     self.name
                 );
             }
@@ -5265,6 +5328,26 @@ mod tests {
         assert_eq!(gap_slots_remaining(u32::MAX, 1), 0);
         // Degenerate gap_limit = 1: the single address leaves nothing.
         assert_eq!(gap_slots_remaining(0, 1), 0);
+    }
+
+    #[test]
+    fn recoverable_slots_remaining_counts_the_initial_scan_floor() {
+        use super::recoverable_slots_remaining;
+        // No initial scan configured: identical to the raw gap-window accounting.
+        assert_eq!(recoverable_slots_remaining(14, 20, Some(100), 0), 5);
+        // The A18 shape: the gap window is exhausted, but issuance at index 100 with a 10000
+        // floor still has 9899 recoverable successors - no warning noise on every address.
+        assert_eq!(
+            recoverable_slots_remaining(19, 20, Some(100), 10_000),
+            9_899
+        );
+        // At the floor's edge the window accounting takes back over.
+        assert_eq!(recoverable_slots_remaining(14, 20, Some(9_999), 10_000), 5);
+        assert_eq!(recoverable_slots_remaining(19, 20, Some(9_999), 10_000), 0);
+        // Unknown index: the floor contributes nothing (fall back to the window).
+        assert_eq!(recoverable_slots_remaining(19, 20, None, 10_000), 0);
+        // Whichever bound leaves more headroom wins.
+        assert_eq!(recoverable_slots_remaining(0, 20, Some(18), 20), 19);
     }
 
     // ZIP-317 standard parameters (mirrors `zip317::FeeRule::standard`), so the selection tests
