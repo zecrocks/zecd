@@ -5,6 +5,18 @@ All notable changes to zecd are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com), and this
 project adheres to [Semantic Versioning](https://semver.org).
 
+## [0.5.1-rc3] - 2026-07-31
+
+### Added
+- `getbalances.mine.coinbase` and `getwalletinfo.transparent.coinbase_balance` report the unspent mature transparent coinbase value. Both are additive extensions, so the Bitcoin Core balance triple still totals the wallet. Mature coinbase counts toward the balance yet no ordinary send can select it, since consensus requires a transaction spending transparent coinbase to carry no transparent output at all; the insufficient-funds error now names that amount and points at `z_shieldcoinbase`.
+
+### Changed
+- The transparent gap limit is anchored at the issuance frontier, the highest of the last funded index, the last index handed out, and the `transparent_initial_scan` floor, rather than at the last funded index alone. It therefore composes with `transparent_initial_scan`: a stateless restore recovers up to the sum of the two. Anyone who inflated `transparent_gap_limit` to match a large `transparent_initial_scan` no longer needs to, and should reduce it, since the daemon now warns above 1000 and logs an error above 10000. Neither blocks startup.
+- Ironwood sends take the cached proving key instead of the fused build path, which rebuilt its key on every send. The gate that forced this existed because the previously pinned dependency rejected Ironwood bundles; the published release candidate builds them.
+
+### Fixed
+- A large `transparent_gap_limit` no longer makes a restore appear to stall. Recording a transparent receive re-derives the whole gap window, once per already-recorded output of the same transaction, so a very wide window cost about a minute of address derivation per received output on the single-writer path. Reported against 0.5.1-rc2 as a restore frozen for hours with one core pegged.
+
 ## [0.5.1-rc2] - 2026-07-30
 
 ### Added
@@ -239,6 +251,7 @@ Zcash, backed entirely by librustzcash and running as a light client.
 ### Security
 - Pre-release audit hardening; refuse to start on mainnet with the placeholder RPC password; enforce a 12-character passphrase minimum.
 
+[0.5.1-rc3]: https://github.com/zecrocks/zecd/compare/v0.5.1-rc2...v0.5.1-rc3
 [0.5.1-rc2]: https://github.com/zecrocks/zecd/compare/v0.5.1-rc1...v0.5.1-rc2
 [0.5.1-rc1]: https://github.com/zecrocks/zecd/compare/v0.5.0...v0.5.1-rc1
 [0.5.0]: https://github.com/zecrocks/zecd/compare/v0.4.3...v0.5.0
