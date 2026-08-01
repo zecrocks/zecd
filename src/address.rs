@@ -60,7 +60,8 @@ pub fn receiver_types_of(addr: &Address) -> Vec<&'static str> {
 /// Reduce a recipient address to the single on-chain receiver a given pool's output actually
 /// pays, re-encoded in its own minimal form: a bare transparent or Sapling address, or a
 /// single-receiver Unified Address for Orchard (Orchard has no standalone encoding). `pool`
-/// is a `v_tx_outputs.output_pool` code (0 = transparent, 2 = Sapling, 3 = Orchard).
+/// is a `v_tx_outputs.output_pool` code (0 = transparent, 2 = Sapling, 3 = Orchard,
+/// 4 = Ironwood - which pays the Orchard receiver, so it reduces exactly like 3).
 ///
 /// This is what makes outgoing transaction history deterministic across a restore-from-seed.
 /// The full (possibly multi-receiver) UA a caller typed is sender-side metadata that never
@@ -89,7 +90,12 @@ pub fn single_receiver_for_pool<P: Parameters>(params: &P, s: &str, pool: i64) -
             _ => None,
         },
         // Orchard has no standalone encoding, so the single receiver is a UA carrying only it.
-        3 => match &addr {
+        //
+        // Ironwood (4) reduces identically and deliberately shares this arm: ironwood notes are
+        // received at ordinary Orchard addresses - there is no ironwood receiver typecode - so the
+        // receiver an ironwood output pays *is* the Orchard one. Post-NU6.3 this is the common
+        // case, not an edge case: an ordinary shielded output is pool 4.
+        3 | 4 => match &addr {
             Address::Unified(ua) => ua
                 .orchard()
                 .and_then(|orch| UnifiedAddress::from_receivers(Some(*orch), None, None))
@@ -251,6 +257,73 @@ mod tests {
             single_receiver_for_pool(&ZNetwork::Test, TESTNET_ORCHARD_UA, 3).as_deref(),
             Some(TESTNET_ORCHARD_UA)
         );
+    }
+
+    /// Ironwood (`output_pool` 4) must reduce exactly like Orchard (3).
+    ///
+    /// Ironwood notes are received at ordinary Orchard addresses - there is no ironwood receiver
+    /// typecode - so the single receiver an ironwood output pays *is* the Orchard receiver. While
+    /// `single_receiver_for_pool` matched only 0/2/3, code 4 fell through to `None`, and
+    /// `wallet_methods::display_address` then fell back to the full recorded `to_address` - the
+    /// multi-receiver UA the caller typed, which a restore-from-seed cannot reproduce (it recovers
+    /// only the receiver actually paid). That is the restore-determinism guarantee this reduction
+    /// exists to provide.
+    ///
+    /// NB the fallback is not currently observed on outgoing history: `regtest_funded` asserts the
+    /// send detail's address differs from the multi-receiver UA, and it passes on an NU6.3-active
+    /// chain, so `sent_notes.output_pool` is evidently still 3 for a payment to an Orchard
+    /// receiver. This test guards the code path rather than a reproduced user-visible failure -
+    /// pool 4 plainly does reach zecd's display layer (`pool_name` maps it to "ironwood"), and if
+    /// an outgoing row is ever recorded with it, silently falling back is the wrong answer.
+    #[test]
+    fn ironwood_reduces_to_the_orchard_receiver() {
+        assert_eq!(
+            single_receiver_for_pool(&ZNetwork::Test, TESTNET_ORCHARD_UA, 4).as_deref(),
+            Some(TESTNET_ORCHARD_UA),
+            "an ironwood output pays the Orchard receiver, so it reduces like pool 3"
+        );
+        // And it agrees with Orchard on the same input - the property that makes the authoring
+        // node and a restored wallet render identical history.
+        assert_eq!(
+            single_receiver_for_pool(&ZNetwork::Test, TESTNET_ORCHARD_UA, 4),
+            single_receiver_for_pool(&ZNetwork::Test, TESTNET_ORCHARD_UA, 3),
+        );
+        // Absent-receiver behaviour matches Orchard too.
+        assert_eq!(
+            single_receiver_for_pool(&ZNetwork::Main, MAINNET_SAPLING, 4),
+            None
+        );
+    }
+
+    /// Every pool code `v_tx_outputs.output_pool` can hold must be handled.
+    ///
+    /// The class of bug this guards is not "ironwood was forgotten here" but "a `match` on a raw
+    /// `i64` pool code is not exhaustive, and nothing fails to compile when a pool is added". Three
+    /// separate ironwood omissions shipped that way. Enumerate the codes so a fourth pool trips a
+    /// test rather than silently taking a fallback path.
+    #[test]
+    fn every_output_pool_code_is_handled() {
+        // A UA carrying every shielded receiver the wallet can be paid at, plus transparent.
+        for (code, name) in [
+            (0i64, "transparent"),
+            (2, "sapling"),
+            (3, "orchard"),
+            (4, "ironwood"),
+        ] {
+            // Each code must resolve against an address that carries that receiver. Orchard and
+            // ironwood share the Orchard receiver; sapling and transparent have their own.
+            let (addr, net) = match code {
+                0 => (MAINNET_P2PKH, ZNetwork::Main),
+                2 => (MAINNET_SAPLING, ZNetwork::Main),
+                _ => (TESTNET_ORCHARD_UA, ZNetwork::Test),
+            };
+            assert!(
+                single_receiver_for_pool(&net, addr, code).is_some(),
+                "output_pool code {code} ({name}) is not handled by single_receiver_for_pool; \
+                 display_address would fall back to the full recorded address and history would \
+                 stop being restore-deterministic for that pool"
+            );
+        }
     }
 
     #[test]
