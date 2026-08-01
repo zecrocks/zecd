@@ -5,6 +5,33 @@ All notable changes to zecd are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com), and this
 project adheres to [Semantic Versioning](https://semver.org).
 
+## [0.5.1] - 2026-08-01
+
+The 0.5.1 line, released as `0.5.1-rc1` through `0.5.1-rc4` and unchanged since `0.5.1-rc4`.
+Everything below is relative to 0.5.0; the release-candidate sections that follow are kept for
+history.
+
+Two of these fixes affect wallets running 0.5.0 with `[pools] transparent = true`, which is off
+by default. If that is you, this release is worth taking.
+
+### Added
+- Coinbase spending. Transparent coinbase is swept with `z_shieldcoinbase` into a single shielded output once it reaches the 100-block maturity, which is the only shape consensus permits, since a transaction spending transparent coinbase may carry no transparent output at all. Shielded coinbase (ZIP-213) needs no special handling. `listunspent` tags transparent entries with zcashd's `generated` flag and excludes immature coinbase, which is reported as `getwalletinfo.immature_balance` until it matures.
+- `zecd rescan` rebuilds a wallet whose database has become unusable, keeping `keys.toml` and the seed so the next start recreates the account and rescans from the birthday. It takes the datadir lock, so it refuses to run against a live daemon.
+- A stuck sync says why it is stuck, distinguishing a network upgrade this build does not understand from a wallet database that cannot apply otherwise-valid blocks.
+- `getbalances.mine.coinbase` and `getwalletinfo.transparent.coinbase_balance` report the unspent mature transparent coinbase value, which counts toward the balance but which no ordinary send can select; the insufficient-funds error now names that amount and points at `z_shieldcoinbase`.
+
+### Changed
+- The transparent gap limit is anchored at the issuance frontier, the highest of the last funded index, the last index handed out, and the `transparent_initial_scan` floor, so it composes with `transparent_initial_scan` and a stateless restore recovers up to the sum of the two. Anyone who inflated `transparent_gap_limit` to match a large initial scan should now reduce it: the daemon warns above 1000 and logs an error above 10000, neither blocking startup.
+- `getreceivedbyaddress` and `listreceivedbyaddress` honor `include_immature_coinbase`, as Bitcoin Core does.
+- Ironwood sends take the cached proving key rather than rebuilding one per send.
+- The librustzcash wallet crates move to `zcash_client_backend 0.24.0-rc.6` and `zcash_client_sqlite 0.22.0-rc.6`.
+
+### Fixed
+- Transparent spends the wallet did not author itself are discovered. The spent output used to stay in the unspent set, so the wallet reported a balance it no longer held and could select that output for a send that then failed at broadcast. Watch-only wallets were the sharpest case, since every transparent spend they see is external.
+- A received coinbase output is recorded as coinbase, so the maturity rule applies to it rather than letting it count as spendable immediately, and transparent-to-transparent sends exclude coinbase inputs, which would have been consensus-invalid.
+- A restore no longer crawls or appears to stall. Transparent spend-detection requests are serviced to the chain tip instead of in roughly 40-block windows that each queued a successor, and a large `transparent_gap_limit` no longer re-derives the whole window on every recorded receive.
+- `getwalletinfo.scanning.progress` reflects the whole scan instead of reading 1.0 from the start, and `scanning` no longer flips to false partway through a restore.
+
 ## [0.5.1-rc4] - 2026-07-31
 
 ### Fixed
@@ -256,6 +283,7 @@ Zcash, backed entirely by librustzcash and running as a light client.
 ### Security
 - Pre-release audit hardening; refuse to start on mainnet with the placeholder RPC password; enforce a 12-character passphrase minimum.
 
+[0.5.1]: https://github.com/zecrocks/zecd/compare/v0.5.0...v0.5.1
 [0.5.1-rc4]: https://github.com/zecrocks/zecd/compare/v0.5.1-rc3...v0.5.1-rc4
 [0.5.1-rc3]: https://github.com/zecrocks/zecd/compare/v0.5.1-rc2...v0.5.1-rc3
 [0.5.1-rc2]: https://github.com/zecrocks/zecd/compare/v0.5.1-rc1...v0.5.1-rc2
