@@ -59,7 +59,7 @@ pub fn http_status_for_code(code: i32) -> u16 {
 
 /// The concrete error type returned by `propose_transfer` / `create_proposed_transactions`
 /// for our `WalletDb`. Naming it pins the otherwise-unconstrained commitment-tree error
-/// parameter so `map_err` closures can infer their argument type (mirrors zcash-devtool's
+/// parameter so `map_err` closures can infer their argument type (mirrors the reference wallet's
 /// `WalletErrorT`).
 pub type ProposalError = zcash_client_backend::data_api::error::Error<
     zcash_client_sqlite::error::SqliteClientError,

@@ -63,7 +63,7 @@ use crate::wallet::{
     WalletCommand, WalletHandle,
 };
 
-/// Note-management defaults for change splitting (match zcash-devtool's send defaults).
+/// Note-management defaults for change splitting.
 const TARGET_NOTE_COUNT: usize = 4;
 const MIN_SPLIT_OUTPUT_VALUE: u64 = 10_000_000; // 0.1 ZEC
 
@@ -625,7 +625,7 @@ struct WalletActor {
     last_sync_error: Option<String>,
     sync_error_streak: u32,
     /// Serviceable transaction-data requests already attempted in the current enhancement drain.
-    /// Mirrors zcash-devtool/zkv's per-pass `satisfied` set, but carried across `enhance_step`
+    /// Carries the per-pass `satisfied` set across `enhance_step`
     /// batches so a request the upstream can't satisfy (left in the DB after servicing) is
     /// re-fetched at most once per drain instead of spinning the batch loop. Cleared whenever a
     /// sync batch does work (new blocks may add or re-satisfy requests). Entries removed from the
@@ -1806,7 +1806,7 @@ impl WalletActor {
     /// `pending_enhancements` count between batches, instead of disappearing into one monolithic
     /// pass that hides the backlog and starves writers for hours.
     ///
-    /// Mirrors zcash-devtool's `enhance` command and zkv's `enhance`. Best-effort: a transport
+    /// Matches the reference wallet's enhancement behavior. Best-effort: a transport
     /// failure drops the client (so the next loop reconnects/fails over) and ends the batch; the
     /// still-pending requests are retried on the next caught-up pass. librustzcash removes each
     /// request once it is satisfied, so a clean drain converges and stops re-fetching.
@@ -2235,7 +2235,7 @@ impl WalletActor {
         };
         let mined_height = raw.mined_height.map(BlockHeight::from_u32);
         // An unmined tx is assumed created under the current tip's consensus branch (matches
-        // zcash-devtool/zkv's enhance and `store_mempool_tx`).
+        // reference enhancement flow and `store_mempool_tx`).
         let tx = Transaction::read(
             &raw.data[..],
             BranchId::for_height(&self.network, mined_height.unwrap_or(chain_tip)),
@@ -4519,7 +4519,7 @@ impl WalletActor {
 
     /// Fetch a full transaction from lightwalletd by txid (the chain's view, never the local
     /// copy - used both by `do_get_raw_tx` and by transaction-data-request servicing). The
-    /// `TxFilter` hash is the txid's internal bytes (per zcash-devtool's enhance).
+    /// `TxFilter` hash is the txid's internal bytes.
     async fn fetch_tx_from_upstream(&mut self, txid: TxId) -> Result<Option<RawTx>, RpcError> {
         if self.client.is_none() {
             self.connect().await.map_err(|e| {
@@ -4957,12 +4957,21 @@ fn prove_sign_pczt(
         prover
     };
     // Ironwood (V6) proof step. A post-NU6.3 transaction carries a separate Ironwood bundle needing
-    // its own proof (mirrors devtool's `pczt/prove.rs`). The Ironwood bundle uses the
+    // its own proof. The Ironwood bundle uses the
     // **`PostNu6_3`** circuit (orchard `bundle.rs`), so it must be proved with the `PostNu6_3` key -
     // `Bundle::create_proof` rejects a `FixedPostNu6_2` key here. That key is
     // `ProvingKeyCache::ironwood_pk`, built at startup whenever the network can activate NU6.3 (so
     // it is always present when `requires_ironwood_proof()` is true; its absence would mean NU6.3
     // fired without the cache expecting it, which is a bug worth surfacing).
+    //
+    // DEAD CODE TODAY (kept intentionally): `do_send` routes every post-NU6.3 send to the fused
+    // `create_proposed_transactions` path (see `ironwood_forces_fused` in `cached_pczt_path`) and
+    // never reaches this PCZT prover for such a tx. So `requires_ironwood_proof()` is always false
+    // here (the branch is dead but compiled). This step is the ready other half: upstream's
+    // published RC now builds Ironwood PCZTs (librustzcash#2543), so dropping the
+    // `ironwood_forces_fused` gate - once the cached path is validated on an NU6.3-active chain -
+    // routes Ironwood sends back through here, reusing the cached key instead of the fused path's
+    // per-send `ProvingKey::build()`.
     let prover = if prover.requires_ironwood_proof() {
         let ironwood_pk = keys.ironwood_pk.as_ref().ok_or_else(|| {
             RpcError::wallet(

@@ -1,5 +1,5 @@
 //! Opening and initializing the per-wallet `zcash_client_sqlite` databases.
-//! Ported from `zcash-devtool/src/data.rs`.
+//! Wallet data access.
 
 use std::path::{Path, PathBuf};
 
@@ -19,7 +19,7 @@ const BLOCKS_FOLDER: &str = "blocks";
 
 /// A read/write wallet handle (uses a real clock + OS RNG, required for writes).
 pub type WriteDb = WalletDb<rusqlite::Connection, ZNetwork, SystemClock, OsRng>;
-/// A read-only wallet handle (no clock/RNG needed), as used by devtool's read paths.
+/// A read-only wallet handle (no clock/RNG needed).
 pub type ReadDb = WalletDb<rusqlite::Connection, ZNetwork, (), ()>;
 
 pub fn data_db_path(wallet_dir: &Path) -> PathBuf {

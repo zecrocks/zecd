@@ -1,5 +1,5 @@
 //! `zecd init`: create a new wallet (age identity + mnemonic + account), ported from
-//! `zcash-devtool/src/commands/wallet/init.rs`.
+//! a reference wallet's initialization flow.
 
 use std::path::Path;
 use std::time::Duration;

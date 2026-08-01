@@ -26,7 +26,7 @@ pub struct BalanceInfo {
     pub orchard_spendable: u64,
     pub sapling_spendable: u64,
     /// Ironwood (NU6.3, Orchard V3) spendable value. Read from `AccountBalance::ironwood_balance()`,
-    /// which the pinned scan-model librustzcash rev surfaces (the same API devtool reads). 0 until
+    /// which the pinned scan-model librustzcash revision surfaces. 0 until
     /// NU6.3 activates and the wallet holds ironwood notes - so 0 on mainnet, and on testnet until
     /// NU6.3 activates at height 4_134_000.
     pub ironwood_spendable: u64,
@@ -57,7 +57,7 @@ pub struct BalanceInfo {
 /// `get_spendable_transparent_outputs`. Shielded coinbase (ZIP-213) has no maturity rule.
 pub const COINBASE_MATURITY: u32 = 100;
 
-/// Aggregate balances via `get_wallet_summary` (mirrors devtool's `balance.rs`), under the
+/// Aggregate balances via `get_wallet_summary` under the
 /// given confirmations policy. Callers pass the wallet's configured policy
 /// (`handle.confirmations`; ZIP-315 trusted-3/untrusted-10 by default) - never
 /// `ConfirmationsPolicy::default()` directly - so balances agree with what a send can spend;
@@ -107,8 +107,8 @@ pub fn balance(
                     .change_pending_confirmation()
                     .into_u64();
             // Ironwood (Orchard V3) balance. The pinned librustzcash ironwood line (the
-            // `dw/ironwood-scan-model` rev zcash-devtool builds against) rolls received ironwood
-            // notes into `AccountBalance::ironwood_balance()`, exactly as devtool's `balance.rs`
+            // `dw/ironwood-scan-model` revision) rolls received ironwood notes into
+            // `AccountBalance::ironwood_balance()`
             // reads it; sum it into the spendable/pending/immature buckets like the other pools.
             // (0 pre-NU6.3, so a no-op on mainnet / pre-activation testnet.)
             info.ironwood_spendable += bal.ironwood_balance().spendable_value().into_u64();

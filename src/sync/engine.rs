@@ -1,4 +1,4 @@
-//! The block-sync loop, ported from `zcash-devtool/src/commands/wallet/sync.rs` and
+//! The block-sync loop, derived from the reference wallet sync flow and
 //! refactored to (a) process one batch per call so the owning actor can interleave RPC
 //! commands between batches, and (b) run against any [`ChainSource`] backend (lightwalletd
 //! gRPC or direct zebrad JSON-RPC) rather than the lightwalletd client concretely. TUI and

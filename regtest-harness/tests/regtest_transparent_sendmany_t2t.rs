@@ -13,7 +13,7 @@
 //! `AllowRevealedRecipients` policy returns `-6` for a transparent-only wallet - is covered by
 //! `regtest_transparent.rs`; here we assert the config-driven positive.)
 //!
-//! Flow mirrors `regtest_transparent_t2t.rs`: bring up the funder (mine + mature + shield), fund
+//! Flow mirrors `regtest_transparent_t2t.rs`: bring up the funder (mine shielded coinbase + mature), fund
 //! zecd's t-address, then pay **two** transparent recipients in one `sendmany` for less than the
 //! wallet holds (forcing change). The two outputs from one transparent input also exercise
 //! `select_transparent_inputs` spanning multiple recipient outputs and the multi-output ZIP-317 fee.
@@ -21,67 +21,61 @@
 //! shielded note), the change is hidden as change in history (two sends - the two recipients - no
 //! phantom self-payment), and a second `sendmany` re-spends that change.
 //!
-//! Skips cleanly unless `ZEBRAD_BIN`, `LIGHTWALLETD_BIN` and `DEVTOOL_BIN` are all set.
+//! Skips cleanly unless `ZEBRAD_BIN` and `ZALLET_BIN` are set.
 
 use std::time::{Duration, Instant};
 
 use serde_json::json;
 use zecd_regtest_harness::{
-    pick_port, resolve_bin, resolve_node_bin, Funder, Lightwalletd, RegtestNode, Zebrad, Zecd,
-    ZecdConfig,
+    pick_port, resolve_bin, resolve_node_bin, start_funder, DEFAULT_MINER_ADDRESS, FOREIGN_TADDR,
+    regtest_nuparams, Zebrad, Zecd, ZecdConfig,
 };
 
 const FUNDER_COINBASES: u32 = 120;
 const MATURITY_TAIL: u32 = 130;
-const TAIL_MINER_ADDRESS: &str = "t27eWDgjFYJGVXmzrXeVjnb5J3uXDM9xH9v";
 const FUND_ZATOSHIS: u64 = 100_000_000; // 1 ZEC
 const FUND_TIMEOUT: Duration = Duration::from_secs(240);
 const SPEND_TIMEOUT: Duration = Duration::from_secs(240);
 
 #[tokio::test]
 async fn regtest_fully_transparent_sendmany_keeps_change_transparent() {
-    let (Some(zebrad_bin), Some(lwd_bin), Some(devtool_bin)) = (
+    let (Some(zebrad_bin), Some(zallet_bin)) = (
         resolve_node_bin(),
-        resolve_bin("LIGHTWALLETD_BIN"),
-        resolve_bin("DEVTOOL_BIN"),
+        resolve_bin("ZALLET_BIN"),
     ) else {
         eprintln!(
-            "SKIP regtest_fully_transparent_sendmany_keeps_change_transparent: set {}, \
-             LIGHTWALLETD_BIN and DEVTOOL_BIN to run the fully-transparent sendmany e2e (see \
-             README.md). The harness still compiled.",
-            RegtestNode::from_env().bin_env()
+            "SKIP regtest_fully_transparent_sendmany_keeps_change_transparent: set the node binary env var (ZEBRAD_BIN or ZAKURAD_BIN) and \
+             ZALLET_BIN to run the fully-transparent sendmany e2e (see README.md). The harness \
+             still compiled."
         );
         return;
     };
 
-    // 1-4. Identical funder bring-up to regtest_transparent_t2t: mine + mature + shield the funder.
-    let funder_taddr = Funder::derive_transparent_address(&devtool_bin)
-        .expect("derive funder transparent address");
-    let mut zebrad = Zebrad::start_with_miner(&zebrad_bin, &funder_taddr)
-        .await
-        .expect("start zebrad mining to the funder");
+    // 1-3. Funder bring-up: start zebrad, start zallet, mine shielded coinbase to the funder's UA.
+    let zebrad = Zebrad::start(&zebrad_bin).await.expect("start zebrad");
+    zebrad.bootstrap_zallet().await.expect("bootstrap Zallet sync");
+    let funder = start_funder(
+        &zallet_bin,
+        zebrad.rpc_port,
+        pick_port().expect("pick zallet rpc port"),
+        &regtest_nuparams(false),
+    )
+    .await
+    .expect("start zallet funder");
     zebrad
-        .generate_blocks(FUNDER_COINBASES)
+        .generatetoaddress(FUNDER_COINBASES, &funder.ua)
         .await
-        .expect("mine the funder's coinbases");
+        .expect("mine shielded coinbase to funder");
     zebrad
-        .restart_with_miner(TAIL_MINER_ADDRESS)
+        .generatetoaddress(MATURITY_TAIL, DEFAULT_MINER_ADDRESS)
         .await
-        .expect("restart zebrad mining to the throwaway address");
-    zebrad
-        .generate_blocks(MATURITY_TAIL)
-        .await
-        .expect("mine the maturity tail");
-    let lwd = Lightwalletd::start(&lwd_bin, zebrad.rpc_port)
-        .await
-        .expect("start lightwalletd");
-    let funder = Funder::init(&devtool_bin, lwd.grpc_port).expect("initialise funding wallet");
-    funder.sync(lwd.grpc_port).expect("funder sync (coinbase)");
+        .expect("mine maturity tail");
     funder
-        .shield(lwd.grpc_port)
-        .expect("shield transparent coinbase");
-    zebrad.generate_blocks(6).await.expect("confirm shield");
-    funder.sync(lwd.grpc_port).expect("funder sync (shielded)");
+        .rpc
+        .wait_for_account_balance(&funder.account_uuid, FUND_ZATOSHIS, Duration::from_secs(120))
+        .await
+        .expect("wait for funder to see shielded coinbase");
+    let funder_taddr = FOREIGN_TADDR.to_string();
 
     // 5. zecd with transparent receiving AND the fully-transparent spend policy. `sendmany` has no
     //    per-call privacyPolicy argument, so this config knob is its ONLY route to a t→t spend.
@@ -127,8 +121,9 @@ async fn regtest_fully_transparent_sendmany_keeps_change_transparent() {
     tokio::time::sleep(Duration::from_secs(3)).await;
 
     // 7. Fund zecd's transparent address and confirm it (transparent receives are found once mined).
-    funder
-        .send(lwd.grpc_port, &taddr, FUND_ZATOSHIS)
+    funder.rpc
+        .z_sendmany_and_wait(&funder.ua, &taddr, FUND_ZATOSHIS, None)
+        .await
         .expect("send to zecd's transparent address");
     zebrad
         .generate_blocks(12)
@@ -163,7 +158,7 @@ async fn regtest_fully_transparent_sendmany_keeps_change_transparent() {
     //    config. The received UTXO is third-party (untrusted), so it becomes spendable only at the
     //    confirmations-policy depth; mine toward it and retry on -6 (a failed attempt builds and
     //    broadcasts nothing, so retrying is safe).
-    let second_taddr = TAIL_MINER_ADDRESS; // a valid regtest transparent address (t2… P2SH)
+    let second_taddr = DEFAULT_MINER_ADDRESS; // a valid regtest transparent address (t2… P2SH)
     let deadline = Instant::now() + SPEND_TIMEOUT;
     let txid = loop {
         let tip = zebrad
@@ -354,7 +349,6 @@ async fn regtest_fully_transparent_sendmany_keeps_change_transparent() {
         tokio::time::sleep(Duration::from_millis(500)).await;
     }
 
-    lwd.stop();
     drop(zecd);
     // `zebrad` and `funder` clean up on drop.
 }

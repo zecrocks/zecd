@@ -15,17 +15,15 @@
 //!     receive side after a restart. Coverage, **not** a fix-guard - it is green with and without the
 //!     dropped self-send memo cherry-pick (see the test's own doc for the verified why).
 //!
-//! Requires the full ironwood toolchain - the official ironwood zebra release (`zfnd/zebra:6.0.0`),
-//! a V6-parsing lightwalletd, an ironwood/regtest-aware `zcash-devtool` funder (its regtest `init`
-//! is given `--activation-heights` via [`Funder::init_ironwood`]), and a plain-release `zecd`
+//! Requires the full ironwood toolchain: the official ironwood zebra release, Zallet with its
+//! Zaino backend configured for regtest NU6.3, and a plain-release `zecd`
 //! (ironwood is compiled unconditionally now - no cargo feature) with `ZECD_REGTEST_NU63_HEIGHT=8`
 //! in its environment so NU6.3 activates at height 8 on the regtest chain (matching zebra).
 //! Gated behind `ZECD_REGTEST_IRONWOOD=1` (its own CI tier) so it never runs against the stock-zebra
-//! funded tier - there `Zebrad::start_with_miner_ironwood`'s `"NU6.3"` activation-height key would
-//! be rejected at startup.
+//! funded tier.
 //!
-//! Flow (no `migrate` needed): mine a transparent coinbase to the funder on an NU6.3-active chain,
-//! mature it, `shield` into Orchard, then `wallet send` to zecd's unified address. Post-NU6.3 the
+//! Flow (no `migrate` needed): mine shielded coinbase to the funder on an NU6.3-active chain,
+//! mature it, then send to zecd's unified address. Post-NU6.3 the
 //! proposal builder auto-routes the Orchard payment to an **ironwood** output (the
 //! `orchard_outputs_to_ironwood` path), so zecd scans an ironwood (V3) note at its Orchard receiver.
 //!
@@ -38,7 +36,8 @@ use std::time::{Duration, Instant};
 
 use serde_json::json;
 use zecd_regtest_harness::{
-    pick_port, resolve_bin, Funder, Lightwalletd, Zebrad, Zecd, ZecdConfig,
+    pick_port, resolve_bin, start_funder, DEFAULT_MINER_ADDRESS, FOREIGN_TADDR,
+    regtest_nuparams, Zebrad, Zecd, ZecdConfig,
 };
 
 /// Coinbase blocks mined to the funder up front (see `regtest_funded.rs` for the finalization
@@ -48,10 +47,9 @@ const FUNDER_COINBASES: u32 = 120;
 /// past the 100-block maturity.
 const MATURITY_TAIL: u32 = 130;
 /// A throwaway P2SH address that mines the maturity tail (the funder does not control it).
-const TAIL_MINER_ADDRESS: &str = "t27eWDgjFYJGVXmzrXeVjnb5J3uXDM9xH9v";
 /// 1 ZEC, in zatoshis.
 const FUND_ZATOSHIS: u64 = 100_000_000;
-/// Generous: lightwalletd ingestion + zecd scan + Orchard/ironwood proving.
+/// Generous: zallet sync + zecd scan + Orchard/ironwood proving.
 const FUND_TIMEOUT: Duration = Duration::from_secs(240);
 
 #[tokio::test]
@@ -59,59 +57,49 @@ async fn regtest_ironwood_receive_and_orchard_send() {
     if std::env::var("ZECD_REGTEST_IRONWOOD").is_err() {
         eprintln!(
             "SKIP regtest_ironwood_receive_and_orchard_send: set ZECD_REGTEST_IRONWOOD=1 (plus the \
-             ironwood ZEBRAD_BIN/LIGHTWALLETD_BIN/DEVTOOL_BIN and an ironwood-built ZECD_BIN) to run \
+             ironwood ZEBRAD_BIN/ZALLET_BIN and an ironwood-built ZECD_BIN) to run \
              the NU6.3 e2e. The harness still compiled and linked."
         );
         return;
     }
-    let (Some(zebrad_bin), Some(lwd_bin), Some(devtool_bin)) = (
+    let (Some(zebrad_bin), Some(zallet_bin)) = (
         resolve_bin("ZEBRAD_BIN"),
-        resolve_bin("LIGHTWALLETD_BIN"),
-        resolve_bin("DEVTOOL_BIN"),
+        resolve_bin("ZALLET_BIN"),
     ) else {
         panic!(
-            "ZECD_REGTEST_IRONWOOD=1 but ZEBRAD_BIN/LIGHTWALLETD_BIN/DEVTOOL_BIN are not all set"
+            "ZECD_REGTEST_IRONWOOD=1 but ZEBRAD_BIN/ZALLET_BIN are not all set"
         );
     };
 
-    // 1. Learn the funder's transparent address offline, so zebra mines straight to it (one chain).
-    let funder_taddr =
-        Funder::derive_transparent_address(&devtool_bin).expect("derive funder transparent addr");
-
-    // 2. Start an NU6.3-active regtest zebra (zakura), mine the funder's coinbases, then restart
-    //    mining to a throwaway address and grow a maturity tail. NU6.3 is active from height 8, so
-    //    every spend below lands on a V6/ironwood-capable chain.
-    let mut zebrad = Zebrad::start_with_miner_ironwood(&zebrad_bin, &funder_taddr)
+    // 1. Start an NU6.3-active regtest zebra (throwaway miner) and the zallet funder. Zebra 6.x's
+    //    `generatetoaddress` mines shielded coinbase (Ironwood post-NU6.3) directly to the funder's
+    //    UA — no transparent coinbase, no shield step, no lightwalletd.
+    let zebrad = Zebrad::start_ironwood(&zebrad_bin)
         .await
-        .expect("start ironwood zebrad mining to the funder");
+        .expect("start ironwood zebrad");
+    zebrad.bootstrap_zallet().await.expect("bootstrap Zallet sync");
+    let funder = start_funder(
+        &zallet_bin,
+        zebrad.rpc_port,
+        pick_port().expect("pick zallet rpc port"),
+        &regtest_nuparams(true),
+    )
+    .await
+    .expect("start zallet funder");
     zebrad
-        .generate_blocks(FUNDER_COINBASES)
+        .generatetoaddress(FUNDER_COINBASES, &funder.ua)
         .await
-        .expect("mine the funder's coinbases");
+        .expect("mine shielded coinbase to funder");
     zebrad
-        .restart_with_miner(TAIL_MINER_ADDRESS)
+        .generatetoaddress(MATURITY_TAIL, DEFAULT_MINER_ADDRESS)
         .await
-        .expect("restart zebrad mining to the throwaway address");
-    zebrad
-        .generate_blocks(MATURITY_TAIL)
-        .await
-        .expect("mine the maturity tail");
-
-    // 3. lightwalletd (V6-aware) in front of zebra, for the funder.
-    let lwd = Lightwalletd::start(&lwd_bin, zebrad.rpc_port)
-        .await
-        .expect("start lightwalletd");
-
-    // 4. Funder shields its matured transparent coinbase into Orchard. The ironwood devtool requires
-    //    `init` to carry the regtest `--activation-heights` (matching this chain's NU6.3 height).
-    let funder =
-        Funder::init_ironwood(&devtool_bin, lwd.grpc_port).expect("initialise funding wallet");
-    funder.sync(lwd.grpc_port).expect("funder sync (coinbase)");
+        .expect("mine maturity tail");
     funder
-        .shield(lwd.grpc_port)
-        .expect("shield transparent coinbase into Orchard");
-    zebrad.generate_blocks(6).await.expect("confirm shield");
-    funder.sync(lwd.grpc_port).expect("funder sync (shielded)");
+        .rpc
+        .wait_for_account_balance(&funder.account_uuid, FUND_ZATOSHIS, Duration::from_secs(120))
+        .await
+        .expect("wait for funder to see shielded coinbase");
+    let _funder_taddr = FOREIGN_TADDR.to_string();
 
     // 5. zecd (ironwood compiled unconditionally) against zebra; get its unified address.
     let cfg = ZecdConfig::new(zebrad.rpc_port, pick_port().expect("pick zecd rpc port"));
@@ -163,8 +151,9 @@ async fn regtest_ironwood_receive_and_orchard_send() {
     // 7. Fund zecd. Post-NU6.3 the funder's `wallet send` auto-routes the Orchard payment to an
     //    ironwood output (no `migrate` needed), so zecd should receive an ironwood note at its
     //    Orchard receiver.
-    funder
-        .send(lwd.grpc_port, &zecd_ua, FUND_ZATOSHIS)
+    funder.rpc
+        .z_sendmany_and_wait(&funder.ua, &zecd_ua, FUND_ZATOSHIS, None)
+        .await
         .expect("send funds to zecd (auto-routed to ironwood post-NU6.3)");
     zebrad
         .generate_blocks(6)
@@ -424,50 +413,47 @@ async fn regtest_ironwood_sapling_send() {
     if std::env::var("ZECD_REGTEST_IRONWOOD").is_err() {
         eprintln!(
             "SKIP regtest_ironwood_sapling_send: set ZECD_REGTEST_IRONWOOD=1 (plus the ironwood \
-             ZEBRAD_BIN/LIGHTWALLETD_BIN/DEVTOOL_BIN and an ironwood-built ZECD_BIN) to run the \
+             ZEBRAD_BIN/ZALLET_BIN and an ironwood-built ZECD_BIN) to run the \
              NU6.3 e2e. The harness still compiled and linked."
         );
         return;
     }
-    let (Some(zebrad_bin), Some(lwd_bin), Some(devtool_bin)) = (
+    let (Some(zebrad_bin), Some(zallet_bin)) = (
         resolve_bin("ZEBRAD_BIN"),
-        resolve_bin("LIGHTWALLETD_BIN"),
-        resolve_bin("DEVTOOL_BIN"),
+        resolve_bin("ZALLET_BIN"),
     ) else {
         panic!(
-            "ZECD_REGTEST_IRONWOOD=1 but ZEBRAD_BIN/LIGHTWALLETD_BIN/DEVTOOL_BIN are not all set"
+            "ZECD_REGTEST_IRONWOOD=1 but ZEBRAD_BIN/ZALLET_BIN are not all set"
         );
     };
 
-    // Same NU6.3-active regtest bring-up + funder shield as the receive test.
-    let funder_taddr =
-        Funder::derive_transparent_address(&devtool_bin).expect("derive funder transparent addr");
-    let mut zebrad = Zebrad::start_with_miner_ironwood(&zebrad_bin, &funder_taddr)
+    // Same NU6.3-active regtest bring-up + zallet funder as the receive test.
+    let zebrad = Zebrad::start_ironwood(&zebrad_bin)
         .await
-        .expect("start ironwood zebrad mining to the funder");
+        .expect("start ironwood zebrad");
+    zebrad.bootstrap_zallet().await.expect("bootstrap Zallet sync");
+    let funder = start_funder(
+        &zallet_bin,
+        zebrad.rpc_port,
+        pick_port().expect("pick zallet rpc port"),
+        &regtest_nuparams(true),
+    )
+    .await
+    .expect("start zallet funder");
     zebrad
-        .generate_blocks(FUNDER_COINBASES)
+        .generatetoaddress(FUNDER_COINBASES, &funder.ua)
         .await
-        .expect("mine the funder's coinbases");
+        .expect("mine shielded coinbase to funder");
     zebrad
-        .restart_with_miner(TAIL_MINER_ADDRESS)
+        .generatetoaddress(MATURITY_TAIL, DEFAULT_MINER_ADDRESS)
         .await
-        .expect("restart zebrad mining to the throwaway address");
-    zebrad
-        .generate_blocks(MATURITY_TAIL)
-        .await
-        .expect("mine the maturity tail");
-    let lwd = Lightwalletd::start(&lwd_bin, zebrad.rpc_port)
-        .await
-        .expect("start lightwalletd");
-    let funder =
-        Funder::init_ironwood(&devtool_bin, lwd.grpc_port).expect("initialise funding wallet");
-    funder.sync(lwd.grpc_port).expect("funder sync (coinbase)");
+        .expect("mine maturity tail");
     funder
-        .shield(lwd.grpc_port)
-        .expect("shield transparent coinbase");
-    zebrad.generate_blocks(6).await.expect("confirm shield");
-    funder.sync(lwd.grpc_port).expect("funder sync (shielded)");
+        .rpc
+        .wait_for_account_balance(&funder.account_uuid, FUND_ZATOSHIS, Duration::from_secs(120))
+        .await
+        .expect("wait for funder to see shielded coinbase");
+    let _funder_taddr = FOREIGN_TADDR.to_string();
 
     // zecd with BOTH shielded pools enabled, so it can hand out a Sapling receiver and route Orchard
     // outputs (which become ironwood past NU6.3).
@@ -511,8 +497,9 @@ async fn regtest_ironwood_sapling_send() {
 
     // Fund zecd's Sapling receiver. The funder spends its (ironwood) notes to a Sapling recipient -
     // a cross-pool payment that lands as a plain Sapling note in zecd.
-    funder
-        .send(lwd.grpc_port, &sapling_ua, FUND_ZATOSHIS)
+    funder.rpc
+        .z_sendmany_and_wait(&funder.ua, &sapling_ua, FUND_ZATOSHIS, None)
+        .await
         .expect("fund zecd's Sapling receiver");
     zebrad
         .generate_blocks(6)
@@ -645,54 +632,50 @@ async fn regtest_ironwood_receive_memo() {
     if std::env::var("ZECD_REGTEST_IRONWOOD").is_err() {
         eprintln!(
             "SKIP regtest_ironwood_receive_memo: set ZECD_REGTEST_IRONWOOD=1 (plus the ironwood \
-             ZEBRAD_BIN/LIGHTWALLETD_BIN/DEVTOOL_BIN and an ironwood-built ZECD_BIN) to run the \
+             ZEBRAD_BIN/ZALLET_BIN and an ironwood-built ZECD_BIN) to run the \
              NU6.3 e2e. The harness still compiled and linked."
         );
         return;
     }
-    let (Some(zebrad_bin), Some(lwd_bin), Some(devtool_bin)) = (
+    let (Some(zebrad_bin), Some(zallet_bin)) = (
         resolve_bin("ZEBRAD_BIN"),
-        resolve_bin("LIGHTWALLETD_BIN"),
-        resolve_bin("DEVTOOL_BIN"),
+        resolve_bin("ZALLET_BIN"),
     ) else {
         panic!(
-            "ZECD_REGTEST_IRONWOOD=1 but ZEBRAD_BIN/LIGHTWALLETD_BIN/DEVTOOL_BIN are not all set"
+            "ZECD_REGTEST_IRONWOOD=1 but ZEBRAD_BIN/ZALLET_BIN are not all set"
         );
     };
 
     /// The ZIP-302 text memo the funder attaches; zecd must surface it on the ironwood receive.
     const RECEIVE_MEMO: &str = "ironwood memo e2e";
 
-    // 1-4. Bring up an NU6.3 chain, mine + mature the funder's coinbases, and shield into Orchard
-    //      (identical to the other ironwood tests - see their comments).
-    let funder_taddr =
-        Funder::derive_transparent_address(&devtool_bin).expect("derive funder transparent addr");
-    let mut zebrad = Zebrad::start_with_miner_ironwood(&zebrad_bin, &funder_taddr)
+    // 1-3. Bring up an NU6.3 chain, start the zallet funder, mine shielded coinbase to it.
+    let zebrad = Zebrad::start_ironwood(&zebrad_bin)
         .await
-        .expect("start ironwood zebrad mining to the funder");
+        .expect("start ironwood zebrad");
+    zebrad.bootstrap_zallet().await.expect("bootstrap Zallet sync");
+    let funder = start_funder(
+        &zallet_bin,
+        zebrad.rpc_port,
+        pick_port().expect("pick zallet rpc port"),
+        &regtest_nuparams(true),
+    )
+    .await
+    .expect("start zallet funder");
     zebrad
-        .generate_blocks(FUNDER_COINBASES)
+        .generatetoaddress(FUNDER_COINBASES, &funder.ua)
         .await
-        .expect("mine the funder's coinbases");
+        .expect("mine shielded coinbase to funder");
     zebrad
-        .restart_with_miner(TAIL_MINER_ADDRESS)
+        .generatetoaddress(MATURITY_TAIL, DEFAULT_MINER_ADDRESS)
         .await
-        .expect("restart zebrad mining to the throwaway address");
-    zebrad
-        .generate_blocks(MATURITY_TAIL)
-        .await
-        .expect("mine the maturity tail");
-    let lwd = Lightwalletd::start(&lwd_bin, zebrad.rpc_port)
-        .await
-        .expect("start lightwalletd");
-    let funder =
-        Funder::init_ironwood(&devtool_bin, lwd.grpc_port).expect("initialise funding wallet");
-    funder.sync(lwd.grpc_port).expect("funder sync (coinbase)");
+        .expect("mine maturity tail");
     funder
-        .shield(lwd.grpc_port)
-        .expect("shield transparent coinbase into Orchard");
-    zebrad.generate_blocks(6).await.expect("confirm shield");
-    funder.sync(lwd.grpc_port).expect("funder sync (shielded)");
+        .rpc
+        .wait_for_account_balance(&funder.account_uuid, FUND_ZATOSHIS, Duration::from_secs(120))
+        .await
+        .expect("wait for funder to see shielded coinbase");
+    let _funder_taddr = FOREIGN_TADDR.to_string();
 
     // 5-6. Start zecd (ironwood compiled unconditionally) and wait until it is caught up.
     let cfg = ZecdConfig::new(zebrad.rpc_port, pick_port().expect("pick zecd rpc port"));
@@ -741,8 +724,9 @@ async fn regtest_ironwood_receive_memo() {
 
     // 7. Fund zecd WITH A MEMO. Post-NU6.3 the funder's `wallet send` auto-routes the Orchard
     //    payment into an ironwood output, so zecd receives an ironwood note carrying the memo.
-    funder
-        .send_with_memo(lwd.grpc_port, &zecd_ua, FUND_ZATOSHIS, Some(RECEIVE_MEMO))
+    funder.rpc
+        .z_sendmany_and_wait(&funder.ua, &zecd_ua, FUND_ZATOSHIS, Some(RECEIVE_MEMO))
+        .await
         .expect("send funds (with a memo) to zecd (auto-routed to ironwood post-NU6.3)");
     zebrad
         .generate_blocks(6)
@@ -867,18 +851,17 @@ async fn regtest_ironwood_self_send_memo_via_block_scan() {
     if std::env::var("ZECD_REGTEST_IRONWOOD").is_err() {
         eprintln!(
             "SKIP regtest_ironwood_self_send_memo_via_block_scan: set ZECD_REGTEST_IRONWOOD=1 (plus \
-             the ironwood ZEBRAD_BIN/LIGHTWALLETD_BIN/DEVTOOL_BIN and an ironwood-built ZECD_BIN) to \
-             run the NU6.3 e2e. The harness still compiled and linked."
+             the ironwood ZEBRAD_BIN/ZALLET_BIN and an ironwood-built ZECD_BIN) to run \
+             the NU6.3 e2e. The harness still compiled and linked."
         );
         return;
     }
-    let (Some(zebrad_bin), Some(lwd_bin), Some(devtool_bin)) = (
+    let (Some(zebrad_bin), Some(zallet_bin)) = (
         resolve_bin("ZEBRAD_BIN"),
-        resolve_bin("LIGHTWALLETD_BIN"),
-        resolve_bin("DEVTOOL_BIN"),
+        resolve_bin("ZALLET_BIN"),
     ) else {
         panic!(
-            "ZECD_REGTEST_IRONWOOD=1 but ZEBRAD_BIN/LIGHTWALLETD_BIN/DEVTOOL_BIN are not all set"
+            "ZECD_REGTEST_IRONWOOD=1 but ZEBRAD_BIN/ZALLET_BIN are not all set"
         );
     };
 
@@ -890,36 +873,32 @@ async fn regtest_ironwood_self_send_memo_via_block_scan() {
     /// The self-send value (ZEC). Comfortably below the funded 1 ZEC note minus the ZIP-317 fee.
     const SELF_SEND_ZEC: f64 = 0.3;
 
-    // 1-4. Bring up an NU6.3 chain and shield the funder into Orchard (identical to the other
-    //      ironwood tests - see their comments).
-    let funder_taddr =
-        Funder::derive_transparent_address(&devtool_bin).expect("derive funder transparent addr");
-    let mut zebrad = Zebrad::start_with_miner_ironwood(&zebrad_bin, &funder_taddr)
+    // 1. Bring up an NU6.3 chain and the zallet funder (identical to the other ironwood tests).
+    let zebrad = Zebrad::start_ironwood(&zebrad_bin)
         .await
-        .expect("start ironwood zebrad mining to the funder");
+        .expect("start ironwood zebrad");
+    zebrad.bootstrap_zallet().await.expect("bootstrap Zallet sync");
+    let funder = start_funder(
+        &zallet_bin,
+        zebrad.rpc_port,
+        pick_port().expect("pick zallet rpc port"),
+        &regtest_nuparams(true),
+    )
+    .await
+    .expect("start zallet funder");
     zebrad
-        .generate_blocks(FUNDER_COINBASES)
+        .generatetoaddress(FUNDER_COINBASES, &funder.ua)
         .await
-        .expect("mine the funder's coinbases");
+        .expect("mine shielded coinbase to funder");
     zebrad
-        .restart_with_miner(TAIL_MINER_ADDRESS)
+        .generatetoaddress(MATURITY_TAIL, DEFAULT_MINER_ADDRESS)
         .await
-        .expect("restart zebrad mining to the throwaway address");
-    zebrad
-        .generate_blocks(MATURITY_TAIL)
-        .await
-        .expect("mine the maturity tail");
-    let lwd = Lightwalletd::start(&lwd_bin, zebrad.rpc_port)
-        .await
-        .expect("start lightwalletd");
-    let funder =
-        Funder::init_ironwood(&devtool_bin, lwd.grpc_port).expect("initialise funding wallet");
-    funder.sync(lwd.grpc_port).expect("funder sync (coinbase)");
+        .expect("mine maturity tail");
     funder
-        .shield(lwd.grpc_port)
-        .expect("shield transparent coinbase into Orchard");
-    zebrad.generate_blocks(6).await.expect("confirm shield");
-    funder.sync(lwd.grpc_port).expect("funder sync (shielded)");
+        .rpc
+        .wait_for_account_balance(&funder.account_uuid, FUND_ZATOSHIS, Duration::from_secs(120))
+        .await
+        .expect("wait for funder to see shielded coinbase");
 
     // 5. Start zecd and wait until it reports a ready upstream.
     let cfg = ZecdConfig::new(zebrad.rpc_port, pick_port().expect("pick zecd rpc port"));
@@ -956,7 +935,9 @@ async fn regtest_ironwood_self_send_memo_via_block_scan() {
     // 6. Fund zecd with an ironwood note and mine until it is *spendable* (a received/untrusted note
     //    needs `untrusted_confirmations` - ZIP-315: 10 - before `getbalance` counts it).
     funder
-        .send(lwd.grpc_port, &zecd_ua, FUND_ZATOSHIS)
+        .rpc
+        .z_sendmany_and_wait(&funder.ua, &zecd_ua, FUND_ZATOSHIS, None)
+        .await
         .expect("fund zecd (auto-routed to ironwood post-NU6.3)");
     zebrad
         .generate_blocks(6)

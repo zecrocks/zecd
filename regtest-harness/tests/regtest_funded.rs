@@ -1,17 +1,9 @@
 //! Funded regtest end-to-end: get real Orchard funds into `zecd` and verify it sees them.
 //!
-//! Regtest can't mine a coinbase directly into an Orchard note that `zecd` (Orchard-only receive)
-//! would scan, so we fund it the way the protocol allows: mine a **transparent** coinbase to a
-//! funding wallet (`zcash-devtool`), let it mature (100 blocks), **shield** it into Orchard, then
-//! **send** Orchard funds to `zecd`'s unified address.
+//! Zebra mines shielded coinbase directly to the Zallet funder's unified address. After the
+//! coinbase matures, the funder sends Orchard funds to `zecd`'s unified address.
 //!
-//! Everything runs on a **single chain**: we derive the funder's transparent address *offline*
-//! (`devtool wallet derive-address`) and mine straight to it, so the funder's wallet birthday
-//! anchor is taken from the same chain it spends on (a throwaway "discover the address" chain would
-//! hand the wallet a wrong note-commitment anchor and the shield/send proofs would be invalid).
-//!
-//! Skips cleanly unless `ZEBRAD_BIN`, `LIGHTWALLETD_BIN` and `DEVTOOL_BIN` are all set (see
-//! README.md).
+//! Skips cleanly unless `ZEBRAD_BIN` and `ZALLET_BIN` are set (see README.md).
 //!
 //! Phase 1: funded receive (funder → zecd) - first observed at **0 conf via the mempool
 //! stream** (`getunconfirmedbalance`/`listtransactions`/`listunspent minconf=0`), then
@@ -39,31 +31,27 @@ use std::time::{Duration, Instant};
 
 use serde_json::json;
 use zecd_regtest_harness::{
-    pick_port, resolve_bin, resolve_node_bin, Funder, Lightwalletd, RegtestNode, Zebrad, Zecd,
-    ZecdConfig,
+    pick_port, resolve_bin, resolve_node_bin, start_funder, DEFAULT_MINER_ADDRESS, FOREIGN_TADDR,
+    regtest_nuparams, Zebrad, Zecd, ZecdConfig,
 };
 
-/// Coinbase blocks mined to the funder up front. zebra finalizes blocks deeper than
-/// `MAX_BLOCK_REORG_HEIGHT` (= coinbase maturity − 1 = 99) below the tip; only finalized blocks are
-/// persisted to disk and survive the miner-swap restart below. So mining 120 finalizes the
-/// funder's coinbases at heights ~1..21 (the rest are non-finalized and dropped on restart). This
-/// matters because the light-client coinbase-maturity filter can't recognise coinbase-ness for
-/// outputs discovered via lightwalletd's GetAddressUtxos (no tx_index), so the funder must simply
-/// never hold an immature coinbase - the restart drops the immature (non-finalized) tail.
+/// Coinbase blocks mined to the funder up front. Zebra 6.x's `generatetoaddress` mines shielded
+/// coinbase (ZIP-213) directly to the funder's unified address — no transparent coinbase, no
+/// shield step. Shielded coinbase notes have no 100-block maturity rule, but the funder needs
+/// enough confirmations for the notes to be spendable; mining 120 and then a 130-block tail gives
+/// generous depth. (Zebra finalizes blocks deeper than `MAX_BLOCK_REORG_HEIGHT` (99) below the
+/// tip, but no restart is needed here — `generatetoaddress` takes the recipient per call.)
 const FUNDER_COINBASES: u32 = 120;
-/// After restarting mining to a throwaway address, mine this many blocks. The restart resets the
-/// tip to the finalized height (~21); this tail re-grows the chain so the surviving funder
-/// coinbases (~1..21) are well past the 100-block maturity, and gives the funder a recent tip to
-/// build its shield against. Comfortably exceeds coinbase maturity (100).
+/// Mined to a throwaway address after the funder's coinbases. Grows the chain so the funder's
+/// shielded coinbase notes have ample confirmations for spending.
 const MATURITY_TAIL: u32 = 130;
 /// A throwaway P2SH address that mines the maturity tail (the funder does not control it).
-const TAIL_MINER_ADDRESS: &str = "t27eWDgjFYJGVXmzrXeVjnb5J3uXDM9xH9v";
 /// 1 ZEC, in zatoshis.
 const FUND_ZATOSHIS: u64 = 100_000_000;
 /// ZIP-302 text memo the funder attaches to the funding send, so zecd's receive-memo path is
 /// exercised. Decoded text is asserted against `memoStr`; hex against `memo`.
 const RECEIVE_MEMO: &str = "hello from the funder";
-/// Generous: lightwalletd ingestion + zecd scan + Orchard proving.
+/// Generous: zallet sync + zecd scan + Orchard proving.
 const FUND_TIMEOUT: Duration = Duration::from_secs(240);
 /// Passphrase the funded wallet is created with (`init --encrypt`). Drives the locked-send
 /// gate before Phase 2 and conformance.py's lock/unlock state machine at the end. ≥12 chars
@@ -72,60 +60,46 @@ const ENCRYPT_PASSPHRASE: &str = "regtest-pass";
 
 #[tokio::test]
 async fn regtest_funded_orchard_receive() {
-    let (Some(zebrad_bin), Some(lwd_bin), Some(devtool_bin)) = (
+    let (Some(zebrad_bin), Some(zallet_bin)) = (
         resolve_node_bin(),
-        resolve_bin("LIGHTWALLETD_BIN"),
-        resolve_bin("DEVTOOL_BIN"),
+        resolve_bin("ZALLET_BIN"),
     ) else {
         eprintln!(
-            "SKIP regtest_funded_orchard_receive: set {}, LIGHTWALLETD_BIN and DEVTOOL_BIN \
-             to run the funded e2e (see README.md). The harness still compiled and linked.",
-            RegtestNode::from_env().bin_env()
+            "SKIP regtest_funded_orchard_receive: set the node binary env var \
+             (ZEBRAD_BIN or ZAKURAD_BIN) and ZALLET_BIN to run the funded e2e (see README.md). \
+             The harness still compiled and linked."
         );
         return;
     };
 
     // 1. Learn the funder's transparent address offline (no chain yet) so zebra can mine its
     //    coinbase straight to it - keeping the whole flow on one chain.
-    let funder_taddr = Funder::derive_transparent_address(&devtool_bin)
-        .expect("derive funder transparent address");
-
-    // 2. Single chain: zebra first mines a few coinbases straight to the funder, then restarts
-    //    mining to a throwaway address. This keeps everything on one chain while letting the
-    //    funder's coinbases age past maturity without it accruing new, immature ones.
-    let mut zebrad = Zebrad::start_with_miner(&zebrad_bin, &funder_taddr)
-        .await
-        .expect("start zebrad mining to the funder");
+    let zebrad = Zebrad::start(&zebrad_bin).await.expect("start zebrad");
+    zebrad.bootstrap_zallet().await.expect("bootstrap Zallet sync");
+    let funder = start_funder(
+        &zallet_bin,
+        zebrad.rpc_port,
+        pick_port().expect("pick zallet rpc port"),
+        &regtest_nuparams(false),
+    )
+    .await
+    .expect("start zallet funder");
     zebrad
-        .generate_blocks(FUNDER_COINBASES)
+        .generatetoaddress(FUNDER_COINBASES, &funder.ua)
         .await
-        .expect("mine the funder's coinbases");
+        .expect("mine shielded coinbase to funder");
     zebrad
-        .restart_with_miner(TAIL_MINER_ADDRESS)
+        .generatetoaddress(MATURITY_TAIL, DEFAULT_MINER_ADDRESS)
         .await
-        .expect("restart zebrad mining to the throwaway address");
-    zebrad
-        .generate_blocks(MATURITY_TAIL)
-        .await
-        .expect("mine the maturity tail");
-
-    // 3. lightwalletd in front of zebra (ingests the whole chain).
-    let lwd = Lightwalletd::start(&lwd_bin, zebrad.rpc_port)
-        .await
-        .expect("start lightwalletd");
-
-    // 4. Initialise the funder against THIS chain, then shield its now-mature transparent coinbases
-    //    into Orchard. Every coinbase the funder holds is older than the maturity tail, so the
-    //    broadcast is accepted.
-    let funder = Funder::init(&devtool_bin, lwd.grpc_port).expect("initialise funding wallet");
-    funder.sync(lwd.grpc_port).expect("funder sync (coinbase)");
+        .expect("mine maturity tail");
     funder
-        .shield(lwd.grpc_port)
-        .expect("shield transparent coinbase into Orchard");
-    // The shielded note must reach the default confirmation depth (3 for trusted/self-shielded
-    // notes) before the funder can spend it; a few extra blocks cover the tip skew.
-    zebrad.generate_blocks(6).await.expect("confirm shield");
-    funder.sync(lwd.grpc_port).expect("funder sync (shielded)");
+        .rpc
+        .wait_for_account_balance(&funder.account_uuid, FUND_ZATOSHIS, Duration::from_secs(120))
+        .await
+        .expect("wait for funder to see shielded coinbase");
+    let funder_taddr = FOREIGN_TADDR.to_string();
+
+
 
     // 5. zecd against zebra's JSON-RPC; get its Orchard unified address. The wallet is
     // created passphrase-encrypted (`init --encrypt`), so it starts locked - Phase 1 receiving
@@ -154,7 +128,7 @@ async fn regtest_funded_orchard_receive() {
 
     // 6. Fund zecd: send Orchard funds from the funder to zecd's UA. First wait for zecd to
     //    be fully caught up (conn_state "ready"): only a caught-up actor subscribes to
-    //    lightwalletd's mempool stream, which the 0-conf check below exercises.
+    //    zebra's mempool stream, which the 0-conf check below exercises.
     let deadline = Instant::now() + FUND_TIMEOUT;
     loop {
         let peers = zecd
@@ -179,8 +153,9 @@ async fn regtest_funded_orchard_receive() {
     // The funding send carries a ZIP-302 text memo so the *receive*-memo path is exercised
     // end to end: zecd must surface this memo on the received output (`memoStr`). This is the
     // complement to the send-memo coverage in Phase 2 (zecd → funder).
-    funder
-        .send_with_memo(lwd.grpc_port, &zecd_ua, FUND_ZATOSHIS, Some(RECEIVE_MEMO))
+    funder.rpc
+        .z_sendmany_and_wait(&funder.ua, &zecd_ua, FUND_ZATOSHIS, Some(RECEIVE_MEMO))
+        .await
         .expect("send Orchard funds (with a memo) to zecd");
 
     // 0-conf visibility via the mempool stream: before any block confirms the funding tx,
@@ -367,7 +342,7 @@ async fn regtest_funded_orchard_receive() {
         .to_string();
     assert_eq!(cursor.len(), 64, "lastblock is a block hash: {lsb}");
 
-    let funder_ua = funder.unified_address().expect("funder unified address");
+    let funder_ua = funder.ua.clone();
 
     // The wallet was created encrypted (`init --encrypt`), so it starts locked: a real spend is
     // refused (-13; the seed check precedes input selection, so the funds don't matter), a wrong
@@ -1419,7 +1394,7 @@ async fn regtest_funded_orchard_receive() {
     );
 
     // The rebuilt account can actually sign and broadcast: a real send back to the funder.
-    let funder_ua = funder.unified_address().expect("funder unified address");
+    let funder_ua = funder.ua.clone();
     let send = zecd
         .call("sendtoaddress", json!([funder_ua, 0.01]))
         .await

@@ -31,13 +31,14 @@
 //! zebra 6.0.0 the flush can lag by many seconds). After the single restart every block pays
 //! zecd, so the coinbase set the assertions key on is deterministic.
 //!
-//! Neither test needs the devtool funder or lightwalletd: zebra's own `generate` mines straight
-//! to zecd. Skips cleanly unless `ZEBRAD_BIN` is set.
+//! Neither test needs the external funder: zebra's own `generate` mines straight
+//! to zecd. Skips cleanly unless `ZECD_REGTEST_EXTENDED=1` and `ZEBRAD_BIN` are set
+//! (the coinbase e2e is timing-sensitive, so it lives in the extended tier).
 
 use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
-use zecd_regtest_harness::{pick_port, resolve_bin, Zebrad, Zecd, ZecdConfig};
+use zecd_regtest_harness::{extended_enabled, pick_port, resolve_bin, Zebrad, Zecd, ZecdConfig};
 
 /// Throwaway P2SH miner address for the pre-zecd seed blocks.
 const SEED_MINER_ADDRESS: &str = "t27eWDgjFYJGVXmzrXeVjnb5J3uXDM9xH9v";
@@ -127,6 +128,13 @@ async fn regtest_transparent_coinbase_shield_and_spend() {
     // so this skips there. (zecd drives zakura fine and zakura *can* build a shielded coinbase, but
     // the transparent-coinbase maturity+shield flow was flaky against zakura in local testing, so
     // the suite is scoped to zebra to keep the zakura leg reliably green - revisit if wanted.)
+    if !extended_enabled() {
+        eprintln!(
+            "SKIP regtest_transparent_coinbase_shield_and_spend: set \
+             ZECD_REGTEST_EXTENDED=1 to run the coinbase e2e (see README.md)."
+        );
+        return;
+    }
     let Some(zebrad_bin) = resolve_bin("ZEBRAD_BIN") else {
         eprintln!(
             "SKIP regtest_transparent_coinbase_shield_and_spend: set ZEBRAD_BIN to run the \
@@ -527,6 +535,13 @@ async fn regtest_transparent_coinbase_shield_and_spend() {
 #[tokio::test]
 async fn regtest_shielded_coinbase_receive_and_spend() {
     // Zebra-only in CI (ZEBRAD_BIN unset on the zakura leg -> skips there); see the sibling test.
+    if !extended_enabled() {
+        eprintln!(
+            "SKIP regtest_shielded_coinbase_receive_and_spend: set \
+             ZECD_REGTEST_EXTENDED=1 to run the coinbase e2e (see README.md)."
+        );
+        return;
+    }
     let Some(zebrad_bin) = resolve_bin("ZEBRAD_BIN") else {
         eprintln!(
             "SKIP regtest_shielded_coinbase_receive_and_spend: set ZEBRAD_BIN to run the \
