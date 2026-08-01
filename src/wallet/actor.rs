@@ -5195,10 +5195,18 @@ fn classify_pczt_err<E: std::fmt::Display>(e: E) -> RpcError {
 }
 
 /// The `FullPrivacy` single-pool rule, factored out for unit testing: a step violates it if it
-/// has any transparent component, or if it touches **both** shielded pools (a Sapling↔Orchard
-/// turnstile crossing, which reveals the crossed amount on-chain via `valueBalance`).
-fn single_pool_violated(transparent: bool, sapling: bool, orchard: bool) -> bool {
-    transparent || (sapling && orchard)
+/// has any transparent component, or if it touches **more than one** shielded pool (a turnstile
+/// crossing, which reveals the crossed amount on-chain via `valueBalance`).
+///
+/// Ironwood counts as its own pool here, not as a flavour of Orchard. It is a distinct value pool
+/// (`PoolType::IRONWOOD`), so moving value between it and Sapling or Orchard crosses a turnstile
+/// exactly like Sapling<->Orchard does. Note this is deliberately *not* the same grouping upstream
+/// uses to select inputs, where {Sapling, Ironwood} is one group: that grouping is about which
+/// notes can fund one transaction, and says nothing about whether the resulting transaction leaks
+/// an amount. Collapsing the two - counting a Sapling output funded from ironwood notes as
+/// single-pool - is what let FullPrivacy pass an amount-revealing send.
+fn single_pool_violated(transparent: bool, sapling: bool, orchard: bool, ironwood: bool) -> bool {
+    transparent || [sapling, orchard, ironwood].iter().filter(|p| **p).count() > 1
 }
 
 /// Enforce `[spend] privacy_policy = FullPrivacy` on a built proposal: every step must stay within
@@ -5212,12 +5220,13 @@ fn enforce_full_privacy<FeeRuleT, NoteRef>(
         let transparent = step.involves(PoolType::Transparent);
         let sapling = step.involves(PoolType::SAPLING);
         let orchard = step.involves(PoolType::ORCHARD);
-        if single_pool_violated(transparent, sapling, orchard) {
+        let ironwood = step.involves(PoolType::IRONWOOD);
+        if single_pool_violated(transparent, sapling, orchard, ironwood) {
             return Err(RpcError::invalid_parameter(
                 "Privacy policy FullPrivacy rejects this send: it would leave a single shielded \
-                 pool (a transparent component, or a Sapling<->Orchard crossing that reveals the \
-                 transferred amount on-chain). Set [spend] privacy_policy = \
-                 \"AllowRevealedRecipients\" to permit this.",
+                 pool (a transparent component, or a crossing between two shielded pools - \
+                 Sapling, Orchard or Ironwood - that reveals the transferred amount on-chain). \
+                 Set [spend] privacy_policy = \"AllowRevealedRecipients\" to permit this.",
             ));
         }
     }
@@ -5987,21 +5996,45 @@ mod tests {
         );
     }
 
-    /// FullPrivacy's single-pool rule: violated by any transparent component, or by touching
-    /// both shielded pools (a Sapling<->Orchard turnstile crossing). A transaction confined to
-    /// one shielded pool is fine.
+    /// FullPrivacy's single-pool rule: violated by any transparent component, or by touching more
+    /// than one shielded pool (a turnstile crossing). A transaction confined to one shielded pool
+    /// is fine.
     #[test]
     fn single_pool_rule() {
         use super::single_pool_violated;
         // Single shielded pool - allowed.
-        assert!(!single_pool_violated(false, true, false)); // Sapling only
-        assert!(!single_pool_violated(false, false, true)); // Orchard only
-                                                            // Cross-pool turnstile - rejected.
-        assert!(single_pool_violated(false, true, true));
+        assert!(!single_pool_violated(false, true, false, false)); // Sapling only
+        assert!(!single_pool_violated(false, false, true, false)); // Orchard only
+        assert!(!single_pool_violated(false, false, false, true)); // Ironwood only
+                                                                   // Cross-pool turnstile - rejected.
+        assert!(single_pool_violated(false, true, true, false));
         // Any transparent component - rejected.
-        assert!(single_pool_violated(true, false, true));
-        assert!(single_pool_violated(true, true, false));
-        assert!(single_pool_violated(true, false, false));
+        assert!(single_pool_violated(true, false, true, false));
+        assert!(single_pool_violated(true, true, false, false));
+        assert!(single_pool_violated(true, false, false, false));
+    }
+
+    /// Ironwood is its own pool for FullPrivacy, not a flavour of Orchard. Post-NU6.3 a wallet's
+    /// shielded funds are ironwood notes, so paying a Sapling recipient from them moves value
+    /// between two distinct pools and reveals the amount via `valueBalance` - exactly the leak the
+    /// policy exists to forbid. Before this was fixed the check consulted only Sapling and Orchard,
+    /// so an ironwood->Sapling send scored `sapling && !orchard` and FullPrivacy passed it.
+    ///
+    /// NB the upstream *input-selection* grouping puts {Sapling, Ironwood} together; that is about
+    /// which notes may fund one transaction and must not be reused as a privacy equivalence.
+    #[test]
+    fn ironwood_crossings_violate_full_privacy() {
+        use super::single_pool_violated;
+        // The regression: ironwood funding a Sapling output is a turnstile crossing.
+        assert!(
+            single_pool_violated(false, true, false, true),
+            "ironwood<->Sapling reveals the crossed amount and must be rejected"
+        );
+        // The same holds against Orchard, and for a step touching all three.
+        assert!(single_pool_violated(false, false, true, true));
+        assert!(single_pool_violated(false, true, true, true));
+        // A transparent component is still rejected alongside ironwood.
+        assert!(single_pool_violated(true, false, false, true));
     }
 
     /// The Orchard-action cap: `max(spends, outputs)` must not exceed the limit; the error blames
