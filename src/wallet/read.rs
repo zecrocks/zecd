@@ -643,6 +643,29 @@ pub fn tx_exists(wallet_dir: &Path, txid_hex: &str) -> bool {
     .is_some()
 }
 
+/// The rebroadcast-set query, factored out so a test can run it against a schema without
+/// standing up a whole wallet directory. Bind `:target_height` to the next-to-be-mined height.
+///
+/// Unexpired is the shared [`tx_unexpired_sql`] predicate (the same rule the selector uses), so
+/// the rebroadcast set never diverges from what the wallet considers live; `expiry_height >=
+/// tip + 1` is exactly the old `expiry > tip`.
+fn unmined_raw_txs_sql() -> String {
+    let unexpired = tx_unexpired_sql("t");
+    format!(
+        "SELECT txid, raw FROM transactions t
+         WHERE mined_height IS NULL AND raw IS NOT NULL
+         AND ({unexpired})
+         AND (EXISTS (SELECT 1 FROM orchard_received_note_spends s
+                      WHERE s.transaction_id = t.id_tx)
+              OR EXISTS (SELECT 1 FROM sapling_received_note_spends s
+                         WHERE s.transaction_id = t.id_tx)
+              OR EXISTS (SELECT 1 FROM ironwood_received_note_spends s
+                         WHERE s.transaction_id = t.id_tx)
+              OR EXISTS (SELECT 1 FROM transparent_received_output_spends s
+                         WHERE s.transaction_id = t.id_tx))"
+    )
+}
+
 /// Wallet transactions that are still unmined and unexpired at `tip` - candidates for
 /// rebroadcast. Returns `(display_txid, raw_bytes)`; `raw` is only present for txs the
 /// wallet created or has enhanced. An expiry height of 0 means "never expires".
@@ -651,24 +674,16 @@ pub fn tx_exists(wallet_dir: &Path, txid_hex: &str) -> bool {
 /// else can spend them, so such a tx was necessarily authored here). The actor's mempool
 /// stream also stores *foreign* incoming txs as unmined rows with raw bytes, and those are
 /// the sender's to retransmit, not ours.
+///
+/// **Every** shielded pool must be listed in that ownership test, ironwood included: a spend of
+/// an ironwood note is recorded in `ironwood_received_note_spends`, not in the orchard table, so
+/// omitting it silently excludes the transaction from the rebroadcast set. Post-NU6.3 a wallet's
+/// shielded funds *are* ironwood notes, so the omission meant no send could ever be retried - a
+/// send whose broadcast failed (upstream briefly down) was simply never retransmitted, and sat
+/// unmined until it expired. Pre-NU6.3 the tables are empty, so this reads as a no-op there.
 pub fn unmined_raw_txs(wallet_dir: &Path, tip: u32) -> anyhow::Result<Vec<(String, Vec<u8>)>> {
     let conn = open_conn(wallet_dir)?;
-    // Unexpired is the shared `tx_unexpired_sql` predicate (same rule the selector uses), so the
-    // rebroadcast set never diverges from what the wallet considers live. `:target_height` is the
-    // next-to-be-mined height; `expiry_height >= tip + 1` is exactly the old `expiry > tip`.
-    let unexpired = tx_unexpired_sql("t");
-    let sql = format!(
-        "SELECT txid, raw FROM transactions t
-         WHERE mined_height IS NULL AND raw IS NOT NULL
-         AND ({unexpired})
-         AND (EXISTS (SELECT 1 FROM orchard_received_note_spends s
-                      WHERE s.transaction_id = t.id_tx)
-              OR EXISTS (SELECT 1 FROM sapling_received_note_spends s
-                         WHERE s.transaction_id = t.id_tx)
-              OR EXISTS (SELECT 1 FROM transparent_received_output_spends s
-                         WHERE s.transaction_id = t.id_tx))"
-    );
-    let mut stmt = conn.prepare(&sql)?;
+    let mut stmt = conn.prepare(&unmined_raw_txs_sql())?;
     let rows = stmt.query_map(named_params! { ":target_height": tip + 1 }, |row| {
         Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, Vec<u8>>(1)?))
     })?;
@@ -1612,6 +1627,51 @@ mod tests {
             super::immature_coinbase_zats(dir.path(), target).unwrap(),
             200,
             "immature = the one-short coinbase only"
+        );
+    }
+
+    /// The rebroadcast set must include a transaction that spends an **ironwood** note.
+    ///
+    /// Post-NU6.3 a wallet's shielded funds are ironwood notes, and a spend of one is recorded in
+    /// `ironwood_received_note_spends` - a different table from the orchard one. While the
+    /// ownership test in [`super::unmined_raw_txs_sql`] listed only sapling/orchard/transparent,
+    /// every post-NU6.3 send was silently excluded from the rebroadcast set: a send whose
+    /// broadcast failed was never retransmitted and sat unmined until it expired. Regtest caught
+    /// it as an outage-recovery send that never confirmed.
+    ///
+    /// Runs the real query against a minimal schema, so it fails if the ironwood arm is dropped.
+    #[test]
+    fn rebroadcast_set_includes_ironwood_spends() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE transactions (
+                 id_tx INTEGER PRIMARY KEY, txid BLOB, raw BLOB,
+                 mined_height INTEGER, expiry_height INTEGER, min_observed_height INTEGER
+             );
+             CREATE TABLE sapling_received_note_spends (transaction_id INTEGER);
+             CREATE TABLE orchard_received_note_spends (transaction_id INTEGER);
+             CREATE TABLE ironwood_received_note_spends (transaction_id INTEGER);
+             CREATE TABLE transparent_received_output_spends (transaction_id INTEGER);
+             -- An unmined, unexpired transaction that spends one ironwood note and nothing else.
+             INSERT INTO transactions (id_tx, txid, raw, mined_height, expiry_height)
+                 VALUES (1, X'0011', X'beef', NULL, 500);
+             INSERT INTO ironwood_received_note_spends (transaction_id) VALUES (1);",
+        )
+        .unwrap();
+
+        let mut stmt = conn.prepare(&super::unmined_raw_txs_sql()).unwrap();
+        let rows: Vec<Vec<u8>> = stmt
+            .query_map(rusqlite::named_params! { ":target_height": 100u32 }, |r| {
+                r.get::<_, Vec<u8>>(1)
+            })
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+        assert_eq!(
+            rows,
+            vec![vec![0xbeu8, 0xef]],
+            "an ironwood-spending tx is a rebroadcast candidate; without the ironwood arm in the \
+             ownership test it is silently dropped and the send is never retried"
         );
     }
 }
