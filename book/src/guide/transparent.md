@@ -76,6 +76,13 @@ A payment to an address that becomes exposed only *after* its funding block was 
 from-seed rescan. `transparent_initial_scan` (below) is the mitigation; automatic reconciliation
 against the node's address index is [not yet implemented](../limitations.md).
 
+The same pass finds **spends**, including ones this wallet did not author: each block's
+transparent inputs are tested against the outputs the wallet still holds unspent, so a spend made
+by another wallet on the same seed, or while this one was down, marks the output spent and records
+the outgoing entry. That test is bounded by the outputs held rather than the addresses issued, and
+costs no request of its own, since the block is already parsed for the shielded scan. Shielded
+spends need none of this: they are found through note nullifiers.
+
 ## Spending: fully-transparent only, strictly opt-in
 
 A received transparent UTXO can be spent to a transparent recipient with the change kept
