@@ -107,7 +107,57 @@ fn check_backend(config: &AppConfig, findings: &mut Vec<Finding>) {
     if let Err(e) = server.preflight() {
         findings.push(Finding::error(format!("{e:#}")));
     }
+
+    let lightwalletd = server.kind() == crate::backend::ServerKind::Lightwalletd;
+    if config.backend.assume_transparent_in_compact_blocks && !lightwalletd {
+        findings.push(Finding::warning(
+            "[backend] assume_transparent_in_compact_blocks is set but the upstream is not a \
+             lightwalletd; it will be ignored (a zebra backend always covers transparent data)",
+        ));
+    }
+    if config.backend.tls_insecure_skip_verify {
+        findings.push(Finding::warning(
+            "[backend] tls_insecure_skip_verify = true accepts any lightwalletd certificate: \
+             the connection is encrypted but unauthenticated, so an on-path attacker can \
+             impersonate the server. Prefer tls_pinned_sha256 for a self-signed certificate",
+        ));
+    }
+
+    for (name, wallet) in &config.wallets {
+        if !wallet.transparent_enabled {
+            continue;
+        }
+        // The actor refuses to run a transparent-enabled wallet against a lightwalletd that
+        // does not advertise transparent data in compact blocks - and no released lightwalletd
+        // populates the advertisement, so in practice the assertion knob is required. Only a
+        // warning: whether a given server advertises it is a fact about the server, not the
+        // config, and this check never dials.
+        if lightwalletd && !config.backend.assume_transparent_in_compact_blocks {
+            findings.push(Finding::warning(format!(
+                "wallet '{name}' has [pools] transparent = true against a lightwalletd upstream: \
+                 the wallet refuses to run unless the server advertises that it serves \
+                 transparent data in compact blocks, and no released lightwalletd populates that \
+                 advertisement yet. Set [backend] assume_transparent_in_compact_blocks = true to \
+                 assert it, or point [backend] server at your own zebra"
+            )));
+        }
+        if lightwalletd
+            && (wallet.transparent_initial_scan >= LIGHT_TRANSPARENT_ADDR_WARN
+                || wallet.transparent_gap_limit >= LIGHT_TRANSPARENT_ADDR_WARN)
+        {
+            findings.push(Finding::warning(format!(
+                "wallet '{name}': transparent_initial_scan = {} / transparent_gap_limit = {} on a \
+                 lightwalletd backend - spend detection queries each funded address separately, \
+                 one remote round trip apiece. Running your own zebra (server = \"zebra\") is \
+                 recommended at this scale",
+                wallet.transparent_initial_scan, wallet.transparent_gap_limit,
+            )));
+        }
+    }
 }
+
+/// Mirrors `daemon.rs`'s per-wallet lightwalletd scale warning.
+const LIGHT_TRANSPARENT_ADDR_WARN: u32 = 1_000;
 
 /// The RPC surface: the credentials must be usable, and a bare password must not be about to
 /// cross a network in the clear (zecd serves plaintext HTTP).
@@ -439,6 +489,39 @@ mod tests {
         );
         assert!(
             errors(&inspect(&config)).is_empty(),
+            "{:?}",
+            inspect(&config)
+        );
+    }
+
+    /// A transparent-enabled wallet on a lightwalletd upstream refuses to run unless the
+    /// capability is asserted - the single most likely way a light-mode transparent deployment
+    /// fails, and invisible in the config file itself.
+    #[test]
+    fn transparent_on_lightwalletd_warns_without_the_capability_assertion() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = format!(
+            "network = \"test\"\ndatadir = {:?}\n[rpc]\nuser = \"u\"\npassword = \"p\"\n\
+             [pools]\ntransparent = true\n[backend]\nserver = \"zecrocks\"\n",
+            dir.path()
+        );
+        let config = resolve(&base, dir.path());
+        assert!(
+            warnings(&inspect(&config))
+                .iter()
+                .any(|w| w.contains("transparent data in compact blocks")),
+            "{:?}",
+            inspect(&config)
+        );
+
+        let config = resolve(
+            &format!("{base}assume_transparent_in_compact_blocks = true\n"),
+            dir.path(),
+        );
+        assert!(
+            !warnings(&inspect(&config))
+                .iter()
+                .any(|w| w.contains("transparent data in compact blocks")),
             "{:?}",
             inspect(&config)
         );

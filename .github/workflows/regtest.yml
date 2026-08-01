@@ -4,16 +4,17 @@ name: Regtest E2E
 # (zecd talks straight to zebrad - see regtest-harness/). Funding comes from a second zecd, run
 # from a digest-pinned public release image, which owns the chain's coinbase, shields it into
 # Orchard with `z_shieldcoinbase` and pays the wallet under test. It talks straight to the same
-# node, so the whole tier needs nothing but a node binary and a zecd.
+# node, so funding needs no lightwalletd; one is provisioned only for the light-mode leg, where the
+# *zecd under test* is the light client.
 # No zingo-infra: the harness mines via zebrad's
 # Regtest-only `generate` RPC, so it has no zebra crate dependency and works against any zebrad
-# release. The node is extracted from its official Docker image.
+# release. zebrad + lightwalletd are extracted from their official Docker images.
 #
 # Runs on PRs and pushes to main against the pinned zebra image. The weekly schedule is the
 # "big run": it tests BOTH the pinned image (re-validating the baseline) and zfnd/zebra:latest
 # (an early-warning canary for upstream zebra changes), and - like manual dispatches - sets
 # ZECD_REGTEST_EXTENDED=1 so the extended tests (reorg, multiwallet, stop/restore, watch-only) run too;
-# on PR runs those skip in seconds (each spins its own zebra stack).
+# on PR runs those skip in seconds (each spins its own zebra+lightwalletd stack).
 #
 # The note-scaling stress test (regtest_stress_notes) is heavier still - it builds thousands of
 # notes and times multi-minute sends - so it is gated separately (ZECD_REGTEST_STRESS) and runs
@@ -91,19 +92,26 @@ on:
 env:
   ZEBRAD_IMAGE_PINNED: "6.2.2"
   ZAKURAD_IMAGE_PINNED: "1.0.5"
-  # The funding wallet is a *released* zecd, from its own digest-pinned image. Running a release
-  # rather than the build under test keeps the two sides of every funded test independent - a
-  # regression on this branch cannot mask itself by being present in both the wallet under test and
-  # the wallet paying it - and makes the funded tier cross-version coverage: last release funds
+  # The funding wallet is a *released* zecd, from its own digest-pinned GHCR image. Running a
+  # release rather than the build under test keeps the two sides of every funded test independent -
+  # a regression on this branch cannot mask itself by being present in both the wallet under test
+  # and the wallet paying it - and makes the funded tier cross-version coverage: last release funds
   # HEAD, the shape a real deployment upgrades through. Bump this in the same PR as any consensus
   # change, or the funder stops understanding the chain it is funding. Prefer the newest release:
-  # 0.5.2 is the first that rebroadcasts a transaction spending Ironwood notes, which every funder
+  # v0.5.2 is the first that rebroadcasts a transaction spending Ironwood notes, which every funder
   # payment is on this NU6.3-active chain - before it, a send whose broadcast failed was never
   # retransmitted and simply sat unmined until it expired.
-  ZECD_FUNDER_IMAGE: ${{ inputs.funder-image || 'ghcr.io/zecrocks/zecd@sha256:94ea96227b3244ec95c7784396d9e18b04aa42bc0ff837ca88bd1cfe272c4e07' }}  # 0.5.2
-  # The harness --test targets, as run on the zebra leg. The zakura leg overrides it with its own
-  # list (see the matrix `include` below). Extended/stress tests skip in seconds unless their gate
-  # is set.
+  ZECD_FUNDER_IMAGE: ${{ inputs.funder-image || 'ghcr.io/zecrocks/zecd@sha256:94ea96227b3244ec95c7784396d9e18b04aa42bc0ff837ca88bd1cfe272c4e07' }}  # v0.5.2
+  # lightwalletd, built from source at this release tag. Needed only where the *zecd under test* is
+  # a light client - the `zecd-lwd` suite and the dedicated regtest_lwd e2e - since the funder now
+  # talks straight to the node. 0.5.0 is the first release serving the versioned lightwallet
+  # protocol, which is what carries transparent and Ironwood data in compact blocks; the chain is
+  # NU6.3-active throughout, so it also has to parse a V6 transaction, which the old v0.4.19 image
+  # cannot.
+  LIGHTWALLETD_VERSION: "v0.5.2"
+  # The harness --test targets for the standard (zecd) suite, as run on the zebra leg. The zakura
+  # and zecd-lwd legs each override it with their own list (see the matrix `include` below).
+  # Extended/stress tests skip in seconds unless their gate is set.
   HARNESS_TESTS: "--test regtest_e2e --test regtest_binding --test regtest_funded --test regtest_ironwood --test regtest_proving_cache --test regtest_sapling --test regtest_transparent --test regtest_transparent_t2t --test regtest_transparent_sendmany_t2t --test regtest_transparent_gap --test regtest_transparent_offline_restore --test regtest_transparent_preexpose_responsive --test regtest_transparent_recovery_window --test regtest_coinbase --test regtest_hang --test regtest_reorg --test regtest_multiwallet --test regtest_restore --test regtest_watchonly --test regtest_stress_notes"
 
 concurrency:
@@ -133,11 +141,29 @@ jobs:
       fail-fast: false
       matrix:
         node: [zebra, zakura]
+        suite: [zecd, zecd-lwd]
         image: ${{ github.event_name == 'schedule' && fromJSON('["pinned", "latest"]') || fromJSON('["event"]') }}
+        exclude:
+          # No zakura light mode: lightwalletd hard-rejects zakura's `/Zakura/` subversion (see
+          # the provisioning step), so a lightwalletd-fronted zecd can't exist on that node.
+          - node: zakura
+            suite: zecd-lwd
         include:
+          # Light mode: the same funded/conformance flow plus the transparent suites (incl. the
+          # regtest_transparent_gap regression trap) rerun with zecd on a lightwalletd upstream
+          # (ZECD_REGTEST_BACKEND=lwd), and the dedicated regtest_lwd e2e (equivalence vs a
+          # zebra-backed twin, outage/reconnect, the offline-window sweep on both server
+          # generations). A parallel leg, so PR wall-time is unchanged. The zecd suite falls
+          # back to the full HARNESS_TESTS list (env above).
+          - suite: zecd-lwd
+            backend: lwd
+            tests: --test regtest_lwd --test regtest_funded --test regtest_transparent --test regtest_transparent_t2t --test regtest_transparent_sendmany_t2t --test regtest_transparent_gap --test regtest_transparent_offline_restore
+            # Heavier per-slot than the zebra suite (an extra lightwalletd per stack), and only
+            # six binaries to get through - see REGTEST_JOBS below.
+            jobs: 4
           # zakura runs the direct-RPC binaries only - the same set it ran before the funder became
           # a zecd. Nothing technical stops the funded ones now (the funder talks straight to the
-          # node, so an indexer's refusal to front zakura no longer matters, and they do pass
+          # node, so lightwalletd's refusal to front zakura no longer matters, and they do pass
           # there), but they have never been validated against zakura and are intermittently red on
           # it while both zebra legs stay green - a different binary each run, always a timing or
           # window-sensitive assertion. Enabling them is worth doing as its own change, where the
@@ -146,7 +172,7 @@ jobs:
           # that calls `start_funded_chain`.
           - node: zakura
             tests: --test regtest_e2e --test regtest_binding --test regtest_transparent_preexpose_responsive --test regtest_transparent_recovery_window --test regtest_coinbase --test regtest_hang --test regtest_reorg --test regtest_multiwallet --test regtest_restore --test regtest_watchonly
-    name: regtest (${{ matrix.node }}, ${{ matrix.image }})
+    name: regtest (${{ matrix.node }}, ${{ matrix.suite }}, ${{ matrix.image }})
     steps:
       - uses: actions/checkout@v4
 
@@ -206,13 +232,18 @@ jobs:
           echo "NODE_BIN_NAME=$binname" >> "$GITHUB_ENV"
           echo "NODE_BIN_ENV=$binenv" >> "$GITHUB_ENV"
 
-      # Extract the selected node from its official Docker image, plus the funder. The harness
+      # Extract the selected node from its official Docker image, plus lightwalletd. The harness
       # drives the node over JSON-RPC only (mining via the Regtest-only `generate` RPC), so any
       # zebrad/zakurad release works. The node binary is read from $NODE_BIN_ENV (ZEBRAD_BIN or
       # ZAKURAD_BIN).
       #
-      # (The coinbase suite is zebra-only - kept off zakura via its ZEBRAD_BIN guard - because the
-      # transparent-coinbase maturity+shield flow was flaky against zakura in testing.)
+      # lightwalletd now matters only where the *zecd under test* is a light client: the
+      # `zecd-lwd` suite. It hard-rejects any node whose `getinfo.subversion` isn't zcashd/zebrad -
+      # including zakura's `/Zakura:x.y.z/` - and exits fatally, which is why there is no
+      # zakura+zecd-lwd leg (see the matrix `exclude`). The funder is a zebra-backed zecd, so
+      # funding no longer depends on it at all. (The coinbase suite stays zebra-only via its own
+      # ZEBRAD_BIN guard: the transparent-coinbase maturity+shield flow was flaky against zakura in
+      # testing.)
       - name: Provision node + funder from images
         run: |
           set -euo pipefail
@@ -230,12 +261,45 @@ jobs:
           }
           extract "$NODE_IMAGE" "$NODE_BIN_NAME"
           echo "$NODE_BIN_ENV=$RUNNER_TEMP/bin/$NODE_BIN_NAME" >> "$GITHUB_ENV"
-          # The funding wallet: a released zecd, from the digest-pinned public image. The harness
-          # falls back to the built binary when this is unset, so a local `cargo test` needs no
-          # image at all - CI pins one to keep funder and wallet-under-test independent.
+          # The funding wallet: a released zecd, from the digest-pinned public GHCR image. The
+          # harness falls back to the built binary when this is unset, so a local `cargo test`
+          # needs no image at all - CI pins one to keep funder and wallet-under-test independent.
           extract "$ZECD_FUNDER_IMAGE" zecd
           echo "ZECD_FUNDER_BIN=$RUNNER_TEMP/bin/zecd" >> "$GITHUB_ENV"
           "$RUNNER_TEMP/bin/zecd" --version
+          # lightwalletd is built from source below (LIGHTWALLETD_VERSION) rather than extracted:
+          # the chain is NU6.3-active, and the old released image cannot parse a V6 transaction.
+
+      # Build lightwalletd at LIGHTWALLETD_VERSION from source (no published image carries it
+      # yet). It is the upstream for the zecd under test on the light-mode leg - the NU6.3-active
+      # chain needs a lightwalletd that parses V6.
+      - name: Cache the release-built lightwalletd
+        id: lwd-master-bin
+        uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}/bin/lightwalletd-release
+          key: lwd-release-bin-${{ runner.os }}-${{ env.LIGHTWALLETD_VERSION }}
+
+      - name: Build lightwalletd from its release tag
+        if: steps.lwd-master-bin.outputs.cache-hit != 'true'
+        run: |
+          set -euo pipefail
+          git clone https://github.com/zcash/lightwalletd.git "$RUNNER_TEMP/lightwalletd-src"
+          git -C "$RUNNER_TEMP/lightwalletd-src" checkout "$LIGHTWALLETD_VERSION"
+          (cd "$RUNNER_TEMP/lightwalletd-src" && go build -o "$RUNNER_TEMP/bin/lightwalletd-release" .)
+          file -b "$RUNNER_TEMP/bin/lightwalletd-release" || true
+
+      # lightwalletd is only usable in front of zebra - it hard-rejects zakura's `/Zakura/`
+      # subversion - so the zakura leg leaves LIGHTWALLETD_BIN unset. Nothing on that leg needs it
+      # any more: the only binaries that do are the light-mode ones, and there is no
+      # zakura+zecd-lwd leg.
+      - name: Select the lightwalletd binary
+        run: |
+          if [ "${{ matrix.node }}" = "zebra" ]; then
+            echo "LIGHTWALLETD_BIN=$RUNNER_TEMP/bin/lightwalletd-release" >> "$GITHUB_ENV"
+          else
+            echo "node=${{ matrix.node }}: skipping lightwalletd (it rejects this node's subversion); nothing on this leg needs it"
+          fi
 
       # The funded test also runs scripts/conformance.py (python3, stdlib-only) against the
       # live daemon, so the full Bitcoin-Core wire-format suite is exercised here in CI.
@@ -268,7 +332,7 @@ jobs:
           ZECD_REGTEST_EXTENDED: ${{ (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && '1' || '' }}
           # The heavy note-scaling stress test runs ONLY on the monthly cron (the 1st-of-month
           # schedule) and on a manual dispatch that ticks `stress` - never on push/PR, and not on
-          # the weekly cron. Its note target is `stress-note-count` on dispatch (blank -> default 256).
+          # the weekly cron. Its note target is `stress-note-count` on dispatch (blank → default 256).
           ZECD_REGTEST_STRESS: ${{ (github.event.schedule == '33 7 1 * *' || (github.event_name == 'workflow_dispatch' && inputs.stress)) && '1' || '' }}
           ZECD_STRESS_NOTE_COUNT: ${{ inputs.stress-note-count }}
           # The shielded-coinbase e2e needs a zebrad whose block template builds valid shielded
@@ -279,10 +343,13 @@ jobs:
           # (Only the zebra leg ever runs the coinbase suite - it is zebra-only in CI, so on the
           # zakura leg both coinbase tests skip via their ZEBRAD_BIN guard before this is read.)
           ZECD_REGTEST_REQUIRE_SHIELDED_COINBASE: ${{ (github.event_name != 'workflow_dispatch' || inputs.zebra-image == '') && '1' || '' }}
-          # The node binary (ZEBRAD_BIN/ZAKURAD_BIN) and the funder (ZECD_FUNDER_BIN) are exported
-          # by the provisioning step above.
+          # Light mode: the zecd-lwd suite reruns the opted-in tests with zecd on a dedicated
+          # lightwalletd upstream instead of the node's JSON-RPC (empty = the node, the default).
+          ZECD_REGTEST_BACKEND: ${{ matrix.backend || '' }}
+          # The node binary (ZEBRAD_BIN/ZAKURAD_BIN) and LIGHTWALLETD_BIN are exported by the
+          # provisioning steps above.
           #
-          # How many test binaries run at once. Each one is a whole zebrad+zecd
+          # How many test binaries run at once. Each one is a whole zebrad(+lightwalletd)+zecd
           # stack that spends most of its wall clock waiting on that stack rather than burning
           # CPU, so the tier overlaps well - but only as far as the runner has cores and RAM for
           # it. Raise REGTEST_JOBS in lockstep with REGTEST_RUNNER, never past it: an oversubscribed
@@ -298,12 +365,18 @@ jobs:
           # 4m18s but failed both attempts, the second time in regtest_sapling
           # ("getunconfirmedbalance is 0: 3.0"), a one-test binary that was simply starved by the
           # extra load. A minute is not worth a flaky tier.
-          REGTEST_JOBS: ${{ vars.REGTEST_JOBS || 6 }}
+          # The light-mode leg runs a lower concurrency than the tuned-for-zebra default: each of
+          # its binaries brings up a lightwalletd *in addition to* the node+zecd stack (regtest_lwd
+          # runs two lightwalletds and a second zebra-backed zecd twin), so a slot there costs
+          # meaningfully more RAM and processes than the zebra suite the 6 was measured against.
+          # Its list is also only 6 binaries, so the ceiling costs little wall clock. Raise it if
+          # the per-binary timing table shows slots idling.
+          REGTEST_JOBS: ${{ matrix.jobs || vars.REGTEST_JOBS || 6 }}
           REGTEST_LOG_DIR: ${{ runner.temp }}/regtest-logs
         # run-tests.sh builds the binaries once (--locked, against the committed lock) and then
         # runs them REGTEST_JOBS at a time, each in its own slice of the loopback port range. It
         # always runs every binary - the old `--no-fail-fast`, so one flaky test can't mask the
-        # rest - and exits non-zero if any failed.
+        # rest - and exits non-zero if any failed. The lwd leg passes its own shorter list.
         run: regtest-harness/run-tests.sh ${{ matrix.tests || env.HARNESS_TESTS }}
 
       # run-tests.sh already replays each failing binary's output and tails its node log, so this

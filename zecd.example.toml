@@ -38,17 +38,78 @@ dir = "./data/default"
 # keys_file = "/secrets/keys.toml"
 
 [backend]
-# The chain upstream is a LOCAL zebrad's JSON-RPC. The default is "zebra": shorthand for
-# "zebra://127.0.0.1:8234" on mainnet / "zebra://127.0.0.1:18234" on testnet (zebrad ships
-# with RPC disabled, so set its `rpc.listen_addr` to that port; the zcashd-convention ports
-# 8232/18232 belong to zecd's own RPC). See [zebra] below for credentials. Use
-# "zebra://host:port" for a zebrad on another host/port.
+# The chain upstream: a LOCAL zebrad's JSON-RPC ("full mode", the default and the
+# recommendation), or a lightwalletd gRPC server ("light mode" - no fully synced local
+# zebra needed).
+#
+#   server = "zebra"               # local zebrad: "zebra://127.0.0.1:8234" mainnet /
+#                                  # ":18234" testnet (zebrad ships with RPC disabled, so set
+#                                  # its `rpc.listen_addr` to that port; the zcashd-convention
+#                                  # ports 8232/18232 belong to zecd's own RPC). See [zebra]
+#                                  # below for credentials.
+#   server = "zebra://host:port"   # a zebrad on another host/port.
+#   server = "zecrocks"            # the zec.rocks public lightwalletd (zec.rocks:443 mainnet,
+#                                  # testnet.zec.rocks:443 testnet), TLS.
+#   server = "https://host[:port]" # any lightwalletd, TLS (port defaults to 443).
+#   server = "http://host:port"    # a lightwalletd without TLS - allowed toward
+#                                  # loopback/private hosts; refused toward public ones unless
+#                                  # allow_remote_cleartext below.
+#   server = "host:port"           # a lightwalletd; TLS decided by locality (loopback/private
+#                                  # plaintext, public TLS), overridable with `tls` below.
+#
+# Light-mode notes: a lightwalletd upstream must be 0.5.0 or later for a transparent-enabled
+# wallet (that is the first release serving transparent and Ironwood data inside compact blocks;
+# zecd probes this at connect and refuses an older server rather than silently missing
+# transparent receives). Shielded-only wallets work against any server. Prefer running your own
+# zebra when the wallet tracks many funded transparent addresses - spend detection costs one
+# upstream query per funded address.
 server = "zebra"
 # Per-attempt dial timeout (seconds) so a hung/black-holed endpoint can't stall sync.
 connect_timeout_secs = 10
 # Reconnect backoff (seconds): start at base, double up to max, with full jitter.
 reconnect_base_secs = 1
 reconnect_max_secs = 60
+# lightwalletd TLS mode: "auto" (default - locality heuristic), "yes", or "no". An explicit
+# https:// or http:// scheme on `server` wins over this. zebra:// endpoints ignore it
+# (always plaintext HTTP, local-only by policy).
+# tls = "auto"
+# Which roots lightwalletd TLS trusts: "native" (OS store, honors SSL_CERT_FILE - default)
+# or "webpki" (embedded Mozilla bundle, for minimal containers).
+# tls_roots = "native"
+# Trust a private CA for lightwalletd TLS, in addition to the public roots above. The
+# certificate is then validated normally - chain, hostname and expiry all checked - so this is
+# the best option for a lightwalletd behind your own CA. An unreadable or malformed file fails
+# startup rather than quietly falling back to the public roots.
+# tls_ca_file = "/etc/zecd/lwd-ca.pem"
+#
+# Pin lightwalletd's TLS certificate to one or more SHA-256 fingerprints. Get one with:
+#   openssl s_client -connect host:443 </dev/null 2>/dev/null \
+#     | openssl x509 -noout -fingerprint -sha256
+# Colons are optional and case does not matter. It is a list so a replacement certificate can be
+# pinned alongside the outgoing one before you switch, avoiding an outage at renewal.
+# On its own the pin IS the identity: no chain, hostname, or expiry check runs, which is what
+# makes a bare self-signed certificate usable without weakening anything. Combined with
+# tls_ca_file, the chain is validated against that CA as well (and only that CA). If a pin ever
+# fails, the error names the fingerprint actually presented - verify it out of band before
+# trusting it, since a mismatch is either a rotation you did not expect or an impersonation.
+# tls_pinned_sha256 = ["AB:CD:EF:...:89"]
+#
+# UNSAFE: accept any lightwalletd TLS certificate - no chain-of-trust or hostname check. The
+# connection stays encrypted but is no longer authenticated, so anyone able to intercept it can
+# impersonate the server and see every address and txid this wallet asks about. Prefer
+# tls_pinned_sha256 above: it handles the same self-signed case while still authenticating the
+# server. Off by default, and refused in combination with tls_ca_file/tls_pinned_sha256.
+# tls_insecure_skip_verify = false
+#
+# Assert that the upstream lightwalletd serves transparent (and ironwood) data inside compact
+# blocks. zecd normally decides this from GetLightdInfo.lightwalletProtocolVersion, and refuses
+# to run a transparent-enabled wallet against a server that does not serve the data - otherwise
+# transparent receives would simply never appear. But no released lightwalletd populates that
+# field yet, so even a 0.5.x server that does serve the data reports "incapable" and is refused.
+# Set this to true to assert the capability yourself. Off by default: asserting it wrongly
+# reintroduces exactly the silent-loss failure the check exists to prevent. Shielded-only
+# wallets (the default) never need it, and a "zebra://" upstream ignores it.
+# assume_transparent_in_compact_blocks = false
 
 # Credentials for the "zebra" / "zebra://host:port" endpoints above. Omit the whole section
 # when zebrad runs with `enable_cookie_auth = false`. A cookie file wins over user/password

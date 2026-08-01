@@ -53,9 +53,9 @@ pub fn render(config: &AppConfig) -> String {
 
     table(&mut s, "backend");
     let b = &config.backend;
-    // The token is what the operator writes; what it resolves to (host and port) is the thing
-    // they actually want to confirm, and it is not itself a config key - so it rides as a
-    // comment, derived from the value beside it.
+    // The token is what the operator writes; what it resolves to (host, port, protocol, and for
+    // lightwalletd the TLS decision) is the thing they actually want to confirm, and it is not
+    // itself a config key - so it rides as a comment, derived from the value beside it.
     match crate::backend::resolve_configured(config) {
         Ok(server) => kv_note(&mut s, "server", str_val(&b.server), &server.describe()),
         Err(e) => kv_note(
@@ -70,6 +70,40 @@ pub fn render(config: &AppConfig) -> String {
     kv(&mut s, "reconnect_max_secs", b.reconnect_max_secs);
     kv(&mut s, "rfc1918_is_local", b.rfc1918_is_local);
     kv(&mut s, "allow_remote_cleartext", b.allow_remote_cleartext);
+    kv(
+        &mut s,
+        "tls",
+        str_val(match b.tls {
+            None => "auto",
+            Some(true) => "yes",
+            Some(false) => "no",
+        }),
+    );
+    kv(
+        &mut s,
+        "tls_roots",
+        str_val(match b.tls_roots {
+            crate::backend::TlsRoots::Native => "native",
+            crate::backend::TlsRoots::Webpki => "webpki",
+        }),
+    );
+    kv(
+        &mut s,
+        "tls_insecure_skip_verify",
+        b.tls_insecure_skip_verify,
+    );
+    if let Some(ca) = &b.tls_ca_file {
+        kv(&mut s, "tls_ca_file", path_val(ca));
+    }
+    if !b.tls_pins.is_empty() {
+        let pins: Vec<String> = b.tls_pins.iter().map(|p| p.to_string()).collect();
+        kv(&mut s, "tls_pinned_sha256", list_val(&pins));
+    }
+    kv(
+        &mut s,
+        "assume_transparent_in_compact_blocks",
+        b.assume_transparent_in_compact_blocks,
+    );
 
     table(&mut s, "zebra");
     if let Some(cookie) = &config.zebra.rpc_cookie {
@@ -382,8 +416,7 @@ mod tests {
         ] {
             assert!(out.contains(defaulted), "missing {defaulted:?} in:\n{out}");
         }
-        // The resolved endpoint rides alongside the token it derives from - which is the whole
-        // point for the default `zebra` shorthand, where the token names no host or port.
+        // The resolved endpoint rides alongside the token it derives from.
         assert!(
             out.contains("server = \"zebra\"  # zebra-rpc 127.0.0.1:18234"),
             "{out}"

@@ -61,6 +61,18 @@ secrecy = "0.8"
 # `sync/engine.rs` serializes to the on-disk block cache). `hyper-util`'s legacy client is the
 # HTTP/1.1 client behind the zebra JSON-RPC backend.
 prost = "0.14"
+# lightwalletd transport. `tls-ring` makes tonic select the `ring` rustls crypto provider for
+# its own ClientConfig (tonic 0.14 does this internally - no CryptoProvider::install_default
+# needed); keep it the *only* rustls provider feature, or tonic's auto-selection breaks.
+# `tls-native-roots` lets us trust the OS store (and SSL_CERT_FILE), which `tls-webpki-roots`
+# alone does not.
+tonic = { version = "0.14", features = ["gzip", "tls-ring", "tls-native-roots", "tls-webpki-roots"] }
+# The rustls that tonic already dials with (via tokio-rustls), pulled in directly only for the
+# `ServerCertVerifier` impl behind `[backend] tls_insecure_skip_verify`. `default-features =
+# false` is load-bearing: rustls' defaults enable `aws_lc_rs` (and `prefer-post-quantum`, which
+# implies it), which would land a second crypto provider in the tree and break tonic's
+# auto-selection. `ring` matches tonic's `tls-ring`.
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
 hyper-util = { version = "0.1", features = ["tokio", "client-legacy", "http1"] }
 rusqlite = { version = "0.37", features = ["time"] }
 time = "0.3"
@@ -80,7 +92,7 @@ zcash_encoding = "0.4"
 # and the received-by-address read paths; zecd's own wallets never expose transparent receivers.
 # `pczt` exposes `create_pczt_from_proposal` / `extract_and_store_transaction_from_pczt`, the
 # build/prove/store seam that lets the proving step take a cached Orchard proving key.
-zcash_client_backend = { version = "0.24.0-rc.7", features = ["orchard", "transparent-inputs", "pczt"] }
+zcash_client_backend = { version = "0.24.0-rc.7", features = ["lightwalletd-tonic-tls-webpki-roots", "orchard", "transparent-inputs", "pczt"] }
 zcash_client_sqlite = { version = "0.22.0-rc.7", features = ["unstable", "orchard", "serde", "transparent-inputs"] }
 zcash_keys = { version = "0.16", features = ["unstable", "orchard"] }
 zcash_primitives = "0.30"

@@ -230,7 +230,7 @@ pub async fn run(config: &AppConfig, args: &InitArgs) -> anyhow::Result<()> {
         AtRest::Identity(ensure_identity(&identity_path).await?)
     };
 
-    // init is a one-shot interactive command that dials the configured zebra endpoint once.
+    // init is a one-shot interactive command that dials the configured upstream once.
     let mut server = backend::resolve(&config.backend.server, network)?;
     backend::apply_zebra_auth(&mut server, &config.zebra.auth());
     backend::apply_cleartext_policy(
@@ -239,6 +239,11 @@ pub async fn run(config: &AppConfig, args: &InitArgs) -> anyhow::Result<()> {
             rfc1918_is_local: config.backend.rfc1918_is_local,
             allow_remote_cleartext: config.backend.allow_remote_cleartext,
         },
+    );
+    backend::apply_tls(&mut server, config.backend.tls_options());
+    backend::apply_transparent_capability_override(
+        &mut server,
+        config.backend.assume_transparent_in_compact_blocks,
     );
     let mut client = server
         .connect_timeout(Duration::from_secs(config.backend.connect_timeout_secs))

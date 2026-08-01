@@ -47,7 +47,8 @@ use zip321::TransactionRequest;
 use crate::backend::Server;
 use crate::backoff::Backoff;
 use crate::chain::{
-    AnySource, BroadcastOutcome, ChainSource, MempoolStream, ServerInfo, UnsupportedUpgrade,
+    AnySource, BroadcastOutcome, ChainSource, MempoolStream, ServerInfo, TxEvidence,
+    UnsupportedUpgrade,
 };
 use crate::config::SendPrivacy;
 use crate::error::{codes, RpcError};
@@ -244,6 +245,7 @@ struct SendCompletion {
 const PREPARE_TIMEOUT: Duration = Duration::from_secs(60);
 /// Unary calls (broadcast, tip refresh, tx fetch) on the live channel.
 const UNARY_RPC_TIMEOUT: Duration = Duration::from_secs(30);
+
 /// Minimum spacing between retries after a sync error, so a persistent failure (e.g. an
 /// unrecoverable reorg) can't spin the actor loop at full speed reconnecting and re-failing.
 const SYNC_ERROR_RETRY_INTERVAL: Duration = Duration::from_secs(2);
@@ -353,7 +355,7 @@ struct EnhanceProgress {
 /// Whether a [`TransactionDataRequest`] is one zecd can actually service (and therefore one that
 /// counts toward the enhancement backlog). All three variants drain: `GetStatus`/`Enhancement` via
 /// `fetch_full_tx`, and `TransactionsInvolvingAddress` via the transparent address-index query
-/// (`fetch_transparent_txids` + `notify_address_checked`), which converges once the address is
+/// (`fetch_transparent_tx_evidence` + `notify_address_checked`), which converges once the address is
 /// recorded as checked, so it doesn't pin the backlog above zero.
 fn is_serviceable_request(req: &TransactionDataRequest) -> bool {
     matches!(
@@ -388,6 +390,32 @@ fn is_serviceable_request(req: &TransactionDataRequest) -> bool {
 fn tia_check_range(block_range_start: u32, chain_tip: u32) -> Option<(u32, u32)> {
     let start = block_range_start.max(1);
     (start <= chain_tip).then_some((start, chain_tip))
+}
+
+/// Why a connected upstream is unusable for this wallet, if it is: a transparent-enabled wallet
+/// needs a backend whose block scan carries transparent data.
+///
+/// zecd used to work around a server that could not (lightwalletd before 0.5.0) by polling the
+/// address index per address - a whole parallel receive-discovery path, quadratically expensive
+/// on a large address set, and one that only ever mattered for servers the ecosystem has since
+/// moved off. Now the requirement is stated instead: transparent receives ride the block scan on
+/// every supported backend. Refusing is what keeps the removal safe, since the failure it
+/// replaces would otherwise be silent - transparent funds simply never appearing.
+///
+/// Shielded-only wallets (the default) are unaffected and work against any server.
+fn transparent_capability_error(
+    transparent_enabled: bool,
+    block_scan_covers: bool,
+) -> Option<&'static str> {
+    (transparent_enabled && !block_scan_covers).then_some(
+        "this wallet has transparent receiving enabled ([pools] transparent = true), but the \
+         upstream lightwalletd does not advertise that it serves transparent data in compact \
+         blocks. Transparent receives would never be discovered. Note that no released \
+         lightwalletd populates the advertisement yet, so a 0.5.x server that does serve the \
+         data still reports this: set [backend] assume_transparent_in_compact_blocks = true to \
+         assert the capability. Otherwise upgrade the server, point [backend] server at your \
+         own zebra, or disable [pools] transparent",
+    )
 }
 
 /// Height-based block-scan progress in `[0, 1]`: how much of the wallet's scan range
@@ -1442,8 +1470,8 @@ impl WalletActor {
                             // pull the full data (memos, …) for transactions seen only as compact
                             // blocks, and (re)subscribe to incoming mempool txs for 0-conf visibility.
                             // (Transparent receives are discovered by the block scan itself - see
-                            // `sync_step` - and at 0-conf by the mempool path below; no separate
-                            // per-address `getaddressutxos` pass is needed.)
+                            // `sync_step` - and at 0-conf by the mempool path below, on every
+                            // supported backend.)
                             self.maybe_rebroadcast().await;
                             // Drain one bounded batch of the enhancement backlog. Keep `more_work`
                             // set while requests remain so the loop keeps draining (servicing queued
@@ -1778,6 +1806,7 @@ impl WalletActor {
             client,
             &mut self.db_data,
             self.network,
+            self.transparent_enabled,
             &mut self.subtree_roots_synced,
             PREPARE_TIMEOUT,
         )
@@ -2027,39 +2056,34 @@ impl WalletActor {
                     u32::from(addr_req.block_range_start()),
                     u32::from(chain_tip),
                 ) else {
+                    // Log the skip: an unserviceable spend-search is otherwise invisible, which
+                    // makes "the wallet never found the spend" indistinguishable from "the
+                    // request was never emitted" when reading a failing restore's logs.
+                    use zcash_keys::encoding::AddressCodec as _;
+                    tracing::debug!(
+                        "[{}] TIA: skipping address={} - range starts at {}, past the tip {}",
+                        self.name,
+                        addr_req.address().encode(&self.network),
+                        u32::from(addr_req.block_range_start()),
+                        u32::from(chain_tip),
+                    );
                     return Ok(());
                 };
                 let address = addr_req.address().encode(&self.network);
                 tracing::debug!(
-                    "[{}] TIA: getaddresstxids addr={address} range={start}..={as_of}",
+                    "[{}] TIA: address-txid query addr={address} range={start}..={as_of}",
                     self.name
                 );
-                let txids = self
-                    .fetch_transparent_txids(vec![address], start, as_of)
+                let evidence = self
+                    .fetch_transparent_tx_evidence(vec![address], start, as_of)
                     .await
                     .map_err(|e| anyhow!("{e}"))?;
                 tracing::debug!(
-                    "[{}] TIA: getaddresstxids returned {} txid(s)",
+                    "[{}] TIA: address-txid query returned {} item(s)",
                     self.name,
-                    txids.len()
+                    evidence.len()
                 );
-                for txid in txids {
-                    // The extended range can cover a whole restore's history for a heavily
-                    // reused address, so bail between fetches on Ctrl-C/`stop` rather than
-                    // fetching it out. Nothing is notified below, so the request is simply
-                    // re-serviced on the next run; each already-stored tx is kept.
-                    if *self.shutdown.borrow() {
-                        return Err(anyhow!("shutdown during address check"));
-                    }
-                    if let Some((tx, mined)) = self.fetch_full_tx(txid, chain_tip).await? {
-                        decrypt_and_store_transaction(
-                            &self.network,
-                            &mut self.db_data,
-                            &tx,
-                            mined,
-                        )?;
-                    }
-                }
+                self.store_tx_evidence(evidence, chain_tip).await?;
                 // Record the address as checked up to `as_of` (the inclusive end), whether or not
                 // any txs were found, so the request converges instead of being re-emitted every
                 // caught-up pass. The backend insists the notified height equal the request's
@@ -2081,6 +2105,51 @@ impl WalletActor {
                 self.db_data
                     .notify_address_checked(checked, BlockHeight::from_u32(as_of))?;
             }
+        }
+        Ok(())
+    }
+
+    /// Store every transaction named by a batch of [`TxEvidence`] (from a transparent
+    /// address-history query): parse-or-fetch, `decrypt_and_store_transaction`, and run the
+    /// transparent receive matcher. Shared by the TIA servicing arm and the offline-window sweep.
+    ///
+    /// The receive matcher runs belt-and-braces: librustzcash's `store_decrypted_tx` attributes
+    /// transparent outputs against the `addresses` table itself on this line, but
+    /// `record_tx_transparent_receives` is byte-for-byte the path the block scan and mempool use,
+    /// and `put_received_transparent_utxo` is idempotent - so recording here guarantees a swept
+    /// receive lands identically to one the block scan would have found.
+    async fn store_tx_evidence(
+        &mut self,
+        evidence: Vec<TxEvidence>,
+        chain_tip: BlockHeight,
+    ) -> anyhow::Result<()> {
+        for item in evidence {
+            // The evidence can cover a whole restore's history for a heavily reused address,
+            // so bail between fetches on Ctrl-C/`stop` rather than fetching it out. Callers
+            // notify nothing on this error, so the request is simply re-serviced on the next
+            // run; each already-stored tx is kept.
+            if *self.shutdown.borrow() {
+                return Err(anyhow!("shutdown during address check"));
+            }
+            let (tx, mined) = match item {
+                // zebra: txid only - fetch the full tx before storing.
+                TxEvidence::Txid(txid) => match self.fetch_full_tx(txid, chain_tip).await? {
+                    Some(found) => found,
+                    None => continue,
+                },
+                // lightwalletd: `GetTaddressTxids` already streamed the full raw tx - parse and
+                // store it directly, no re-fetch.
+                TxEvidence::Raw(raw) => {
+                    let mined = raw.mined_height.map(BlockHeight::from_u32);
+                    let tx = Transaction::read(
+                        &raw.data[..],
+                        BranchId::for_height(&self.network, mined.unwrap_or(chain_tip)),
+                    )?;
+                    (tx, mined)
+                }
+            };
+            decrypt_and_store_transaction(&self.network, &mut self.db_data, &tx, mined)?;
+            self.record_tx_transparent_receives(&tx, mined);
         }
         Ok(())
     }
@@ -4788,15 +4857,16 @@ impl WalletActor {
         }
     }
 
-    /// Query the upstream for all txids touching a transparent address in `[start, end]`
-    /// (`getaddresstxids`). A transport failure drops the client (so the next op reconnects) and
-    /// surfaces as `Err`; an unseen address simply yields an empty list.
-    async fn fetch_transparent_txids(
+    /// Query the upstream for evidence of every tx touching a transparent address in
+    /// `[start, end]` (zebra `getaddresstxids`; lightwalletd `GetTaddressTxids`). A transport
+    /// failure drops the client (so the next op reconnects) and surfaces as `Err`; an unseen
+    /// address simply yields an empty list.
+    async fn fetch_transparent_tx_evidence(
         &mut self,
         addresses: Vec<String>,
         start: u32,
         end: u32,
-    ) -> Result<Vec<TxId>, RpcError> {
+    ) -> Result<Vec<TxEvidence>, RpcError> {
         if self.client.is_none() {
             self.connect().await.map_err(|e| {
                 upstream_error(&self.name, e, "could not connect to the upstream node")
@@ -4809,10 +4879,10 @@ impl WalletActor {
                 .ok_or_else(|| RpcError::misc("not connected to upstream"))?;
             tokio::time::timeout(
                 UNARY_RPC_TIMEOUT,
-                client.transparent_txids(addresses, start, end),
+                client.transparent_tx_evidence(addresses, start, end),
             )
             .await
-            .map_err(|_| anyhow!("getaddresstxids timed out after {UNARY_RPC_TIMEOUT:?}"))
+            .map_err(|_| anyhow!("address-txid query timed out after {UNARY_RPC_TIMEOUT:?}"))
             .and_then(|r| r)
         };
         match result {
@@ -4969,11 +5039,18 @@ async fn prepare_client<C: ChainSource>(
     client: &mut C,
     db_data: &mut WriteDb,
     network: ZNetwork,
+    transparent_enabled: bool,
     roots_synced: &mut bool,
     budget: Duration,
 ) -> anyhow::Result<ServerInfo> {
     tokio::time::timeout(budget, async {
         let info = verify_server_network(client, network).await?;
+        if let Some(why) = transparent_capability_error(
+            transparent_enabled,
+            client.block_scan_covers_transparent(),
+        ) {
+            return Err(anyhow!("{why}"));
+        }
         if !*roots_synced {
             engine::update_subtree_roots(client, db_data).await?;
             *roots_synced = true;
@@ -5688,6 +5765,27 @@ mod tests {
         // and the caller must not notify - the old code notified anyway and tripped the backend's
         // `as_of == block_range_end - 1` check, aborting the enhancement pass every time.
         assert_eq!(tia_check_range(101, 100), None);
+    }
+
+    #[test]
+    fn a_server_without_transparent_block_data_is_refused_only_when_it_matters() {
+        use super::transparent_capability_error;
+        // The default wallet is shielded-only and works against any server, old or new.
+        assert!(transparent_capability_error(false, false).is_none());
+        assert!(transparent_capability_error(false, true).is_none());
+        // So does a transparent wallet on a backend whose block scan carries transparent data
+        // (zebra, or lightwalletd 0.5.0+).
+        assert!(transparent_capability_error(true, true).is_none());
+        // The one refused combination. The message has to name the fix, because the failure it
+        // replaces - transparent receives silently never appearing - gives no other clue. The
+        // most likely fix is the override: no released lightwalletd advertises the capability,
+        // so a server that *does* serve the data still lands here.
+        let why = transparent_capability_error(true, false).expect("must be refused");
+        assert!(
+            why.contains("assume_transparent_in_compact_blocks"),
+            "should name the override knob: {why}"
+        );
+        assert!(why.contains("transparent"), "{why}");
     }
 
     #[test]

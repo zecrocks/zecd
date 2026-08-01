@@ -16,10 +16,20 @@ use zcash_client_backend::data_api::wallet::ConfirmationsPolicy;
 use crate::network::ZNetwork;
 use crate::pools::{Pool, PoolSet};
 
-/// Default chain upstream: a local zebrad's JSON-RPC (`zebra://127.0.0.1:8234` on mainnet,
-/// `zebra://127.0.0.1:18234` on testnet/regtest - see `backend::ZEBRA_RPC_PORT_*`). A zebrad
-/// on another host/port is set via `[backend] server = "zebra://host:port"`.
+/// Default chain upstream: a local zebrad's JSON-RPC ("full mode"). Public keeps the bare
+/// `zebra` shorthand as the default rather than spelling the authority out; `backend::resolve`
+/// expands it to `127.0.0.1:8234` on mainnet / `:18234` on testnet and regtest (see
+/// `backend::ZEBRA_RPC_PORT_*`). A zebrad on another host/port is
+/// `[backend] server = "zebra://host:port"`, and `backend::resolve` documents the full token
+/// grammar including the light-mode forms.
 pub const DEFAULT_SERVER: &str = "zebra";
+
+/// The built-in `server` token for `network`, used when neither `--server` nor `[backend]
+/// server` is set. Network-independent here, since the shorthand resolves per network.
+/// (`backend::tests::default_server_resolves_to_local_zebrad_per_network` pins that.)
+pub fn default_server(_network: ZNetwork) -> &'static str {
+    DEFAULT_SERVER
+}
 
 /// Binary configuration defaults (config file, datadir, ports).
 pub struct BinaryDefaults {
@@ -282,8 +292,9 @@ impl WalletEntry {
 
 #[derive(Debug, Clone)]
 pub struct BackendConfig {
-    /// The upstream server token: `zebra` (a local zebrad, the default) or
-    /// `zebra://host:port` / `host:port`.
+    /// The upstream server token: `zebra` (a local zebrad, the default),
+    /// `zebra://host:port`, the `zecrocks` public-lightwalletd preset, or a lightwalletd
+    /// endpoint (`https://host[:port]` / `http://host:port` / bare `host:port`).
     pub server: String,
     /// Per-attempt dial timeout (seconds) for connecting to the backend endpoint.
     pub connect_timeout_secs: u64,
@@ -302,6 +313,58 @@ pub struct BackendConfig {
     /// Set this only when the hop to a remote zebra is secured out-of-band (SSH/WireGuard tunnel,
     /// private overlay).
     pub allow_remote_cleartext: bool,
+    /// lightwalletd TLS mode: `None` ("auto", the default) uses the locality heuristic
+    /// (loopback/private plaintext, public TLS); `Some(true/false)` forces it. Ignored by
+    /// `zebra://` endpoints (always plaintext) and overridden per-endpoint by an explicit
+    /// `https://`/`http://` scheme.
+    pub tls: Option<bool>,
+    /// Which root certificates lightwalletd TLS trusts (`native` = OS store, the default;
+    /// `webpki` = the embedded Mozilla bundle).
+    pub tls_roots: crate::backend::TlsRoots,
+    /// Accept *any* lightwalletd TLS certificate - no chain-of-trust or hostname check. Off by
+    /// default. The connection stays encrypted but is no longer authenticated, so an on-path
+    /// attacker can impersonate the server and observe every address and txid this wallet asks
+    /// about. `tls_pinned_sha256` is the better answer for a self-signed certificate: it
+    /// authenticates the server rather than giving up on doing so.
+    pub tls_insecure_skip_verify: bool,
+    /// PEM contents of a private CA to trust for lightwalletd TLS (`tls_ca_file`), read at
+    /// config load. Added to the public roots, so a private-CA-issued certificate validates
+    /// normally - hostname and expiry included.
+    pub tls_ca_pem: Option<Vec<u8>>,
+    /// Where [`tls_ca_pem`](Self::tls_ca_pem) was read from. Kept alongside the bytes purely so
+    /// the setting can be *reported* by its key (`zecd config show` renders the effective
+    /// configuration in its own TOML syntax, and a PEM blob is not a value that can be written
+    /// back as `tls_ca_file`). Nothing on the connect path reads it.
+    pub tls_ca_file: Option<PathBuf>,
+    /// Acceptable lightwalletd leaf-certificate SHA-256 fingerprints (`tls_pinned_sha256`).
+    /// Non-empty pins the connection to those certificates; combined with `tls_ca_file` the
+    /// chain is validated against that CA as well.
+    pub tls_pins: Vec<crate::backend::CertFingerprint>,
+    /// Operator assertion that the upstream lightwalletd serves transparent (and ironwood) data
+    /// inside compact blocks, overriding the `GetLightdInfo.lightwalletProtocolVersion` probe.
+    ///
+    /// The probe exists because a server that cannot serve that data would silently never
+    /// discover transparent receives. But no released lightwalletd populates the field yet - it
+    /// is specified in the lightwallet protocol and left empty by the reference implementation -
+    /// so the probe reports "incapable" even for a 0.5.x server that does serve the data. This
+    /// knob is the operator's way to say "I know what my server does". Off by default: guessing
+    /// wrong reintroduces exactly the silent-loss failure the probe is there to prevent.
+    ///
+    /// Ignored by `zebra://` endpoints, which always cover transparent data.
+    pub assume_transparent_in_compact_blocks: bool,
+}
+
+impl BackendConfig {
+    /// The resolved TLS settings for the lightwalletd dial.
+    pub fn tls_options(&self) -> crate::backend::TlsOptions {
+        crate::backend::TlsOptions {
+            force_tls: self.tls,
+            roots: self.tls_roots,
+            insecure_skip_verify: self.tls_insecure_skip_verify,
+            ca_pem: self.tls_ca_pem.clone(),
+            pins: self.tls_pins.clone(),
+        }
+    }
 }
 
 /// `[zebra]` - credentials for the `zebra://host:port` endpoint (direct-to-zebrad mode).
@@ -587,6 +650,21 @@ struct BackendFile {
     reconnect_max_secs: Option<u64>,
     rfc1918_is_local: Option<bool>,
     allow_remote_cleartext: Option<bool>,
+    /// lightwalletd TLS mode: `auto` (default) / `yes` / `no`.
+    tls: Option<String>,
+    /// lightwalletd TLS root store: `native` (default) / `webpki`.
+    tls_roots: Option<String>,
+    /// Accept any lightwalletd TLS certificate (default `false`). Unsafe - see
+    /// [`BackendConfig::tls_insecure_skip_verify`].
+    tls_insecure_skip_verify: Option<bool>,
+    /// Path to a PEM bundle holding a private CA to trust for lightwalletd TLS.
+    tls_ca_file: Option<PathBuf>,
+    /// SHA-256 leaf-certificate fingerprints to pin lightwalletd TLS to (`openssl x509 -noout
+    /// -fingerprint -sha256` form; colons optional, case-insensitive).
+    tls_pinned_sha256: Option<Vec<String>>,
+    /// Assert that the upstream lightwalletd serves transparent data in compact blocks - see
+    /// [`BackendConfig::assume_transparent_in_compact_blocks`].
+    assume_transparent_in_compact_blocks: Option<bool>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -1075,6 +1153,12 @@ impl AppConfig {
             reconnect_max_secs: None,
             rfc1918_is_local: None,
             allow_remote_cleartext: None,
+            tls: None,
+            tls_roots: None,
+            tls_insecure_skip_verify: None,
+            tls_ca_file: None,
+            tls_pinned_sha256: None,
+            assume_transparent_in_compact_blocks: None,
         });
         let server = select_server_token(cli.server.clone(), backend_file.server);
         let reconnect_base_secs = backend_file.reconnect_base_secs.unwrap_or(1).max(1);
@@ -1088,7 +1172,39 @@ impl AppConfig {
                 .max(reconnect_base_secs),
             rfc1918_is_local: backend_file.rfc1918_is_local.unwrap_or(true),
             allow_remote_cleartext: backend_file.allow_remote_cleartext.unwrap_or(false),
+            tls: match backend_file.tls.as_deref() {
+                Some(mode) => crate::backend::parse_tls_mode(mode).context("[backend] tls")?,
+                None => None,
+            },
+            tls_roots: match backend_file.tls_roots.as_deref() {
+                Some(roots) => {
+                    crate::backend::TlsRoots::parse(roots).context("[backend] tls_roots")?
+                }
+                None => crate::backend::TlsRoots::default(),
+            },
+            tls_insecure_skip_verify: backend_file.tls_insecure_skip_verify.unwrap_or(false),
+            // Read now, not at connect time: an unreadable or malformed CA file must fail
+            // startup rather than leave the daemon quietly falling back to the public roots
+            // (the same fail-fast rule `[rpc] password_file` follows).
+            tls_ca_pem: match backend_file.tls_ca_file.as_deref() {
+                Some(path) => Some(std::fs::read(path).with_context(|| {
+                    format!("reading [backend] tls_ca_file {}", path.display())
+                })?),
+                None => None,
+            },
+            tls_ca_file: backend_file.tls_ca_file.clone(),
+            tls_pins: backend_file
+                .tls_pinned_sha256
+                .unwrap_or_default()
+                .iter()
+                .map(|s| crate::backend::CertFingerprint::parse(s))
+                .collect::<anyhow::Result<Vec<_>>>()
+                .context("[backend] tls_pinned_sha256")?,
+            assume_transparent_in_compact_blocks: backend_file
+                .assume_transparent_in_compact_blocks
+                .unwrap_or(false),
         };
+        validate_backend_tls(&backend)?;
 
         let zebra_file = file.zebra.unwrap_or_default();
         let zebra = ZebraConfig {
@@ -1295,6 +1411,38 @@ pub fn reject_placeholder_password(config: &AppConfig) -> anyhow::Result<()> {
 /// Resolve and validate the global `[pools]` section. `enabled` defaults to Orchard-only;
 /// `default_receivers` defaults to the enabled set. The receivers must be a subset of the
 /// enabled pools.
+/// Reject `[backend]` TLS settings that contradict each other, at load rather than at connect.
+///
+/// The failure being prevented is a *silent* one: a pin or a private CA that is never consulted
+/// looks in the config exactly like one that is, so an operator who believes the connection is
+/// authenticated would have no signal that it isn't. Two shapes are caught here (the third, a
+/// bare `host:port` that the locality heuristic resolves to plaintext, is caught at connect,
+/// where the heuristic has run).
+fn validate_backend_tls(backend: &BackendConfig) -> anyhow::Result<()> {
+    let authenticating = backend.tls_ca_pem.is_some() || !backend.tls_pins.is_empty();
+    if authenticating && backend.tls_insecure_skip_verify {
+        anyhow::bail!(
+            "[backend] tls_insecure_skip_verify = true cannot be combined with \
+             tls_pinned_sha256/tls_ca_file: it disables the very check they configure. Remove \
+             tls_insecure_skip_verify - a pin authenticates a self-signed certificate without \
+             giving up verification"
+        );
+    }
+    if authenticating && backend.tls == Some(false) {
+        anyhow::bail!(
+            "[backend] tls_pinned_sha256/tls_ca_file require TLS, but tls = \"no\" forces a \
+             plaintext connection where neither can be checked"
+        );
+    }
+    if authenticating && backend.server.starts_with("http://") {
+        anyhow::bail!(
+            "[backend] tls_pinned_sha256/tls_ca_file require TLS, but the http:// server token \
+             forces a plaintext connection where neither can be checked; use https://"
+        );
+    }
+    Ok(())
+}
+
 fn resolve_global_pools(file: Option<&PoolsFile>) -> anyhow::Result<PoolsConfig> {
     let enabled = match file.and_then(|f| f.enabled.as_deref()) {
         Some(tokens) => PoolSet::parse(tokens).context("[pools] enabled")?,
@@ -1854,6 +2002,120 @@ mod tests {
             toml::from_str("rfc1918_is_local = false\nallow_remote_cleartext = true").unwrap();
         assert_eq!(f.rfc1918_is_local, Some(false));
         assert_eq!(f.allow_remote_cleartext, Some(true));
+    }
+
+    #[test]
+    fn backend_file_parses_transparent_capability_override() {
+        // Absent by default - asserting a capability the server does not advertise has to be a
+        // deliberate act, since guessing wrong loses transparent receives silently.
+        let f: BackendFile = toml::from_str("server = \"zecrocks\"").unwrap();
+        assert_eq!(f.assume_transparent_in_compact_blocks, None);
+        let f: BackendFile = toml::from_str("assume_transparent_in_compact_blocks = true").unwrap();
+        assert_eq!(f.assume_transparent_in_compact_blocks, Some(true));
+    }
+
+    #[test]
+    fn backend_file_parses_tls_options() {
+        // Unset is the safe default: verification stays on, with no private CA and no pins.
+        let f: BackendFile = toml::from_str("tls = \"yes\"\ntls_roots = \"webpki\"").unwrap();
+        assert_eq!(f.tls.as_deref(), Some("yes"));
+        assert_eq!(f.tls_roots.as_deref(), Some("webpki"));
+        assert_eq!(f.tls_insecure_skip_verify, None);
+        assert_eq!(f.tls_ca_file, None);
+        assert_eq!(f.tls_pinned_sha256, None);
+        // …and each of the three trust knobs has to be asked for explicitly.
+        let f: BackendFile = toml::from_str("tls_insecure_skip_verify = true").unwrap();
+        assert_eq!(f.tls_insecure_skip_verify, Some(true));
+        let f: BackendFile = toml::from_str(
+            "tls_ca_file = \"/etc/zecd/ca.pem\"\ntls_pinned_sha256 = [\"AB:CD\", \"ef01\"]",
+        )
+        .unwrap();
+        assert_eq!(f.tls_ca_file, Some(PathBuf::from("/etc/zecd/ca.pem")));
+        assert_eq!(
+            f.tls_pinned_sha256,
+            Some(vec!["AB:CD".to_string(), "ef01".to_string()])
+        );
+    }
+
+    /// A `BackendConfig` with everything at its default, for the TLS-combination checks.
+    fn backend_cfg() -> BackendConfig {
+        BackendConfig {
+            server: "zecrocks".into(),
+            connect_timeout_secs: 10,
+            reconnect_base_secs: 1,
+            reconnect_max_secs: 60,
+            rfc1918_is_local: true,
+            allow_remote_cleartext: false,
+            tls: None,
+            tls_roots: Default::default(),
+            tls_insecure_skip_verify: false,
+            tls_ca_pem: None,
+            tls_ca_file: None,
+            tls_pins: Vec::new(),
+            assume_transparent_in_compact_blocks: false,
+        }
+    }
+
+    #[test]
+    fn tls_trust_settings_compose_and_contradictions_are_rejected() {
+        let pin = crate::backend::CertFingerprint::parse(&"ab".repeat(32)).unwrap();
+
+        // Each knob alone is fine, and so is the pin + private-CA combination (pin the leaf,
+        // validate the chain) - "optional everywhere" is the point of these settings.
+        for cfg in [
+            backend_cfg(),
+            BackendConfig {
+                tls_insecure_skip_verify: true,
+                ..backend_cfg()
+            },
+            BackendConfig {
+                tls_ca_pem: Some(b"pem".to_vec()),
+                ..backend_cfg()
+            },
+            BackendConfig {
+                tls_pins: vec![pin],
+                ..backend_cfg()
+            },
+            BackendConfig {
+                tls_ca_pem: Some(b"pem".to_vec()),
+                tls_pins: vec![pin],
+                ..backend_cfg()
+            },
+        ] {
+            assert!(validate_backend_tls(&cfg).is_ok());
+        }
+
+        // Skipping verification cannot be combined with settings whose whole purpose is to
+        // verify - that config would look authenticated while being anything but.
+        let err = validate_backend_tls(&BackendConfig {
+            tls_insecure_skip_verify: true,
+            tls_pins: vec![pin],
+            ..backend_cfg()
+        })
+        .unwrap_err();
+        assert!(err.to_string().contains("tls_insecure_skip_verify"));
+
+        // Nor can they ride a connection that will not be TLS at all, whether that is forced by
+        // `tls = "no"`…
+        assert!(validate_backend_tls(&BackendConfig {
+            tls: Some(false),
+            tls_pins: vec![pin],
+            ..backend_cfg()
+        })
+        .is_err());
+        // …or by an http:// endpoint.
+        assert!(validate_backend_tls(&BackendConfig {
+            server: "http://lwd.example.com:9067".into(),
+            tls_ca_pem: Some(b"pem".to_vec()),
+            ..backend_cfg()
+        })
+        .is_err());
+        // A plaintext endpoint with no trust settings stays valid - that is the regtest harness.
+        assert!(validate_backend_tls(&BackendConfig {
+            server: "http://127.0.0.1:9067".into(),
+            ..backend_cfg()
+        })
+        .is_ok());
     }
 
     #[test]

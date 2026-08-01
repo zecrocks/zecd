@@ -5,7 +5,7 @@
 //! | operation             | zebrad JSON-RPC                                            |
 //! |-----------------------|------------------------------------------------------------|
 //! | `latest_block`        | `getblockchaininfo` (height + best hash)                   |
-//! | `tree_state`          | `z_gettreestate` (finalState hex -> protobuf `TreeState`)   |
+//! | `tree_state`          | `z_gettreestate` (finalState hex → protobuf `TreeState`)   |
 //! | `compact_block_range` | `getblock verbosity=0` (raw block, parsed + compacted      |
 //! |                       | locally) + `getblock verbosity=1` (`trees` sizes)          |
 //! | `subtree_roots`       | `z_getsubtreesbyindex`                                     |
@@ -17,7 +17,7 @@
 //! |                       | closes when `getbestblockhash` changes (lightwalletd       |
 //! |                       | parity: stream-close is the actor's sync-now signal)       |
 //!
-//! The full-block->CompactBlock conversion ([`block_to_compact`]) is the part lightwalletd
+//! The full-block→CompactBlock conversion ([`block_to_compact`]) is the part lightwalletd
 //! otherwise does for us: parse the raw block (`zcash_primitives::block::Block`), then per
 //! transaction extract the trial-decryption fields via librustzcash's own `From` impls
 //! (Sapling nullifier/cmu/epk + 52-byte ciphertext prefix; Orchard nullifier/cmx/epk +
@@ -53,8 +53,8 @@ use zcash_protocol::consensus::BlockHeight;
 use zcash_protocol::{ShieldedPool, TxId};
 
 use super::{
-    BroadcastOutcome, ChainSource, ChainTip, CompactBlockStream, FetchedTx, MempoolStream,
-    ServerInfo, SubtreeRootInfo, UpgradeInfo, UpgradeStatus,
+    AbortOnDrop, BroadcastOutcome, ChainSource, ChainTip, CompactBlockStream, FetchedTx,
+    MempoolStream, ServerInfo, SubtreeRootInfo, UpgradeInfo, UpgradeStatus,
 };
 use crate::network::ZNetwork;
 
@@ -198,7 +198,7 @@ pub struct CleartextPolicy {
     /// Treat private / non-globally-routable addresses (RFC1918 `10/172.16/192.168`, link-local,
     /// CGNAT `100.64/10`, IPv6 unique-local `fc00::/7` and link-local `fe80::/10`) as "local", so
     /// a credentialed connect to a container/LAN zebra is allowed without an override. Default
-    /// `true` (matches the self-hosted `zebra -> zecd` Docker/LAN norm); set `false` for a strict
+    /// `true` (matches the self-hosted `zebra → zecd` Docker/LAN norm); set `false` for a strict
     /// loopback-only posture. `[backend] rfc1918_is_local`.
     pub rfc1918_is_local: bool,
     /// Allow credentials over cleartext to *any* host, including globally-routable ones - the
@@ -241,7 +241,7 @@ fn host_is_loopback(host: &str) -> bool {
 /// globally-routable host never qualifies, so credentials there would cross the internet in the
 /// clear - that is what the gate refuses. A hostname other than `localhost` is treated as
 /// non-local (no DNS lookup - fail closed).
-fn host_is_local(host: &str, rfc1918_is_local: bool) -> bool {
+pub(crate) fn host_is_local(host: &str, rfc1918_is_local: bool) -> bool {
     match parse_host_ip(host) {
         Some(ip) => ip.is_loopback() || (rfc1918_is_local && ip_is_private_network(ip)),
         None => host.eq_ignore_ascii_case("localhost"),
@@ -546,7 +546,7 @@ struct Trees {
     #[serde(default)]
     orchard: Option<TreeSize>,
     // Present only on the zebra ironwood branch (its `trees` gains an ironwood entry). Absent on
-    // stock zebra -> `None` -> size 0, which is correct pre-activation and in the default build.
+    // stock zebra → `None` → size 0, which is correct pre-activation and in the default build.
     #[serde(default)]
     ironwood: Option<TreeSize>,
 }
@@ -798,15 +798,17 @@ impl ChainSource for ZebraSource {
         Ok(Some(FetchedTx { data, mined_height }))
     }
 
-    async fn transparent_txids(
+    async fn transparent_tx_evidence(
         &mut self,
         addresses: Vec<String>,
         start: u32,
         end: u32,
-    ) -> anyhow::Result<Vec<TxId>> {
+    ) -> anyhow::Result<Vec<super::TxEvidence>> {
         // zcashd/zebra `getaddresstxids` takes an object param (with a batch of addresses) and
-        // returns display-hex txids in chain order. Valid-but-unseen addresses yield `[]`; an error
-        // is transport/application and propagates (dropping the client).
+        // returns display-hex txids in chain order - txids only, so the evidence is
+        // `TxEvidence::Txid` and the caller re-fetches any tx it needs. Valid-but-unseen
+        // addresses yield `[]`; an error is transport/application and propagates (dropping the
+        // client).
         let params = json!([{ "addresses": addresses, "start": start, "end": end }]);
         tracing::debug!(
             "getaddresstxids req addrs={} start={start} end={end}",
@@ -820,53 +822,15 @@ impl ChainSource for ZebraSource {
         tracing::debug!("getaddresstxids resp -> {} txid(s)", hexes.len());
         let mut out = Vec::with_capacity(hexes.len());
         for h in hexes {
-            out.push(parse_display_txid(&h)?);
+            out.push(super::TxEvidence::Txid(parse_display_txid(&h)?));
         }
         Ok(out)
     }
 
-    async fn get_address_utxos(
-        &mut self,
-        addresses: Vec<String>,
-    ) -> anyhow::Result<Vec<super::TransparentUtxo>> {
-        // zcashd/zebra `getaddressutxos` takes `{ addresses, chainInfo }` and returns every
-        // currently-unspent output paying those addresses (no height filter). `txid` is big-endian
-        // (display) hex; `outputIndex`/`satoshis`/`height` are numeric; `script` is hex. An error is
-        // transport/application and propagates (dropping the client).
-        #[derive(serde::Deserialize)]
-        struct Entry {
-            txid: String,
-            #[serde(rename = "outputIndex")]
-            output_index: u32,
-            script: String,
-            satoshis: u64,
-            height: u32,
-        }
-        let params = json!([{ "addresses": addresses, "chainInfo": false }]);
-        tracing::debug!("getaddressutxos req addrs={}", addresses.len());
-        let entries: Vec<Entry> = self
-            .client
-            .call_as("getaddressutxos", params)
-            .await
-            .context("getaddressutxos")?;
-        tracing::debug!("getaddressutxos resp -> {} utxo(s)", entries.len());
-        let mut out = Vec::with_capacity(entries.len());
-        for e in entries {
-            out.push(super::TransparentUtxo {
-                txid: parse_display_txid(&e.txid)?,
-                index: e.output_index,
-                value_zat: e.satoshis,
-                script: hex::decode(&e.script).context("getaddressutxos script hex")?,
-                height: Some(e.height),
-                // `getaddressutxos` carries no coinbase marker (the same gap the upstream
-                // FIXME on `excluding_immature_coinbase_outputs` notes for lightwalletd's
-                // GetAddressUtxos); a consumer of this path would need the enhancement pass
-                // to backfill `tx_index`. The block-scan receive path - the one zecd actually
-                // records receives from - tags coinbase outputs itself.
-                coinbase_tx: None,
-            });
-        }
-        Ok(out)
+    fn block_scan_covers_transparent(&self) -> bool {
+        // The zebra backend parses every full block locally, so `include_transparent` always
+        // yields each block's complete transparent output set.
+        true
     }
 
     async fn subscribe_mempool(&mut self) -> anyhow::Result<MempoolStream> {
@@ -1097,14 +1061,6 @@ impl ZebraMempoolStream {
             // already reported) - lightwalletd's close-on-new-block signal.
             None => Ok(None),
         }
-    }
-}
-
-struct AbortOnDrop(tokio::task::JoinHandle<()>);
-
-impl Drop for AbortOnDrop {
-    fn drop(&mut self) {
-        self.0.abort();
     }
 }
 
@@ -1367,11 +1323,8 @@ mod tests {
         subtrees: Value,
         mempool: Vec<String>,
         raw_txs: HashMap<String, Value>,
-        /// `getaddresstxids` responses keyed by transparent address -> display-hex txids.
+        /// `getaddresstxids` responses keyed by transparent address → display-hex txids.
         addr_txids: HashMap<String, Vec<String>>,
-        /// `getaddressutxos` responses keyed by transparent address -> UTXO objects
-        /// (`{txid, outputIndex, script, satoshis, height}`).
-        addr_utxos: HashMap<String, Vec<Value>>,
         /// `Err((code, message))` makes `sendrawtransaction` reject.
         send: Result<String, (i64, String)>,
         /// When set, `sendrawtransaction` returns this exact `error` object verbatim,
@@ -1400,7 +1353,6 @@ mod tests {
                 mempool: Vec::new(),
                 raw_txs: HashMap::new(),
                 addr_txids: HashMap::new(),
-                addr_utxos: HashMap::new(),
                 send: Ok("00".repeat(32)),
                 send_error_object: None,
                 seen_auth: Vec::new(),
@@ -1485,20 +1437,6 @@ mod tests {
                     .collect();
                 reply(json!(txids))
             }
-            "getaddressutxos" => {
-                // Param is `{ "addresses": [...], "chainInfo": bool }`; returns the union of the
-                // configured UTXO objects across the requested addresses.
-                let addrs = params[0]["addresses"]
-                    .as_array()
-                    .cloned()
-                    .unwrap_or_default();
-                let utxos: Vec<Value> = addrs
-                    .iter()
-                    .filter_map(|a| a.as_str())
-                    .flat_map(|a| fake.addr_utxos.get(a).cloned().unwrap_or_default())
-                    .collect();
-                reply(json!(utxos))
-            }
             "sendrawtransaction" => match (&fake.send_error_object, &fake.send) {
                 (Some(error), _) => Json(json!({
                     "result": null,
@@ -1545,13 +1483,20 @@ mod tests {
         fake.addr_txids.insert(addr.clone(), vec![txid_hex.clone()]);
         let mut src = source_for(Arc::new(Mutex::new(fake))).await;
 
-        let got = src.transparent_txids(vec![addr], 1, 100).await.unwrap();
+        let got = src
+            .transparent_tx_evidence(vec![addr], 1, 100)
+            .await
+            .unwrap();
         assert_eq!(got.len(), 1);
-        assert_eq!(got[0].to_string(), txid_hex);
+        // zebra evidence is txid-only (the RPC returns no tx bodies).
+        let super::super::TxEvidence::Txid(txid) = &got[0] else {
+            panic!("zebra must return TxEvidence::Txid");
+        };
+        assert_eq!(txid.to_string(), txid_hex);
 
         // An address with no recorded txids yields an empty list, not an error.
         let none = src
-            .transparent_txids(vec!["t1Unseen".into()], 1, 100)
+            .transparent_tx_evidence(vec!["t1Unseen".into()], 1, 100)
             .await
             .unwrap();
         assert!(none.is_empty());
@@ -1566,48 +1511,11 @@ mod tests {
             .addr_txids
             .insert(b.clone(), vec![format!("33{}", "44".repeat(31))]);
         let mut src2 = source_for(Arc::new(Mutex::new(fake2))).await;
-        let both = src2.transparent_txids(vec![a, b], 1, 100).await.unwrap();
-        assert_eq!(both.len(), 2, "batch query unions txids across addresses");
-    }
-
-    #[tokio::test]
-    async fn get_address_utxos_maps_getaddressutxos() {
-        let mut fake = Fake::new();
-        let addr = "t1KnownTransparentAddressForTest".to_string();
-        let txid_hex = format!("aa{}", "bb".repeat(31));
-        fake.addr_utxos.insert(
-            addr.clone(),
-            vec![json!({
-                "address": addr,
-                "txid": txid_hex,
-                "outputIndex": 2,
-                // p2pkh script (25 bytes): OP_DUP OP_HASH160 <20> OP_EQUALVERIFY OP_CHECKSIG
-                "script": format!("76a914{}88ac", "00".repeat(20)),
-                "satoshis": 100_000_000u64,
-                "height": 42,
-            })],
-        );
-        let mut src = source_for(Arc::new(Mutex::new(fake))).await;
-
-        let utxos = src.get_address_utxos(vec![addr]).await.unwrap();
-        assert_eq!(utxos.len(), 1);
-        let u = &utxos[0];
-        assert_eq!(
-            u.txid.to_string(),
-            txid_hex,
-            "txid round-trips display order"
-        );
-        assert_eq!(u.index, 2);
-        assert_eq!(u.value_zat, 100_000_000);
-        assert_eq!(u.height, Some(42));
-        assert_eq!(u.script.len(), 25, "p2pkh script_pubkey decoded from hex");
-
-        // An address with no UTXOs yields an empty list, not an error.
-        let none = src
-            .get_address_utxos(vec!["t1Unseen".into()])
+        let both = src2
+            .transparent_tx_evidence(vec![a, b], 1, 100)
             .await
             .unwrap();
-        assert!(none.is_empty());
+        assert_eq!(both.len(), 2, "batch query unions txids across addresses");
     }
 
     #[tokio::test]
@@ -1674,8 +1582,8 @@ mod tests {
 
     /// Regression guard for the tip-advance step of the -25 (already-expired) send fix: a
     /// spend's expiry height is derived from the wallet DB's chain tip, so before building one
-    /// the actor pulls the upstream's *real* tip into the DB and scans up to it (`do_send` ->
-    /// `sync_to_tip_for_send` -> `fetch_and_store_chain_tip`, then a catch-up scan). This covers
+    /// the actor pulls the upstream's *real* tip into the DB and scans up to it (`do_send` →
+    /// `sync_to_tip_for_send` → `fetch_and_store_chain_tip`, then a catch-up scan). This covers
     /// the tip-advance half: the DB starts at a stale height far below the upstream's, and one
     /// call must advance it to the upstream tip (the actor then scans the gap so the anchor is
     /// valid too). If the tip didn't advance, a send would expire against the stale height.
@@ -2202,7 +2110,9 @@ mod tests {
         let mut src = source_for(fake.clone())
             .await
             .with_mempool_poll(Duration::from_millis(20));
-        let MempoolStream::Zebra(mut stream) = src.subscribe_mempool().await.unwrap();
+        let MempoolStream::Zebra(mut stream) = src.subscribe_mempool().await.unwrap() else {
+            panic!("zebra source must yield a zebra mempool stream");
+        };
 
         // The current mempool is streamed first.
         let first = stream.message().await.unwrap().expect("first mempool tx");

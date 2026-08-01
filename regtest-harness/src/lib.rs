@@ -4,15 +4,17 @@
 //! its Bitcoin-Core-style JSON-RPC - `zecd` talks straight to zebrad. There is intentionally
 //! **no `zingo-infra`/`zcash_local_net` dependency**, and no compile-time zebra dependency
 //! either: blocks are mined with zebrad's own Regtest-only `generate` RPC (zebra ≥ 2.0.0),
-//! which runs the template->assemble->submit flow server-side against the node's own network
+//! which runs the template→assemble→submit flow server-side against the node's own network
 //! parameters. The harness is a pure black-box JSON-RPC driver, so it works unmodified against
 //! any zebrad release.
 //!
 //! The funded tests bring up a second `zecd` as the [funding wallet](Funder). It talks straight
-//! to the same zebrad over JSON-RPC, so the whole tier needs nothing but a node.
+//! to the same zebrad, so funding needs no lightwalletd; `lightwalletd` is spawned only when the
+//! `zecd` **under test** runs in light mode (`ZECD_REGTEST_BACKEND=lwd`, see [`attach_backend`]).
 //!
-//! Binaries are supplied by the caller via `$ZEBRAD_BIN` (see [`resolve_bin`]); in CI zebrad is
-//! extracted from the official `zfnd/zebra` image. `zecd` itself is the built release binary; the
+//! Binaries are supplied by the caller via `$ZEBRAD_BIN` / `$LIGHTWALLETD_BIN` (see
+//! [`resolve_bin`]); in CI zebrad is extracted from the official `zfnd/zebra` image and
+//! lightwalletd is built from a release tag. `zecd` itself is the built release binary; the
 //! funder's `zecd` comes from `$ZECD_FUNDER_BIN` (see [`funder_bin`]).
 
 use std::net::TcpListener;
@@ -191,8 +193,8 @@ pub const SEED_MINER_ADDRESS: &str = "t27eWDgjFYJGVXmzrXeVjnb5J3uXDM9xH9v";
 /// one so the replacement blocks are guaranteed to differ from the originals.
 pub const ALT_MINER_ADDRESS: &str = "tmGqwWtL7RsbxikDSN26gsbicxVr2xJNe86";
 
-/// A running `zebrad`-dialect Regtest node. Drives whichever binary the caller passes - the
-/// Zcash Foundation's `zebrad` or Zakura's `zakurad` (see [`RegtestNode`]) - the same way: both
+/// A running `zebrad`-dialect Regtest node. Drives whichever binary the caller passes (the
+/// Zcash Foundation's `zebrad` or Zakura's `zakurad`, see [`RegtestNode`]) the same way: both
 /// take the same regtest config and mine via the same Regtest-only `generate` RPC.
 pub struct Zebrad {
     child: Child,
@@ -224,7 +226,7 @@ fn spawn_zebrad(bin: &Path, config_path: &Path) -> Result<Child> {
     // (config-rs), and an unrelated variable like `ZEBRA_TAG` in a CI job makes the node exit at
     // startup with "Configuration error: unknown field". Scrub both prefixes so the harness only
     // ever configures the node through the config file it writes. (`ZEBRAD_BIN`/`ZAKURAD_BIN`
-    // don't match - no trailing underscore after the prefix - so the binary selectors survive.)
+    // don't match, no trailing underscore after the prefix, so the binary selectors survive.)
     for (key, _) in std::env::vars_os() {
         let key_str = key.to_string_lossy();
         if key_str.starts_with("ZEBRA_") || key_str.starts_with("ZAKURA_") {
@@ -360,7 +362,7 @@ impl Zebrad {
     }
 
     /// Mine `n` blocks via zebrad's Regtest-only `generate` RPC (zebra ≥ 2.0.0). Server-side it
-    /// runs the same `getblocktemplate` -> assemble -> `submitblock` flow zebra's own regtest tests
+    /// runs the same `getblocktemplate` → assemble → `submitblock` flow zebra's own regtest tests
     /// use, against the node's own network parameters - so the harness needs no zebra crates and
     /// can't drift from the running node's consensus rules. Regtest disables PoW, so there is no
     /// solving step.
@@ -401,7 +403,7 @@ impl Drop for Zebrad {
 
 /// zebrad Regtest config for zebra 6.x. Note: no `[mining] debug_like_zcashd` (removed after
 /// 2.x), `disable_pow = true` so submitted blocks need no PoW, and `enable_cookie_auth = false`
-/// so clients authenticate with the rpcuser/rpcpassword the harness writes.
+/// so lightwalletd can use the rpcuser/rpcpassword from its `zcash.conf`.
 fn zebrad_toml(
     net_port: u16,
     rpc_port: u16,
@@ -466,6 +468,151 @@ listen_addr = "127.0.0.1:{rpc_port}"
 enable_cookie_auth = false
 "#
     )
+}
+
+// =============================== lightwalletd (indexer) ===============================
+
+/// A running `lightwalletd` pointed at a regtest zebrad.
+pub struct Lightwalletd {
+    child: Child,
+    /// gRPC port serving the lightwalletd `CompactTxStreamer` protocol.
+    pub grpc_port: u16,
+    _dir: tempfile::TempDir,
+}
+
+impl Lightwalletd {
+    /// Launch `lightwalletd` against the given zebrad RPC port and wait until its gRPC server is up.
+    pub async fn start(bin: &Path, zebrad_rpc_port: u16) -> Result<Lightwalletd> {
+        let grpc_port = pick_port()?;
+        Self::start_on(bin, zebrad_rpc_port, grpc_port).await
+    }
+
+    /// Launch on a *fixed* gRPC port. Used by the fault tests to bring lightwalletd back on
+    /// the same address a running zecd is configured for (a fresh data dir re-ingests the
+    /// chain from zebra, which takes seconds on a regtest chain).
+    pub async fn start_on(
+        bin: &Path,
+        zebrad_rpc_port: u16,
+        grpc_port: u16,
+    ) -> Result<Lightwalletd> {
+        let dir = tempfile::tempdir().context("create lightwalletd dir")?;
+        let http_port = pick_port()?;
+        let data_dir = dir.path().join("data");
+        std::fs::create_dir_all(&data_dir)?;
+
+        // lightwalletd reads the node's RPC connection details from a zcash.conf-style file.
+        let zcash_conf = dir.path().join("zcash.conf");
+        std::fs::write(
+            &zcash_conf,
+            format!("rpcuser=zecdtest\nrpcpassword=zecdtest\nrpcbind=127.0.0.1\nrpcport={zebrad_rpc_port}\n"),
+        )
+        .context("write zcash.conf")?;
+
+        let log_file = dir.path().join("lightwalletd.log");
+        let child = Command::new(bin)
+            .args([
+                "--no-tls-very-insecure",
+                "--grpc-bind-addr",
+                &format!("127.0.0.1:{grpc_port}"),
+                "--http-bind-addr",
+                &format!("127.0.0.1:{http_port}"),
+                "--data-dir",
+                data_dir.to_str().unwrap(),
+                "--log-file",
+                log_file.to_str().unwrap(),
+                "--zcash-conf-path",
+                zcash_conf.to_str().unwrap(),
+            ])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .with_context(|| format!("spawn lightwalletd ({})", bin.display()))?;
+
+        let lwd = Lightwalletd {
+            child,
+            grpc_port,
+            _dir: dir,
+        };
+        lwd.wait_until_ready(&log_file).await?;
+        Ok(lwd)
+    }
+
+    /// Kill the process, simulating an upstream outage. The gRPC port is freed (new
+    /// connections are refused) and can be reused by a later [`Lightwalletd::start_on`].
+    pub fn stop(self) {
+        // Drop runs kill + wait.
+    }
+
+    /// Pause the process with SIGSTOP, simulating a *hung* upstream: the kernel keeps its
+    /// sockets alive - TCP connects succeed and segments are ACKed - but no request is ever
+    /// answered. This is the failure mode a kill can't reproduce (a dead process refuses
+    /// connections immediately) and the one only HTTP/2 keepalive / per-RPC deadlines can
+    /// detect. Resume with [`Lightwalletd::resume`].
+    pub fn pause(&self) -> Result<()> {
+        signal_process(self.child.id(), "STOP")
+    }
+
+    /// Resume a [`Lightwalletd::pause`]d process (SIGCONT); it picks up where it stopped.
+    pub fn resume(&self) -> Result<()> {
+        signal_process(self.child.id(), "CONT")
+    }
+
+    async fn wait_until_ready(&self, log_file: &Path) -> Result<()> {
+        let deadline = Instant::now() + Duration::from_secs(90);
+        loop {
+            if let Ok(log) = std::fs::read_to_string(log_file) {
+                if log.contains("Starting insecure no-TLS (plaintext) server") {
+                    return Ok(());
+                }
+            }
+            if Instant::now() >= deadline {
+                let log = std::fs::read_to_string(log_file).unwrap_or_default();
+                bail!(
+                    "lightwalletd did not become ready within 90s; log tail:\n{}",
+                    tail(&log, 20)
+                );
+            }
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
+    }
+}
+
+impl Drop for Lightwalletd {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+/// Whether the zecd under test should use a lightwalletd upstream ("light mode") instead of
+/// zebrad - the `ZECD_REGTEST_BACKEND=lwd` convention, used by the CI lwd matrix leg to rerun
+/// the opted-in suites against the light backend.
+pub fn zecd_backend_is_lwd() -> bool {
+    std::env::var("ZECD_REGTEST_BACKEND")
+        .is_ok_and(|v| v.eq_ignore_ascii_case("lwd") || v.eq_ignore_ascii_case("lightwalletd"))
+}
+
+/// Point `cfg` at the backend selected by `ZECD_REGTEST_BACKEND`: in lwd mode, spawn a
+/// **dedicated** lightwalletd for the zecd under test (separate from the funder's instance, so
+/// fault-injection against zecd's upstream never stalls the funder) and wire its gRPC port
+/// into the config; in zebra mode (the default), leave the config pointing at zebrad. The
+/// returned supervisor must be kept alive for the daemon's lifetime; killing/pausing it is the
+/// light-mode analog of pausing zebrad.
+pub async fn attach_backend(
+    cfg: &mut ZecdConfig,
+    zebrad_rpc_port: u16,
+) -> Result<Option<Lightwalletd>> {
+    if !zecd_backend_is_lwd() {
+        return Ok(None);
+    }
+    let bin = resolve_bin("LIGHTWALLETD_BIN").ok_or_else(|| {
+        anyhow::anyhow!(
+            "ZECD_REGTEST_BACKEND=lwd needs $LIGHTWALLETD_BIN (the lightwalletd binary)"
+        )
+    })?;
+    let lwd = Lightwalletd::start(&bin, zebrad_rpc_port).await?;
+    cfg.lightwalletd_grpc_port = Some(lwd.grpc_port);
+    Ok(Some(lwd))
 }
 
 // =============================== funder (a released zecd) ===============================
@@ -551,7 +698,7 @@ pub fn derive_address_offline(mnemonic: &str, address_type: &str, index: u32) ->
 pub const FUNDER_COINBASES: u32 = 20;
 /// Zcash's transparent-coinbase maturity: a coinbase output is unspendable until this many blocks
 /// deep. `z_shieldcoinbase` filters immature UTXOs itself, so the funder may hold them - unlike the
-/// previous funder, which had to be kept clear of them entirely.
+/// old lightwalletd-backed funder, which had to be kept clear of them entirely.
 pub const COINBASE_MATURITY: u32 = 100;
 /// Blocks mined after the funder's coinbases so they clear [`COINBASE_MATURITY`], with slack.
 pub const MATURITY_TAIL: u32 = COINBASE_MATURITY + 10;
@@ -583,8 +730,8 @@ pub fn funder_bin() -> PathBuf {
 /// Regtest can't mine a coinbase straight into a shielded note the wallet under test would see, so
 /// this is how funds get in: zebra mines transparent coinbase to the funder's t-address, it matures
 /// (100 blocks), the funder sweeps it into a shielded note with `z_shieldcoinbase`, and then pays
-/// the wallet under test. The funder talks straight to zebrad's JSON-RPC, so funding needs no
-/// indexer or intermediary of any kind.
+/// the wallet under test. The funder talks straight to zebrad's JSON-RPC, so **funding needs no
+/// lightwalletd** - the only reason the suite still builds one is the zecd-under-test's light mode.
 ///
 /// Bring-up: the funder's t-address is derived **offline** (`zecd derive-address`, see
 /// [`derive_funder_transparent_address`]), so zebra mines to the funder from its very first
@@ -1173,7 +1320,7 @@ pub fn zecd_bin() -> PathBuf {
 }
 
 /// Whether the extended ("big run") regtest tier is enabled: set `ZECD_REGTEST_EXTENDED=1`.
-/// PR runs skip these tests (each spins a full zebra stack); the scheduled and
+/// PR runs skip these tests (each spins a full zebra+lightwalletd stack); the scheduled and
 /// manually dispatched workflow runs set the variable.
 pub fn extended_enabled() -> bool {
     std::env::var("ZECD_REGTEST_EXTENDED").is_ok_and(|v| !v.is_empty() && v != "0")
@@ -1211,12 +1358,26 @@ pub struct Zecd {
     _datadir: tempfile::TempDir,
 }
 
-/// How `zecd` should reach the regtest chain (a local zebrad's JSON-RPC) and what RPC
-/// port/creds to expose.
+/// How `zecd` should reach the regtest chain (a local zebrad's JSON-RPC, or a lightwalletd in
+/// front of it) and what RPC port/creds to expose.
 pub struct ZecdConfig {
-    /// zebrad JSON-RPC port zecd connects to (`zebra://127.0.0.1:<port>`).
+    /// zebrad JSON-RPC port zecd connects to (`zebra://127.0.0.1:<port>`) when
+    /// `lightwalletd_grpc_port` is unset.
     pub zebra_rpc_port: u16,
+    /// When set, zecd connects to this local lightwalletd gRPC port instead of zebrad
+    /// (`server = "http://127.0.0.1:<port>"` - light mode over the harness's plaintext
+    /// lightwalletd). See [`attach_backend`] for the `ZECD_REGTEST_BACKEND` convention.
+    pub lightwalletd_grpc_port: Option<u16>,
     pub rpc_port: u16,
+    /// The `[health]` port zecd is configured with. Picked via [`pick_port`] in
+    /// [`ZecdConfig::new`] - NOT derived as `rpc_port + 1`: a derived port never advances the
+    /// pick cursor, so the very next [`pick_port`] call (e.g. [`attach_backend`]'s dedicated
+    /// lightwalletd, which runs before zecd binds anything) would probe it, find it unbound,
+    /// and hand the same port to another component. That exact collision put the funded
+    /// test's lightwalletd on zecd's health port: zecd came up "without health endpoints",
+    /// and the outage phase's health poll then waited forever on a listener that never
+    /// existed - a multi-hour CI hang.
+    pub health_port: u16,
     pub rpc_user: String,
     pub rpc_password: String,
     /// `[sync] rebroadcast_secs` - tight by default so outage tests don't idle a minute.
@@ -1243,6 +1404,10 @@ pub struct ZecdConfig {
     /// omits it (zecd defaults to `true`). The proving-key-cache benchmark runs one instance
     /// each way.
     pub cache_proving_key: Option<bool>,
+    /// `[spend] privacy_policy`: `Some("AllowFullyTransparent")` etc. writes the knob explicitly,
+    /// `None` omits it (zecd defaults to `AllowRevealedRecipients`). The fully-transparent spend
+    /// e2e sets it to `AllowFullyTransparent`.
+    pub privacy_policy: Option<String>,
     /// `[spend] pipeline_proving`: `Some(true/false)` writes the knob explicitly, `None` omits it
     /// (zecd defaults to `false`). The stress test runs with it on to exercise the off-actor
     /// proving pipeline (sync stays live during a send).
@@ -1251,10 +1416,6 @@ pub struct ZecdConfig {
     /// (zecd defaults to 50). The stress test lifts the cap so its big fan-out/sweep sends aren't
     /// rejected.
     pub orchard_action_limit: Option<usize>,
-    /// `[spend] privacy_policy`: `Some("AllowFullyTransparent")` etc. writes the knob explicitly,
-    /// `None` omits it (zecd defaults to `AllowRevealedRecipients`). The fully-transparent spend
-    /// e2e sets it to `AllowFullyTransparent`.
-    pub privacy_policy: Option<String>,
     /// Optional `[pools]` section as `(enabled, default_receivers)`. `None` omits the section
     /// (the Orchard-only default). Used by the multi-pool (Sapling) e2e.
     pub pools: Option<(Vec<String>, Vec<String>)>,
@@ -1267,7 +1428,7 @@ pub struct ZecdConfig {
     /// `transparent = true`. The transparent-gap restore e2e sets it small (a beyond-gap receive
     /// is missed) vs large (the same receive is recovered).
     pub transparent_gap_limit: Option<u32>,
-    /// `[pools] transparent_initial_scan` - the initial scan depth (pre-expose + scan external
+    /// `[pools] transparent_initial_scan` - the A18 initial scan depth (pre-expose + scan external
     /// indices `0..N` on startup, independent of the gap limit). `None` omits it (defaults to 0).
     /// The gap e2e uses it to prove a *small* gap plus a large initial scan still recovers a
     /// high-index receive.
@@ -1291,7 +1452,9 @@ impl ZecdConfig {
     pub fn new(zebra_rpc_port: u16, rpc_port: u16) -> ZecdConfig {
         ZecdConfig {
             zebra_rpc_port,
+            lightwalletd_grpc_port: None,
             rpc_port,
+            health_port: pick_port().expect("pick zecd health port"),
             rpc_user: "user".to_string(),
             rpc_password: "pass".to_string(),
             rebroadcast_secs: 2,
@@ -1301,9 +1464,9 @@ impl ZecdConfig {
             ufvk: None,
             birthday: None,
             cache_proving_key: None,
+            privacy_policy: None,
             pipeline_proving: None,
             orchard_action_limit: None,
-            privacy_policy: None,
             pools: None,
             transparent: false,
             transparent_gap_limit: None,
@@ -1315,14 +1478,15 @@ impl ZecdConfig {
     }
 
     /// The `[health]` port (`/healthz`, `/readyz`, `/status`) the daemon is configured with -
-    /// [`write_zecd_toml`]'s convention is the RPC port + 1.
+    /// a [`pick_port`]-reserved port (see the `health_port` field for why it must not be
+    /// derived from the RPC port).
     pub fn health_port(&self) -> u16 {
-        self.rpc_port + 1
+        self.health_port
     }
 }
 
 impl Zecd {
-    /// Write a regtest `zecd.toml`, run `zecd init` (retried while zebra catches up to the
+    /// Write a regtest `zecd.toml`, run `zecd init` (retried while lightwalletd catches up to the
     /// chain tip), then spawn the daemon. Returns once the RPC is up; call
     /// [`Zecd::wait_until_synced`] to wait for the scan to reach the tip.
     pub async fn start(cfg: &ZecdConfig) -> Result<Zecd> {
@@ -1405,8 +1569,8 @@ impl Zecd {
         Ok(String::from_utf8_lossy(&out.stderr).into_owned())
     }
 
-    /// Prepare a datadir: write `zecd.toml`, init the `default` wallet (retried while the node
-    /// warms up), then init any watch-only replicas. (Only one spending wallet is
+    /// Prepare a datadir: write `zecd.toml`, init the `default` wallet (retried while
+    /// lightwalletd warms up), then init any watch-only replicas. (Only one spending wallet is
     /// permitted, so extra *spending* wallets are never initialised here.)
     async fn prepare_datadir(cfg: &ZecdConfig) -> Result<(tempfile::TempDir, Option<String>)> {
         let datadir = tempfile::tempdir().context("create zecd datadir")?;
@@ -1967,9 +2131,9 @@ fn run_zecd_init(
     Ok((!phrase.is_empty()).then_some(phrase))
 }
 
-/// Init the `default` wallet, retried while the node catches up to the chain tip. Just after
-/// launch zebrad may still be committing blocks, so `zecd init` (which contacts it for the
-/// chain tip and tree state) is retried, resetting the datadir between
+/// Init the `default` wallet, retried while lightwalletd catches up to the chain tip. Just
+/// after launch lightwalletd may still be ingesting from zebrad, so `zecd init` (which contacts
+/// it for `get_latest_block` + `get_tree_state`) is retried, resetting the datadir between
 /// attempts so a partial init can't wedge the next one. Returns the generated mnemonic.
 async fn init_default_with_retry(
     bin: &Path,
@@ -2094,31 +2258,42 @@ fn export_ufvk_from_datadir(datadir: &Path, wallet: &str) -> Result<String> {
 }
 
 fn write_zecd_toml(datadir: &Path, cfg: &ZecdConfig) -> Result<()> {
-    // zecd is zebra-only: the single upstream is a local zebrad JSON-RPC endpoint.
-    let server = format!("zebra://127.0.0.1:{}", cfg.zebra_rpc_port);
-    // Optional `[spend]` knobs: `cache_proving_key` (the proving-key-cache benchmark) and
-    // `privacy_policy` (the fully-transparent spend e2e). Emit the section if either is set.
-    let spend_section = if cfg.cache_proving_key.is_some()
-        || cfg.pipeline_proving.is_some()
-        || cfg.orchard_action_limit.is_some()
-        || cfg.privacy_policy.is_some()
-    {
-        let mut s = String::from("\n[spend]\n");
+    // The single upstream: a local zebrad JSON-RPC endpoint (full mode), or - when
+    // `lightwalletd_grpc_port` is set - a local plaintext lightwalletd (light mode).
+    let server = match cfg.lightwalletd_grpc_port {
+        Some(grpc_port) => format!("http://127.0.0.1:{grpc_port}"),
+        None => format!("zebra://127.0.0.1:{}", cfg.zebra_rpc_port),
+    };
+    // In light mode, assert the upstream's transparent-in-compact-blocks capability. The
+    // harness builds lightwalletd from a 0.5.x release, which serves that data - but no
+    // released lightwalletd populates `GetLightdInfo.lightwalletProtocolVersion`, so zecd's
+    // connect-time probe cannot see the capability and would refuse every transparent wallet.
+    let backend_capability = match cfg.lightwalletd_grpc_port {
+        Some(_) => "assume_transparent_in_compact_blocks = true\n",
+        None => "",
+    };
+    // Optional `[spend]` knobs: `cache_proving_key` (proving-key-cache benchmark),
+    // `privacy_policy` (fully-transparent spend e2e), `pipeline_proving` and
+    // `orchard_action_limit` (stress test). Emit the section only if at least one is set.
+    let spend_section = {
+        let mut lines = String::new();
         if let Some(b) = cfg.cache_proving_key {
-            s.push_str(&format!("cache_proving_key = {b}\n"));
-        }
-        if let Some(b) = cfg.pipeline_proving {
-            s.push_str(&format!("pipeline_proving = {b}\n"));
-        }
-        if let Some(n) = cfg.orchard_action_limit {
-            s.push_str(&format!("orchard_action_limit = {n}\n"));
+            lines.push_str(&format!("cache_proving_key = {b}\n"));
         }
         if let Some(p) = &cfg.privacy_policy {
-            s.push_str(&format!("privacy_policy = \"{p}\"\n"));
+            lines.push_str(&format!("privacy_policy = \"{p}\"\n"));
         }
-        s
-    } else {
-        String::new()
+        if let Some(b) = cfg.pipeline_proving {
+            lines.push_str(&format!("pipeline_proving = {b}\n"));
+        }
+        if let Some(n) = cfg.orchard_action_limit {
+            lines.push_str(&format!("orchard_action_limit = {n}\n"));
+        }
+        if lines.is_empty() {
+            String::new()
+        } else {
+            format!("\n[spend]\n{lines}")
+        }
     };
     // The default wallet plus any extra `[wallets.<name>]` entries (multiwallet tests).
     let mut wallets = format!(
@@ -2136,7 +2311,7 @@ fn write_zecd_toml(datadir: &Path, cfg: &ZecdConfig) -> Result<()> {
         ));
     }
     // Optional [pools] section (multi-pool / Sapling e2e, and/or transparent receiving); omitted
-    // entirely -> Orchard-only, no transparent.
+    // entirely → Orchard-only, no transparent.
     let pools = if cfg.pools.is_some() || cfg.transparent {
         let mut s = String::from("\n[pools]\n");
         if let Some((enabled, receivers)) = &cfg.pools {
@@ -2184,7 +2359,7 @@ server = "{server}"
 connect_timeout_secs = 5
 reconnect_base_secs = 1
 reconnect_max_secs = 2
-
+{backend_capability}
 [rpc]
 bind = "127.0.0.1"
 port = {rpc_port}

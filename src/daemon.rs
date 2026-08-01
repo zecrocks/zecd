@@ -114,6 +114,27 @@ pub async fn run(config: AppConfig) -> anyhow::Result<()> {
             continue;
         }
         let server = backend::resolve_configured(&config)?;
+        // Transparent *receives* now ride the block scan on both backends, so a large address
+        // set no longer means per-block polling. What stays per-address is spend detection:
+        // librustzcash emits one `TransactionsInvolvingAddress` request per funded address, and
+        // on a light backend each is a remote round trip rather than a local index lookup. A
+        // wallet holding many funded transparent addresses is therefore still better served by
+        // a local zebra - worth saying once at startup, before the scan begins.
+        const LIGHT_TRANSPARENT_ADDR_WARN: u32 = 1_000;
+        if server.kind() == backend::ServerKind::Lightwalletd
+            && entry.transparent_enabled
+            && (entry.transparent_initial_scan >= LIGHT_TRANSPARENT_ADDR_WARN
+                || entry.transparent_gap_limit >= LIGHT_TRANSPARENT_ADDR_WARN)
+        {
+            tracing::warn!(
+                "[{name}] transparent_initial_scan = {} / transparent_gap_limit = {} on a \
+                 lightwalletd backend: spend detection queries each funded address separately, \
+                 one remote round trip apiece. Running your own zebra (server = \"zebra\") is \
+                 recommended at this scale",
+                entry.transparent_initial_scan,
+                entry.transparent_gap_limit,
+            );
+        }
         let actor_cfg = ActorConfig {
             name: name.clone(),
             network: config.network,
