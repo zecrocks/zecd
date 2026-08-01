@@ -65,6 +65,34 @@ pub struct TransparentUtxo {
     pub coinbase_tx: Option<std::sync::Arc<zcash_primitives::transaction::Transaction>>,
 }
 
+/// A transparent **input** seen by the block scan: the outpoint it consumes, plus the transaction
+/// consuming it. The matcher tests the outpoint against the wallet's unspent transparent outputs,
+/// so a hit means one of the wallet's own UTXOs was just spent.
+///
+/// This is the spend-side counterpart of [`TransparentUtxo`], and it exists because a transparent
+/// spend is otherwise invisible to zecd. The block scan only ever inspected *outputs*, so a spend
+/// was discovered solely when librustzcash asked for an address check
+/// (`TransactionDataRequest::TransactionsInvolvingAddress`) - which it does not emit for a UTXO
+/// zecd recorded itself through the block-scan matcher. The result was a wallet that kept an
+/// already-spent output in its unspent set: a balance higher than the wallet really held, and an
+/// input that could be selected for a send that then failed at broadcast.
+///
+/// Both backends already carry this data in bytes they were fetching anyway - zebra parses the
+/// full block, and a versioned-protocol lightwalletd puts `prevoutTxid`/`prevoutIndex` on each
+/// `CompactTxIn` - so matching costs no extra requests. Only the *spending transaction* of a
+/// matched outpoint has to be fetched, and that happens once per real wallet spend.
+#[derive(Clone, Debug)]
+pub struct TransparentSpend {
+    /// Internal-byte-order txid of the transaction whose output is being spent.
+    pub prevout_txid: TxId,
+    /// Index of the spent output within that transaction's `vout`.
+    pub prevout_index: u32,
+    /// Internal-byte-order txid of the transaction doing the spending.
+    pub spending_txid: TxId,
+    /// Height of the block the spend was mined in.
+    pub height: u32,
+}
+
 /// Upstream identity, used by the wrong-chain guard. `chain_name` follows zcashd's
 /// `getblockchaininfo.chain` / lightwalletd's `chain_name`: `"main"`, `"test"`, `"regtest"`.
 ///
@@ -387,15 +415,19 @@ pub enum CompactBlockStream {
 }
 
 impl CompactBlockStream {
-    /// The next block paired with its transparent outputs, `Ok(None)` at end of range, or a
-    /// transport-class error.
+    /// The next block paired with its transparent outputs and inputs, `Ok(None)` at end of range,
+    /// or a transport-class error.
     ///
-    /// The transparent-output vector is the block's full set of transparent `vout`s (every
-    /// output, not just the wallet's - the caller matches against its address set); it is always
-    /// empty unless the stream was opened with `include_transparent`. Carrying it here lets the
-    /// wallet discover transparent receives from the block it already downloaded for the shielded
-    /// scan, at no extra fetch.
-    pub async fn next(&mut self) -> anyhow::Result<Option<(CompactBlock, Vec<TransparentUtxo>)>> {
+    /// Both vectors are the block's *full* sets (every transparent `vout` and every transparent
+    /// input, not just the wallet's - the caller matches outputs against its address set and
+    /// inputs against its unspent outpoints), and both are empty unless the stream was opened with
+    /// `include_transparent`. Carrying them here lets the wallet discover transparent receives
+    /// **and spends** from the block it already downloaded for the shielded scan, at no extra
+    /// fetch.
+    #[allow(clippy::type_complexity)]
+    pub async fn next(
+        &mut self,
+    ) -> anyhow::Result<Option<(CompactBlock, Vec<TransparentUtxo>, Vec<TransparentSpend>)>> {
         match self {
             CompactBlockStream::Zebra(s) => s.next().await,
         }

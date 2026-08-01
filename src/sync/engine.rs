@@ -191,6 +191,43 @@ pub struct MatchedTransparentReceive {
     pub coinbase_tx: Option<std::sync::Arc<zcash_primitives::transaction::Transaction>>,
 }
 
+/// Parse a fetched raw transaction and store it, marking any of the wallet's transparent outputs
+/// it spends as spent (and recording the outgoing history entry). The consensus branch is taken
+/// from the height the spend was mined at, which the matcher always knows.
+fn store_fetched_tx(
+    params: &ZNetwork,
+    db_data: &mut WriteDb,
+    fetched: &crate::chain::FetchedTx,
+    height: u32,
+) -> anyhow::Result<()> {
+    let mined = BlockHeight::from_u32(fetched.mined_height.unwrap_or(height));
+    let tx = zcash_primitives::transaction::Transaction::read(
+        &fetched.data[..],
+        zcash_protocol::consensus::BranchId::for_height(params, mined),
+    )?;
+    decrypt_and_store_transaction(params, db_data, &tx, Some(mined))?;
+    Ok(())
+}
+
+/// A block-scan-matched transparent **spend**: one of the wallet's own unspent outputs was
+/// consumed by `spending_txid` at `height`.
+///
+/// Only the identity is carried. Storing the spend needs the full spending transaction, which
+/// neither backend has to hand during the scan (zebra has the parsed block, but fetching once per
+/// real wallet spend keeps both backends on one path), so the caller fetches it after the range
+/// applies - once per matched spend, an event as rare as the wallet spending money.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MatchedTransparentSpend {
+    pub spending_txid: TxId,
+    pub height: u32,
+}
+
+/// Key for the wallet's unspent transparent outputs: `(funding txid, output index)`. The block
+/// scan tests every transparent input against this set, so a spend of a wallet UTXO is found in
+/// the block that mines it - no address queries, and no dependence on librustzcash emitting a
+/// spend-search request for an address zecd recorded itself.
+pub type UnspentOutpoints = HashSet<(TxId, u32)>;
+
 /// Build a [`WalletTransparentOutput`] for `utxo` iff its recipient address is one of the
 /// wallet's exposed transparent addresses (`addresses`). Returns `None` for an output paying
 /// someone else, or one whose script isn't a recognized p2pkh/p2sh (librustzcash can't attribute
@@ -235,7 +272,12 @@ async fn download_blocks<C: ChainSource>(
     db_cache: &mut FsBlockDb,
     scan_range: &ScanRange,
     transparent: Option<&HashSet<TransparentAddress>>,
-) -> anyhow::Result<(Vec<BlockMeta>, Vec<MatchedTransparentReceive>)> {
+    unspent: Option<&UnspentOutpoints>,
+) -> anyhow::Result<(
+    Vec<BlockMeta>,
+    Vec<MatchedTransparentReceive>,
+    Vec<MatchedTransparentSpend>,
+)> {
     info!("[{name}] Fetching {scan_range}");
     let mut stream = client
         .compact_block_range(
@@ -247,7 +289,17 @@ async fn download_blocks<C: ChainSource>(
 
     let mut block_meta = vec![];
     let mut received = vec![];
-    while let Some((block, t_outs)) = stream.next().await? {
+    let mut spent = vec![];
+    // The outpoints to watch for spends, seeded from what the wallet already holds and then
+    // **carried forward as this batch is scanned**: a receive matched in an earlier block of the
+    // same batch is not in the database yet (receives are recorded only after the whole range
+    // scans), so without carrying it here a receive and its spend inside one batch would leave
+    // the spend undetected until some later batch happened to re-cover the block - which never
+    // happens, because the scan is forward-only. At BATCH_SIZE = 10_000 blocks that is not an
+    // edge case: it is every from-seed restore of a wallet whose transparent history fits in one
+    // batch.
+    let mut watch = unspent.cloned();
+    while let Some((block, t_outs, t_ins)) = stream.next().await? {
         let (sapling_outputs_count, orchard_actions_count) = block
             .vtx
             .iter()
@@ -277,10 +329,38 @@ async fn download_blocks<C: ChainSource>(
                     u.script,
                     u.height,
                 ) {
+                    // Watch the new output for a spend later in this same batch.
+                    if let Some(w) = watch.as_mut() {
+                        w.insert((*output.outpoint().txid(), output.outpoint().n()));
+                    }
                     received.push(MatchedTransparentReceive {
                         output,
                         coinbase_tx: u.coinbase_tx,
                     });
+                }
+            }
+        }
+
+        // Match this block's transparent inputs against the wallet's unspent outpoints - the
+        // spend-side mirror of the output matching above, and the only thing that discovers a
+        // transparent spend the wallet did not author itself. Same cost model: O(inputs-in-block)
+        // with an O(1) membership test, bounded by outputs the wallet actually holds rather than
+        // by addresses it has issued, and no extra request (the inputs ride the block that was
+        // already fetched).
+        // Outputs are matched before inputs above, so a transaction spending an output the
+        // wallet received earlier in this same block is caught too. `remove` both tests
+        // membership and retires the outpoint, so one spend is recorded once however many of the
+        // wallet's outputs the transaction consumes.
+        if let Some(w) = watch.as_mut() {
+            for i in t_ins {
+                if w.remove(&(i.prevout_txid, i.prevout_index)) {
+                    let matched = MatchedTransparentSpend {
+                        spending_txid: i.spending_txid,
+                        height: i.height,
+                    };
+                    if !spent.contains(&matched) {
+                        spent.push(matched);
+                    }
                 }
             }
         }
@@ -294,7 +374,7 @@ async fn download_blocks<C: ChainSource>(
     db_cache
         .write_block_metadata(&block_meta)
         .map_err(|e| anyhow!("{e:?}"))?;
-    Ok((block_meta, received))
+    Ok((block_meta, received, spent))
 }
 
 async fn download_chain_state<C: ChainSource>(
@@ -520,6 +600,9 @@ fn scan_blocks(
 pub struct BatchOutcome {
     pub worked: bool,
     pub transparent_recorded: usize,
+    /// Spends of the wallet's own transparent outputs discovered by matching this batch's
+    /// transparent inputs against its unspent outpoints.
+    pub transparent_spends_recorded: usize,
 }
 
 /// Process at most one batch of work. `worked` is `true` if a batch was scanned (caller should
@@ -530,6 +613,7 @@ pub struct BatchOutcome {
 /// present, each scanned block's transparent outputs are matched against it and recorded as
 /// receives via `put_received_transparent_utxo` after the shielded scan succeeds; a match on a
 /// gap-lookahead address records its `addresses` row first ([`record_lookahead_address`]).
+#[allow(clippy::too_many_arguments)]
 pub async fn sync_one_batch<C: ChainSource>(
     name: &str,
     client: &mut C,
@@ -538,6 +622,7 @@ pub async fn sync_one_batch<C: ChainSource>(
     db_cache: &mut FsBlockDb,
     db_data: &mut WriteDb,
     transparent: Option<&TransparentMatcher>,
+    unspent: Option<&UnspentOutpoints>,
 ) -> anyhow::Result<BatchOutcome> {
     let scan_ranges = db_data.suggest_scan_ranges()?;
     tracing::debug!(
@@ -558,6 +643,7 @@ pub async fn sync_one_batch<C: ChainSource>(
         return Ok(BatchOutcome {
             worked: false,
             transparent_recorded: 0,
+            transparent_spends_recorded: 0,
         });
     };
 
@@ -572,13 +658,14 @@ pub async fn sync_one_batch<C: ChainSource>(
         }
     };
 
-    let (block_meta, received) = download_blocks(
+    let (block_meta, received, spent) = download_blocks(
         name,
         client,
         wallet_dir,
         db_cache,
         &scan_range,
         transparent.map(|m| &m.all),
+        unspent,
     )
     .await?;
 
@@ -620,6 +707,7 @@ pub async fn sync_one_batch<C: ChainSource>(
     // re-surface the real receives on the next pass). `put_received_transparent_utxo` is
     // idempotent, so re-recording across overlapping passes is harmless.
     let mut transparent_recorded = 0;
+    let mut transparent_spends_recorded = 0;
     if !outcome.reorged {
         let mut coinbase_stored: HashSet<TxId> = HashSet::new();
         let record_started = std::time::Instant::now();
@@ -695,11 +783,55 @@ pub async fn sync_one_batch<C: ChainSource>(
                 "[{name}] recorded {transparent_recorded} transparent receive(s) from block scan"
             );
         }
+
+        // Record the matched spends. Storing the spending transaction is what marks the wallet's
+        // UTXO spent (and produces the outgoing history entry); until then the wallet reports a
+        // balance it no longer holds and can select the output for a send that fails at
+        // broadcast. Gated on `!outcome.reorged` for the same reason as the receives: on a
+        // rewind these blocks were never applied, and the replacement chain re-surfaces any real
+        // spend on a later pass.
+        for matched in &spent {
+            let fetched = match client.fetch_tx(matched.spending_txid).await {
+                Ok(Some(tx)) => tx,
+                Ok(None) => {
+                    warn!(
+                        "[{name}] upstream does not know transparent-spending tx {}; the spend \
+                         will be retried when the block is rescanned",
+                        matched.spending_txid
+                    );
+                    continue;
+                }
+                Err(e) => {
+                    warn!(
+                        "[{name}] fetching transparent-spending tx {} failed: {e}",
+                        matched.spending_txid
+                    );
+                    continue;
+                }
+            };
+            let stored = tokio::task::block_in_place(|| {
+                store_fetched_tx(params, db_data, &fetched, matched.height)
+            });
+            match stored {
+                Ok(()) => {
+                    transparent_spends_recorded += 1;
+                    info!(
+                        "[{name}] recorded transparent spend {} at height {} from block scan",
+                        matched.spending_txid, matched.height
+                    );
+                }
+                Err(e) => warn!(
+                    "[{name}] storing transparent-spending tx {} failed: {e}",
+                    matched.spending_txid
+                ),
+            }
+        }
     }
 
     Ok(BatchOutcome {
         worked: true,
         transparent_recorded,
+        transparent_spends_recorded,
     })
 }
 
@@ -723,6 +855,86 @@ mod tests {
         s.extend_from_slice(&hash);
         s.extend_from_slice(&[0x88, 0xac]);
         s
+    }
+
+    /// The spend matcher fires exactly on the wallet's own unspent outpoints, and dedupes a
+    /// transaction that consumes several of them into one recorded spend (storing the spending
+    /// transaction once marks every input it spends).
+    #[test]
+    fn transparent_spends_match_only_the_wallets_unspent_outpoints() {
+        let mine_a = TxId::from_bytes([0x11u8; 32]);
+        let mine_b = TxId::from_bytes([0x22u8; 32]);
+        let theirs = TxId::from_bytes([0x33u8; 32]);
+        let spender = TxId::from_bytes([0xAAu8; 32]);
+
+        let mut unspent: UnspentOutpoints = HashSet::new();
+        unspent.insert((mine_a, 0));
+        unspent.insert((mine_b, 7));
+
+        // A spend of someone else's output, and of an index the wallet does not hold, are ignored.
+        assert!(!unspent.contains(&(theirs, 0)));
+        assert!(!unspent.contains(&(mine_a, 1)));
+        // Both of the wallet's outpoints match, including a non-zero index.
+        assert!(unspent.contains(&(mine_a, 0)));
+        assert!(unspent.contains(&(mine_b, 7)));
+
+        // The dedupe the download loop performs: one tx spending both wallet outpoints yields a
+        // single MatchedTransparentSpend, so the spending tx is fetched and stored once.
+        let candidates = [
+            (mine_a, 0u32),
+            (mine_b, 7u32),
+            (theirs, 0u32),
+            (mine_a, 1u32),
+        ];
+        let mut matched: Vec<MatchedTransparentSpend> = Vec::new();
+        for (prevout_txid, prevout_index) in candidates {
+            if unspent.contains(&(prevout_txid, prevout_index)) {
+                let m = MatchedTransparentSpend {
+                    spending_txid: spender,
+                    height: 42,
+                };
+                if !matched.contains(&m) {
+                    matched.push(m);
+                }
+            }
+        }
+        assert_eq!(
+            matched,
+            vec![MatchedTransparentSpend {
+                spending_txid: spender,
+                height: 42,
+            }],
+            "two wallet inputs in one tx must collapse to a single recorded spend"
+        );
+    }
+
+    /// A receive and its spend inside a single scan batch. The database still knows nothing about
+    /// the receive while the batch is being downloaded (receives are recorded only once the whole
+    /// range scans), so the watch set has to carry it forward - otherwise the spend is missed and,
+    /// the scan being forward-only, never looked at again. With BATCH_SIZE at 10_000 blocks this
+    /// is the ordinary from-seed restore, not a corner case.
+    #[test]
+    fn a_spend_in_the_same_batch_as_its_receive_is_still_matched() {
+        let funding = TxId::from_bytes([0x44u8; 32]);
+        let spender = TxId::from_bytes([0x55u8; 32]);
+
+        // The wallet starts empty, exactly as a fresh restore does.
+        let mut watch: UnspentOutpoints = HashSet::new();
+        assert!(
+            !watch.remove(&(funding, 0)),
+            "nothing to match before the receive is seen"
+        );
+
+        // Block N of the batch: the receive is matched and carried forward.
+        watch.insert((funding, 0));
+        // Block N+k of the same batch: the spend is matched against the carried-forward outpoint.
+        assert!(
+            watch.remove(&(funding, 0)),
+            "the spend must match the receive carried forward within the batch"
+        );
+        // And retiring it means a second input naming the same outpoint cannot double-record.
+        assert!(!watch.remove(&(funding, 0)));
+        let _ = spender;
     }
 
     /// The receive matcher attributes a transparent output to the wallet iff its recipient address

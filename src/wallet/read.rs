@@ -680,6 +680,40 @@ pub fn unmined_raw_txs(wallet_dir: &Path, tip: u32) -> anyhow::Result<Vec<(Strin
     Ok(out)
 }
 
+/// Every transparent output the wallet holds and has not yet seen spent, as
+/// `(funding txid, output index)` outpoints - the membership set the block scan tests each
+/// block's transparent inputs against to discover spends.
+///
+/// Deliberately unfiltered by maturity or confirmations: this answers "could a spend of this
+/// output show up in a block", not "may we spend it". Unmined (0-conf) receives are included so
+/// a spend of one is caught as soon as it is mined, and immature coinbase is included because a
+/// spend of it is still a spend the wallet must record. An output is dropped as soon as any
+/// spend of it is recorded, which is what keeps the set shrinking as spends are found.
+pub fn unspent_transparent_outpoints(
+    wallet_dir: &Path,
+) -> anyhow::Result<std::collections::HashSet<(TxId, u32)>> {
+    let conn = Connection::open(data_db_path(wallet_dir))?;
+    let mut stmt = conn.prepare(
+        "SELECT t.txid, txo.output_index
+         FROM transparent_received_outputs txo
+         JOIN transactions t ON t.id_tx = txo.transaction_id
+         WHERE txo.id NOT IN (
+             SELECT s.transparent_received_output_id
+             FROM transparent_received_output_spends s
+         )",
+    )?;
+    let rows = stmt.query_map([], |r| Ok((r.get::<_, Vec<u8>>(0)?, r.get::<_, u32>(1)?)))?;
+    let mut out = std::collections::HashSet::new();
+    for row in rows {
+        let (txid_bytes, index) = row?;
+        let Ok(bytes) = <[u8; 32]>::try_from(txid_bytes.as_slice()) else {
+            continue;
+        };
+        out.insert((TxId::from_bytes(bytes), index));
+    }
+    Ok(out)
+}
+
 /// Display-hex txids of every wallet transaction that is still unmined (`mined_height` NULL),
 /// including foreign incoming txs the mempool stream stored. Used to prune the actor's transient
 /// in-memory first-seen map (which only ever matters for unmined txs).

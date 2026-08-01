@@ -864,9 +864,16 @@ pub struct ZebraBlockStream {
 }
 
 impl ZebraBlockStream {
+    #[allow(clippy::type_complexity)]
     pub async fn next(
         &mut self,
-    ) -> anyhow::Result<Option<(pb::CompactBlock, Vec<crate::chain::TransparentUtxo>)>> {
+    ) -> anyhow::Result<
+        Option<(
+            pb::CompactBlock,
+            Vec<crate::chain::TransparentUtxo>,
+            Vec<crate::chain::TransparentSpend>,
+        )>,
+    > {
         if self.next > self.end {
             return Ok(None);
         }
@@ -900,14 +907,17 @@ impl ZebraBlockStream {
         // The raw block was already fetched and parsed for the shielded compact block, so
         // harvesting its transparent outputs here is free (no extra request). The matcher
         // filters to the wallet's addresses; we just surface every output.
-        let transparent = if self.include_transparent {
-            block_transparent_outputs(&block, height)
+        let (transparent, spends) = if self.include_transparent {
+            (
+                block_transparent_outputs(&block, height),
+                block_transparent_spends(&block, height),
+            )
         } else {
-            Vec::new()
+            (Vec::new(), Vec::new())
         };
         let compact = block_to_compact(&block, sapling_size, orchard_size, ironwood_size);
         self.next += 1;
-        Ok(Some((compact, transparent)))
+        Ok(Some((compact, transparent, spends)))
     }
 }
 
@@ -937,6 +947,33 @@ fn block_transparent_outputs(block: &Block, height: u32) -> Vec<crate::chain::Tr
                 script: txout.script_pubkey().0 .0.clone(),
                 height: Some(height),
                 coinbase_tx: coinbase_tx.clone(),
+            });
+        }
+    }
+    out
+}
+
+/// Every transparent input in `block`, as [`TransparentSpend`] candidates for the wallet's
+/// unspent-outpoint matcher. Free, like the output harvest above: the block is already parsed.
+///
+/// Coinbase transactions are skipped - their single input is the null prevout, which spends
+/// nothing and can never match a wallet outpoint.
+fn block_transparent_spends(block: &Block, height: u32) -> Vec<crate::chain::TransparentSpend> {
+    let mut out = Vec::new();
+    for tx in block.vtx() {
+        let Some(bundle) = tx.transparent_bundle() else {
+            continue;
+        };
+        if bundle.is_coinbase() {
+            continue;
+        }
+        let spending_txid = tx.txid();
+        for txin in &bundle.vin {
+            out.push(crate::chain::TransparentSpend {
+                prevout_txid: TxId::from_bytes(*txin.prevout().hash()),
+                prevout_index: txin.prevout().n(),
+                spending_txid,
+                height,
             });
         }
     }
@@ -1937,7 +1974,7 @@ mod tests {
             .await
             .unwrap();
 
-        let (cb, transparent) = stream.next().await.unwrap().expect("one block");
+        let (cb, transparent, _spends) = stream.next().await.unwrap().expect("one block");
         assert_eq!(cb.height, 415000);
         assert_eq!(
             cb.hash,

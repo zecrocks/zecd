@@ -528,6 +528,13 @@ struct WalletActor {
     /// before matching. `transparent_preexposed` flips once `0..transparent_initial_scan` has been
     /// pre-exposed.
     transparent_set_dirty: bool,
+    /// The wallet's unspent transparent outpoints, tested against each scanned block's
+    /// transparent inputs so a spend of one of them is discovered by the block scan itself.
+    /// `None` until first built; rebuilt when `transparent_unspent_dirty`.
+    transparent_unspent: Option<engine::UnspentOutpoints>,
+    /// Set whenever the unspent set may have changed (a receive or a spend was recorded, or the
+    /// wallet authored a send), so the next pass rebuilds it.
+    transparent_unspent_dirty: bool,
     transparent_preexposed: bool,
     /// Live initial-sync progress while it runs (and the final state afterward), for the
     /// heartbeat log and the `getwalletinfo`/`/status` surfaces. `None` until the first chunk;
@@ -906,6 +913,8 @@ pub async fn spawn(
         transparent_gap_warn_threshold: cfg.transparent_gap_warn_threshold,
         transparent_scripts: None,
         transparent_set_dirty: true,
+        transparent_unspent: None,
+        transparent_unspent_dirty: true,
         transparent_preexposed: false,
         transparent_preexpose: None,
         first_seen: first_seen.clone(),
@@ -2052,6 +2061,8 @@ impl WalletActor {
         if recorded > 0 {
             // A new receive may have extended the transparent gap; rebuild the set next pass.
             self.transparent_set_dirty = true;
+            // New unspent outputs to watch for spends.
+            self.transparent_unspent_dirty = true;
         }
         recorded
     }
@@ -2413,10 +2424,14 @@ impl WalletActor {
             if self.transparent_set_dirty {
                 self.rebuild_transparent_set(account_id);
             }
+            if self.transparent_unspent_dirty {
+                self.rebuild_transparent_unspent();
+            }
         }
 
         let outcome = {
             let transparent = self.transparent_scripts.as_ref();
+            let unspent = self.transparent_unspent.as_ref();
             let client = self
                 .client
                 .as_mut()
@@ -2429,6 +2444,7 @@ impl WalletActor {
                 &mut self.db_cache,
                 &mut self.db_data,
                 transparent,
+                unspent,
             )
             .await?
         };
@@ -2436,6 +2452,11 @@ impl WalletActor {
         // rebuild the address set before the next pass to cover them.
         if outcome.transparent_recorded > 0 {
             self.transparent_set_dirty = true;
+        }
+        // A recorded receive adds an outpoint to watch; a recorded spend removes one. Either way
+        // the membership set is stale, so rebuild it before the next pass.
+        if outcome.transparent_recorded > 0 || outcome.transparent_spends_recorded > 0 {
+            self.transparent_unspent_dirty = true;
         }
         self.update_status();
         Ok(outcome.worked)
@@ -2526,6 +2547,29 @@ impl WalletActor {
             lookahead,
         });
         self.transparent_set_dirty = false;
+    }
+
+    /// Refresh the unspent-transparent-outpoint set the block scan matches spends against. One
+    /// indexed query bounded by the outputs the wallet actually holds - not by how many addresses
+    /// it has issued - so it stays cheap for a wallet tracking a large address set.
+    fn rebuild_transparent_unspent(&mut self) {
+        match crate::wallet::read::unspent_transparent_outpoints(&self.wallet_dir) {
+            Ok(set) => {
+                tracing::debug!(
+                    "[{}] watching {} unspent transparent outpoint(s) for spends",
+                    self.name,
+                    set.len()
+                );
+                self.transparent_unspent = Some(set);
+                self.transparent_unspent_dirty = false;
+            }
+            // Leave the previous set in place: a stale set still catches most spends, and the
+            // next pass retries. Never fatal - this is discovery, not consensus.
+            Err(e) => warn!(
+                "[{}] rebuilding the unspent transparent outpoint set: {e}",
+                self.name
+            ),
+        }
     }
 
     /// The account's external transparent incoming viewing key (for deriving the gap-lookahead
@@ -4173,6 +4217,10 @@ impl WalletActor {
                 Ok((txid, raw))
             })?;
 
+        // The send consumed some of the wallet's transparent outputs and created transparent
+        // change: both sides of the watch set moved, so rebuild it before the next scan rather
+        // than re-matching spends the wallet already recorded itself.
+        self.transparent_unspent_dirty = true;
         self.broadcast_committed(txid, raw).await?;
         self.update_status();
         Ok(txid)
