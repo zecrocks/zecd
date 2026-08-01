@@ -194,9 +194,51 @@ async fn regtest_transparent_gap_limit_bounds_restore_recovery() {
     miss.wait_until_synced(tip, FUND_TIMEOUT)
         .await
         .expect("the small-gap restore scans to the tip");
-    // The block scan has reached the tip; give the caught-up enhancement pass (which services the
-    // transparent getaddresstxids requests) a settle window, then assert the funds stayed missed.
-    assert_balance_stays_zero(&miss, Duration::from_secs(20)).await;
+    // Assert the *cause*, not a symptom-over-time. The matcher's live coverage runs
+    // `gap_limit` past its issuance frontier (see the two-window note in the project docs); the funded
+    // index must sit outside it, or this restore would credit a receive the gap limit says is
+    // unrecoverable. Checking coverage directly is deterministic - the old
+    // `assert_balance_stays_zero` watched a balance for 20 seconds, which made the guard a race
+    // (it decided only whether the scan reached the funding block inside the window) and, when
+    // it did fail, said nothing about why.
+    let t = miss
+        .call("getwalletinfo", json!([]))
+        .await
+        .expect("getwalletinfo on the small-gap restore")["transparent"]
+        .clone();
+    let lookahead_through = t["lookahead_through"]
+        .as_u64()
+        .expect("lookahead_through present once the matcher is built");
+    let funded_index = (NUM_ADDRESSES - 1) as u64;
+    assert!(
+        lookahead_through < funded_index,
+        "the small-gap restore's lookahead reaches index {lookahead_through}, covering the \
+         funded index {funded_index}: a receive the configured gap limit says is unrecoverable \
+         would be credited. transparent = {t}"
+    );
+    assert_eq!(
+        t["recovery_horizon"].as_u64(),
+        Some(u64::from(SMALL_GAP)),
+        "initial_scan is 0 here, so the recovery horizon is just the gap limit: {t}"
+    );
+    // A restore that has issued nothing must sit entirely inside its own recovery horizon.
+    assert_eq!(
+        t["restorable"].as_bool(),
+        Some(true),
+        "a from-seed restore that has issued no addresses must report restorable = true: {t}"
+    );
+    // With coverage proven to exclude it, the balance must be zero - checked once, not watched.
+    let bal = miss
+        .call("getbalance", json!([]))
+        .await
+        .ok()
+        .and_then(|v| v.as_f64())
+        .unwrap_or(0.0);
+    assert!(
+        bal < 1e-8,
+        "a receive beyond the configured gap limit must not be recovered, but balance = {bal} \
+         (lookahead ends at {lookahead_through}, funded index {funded_index})"
+    );
     drop(miss);
 
     // 8. Restore with a SUFFICIENT gap: the same seed, same chain - now the scan exposes the funded
@@ -376,26 +418,5 @@ async fn wait_for_balance_at_least(zecd: &Zecd, target: f64, timeout: Duration) 
             "zecd never reached {target} ZEC (got {bal})"
         );
         tokio::time::sleep(Duration::from_millis(500)).await;
-    }
-}
-
-/// Assert the balance stays at 0 for the whole window - a positive check that the beyond-gap
-/// receive is never discovered (not merely "not yet"). The wallet is already synced to the tip, so
-/// the caught-up enhancement passes run within this window; if a regression exposed the funded
-/// index, the funds would appear here (the sufficient-gap restore finds them in comparable time).
-async fn assert_balance_stays_zero(zecd: &Zecd, window: Duration) {
-    let deadline = Instant::now() + window;
-    while Instant::now() < deadline {
-        let bal = zecd
-            .call("getbalance", json!([]))
-            .await
-            .ok()
-            .and_then(|v| v.as_f64())
-            .unwrap_or(0.0);
-        assert!(
-            bal < 1e-8,
-            "a receive beyond the configured gap limit must not be recovered, but balance = {bal}"
-        );
-        tokio::time::sleep(Duration::from_secs(1)).await;
     }
 }

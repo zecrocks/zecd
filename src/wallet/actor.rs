@@ -540,6 +540,8 @@ struct WalletActor {
     /// heartbeat log and the `getwalletinfo`/`/status` surfaces. `None` until the first chunk;
     /// stays `Some` once started so an operator can poll the completed count too.
     transparent_preexpose: Option<PreexposeProgress>,
+    /// Last frontier computed by `rebuild_transparent_set`, for `SyncStatus`.
+    transparent_frontier: Option<u32>,
     /// Transient first-seen times for unmined txs, shared with the read-path handle. Stamped when
     /// the mempool stream first stores an unmined tx; pruned once the tx mines. Never persisted
     /// (zecd is stateless). See [`crate::wallet::FirstSeen`].
@@ -917,6 +919,7 @@ pub async fn spawn(
         transparent_unspent_dirty: true,
         transparent_preexposed: false,
         transparent_preexpose: None,
+        transparent_frontier: None,
         first_seen: first_seen.clone(),
         account_id,
         account_index,
@@ -2535,12 +2538,23 @@ impl WalletActor {
                 }
             }
         }
+        // Two windows, deliberately different (see the transparent notes in the project docs):
+        // `frontier` follows *exposure*, so live matching covers `frontier .. frontier +
+        // gap_limit` and a wallet always credits receives on addresses it handed out. The
+        // *recovery* horizon (`transparent_initial_scan + transparent_gap_limit`) follows
+        // *funding*, and is what bounds a from-seed restore. Log both so the difference is
+        // visible when a wallet has issued past its recovery horizon.
         tracing::debug!(
-            "[{}] transparent address set rebuilt: {} receiver(s) ({} gap-lookahead from index {frontier})",
+            "[{}] transparent address set rebuilt: {} receiver(s) ({} gap-lookahead from index \
+             {frontier}, live coverage through {}; recovery horizon {})",
             self.name,
             all.len(),
-            lookahead.len()
+            lookahead.len(),
+            frontier.saturating_add(self.transparent_gap_limit),
+            self.transparent_initial_scan
+                .saturating_add(self.transparent_gap_limit),
         );
+        self.transparent_frontier = Some(frontier);
         self.transparent_scripts = Some(engine::TransparentMatcher {
             account: account_id,
             all,
@@ -2863,6 +2877,11 @@ impl WalletActor {
             encrypted: self.encrypted,
             watch_only: self.watch_only,
             unlocked_until,
+            transparent_frontier: self.transparent_frontier,
+            transparent_recovery_horizon: self.transparent_enabled.then(|| {
+                self.transparent_initial_scan
+                    .saturating_add(self.transparent_gap_limit)
+            }),
             transparent_preexpose: self
                 .transparent_preexpose
                 .as_ref()

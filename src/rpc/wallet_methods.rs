@@ -425,7 +425,47 @@ pub(crate) fn getwalletinfo(state: &AppState, wallet: Option<&str>) -> Result<Va
             // Mature coinbase value awaiting `z_shieldcoinbase` - a subset of `balance` that
             // no regular send can select (the same number as `getbalances.mine.coinbase`).
             "coinbase_balance": zats_to_value(info.mature_coinbase),
+            // The bound a from-seed restore recovers within: anchored on *funding*, so it does
+            // not move when addresses are merely issued. See the two-window note in the project docs.
+            "recovery_horizon": st.transparent_recovery_horizon,
         });
+        // The BIP-44 lookahead window the running wallet is currently scanning *ahead of* its
+        // recorded addresses. Both bounds are INCLUSIVE. Anchored on address *exposure* (the
+        // last index handed out or funded, or the `transparent_initial_scan` floor), so it
+        // follows issuance and can legitimately run past `recovery_horizon`.
+        //
+        // NB this is the lookahead only: every address with a database row is matched too,
+        // including indices below `lookahead_from`. So these bounds describe the forward reach,
+        // not the whole matched set.
+        //
+        // `restorable` answers the question an operator actually has - would these addresses
+        // survive a from-seed restore? - so nobody has to compare two integers correctly to get
+        // a safety-critical answer right. False means the wallet is currently crediting
+        // addresses a restore of the same seed would not rediscover (see
+        // `transparent_allow_beyond_recovery_window`). Absent until the matcher is first built,
+        // and the window is omitted entirely when the gap limit is 0 (no lookahead at all).
+        if let Some(from) = st.transparent_frontier {
+            transparent["lookahead_from"] = json!(from);
+            if handle.transparent_gap_limit > 0 {
+                let through = from
+                    .saturating_add(handle.transparent_gap_limit)
+                    .saturating_sub(1);
+                transparent["lookahead_through"] = json!(through);
+                // The unrecoverable band opens exactly when an address has been *exposed at or
+                // beyond* the recovery horizon - the same condition `getnewaddress` refuses on
+                // when `transparent_allow_beyond_recovery_window` is false. `lookahead_from` is
+                // `highest exposed + 1`, so that is `lookahead_from > recovery_horizon`.
+                //
+                // NB not `lookahead_through < horizon`: account creation exposes index 0, so a
+                // healthy fresh wallet already sits at `lookahead_from = 1` and its lookahead
+                // ends at `gap_limit`, which would make that comparison report false on the
+                // default happy path. The frontier, not the window's far edge, is what issuance
+                // moves.
+                if let Some(horizon) = st.transparent_recovery_horizon {
+                    transparent["restorable"] = json!(from <= horizon);
+                }
+            }
+        }
         // Initial-sync progress (pre-exposing `transparent_initial_scan` external addresses),
         // so an operator can poll the fill rather than scrape the log. Present only while the
         // wallet is/was pre-exposing this process; absent when the depth is 0.

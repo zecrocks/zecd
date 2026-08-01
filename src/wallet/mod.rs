@@ -120,6 +120,19 @@ pub struct SyncStatus {
     /// `None` when the feature is off. Surfaced in `getwalletinfo.transparent.initial_sync` so an
     /// operator can poll the fill instead of grepping logs. Transient (rebuilt on restart).
     pub transparent_preexpose: Option<(u32, u32)>,
+    /// The block-scan matcher's current issuance frontier: `max(transparent_initial_scan,
+    /// highest *exposed* external index + 1)`. Live coverage runs `transparent_gap_limit` past
+    /// it. `None` until the matcher has been built (shielded-only wallets never build one).
+    ///
+    /// Surfaced so the two windows described in the project docs are observable rather than inferred:
+    /// this one follows issuance, while the recovery horizon
+    /// (`transparent_initial_scan + transparent_gap_limit`) follows funding and is what bounds a
+    /// from-seed restore.
+    pub transparent_frontier: Option<u32>,
+    /// `transparent_initial_scan + transparent_gap_limit` - the bound a from-seed restore
+    /// recovers within. Anchored on *funding*, so unlike `transparent_frontier` it does not move
+    /// when addresses are merely issued. `None` for shielded-only wallets.
+    pub transparent_recovery_horizon: Option<u32>,
 }
 
 impl SyncStatus {

@@ -200,6 +200,19 @@ default_receivers = ["orchard"]
 # records re-derives the entire window (one address derivation per index, repeated per output of
 # a multi-output transaction), so a wide window costs seconds-to-minutes of CPU per received UTXO
 # and can stall a restore. For deep coverage use transparent_initial_scan below instead.
+#
+# NOTE the two anchors, because they are not the same and the difference is what decides whether
+# funds survive a restore. RESTORE recovery is funded-anchored, BIP-44 style: from a bare seed
+# zecd rediscovers indices 0..transparent_initial_scan + transparent_gap_limit, then extends
+# transparent_gap_limit past each FUNDED index it finds - merely handing an address out does not
+# extend it, because issuance leaves no trace on chain. The RUNNING wallet's lookahead is
+# exposure-anchored: it also slides past addresses you have merely handed out, so a live wallet
+# can credit a receive that a restore of the same seed would not rediscover. That band opens only
+# when getnewaddress issues at/past the recovery horizon, which is what
+# transparent_allow_beyond_recovery_window below governs. Watch it directly:
+# getwalletinfo.transparent reports lookahead_from/lookahead_through (the live window, inclusive),
+# recovery_horizon, and restorable - a single boolean that is false exactly when the wallet is
+# crediting addresses a from-seed restore would miss.
 # transparent_gap_limit = 20
 #
 # transparent_initial_scan (default 0 = off) is the better tool when you hand out MANY addresses
