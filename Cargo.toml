@@ -66,7 +66,7 @@ rusqlite = { version = "0.37", features = ["time"] }
 time = "0.3"
 uuid = { version = "1", features = ["v4", "serde"] }
 
-# Zcash - versions identical to zcash-devtool/Cargo.toml
+# Zcash dependencies
 # `circuit` exposes `orchard::circuit::{ProvingKey, VerifyingKey}` so we can build the Orchard
 # proving key once at startup and reuse it for every send (the PCZT prove path), instead of
 # librustzcash's fused builder which rebuilds it per transaction.
@@ -169,13 +169,13 @@ incrementalmerkletree = "0.8"
 #   V2 is a legacy drain-only pool). Applied *unconditionally* (pre-NU6.3 too), so the default
 #   (NU6.2) build no longer combines Sapling+Orchard inputs in one transaction; the `regtest_sapling`
 #   e2e was updated to the turnstile model to match.
-# - **Ironwood model** (matches devtool): ironwood notes are **Orchard V3 notes** - same key tree,
+# - **Ironwood model**: ironwood notes are **Orchard V3 notes** - same key tree,
 #   same key derivation, scanned by the existing Orchard path, stored in `ironwood_received_notes`
 #   and surfaced in `v_received_outputs` with pool code 4; balances roll up via
 #   `AccountBalance::ironwood_balance()`. **Sends**: the proposal auto-routes Orchard payment/change
 #   into the ironwood bundle past NU6.3, and the prover adds an ironwood proof step
 #   (`requires_ironwood_proof`/`create_ironwood_proof`) using a `PostNu6_3` proving key (see
-#   `actor.rs`; mirrors devtool's `pczt/prove.rs`).
+#   `actor.rs`).
 #
 # The only remaining patch: i18n-embed-fl, a vendored 0.9.4 with the deterministic-argument-order
 # fix from kellpossible/cargo-i18n#151 backported, so `age`'s fl! macro expansions (and therefore the

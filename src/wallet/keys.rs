@@ -1,7 +1,7 @@
 //! In-memory custody of the decrypted wallet seed and on-demand spending-key derivation.
 //!
 //! The seed is held as a zeroizing secret and never persisted in the clear. The Unified
-//! Spending Key is derived fresh per send (mirrors `zcash-devtool/src/commands/wallet/send.rs`)
+//! Spending Key is derived fresh per send.
 //! and never cached.
 
 use std::path::Path;

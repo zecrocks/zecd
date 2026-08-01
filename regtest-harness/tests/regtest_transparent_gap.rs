@@ -19,13 +19,7 @@
 //! Indices are small/explicit for CI speed, but the mechanism is identical at index 999 of 1000 -
 //! you size the gap limit to your maximum outstanding-unfunded address count.
 //!
-//! It then proves the **horizon composition** (the knobs compose instead of the gap having to
-//! swallow the floor): on the small-gap + `transparent_initial_scan` restore, `getnewaddress`
-//! keeps issuing at the floor index without error, a payment there is received live, and a final
-//! from-seed restore with the **same** small-gap config recovers it via the matcher's gap
-//! lookahead - the `initial_scan = 70000, gap_limit = 1000` exchange shape at CI-sized indices.
-//!
-//! Skips cleanly unless `ZEBRAD_BIN`/`LIGHTWALLETD_BIN`/`DEVTOOL_BIN` are all set. Standard tier:
+//! Skips cleanly unless `ZEBRAD_BIN`/`ZALLET_BIN` are set. Standard tier:
 //! it's the load-bearing guard for the (recently-broken) transparent receive-discovery path plus
 //! the gap-limit / initial-scan logic, so it runs on every regtest CI run rather than only the weekly tier.
 
@@ -33,13 +27,12 @@ use std::time::{Duration, Instant};
 
 use serde_json::json;
 use zecd_regtest_harness::{
-    pick_port, resolve_bin, resolve_node_bin, Funder, Lightwalletd, RegtestNode, Zebrad, Zecd,
-    ZecdConfig,
+    pick_port, resolve_bin, resolve_node_bin, start_funder, DEFAULT_MINER_ADDRESS, FOREIGN_TADDR,
+    regtest_nuparams, Zebrad, Zecd, ZecdConfig,
 };
 
 const FUNDER_COINBASES: u32 = 120;
 const MATURITY_TAIL: u32 = 130;
-const TAIL_MINER_ADDRESS: &str = "t27eWDgjFYJGVXmzrXeVjnb5J3uXDM9xH9v";
 const FUND_ZATOSHIS: u64 = 100_000_000; // 1 ZEC
 const FUND_TIMEOUT: Duration = Duration::from_secs(240);
 
@@ -54,47 +47,43 @@ const LARGE_GAP: u32 = 25;
 
 #[tokio::test]
 async fn regtest_transparent_gap_limit_bounds_restore_recovery() {
-    let (Some(zebrad_bin), Some(lwd_bin), Some(devtool_bin)) = (
+    let (Some(zebrad_bin), Some(zallet_bin)) = (
         resolve_node_bin(),
-        resolve_bin("LIGHTWALLETD_BIN"),
-        resolve_bin("DEVTOOL_BIN"),
+        resolve_bin("ZALLET_BIN"),
     ) else {
         eprintln!(
-            "SKIP regtest_transparent_gap_limit_bounds_restore_recovery: set {}, \
-             LIGHTWALLETD_BIN and DEVTOOL_BIN to run the transparent gap-limit e2e (see README.md).",
-            RegtestNode::from_env().bin_env()
+            "SKIP regtest_transparent_gap_limit_bounds_restore_recovery: set the node binary env var (ZEBRAD_BIN or ZAKURAD_BIN) and \
+             ZALLET_BIN to run the transparent gap-limit e2e (see README.md)."
         );
         return;
     };
 
-    // 1-4. Funder bring-up (identical to regtest_transparent): mine + mature + shield the funder.
-    let funder_taddr = Funder::derive_transparent_address(&devtool_bin)
-        .expect("derive funder transparent address");
-    let mut zebrad = Zebrad::start_with_miner(&zebrad_bin, &funder_taddr)
-        .await
-        .expect("start zebrad mining to the funder");
+    // 1-3. Funder bring-up: start zebrad (throwaway), start zallet, mine shielded coinbase to the
+    //       funder's UA, mine maturity tail, wait for the funder to see the balance.
+    let zebrad = Zebrad::start(&zebrad_bin).await.expect("start zebrad");
+    zebrad.bootstrap_zallet().await.expect("bootstrap Zallet sync");
+    let funder = start_funder(
+        &zallet_bin,
+        zebrad.rpc_port,
+        pick_port().expect("pick zallet rpc port"),
+        &regtest_nuparams(false),
+    )
+    .await
+    .expect("start zallet funder");
     zebrad
-        .generate_blocks(FUNDER_COINBASES)
+        .generatetoaddress(FUNDER_COINBASES, &funder.ua)
         .await
-        .expect("mine the funder's coinbases");
+        .expect("mine shielded coinbase to funder");
     zebrad
-        .restart_with_miner(TAIL_MINER_ADDRESS)
+        .generatetoaddress(MATURITY_TAIL, DEFAULT_MINER_ADDRESS)
         .await
-        .expect("restart zebrad mining to the throwaway address");
-    zebrad
-        .generate_blocks(MATURITY_TAIL)
-        .await
-        .expect("mine the maturity tail");
-    let lwd = Lightwalletd::start(&lwd_bin, zebrad.rpc_port)
-        .await
-        .expect("start lightwalletd");
-    let funder = Funder::init(&devtool_bin, lwd.grpc_port).expect("initialise funding wallet");
-    funder.sync(lwd.grpc_port).expect("funder sync (coinbase)");
+        .expect("mine maturity tail");
     funder
-        .shield(lwd.grpc_port)
-        .expect("shield transparent coinbase");
-    zebrad.generate_blocks(6).await.expect("confirm shield");
-    funder.sync(lwd.grpc_port).expect("funder sync (shielded)");
+        .rpc
+        .wait_for_account_balance(&funder.account_uuid, FUND_ZATOSHIS, Duration::from_secs(120))
+        .await
+        .expect("wait for funder to see shielded coinbase");
+    let _funder_taddr = FOREIGN_TADDR.to_string();
 
     // 5. The "authoring" wallet: transparent enabled (default gap). It hands out NUM_ADDRESSES bare
     //    transparent addresses; because each is explicitly exposed by getnewaddress, the authoring
@@ -144,7 +133,9 @@ async fn regtest_transparent_gap_limit_bounds_restore_recovery() {
 
     // 6. Fund the high-index transparent address and confirm it.
     funder
-        .send(lwd.grpc_port, &funded_addr, FUND_ZATOSHIS)
+        .rpc
+        .z_sendmany_and_wait(&funder.ua, &funded_addr, FUND_ZATOSHIS, None)
+        .await
         .expect("send to the high-index transparent address");
     zebrad
         .generate_blocks(12)
@@ -286,7 +277,9 @@ async fn regtest_transparent_gap_limit_bounds_restore_recovery() {
         "the floor address must be a fresh index, not a reissue of the authoring run: {floor_addr}"
     );
     funder
-        .send(lwd.grpc_port, &floor_addr, FUND_ZATOSHIS)
+        .rpc
+        .z_sendmany_and_wait(&funder.ua, &floor_addr, FUND_ZATOSHIS, None)
+        .await
         .expect("send to the floor-index transparent address");
     zebrad
         .generate_blocks(12)
@@ -329,7 +322,6 @@ async fn regtest_transparent_gap_limit_bounds_restore_recovery() {
          (expected 2 ZEC = high-index + floor-index): {horizon_balance}"
     );
 
-    lwd.stop();
     drop(horizon);
     // `zebrad` and `funder` clean up on drop.
 }

@@ -1,19 +1,21 @@
 name: Regtest E2E
 
 # Live tier: brings up a zebra (Regtest) node and drives the real zecd binary over its JSON-RPC
-# (zecd talks straight to zebrad - see regtest-harness/). It also builds zcash-devtool
-# (regtest-enabled) as a funding wallet, used to shield a mined transparent coinbase into Orchard
-# and fund zecd (the funded e2e). The funder speaks lightwalletd's gRPC, so the funded tests also
-# run a lightwalletd in front of the same zebra - but the zecd under test always uses zebra.
-# No zingo-infra: the harness mines via zebrad's
-# Regtest-only `generate` RPC, so it has no zebra crate dependency and works against any zebrad
-# release. zebrad + lightwalletd are extracted from their official Docker images.
+# (zecd talks straight to zebrad - see regtest-harness/). It also builds Zallet (the Zcash
+# Foundation's zcashd-wallet successor) as a funding wallet. Zallet's zaino backend embeds its
+# indexer in-process and talks straight to zebrad over JSON-RPC, so — unlike the former
+# former gRPC funder — no lightwalletd is needed. Zebra 6.x's `generatetoaddress` mines
+# shielded coinbase directly to the funder's unified address, so the funded flow is: mine
+# shielded coinbase → mature → send to zecd (no transparent coinbase, no shield step).
+# No zingo-infra: the harness mines via zebrad's Regtest-only `generate`/`generatetoaddress` RPCs,
+# so it has no zebra crate dependency and works against any zebrad release. zebrad is extracted
+# from the official `zfnd/zebra` Docker image; zallet + zallet-zaino are built from source.
 #
 # Runs on PRs and pushes to main against the pinned zebra image. The weekly schedule is the
 # "big run": it tests BOTH the pinned image (re-validating the baseline) and zfnd/zebra:latest
 # (an early-warning canary for upstream zebra changes), and - like manual dispatches - sets
 # ZECD_REGTEST_EXTENDED=1 so the extended tests (reorg, multiwallet, stop/restore, watch-only) run too;
-# on PR runs those skip in seconds (each spins its own zebra+lightwalletd stack).
+# on PR runs those skip in seconds (each spins its own zebra+zallet stack).
 #
 # The note-scaling stress test (regtest_stress_notes) is heavier still - it builds thousands of
 # notes and times multi-minute sends - so it is gated separately (ZECD_REGTEST_STRESS) and runs
@@ -46,14 +48,6 @@ on:
         default: ""
       zebra-ironwood-image:
         description: "Ironwood tier: NU6.3-capable zebrad image (default zfnd/zebra:6.2.2); blank = the job default"
-        required: false
-        default: ""
-      lwd-ironwood-image:
-        description: "Ironwood tier: V6-aware lightwalletd image; blank = the job default"
-        required: false
-        default: ""
-      devtool-ironwood-image:
-        description: "Ironwood tier: regtest-aware zcash-devtool image; blank = the job default"
         required: false
         default: ""
   schedule:
@@ -96,9 +90,9 @@ on:
 env:
   ZEBRAD_IMAGE_PINNED: "6.2.2"
   ZAKURAD_IMAGE_PINNED: "1.0.5"
-  # The harness --test targets. Identical for both backends; the lightwalletd-funded tests skip
-  # themselves on the zakura leg (see the provisioning step - lightwalletd can't front zakura's
-  # `/Zakura/` subversion), and extended/stress tests skip in seconds unless their gate is set.
+  # The harness --test targets. Identical for both backends; the Zallet funder talks
+  # straight to the node over JSON-RPC (no lightwalletd), so funded tests run on both legs.
+  # Extended/stress tests skip in seconds unless their gate is set.
   HARNESS_TESTS: "--test regtest_e2e --test regtest_binding --test regtest_funded --test regtest_proving_cache --test regtest_sapling --test regtest_transparent --test regtest_transparent_t2t --test regtest_transparent_sendmany_t2t --test regtest_transparent_gap --test regtest_transparent_offline_restore --test regtest_transparent_preexpose_responsive --test regtest_transparent_recovery_window --test regtest_coinbase --test regtest_hang --test regtest_reorg --test regtest_multiwallet --test regtest_restore --test regtest_watchonly --test regtest_stress_notes"
 
 concurrency:
@@ -119,8 +113,8 @@ jobs:
     #
     # `node` runs the whole suite against each backend (zebra + zakura). Both speak the same
     # JSON-RPC dialect and take the same regtest config, so the harness code path is identical -
-    # only the provisioned binary and `ZECD_REGTEST_NODE` differ. (The lightwalletd-funded tests
-    # skip on the zakura leg - lightwalletd rejects zakura's subversion; see the provisioning step.)
+    # only the provisioned binary and `ZECD_REGTEST_NODE` differ. The Zallet funder (zallet-zaino)
+    # talks straight to the node over JSON-RPC, so funded tests run on both legs.
     # The `image` dimension is "event" except on the weekly schedule, where both the pinned
     # baseline and `latest` run ("event" resolves the tag from the trigger: the node's dispatch
     # input or the pinned default).
@@ -153,40 +147,46 @@ jobs:
           workspaces: |
             .
             regtest-harness
-            zcash-devtool
+            zallet
+            zallet/backends/zaino
 
       # Release build: debug Orchard/Sapling proving is >20s; release keeps the harness snappy.
       - name: Build zecd (release)
         run: cargo build --release --bin zecd
 
-      # The funding wallet: zcash-devtool with regtest support (PR zecrocks/zcash-devtool#1).
-      # It shields a mined transparent coinbase into Orchard and sends it to zecd, since regtest
-      # can't mine an Orchard coinbase zecd would scan.
-      # Pinned to a commit SHA (branch sleepy-faraday-T6HUy) so the build can't change
-      # or vanish under us. TODO: switch `ref` to a main-branch SHA once zcash-devtool#1 merges.
-      - name: Checkout zcash-devtool (funder)
+      # The funding wallet: Zallet (the Zcash Foundation's zcashd-wallet successor), using the
+      # Zaino chain backend (zallet-zaino), which embeds the indexer in-process and talks
+      # straight to zebrad over JSON-RPC (Fetch mode) — no lightwalletd needed. Zebra 6.x's
+      # `generatetoaddress` mines shielded coinbase directly to the funder's unified address.
+      # Pinned to the immutable commit behind the beta.2 release tag, so the build is reproducible.
+      - name: Checkout Zallet (funder)
         uses: actions/checkout@v4
         with:
-          repository: zecrocks/zcash-devtool
-          ref: 7ca3ce28ed9f606cdb1e1a6c8ae087cb2c5a2973
-          path: zcash-devtool
+          repository: zcash/zallet
+          # v0.1.0-beta.2; pin the immutable commit rather than a movable tag.
+          ref: bd7f020eb9e1de6f79da947e8102281832b05f83
+          path: zallet
 
-      # Cache the funder binary keyed on its commit, so devtool is built once per devtool change
-      # and skipped entirely on every other run (it rarely changes between zecd runs). On a miss,
-      # rust-cache (above) still has its dependency tree, so the rebuild is just devtool's own crate.
-      - name: Resolve devtool commit
-        run: echo "DEVTOOL_SHA=$(git -C zcash-devtool rev-parse HEAD)" >> "$GITHUB_ENV"
+      # Cache the funder binaries keyed on the zallet commit, so they're built once per zallet
+      # change and skipped on every other run. On a miss, rust-cache (above) still has the
+      # dependency tree, so the rebuild is just zallet's own crates.
+      - name: Resolve zallet commit
+        run: echo "ZALLET_SHA=$(git -C zallet rev-parse HEAD)" >> "$GITHUB_ENV"
 
-      - name: Cache the funder binary
-        id: devtool-bin
+      - name: Cache the funder binaries
+        id: zallet-bin
         uses: actions/cache@v4
         with:
-          path: zcash-devtool/target/release/zcash-devtool
-          key: devtool-bin-${{ runner.os }}-${{ env.DEVTOOL_SHA }}
+          path: |
+            zallet/target/release/zallet
+            zallet/backends/zaino/target/release/zallet-zaino
+          key: zallet-bin-${{ runner.os }}-${{ env.ZALLET_SHA }}
 
-      - name: Build zcash-devtool (funder)
-        if: steps.devtool-bin.outputs.cache-hit != 'true'
-        run: cargo build --release --manifest-path zcash-devtool/Cargo.toml --bin zcash-devtool
+      - name: Build Zallet (funder)
+        if: steps.zallet-bin.outputs.cache-hit != 'true'
+        run: |
+          cargo build --release --manifest-path zallet/Cargo.toml --bin zallet
+          cargo build --release --manifest-path zallet/backends/zaino/Cargo.toml --bin zallet-zaino
 
       # Pick the node image + tag for this leg. `node` selects the project (zebra/zakura), which
       # fixes the image repo, pinned tag, binary name and the env var the harness reads. The
@@ -219,23 +219,12 @@ jobs:
           echo "NODE_BIN_NAME=$binname" >> "$GITHUB_ENV"
           echo "NODE_BIN_ENV=$binenv" >> "$GITHUB_ENV"
 
-      # Extract the selected node from its official Docker image, plus lightwalletd. The harness
-      # drives the node over JSON-RPC only (mining via the Regtest-only `generate` RPC), so any
-      # zebrad/zakurad release works. The node binary is read from $NODE_BIN_ENV (ZEBRAD_BIN or
-      # ZAKURAD_BIN).
-      #
-      # lightwalletd is only used by the devtool *funder* (it fronts the node so devtool's gRPC
-      # wallet can shield+send Orchard funds into zecd). lightwalletd v0.4.19 hard-rejects any node
-      # whose `getinfo.subversion` isn't zcashd/zebrad - including zakura's `/Zakura:x.y.z/` - and
-      # exits fatally, so we can't run the funder in front of zakura. We therefore only provision
-      # LIGHTWALLETD_BIN on the zebra leg; on zakura the funder-dependent tests skip themselves
-      # (their existing `resolve_bin("LIGHTWALLETD_BIN")` guard), while every direct-RPC test
-      # (sync/addresses/reorg/multiwallet/restore/watch-only/transparent-recovery/...) still runs.
-      # (The coinbase suite is also zebra-only - kept off zakura via its ZEBRAD_BIN guard - because
-      # the transparent-coinbase maturity+shield flow was flaky against zakura in testing.) zecd
-      # itself talks to zakura directly and needs no lightwalletd; this is purely a limit of the
-      # test funder. A zakura-compatible lightwalletd would let the funded tests run here too.
-      - name: Provision node + lightwalletd from images
+      # Extract the selected node from its official Docker image. The harness drives the node
+      # over JSON-RPC only (mining via the Regtest-only `generate`/`generatetoaddress` RPCs), so
+      # any zebrad/zakurad release works. The node binary is read from $NODE_BIN_ENV (ZEBRAD_BIN
+      # or ZAKURAD_BIN). Zallet-zaino (the funder) embeds its indexer in-process and also talks
+      # straight to the node over JSON-RPC — no lightwalletd needed, on either leg.
+      - name: Provision node from image
         run: |
           set -euo pipefail
           mkdir -p "$RUNNER_TEMP/bin"
@@ -252,19 +241,14 @@ jobs:
           }
           extract "$NODE_IMAGE" "$NODE_BIN_NAME"
           echo "$NODE_BIN_ENV=$RUNNER_TEMP/bin/$NODE_BIN_NAME" >> "$GITHUB_ENV"
-          if [ "${{ matrix.node }}" = "zebra" ]; then
-            extract electriccoinco/lightwalletd:v0.4.19 lightwalletd
-            echo "LIGHTWALLETD_BIN=$RUNNER_TEMP/bin/lightwalletd" >> "$GITHUB_ENV"
-          else
-            echo "node=${{ matrix.node }}: skipping lightwalletd (it rejects this node's subversion); funder tests will self-skip"
-          fi
+          echo "ZALLET_BIN=$GITHUB_WORKSPACE/zallet/backends/zaino/target/release/zallet-zaino" >> "$GITHUB_ENV"
 
       # The funded test also runs scripts/conformance.py (python3, stdlib-only) against the
       # live daemon, so the full Bitcoin-Core wire-format suite is exercised here in CI.
       - name: Run regtest end-to-end harness
         env:
           ZECD_BIN: ${{ github.workspace }}/target/release/zecd
-          DEVTOOL_BIN: ${{ github.workspace }}/zcash-devtool/target/release/zcash-devtool
+          ZALLET_BIN: ${{ github.workspace }}/zallet/backends/zaino/target/release/zallet-zaino
           # Select the backend for this matrix leg (zebra/zakura); the harness resolves the node
           # binary from the matching env var (ZEBRAD_BIN / ZAKURAD_BIN, exported above).
           ZECD_REGTEST_NODE: ${{ matrix.node }}
@@ -297,16 +281,16 @@ jobs:
           # (Only the zebra leg ever runs the coinbase suite - it is zebra-only in CI, so on the
           # zakura leg both coinbase tests skip via their ZEBRAD_BIN guard before this is read.)
           ZECD_REGTEST_REQUIRE_SHIELDED_COINBASE: ${{ (github.event_name != 'workflow_dispatch' || inputs.zebra-image == '') && '1' || '' }}
-          # The node binary (ZEBRAD_BIN/ZAKURAD_BIN) and LIGHTWALLETD_BIN (zebra leg only) are
-          # exported by the provisioning step above.
+          # The node binary (ZEBRAD_BIN/ZAKURAD_BIN) and ZALLET_BIN are exported by the
+          # provisioning step above.
           #
-          # How many test binaries run at once. Each one is a whole zebrad(+lightwalletd)+zecd
-          # stack that spends most of its wall clock waiting on that stack rather than burning
-          # CPU, so the tier overlaps well - but only as far as the runner has cores and RAM for
-          # it. Raise REGTEST_JOBS in lockstep with REGTEST_RUNNER, never past it: an oversubscribed
-          # runner does not just run slower, it pushes the harness's sync/confirmation waits past
-          # their timeouts and turns into flakes. The per-binary wall-clock table the driver prints
-          # at the end of the step is the tuning input.
+          # How many test binaries run at once. Each one is a whole zebrad+zecd stack that spends
+          # most of its wall clock waiting on that stack rather than burning CPU, so the tier
+          # overlaps well - but only as far as the runner has cores and RAM for it. Raise
+          # REGTEST_JOBS in lockstep with REGTEST_RUNNER, never past it: an oversubscribed runner
+          # does not just run slower, it pushes the harness's sync/confirmation waits past their
+          # timeouts and turns into flakes. The per-binary wall-clock table the driver prints at
+          # the end of the step is the tuning input.
           #
           # 6 on 8 vCPU was measured, not guessed: 6 -> 5m42s, 8 -> 6m04s, 12 -> 6m07s. Past 6 it
           # gets *slower*, because the tier is no longer bounded by total work but by its longest
@@ -337,27 +321,24 @@ jobs:
           echo "== captured logs (${{ matrix.node }}) =="
           ls -la "$RUNNER_TEMP/regtest-logs" 2>/dev/null || echo "(no logs were written)"
 
-  # Ironwood (NU6.3) tier. Builds zecd with the `ironwood` feature (no cfg - the librustzcash pin,
-  # zcash/librustzcash `dw/ironwood-scan-model`, exposes the ironwood wallet APIs unconditionally),
-  # and runs the gated regtest_ironwood receive e2e against the NU6.3 toolchain: the OFFICIAL zebra
-  # ironwood release (`zfnd/zebra:6.2.2`) plus a still-dev V6-aware lightwalletd and a regtest-aware
-  # zcash-devtool funder. It funds zecd post-NU6.3 (auto-routed to an ironwood output) and asserts
-  # zecd labels the received note `pool == "ironwood"`.
+  # Ironwood (NU6.3) tier. Builds zecd (the ironwood scan/balance/pool/send paths are compiled
+  # unconditionally now) and runs the gated regtest_ironwood e2e against the NU6.3 toolchain:
+  # the OFFICIAL zebra ironwood release (`zfnd/zebra:6.2.2`) plus Zallet (the same funder as the
+  # standard tier, configured with NU6.3 in its `regtest_nuparams`). It funds zecd post-NU6.3
+  # (auto-routed to an ironwood output) and asserts zecd labels the received note
+  # `pool == "ironwood"`.
   #
-  # zebra is now an official image, but lwd + devtool are still DEV images (emersonian/*) that may
-  # move or vanish, so this job runs ONLY on the weekly schedule and on manual dispatch - never on
-  # other branches' PRs, so a missing image can't redden PR CI. Bump the image refs in `env` below
-  # (or pass them as dispatch inputs) as the ironwood stack is rebuilt; keep the NU6.3 height (8) in
-  # lockstep with the harness' NU6_3_ACTIVATION_HEIGHT, zecd's network::regtest(), and devtool's
-  # regtest_params().
+  # Zallet ships Ironwood in its released betas, so the former emersonian/* dev images
+  # (sha256-pinned, "may move or vanish") are retired. This job now uses the same funder
+  # provisioning as the standard tier. The `if:` gating is retained for now (zallet is still
+  # beta); relaxing it to run on all PRs is a follow-up once zallet stabilizes.
+  # Keep the NU6.3 height (8) in lockstep with the harness' NU6_3_ACTIVATION_HEIGHT, zecd's
+  # network::regtest(), and zallet's regtest_nuparams.
   regtest-ironwood:
     # schedule + manual dispatch, plus the mainline so trunk-bound work auto-runs the NU6.3 e2e
     # without a manual dispatch. `base_ref` matches any PR **into** `main`; `ref` matches a direct
-    # push to `main`. (Both clauses named `ironwood` while that was the integration line; the
-    # ironwood work sits on the trunk now, so retargeting preserves the original intent.) Still
-    # never on unrelated branches' PRs - a PR into a feature branch does not pull in the
-    # emersonian/* lwd/devtool images, which remain dev artifacts. Once those images ship, the
-    # keying can be dropped entirely so the tier runs everywhere.
+    # push to `main`. Still never on unrelated branches' PRs — zallet is beta, so the tier is
+    # gated until it stabilizes. Relaxing to run everywhere is a follow-up.
     if: ${{ github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' || github.base_ref == 'main' || github.ref == 'refs/heads/main' }}
     # Same runner as the tier above. This job runs a single test binary, so it gets nothing from
     # REGTEST_JOBS - but its release build and its Orchard proving are both parallel, and with the
@@ -366,18 +347,7 @@ jobs:
     runs-on: ${{ vars.REGTEST_RUNNER || 'ubuntu-latest-8-cores' }}
     name: regtest (ironwood / NU6.3)
     env:
-      # zebrad is now the OFFICIAL ironwood-capable release on Docker Hub (`zfnd/zebra:6.2.2`),
-      # which is NU6.3-capable and accepts the `"NU6.3"` regtest activation-height key - so the dev
-      # `emersonian/zcash-zakura` image is retired. lwd + devtool stay pinned to dev images by
-      # @sha256 digest (their tags are mutable), both rebuilt against the official zebra's V6 wire
-      # format: lwd = `emersonian/zcash-lwd-ironwood:360a37d-zr8-nu63` (V6 parser for zebra 6.x);
-      # devtool = `emersonian/zcash-devtool:cac96846` (== ironwood-valar tip), built with
-      # `regtest_support` so its regtest `init` takes `--activation-heights`; sends+receives ironwood.
-      # A dispatch input can override any of them (e.g. with a `repo:tag`) when the stack is rebuilt;
-      # bump these as the images are rebuilt.
       ZEBRAD_IRONWOOD_IMAGE: ${{ inputs.zebra-ironwood-image || 'zfnd/zebra:6.2.2' }}
-      LWD_IRONWOOD_IMAGE: ${{ inputs.lwd-ironwood-image || 'emersonian/zcash-lwd-ironwood@sha256:5f63b64ed788330ad8fe859fbbb334ceea844cf8a376318e7e25fbd3351b2f9f' }}
-      DEVTOOL_IRONWOOD_IMAGE: ${{ inputs.devtool-ironwood-image || 'emersonian/zcash-devtool@sha256:fd95d8b432f47d3eec6e5f1eca0bdfbb8daa094c28742d230bec3ac47957bd6c' }}
     steps:
       - uses: actions/checkout@v4
 
@@ -391,6 +361,8 @@ jobs:
           workspaces: |
             .
             regtest-harness
+            zallet
+            zallet/backends/zaino
           # Separate cache key: this build carries the ironwood feature + nu6.3 cfg.
           key: ironwood
 
@@ -400,8 +372,36 @@ jobs:
       - name: Build zecd (release)
         run: cargo build --release --bin zecd
 
-      # Extract zebrad + lightwalletd + the devtool funder from the ironwood toolchain images.
-      - name: Provision ironwood zebrad + lightwalletd + devtool from images
+      # Checkout Zallet (same as the standard tier) and build the funder binaries.
+      - name: Checkout Zallet (funder)
+        uses: actions/checkout@v4
+        with:
+          repository: zcash/zallet
+          # v0.1.0-beta.2; pin the immutable commit rather than a movable tag.
+          ref: bd7f020eb9e1de6f79da947e8102281832b05f83
+          path: zallet
+
+      - name: Resolve zallet commit
+        run: echo "ZALLET_SHA=$(git -C zallet rev-parse HEAD)" >> "$GITHUB_ENV"
+
+      - name: Cache the funder binaries
+        id: zallet-bin-ironwood
+        uses: actions/cache@v4
+        with:
+          path: |
+            zallet/target/release/zallet
+            zallet/backends/zaino/target/release/zallet-zaino
+          key: zallet-bin-${{ runner.os }}-${{ env.ZALLET_SHA }}
+
+      - name: Build Zallet (funder)
+        if: steps.zallet-bin-ironwood.outputs.cache-hit != 'true'
+        run: |
+          cargo build --release --manifest-path zallet/Cargo.toml --bin zallet
+          cargo build --release --manifest-path zallet/backends/zaino/Cargo.toml --bin zallet-zaino
+
+      # Extract zebrad from the ironwood-capable official image. Zallet-zaino embeds its indexer
+      # in-process — no lightwalletd needed (the emersonian dev images are retired).
+      - name: Provision ironwood zebrad from image
         run: |
           set -euo pipefail
           mkdir -p "$RUNNER_TEMP/bin"
@@ -417,11 +417,8 @@ jobs:
             echo "$name -> $out"; file -b "$out" || true
           }
           extract "$ZEBRAD_IRONWOOD_IMAGE" zebrad
-          extract "$LWD_IRONWOOD_IMAGE" lightwalletd
-          extract "$DEVTOOL_IRONWOOD_IMAGE" zcash-devtool
           echo "ZEBRAD_BIN=$RUNNER_TEMP/bin/zebrad" >> "$GITHUB_ENV"
-          echo "LIGHTWALLETD_BIN=$RUNNER_TEMP/bin/lightwalletd" >> "$GITHUB_ENV"
-          echo "DEVTOOL_BIN=$RUNNER_TEMP/bin/zcash-devtool" >> "$GITHUB_ENV"
+          echo "ZALLET_BIN=$GITHUB_WORKSPACE/zallet/backends/zaino/target/release/zallet-zaino" >> "$GITHUB_ENV"
 
       - name: Run ironwood (NU6.3) receive e2e
         env:
@@ -436,7 +433,7 @@ jobs:
           # without the debug flood that the receive/send bring-up needed.
           ZECD_STDERR: "1"
           RUST_LOG: "zecd=info"
-          # ZEBRAD_BIN / LIGHTWALLETD_BIN / DEVTOOL_BIN are exported by the provisioning step.
+          # ZEBRAD_BIN / ZALLET_BIN are exported by the provisioning step.
         run: cargo test --locked --manifest-path regtest-harness/Cargo.toml --test regtest_ironwood --no-fail-fast -- --nocapture --test-threads=1
 
       - name: Dump diagnostics on failure

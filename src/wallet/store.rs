@@ -1,5 +1,5 @@
 //! Per-wallet on-disk metadata (`keys.toml`): network, birthday height, and the
-//! age-encrypted BIP-39 mnemonic. Ported from `zcash-devtool/src/config.rs`.
+//! age-encrypted BIP-39 mnemonic.
 
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
@@ -315,7 +315,7 @@ fn decrypt_mnemonic<'a>(
     let decryptor = age::Decryptor::new(age::armor::ArmoredReader::new(ciphertext.as_bytes()))?;
     let mut buf = vec![];
     // Take ownership of the buffer into a `SecretVec` before propagating any read error so
-    // partially-read secret bytes are still zeroized (matches devtool's rationale).
+    // partially-read secret bytes are still zeroized.
     let ret = decryptor.decrypt(identities)?.read_to_end(&mut buf);
     let res = SecretVec::new(buf);
     ret?;

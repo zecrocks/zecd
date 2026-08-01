@@ -2,17 +2,15 @@
 //! shielded pools generates Sapling-bearing addresses, holds funds in **both** pools at once, and
 //! reports those funds correctly across every balance/history RPC - then spends via the turnstile.
 //!
-//! Setup mirrors `regtest_funded.rs`: mine a transparent coinbase to the funder, mature it, shield
-//! it, then send shielded funds to zecd. The difference is that zecd is configured with
+//! Setup mirrors `regtest_funded.rs`: mine shielded coinbase to the funder, mature it, then send
+//! shielded funds to zecd. The difference is that zecd is configured with
 //! `[pools] enabled = ["sapling", "orchard"]`, and we fund **two** receivers - a Sapling-only one
 //! (1 ZEC) and an Orchard-only one (2 ZEC) - so the wallet ends up holding one Sapling note and one
 //! Orchard note. That lets us assert that getbalance / getbalances / getwalletinfo / listunspent /
 //! getreceivedbyaddress all aggregate across pools.
 //!
-//! The funder (zcash-devtool) spends its Orchard notes; sending to a Sapling-only receiver is an
-//! ordinary cross-pool transfer (devtool's `propose_transfer` takes no privacy policy - the same
-//! call zecd uses when it sends Orchard->transparent in `regtest_funded`), so the value simply
-//! lands as a Sapling note.
+//! The Zallet funder spends its Orchard notes; sending to a Sapling-only receiver is an ordinary
+//! cross-pool transfer, so the value simply lands as a Sapling note.
 //!
 //! NB: past the `dw/ironwood-scan-model` "select shielded inputs from a single pool group" change,
 //! a single transaction never combines Orchard inputs with Sapling inputs - selection uses one
@@ -27,65 +25,59 @@
 //! receipt is verifiable via `getreceivedbyaddress` (zebra's verbose getrawtransaction doesn't
 //! decode shielded bundles into JSON, so this behavioral check stands in for a structural one).
 //!
-//! Skips cleanly unless `ZEBRAD_BIN`, `LIGHTWALLETD_BIN` and `DEVTOOL_BIN` are all set.
+//! Skips cleanly unless `ZEBRAD_BIN` and `ZALLET_BIN` are set.
 
 use std::time::{Duration, Instant};
 
 use serde_json::json;
 use zecd_regtest_harness::{
-    pick_port, resolve_bin, resolve_node_bin, Funder, Lightwalletd, RegtestNode, Zebrad, Zecd,
-    ZecdConfig,
+    pick_port, resolve_bin, resolve_node_bin, start_funder, DEFAULT_MINER_ADDRESS, FOREIGN_TADDR,
+    regtest_nuparams, Zebrad, Zecd, ZecdConfig,
 };
 
 const FUNDER_COINBASES: u32 = 120;
 const MATURITY_TAIL: u32 = 130;
-const TAIL_MINER_ADDRESS: &str = "t27eWDgjFYJGVXmzrXeVjnb5J3uXDM9xH9v";
 const FUND_ZATOSHIS: u64 = 100_000_000; // 1 ZEC per receiver
 const FUND_TIMEOUT: Duration = Duration::from_secs(240);
 
 #[tokio::test]
 async fn regtest_sapling_and_orchard_balances() {
-    let (Some(zebrad_bin), Some(lwd_bin), Some(devtool_bin)) = (
+    let (Some(zebrad_bin), Some(zallet_bin)) = (
         resolve_node_bin(),
-        resolve_bin("LIGHTWALLETD_BIN"),
-        resolve_bin("DEVTOOL_BIN"),
+        resolve_bin("ZALLET_BIN"),
     ) else {
         eprintln!(
-            "SKIP regtest_sapling_and_orchard_balances: set {}, LIGHTWALLETD_BIN and \
-             DEVTOOL_BIN to run the multi-pool e2e (see README.md). The harness still compiled.",
-            RegtestNode::from_env().bin_env()
+            "SKIP regtest_sapling_and_orchard_balances: set the node binary env var (ZEBRAD_BIN or ZAKURAD_BIN) and ZALLET_BIN to \
+             run the multi-pool e2e (see README.md). The harness still compiled."
         );
         return;
     };
 
-    // 1-4. Identical funder bring-up to regtest_funded: mine + mature + shield the funder.
-    let funder_taddr = Funder::derive_transparent_address(&devtool_bin)
-        .expect("derive funder transparent address");
-    let mut zebrad = Zebrad::start_with_miner(&zebrad_bin, &funder_taddr)
-        .await
-        .expect("start zebrad mining to the funder");
+    // 1-3. Funder bring-up: start zebrad, start zallet, mine shielded coinbase to the funder's UA.
+    let zebrad = Zebrad::start(&zebrad_bin).await.expect("start zebrad");
+    zebrad.bootstrap_zallet().await.expect("bootstrap Zallet sync");
+    let funder = start_funder(
+        &zallet_bin,
+        zebrad.rpc_port,
+        pick_port().expect("pick zallet rpc port"),
+        &regtest_nuparams(false),
+    )
+    .await
+    .expect("start zallet funder");
     zebrad
-        .generate_blocks(FUNDER_COINBASES)
+        .generatetoaddress(FUNDER_COINBASES, &funder.ua)
         .await
-        .expect("mine the funder's coinbases");
+        .expect("mine shielded coinbase to funder");
     zebrad
-        .restart_with_miner(TAIL_MINER_ADDRESS)
+        .generatetoaddress(MATURITY_TAIL, DEFAULT_MINER_ADDRESS)
         .await
-        .expect("restart zebrad mining to the throwaway address");
-    zebrad
-        .generate_blocks(MATURITY_TAIL)
-        .await
-        .expect("mine the maturity tail");
-    let lwd = Lightwalletd::start(&lwd_bin, zebrad.rpc_port)
-        .await
-        .expect("start lightwalletd");
-    let funder = Funder::init(&devtool_bin, lwd.grpc_port).expect("initialise funding wallet");
-    funder.sync(lwd.grpc_port).expect("funder sync (coinbase)");
+        .expect("mine maturity tail");
     funder
-        .shield(lwd.grpc_port)
-        .expect("shield transparent coinbase");
-    zebrad.generate_blocks(6).await.expect("confirm shield");
-    funder.sync(lwd.grpc_port).expect("funder sync (shielded)");
+        .rpc
+        .wait_for_account_balance(&funder.account_uuid, FUND_ZATOSHIS, Duration::from_secs(120))
+        .await
+        .expect("wait for funder to see shielded coinbase");
+    let funder_taddr = FOREIGN_TADDR.to_string();
 
     // 5. zecd with BOTH shielded pools enabled.
     let mut cfg = ZecdConfig::new(zebrad.rpc_port, pick_port().expect("pick zecd rpc port"));
@@ -231,21 +223,20 @@ async fn regtest_sapling_and_orchard_balances() {
     // asymmetric funding lets a 1.5-ZEC payment to the Sapling-only receiver still build (the
     // Sapling group's 1 ZEC can't cover it, so selection falls to the 2-ZEC Orchard group,
     // producing an Orchard->Sapling *turnstile*), which is what phase 8a/8b exercise.
-    funder
-        .send(lwd.grpc_port, &orchard_ua, 2 * FUND_ZATOSHIS)
+    funder.rpc
+        .z_sendmany_and_wait(&funder.ua, &orchard_ua, 2 * FUND_ZATOSHIS, None)
+        .await
         .expect("send to zecd's Orchard receiver");
     zebrad
         .generate_blocks(12)
         .await
         .expect("confirm Orchard send");
-    funder
-        .sync(lwd.grpc_port)
-        .expect("funder sync after Orchard send");
 
     // Fund the SAPLING-only receiver: the value can only land as a Sapling note. Observe it at
     // 0 conf via the mempool stream first, then confirm.
-    funder
-        .send(lwd.grpc_port, &sapling_ua, FUND_ZATOSHIS)
+    funder.rpc
+        .z_sendmany_and_wait(&funder.ua, &sapling_ua, FUND_ZATOSHIS, None)
+        .await
         .expect("send to zecd's Sapling receiver");
     {
         let deadline = Instant::now() + FUND_TIMEOUT;
@@ -473,7 +464,7 @@ async fn regtest_sapling_and_orchard_balances() {
     //     strongest enabled pool), which phase 9's tri-pool send then draws on. (The default policy
     //     would also permit the turnstile 8a rejected; that permission is covered by the funded
     //     e2e's transparent-recipient sends.)
-    let funder_ua = funder.unified_address().expect("funder unified address");
+    let funder_ua = funder.ua.clone();
     let txid = zecd
         .call("sendtoaddress", json!([funder_ua, 1.5]))
         .await
@@ -619,7 +610,6 @@ async fn regtest_sapling_and_orchard_balances() {
          {orchard_before} -> {orchard_after}"
     );
 
-    lwd.stop();
     drop(zecd);
     // `zebrad` and `funder` clean up on drop.
 }

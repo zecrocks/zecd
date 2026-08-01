@@ -8,12 +8,12 @@
 //! parameters. The harness is a pure black-box JSON-RPC driver, so it works unmodified against
 //! any zebrad release.
 //!
-//! The funded tests also run a `lightwalletd` in front of zebra - not for `zecd` (which uses
-//! zebra), but for the `zcash-devtool` funding wallet, which only speaks lightwalletd's gRPC.
+//! Funded tests use Zallet with its Zaino backend, which talks directly to zebra's JSON-RPC and
+//! embeds its indexer in-process.
 //!
-//! Binaries are supplied by the caller via `$ZEBRAD_BIN` / `$LIGHTWALLETD_BIN` / `$DEVTOOL_BIN`
-//! (see [`resolve_bin`]); in CI they're extracted from the official `zfnd/zebra` and
-//! `electriccoinco/lightwalletd` images. `zecd` itself is the built release binary.
+//! Binaries are supplied by the caller via `$ZEBRAD_BIN` / `$ZALLET_BIN` (see [`resolve_bin`]);
+//! in CI, zebrad is extracted from the official `zfnd/zebra` image and Zallet is built from its
+//! pinned source revision. `zecd` itself is the built release binary.
 
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
@@ -171,7 +171,7 @@ const NU6_2_ACTIVATION_HEIGHT: u32 = 4;
 /// Height at which NU6.3 (ironwood) activates on the ironwood regtest chain. Only emitted into the
 /// zebra config for the ironwood tier (stock zebra rejects the `"NU6.3"` key). This value is the
 /// canonical reference for the cross-component schedule: it MUST equal `zecd`'s `network::regtest()`
-/// `nu6_3` height and `devtool`'s `regtest_params()` - a mismatch diverges the NU6.3 consensus
+/// `nu6_3` height and zallet's `regtest_nuparams` - a mismatch diverges the NU6.3 consensus
 /// branch id and zebra rejects the tx (loud failure, not silent).
 pub const NU6_3_ACTIVATION_HEIGHT: u32 = 8;
 /// ZIP-271 one-time lockbox disbursement paid in the NU6.1 activation block's coinbase. A P2SH
@@ -180,8 +180,16 @@ const LOCKBOX_DISBURSEMENT_ADDR: &str = "t27eWDgjFYJGVXmzrXeVjnb5J3uXDM9xH9v";
 const LOCKBOX_DISBURSEMENT_ZATS: u64 = 1;
 
 /// A throwaway transparent address used as zebra's coinbase recipient when the caller doesn't need
-/// to control the coinbase (the unfunded e2e). Funded flows pass the funding wallet's own address.
-const DEFAULT_MINER_ADDRESS: &str = "t27eWDgjFYJGVXmzrXeVjnb5J3uXDM9xH9v";
+/// to control the coinbase (the unfunded e2e). Funded flows mine via `generatetoaddress` to the
+/// funder's unified address (shielded coinbase).
+pub const DEFAULT_MINER_ADDRESS: &str = "t27eWDgjFYJGVXmzrXeVjnb5J3uXDM9xH9v";
+
+/// A second throwaway transparent address, distinct from [`DEFAULT_MINER_ADDRESS`], used as a
+/// foreign send target / replacement miner in tests. The funded tests send to this address and
+/// assert on *zecd's* send details; they never check receipt here (it's a black-hole address).
+/// The reorg test uses it as the replacement miner address (different coinbase output →
+/// guaranteed-different replacement blocks). Replaces the former `Funder::derive_transparent_address`.
+pub const FOREIGN_TADDR: &str = "tmGqwWtL7RsbxikDSN26gsbicxVr2xJNe86";
 
 /// A running `zebrad`-dialect Regtest node. Drives whichever binary the caller passes - the
 /// Zcash Foundation's `zebrad` or Zakura's `zakurad` (see [`RegtestNode`]) - the same way: both
@@ -244,10 +252,11 @@ impl Zebrad {
     }
 
     /// Launch `zebrad` on the ironwood regtest chain (NU6.3 active at [`NU6_3_ACTIVATION_HEIGHT`]),
-    /// mining its coinbase to `miner_address`. Requires an ironwood-capable zebrad (the zakura
-    /// image) - stock zebra rejects the `"NU6.3"` activation-height key.
-    pub async fn start_with_miner_ironwood(bin: &Path, miner_address: &str) -> Result<Zebrad> {
-        Self::start_inner(bin, miner_address, Some(NU6_3_ACTIVATION_HEIGHT)).await
+    /// mining its coinbase to [`DEFAULT_MINER_ADDRESS`]. Requires an ironwood-capable zebrad (the
+    /// official `zfnd/zebra` image) - stock zebra rejects the `"NU6.3"` activation-height key.
+    /// Funded tests mine via [`Zebrad::generatetoaddress`] to the funder's UA (shielded coinbase).
+    pub async fn start_ironwood(bin: &Path) -> Result<Zebrad> {
+        Self::start_inner(bin, DEFAULT_MINER_ADDRESS, Some(NU6_3_ACTIVATION_HEIGHT)).await
     }
 
     async fn start_inner(
@@ -379,6 +388,31 @@ impl Zebrad {
         Ok(())
     }
 
+    /// Mine `n` blocks to `address` via zebrad's Regtest-only `generatetoaddress` RPC. Unlike
+    /// [`Zebrad::generate_blocks`] (which mines to the configured `miner_address`), this takes
+    /// the recipient per-call, so the funded flow can mine shielded coinbase to the funder's
+    /// unified address and the maturity tail to a throwaway, without restarting zebrad. Zebra 6.x
+    /// accepts a unified address and mines **shielded coinbase** (ZIP-213) to its Orchard receiver.
+    pub async fn generatetoaddress(&self, n: u32, address: &str) -> Result<()> {
+        let hashes = zebra_rpc_call(&self.rpc_url(), "generatetoaddress", json!([n, address]))
+            .await
+            .context("generatetoaddress")?;
+        let mined = hashes.as_array().map(|a| a.len()).unwrap_or(0);
+        if mined != n as usize {
+            bail!("generatetoaddress mined {mined} of {n} requested blocks: {hashes}");
+        }
+        Ok(())
+    }
+
+    /// Mine the explicit one-block precondition required before a new Zallet wallet can sync and
+    /// create its first account. This belongs to test setup, not `start_funder`, so the chain
+    /// mutation is visible at every call site.
+    pub async fn bootstrap_zallet(&self) -> Result<()> {
+        self.generatetoaddress(1, DEFAULT_MINER_ADDRESS)
+            .await
+            .context("mine Zallet bootstrap block")
+    }
+
     /// Pause the process with SIGSTOP, simulating a *hung* upstream: the kernel keeps its
     /// sockets alive - TCP connects succeed and segments are ACKed - but no JSON-RPC request is
     /// ever answered. This is the failure mode a kill can't reproduce (a dead process refuses
@@ -403,7 +437,7 @@ impl Drop for Zebrad {
 
 /// zebrad Regtest config for zebra 6.x. Note: no `[mining] debug_like_zcashd` (removed after
 /// 2.x), `disable_pow = true` so submitted blocks need no PoW, and `enable_cookie_auth = false`
-/// so lightwalletd can use the rpcuser/rpcpassword from its `zcash.conf`.
+/// so the zallet funder and zecd can use the rpcuser/rpcpassword directly.
 fn zebrad_toml(
     net_port: u16,
     rpc_port: u16,
@@ -433,7 +467,7 @@ disable_pow = true
 # deferred (lockbox) pool only accrues once NU6 is active - so we let NU6 run for a few blocks to
 # build a pool, then disburse a token amount at the NU6.1/NU6.2 activation block. zebra's
 # getblocktemplate emits the disbursement output automatically from the config below.
-# devtool's and zecd's regtest networks must match these heights (network::regtest / regtest_local).
+# zallet's and zecd's regtest networks must match these heights (network::regtest / regtest_local).
 [network.testnet_parameters.activation_heights]
 NU5 = 1
 NU6 = 1
@@ -473,413 +507,413 @@ enable_cookie_auth = false
     )
 }
 
-// =============================== lightwalletd (indexer) ===============================
+// =============================== Client (shared JSON-RPC) ===============================
 
-/// A running `lightwalletd` pointed at a regtest zebrad.
-pub struct Lightwalletd {
-    child: Child,
-    /// gRPC port serving the lightwalletd `CompactTxStreamer` protocol.
-    pub grpc_port: u16,
-    _dir: tempfile::TempDir,
+/// A Bitcoin-Core-style JSON-RPC client over HTTP with basic auth. Used by both [`Zecd`] (the
+/// system under test) and [`Funder`] (the zallet funding wallet) - both are wallets driven the
+/// same way, so the call/envelope/error logic is shared.
+pub struct Client {
+    http: reqwest::Client,
+    pub base_url: String,
+    pub user: String,
+    pub password: String,
 }
 
-impl Lightwalletd {
-    /// Launch `lightwalletd` against the given zebrad RPC port and wait until its gRPC server is up.
-    pub async fn start(bin: &Path, zebrad_rpc_port: u16) -> Result<Lightwalletd> {
-        let grpc_port = pick_port()?;
-        Self::start_on(bin, zebrad_rpc_port, grpc_port).await
+/// A JSON-RPC failure: either a transport problem or a Bitcoin-Core-style `{code, message}`.
+#[derive(Debug)]
+pub enum RpcError {
+    Transport(String),
+    Rpc { code: i64, message: String },
+}
+
+impl RpcError {
+    fn transport(s: String) -> Self {
+        RpcError::Transport(s)
     }
-
-    /// Launch on a *fixed* gRPC port. Used by the fault tests to bring lightwalletd back on
-    /// the same address a running zecd is configured for (a fresh data dir re-ingests the
-    /// chain from zebra, which takes seconds on a regtest chain).
-    pub async fn start_on(
-        bin: &Path,
-        zebrad_rpc_port: u16,
-        grpc_port: u16,
-    ) -> Result<Lightwalletd> {
-        let dir = tempfile::tempdir().context("create lightwalletd dir")?;
-        let http_port = pick_port()?;
-        let data_dir = dir.path().join("data");
-        std::fs::create_dir_all(&data_dir)?;
-
-        // lightwalletd reads the node's RPC connection details from a zcash.conf-style file.
-        let zcash_conf = dir.path().join("zcash.conf");
-        std::fs::write(
-            &zcash_conf,
-            format!("rpcuser=zecdtest\nrpcpassword=zecdtest\nrpcbind=127.0.0.1\nrpcport={zebrad_rpc_port}\n"),
-        )
-        .context("write zcash.conf")?;
-
-        let log_file = dir.path().join("lightwalletd.log");
-        let child = Command::new(bin)
-            .args([
-                "--no-tls-very-insecure",
-                "--grpc-bind-addr",
-                &format!("127.0.0.1:{grpc_port}"),
-                "--http-bind-addr",
-                &format!("127.0.0.1:{http_port}"),
-                "--data-dir",
-                data_dir.to_str().unwrap(),
-                "--log-file",
-                log_file.to_str().unwrap(),
-                "--zcash-conf-path",
-                zcash_conf.to_str().unwrap(),
-            ])
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .with_context(|| format!("spawn lightwalletd ({})", bin.display()))?;
-
-        let lwd = Lightwalletd {
-            child,
-            grpc_port,
-            _dir: dir,
-        };
-        lwd.wait_until_ready(&log_file).await?;
-        Ok(lwd)
-    }
-
-    /// Kill the process, simulating an upstream outage. The gRPC port is freed (new
-    /// connections are refused) and can be reused by a later [`Lightwalletd::start_on`].
-    pub fn stop(self) {
-        // Drop runs kill + wait.
-    }
-
-    /// Pause the process with SIGSTOP, simulating a *hung* upstream: the kernel keeps its
-    /// sockets alive - TCP connects succeed and segments are ACKed - but no request is ever
-    /// answered. This is the failure mode a kill can't reproduce (a dead process refuses
-    /// connections immediately) and the one only HTTP/2 keepalive / per-RPC deadlines can
-    /// detect. Resume with [`Lightwalletd::resume`].
-    pub fn pause(&self) -> Result<()> {
-        signal_process(self.child.id(), "STOP")
-    }
-
-    /// Resume a [`Lightwalletd::pause`]d process (SIGCONT); it picks up where it stopped.
-    pub fn resume(&self) -> Result<()> {
-        signal_process(self.child.id(), "CONT")
-    }
-
-    async fn wait_until_ready(&self, log_file: &Path) -> Result<()> {
-        let deadline = Instant::now() + Duration::from_secs(90);
-        loop {
-            if let Ok(log) = std::fs::read_to_string(log_file) {
-                if log.contains("Starting insecure no-TLS (plaintext) server") {
-                    return Ok(());
-                }
-            }
-            if Instant::now() >= deadline {
-                let log = std::fs::read_to_string(log_file).unwrap_or_default();
-                bail!(
-                    "lightwalletd did not become ready within 90s; log tail:\n{}",
-                    tail(&log, 20)
-                );
-            }
-            tokio::time::sleep(Duration::from_millis(500)).await;
+    /// The Bitcoin Core error code, if this was an RPC-level error.
+    pub fn code(&self) -> Option<i64> {
+        match self {
+            RpcError::Rpc { code, .. } => Some(*code),
+            RpcError::Transport(_) => None,
         }
     }
 }
 
-impl Drop for Lightwalletd {
+impl std::fmt::Display for RpcError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            RpcError::Transport(s) => write!(f, "transport error: {s}"),
+            RpcError::Rpc { code, message } => write!(f, "rpc error {code}: {message}"),
+        }
+    }
+}
+
+impl Client {
+    /// Construct a client pointed at `base_url` with the given basic-auth credentials.
+    pub fn new(base_url: String, user: String, password: String) -> Client {
+        Client {
+            http: reqwest::Client::new(),
+            base_url,
+            user,
+            password,
+        }
+    }
+
+    /// Issue a JSON-RPC call to [`Client::base_url`], returning the `result` on success or an
+    /// error carrying the Bitcoin Core error `code` (so tests can assert e.g. `-6`).
+    pub async fn call(&self, method: &str, params: Value) -> Result<Value, RpcError> {
+        self.call_at(&self.base_url.clone(), method, params).await
+    }
+
+    /// Issue a JSON-RPC call against an explicit URL (used by `call_wallet` for multiwallet
+    /// routing).
+    pub async fn call_at(
+        &self,
+        url: &str,
+        method: &str,
+        params: Value,
+    ) -> Result<Value, RpcError> {
+        let body = json!({ "jsonrpc": "1.0", "id": "harness", "method": method, "params": params });
+        let resp = self
+            .http
+            .post(url)
+            .basic_auth(&self.user, Some(&self.password))
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| RpcError::transport(e.to_string()))?;
+        let envelope: Value = resp
+            .json()
+            .await
+            .map_err(|e| RpcError::transport(format!("decoding response: {e}")))?;
+        if let Some(err) = envelope.get("error").filter(|e| !e.is_null()) {
+            let code = err.get("code").and_then(|c| c.as_i64()).unwrap_or(0);
+            let message = err
+                .get("message")
+                .and_then(|m| m.as_str())
+                .unwrap_or("")
+                .to_string();
+            return Err(RpcError::Rpc { code, message });
+        }
+        Ok(envelope.get("result").cloned().unwrap_or(Value::Null))
+    }
+
+    /// Submit a `z_sendmany` from `from_address` to `to_address`, poll `z_getoperationstatus`
+    /// until the async op reaches a terminal state, and return the resulting txid. Converts
+    /// `zatoshis` to ZEC decimal (z_sendmany takes ZEC, not zatoshis). The funder is a throwaway
+    /// wallet, so the privacy policy is `NoPrivacy` (always permissive — no privacy to protect).
+    pub async fn z_sendmany_and_wait(
+        &self,
+        from_address: &str,
+        to_address: &str,
+        zatoshis: u64,
+        memo: Option<&str>,
+    ) -> Result<String> {
+        let amount_zec = format!("{:.8}", zatoshis as f64 / 1e8);
+        let mut payment = json!({"address": to_address, "amount": amount_zec});
+        if let Some(m) = memo {
+            payment["memo"] = json!(zallet_memo_hex(m)?);
+        }
+        let opid = self
+            .call("z_sendmany", json!([from_address, [payment], 1, null, "NoPrivacy"]))
+            .await
+            .map_err(|e| anyhow!("z_sendmany failed: {e}"))?
+            .as_str()
+            .ok_or_else(|| anyhow!("z_sendmany did not return an opid string"))?
+            .to_string();
+
+        let deadline = Instant::now() + Duration::from_secs(240);
+        loop {
+            let ops = self
+                .call("z_getoperationstatus", json!([[opid.clone()]]))
+                .await
+                .map_err(|e| anyhow!("z_getoperationstatus failed: {e}"))?;
+            let status = ops
+                .as_array()
+                .and_then(|a| a.first())
+                .and_then(|o| o.get("status"))
+                .and_then(|s| s.as_str())
+                .unwrap_or("");
+            match status {
+                "success" => {
+                    let result = self
+                        .call("z_getoperationresult", json!([[opid.clone()]]))
+                        .await
+                        .map_err(|e| anyhow!("z_getoperationresult failed: {e}"))?;
+                    let txid = result
+                        .as_array()
+                        .and_then(|a| a.first())
+                        .and_then(|o| o.get("result"))
+                        .and_then(|r| r.get("txid"))
+                        .and_then(|t| t.as_str())
+                        .ok_or_else(|| anyhow!("no txid in operation result: {result}"))?
+                        .to_string();
+                    return Ok(txid);
+                }
+                "failed" => {
+                    let msg = ops
+                        .as_array()
+                        .and_then(|a| a.first())
+                        .and_then(|o| o.get("error"))
+                        .and_then(|e| e.get("message"))
+                        .and_then(|m| m.as_str())
+                        .unwrap_or("unknown error");
+                    bail!("z_sendmany operation failed: {msg}");
+                }
+                "cancelled" => bail!("z_sendmany operation cancelled"),
+                _ => {}
+            }
+            if Instant::now() >= deadline {
+                bail!("z_sendmany operation did not complete within 240s (last status: {status})");
+            }
+            tokio::time::sleep(Duration::from_secs(2)).await;
+        }
+    }
+
+    /// Wait until Zallet reports a fully synchronized wallet view. Its documented readiness
+    /// condition is `wallet_tip == node_tip`; account and balance RPCs require this state.
+    pub async fn wait_for_wallet_sync(&self, timeout: Duration) -> Result<()> {
+        let deadline = Instant::now() + timeout;
+        loop {
+            if let Ok(status) = self.call("getwalletstatus", json!([])).await {
+                let node_tip = status.get("node_tip");
+                let wallet_tip = status.get("wallet_tip");
+                if node_tip.is_some() && node_tip == wallet_tip {
+                    return Ok(());
+                }
+            }
+            if Instant::now() >= deadline {
+                bail!("Zallet wallet_tip did not reach node_tip within {timeout:?}");
+            }
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
+    }
+
+    /// Poll Zallet's account-scoped balance until the total across its reported pools reaches
+    /// `min_zat`. This avoids accidentally reading another account from `z_getbalances`.
+    pub async fn wait_for_account_balance(
+        &self,
+        account_uuid: &str,
+        min_zat: u64,
+        timeout: Duration,
+    ) -> Result<()> {
+        let deadline = Instant::now() + timeout;
+        loop {
+            if let Ok(balance) = self
+                .call("z_getbalanceforaccount", json!([account_uuid]))
+                .await
+            {
+                let total_zat = balance
+                    .get("pools")
+                    .and_then(|pools| pools.as_object())
+                    .into_iter()
+                    .flat_map(|pools| pools.values())
+                    .filter_map(|pool| pool.get("valueZat").and_then(|v| v.as_u64()))
+                    .sum::<u64>();
+                if total_zat >= min_zat {
+                    return Ok(());
+                }
+            }
+            if Instant::now() >= deadline {
+                bail!("Zallet account {account_uuid} did not reach {min_zat} zat within {timeout:?}");
+            }
+            tokio::time::sleep(Duration::from_secs(2)).await;
+        }
+    }
+}
+
+/// Render UTF-8 text as Zallet's required hexadecimal memo representation.
+fn zallet_memo_hex(memo: &str) -> Result<String> {
+    if memo.len() > 512 {
+        bail!("memo is {} bytes; Zallet permits at most 512", memo.len());
+    }
+    Ok(memo
+        .as_bytes()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect())
+}
+
+// =============================== funder (zallet) ===============================
+
+/// The funding wallet: a `zallet-zaino` daemon driven over JSON-RPC. One process for the
+/// whole test; the harness drives it the same way it drives [`Zecd`] (HTTP JSON-RPC), not by
+/// spawning subprocesses. The funder's account is created on the running regtest chain, and
+/// zebra 6.x's `generatetoaddress` mines shielded coinbase directly to [`Funder::ua`]'s
+/// Orchard receiver — no transparent coinbase, no shield step, no lightwalletd.
+pub struct Funder {
+    child: Child,
+    /// The JSON-RPC endpoint (same `Client` type `Zecd` uses).
+    pub rpc: Client,
+    /// Zallet's account identity. Balance checks use this rather than an all-accounts RPC.
+    pub account_uuid: String,
+    /// The funder's stored unified address (Orchard+Sapling+transparent receivers). Receives
+    /// shielded coinbase via `generatetoaddress` and serves as zecd's spend-back target.
+    pub ua: String,
+    _datadir: tempfile::TempDir,
+}
+
+impl Drop for Funder {
     fn drop(&mut self) {
         let _ = self.child.kill();
         let _ = self.child.wait();
     }
 }
 
-// =============================== funder (zcash-devtool) ===============================
-
-/// A valid 24-word BIP-39 test mnemonic (the canonical all-zero-entropy vector). Regtest only - it
-/// controls throwaway coinbase funds, never anything of value.
-const FUNDER_MNEMONIC: &str = "abandon abandon abandon abandon abandon abandon abandon abandon \
-abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon \
-abandon abandon abandon art";
-
-/// Drives the `zcash-devtool` binary as a funding wallet. It controls zebra's coinbase (which is
-/// mined to its address), shields the matured transparent coinbase into Orchard, and sends Orchard
-/// funds to the `zecd` wallet under test. Resolve the binary via `$DEVTOOL_BIN`.
-///
-/// Regtest can't mine a coinbase straight into an Orchard note that `zecd` (Orchard-only) would
-/// see, so this is how we get funds into `zecd`: mine transparent coinbase -> mature (101 blocks) ->
-/// shield to Orchard -> send to `zecd`'s unified address.
-pub struct Funder {
-    bin: PathBuf,
-    dir: tempfile::TempDir,
+/// The network-upgrade activation heights for the regtest chain, expressed in zallet's
+/// `regtest_nuparams` format (`"<branch_id_hex>:<height>"`). These MUST match the zebra config
+/// the harness launches ([`zebrad_toml`]) and `zecd`'s `network::regtest()`.
+pub fn regtest_nuparams(ironwood: bool) -> Vec<String> {
+    let mut params = vec![
+        format!("{:08x}:1", 0xc2d6d0b4u32), // Nu5
+        format!("{:08x}:1", 0xc8e71055u32), // Nu6
+        format!("{:08x}:{}", 0x4dec4df0u32, NU6_2_ACTIVATION_HEIGHT), // Nu6_1
+        format!("{:08x}:{}", 0x5437f330u32, NU6_2_ACTIVATION_HEIGHT), // Nu6_2
+    ];
+    if ironwood {
+        params.push(format!("{:08x}:{}", 0x37a5165bu32, NU6_3_ACTIVATION_HEIGHT)); // Nu6_3 (Ironwood)
+    }
+    params
 }
 
-impl Funder {
-    /// Derive the funder's default transparent address offline (no chain, no wallet) from its
-    /// fixed mnemonic, so zebra can be told to mine its coinbase here *before* any chain exists.
-    /// Mining straight to the funder keeps everything on one chain, so the wallet's birthday anchor
-    /// stays valid (a throwaway chain would hand the wallet a wrong note-commitment anchor).
-    pub fn derive_transparent_address(bin: &Path) -> Result<String> {
-        let output = Command::new(bin)
-            .args([
-                "wallet",
-                "derive-address",
-                "--network",
-                "regtest",
-                "--mnemonic",
-                FUNDER_MNEMONIC,
-            ])
-            .output()
-            .context("spawn devtool derive-address")?;
-        if !output.status.success() {
-            bail!(
-                "devtool derive-address failed ({}): {}",
-                output.status,
-                String::from_utf8_lossy(&output.stderr)
-            );
-        }
-        let out = String::from_utf8_lossy(&output.stdout);
-        out.lines()
-            .find_map(|line| line.split("Transparent Address:").nth(1))
-            .map(|addr| addr.trim().to_string())
-            .ok_or_else(|| anyhow!("no Transparent Address in derive-address output:\n{out}"))
-    }
+/// Launch the `zallet-zaino` funder daemon: write `zallet.toml`, run the CLI init sequence
+/// (encryption identity → wallet encryption → mnemonic), spawn the daemon, wait for its wallet
+/// view to synchronize with the explicitly bootstrapped chain, then create the account + generate
+/// a stored unified address. Returns a [`Funder`] handle with [`Funder::ua`] and [`Funder::rpc`]
+/// populated. Call [`Zebrad::bootstrap_zallet`] before this function. Resolve the binary via
+/// `$ZALLET_BIN`.
+pub async fn start_funder(
+    bin: &Path,
+    zebra_rpc_port: u16,
+    rpc_port: u16,
+    nuparams: &[String],
+) -> Result<Funder> {
+    let datadir = tempfile::tempdir().context("create zallet datadir")?;
+    let user = "funder";
+    let password = "funder";
 
-    /// Initialise the funding wallet against a lightwalletd. Non-interactive via `--mnemonic`;
-    /// `--birthday 2` is the lowest height with a tree state (init fetches `GetTreeState(birthday-1)`,
-    /// which needs a real block - `birthday 0/1` requests genesis and is rejected). The funder's
-    /// transparent coinbase is detected regardless of birthday.
-    pub fn init(bin: &Path, lwd_port: u16) -> Result<Funder> {
-        Self::init_inner(bin, lwd_port, false)
-    }
-
-    /// Initialise the funding wallet on the **ironwood** regtest chain (NU6.3 active). The ironwood
-    /// `zcash-devtool` (`regtest_support` feature) differs from the older standard-tier build on two
-    /// `init` points: (1) `-n regtest` requires an explicit `--activation-heights <TOML>` (persisted
-    /// into the wallet so its per-build consensus branch ID matches the launched zebra), and (2) the
-    /// mnemonic is read from **stdin** (piped) rather than a `--mnemonic` flag (which it no longer
-    /// accepts). [`Funder::init`] keeps the old `--mnemonic`/no-heights shape for the standard tier.
-    pub fn init_ironwood(bin: &Path, lwd_port: u16) -> Result<Funder> {
-        Self::init_inner(bin, lwd_port, true)
-    }
-
-    fn init_inner(bin: &Path, lwd_port: u16, ironwood: bool) -> Result<Funder> {
-        let dir = tempfile::tempdir().context("create funder dir")?;
-        let funder = Funder {
-            bin: bin.to_path_buf(),
-            dir,
-        };
-        let identity = funder.identity();
-        if ironwood {
-            // Newer devtool: mnemonic piped to stdin, activation heights via file.
-            let heights_path = funder.write_activation_heights()?;
-            let args = [
-                "--name",
-                "funder",
-                "--network",
-                "regtest",
-                "--identity",
-                &identity,
-                "--birthday",
-                "2",
-                "--activation-heights",
-                &heights_path,
-            ];
-            funder.run_with_stdin(
-                "init",
-                &args,
-                Some(lwd_port),
-                &format!("{FUNDER_MNEMONIC}\n"),
-            )?;
-        } else {
-            // Older devtool: mnemonic via `--mnemonic`, no activation heights.
-            let args = [
-                "--name",
-                "funder",
-                "--network",
-                "regtest",
-                "--identity",
-                &identity,
-                "--mnemonic",
-                FUNDER_MNEMONIC,
-                "--birthday",
-                "2",
-            ];
-            funder.run("init", &args, Some(lwd_port))?;
-        }
-        Ok(funder)
-    }
-
-    /// Write the `--activation-heights` TOML the ironwood `zcash-devtool` requires for `init`, in the
-    /// `ActivationHeights` schema (one optional height per network upgrade). These MUST match zecd's
-    /// `network::regtest()` and the zebra config the harness launches (`zebrad_toml`): NU5/NU6 from
-    /// height 1, NU6.1/NU6.2 at [`NU6_2_ACTIVATION_HEIGHT`], NU6.3 (Ironwood) at
-    /// [`NU6_3_ACTIVATION_HEIGHT`] - any drift makes the validator reject the funder's transactions.
-    fn write_activation_heights(&self) -> Result<String> {
-        let path = self.dir.path().join("activation-heights.toml");
-        let toml = format!(
-            "overwinter = 1\n\
-             sapling = 1\n\
-             blossom = 1\n\
-             heartwood = 1\n\
-             canopy = 1\n\
-             nu5 = 1\n\
-             nu6 = 1\n\
-             nu6_1 = {nu62}\n\
-             nu6_2 = {nu62}\n\
-             nu6_3 = {nu63}\n",
-            nu62 = NU6_2_ACTIVATION_HEIGHT,
-            nu63 = NU6_3_ACTIVATION_HEIGHT,
+    // 1. Generate the base config from `zallet example-config`, then uncomment+edit fields.
+    let example = Command::new(bin)
+        .args([
+            "-d",
+            datadir.path().to_str().unwrap(),
+            "example-config",
+            "-o",
+            "-",
+            "--this-is-beta-code-and-you-will-need-to-recreate-the-example-later",
+            "-f",
+        ])
+        .output()
+        .context("spawn zallet example-config")?;
+    if !example.status.success() {
+        bail!(
+            "zallet example-config failed ({}): {}",
+            example.status,
+            String::from_utf8_lossy(&example.stderr)
         );
-        std::fs::write(&path, toml).context("write activation-heights.toml")?;
-        Ok(path.to_string_lossy().into_owned())
     }
+    let mut config = String::from_utf8_lossy(&example.stdout).to_string();
+    // Uncomment + set the fields we need (never insert new sections — that breaks TOML).
+    config = config.replacen("network = \"main\"", &format!("network = \"regtest\"\nregtest_nuparams = [{}]", nuparams.iter().map(|p| format!("\"{p}\"")).collect::<Vec<_>>().join(", ")), 1);
+    config = regex_replacen("#validator_address = UNSET", &format!("validator_address = \"127.0.0.1:{zebra_rpc_port}\""), &config);
+    config = regex_replacen("#validator_user = UNSET", &format!("validator_user = \"{user}\""), &config);
+    config = regex_replacen("#validator_password = UNSET", &format!("validator_password = \"{password}\""), &config);
+    config = regex_replacen("#require_backup = true", "require_backup = false", &config);
+    config = regex_replacen("#bind = []", &format!("bind = [\"127.0.0.1:{rpc_port}\"]"), &config);
+    config = regex_replacen("#[[rpc.auth]]", "[[rpc.auth]]", &config);
+    config = regex_replacen("#user = UNSET", &format!("user = \"{user}\""), &config);
+    config = regex_replacen("#password = UNSET", &format!("password = \"{password}\""), &config);
+    std::fs::write(datadir.path().join("zallet.toml"), config)
+        .context("write zallet.toml")?;
 
-    fn identity(&self) -> String {
-        self.dir
-            .path()
-            .join("identity.txt")
-            .to_string_lossy()
-            .into_owned()
-    }
+    // 2. CLI init sequence: encryption identity → wallet encryption → mnemonic.
+    run_zallet_cli(bin, datadir.path(), &["generate-encryption-identity"])?;
+    run_zallet_cli(bin, datadir.path(), &["init-wallet-encryption"])?;
+    run_zallet_cli(bin, datadir.path(), &["generate-mnemonic"])?;
 
-    fn wallet_dir(&self) -> String {
-        self.dir.path().to_string_lossy().into_owned()
-    }
+    // 3. Spawn the daemon.
+    let (out, err) = match std::env::var_os("ZALLET_STDERR") {
+        Some(_) => (Stdio::inherit(), Stdio::inherit()),
+        None => (Stdio::null(), Stdio::null()),
+    };
+    let mut child = Command::new(bin)
+        .args(["-d", datadir.path().to_str().unwrap(), "start"])
+        .stdout(out)
+        .stderr(err)
+        .spawn()
+        .context("spawn zallet-zaino")?;
 
-    /// The funder's unified address (parsed from `list-addresses`), used as zebra's miner address.
-    pub fn unified_address(&self) -> Result<String> {
-        let out = self.run("list-addresses", &[], None)?;
-        out.lines()
-            .find_map(|line| line.split("Default Address:").nth(1))
-            .map(|addr| addr.trim().to_string())
-            .ok_or_else(|| anyhow!("no Default Address in devtool list-addresses output:\n{out}"))
-    }
+    let base_url = format!("http://127.0.0.1:{}/", rpc_port);
+    let rpc = Client::new(base_url, user.to_string(), password.to_string());
 
-    /// Scan the chain via lightwalletd to pick up new transactions / UTXOs.
-    pub fn sync(&self, lwd_port: u16) -> Result<()> {
-        self.run("sync", &[], Some(lwd_port)).map(|_| ())
-    }
-
-    /// Shield all spendable transparent funds (the matured coinbase) into Orchard.
-    pub fn shield(&self, lwd_port: u16) -> Result<()> {
-        let identity = self.identity();
-        self.run("shield", &["--identity", &identity], Some(lwd_port))
-            .map(|_| ())
-    }
-
-    /// Send `zatoshis` to `to_address` (an Orchard/unified address).
-    pub fn send(&self, lwd_port: u16, to_address: &str, zatoshis: u64) -> Result<()> {
-        self.send_with_memo(lwd_port, to_address, zatoshis, None)
-    }
-
-    /// Send `zatoshis` to `to_address`, optionally attaching a ZIP-302 text `memo` (devtool's
-    /// `--memo`, parsed as a text memo). Used to exercise zecd's *receive*-memo path: the
-    /// recipient must surface the memo on the received output.
-    pub fn send_with_memo(
-        &self,
-        lwd_port: u16,
-        to_address: &str,
-        zatoshis: u64,
-        memo: Option<&str>,
-    ) -> Result<()> {
-        let identity = self.identity();
-        let value = zatoshis.to_string();
-        let mut extra = vec![
-            "--identity",
-            &identity,
-            "--address",
-            to_address,
-            "--value",
-            &value,
-        ];
-        if let Some(memo) = memo {
-            extra.push("--memo");
-            extra.push(memo);
+    // 4. Wait for the RPC to come up, then for its documented synchronized state.
+    let deadline = Instant::now() + Duration::from_secs(90);
+    loop {
+        if rpc.call("getwalletstatus", json!([])).await.is_ok() {
+            break;
         }
-        self.run("send", &extra, Some(lwd_port)).map(|_| ())
+        if let Ok(Some(status)) = child.try_wait() {
+            bail!("zallet exited during startup ({status})");
+        }
+        if Instant::now() >= deadline {
+            bail!("zallet RPC did not come up within 90s");
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
     }
+    rpc.wait_for_wallet_sync(Duration::from_secs(60)).await?;
 
-    /// Run `zcash-devtool wallet -w <dir> <subcommand> <extra...> [--server .. --connection direct]`.
-    fn run(&self, subcommand: &str, extra: &[&str], lwd_port: Option<u16>) -> Result<String> {
-        let mut args: Vec<String> = vec![
-            "wallet".into(),
-            "-w".into(),
-            self.wallet_dir(),
-            subcommand.into(),
-        ];
-        args.extend(extra.iter().map(|s| s.to_string()));
-        if let Some(port) = lwd_port {
-            args.extend([
-                "--server".into(),
-                format!("127.0.0.1:{port}"),
-                "--connection".into(),
-                "direct".into(),
-            ]);
-        }
-        let output = Command::new(&self.bin)
-            .args(&args)
-            .output()
-            .with_context(|| format!("spawn devtool {subcommand}"))?;
-        if !output.status.success() {
-            bail!(
-                "devtool {subcommand} failed ({}):\nstdout: {}\nstderr: {}",
-                output.status,
-                String::from_utf8_lossy(&output.stdout),
-                tail(&String::from_utf8_lossy(&output.stderr), 30),
-            );
-        }
-        Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+    // 5. Zallet's positional API is `(account_name, optional_seedfp)`. This harness creates one
+    // mnemonic, so the seed fingerprint is intentionally omitted.
+    let acct = rpc
+        .call("z_getnewaccount", json!(["funder"]))
+        .await
+        .map_err(|e| anyhow!("z_getnewaccount failed: {e}"))?;
+    let acct_uuid = acct
+        .get("account_uuid")
+        .and_then(|u| u.as_str())
+        .ok_or_else(|| anyhow!("no account_uuid in z_getnewaccount response: {acct}"))?
+        .to_string();
+    let addr_resp = rpc
+        .call("z_getaddressforaccount", json!([acct_uuid]))
+        .await
+        .map_err(|e| anyhow!("z_getaddressforaccount failed: {e}"))?;
+    let ua = addr_resp
+        .get("address")
+        .and_then(|a| a.as_str())
+        .ok_or_else(|| anyhow!("no address in z_getaddressforaccount response: {addr_resp}"))?
+        .to_string();
+
+    Ok(Funder {
+        child,
+        rpc,
+        account_uuid: acct_uuid,
+        ua,
+        _datadir: datadir,
+    })
+}
+
+/// Run a `zallet-zaino` CLI subcommand against `datadir`.
+fn run_zallet_cli(bin: &Path, datadir: &Path, args: &[&str]) -> Result<String> {
+    let output = Command::new(bin)
+        .args(["-d", datadir.to_str().unwrap()])
+        .args(args)
+        .output()
+        .with_context(|| format!("spawn zallet {}", args.join(" ")))?;
+    if !output.status.success() {
+        bail!(
+            "zallet {} failed ({}): {}",
+            args.join(" "),
+            output.status,
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
+    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+}
 
-    /// Like [`Funder::run`], but pipes `stdin_data` to the child's stdin (then closes it, signalling
-    /// EOF). Used for the newer devtool `init`, which reads the mnemonic phrase from stdin instead of
-    /// a `--mnemonic` flag when stdin is not a terminal (as under `cargo test`).
-    fn run_with_stdin(
-        &self,
-        subcommand: &str,
-        extra: &[&str],
-        lwd_port: Option<u16>,
-        stdin_data: &str,
-    ) -> Result<String> {
-        use std::io::Write;
-        use std::process::Stdio;
-
-        let mut args: Vec<String> = vec![
-            "wallet".into(),
-            "-w".into(),
-            self.wallet_dir(),
-            subcommand.into(),
-        ];
-        args.extend(extra.iter().map(|s| s.to_string()));
-        if let Some(port) = lwd_port {
-            args.extend([
-                "--server".into(),
-                format!("127.0.0.1:{port}"),
-                "--connection".into(),
-                "direct".into(),
-            ]);
-        }
-        let mut child = Command::new(&self.bin)
-            .args(&args)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .with_context(|| format!("spawn devtool {subcommand}"))?;
-        {
-            let mut stdin = child.stdin.take().context("devtool stdin not piped")?;
-            stdin
-                .write_all(stdin_data.as_bytes())
-                .with_context(|| format!("write stdin to devtool {subcommand}"))?;
-            // Dropping `stdin` here closes the pipe, so the child sees EOF after the phrase.
-        }
-        let output = child
-            .wait_with_output()
-            .with_context(|| format!("wait for devtool {subcommand}"))?;
-        if !output.status.success() {
-            bail!(
-                "devtool {subcommand} failed ({}):\nstdout: {}\nstderr: {}",
-                output.status,
-                String::from_utf8_lossy(&output.stdout),
-                tail(&String::from_utf8_lossy(&output.stderr), 30),
-            );
-        }
-        Ok(String::from_utf8_lossy(&output.stdout).into_owned())
-    }
+/// Simple string replacement that finds the first occurrence of `pattern` and replaces it.
+/// (Avoids pulling in the `regex` crate for a handful of config edits.)
+fn regex_replacen(pattern: &str, replacement: &str, text: &str) -> String {
+    text.replacen(pattern, replacement, 1)
 }
 
 // =============================== zecd (the system under test) ===============================
@@ -897,7 +931,7 @@ pub fn zecd_bin() -> PathBuf {
 }
 
 /// Whether the extended ("big run") regtest tier is enabled: set `ZECD_REGTEST_EXTENDED=1`.
-/// PR runs skip these tests (each spins a full zebra+lightwalletd stack); the scheduled and
+/// PR runs skip these tests (each spins a full zebra+zallet stack); the scheduled and
 /// manually dispatched workflow runs set the variable.
 pub fn extended_enabled() -> bool {
     std::env::var("ZECD_REGTEST_EXTENDED").is_ok_and(|v| !v.is_empty() && v != "0")
@@ -925,10 +959,7 @@ pub fn stress_note_count() -> usize {
 /// A running `zecd` daemon plus the HTTP client and credentials to drive it.
 pub struct Zecd {
     child: Child,
-    base_url: String,
-    user: String,
-    password: String,
-    http: reqwest::Client,
+    client: Client,
     /// The default wallet's generated mnemonic, captured from `zecd init`'s stdout. `None`
     /// when the wallet was restored ([`ZecdConfig::restore_mnemonic`]) - a restore prints none.
     pub mnemonic: Option<String>,
@@ -1046,7 +1077,7 @@ impl ZecdConfig {
 }
 
 impl Zecd {
-    /// Write a regtest `zecd.toml`, run `zecd init` (retried while lightwalletd catches up to the
+    /// Write a regtest `zecd.toml`, run `zecd init` (retried while the node warms up to the
     /// chain tip), then spawn the daemon. Returns once the RPC is up; call
     /// [`Zecd::wait_until_synced`] to wait for the scan to reach the tip.
     pub async fn start(cfg: &ZecdConfig) -> Result<Zecd> {
@@ -1075,10 +1106,11 @@ impl Zecd {
 
         let zecd = Zecd {
             child,
-            base_url: format!("http://127.0.0.1:{}/", cfg.rpc_port),
-            user: cfg.rpc_user.clone(),
-            password: cfg.rpc_password.clone(),
-            http: reqwest::Client::new(),
+            client: Client::new(
+                format!("http://127.0.0.1:{}/", cfg.rpc_port),
+                cfg.rpc_user.clone(),
+                cfg.rpc_password.clone(),
+            ),
             mnemonic,
             _datadir: datadir,
         };
@@ -1130,7 +1162,7 @@ impl Zecd {
     }
 
     /// Prepare a datadir: write `zecd.toml`, init the `default` wallet (retried while
-    /// lightwalletd warms up), then init any watch-only replicas. (Only one spending wallet is
+    /// the node warms up), then init any watch-only replicas. (Only one spending wallet is
     /// permitted, so extra *spending* wallets are never initialised here.)
     async fn prepare_datadir(cfg: &ZecdConfig) -> Result<(tempfile::TempDir, Option<String>)> {
         let datadir = tempfile::tempdir().context("create zecd datadir")?;
@@ -1370,9 +1402,9 @@ impl Zecd {
             .stderr(Stdio::null())
             .spawn()
             .context("respawn zecd")?;
-        self.base_url = format!("http://127.0.0.1:{}/", cfg.rpc_port);
-        self.user = cfg.rpc_user.clone();
-        self.password = cfg.rpc_password.clone();
+        self.client.base_url = format!("http://127.0.0.1:{}/", cfg.rpc_port);
+        self.client.user = cfg.rpc_user.clone();
+        self.client.password = cfg.rpc_password.clone();
         self.wait_until_rpc_up().await?;
         Ok(())
     }
@@ -1380,7 +1412,7 @@ impl Zecd {
     /// Issue a JSON-RPC call, returning the `result` on success or an error carrying the
     /// Bitcoin Core error `code` (so tests can assert e.g. `-6` for insufficient funds).
     pub async fn call(&self, method: &str, params: Value) -> Result<Value, RpcError> {
-        self.call_at(self.base_url.clone(), method, params).await
+        self.client.call(method, params).await
     }
 
     /// Issue a JSON-RPC call against a named wallet's `/wallet/<name>` endpoint (multiwallet
@@ -1391,34 +1423,8 @@ impl Zecd {
         method: &str,
         params: Value,
     ) -> Result<Value, RpcError> {
-        self.call_at(format!("{}wallet/{wallet}", self.base_url), method, params)
-            .await
-    }
-
-    async fn call_at(&self, url: String, method: &str, params: Value) -> Result<Value, RpcError> {
-        let body = json!({ "jsonrpc": "1.0", "id": "harness", "method": method, "params": params });
-        let resp = self
-            .http
-            .post(url)
-            .basic_auth(&self.user, Some(&self.password))
-            .json(&body)
-            .send()
-            .await
-            .map_err(|e| RpcError::transport(e.to_string()))?;
-        let envelope: Value = resp
-            .json()
-            .await
-            .map_err(|e| RpcError::transport(format!("decoding response: {e}")))?;
-        if let Some(err) = envelope.get("error").filter(|e| !e.is_null()) {
-            let code = err.get("code").and_then(|c| c.as_i64()).unwrap_or(0);
-            let message = err
-                .get("message")
-                .and_then(|m| m.as_str())
-                .unwrap_or("")
-                .to_string();
-            return Err(RpcError::Rpc { code, message });
-        }
-        Ok(envelope.get("result").cloned().unwrap_or(Value::Null))
+        let url = format!("{}wallet/{wallet}", self.client.base_url);
+        self.client.call_at(&url, method, params).await
     }
 
     /// The current best-block height as seen by zecd (`getblockcount`).
@@ -1468,35 +1474,6 @@ impl Drop for Zecd {
     }
 }
 
-/// A JSON-RPC failure: either a transport problem or a Bitcoin-Core-style `{code, message}`.
-#[derive(Debug)]
-pub enum RpcError {
-    Transport(String),
-    Rpc { code: i64, message: String },
-}
-
-impl RpcError {
-    fn transport(s: String) -> Self {
-        RpcError::Transport(s)
-    }
-    /// The Bitcoin Core error code, if this was an RPC-level error.
-    pub fn code(&self) -> Option<i64> {
-        match self {
-            RpcError::Rpc { code, .. } => Some(*code),
-            RpcError::Transport(_) => None,
-        }
-    }
-}
-
-impl std::fmt::Display for RpcError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            RpcError::Transport(s) => write!(f, "transport error: {s}"),
-            RpcError::Rpc { code, message } => write!(f, "rpc error {code}: {message}"),
-        }
-    }
-}
-
 // =============================== helpers ===============================
 
 /// JSON-RPC 2.0 call to zebrad; returns the `result` or an error carrying the message.
@@ -1513,11 +1490,6 @@ async fn zebra_rpc_call(url: &str, method: &str, params: Value) -> Result<Value>
         bail!("zebra rpc error from {method}: {err}");
     }
     Ok(envelope.get("result").cloned().unwrap_or(Value::Null))
-}
-
-fn tail(s: &str, lines: usize) -> String {
-    let all: Vec<&str> = s.lines().collect();
-    all[all.len().saturating_sub(lines)..].join("\n")
 }
 
 /// Send a named signal (e.g. `STOP`, `CONT`) to a process via the portable `kill` binary
@@ -1623,8 +1595,8 @@ fn run_zecd_init(
     Ok((!phrase.is_empty()).then_some(phrase))
 }
 
-/// Init the `default` wallet, retried while lightwalletd catches up to the chain tip. Just
-/// after launch lightwalletd may still be ingesting from zebrad, so `zecd init` (which contacts
+/// Init the `default` wallet, retried while the node catches up to the chain tip. Just
+/// after launch the node may still be ingesting from zebrad, so `zecd init` (which contacts
 /// it for `get_latest_block` + `get_tree_state`) is retried, resetting the datadir between
 /// attempts so a partial init can't wedge the next one. Returns the generated mnemonic.
 async fn init_default_with_retry(
@@ -1902,5 +1874,16 @@ mod tests {
         let (lo, span) = port_window();
         assert_eq!((lo, span), (DEFAULT_PORT_LO, DEFAULT_PORT_SPAN));
         assert!(u32::from(lo) + u32::from(span) <= 32768);
+    }
+
+    #[test]
+    fn zallet_memos_are_hex_encoded_utf8_bytes() {
+        assert_eq!(super::zallet_memo_hex("memo ✓").unwrap(), "6d656d6f20e29c93");
+    }
+
+    #[test]
+    fn zallet_memo_limit_is_512_bytes() {
+        assert!(super::zallet_memo_hex(&"a".repeat(512)).is_ok());
+        assert!(super::zallet_memo_hex(&"a".repeat(513)).is_err());
     }
 }

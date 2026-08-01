@@ -23,22 +23,21 @@
 //! select+build … prove+sign … store … broadcast …`) are the Layer-0 profiling artifact - set
 //! `ZECD_STDERR=1` to stream them into the CI log.
 //!
-//! Skips cleanly unless `ZEBRAD_BIN`, `LIGHTWALLETD_BIN`, `DEVTOOL_BIN` are all set *and*
+//! Skips cleanly unless `ZEBRAD_BIN`, `ZALLET_BIN` are set *and*
 //! `ZECD_REGTEST_STRESS=1`.
 
 use std::time::{Duration, Instant};
 
 use serde_json::json;
 use zecd_regtest_harness::{
-    pick_port, resolve_bin, resolve_node_bin, stress_enabled, stress_note_count, Funder,
-    Lightwalletd, RegtestNode, Zebrad, Zecd, ZecdConfig,
+    pick_port, resolve_bin, resolve_node_bin, stress_enabled, stress_note_count, start_funder,
+    DEFAULT_MINER_ADDRESS, FOREIGN_TADDR, regtest_nuparams, Zebrad, Zecd, ZecdConfig,
 };
 
 /// Coinbases mined to the funder, then aged past maturity - same single-chain shaping as the
 /// funded e2e (see `regtest_funded.rs`); ~21 of these finalize and become spendable.
 const FUNDER_COINBASES: u32 = 120;
 const MATURITY_TAIL: u32 = 130;
-const TAIL_MINER_ADDRESS: &str = "t27eWDgjFYJGVXmzrXeVjnb5J3uXDM9xH9v";
 
 /// Value of each note the wallet is fragmented into (0.001 ZEC - comfortably above dust and the
 /// ZIP-317 marginal fee, so notes don't decay as the build loop recycles them).
@@ -68,15 +67,13 @@ async fn regtest_stress_many_notes() {
         );
         return;
     }
-    let (Some(zebrad_bin), Some(lwd_bin), Some(devtool_bin)) = (
+    let (Some(zebrad_bin), Some(zallet_bin)) = (
         resolve_node_bin(),
-        resolve_bin("LIGHTWALLETD_BIN"),
-        resolve_bin("DEVTOOL_BIN"),
+        resolve_bin("ZALLET_BIN"),
     ) else {
         eprintln!(
-            "SKIP regtest_stress_many_notes: set {}, LIGHTWALLETD_BIN and DEVTOOL_BIN \
-             to run the stress e2e (see README.md).",
-            RegtestNode::from_env().bin_env()
+            "SKIP regtest_stress_many_notes: set the node binary env var (ZEBRAD_BIN or ZAKURAD_BIN) and ZALLET_BIN to run the stress e2e \
+             (see README.md)."
         );
         return;
     };
@@ -84,35 +81,31 @@ async fn regtest_stress_many_notes() {
     let note_target = stress_note_count();
     eprintln!("stress: building a wallet of >= {note_target} notes");
 
-    // --- Single-chain funding (mirrors regtest_funded.rs) ---
-    let funder_taddr = Funder::derive_transparent_address(&devtool_bin)
-        .expect("derive funder transparent address");
-    let mut zebrad = Zebrad::start_with_miner(&zebrad_bin, &funder_taddr)
-        .await
-        .expect("start zebrad mining to the funder");
+    // --- Single-chain funding: mine shielded coinbase to the zallet funder, then send to zecd. ---
+    let zebrad = Zebrad::start(&zebrad_bin).await.expect("start zebrad");
+    zebrad.bootstrap_zallet().await.expect("bootstrap Zallet sync");
+    let funder = start_funder(
+        &zallet_bin,
+        zebrad.rpc_port,
+        pick_port().expect("pick zallet rpc port"),
+        &regtest_nuparams(false),
+    )
+    .await
+    .expect("start zallet funder");
     zebrad
-        .generate_blocks(FUNDER_COINBASES)
+        .generatetoaddress(FUNDER_COINBASES, &funder.ua)
         .await
-        .expect("mine the funder's coinbases");
+        .expect("mine shielded coinbase to funder");
     zebrad
-        .restart_with_miner(TAIL_MINER_ADDRESS)
+        .generatetoaddress(MATURITY_TAIL, DEFAULT_MINER_ADDRESS)
         .await
-        .expect("restart zebrad mining to the throwaway address");
-    zebrad
-        .generate_blocks(MATURITY_TAIL)
-        .await
-        .expect("mine the maturity tail");
-
-    let lwd = Lightwalletd::start(&lwd_bin, zebrad.rpc_port)
-        .await
-        .expect("start lightwalletd");
-    let funder = Funder::init(&devtool_bin, lwd.grpc_port).expect("initialise funding wallet");
-    funder.sync(lwd.grpc_port).expect("funder sync (coinbase)");
+        .expect("mine maturity tail");
     funder
-        .shield(lwd.grpc_port)
-        .expect("shield transparent coinbase into Orchard");
-    zebrad.generate_blocks(6).await.expect("confirm shield");
-    funder.sync(lwd.grpc_port).expect("funder sync (shielded)");
+        .rpc
+        .wait_for_account_balance(&funder.account_uuid, 1_000_000, Duration::from_secs(120))
+        .await
+        .expect("wait for funder to see shielded coinbase");
+    let funder_taddr = FOREIGN_TADDR.to_string();
 
     // --- zecd with the pipeline on (and the action cap lifted so big fan-out/sweep sends aren't
     //     rejected by `orchard_action_limit`). cache_proving_key stays default-on: the pipeline
@@ -141,8 +134,9 @@ async fn regtest_stress_many_notes() {
     // --- Fund zecd with one large note, sized to split into `note_target` notes plus fee/slack. ---
     let headroom = (note_target as u64) * 20_000 + 50_000_000;
     let fund_zat = (note_target as u64) * PER_NOTE_ZAT + headroom;
-    funder
-        .send(lwd.grpc_port, &zecd_ua, fund_zat)
+    funder.rpc
+        .z_sendmany_and_wait(&funder.ua, &zecd_ua, fund_zat, None)
+        .await
         .expect("fund zecd with the seed note");
     zebrad.generate_blocks(6).await.expect("confirm the fund");
     let tip = zebrad_tip(&zebrad).await;
