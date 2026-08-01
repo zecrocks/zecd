@@ -5,6 +5,11 @@ All notable changes to zecd are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com), and this
 project adheres to [Semantic Versioning](https://semver.org).
 
+## [0.5.1-rc4] - 2026-07-31
+
+### Fixed
+- Transparent spends the wallet did not author itself are now discovered. The block scan matched only transparent outputs, and the address check that would have found such a spend is never requested for an output the scan itself recorded, which is every transparent receive. The spent output therefore stayed in the unspent set, so the wallet reported a balance it no longer held and could select that output for a send that then failed at broadcast. A restore of a wallet that had received and spent on a transparent address while down reported 0.7999 against an actual 0.2999. Each block's transparent inputs are now matched against the wallet's unspent outputs during the scan it already performs, at no extra request. This affects every release from 0.5.0 onward for wallets with `[pools] transparent = true`, which is off by default; shielded-only wallets find spends through note nullifiers and were never affected. Watch-only wallets are the sharpest case, since every transparent spend they see is external by definition.
+
 ## [0.5.1-rc3] - 2026-07-31
 
 ### Added
@@ -251,6 +256,7 @@ Zcash, backed entirely by librustzcash and running as a light client.
 ### Security
 - Pre-release audit hardening; refuse to start on mainnet with the placeholder RPC password; enforce a 12-character passphrase minimum.
 
+[0.5.1-rc4]: https://github.com/zecrocks/zecd/compare/v0.5.1-rc3...v0.5.1-rc4
 [0.5.1-rc3]: https://github.com/zecrocks/zecd/compare/v0.5.1-rc2...v0.5.1-rc3
 [0.5.1-rc2]: https://github.com/zecrocks/zecd/compare/v0.5.1-rc1...v0.5.1-rc2
 [0.5.1-rc1]: https://github.com/zecrocks/zecd/compare/v0.5.0...v0.5.1-rc1
