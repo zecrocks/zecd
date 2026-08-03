@@ -2,11 +2,10 @@
 //! away; a from-seed restore that never saw either transaction live must recover the **full
 //! receive+send pair**.
 //!
-//! This is the backend-agnostic counterpart to `regtest_lwd.rs`'s offline-window leg, and it
-//! exists because that leg turned out to be testing something neither backend actually
-//! guarantees. Transparent *receives* ride the block scan on both backends (zebra parses full
-//! blocks; a versioned-protocol lightwalletd carries transparent data in compact blocks), so the
-//! receive half is covered. Transparent *spends* ride neither: the block-scan matcher only
+//! This is deliberately backend-agnostic, because the offline window turned out to be testing
+//! something no backend actually guarantees. Transparent *receives* ride the block scan (zebra
+//! parses full blocks; a versioned-protocol lightwalletd carries transparent data in compact
+//! blocks), so the receive half is covered. Transparent *spends* ride neither: the matcher only
 //! inspects outputs (`engine::owned_transparent_output`), so a spend is discovered solely when
 //! librustzcash asks zecd to check an address via `TransactionDataRequest::
 //! TransactionsInvolvingAddress`. When zecd records a UTXO itself - which is exactly what the
