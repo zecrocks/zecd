@@ -5,6 +5,20 @@ All notable changes to zecd are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com), and this
 project adheres to [Semantic Versioning](https://semver.org).
 
+## [0.5.2] - 2026-08-03
+
+Three fixes for wallets holding Ironwood notes, which since NU6.3 activated on mainnet at height
+3,428,143 means any wallet whose shielded funds were received after that point. All three are live
+behaviour rather than latent, so this release is worth taking.
+
+### Fixed
+- Transactions that spend Ironwood notes are rebroadcast. The unmined-transaction set qualified a transaction by checking that it spends something the wallet owns, and that test covered sapling, orchard and transparent spends only. An ironwood spend is recorded separately, so after NU6.3 no send qualified at all: a send whose broadcast failed, which is the case rebroadcast exists for, was never retransmitted and sat unmined until it expired. Nothing reported an error, since the send returns a txid and the transaction is stored.
+- A FullPrivacy send no longer crosses the Ironwood turnstile. The policy check asked whether a send involved Transparent, Sapling and Orchard and never asked about Ironwood, so a send spending ironwood notes to a Sapling or Orchard recipient passed unexamined, even though moving value between two pools reveals the amount on chain. The rule is now any transparent component, or more than one shielded pool.
+- Outgoing history reduces an Ironwood output to the Orchard receiver it actually pays. Ironwood notes are received at ordinary Orchard addresses, but the reduction handled only transparent, Sapling and Orchard, so an ironwood row fell back to the full multi-receiver address the caller typed, which a restore from seed cannot reproduce.
+
+### Added
+- `getwalletinfo.transparent` reports the wallet's live lookahead window as `lookahead_from` and `lookahead_through`, both inclusive, alongside the existing `recovery_horizon`, plus a derived `restorable`. The two windows are anchored differently, and the difference decides whether funds survive a restore: the live window follows addresses handed out, while restore recovery follows funding, so a running wallet can credit a receive that a restore of the same seed would not rediscover. `restorable` is false exactly when the wallet is in that state, which happens only when an address is issued at or past the recovery horizon.
+
 ## [0.5.1] - 2026-08-01
 
 The 0.5.1 line, released as `0.5.1-rc1` through `0.5.1-rc4` and unchanged since `0.5.1-rc4`.
@@ -283,6 +297,7 @@ Zcash, backed entirely by librustzcash and running as a light client.
 ### Security
 - Pre-release audit hardening; refuse to start on mainnet with the placeholder RPC password; enforce a 12-character passphrase minimum.
 
+[0.5.2]: https://github.com/zecrocks/zecd/compare/v0.5.1...v0.5.2
 [0.5.1]: https://github.com/zecrocks/zecd/compare/v0.5.0...v0.5.1
 [0.5.1-rc4]: https://github.com/zecrocks/zecd/compare/v0.5.1-rc3...v0.5.1-rc4
 [0.5.1-rc3]: https://github.com/zecrocks/zecd/compare/v0.5.1-rc2...v0.5.1-rc3
