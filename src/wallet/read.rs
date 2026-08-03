@@ -209,7 +209,9 @@ pub const EXTERNAL_KEY_SCOPE: i64 = 0;
 /// One output row from `v_tx_outputs`.
 #[derive(Debug, Clone)]
 pub struct TxOutputRecord {
-    /// `v_tx_outputs.output_pool`: 0 = transparent, 2 = Sapling, 3 = Orchard.
+    /// `v_tx_outputs.output_pool`: 0 = transparent, 2 = Sapling, 3 = Orchard, 4 = Ironwood.
+    /// Post-NU6.3 an ordinary shielded output is 4, not 3, so a `match` on this that stops at
+    /// Orchard silently skips the common case rather than failing to compile.
     pub pool: i64,
     pub output_index: u32,
     pub from_account: Option<Uuid>,

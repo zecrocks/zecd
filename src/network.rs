@@ -84,17 +84,28 @@ pub fn regtest() -> ZNetwork {
     // live. This must match the regtest chain the harness/zebra run (regtest-harness's
     // NU6_2_ACTIVATION_HEIGHT) so zecd commits transactions to the right consensus branch id.
     let nu62 = Some(BlockHeight::from_u32(4));
-    // NU6.3 (ironwood) activation on the regtest chain is opt-in via `ZECD_REGTEST_NU63_HEIGHT`.
-    // Ironwood is always compiled now, so the *code* is unconditional; only the regtest activation
-    // height is a knob: the ironwood harness configures zebra with NU6.3 at that height (8) and sets
-    // this env var so zecd commits to the matching consensus branch id, while the standard harness
-    // leaves it unset (no NU6.3) to match its stock zebra. (Real networks get their heights from the
-    // pinned protocol - NU6.3 is unset on mainnet and 4_134_000 on testnet - so this only affects
-    // regtest.) An unset/unparseable value means no NU6.3, exactly like the old default build.
-    let nu63 = std::env::var("ZECD_REGTEST_NU63_HEIGHT")
-        .ok()
-        .and_then(|s| s.parse::<u32>().ok())
-        .map(BlockHeight::from_u32);
+    // NU6.3 (ironwood) activation height on the regtest chain, from `ZECD_REGTEST_NU63_HEIGHT`.
+    // Ironwood is always compiled, so the *code* is unconditional; only the regtest activation
+    // height is a knob, because regtest has no protocol-assigned height (real networks get theirs
+    // from the pinned protocol crate). The regtest harness configures zebra with NU6.3 at height 8
+    // and sets this env var so zecd commits to the matching consensus branch id; the same height
+    // goes to the devtool funder via `--activation-heights`. All three MUST agree.
+    //
+    // Unset means no NU6.3 on regtest (a chain built against a zebra without the `"NU6.3"` key).
+    // A *set but unparseable* value is fatal rather than silently ignored: falling back to "no
+    // NU6.3" would leave zecd committing transactions to the wrong consensus branch id, which
+    // surfaces far away as an opaque zebra rejection at broadcast time.
+    let nu63 = match std::env::var("ZECD_REGTEST_NU63_HEIGHT") {
+        Ok(s) => Some(BlockHeight::from_u32(
+            s.trim().parse::<u32>().unwrap_or_else(|_| {
+                panic!(
+                    "ZECD_REGTEST_NU63_HEIGHT must be a block height (got {s:?}); \
+                     unset it to build a regtest chain without NU6.3"
+                )
+            }),
+        )),
+        Err(_) => None,
+    };
     ZNetwork::Regtest(LocalNetwork {
         overwinter: h,
         sapling: h,
@@ -127,6 +138,23 @@ mod tests {
         assert_eq!(ZNetwork::parse(" test ").unwrap(), ZNetwork::Test);
         assert_eq!(ZNetwork::parse("regtest").unwrap(), regtest());
         assert!(ZNetwork::parse("bogus").is_err());
+    }
+
+    /// NU6.3 (ironwood) is live on mainnet and testnet, so the pinned protocol crate must carry an
+    /// activation height for both. This is the guard that a dependency bump can't silently drop
+    /// ironwood back to "never activates": zecd derives activation purely from these heights
+    /// (`is_nu_active(Nu6_3, ..)`), and with no height every mainnet send would keep building
+    /// legacy Orchard-V2 output - wrong pool, no error.
+    #[test]
+    fn nu6_3_is_scheduled_on_mainnet_and_testnet() {
+        for net in [ZNetwork::Main, ZNetwork::Test] {
+            assert!(
+                net.activation_height(NetworkUpgrade::Nu6_3).is_some(),
+                "the pinned protocol has no NU6.3 activation height for {}; ironwood cannot \
+                 activate there",
+                net.name()
+            );
+        }
     }
 
     #[test]

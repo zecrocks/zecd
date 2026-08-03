@@ -76,6 +76,12 @@ impl Pool {
 
     /// The `v_tx_outputs.output_pool` / received-note pool code (0 = transparent, 2 = Sapling,
     /// 3 = Orchard), matching zcash_client_sqlite's `PoolType` encoding.
+    ///
+    /// That encoding also has **4 = Ironwood**, which no `Pool` maps to: ironwood is not a UA
+    /// receiver (see the enum above), so it can be an output's pool without being a selectable
+    /// one. Anything matching on a raw pool code therefore has to handle 4 itself - reading this
+    /// list as exhaustive is what produced the FullPrivacy, rebroadcast and history gaps fixed
+    /// earlier in this series.
     pub fn output_pool_code(&self) -> i64 {
         match self {
             Pool::Transparent => 0,
