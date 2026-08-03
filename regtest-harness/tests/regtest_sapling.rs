@@ -619,6 +619,26 @@ async fn regtest_sapling_and_orchard_balances() {
          {orchard_before} -> {orchard_after}"
     );
 
+    // 9c. That "Orchard" output is an IRONWOOD (Orchard-V3) note. NU6.3 is active on this chain, so
+    //     paying an Orchard receiver mints an ironwood note - the Orchard receiver is the *address*
+    //     typecode, the pool is a property of the note. Both pools of the {Sapling+Ironwood}
+    //     selection group are therefore live in this wallet, which is what the aggregation and
+    //     turnstile assertions above are really exercising post-NU6.3. Held here (rather than as a
+    //     separate binary) because the balance/history checks are pool-blind by construction.
+    let lu = zecd
+        .call("listunspent", json!([]))
+        .await
+        .expect("listunspent after the tri-pool send");
+    let lu = lu.as_array().expect("listunspent is an array");
+    assert!(
+        lu.iter().any(|u| u["pool"] == "ironwood"),
+        "the Orchard-receiver output landed as an ironwood note on this NU6.3-active chain: {lu:?}"
+    );
+    assert!(
+        lu.iter().any(|u| u["pool"] == "sapling"),
+        "the Sapling-receiver output landed as a sapling note: {lu:?}"
+    );
+
     lwd.stop();
     drop(zecd);
     // `zebrad` and `funder` clean up on drop.

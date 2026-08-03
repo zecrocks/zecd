@@ -168,11 +168,13 @@ pub fn resolve_node_bin() -> Option<PathBuf> {
 /// only accrues once NU6 is live - so NU6.1/NU6.2 activate a few blocks in, after a pool exists.
 /// Must match `zecd`'s `network::regtest`.
 const NU6_2_ACTIVATION_HEIGHT: u32 = 4;
-/// Height at which NU6.3 (ironwood) activates on the ironwood regtest chain. Only emitted into the
-/// zebra config for the ironwood tier (stock zebra rejects the `"NU6.3"` key). This value is the
-/// canonical reference for the cross-component schedule: it MUST equal `zecd`'s `network::regtest()`
-/// `nu6_3` height and `devtool`'s `regtest_params()` - a mismatch diverges the NU6.3 consensus
-/// branch id and zebra rejects the tx (loud failure, not silent).
+/// Height at which NU6.3 (ironwood) activates on the regtest chain. NU6.3 is active on mainnet and
+/// testnet, so the harness chain activates it too - every regtest flow runs on the pool real users
+/// are on. This value is the canonical reference for the cross-component schedule: it MUST equal
+/// `zecd`'s `network::regtest()` `nu6_3` height (set via `ZECD_REGTEST_NU63_HEIGHT`) and `devtool`'s
+/// `regtest_params()` (passed via `--activation-heights`) - a mismatch diverges the NU6.3 consensus
+/// branch id and zebra rejects the tx (loud failure, not silent). Needs zebrad >= 6.2.2, which
+/// accepts the `"NU6.3"` activation-height key.
 pub const NU6_3_ACTIVATION_HEIGHT: u32 = 8;
 /// ZIP-271 one-time lockbox disbursement paid in the NU6.1 activation block's coinbase. A P2SH
 /// regtest address and a token amount (<= the pool accrued by [`NU6_2_ACTIVATION_HEIGHT`]).
@@ -193,9 +195,9 @@ pub struct Zebrad {
     net_port: u16,
     bin: PathBuf,
     config_path: PathBuf,
-    /// NU6.3 (ironwood) activation height, or `None` for a stock-zebra (non-ironwood) chain.
-    /// Preserved across `restart_with_miner` so the rebuilt config keeps the same schedule.
-    nu6_3_height: Option<u32>,
+    /// NU6.3 (ironwood) activation height. Preserved across `restart_with_miner` so the rebuilt
+    /// config keeps the same schedule.
+    nu6_3_height: u32,
     _dir: tempfile::TempDir,
 }
 
@@ -238,23 +240,13 @@ impl Zebrad {
     }
 
     /// Launch `zebrad` mining its coinbase to `miner_address`, so a wallet that controls that
-    /// address can spend the matured coinbase (used to fund the Orchard wallet under test).
+    /// address can spend the matured coinbase (used to fund the shielded wallet under test).
+    /// The chain always activates NU6.3 at [`NU6_3_ACTIVATION_HEIGHT`], matching mainnet/testnet.
     pub async fn start_with_miner(bin: &Path, miner_address: &str) -> Result<Zebrad> {
-        Self::start_inner(bin, miner_address, None).await
+        Self::start_inner(bin, miner_address, NU6_3_ACTIVATION_HEIGHT).await
     }
 
-    /// Launch `zebrad` on the ironwood regtest chain (NU6.3 active at [`NU6_3_ACTIVATION_HEIGHT`]),
-    /// mining its coinbase to `miner_address`. Requires an ironwood-capable zebrad (the zakura
-    /// image) - stock zebra rejects the `"NU6.3"` activation-height key.
-    pub async fn start_with_miner_ironwood(bin: &Path, miner_address: &str) -> Result<Zebrad> {
-        Self::start_inner(bin, miner_address, Some(NU6_3_ACTIVATION_HEIGHT)).await
-    }
-
-    async fn start_inner(
-        bin: &Path,
-        miner_address: &str,
-        nu6_3_height: Option<u32>,
-    ) -> Result<Zebrad> {
+    async fn start_inner(bin: &Path, miner_address: &str, nu6_3_height: u32) -> Result<Zebrad> {
         let dir = tempfile::tempdir().context("create zebrad dir")?;
         let rpc_port = pick_port()?;
         let net_port = pick_port()?;
@@ -409,17 +401,14 @@ fn zebrad_toml(
     rpc_port: u16,
     miner_address: &str,
     cache_dir: &str,
-    nu6_3_height: Option<u32>,
+    nu6_3_height: u32,
 ) -> String {
     let nu6_2 = NU6_2_ACTIVATION_HEIGHT;
     let lockbox_addr = LOCKBOX_DISBURSEMENT_ADDR;
     let lockbox_amount = LOCKBOX_DISBURSEMENT_ZATS;
-    // NU6.3 (ironwood) activation line, emitted only for the ironwood tier - stock zebra has no
-    // `"NU6.3"` key and rejects an unknown activation-height entry at startup.
-    let nu6_3_line = match nu6_3_height {
-        Some(h) => format!("\"NU6.3\" = {h}\n"),
-        None => String::new(),
-    };
+    // NU6.3 (ironwood) activation. Needs zebrad >= 6.2.2; older releases have no `"NU6.3"` key and
+    // reject an unknown activation-height entry at startup.
+    let nu6_3_line = format!("\"NU6.3\" = {nu6_3_height}\n");
     format!(
         r#"[network]
 network = "Regtest"
@@ -638,72 +627,45 @@ impl Funder {
             .ok_or_else(|| anyhow!("no Transparent Address in derive-address output:\n{out}"))
     }
 
-    /// Initialise the funding wallet against a lightwalletd. Non-interactive via `--mnemonic`;
+    /// Initialise the funding wallet against a lightwalletd on the NU6.3-active regtest chain.
     /// `--birthday 2` is the lowest height with a tree state (init fetches `GetTreeState(birthday-1)`,
     /// which needs a real block - `birthday 0/1` requests genesis and is rejected). The funder's
     /// transparent coinbase is detected regardless of birthday.
+    ///
+    /// Requires a `zcash-devtool` built with `regtest_support`: its `-n regtest` `init` takes an
+    /// explicit `--activation-heights <TOML>` (persisted into the wallet so its consensus branch ID
+    /// matches the launched zebra), and reads the mnemonic from **stdin** rather than a `--mnemonic`
+    /// flag (which it no longer accepts).
     pub fn init(bin: &Path, lwd_port: u16) -> Result<Funder> {
-        Self::init_inner(bin, lwd_port, false)
-    }
-
-    /// Initialise the funding wallet on the **ironwood** regtest chain (NU6.3 active). The ironwood
-    /// `zcash-devtool` (`regtest_support` feature) differs from the older standard-tier build on two
-    /// `init` points: (1) `-n regtest` requires an explicit `--activation-heights <TOML>` (persisted
-    /// into the wallet so its per-build consensus branch ID matches the launched zebra), and (2) the
-    /// mnemonic is read from **stdin** (piped) rather than a `--mnemonic` flag (which it no longer
-    /// accepts). [`Funder::init`] keeps the old `--mnemonic`/no-heights shape for the standard tier.
-    pub fn init_ironwood(bin: &Path, lwd_port: u16) -> Result<Funder> {
-        Self::init_inner(bin, lwd_port, true)
-    }
-
-    fn init_inner(bin: &Path, lwd_port: u16, ironwood: bool) -> Result<Funder> {
         let dir = tempfile::tempdir().context("create funder dir")?;
         let funder = Funder {
             bin: bin.to_path_buf(),
             dir,
         };
         let identity = funder.identity();
-        if ironwood {
-            // Newer devtool: mnemonic piped to stdin, activation heights via file.
-            let heights_path = funder.write_activation_heights()?;
-            let args = [
-                "--name",
-                "funder",
-                "--network",
-                "regtest",
-                "--identity",
-                &identity,
-                "--birthday",
-                "2",
-                "--activation-heights",
-                &heights_path,
-            ];
-            funder.run_with_stdin(
-                "init",
-                &args,
-                Some(lwd_port),
-                &format!("{FUNDER_MNEMONIC}\n"),
-            )?;
-        } else {
-            // Older devtool: mnemonic via `--mnemonic`, no activation heights.
-            let args = [
-                "--name",
-                "funder",
-                "--network",
-                "regtest",
-                "--identity",
-                &identity,
-                "--mnemonic",
-                FUNDER_MNEMONIC,
-                "--birthday",
-                "2",
-            ];
-            funder.run("init", &args, Some(lwd_port))?;
-        }
+        let heights_path = funder.write_activation_heights()?;
+        let args = [
+            "--name",
+            "funder",
+            "--network",
+            "regtest",
+            "--identity",
+            &identity,
+            "--birthday",
+            "2",
+            "--activation-heights",
+            &heights_path,
+        ];
+        funder.run_with_stdin(
+            "init",
+            &args,
+            Some(lwd_port),
+            &format!("{FUNDER_MNEMONIC}\n"),
+        )?;
         Ok(funder)
     }
 
-    /// Write the `--activation-heights` TOML the ironwood `zcash-devtool` requires for `init`, in the
+    /// Write the `--activation-heights` TOML the `zcash-devtool` funder requires for `init`, in the
     /// `ActivationHeights` schema (one optional height per network upgrade). These MUST match zecd's
     /// `network::regtest()` and the zebra config the harness launches (`zebrad_toml`): NU5/NU6 from
     /// height 1, NU6.1/NU6.2 at [`NU6_2_ACTIVATION_HEIGHT`], NU6.3 (Ironwood) at

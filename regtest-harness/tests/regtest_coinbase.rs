@@ -464,21 +464,22 @@ async fn regtest_transparent_coinbase_shield_and_spend() {
     sync_to_tip(&zecd, &zebrad).await;
 
     // 11. The shielded balance now carries the swept coinbase value (minus the two shielding
-    //     fees), held as ordinary Orchard notes.
+    //     fees), held as ordinary ironwood notes: `z_shieldcoinbase` paid an Orchard receiver, and
+    //     NU6.3 is active on this chain, so the shielded proceeds are Orchard-V3 (ironwood) notes.
     let unspent = zecd
         .call("listunspent", json!([]))
         .await
         .expect("listunspent");
-    let orchard_total: f64 = unspent
+    let shielded_total: f64 = unspent
         .as_array()
         .expect("array")
         .iter()
-        .filter(|e| e["pool"] == "orchard")
+        .filter(|e| e["pool"] == "ironwood")
         .map(|e| e["amount"].as_f64().expect("amount"))
         .sum();
     assert!(
-        orchard_total > 0.0,
-        "the shielded coinbase funds are Orchard notes now: {unspent}"
+        shielded_total > 0.0,
+        "the shielded coinbase funds are ironwood notes now: {unspent}"
     );
 
     // 12. Spend the shielded (ex-coinbase) funds with a normal send - the full
@@ -591,9 +592,9 @@ async fn regtest_shielded_coinbase_receive_and_spend() {
         .expect("confirmations tail");
     sync_to_tip(&zecd, &zebrad).await;
 
-    // 4. The Orchard coinbase notes are ordinary notes: full spendable balance at 1+
-    //    confirmations, listed as orchard-pool notes, and - the key contrast with transparent
-    //    coinbase at the same depth - NO immature bucket.
+    // 4. The shielded coinbase notes are ordinary notes: full spendable balance at 1+
+    //    confirmations, listed with the shielded pool their mining height implies, and - the key
+    //    contrast with transparent coinbase at the same depth - NO immature bucket.
     let unspent = zecd
         .call("listunspent", json!([]))
         .await
@@ -603,8 +604,34 @@ async fn regtest_shielded_coinbase_receive_and_spend() {
         entries.len() >= 5,
         "every mined shielded coinbase note is listed with no maturity gate: {unspent}"
     );
+    // Pool is keyed on the height that minted each note, because this coinbase set **straddles
+    // the NU6.3 activation height**: the chain is seeded with a couple of blocks before the miner
+    // is pointed at zecd, so the notes below start a few blocks under NU6_3_ACTIVATION_HEIGHT and
+    // run past it. A block mined at or after activation carries an Orchard-V3 (ironwood) coinbase
+    // output; an earlier one carries Orchard-V2. So a uniform assertion is wrong in both
+    // directions - asserting all-orchard and asserting all-ironwood each fail on whichever note
+    // happens to trip first, which is exactly how this showed up in CI (one run reported orchard,
+    // the next ironwood, from the same code).
+    //
+    // Unlike the transparent ladder above - whose shielded proceeds are ironwood because *zecd*
+    // authors the `z_shieldcoinbase` transaction - these outputs are authored by the **miner**, so
+    // the pool follows the consensus rules in force at the mining height.
+    let tip = zebra_tip(&zebrad).await;
     for e in entries {
-        assert_eq!(e["pool"], json!("orchard"), "shielded coinbase note: {e}");
+        // listunspent reports confirmations, so height = tip - confirmations + 1.
+        let confs = e["confirmations"].as_u64().expect("confirmations");
+        let height = tip - confs + 1;
+        let expected = if height >= u64::from(zecd_regtest_harness::NU6_3_ACTIVATION_HEIGHT) {
+            "ironwood"
+        } else {
+            "orchard"
+        };
+        assert_eq!(
+            e["pool"],
+            json!(expected),
+            "shielded coinbase note mined at height {height} (NU6.3 activates at {}): {e}",
+            zecd_regtest_harness::NU6_3_ACTIVATION_HEIGHT
+        );
     }
     let coinbase_total: f64 = entries
         .iter()

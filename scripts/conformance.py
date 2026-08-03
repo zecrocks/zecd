@@ -563,7 +563,7 @@ def main() -> int:
         ck("z_listtransactions amount is Decimal", isinstance(z["amount"], decimal.Decimal))
         ck("z_listtransactions amountZat is int", isinstance(z["amountZat"], int))
         ck("z_listtransactions pool valid",
-           z["pool"] in ("transparent", "sapling", "orchard"))
+           z["pool"] in ("transparent", "sapling", "orchard", "ironwood"))
         ck("z_listtransactions category valid", z["category"] in ("send", "receive"))
         ck("z_listtransactions status valid",
            z["status"] in ("mined", "waiting", "expired", "expiringsoon"))

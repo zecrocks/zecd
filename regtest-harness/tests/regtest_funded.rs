@@ -265,7 +265,24 @@ async fn regtest_funded_orchard_receive() {
 
     assert!(
         balance > 0.0,
-        "zecd should have a positive Orchard balance, got {balance}"
+        "zecd should have a positive shielded balance, got {balance}"
+    );
+
+    // The confirmed note is an IRONWOOD note. NU6.3 is active on this chain (as on mainnet and
+    // testnet), so the funder's payment to zecd's Orchard receiver is an Orchard-V3 (ironwood) note,
+    // not an Orchard-V2 one - and every send below therefore spends ironwood. Pin it here so this
+    // whole e2e is known to exercise the pool real users are on: without this the entire file stays
+    // green if the receive silently lands in the legacy Orchard pool. NB the *mined* note is checked,
+    // not the 0-conf one from the mempool path above, which can still read `orchard` until the block
+    // scan relabels it.
+    let lu = zecd
+        .call("listunspent", json!([]))
+        .await
+        .expect("listunspent after confirmation");
+    let lu = lu.as_array().expect("listunspent is an array");
+    assert!(
+        lu.iter().any(|u| u["pool"] == "ironwood"),
+        "the confirmed receive is an ironwood note on this NU6.3-active chain: {lu:?}"
     );
 
     // The receive shows up in history as a `receive` transaction.
@@ -1345,6 +1362,23 @@ async fn regtest_funded_orchard_receive() {
         );
         tokio::time::sleep(Duration::from_millis(500)).await;
     }
+
+    // What was just rediscovered from nothing but a viewing key + the chain is an IRONWOOD note.
+    // This is the from-scratch recovery path for the pool mainnet/testnet are on: the scan had to
+    // trial-decrypt an Orchard-V3 note out of the compact blocks, record it in `ironwood_received_notes`,
+    // and surface it through `listunspent`'s ironwood accessor - none of which the memo assertion
+    // above would notice if ironwood scanning regressed to producing nothing (an empty history would
+    // simply time out) or to recording the note in the legacy Orchard pool (the memo would still
+    // decode). Assert the pool explicitly so a restore-side ironwood regression is named, not guessed.
+    let watch_lu = watch_only
+        .call("listunspent", json!([0]))
+        .await
+        .expect("listunspent on the watch-only wallet");
+    let watch_lu = watch_lu.as_array().expect("listunspent is an array");
+    assert!(
+        watch_lu.iter().any(|u| u["pool"] == "ironwood"),
+        "the viewing-key-only rescan rediscovers the receive as an ironwood note: {watch_lu:?}"
+    );
 
     // The enhancement backlog is an observable signal, not just an internal step: once the drain
     // completes, /status must report `pending_enhancements: 0` and the connection back to `ready`

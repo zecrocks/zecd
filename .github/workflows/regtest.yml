@@ -20,10 +20,13 @@ name: Regtest E2E
 # ONLY on a monthly cron (1st of the month) or a manual dispatch with the `stress` box ticked.
 # It compiles on every run but skips in seconds otherwise.
 #
-# A separate `regtest-ironwood` job (schedule + manual dispatch, plus the mainline) builds zecd
-# with the ironwood scan/send paths - which are compiled unconditionally now - against the official
-# zcash/librustzcash ironwood RC (no `nu6.3` cfg needed any more) - and runs the NU6.3 receive+send
-# e2e against the ironwood toolchain images - see that job's header.
+# NU6.3 (ironwood) is ACTIVE on mainnet and testnet, so the regtest chain activates it too: the
+# harness always configures the node with `"NU6.3"` at NU6_3_ACTIVATION_HEIGHT (8) and the zecd
+# under test gets ZECD_REGTEST_NU63_HEIGHT to match. Every funded flow here therefore exercises the
+# pool real users are on - a receive lands as an ironwood (V3) note, and every send builds a V6
+# ironwood bundle. `regtest_ironwood` runs alongside the rest as one more test binary; it holds only
+# the assertions the other flows can't imply (input/change pool pinning and the librustzcash#2554
+# anchor-retention guard). There is no separate ironwood CI tier.
 
 on:
   workflow_dispatch:
@@ -44,16 +47,8 @@ on:
         description: "Notes to build in the stress test (blank = default 256)"
         required: false
         default: ""
-      zebra-ironwood-image:
-        description: "Ironwood tier: NU6.3-capable zebrad image (default zfnd/zebra:6.2.2); blank = the job default"
-        required: false
-        default: ""
-      lwd-ironwood-image:
-        description: "Ironwood tier: V6-aware lightwalletd image; blank = the job default"
-        required: false
-        default: ""
-      devtool-ironwood-image:
-        description: "Ironwood tier: regtest-aware zcash-devtool image; blank = the job default"
+      devtool-image:
+        description: "Ironwood/regtest-aware zcash-devtool funder image; blank = the workflow default"
         required: false
         default: ""
   schedule:
@@ -96,10 +91,21 @@ on:
 env:
   ZEBRAD_IMAGE_PINNED: "6.2.2"
   ZAKURAD_IMAGE_PINNED: "1.0.5"
-  # The harness --test targets. Identical for both backends; the lightwalletd-funded tests skip
+  # The zcash-devtool funder, from a digest-pinned dev image: its regtest `init` takes
+  # `--activation-heights` and reads the mnemonic from stdin (the `regtest_support` build), which
+  # the older source build does not - and without those it cannot fund an NU6.3 chain. Still a DEV
+  # image; swap it for an official release once one ships.
+  DEVTOOL_IMAGE: ${{ inputs.devtool-image || 'emersonian/zcash-devtool@sha256:fd95d8b432f47d3eec6e5f1eca0bdfbb8daa094c28742d230bec3ac47957bd6c' }}
+  # lightwalletd, built from source at this release tag and used as the devtool funder's backend
+  # on every leg. 0.5.0 is the first release serving the versioned lightwallet protocol, which is
+  # what carries transparent and Ironwood data in compact blocks. The chain is NU6.3-active
+  # throughout, so the funder needs a lightwalletd that can parse a V6 transaction; the old
+  # v0.4.19 image cannot, which is why it is no longer used.
+  LIGHTWALLETD_VERSION: "v0.5.2"
+  # The harness --test targets. Identical for both nodes; the lightwalletd-funded tests skip
   # themselves on the zakura leg (see the provisioning step - lightwalletd can't front zakura's
   # `/Zakura/` subversion), and extended/stress tests skip in seconds unless their gate is set.
-  HARNESS_TESTS: "--test regtest_e2e --test regtest_binding --test regtest_funded --test regtest_proving_cache --test regtest_sapling --test regtest_transparent --test regtest_transparent_t2t --test regtest_transparent_sendmany_t2t --test regtest_transparent_gap --test regtest_transparent_offline_restore --test regtest_transparent_preexpose_responsive --test regtest_transparent_recovery_window --test regtest_coinbase --test regtest_hang --test regtest_reorg --test regtest_multiwallet --test regtest_restore --test regtest_watchonly --test regtest_stress_notes"
+  HARNESS_TESTS: "--test regtest_e2e --test regtest_binding --test regtest_funded --test regtest_ironwood --test regtest_proving_cache --test regtest_sapling --test regtest_transparent --test regtest_transparent_t2t --test regtest_transparent_sendmany_t2t --test regtest_transparent_gap --test regtest_transparent_offline_restore --test regtest_transparent_preexpose_responsive --test regtest_transparent_recovery_window --test regtest_coinbase --test regtest_hang --test regtest_reorg --test regtest_multiwallet --test regtest_restore --test regtest_watchonly --test regtest_stress_notes"
 
 concurrency:
   group: regtest-${{ github.event_name }}-${{ github.ref }}
@@ -153,40 +159,10 @@ jobs:
           workspaces: |
             .
             regtest-harness
-            zcash-devtool
 
       # Release build: debug Orchard/Sapling proving is >20s; release keeps the harness snappy.
       - name: Build zecd (release)
         run: cargo build --release --bin zecd
-
-      # The funding wallet: zcash-devtool with regtest support (PR zecrocks/zcash-devtool#1).
-      # It shields a mined transparent coinbase into Orchard and sends it to zecd, since regtest
-      # can't mine an Orchard coinbase zecd would scan.
-      # Pinned to a commit SHA (branch sleepy-faraday-T6HUy) so the build can't change
-      # or vanish under us. TODO: switch `ref` to a main-branch SHA once zcash-devtool#1 merges.
-      - name: Checkout zcash-devtool (funder)
-        uses: actions/checkout@v4
-        with:
-          repository: zecrocks/zcash-devtool
-          ref: 7ca3ce28ed9f606cdb1e1a6c8ae087cb2c5a2973
-          path: zcash-devtool
-
-      # Cache the funder binary keyed on its commit, so devtool is built once per devtool change
-      # and skipped entirely on every other run (it rarely changes between zecd runs). On a miss,
-      # rust-cache (above) still has its dependency tree, so the rebuild is just devtool's own crate.
-      - name: Resolve devtool commit
-        run: echo "DEVTOOL_SHA=$(git -C zcash-devtool rev-parse HEAD)" >> "$GITHUB_ENV"
-
-      - name: Cache the funder binary
-        id: devtool-bin
-        uses: actions/cache@v4
-        with:
-          path: zcash-devtool/target/release/zcash-devtool
-          key: devtool-bin-${{ runner.os }}-${{ env.DEVTOOL_SHA }}
-
-      - name: Build zcash-devtool (funder)
-        if: steps.devtool-bin.outputs.cache-hit != 'true'
-        run: cargo build --release --manifest-path zcash-devtool/Cargo.toml --bin zcash-devtool
 
       # Pick the node image + tag for this leg. `node` selects the project (zebra/zakura), which
       # fixes the image repo, pinned tag, binary name and the env var the harness reads. The
@@ -235,7 +211,7 @@ jobs:
       # the transparent-coinbase maturity+shield flow was flaky against zakura in testing.) zecd
       # itself talks to zakura directly and needs no lightwalletd; this is purely a limit of the
       # test funder. A zakura-compatible lightwalletd would let the funded tests run here too.
-      - name: Provision node + lightwalletd from images
+      - name: Provision node + devtool funder from images
         run: |
           set -euo pipefail
           mkdir -p "$RUNNER_TEMP/bin"
@@ -252,9 +228,38 @@ jobs:
           }
           extract "$NODE_IMAGE" "$NODE_BIN_NAME"
           echo "$NODE_BIN_ENV=$RUNNER_TEMP/bin/$NODE_BIN_NAME" >> "$GITHUB_ENV"
+          # The devtool funder. Needed on every leg that funds a wallet; its tests self-skip
+          # wherever lightwalletd is absent (the zakura leg).
+          extract "$DEVTOOL_IMAGE" zcash-devtool
+          echo "DEVTOOL_BIN=$RUNNER_TEMP/bin/zcash-devtool" >> "$GITHUB_ENV"
+          # lightwalletd is built from source below (LIGHTWALLETD_VERSION) rather than extracted:
+          # the chain is NU6.3-active, and the old released image cannot parse a V6 transaction.
+
+      # Build lightwalletd at LIGHTWALLETD_VERSION from source (no published image carries it
+      # yet). It serves the devtool funder on every leg - the NU6.3-active chain needs a
+      # lightwalletd that parses V6.
+      - name: Cache the release-built lightwalletd
+        id: lwd-master-bin
+        uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}/bin/lightwalletd-release
+          key: lwd-release-bin-${{ runner.os }}-${{ env.LIGHTWALLETD_VERSION }}
+
+      - name: Build lightwalletd from its release tag
+        if: steps.lwd-master-bin.outputs.cache-hit != 'true'
+        run: |
+          set -euo pipefail
+          git clone https://github.com/zcash/lightwalletd.git "$RUNNER_TEMP/lightwalletd-src"
+          git -C "$RUNNER_TEMP/lightwalletd-src" checkout "$LIGHTWALLETD_VERSION"
+          (cd "$RUNNER_TEMP/lightwalletd-src" && go build -o "$RUNNER_TEMP/bin/lightwalletd-release" .)
+          file -b "$RUNNER_TEMP/bin/lightwalletd-release" || true
+
+      # lightwalletd is only usable in front of zebra - it hard-rejects zakura's `/Zakura/`
+      # subversion - so the zakura leg leaves LIGHTWALLETD_BIN unset and its funded tests self-skip.
+      - name: Select the lightwalletd binary
+        run: |
           if [ "${{ matrix.node }}" = "zebra" ]; then
-            extract electriccoinco/lightwalletd:v0.4.19 lightwalletd
-            echo "LIGHTWALLETD_BIN=$RUNNER_TEMP/bin/lightwalletd" >> "$GITHUB_ENV"
+            echo "LIGHTWALLETD_BIN=$RUNNER_TEMP/bin/lightwalletd-release" >> "$GITHUB_ENV"
           else
             echo "node=${{ matrix.node }}: skipping lightwalletd (it rejects this node's subversion); funder tests will self-skip"
           fi
@@ -264,7 +269,11 @@ jobs:
       - name: Run regtest end-to-end harness
         env:
           ZECD_BIN: ${{ github.workspace }}/target/release/zecd
-          DEVTOOL_BIN: ${{ github.workspace }}/zcash-devtool/target/release/zcash-devtool
+          # Activate NU6.3 (ironwood) at height 8 on the regtest chain for the zecd process, matching
+          # the node config the harness writes (regtest-harness's NU6_3_ACTIVATION_HEIGHT) and the
+          # funder's --activation-heights. All three MUST agree: a mismatch diverges the NU6.3
+          # consensus branch id and the node rejects the transactions.
+          ZECD_REGTEST_NU63_HEIGHT: "8"
           # Select the backend for this matrix leg (zebra/zakura); the harness resolves the node
           # binary from the matching env var (ZEBRAD_BIN / ZAKURAD_BIN, exported above).
           ZECD_REGTEST_NODE: ${{ matrix.node }}
@@ -336,113 +345,3 @@ jobs:
           free -g || true
           echo "== captured logs (${{ matrix.node }}) =="
           ls -la "$RUNNER_TEMP/regtest-logs" 2>/dev/null || echo "(no logs were written)"
-
-  # Ironwood (NU6.3) tier. Builds zecd with the `ironwood` feature (no cfg - the librustzcash pin,
-  # zcash/librustzcash `dw/ironwood-scan-model`, exposes the ironwood wallet APIs unconditionally),
-  # and runs the gated regtest_ironwood receive e2e against the NU6.3 toolchain: the OFFICIAL zebra
-  # ironwood release (`zfnd/zebra:6.2.2`) plus a still-dev V6-aware lightwalletd and a regtest-aware
-  # zcash-devtool funder. It funds zecd post-NU6.3 (auto-routed to an ironwood output) and asserts
-  # zecd labels the received note `pool == "ironwood"`.
-  #
-  # zebra is now an official image, but lwd + devtool are still DEV images (emersonian/*) that may
-  # move or vanish, so this job runs ONLY on the weekly schedule and on manual dispatch - never on
-  # other branches' PRs, so a missing image can't redden PR CI. Bump the image refs in `env` below
-  # (or pass them as dispatch inputs) as the ironwood stack is rebuilt; keep the NU6.3 height (8) in
-  # lockstep with the harness' NU6_3_ACTIVATION_HEIGHT, zecd's network::regtest(), and devtool's
-  # regtest_params().
-  regtest-ironwood:
-    # schedule + manual dispatch, plus the mainline so trunk-bound work auto-runs the NU6.3 e2e
-    # without a manual dispatch. `base_ref` matches any PR **into** `main`; `ref` matches a direct
-    # push to `main`. (Both clauses named `ironwood` while that was the integration line; the
-    # ironwood work sits on the trunk now, so retargeting preserves the original intent.) Still
-    # never on unrelated branches' PRs - a PR into a feature branch does not pull in the
-    # emersonian/* lwd/devtool images, which remain dev artifacts. Once those images ship, the
-    # keying can be dropped entirely so the tier runs everywhere.
-    if: ${{ github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' || github.base_ref == 'main' || github.ref == 'refs/heads/main' }}
-    # Same runner as the tier above. This job runs a single test binary, so it gets nothing from
-    # REGTEST_JOBS - but its release build and its Orchard proving are both parallel, and with the
-    # zebra leg down to ~8 min this job (12m13s on a 2-core runner) is what the workflow now waits
-    # on. Left on the stock runner it would simply become the new ceiling.
-    runs-on: ${{ vars.REGTEST_RUNNER || 'ubuntu-latest-8-cores' }}
-    name: regtest (ironwood / NU6.3)
-    env:
-      # zebrad is now the OFFICIAL ironwood-capable release on Docker Hub (`zfnd/zebra:6.2.2`),
-      # which is NU6.3-capable and accepts the `"NU6.3"` regtest activation-height key - so the dev
-      # `emersonian/zcash-zakura` image is retired. lwd + devtool stay pinned to dev images by
-      # @sha256 digest (their tags are mutable), both rebuilt against the official zebra's V6 wire
-      # format: lwd = `emersonian/zcash-lwd-ironwood:360a37d-zr8-nu63` (V6 parser for zebra 6.x);
-      # devtool = `emersonian/zcash-devtool:cac96846` (== ironwood-valar tip), built with
-      # `regtest_support` so its regtest `init` takes `--activation-heights`; sends+receives ironwood.
-      # A dispatch input can override any of them (e.g. with a `repo:tag`) when the stack is rebuilt;
-      # bump these as the images are rebuilt.
-      ZEBRAD_IRONWOOD_IMAGE: ${{ inputs.zebra-ironwood-image || 'zfnd/zebra:6.2.2' }}
-      LWD_IRONWOOD_IMAGE: ${{ inputs.lwd-ironwood-image || 'emersonian/zcash-lwd-ironwood@sha256:5f63b64ed788330ad8fe859fbbb334ceea844cf8a376318e7e25fbd3351b2f9f' }}
-      DEVTOOL_IRONWOOD_IMAGE: ${{ inputs.devtool-ironwood-image || 'emersonian/zcash-devtool@sha256:fd95d8b432f47d3eec6e5f1eca0bdfbb8daa094c28742d230bec3ac47957bd6c' }}
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Install protobuf compiler
-        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
-
-      - uses: dtolnay/rust-toolchain@stable
-
-      - uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: |
-            .
-            regtest-harness
-          # Separate cache key: this build carries the ironwood feature + nu6.3 cfg.
-          key: ironwood
-
-      # zecd compiles the ironwood scan/balance/pool/send paths unconditionally now (no cargo
-      # feature) - this is a plain release build. NU6.3 activation on the regtest chain is turned on
-      # for the zecd process below via the `ZECD_REGTEST_NU63_HEIGHT` env var (see the e2e step).
-      - name: Build zecd (release)
-        run: cargo build --release --bin zecd
-
-      # Extract zebrad + lightwalletd + the devtool funder from the ironwood toolchain images.
-      - name: Provision ironwood zebrad + lightwalletd + devtool from images
-        run: |
-          set -euo pipefail
-          mkdir -p "$RUNNER_TEMP/bin"
-          extract() {
-            img="$1"; name="$2"; out="$RUNNER_TEMP/bin/$name"
-            docker pull -q "$img"
-            cid=$(docker create "$img")
-            rel=$(docker export "$cid" | tar -tf - | grep -m1 -E "(^|/)${name}\$" || true)
-            if [ -z "$rel" ]; then echo "::error::could not locate $name in $img"; docker rm "$cid" >/dev/null; exit 1; fi
-            docker cp "$cid:/$rel" "$out"
-            docker rm "$cid" >/dev/null
-            chmod +x "$out"
-            echo "$name -> $out"; file -b "$out" || true
-          }
-          extract "$ZEBRAD_IRONWOOD_IMAGE" zebrad
-          extract "$LWD_IRONWOOD_IMAGE" lightwalletd
-          extract "$DEVTOOL_IRONWOOD_IMAGE" zcash-devtool
-          echo "ZEBRAD_BIN=$RUNNER_TEMP/bin/zebrad" >> "$GITHUB_ENV"
-          echo "LIGHTWALLETD_BIN=$RUNNER_TEMP/bin/lightwalletd" >> "$GITHUB_ENV"
-          echo "DEVTOOL_BIN=$RUNNER_TEMP/bin/zcash-devtool" >> "$GITHUB_ENV"
-
-      - name: Run ironwood (NU6.3) receive e2e
-        env:
-          ZECD_BIN: ${{ github.workspace }}/target/release/zecd
-          ZECD_REGTEST_IRONWOOD: "1"
-          # Activate NU6.3 at height 8 on the regtest chain for the zecd process (matches the zebra
-          # the ironwood harness configures). Ironwood is always compiled; this env var is what turns
-          # its activation on for regtest. The standard regtest tier leaves it unset (no NU6.3).
-          ZECD_REGTEST_NU63_HEIGHT: "8"
-          ZEBRAD_STDERR: ${{ runner.temp }}/zebrad.log
-          # Stream zecd's own logs into the run output (info level) so a failure is diagnosable
-          # without the debug flood that the receive/send bring-up needed.
-          ZECD_STDERR: "1"
-          RUST_LOG: "zecd=info"
-          # ZEBRAD_BIN / LIGHTWALLETD_BIN / DEVTOOL_BIN are exported by the provisioning step.
-        run: cargo test --locked --manifest-path regtest-harness/Cargo.toml --test regtest_ironwood --no-fail-fast -- --nocapture --test-threads=1
-
-      - name: Dump diagnostics on failure
-        if: failure()
-        run: |
-          echo "== disk =="
-          df -h / "$RUNNER_TEMP" || true
-          echo "== zebrad log (last 200 lines) =="
-          tail -n 200 "$RUNNER_TEMP/zebrad.log" 2>/dev/null || echo "(no zebrad log was written)"
