@@ -68,9 +68,11 @@ pools](guide/addresses.md).
 
 ### Sends that leave a single shielded pool reveal information
 
-A transparent recipient reveals the recipient and the amount on-chain; crossing the
-Sapling to Orchard turnstile (spending one pool, paying the other) reveals the crossed amount
-via `valueBalance`. Both are permitted under the default policy, `AllowRevealedRecipients`.
+A transparent recipient reveals the recipient and the amount on-chain; crossing a turnstile
+between two shielded pools (spending one, paying the other) reveals the crossed amount via
+`valueBalance`. Sapling, Orchard and Ironwood are three distinct pools for this purpose, so a
+post-NU6.3 wallet paying a Sapling or Orchard recipient from ironwood notes is crossing one.
+Both leaks are permitted under the default policy, `AllowRevealedRecipients`.
 The `[spend] privacy_policy` setting (and `z_sendmany`'s per-call `privacyPolicy`) is a
 four-rung ladder that lets you forbid either leak, or additionally opt in to fully
 transparent spends. See [privacy policy](design/privacy.md) for the rungs and where each is

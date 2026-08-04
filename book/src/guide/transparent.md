@@ -206,6 +206,52 @@ addresses: every issuance past the floor otherwise tripped the gap limit, was wa
 potentially unrecoverable, and genuinely was unrecoverable from seed. That workaround is no
 longer needed, and for the reason in the next section it is now actively discouraged.
 
+### Two windows: live lookahead vs restore recovery
+
+The running wallet and a from-seed restore do not cover the same range, because the two windows
+are anchored on different events. Both behaviours are correct, and the difference is what decides
+whether funds survive a restore.
+
+| | Anchored on | Moves when |
+| --- | --- | --- |
+| **Live lookahead** (what the running matcher reaches) | address **exposure** | you hand an address out, *or* an index is funded |
+| **Recovery horizon** (what a from-seed restore rediscovers within) | **funding** | an index is funded |
+
+Issuance leaves no trace on chain, so a restore cannot know which addresses you handed out; it
+starts its frontier at the floor and works forward from funded indices. A running wallet, by
+contrast, must credit a receive on any address it handed out, so its lookahead follows issuance.
+
+The consequence is a band that is matched live but **not** recovered from seed. It opens only
+when an address is issued at or past the recovery horizon, which is exactly the act
+[`transparent_allow_beyond_recovery_window`](#at-the-edge-of-the-recovery-window) governs and
+already warns about, so it is an accepted operator choice rather than a surprise. Funding-driven
+movement never opens the band: funding extends the restore's own window too, so a restore chains
+forward to it.
+
+`getwalletinfo.transparent` reports both windows, so this is observable rather than inferred:
+
+```json
+"transparent": {
+  "gap_limit": 20,
+  "lookahead_from": 1,
+  "lookahead_through": 20,
+  "recovery_horizon": 20,
+  "restorable": true
+}
+```
+
+- `lookahead_from` / `lookahead_through` are the live window, both **inclusive**. They describe
+  the *forward reach* only: every address with a database row is matched too, including indices
+  below `lookahead_from`.
+- `recovery_horizon` is `transparent_initial_scan + transparent_gap_limit`.
+- `restorable` is the one to watch. It is `lookahead_from <= recovery_horizon`, and `false`
+  means the wallet is currently crediting addresses that a restore of the same seed would not
+  rediscover. Alert on it rather than comparing the integers yourself.
+
+Do not read a `false` as data loss: those funds are held and spendable, and are only at risk if
+the wallet is later rebuilt from seed alone. Raising `transparent_initial_scan` (not
+`transparent_gap_limit`, for the reason below) is the fix.
+
 ### Sizing `transparent_gap_limit`: keep it small
 
 **Size the gap limit to the addresses you have handed out that are still unfunded, and no

@@ -32,7 +32,7 @@ opt-in implies a willingness to spend transparently (leak 3).
 `SendPrivacy` (`src/config.rs`) has four variants, strictest first. Each rung permits everything
 the rung above it permits, plus one more disclosure.
 
-| Policy | Transparent recipient | Sapling/Orchard crossing | Transparent-funded (t-to-t) spend |
+| Policy | Transparent recipient | Shielded pool crossing | Transparent-funded (t-to-t) spend |
 |---|---|---|---|
 | `FullPrivacy` | rejected, `-8` | rejected, `-8` | no |
 | `AllowRevealedAmounts` | rejected, `-8` | allowed | no |
@@ -43,8 +43,11 @@ Details per rung:
 
 - **`FullPrivacy`**: only fully shielded sends confined to a single shielded pool. A recipient
   with no shielded receiver is `-8` at the RPC layer; a proposal whose inputs, outputs, or change
-  would touch a transparent component or both shielded pools is `-8` from the actor, with a
-  message naming the policy and the config knob to change.
+  would touch a transparent component or **more than one** shielded pool is `-8` from the actor,
+  with a message naming the policy and the config knob to change. Sapling, Orchard and Ironwood
+  are three distinct pools here: ironwood notes are received at ordinary Orchard addresses, but
+  they are a separate value pool, so an ironwood-to-Orchard send crosses the turnstile exactly as
+  an ironwood-to-Sapling one does.
 - **`AllowRevealedAmounts`**: permits the turnstile crossing (revealing the amount via
   `valueBalance`) but still rejects a transparent recipient with `-8`. This rung is the reason
   the ladder exists: collapsing it onto `AllowRevealedRecipients` silently pays transparent
@@ -142,9 +145,11 @@ which notes fund it, and that is unknown until librustzcash builds the transfer 
 (librustzcash has no privacy-policy concept of its own). So the actor's send path
 (`actor::build_proposal_and_pczt` / `do_send_fused`) enforces the single-pool rule on the built
 proposal, and only for `FullPrivacy`: `enforce_full_privacy` walks every proposal step with
-`Step::involves` and rejects with `-8` if any step touches a transparent component or both
-shielded pools (`single_pool_violated`: `transparent || (sapling && orchard)`). Inputs, payment
-outputs, and change all count. `AllowRevealedAmounts` and above skip this check, since crossing
+`Step::involves` and rejects with `-8` if any step touches a transparent component or more than
+one shielded pool. Inputs, payment outputs, and change all count. The rule is stated over the
+pool *count* rather than as a list of forbidden pairs, so a fourth pool is covered without
+another edit; an earlier form that named only Sapling and Orchard let ironwood crossings through
+(fixed in 0.5.2). `AllowRevealedAmounts` and above skip this check, since crossing
 is exactly what that rung opts into. For `z_sendmany` this half runs on the background operation,
 so the failure surfaces in `z_getoperationstatus`/`z_getoperationresult` rather than as a
 synchronous error.

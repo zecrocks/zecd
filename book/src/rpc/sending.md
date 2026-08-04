@@ -66,7 +66,8 @@ refuses to spend explains itself. The same amount is readable as
 `[spend] privacy_policy` (default `AllowRevealedRecipients`), a recipient with no shielded
 receiver (a bare `t1`/`t3` address) is rejected up front with `-8` when the policy is
 `FullPrivacy` or `AllowRevealedAmounts`. `FullPrivacy` additionally rejects, on the built
-proposal, any send that crosses the Sapling to Orchard turnstile. Neither method takes a
+proposal, any send that crosses a turnstile between two shielded pools (Sapling, Orchard and
+Ironwood are three distinct pools). Neither method takes a
 per-call policy argument; the config value applies. See the
 [privacy policy ladder](../design/privacy.md).
 

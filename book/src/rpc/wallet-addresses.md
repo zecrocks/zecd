@@ -239,10 +239,23 @@ and full transaction data), not just during the block scan.
   auto-relocks, or `0` while locked. Absent on unencrypted and watch-only wallets.
 - `transparent` (extension): present only when `[pools] transparent = true`, so a
   shielded-only wallet's shape is unchanged. `{"enabled": true, "default": <bool>,
-  "gap_limit": <n>, "coinbase_balance": <amount>}`, plus, when `transparent_initial_scan`
-  is set, an `initial_sync` object `{"exposed": <n>, "total": <n>, "complete": <bool>}`
-  for polling the address pre-exposure. See
-  [Transparent support](../guide/transparent.md).
+  "gap_limit": <n>, "coinbase_balance": <amount>, "recovery_horizon": <n>}`, plus the
+  lookahead fields below and, when `transparent_initial_scan` is set, an `initial_sync`
+  object `{"exposed": <n>, "total": <n>, "complete": <bool>}` for polling the address
+  pre-exposure. See [Transparent support](../guide/transparent.md).
+- `transparent.recovery_horizon` / `.lookahead_from` / `.lookahead_through` / `.restorable`
+  (extension): the two address windows, which are anchored differently and can disagree.
+  `recovery_horizon` (`transparent_initial_scan + transparent_gap_limit`) is what a from-seed
+  restore rediscovers within, anchored on **funding**, so handing an address out does not move
+  it. `lookahead_from`/`lookahead_through` are the forward lookahead the running wallet
+  scans ahead of its recorded addresses, both **inclusive** and anchored on **exposure**, so
+  issuance does move them. They describe forward reach only: every address with a database row
+  is matched too, including indices below `lookahead_from`. `restorable` is
+  `lookahead_from <= recovery_horizon`, and `false` means the wallet is crediting addresses a
+  from-seed restore would not rediscover, which is the field to alert on. The lookahead fields
+  are absent until the matcher is first built, and `lookahead_through`/`restorable` are omitted
+  when `gap_limit` is `0`. See
+  [Two windows](../guide/transparent.md#two-windows-live-lookahead-vs-restore-recovery).
 - `transparent.coinbase_balance` (extension): the unspent **mature** transparent coinbase
   value, the same number as [`getbalances.mine.coinbase`](wallet-balances.md#getbalances).
   It is already inside `balance`, and is reported separately because no ordinary send can

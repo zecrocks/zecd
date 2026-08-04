@@ -75,7 +75,7 @@ addresses works and selects the same funds.
 
 | Value | Effect in zecd |
 |-------|----------------|
-| `FullPrivacy` | No shielded leak: a transparent recipient is `-8` up front, and a proposal that crosses the Sapling/Orchard turnstile is rejected. |
+| `FullPrivacy` | No shielded leak: a transparent recipient is `-8` up front, and a proposal that crosses a turnstile between two shielded pools is rejected (Sapling, Orchard and Ironwood are three distinct pools). |
 | `AllowRevealedAmounts` | Turnstile crossing allowed (reveals the amount). A transparent recipient is still `-8`. |
 | `AllowRevealedRecipients`, `AllowRevealedSenders`, `AllowLinkingAccountAddresses` | Transparent recipients allowed, paid from shielded funds with shielded change. zcashd's sender-side rungs collapse here because zecd's shielded sends have no transparent sender to reveal. |
 | `AllowFullyTransparent`, `NoPrivacy` | Additionally permits a fully transparent spend: funding the send from transparent UTXOs with kept-transparent change (see [Transparent support](../guide/transparent.md)). |
