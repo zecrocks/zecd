@@ -1405,6 +1405,12 @@ impl Zecd {
         }
 
         write_zecd_toml(datadir.path(), cfg).context("write zecd.toml")?;
+        // Every regtest is a free assertion that `zecd config check` agrees with the daemon:
+        // this exact file is about to be handed to a zecd that must start on it, so a check
+        // that rejects it (or a daemon that refuses a file the check passed) is a real
+        // disagreement between the two - on a production-shaped config rather than a fixture,
+        // across both backends and every tier.
+        assert_config_check_passes(&bin, datadir.path())?;
         let mnemonic = init_default_with_retry(&bin, datadir.path(), cfg).await?;
 
         // Watch-only replicas derive from the default wallet's exported UFVK (read straight from
@@ -2006,6 +2012,34 @@ fn run_zecd_init_watch_only(
         bail!(
             "zecd init --wallet {wallet} --ufvk failed ({}):\n{}",
             out.status,
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+    Ok(())
+}
+
+/// Run `zecd config check` against a datadir's freshly written `zecd.toml` and require it to
+/// pass. Offline and read-only (it takes no datadir lock and writes nothing), so it costs one
+/// process spawn.
+///
+/// Warnings are expected here and do not fail the check - at this point no wallet has been
+/// initialised yet, which the command reports as exactly that. `--strict` would turn that
+/// normal state into a failure.
+fn assert_config_check_passes(bin: &Path, datadir: &Path) -> Result<()> {
+    let out = Command::new(bin)
+        .args([
+            "config",
+            "check",
+            "--conf",
+            datadir.join("zecd.toml").to_str().unwrap(),
+        ])
+        .output()
+        .context("spawn zecd config check")?;
+    if !out.status.success() {
+        bail!(
+            "zecd config check rejected the config this test is about to run zecd on ({}):\n{}{}",
+            out.status,
+            String::from_utf8_lossy(&out.stdout),
             String::from_utf8_lossy(&out.stderr)
         );
     }

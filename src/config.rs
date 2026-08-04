@@ -671,61 +671,73 @@ struct PoolsFile {
 // ---------------------------------------------------------------------------
 
 /// `zecd` - a Bitcoin-Core-style JSON-RPC server for shielded-first Zcash.
+// Every flag here is `global`, so it is accepted before *or* after a subcommand
+// (`zecd --conf f config check` and `zecd config check --conf f` are the same command). That
+// matters most for `config check`, whose whole job is resolving a named config the way the daemon
+// would - having to remember that `--conf` only works in one position would be a trap on the one
+// command an operator reaches for when something is already wrong. (A normal comment, not a doc
+// comment: clap renders the doc comment as the command's help text, and this is a note for
+// readers of the source.)
 #[derive(Debug, Parser)]
 #[command(name = "zecd", version)]
 pub struct Cli {
     /// Path to the TOML config file (default: <datadir>/zecd.toml, else ./zecd.toml).
-    #[arg(long, value_name = "FILE")]
+    #[arg(long, global = true, value_name = "FILE")]
     pub conf: Option<PathBuf>,
 
     /// Data directory holding per-wallet subdirectories and the cookie file.
-    #[arg(long, value_name = "DIR")]
+    #[arg(long, global = true, value_name = "DIR")]
     pub datadir: Option<PathBuf>,
 
     /// Use testnet (overrides config `network`).
-    #[arg(long)]
+    #[arg(long, global = true)]
     pub testnet: bool,
 
     /// Use regtest - a local zebra regtest chain (overrides config `network`).
-    #[arg(long)]
+    #[arg(long, global = true)]
     pub regtest: bool,
 
     /// Network: "main", "test", or "regtest".
-    #[arg(long, value_name = "NET")]
+    #[arg(long, global = true, value_name = "NET")]
     pub network: Option<String>,
 
     /// RPC bind address.
-    #[arg(long = "rpcbind", value_name = "ADDR")]
+    #[arg(long = "rpcbind", global = true, value_name = "ADDR")]
     pub rpc_bind: Option<String>,
 
     /// RPC port.
-    #[arg(long = "rpcport", value_name = "PORT")]
+    #[arg(long = "rpcport", global = true, value_name = "PORT")]
     pub rpc_port: Option<u16>,
 
     /// RPC username (HTTP Basic auth).
-    #[arg(long = "rpcuser", value_name = "USER")]
+    #[arg(long = "rpcuser", global = true, value_name = "USER")]
     pub rpc_user: Option<String>,
 
     /// RPC password (HTTP Basic auth). May also be supplied via `ZECD_RPC_PASSWORD` or
     /// `[rpc] password_file` so it need not live in the (ConfigMap-bound) TOML.
-    #[arg(long = "rpcpassword", value_name = "PASS", env = "ZECD_RPC_PASSWORD")]
+    #[arg(
+        long = "rpcpassword",
+        global = true,
+        value_name = "PASS",
+        env = "ZECD_RPC_PASSWORD"
+    )]
     pub rpc_password: Option<String>,
 
     /// rpcauth credential (`<user>:<salt>$<hmac-sha256 hex>`); may be repeated.
-    #[arg(long = "rpcauth", value_name = "USER:SALT$HASH")]
+    #[arg(long = "rpcauth", global = true, value_name = "USER:SALT$HASH")]
     pub rpc_auth: Vec<String>,
 
     /// Chain upstream: `zebra` (local zebrad, the default) or `zebra://host:port`.
-    #[arg(long, value_name = "SERVER")]
+    #[arg(long, global = true, value_name = "SERVER")]
     pub server: Option<String>,
 
     /// age identity file used to decrypt the wallet seed for sending.
-    #[arg(long, value_name = "FILE", env = "ZECD_AGE_IDENTITY")]
+    #[arg(long, global = true, value_name = "FILE", env = "ZECD_AGE_IDENTITY")]
     pub age_identity: Option<PathBuf>,
 
     /// Path to the default wallet's `keys.toml`, independent of the datadir (so the encrypted
     /// seed can be a mounted Secret while the datadir stays a disposable cache).
-    #[arg(long, value_name = "FILE", env = "ZECD_KEYS_FILE")]
+    #[arg(long, global = true, value_name = "FILE", env = "ZECD_KEYS_FILE")]
     pub keys_file: Option<PathBuf>,
 
     /// Subcommand. When omitted, runs the daemon.
@@ -750,6 +762,9 @@ pub enum Command {
     /// Print the annotated example configuration file to stdout (or `--output-file`), then
     /// exit. Redirect it to `<datadir>/zecd.toml` and edit to taste.
     ExampleConfig(ExampleConfigArgs),
+    /// Inspect the configuration (`zecd config check`), then exit.
+    #[command(subcommand)]
+    Config(ConfigCommand),
     /// Rebuild a wallet whose database is broken: delete the wallet database (keys.toml and
     /// the seed are kept) so the next daemon start recreates the account from the seed and
     /// rescans the chain from the wallet birthday, re-deriving all funds and history. Refuses
@@ -812,6 +827,26 @@ pub struct ExampleConfigArgs {
     /// Overwrite `--output-file` if it already exists.
     #[arg(long)]
     pub force: bool,
+}
+
+#[derive(Debug, clap::Subcommand)]
+pub enum ConfigCommand {
+    /// Validate a configuration file against this zecd build without starting the daemon, and
+    /// print the settings it resolves to. Exits non-zero if the daemon would refuse to start.
+    Check(ConfigCheckArgs),
+}
+
+#[derive(Debug, clap::Args)]
+pub struct ConfigCheckArgs {
+    /// Treat warnings as errors, so a config that merely looks risky also exits non-zero
+    /// (for CI gates on a deployment repository).
+    #[arg(long)]
+    pub strict: bool,
+
+    /// Suppress the effective-configuration summary and the success line; problems and the
+    /// exit code are still reported.
+    #[arg(short = 'q', long)]
+    pub quiet: bool,
 }
 
 #[derive(Debug, clap::Args)]
@@ -885,23 +920,36 @@ impl AppConfig {
         Self::resolve_with(cli, &ZECD_DEFAULTS)
     }
 
-    /// Resolve the effective configuration with the binary's defaults (`zecd`).
-    pub fn resolve_with(cli: &Cli, defaults: &BinaryDefaults) -> anyhow::Result<AppConfig> {
-        // Datadir precedence: CLI > env (ZECD_DATADIR) > config file > default.
-        // The config file is located *before* its own `datadir` can apply (like bitcoind:
-        // `-conf` resolution never depends on a datadir set inside the file), so the file
-        // lookup uses only CLI/env.
-        let cli_datadir = cli
-            .datadir
+    /// The datadir named on the command line or in the environment, before the config file is
+    /// read. The file is located *before* its own `datadir` can apply (like bitcoind: `-conf`
+    /// resolution never depends on a datadir set inside the file), so the lookup uses only
+    /// CLI/env. Datadir precedence overall: CLI > env (`ZECD_DATADIR`) > config file > default.
+    fn cli_datadir(cli: &Cli, defaults: &BinaryDefaults) -> Option<PathBuf> {
+        cli.datadir
             .clone()
-            .or_else(|| std::env::var_os(defaults.datadir_env).map(PathBuf::from));
+            .or_else(|| std::env::var_os(defaults.datadir_env).map(PathBuf::from))
+    }
 
-        let conf_path = cli.conf.clone().unwrap_or_else(|| {
-            cli_datadir
-                .clone()
+    /// The config file [`resolve`](Self::resolve) would read for this invocation, whether or not
+    /// it exists. Exposed so `zecd config check` can name the file it is checking - and can only
+    /// ever check the same one the daemon would load.
+    pub fn conf_path(cli: &Cli) -> PathBuf {
+        Self::conf_path_with(cli, &ZECD_DEFAULTS)
+    }
+
+    /// [`conf_path`](Self::conf_path) with the binary's defaults.
+    pub fn conf_path_with(cli: &Cli, defaults: &BinaryDefaults) -> PathBuf {
+        cli.conf.clone().unwrap_or_else(|| {
+            Self::cli_datadir(cli, defaults)
                 .unwrap_or_else(|| PathBuf::from(defaults.datadir))
                 .join(defaults.conf_file)
-        });
+        })
+    }
+
+    /// Resolve the effective configuration with the binary's defaults (`zecd`).
+    pub fn resolve_with(cli: &Cli, defaults: &BinaryDefaults) -> anyhow::Result<AppConfig> {
+        let cli_datadir = Self::cli_datadir(cli, defaults);
+        let conf_path = Self::conf_path_with(cli, defaults);
 
         let file: ConfigFile = if conf_path.exists() {
             let text = std::fs::read_to_string(&conf_path)
@@ -1210,6 +1258,30 @@ impl AppConfig {
             log,
         })
     }
+}
+
+/// Refuse the shipped placeholder RPC password on mainnet, where the RPC credential is spend
+/// authority. The example config and the deploy templates ship `change-me`/`CHANGE-ME`, so a
+/// config that still carries it was never edited.
+///
+/// Deliberately *not* part of [`AppConfig::resolve`]: it is a startup policy, not a parse rule,
+/// and `resolve` is used by tooling (`config check`) that must be able to describe such a config
+/// rather than fail to build it. Both the daemon and `zecd config check` call this, so the two
+/// always agree on the verdict.
+pub fn reject_placeholder_password(config: &AppConfig) -> anyhow::Result<()> {
+    if matches!(config.network, ZNetwork::Main)
+        && config
+            .rpc
+            .password
+            .as_deref()
+            .is_some_and(|p| p.trim().eq_ignore_ascii_case("change-me"))
+    {
+        anyhow::bail!(
+            "[rpc] password is still the example placeholder \"CHANGE-ME\"; \
+             set a real password before running on mainnet"
+        );
+    }
+    Ok(())
 }
 
 /// Resolve and validate the global `[pools]` section. `enabled` defaults to Orchard-only;

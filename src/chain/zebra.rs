@@ -85,9 +85,31 @@ pub struct ZebraAuth {
 }
 
 impl ZebraAuth {
+    /// Whether any credential source is configured, without reading the cookie file. This is
+    /// what decides whether the cleartext gate applies, so `zecd config check` can reach the
+    /// same verdict as a connect would on a host where zebrad's cookie does not exist yet.
+    pub fn is_configured(&self) -> bool {
+        self.cookie.is_some() || self.user.is_some() || self.password.is_some()
+    }
+
+    /// Configuration-only validation: no file is read, so this is safe to run before deployment.
+    /// A cookie supersedes the pair, matching [`header`](Self::header)'s precedence.
+    pub fn validate(&self) -> anyhow::Result<()> {
+        if self.cookie.is_some() {
+            return Ok(());
+        }
+        match (&self.user, &self.password) {
+            (Some(_), None) | (None, Some(_)) => Err(anyhow!(
+                "[zebra] rpc_user and rpc_password must be set together"
+            )),
+            _ => Ok(()),
+        }
+    }
+
     /// Build the `Authorization` header value, if any. Errors are configuration problems
     /// (unreadable cookie, user without password) and should fail the connect loudly.
     pub fn header(&self) -> anyhow::Result<Option<String>> {
+        self.validate()?;
         if let Some(path) = &self.cookie {
             let contents = std::fs::read_to_string(path)
                 .with_context(|| format!("reading zebra rpc cookie {}", path.display()))?;
@@ -226,6 +248,34 @@ fn host_is_local(host: &str, rfc1918_is_local: bool) -> bool {
     }
 }
 
+/// The cleartext-credential gate: refuse to put zebrad's `Authorization` header on a plaintext
+/// connection to a globally-routable host. `credentialed` says whether a header would be sent at
+/// all (chain data is public, so an unauthenticated remote connect is always allowed).
+///
+/// A free function rather than an inline check in [`ZebraClient::new`] because it decides purely
+/// from configuration - no DNS, no I/O - which lets `zecd config check` report the refusal before
+/// deployment instead of leaving the operator with a daemon that starts and then never syncs.
+pub(crate) fn cleartext_gate(
+    host: &str,
+    credentialed: bool,
+    policy: CleartextPolicy,
+) -> anyhow::Result<()> {
+    if credentialed
+        && !host_is_local(host, policy.rfc1918_is_local)
+        && !policy.allow_remote_cleartext
+    {
+        bail!(
+            "refusing to send zebra RPC credentials in cleartext to the globally-routable \
+             host '{host}': the zebra connection is plaintext HTTP, so the Authorization \
+             header would cross the public internet in the clear. Point zecd at a loopback or \
+             private-network zebra (127.0.0.1/localhost, an RFC1918/container address), tunnel \
+             the RPC port over SSH/WireGuard and use the local end, or set `[backend] \
+             allow_remote_cleartext = true` if the hop is already secured."
+        );
+    }
+    Ok(())
+}
+
 /// Is `ip` in a private / non-globally-routable range (as opposed to loopback, handled by the
 /// caller, or a globally-routable public address)?
 fn ip_is_private_network(ip: std::net::IpAddr) -> bool {
@@ -271,19 +321,7 @@ impl ZebraClient {
             .parse()
             .with_context(|| format!("invalid zebra rpc address {host}:{port}"))?;
         let auth_header = auth.header()?;
-        if auth_header.is_some()
-            && !host_is_local(host, policy.rfc1918_is_local)
-            && !policy.allow_remote_cleartext
-        {
-            bail!(
-                "refusing to send zebra RPC credentials in cleartext to the globally-routable \
-                 host '{host}': the zebra connection is plaintext HTTP, so the Authorization \
-                 header would cross the public internet in the clear. Point zecd at a loopback or \
-                 private-network zebra (127.0.0.1/localhost, an RFC1918/container address), tunnel \
-                 the RPC port over SSH/WireGuard and use the local end, or set `[backend] \
-                 allow_remote_cleartext = true` if the hop is already secured."
-            );
-        }
+        cleartext_gate(host, auth_header.is_some(), policy)?;
         if !host_is_loopback(host) {
             tracing::warn!(
                 host,

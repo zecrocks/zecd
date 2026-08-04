@@ -54,12 +54,42 @@ impl Server {
         Ok(AnySource::Zebra(source))
     }
 
+    /// Run the connect-time checks that need no network, so a misconfiguration that would leave
+    /// the daemon retrying a connect it can never complete is reportable up front - this is what
+    /// `zecd config check` calls. [`connect_timeout`](Server::connect_timeout) reaches the same
+    /// verdicts through the same helpers, so the two cannot drift.
+    pub fn preflight(&self) -> anyhow::Result<()> {
+        self.zebra_auth.validate()?;
+        crate::chain::zebra::cleartext_gate(
+            &self.host,
+            self.zebra_auth.is_configured(),
+            self.cleartext_policy,
+        )
+    }
+
     /// Connect with a default dial timeout. Convenience for tests; production callers use
     /// [`connect_timeout`](Server::connect_timeout).
     #[cfg(test)]
     pub async fn connect(&self) -> anyhow::Result<AnySource> {
         self.connect_timeout(Duration::from_secs(30)).await
     }
+}
+
+/// Resolve `[backend] server` into an endpoint carrying every setting that applies to it -
+/// `[zebra]` credentials and the locality/cleartext policy. The daemon builds each wallet's
+/// endpoint this way, and `zecd config check` inspects the same value, so what the check reports
+/// is what the daemon would dial.
+pub fn resolve_configured(config: &crate::config::AppConfig) -> anyhow::Result<Server> {
+    let mut server = resolve(&config.backend.server, config.network)?;
+    apply_zebra_auth(&mut server, &config.zebra.auth());
+    apply_cleartext_policy(
+        &mut server,
+        CleartextPolicy {
+            rfc1918_is_local: config.backend.rfc1918_is_local,
+            allow_remote_cleartext: config.backend.allow_remote_cleartext,
+        },
+    );
+    Ok(server)
 }
 
 /// Attach zebrad RPC credentials (the `[zebra]` config section) to the resolved endpoint.

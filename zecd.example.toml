@@ -1,6 +1,12 @@
 # Example zecd configuration. Copy to <datadir>/zecd.toml (or pass --conf) and edit.
 # CLI flags (e.g. --rpcuser, --rpcport, --testnet, --datadir, --server) override these.
 #
+# Validate an edited config against the binary you are about to run, without starting it:
+#   zecd config check --conf <file>
+# It exits non-zero if that build would refuse the file (zecd rejects unknown keys, so a
+# config can be valid for one version and not another), and prints the settings it resolves
+# to - including every value left to a built-in default.
+#
 # For 12-factor / Kubernetes deployments, several secret inputs can come from the environment
 # or a mounted Secret file instead of this (ConfigMap-bound) TOML:
 #   ZECD_AGE_IDENTITY - path to the age identity (also --age-identity / [keys] age_identity)

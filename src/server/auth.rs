@@ -121,6 +121,36 @@ pub struct Authenticator {
     users: Vec<(String, PasswordHash)>,
 }
 
+/// Parse the salted `[rpc] auth` (`rpcauth`) entries into credentials. No side effects.
+fn parse_auth_entries(rpc: &RpcConfig) -> anyhow::Result<Vec<(String, PasswordHash)>> {
+    rpc.auth
+        .iter()
+        .map(|entry| {
+            let (user, pwhash) = entry
+                .split_once(':')
+                .ok_or_else(|| anyhow!("invalid rpcauth entry (expected user:salt$hash)"))?;
+            let pwhash = pwhash
+                .parse()
+                .with_context(|| format!("invalid rpcauth entry for user {user}"))?;
+            Ok((user.to_string(), pwhash))
+        })
+        .collect()
+}
+
+/// Reach [`Authenticator::from_config`]'s verdict *without* its side effect of minting and
+/// writing a cookie file. For `zecd config check`, which must never touch the datadir of a
+/// deployment it is only inspecting - a fresh cookie there would invalidate the credential a
+/// running daemon handed out.
+pub fn check_config(rpc: &RpcConfig) -> anyhow::Result<()> {
+    parse_auth_entries(rpc)?;
+    if (rpc.user.is_some() && rpc.password.is_some()) || rpc.cookiefile.is_some() {
+        return Ok(());
+    }
+    Err(anyhow!(
+        "no RPC auth configured: set [rpc] user+password, auth, or a cookiefile"
+    ))
+}
+
 impl Authenticator {
     /// Build from config. Accepted credentials are the union of every `[rpc] auth`
     /// (`rpcauth`) entry and the `rpcuser`/`rpcpassword` pair; when no pair is set, a
@@ -128,17 +158,7 @@ impl Authenticator {
     /// cookie file (mode 0600 on Unix) - also alongside `rpcauth` entries, as bitcoind
     /// does whenever `rpcpassword` is empty.
     pub fn from_config(rpc: &RpcConfig) -> anyhow::Result<Authenticator> {
-        let mut users = Vec::new();
-
-        for entry in &rpc.auth {
-            let (user, pwhash) = entry
-                .split_once(':')
-                .ok_or_else(|| anyhow!("invalid rpcauth entry (expected user:salt$hash)"))?;
-            let pwhash = pwhash
-                .parse()
-                .with_context(|| format!("invalid rpcauth entry for user {user}"))?;
-            users.push((user.to_string(), pwhash));
-        }
+        let mut users = parse_auth_entries(rpc)?;
 
         if let (Some(user), Some(password)) = (&rpc.user, &rpc.password) {
             users.push((user.clone(), PasswordHash::from_bare(password)));

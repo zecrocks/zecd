@@ -8,6 +8,7 @@ pub mod backend;
 pub mod backoff;
 pub mod chain;
 pub mod config;
+pub mod config_check;
 pub mod daemon;
 pub mod derive_address;
 pub mod error;

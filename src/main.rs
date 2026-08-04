@@ -2,7 +2,7 @@
 
 use clap::Parser;
 
-use zecd::config::{AppConfig, Cli, Command};
+use zecd::config::{AppConfig, Cli, Command, ConfigCommand};
 use zecd::daemon;
 
 // musl's default allocator contends under Orchard proving's multi-threaded allocation churn
@@ -31,6 +31,13 @@ async fn main() -> anyhow::Result<()> {
     // (no `zecd.toml`, or one whose placeholders `resolve` refuses on mainnet).
     if let Some(Command::ExampleConfig(args)) = &cli.command {
         return zecd::example_config::run(args);
+    }
+
+    // `config check` reports on the configuration - including a configuration `resolve` rejects,
+    // which is the case it exists for - so it must run *before* `resolve`, and without tracing
+    // (its report is the command's output; log lines would interleave with it).
+    if let Some(Command::Config(ConfigCommand::Check(args))) = &cli.command {
+        return zecd::config_check::run(&cli, args);
     }
 
     let config = AppConfig::resolve(&cli)?;

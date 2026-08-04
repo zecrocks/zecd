@@ -264,16 +264,31 @@ zecd diagnoses the two known causes and says so in the log:
 
 ## Upgrades
 
-1. `zecd stop` (or SIGINT) - graceful: in-flight requests finish, new ones get 503.
-2. Replace the binary / pull the new image.
-3. Start. Wallet DB migrations run automatically at open; the first start after a big
+1. Check the config against the **new** binary before anything else, while the old one is
+   still serving (the check is read-only and takes no datadir lock):
+
+   ```sh
+   ./zecd-new config check --conf /etc/zecd/zecd.toml
+   ```
+
+   zecd rejects unknown config keys, so a key the new build has not learned - or, on a
+   rollback, one it has dropped - fails startup. This catches that offline, exits non-zero if
+   the build would refuse the file, and prints the **effective** settings so you can diff the
+   old and new binaries' output and see which defaults moved. Add `--strict` to fail on the
+   warnings too.
+2. `zecd stop` (or SIGINT) - graceful: in-flight requests finish, new ones get 503.
+3. Replace the binary / pull the new image.
+4. Start. Wallet DB migrations run automatically at open; the first start after a big
    librustzcash bump can take longer.
 
 Downgrades across DB migrations are not supported - snapshot the datadir first if you
-need a rollback path (stop the daemon before copying).
+need a rollback path (stop the daemon before copying). Run the same `config check` with the
+older binary before rolling back to it.
 
 ## Mainnet checklist
 
+- [ ] `zecd config check --conf <file>` clean against the binary being deployed (it
+      resolves the file the way the daemon would and reports what it would refuse).
 - [ ] `network = "main"` and `[rpc] password` set to a real secret (the daemon refuses
       to start with the `CHANGE-ME` placeholder).
 - [ ] RPC bound to `127.0.0.1` or a private network; TLS/reverse proxy in front if it

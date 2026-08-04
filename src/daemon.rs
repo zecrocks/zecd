@@ -51,19 +51,9 @@ pub async fn run(config: AppConfig) -> anyhow::Result<()> {
     // would corrupt the wallet DB; this makes it refuse to start instead. See `crate::lock`.
     let _datadir_lock = crate::lock::lock_datadir(&config.datadir)?;
     // The example/deploy configs ship with a placeholder RPC password; on mainnet that is
-    // spend authority, so refuse to start until it has been changed.
-    if matches!(config.network, crate::network::ZNetwork::Main)
-        && config
-            .rpc
-            .password
-            .as_deref()
-            .is_some_and(|p| p.trim().eq_ignore_ascii_case("change-me"))
-    {
-        anyhow::bail!(
-            "[rpc] password is still the example placeholder \"CHANGE-ME\"; \
-             set a real password before running on mainnet"
-        );
-    }
+    // spend authority, so refuse to start until it has been changed. Shared with
+    // `zecd config check`, which reports the same refusal without starting anything.
+    config::reject_placeholder_password(&config)?;
     actor::install_panic_hook();
     let config = Arc::new(config);
     let auth = server::auth::Authenticator::from_config(&config.rpc)?;
@@ -120,15 +110,7 @@ pub async fn run(config: AppConfig) -> anyhow::Result<()> {
             );
             continue;
         }
-        let mut server = backend::resolve(&config.backend.server, config.network)?;
-        backend::apply_zebra_auth(&mut server, &config.zebra.auth());
-        backend::apply_cleartext_policy(
-            &mut server,
-            crate::chain::zebra::CleartextPolicy {
-                rfc1918_is_local: config.backend.rfc1918_is_local,
-                allow_remote_cleartext: config.backend.allow_remote_cleartext,
-            },
-        );
+        let server = backend::resolve_configured(&config)?;
         let actor_cfg = ActorConfig {
             name: name.clone(),
             network: config.network,
