@@ -1,9 +1,7 @@
 //! Black-box CLI acceptance tests: run the compiled `zecd` binary as a subprocess and
 //! assert exit codes and output, modeled on zallet's `tests/acceptance.rs`.
 //!
-//! Everything here is offline except the `#[ignore]`d init test, which follows the
-//! repo convention for tests that hit the public testnet lightwalletd
-//! (`cargo test -- --include-ignored`).
+//! Everything here is offline: no test contacts a chain upstream or a running daemon.
 
 use std::process::{Command, Output, Stdio};
 use std::time::{Duration, Instant};
@@ -714,6 +712,198 @@ fn help_lists_example_config_subcommand() {
         stdout.contains("example-config"),
         "help should list example-config: {stdout}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// config check
+// ---------------------------------------------------------------------------
+
+fn config_check(conf: &std::path::Path, extra: &[&str]) -> Output {
+    run_with_timeout(
+        {
+            let mut c = zecd();
+            c.args(["config", "check", "--conf", conf.to_str().unwrap()]);
+            c.args(extra);
+            c
+        },
+        Duration::from_secs(10),
+    )
+}
+
+fn stdout_of(out: &Output) -> String {
+    String::from_utf8_lossy(&out.stdout).into_owned()
+}
+
+/// The happy path: a config this build accepts exits 0 and reports the settings it resolves
+/// to - including the ones the file never mentions, which is what makes the command useful
+/// across an upgrade or a rollback (every unset key takes the *binary's* default).
+#[test]
+fn config_check_accepts_a_valid_config_and_prints_the_effective_settings() {
+    let dir = tempfile::tempdir().unwrap();
+    let conf = dir.path().join("zecd.toml");
+    std::fs::write(
+        &conf,
+        format!(
+            "network = \"test\"\ndatadir = {:?}\n[rpc]\nuser = \"u\"\npassword = \"p\"\n",
+            dir.path()
+        ),
+    )
+    .unwrap();
+
+    let out = config_check(&conf, &[]);
+    assert!(out.status.success(), "stderr: {}", stderr_of(&out));
+    let stdout = stdout_of(&out);
+    assert!(stdout.contains("OK:"), "{stdout}");
+    // Resolved from the file...
+    assert!(
+        stdout.contains("network") && stdout.contains("test"),
+        "{stdout}"
+    );
+    // ...and defaulted by this binary.
+    assert!(stdout.contains("AllowRevealedRecipients"), "{stdout}");
+    assert!(stdout.contains("zebra-rpc 127.0.0.1:18234"), "{stdout}");
+}
+
+/// The reason the command exists: an unknown key is rejected by `resolve`, and `config check`
+/// has to report that rather than inherit it (it runs *before* `resolve` in `main`, like
+/// `example-config`). The message must name the offending key, not just fail.
+#[test]
+fn config_check_rejects_an_unknown_key_and_names_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let conf = dir.path().join("zecd.toml");
+    std::fs::write(&conf, "[rpc]\nbogus_field = 1\n").unwrap();
+
+    let out = config_check(&conf, &[]);
+    assert_eq!(out.status.code(), Some(1), "stderr: {}", stderr_of(&out));
+    let stdout = stdout_of(&out);
+    assert!(stdout.contains("bogus_field"), "{stdout}");
+    assert!(
+        stdout.contains("error:"),
+        "the report classifies the finding: {stdout}"
+    );
+}
+
+/// Checking a file that isn't there is a typo'd path, not a request to validate the built-in
+/// defaults - so it fails, and says which path it looked at.
+#[test]
+fn config_check_refuses_a_missing_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let conf = dir.path().join("does-not-exist.toml");
+
+    let out = config_check(&conf, &[]);
+    assert_eq!(out.status.code(), Some(1));
+    assert!(
+        stderr_of(&out).contains("no config file at"),
+        "stderr: {}",
+        stderr_of(&out)
+    );
+}
+
+/// `--strict` turns warnings into a non-zero exit (a CI gate on a deployment repository),
+/// while the same config passes without it.
+#[test]
+fn config_check_strict_fails_on_warnings_alone() {
+    let dir = tempfile::tempdir().unwrap();
+    let conf = dir.path().join("zecd.toml");
+    // No wallet is initialized in this datadir, which is a warning and nothing more.
+    std::fs::write(
+        &conf,
+        format!(
+            "network = \"test\"\ndatadir = {:?}\n[rpc]\nuser = \"u\"\npassword = \"p\"\n",
+            dir.path()
+        ),
+    )
+    .unwrap();
+
+    assert!(config_check(&conf, &[]).status.success());
+    let out = config_check(&conf, &["--strict"]);
+    assert_eq!(out.status.code(), Some(1), "stdout: {}", stdout_of(&out));
+    assert!(
+        stderr_of(&out).contains("--strict"),
+        "stderr: {}",
+        stderr_of(&out)
+    );
+}
+
+/// The check must leave the datadir exactly as it found it. The cookie file is the one thing
+/// that would otherwise be written - `Authenticator::from_config` mints one as a side effect -
+/// and doing so against a live deployment would invalidate the credential its daemon handed out.
+#[test]
+fn config_check_writes_nothing_to_the_datadir() {
+    let dir = tempfile::tempdir().unwrap();
+    let datadir = dir.path().join("data");
+    std::fs::create_dir(&datadir).unwrap();
+    let conf = dir.path().join("zecd.toml");
+    // No user/password, so this config authenticates by cookie.
+    std::fs::write(
+        &conf,
+        format!("network = \"test\"\ndatadir = {datadir:?}\n"),
+    )
+    .unwrap();
+
+    let out = config_check(&conf, &[]);
+    assert!(out.status.success(), "stderr: {}", stderr_of(&out));
+    let entries: Vec<_> = std::fs::read_dir(&datadir).unwrap().collect();
+    assert!(
+        entries.is_empty(),
+        "config check must not create files (found {} entries, e.g. a .cookie or .lock)",
+        entries.len()
+    );
+}
+
+/// `config check` is read-only, so - unlike `init`/`rescan` and like `export-ufvk` - it must
+/// stay usable while a daemon holds the datadir lock. Checking the config of a running
+/// deployment is the main thing an operator does before an upgrade.
+#[test]
+fn config_check_is_not_blocked_by_the_datadir_lock() {
+    let dir = tempfile::tempdir().unwrap();
+    let _held = zecd::lock::lock_datadir(dir.path()).expect("acquire the datadir lock");
+    let conf = dir.path().join("zecd.toml");
+    std::fs::write(
+        &conf,
+        format!(
+            "network = \"test\"\ndatadir = {:?}\n[rpc]\nuser = \"u\"\npassword = \"p\"\n",
+            dir.path()
+        ),
+    )
+    .unwrap();
+
+    let out = config_check(&conf, &[]);
+    assert!(out.status.success(), "stderr: {}", stderr_of(&out));
+}
+
+/// The global flags are accepted on both sides of the subcommand, and mean the same thing
+/// either way - `zecd config check --conf FILE` is the spelling this command is reached for.
+#[test]
+fn config_check_accepts_global_flags_after_the_subcommand() {
+    let dir = tempfile::tempdir().unwrap();
+    let conf = dir.path().join("zecd.toml");
+    std::fs::write(&conf, "network = \"test\"\n").unwrap();
+    let conf_str = conf.to_str().unwrap().to_owned();
+
+    // `--network main` after the subcommand must override the file's `network = "test"`.
+    let out = run_with_timeout(
+        {
+            let mut c = zecd();
+            c.args(["config", "check", "--conf", &conf_str, "--network", "main"]);
+            c
+        },
+        Duration::from_secs(10),
+    );
+    assert!(out.status.success(), "stderr: {}", stderr_of(&out));
+    assert!(stdout_of(&out).contains("main"), "{}", stdout_of(&out));
+
+    // ...and before it, the historical position, identically.
+    let out = run_with_timeout(
+        {
+            let mut c = zecd();
+            c.args(["--conf", &conf_str, "--network", "main", "config", "check"]);
+            c
+        },
+        Duration::from_secs(10),
+    );
+    assert!(out.status.success(), "stderr: {}", stderr_of(&out));
+    assert!(stdout_of(&out).contains("main"), "{}", stdout_of(&out));
 }
 
 /// The committed testnet development mnemonic (valueless TAZ only), used here as
