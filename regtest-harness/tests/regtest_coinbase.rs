@@ -90,26 +90,45 @@ async fn sync_to_tip(zecd: &Zecd, zebrad: &Zebrad) {
 }
 
 /// Drive a `z_shieldcoinbase`-style opid to completion and return the txid.
+///
+/// This is the poll-sleep-check loop `z_waitforoperation` exists to delete: one blocking call
+/// replaces it, and the result is then reaped so the registry doesn't retain it (the wait is
+/// deliberately non-destructive). Doubles as this tier's live coverage of the RPC.
 async fn await_op_txid(zecd: &Zecd, opid: &str) -> String {
-    let deadline = Instant::now() + OP_TIMEOUT;
-    loop {
-        let res = zecd
-            .call("z_getoperationresult", json!([[opid]]))
-            .await
-            .expect("z_getoperationresult");
-        if let Some(entry) = res.as_array().and_then(|a| a.first()) {
-            assert_eq!(
-                entry["status"], "success",
-                "operation {opid} did not succeed: {entry}"
-            );
-            return entry["result"]["txid"]
-                .as_str()
-                .expect("op result txid")
-                .to_string();
-        }
-        assert!(Instant::now() < deadline, "operation {opid} never finished");
-        tokio::time::sleep(Duration::from_millis(500)).await;
-    }
+    let waited = zecd
+        .call(
+            "z_waitforoperation",
+            json!([opid, OP_TIMEOUT.as_secs() as i64]),
+        )
+        .await
+        .expect("z_waitforoperation");
+    // `finished` distinguishes "the operation ended" from "the wait timed out" - both come back
+    // as a successful call, so assert it separately or a slow op reads as a failed one.
+    assert_eq!(
+        waited["finished"], true,
+        "waiting on {opid} timed out rather than observing it finish: {waited}"
+    );
+    assert_eq!(
+        waited["status"], "success",
+        "operation {opid} did not succeed: {waited}"
+    );
+    let txid = waited["result"]["txid"]
+        .as_str()
+        .expect("op result txid")
+        .to_string();
+
+    // The wait left the operation in place, so the reap still finds it exactly once.
+    let reaped = zecd
+        .call("z_getoperationresult", json!([[opid]]))
+        .await
+        .expect("z_getoperationresult");
+    assert_eq!(
+        reaped.as_array().and_then(|a| a.first()).map(|e| &e["id"]),
+        Some(&json!(opid)),
+        "the non-destructive wait must leave the result for z_getoperationresult: {reaped}"
+    );
+
+    txid
 }
 
 /// getbalance as float ZEC (fine for assertions against exact zatoshi-derived sums).

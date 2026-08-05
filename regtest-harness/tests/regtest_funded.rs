@@ -891,41 +891,70 @@ async fn regtest_funded_orchard_receive() {
         "new opid appears in z_listoperationids: {ids}"
     );
 
-    // Poll z_getoperationstatus until the background send finishes (60s budget covers a debug
-    // build's slow proving); a failed operation fails the test.
-    let mut op_txid = None;
-    for _ in 0..120 {
-        let st = zecd
-            .call("z_getoperationstatus", json!([[opid]]))
-            .await
-            .expect("z_getoperationstatus");
-        let obj = st
-            .as_array()
-            .expect("status array")
-            .first()
-            .expect("our operation is present")
-            .clone();
-        assert_eq!(obj["id"], json!(opid), "status carries our opid: {obj}");
-        match obj["status"].as_str().expect("status string") {
-            "success" => {
-                assert!(
-                    !obj["execution_secs"].is_null(),
-                    "a successful op reports execution_secs: {obj}"
-                );
-                op_txid = Some(
-                    obj["result"]["txid"]
-                        .as_str()
-                        .expect("a successful op carries result.txid")
-                        .to_string(),
-                );
-                break;
-            }
-            "failed" => panic!("z_sendmany operation failed: {obj}"),
-            _ => tokio::time::sleep(Duration::from_millis(500)).await,
-        }
-    }
-    let op_txid = op_txid.expect("z_sendmany operation reached success");
+    // z_waitforoperation with timeout 0 is the non-blocking single-operation read: it returns
+    // the current status object right away, whatever state the send is in.
+    let now = zecd
+        .call("z_waitforoperation", json!([opid, 0]))
+        .await
+        .expect("z_waitforoperation with timeout 0");
+    assert_eq!(now["id"], json!(opid), "the status carries our opid: {now}");
+    assert!(
+        matches!(
+            now["status"].as_str(),
+            Some("queued" | "executing" | "success" | "failed")
+        ),
+        "timeout 0 returns a status object rather than blocking: {now}"
+    );
+    assert!(
+        now["finished"].is_boolean(),
+        "every wait states outright whether the operation finished: {now}"
+    );
+
+    // Block until the background send finishes - one call in place of the poll-sleep loop every
+    // client used to write. The 120s budget covers a debug build's slow proving. `finished`
+    // separates "the operation ended" from "the wait gave up", so a timeout here fails the test
+    // as a timeout rather than being mistaken for a failed send (both are non-errors on the RPC).
+    let obj = zecd
+        .call("z_waitforoperation", json!([opid, 120]))
+        .await
+        .expect("z_waitforoperation");
+    assert_eq!(obj["id"], json!(opid), "status carries our opid: {obj}");
+    assert_eq!(
+        obj["finished"],
+        json!(true),
+        "the wait must observe the send end, not time out: {obj}"
+    );
+    assert_eq!(
+        obj["status"],
+        json!("success"),
+        "the async send must finish successfully within the wait: {obj}"
+    );
+    assert!(
+        !obj["execution_secs"].is_null(),
+        "a successful op reports execution_secs: {obj}"
+    );
+    let op_txid = obj["result"]["txid"]
+        .as_str()
+        .expect("a successful op carries result.txid")
+        .to_string();
     assert_eq!(op_txid.len(), 64, "operation result txid is display hex");
+
+    // The wait is non-destructive: z_getoperationstatus still sees the finished operation, and
+    // waiting again returns the same terminal status immediately.
+    let st = zecd
+        .call("z_getoperationstatus", json!([[opid]]))
+        .await
+        .expect("z_getoperationstatus after the wait");
+    assert_eq!(
+        st.as_array().expect("status array").len(),
+        1,
+        "z_waitforoperation must not reap the operation: {st}"
+    );
+    let again = zecd
+        .call("z_waitforoperation", json!([opid]))
+        .await
+        .expect("z_waitforoperation is repeatable");
+    assert_eq!(again["result"]["txid"], json!(op_txid));
 
     // z_getoperationresult returns the finished op exactly once and removes it from memory.
     let res = zecd
@@ -943,6 +972,14 @@ async fn regtest_funded_orchard_receive() {
         after.as_array().expect("array").is_empty(),
         "operation removed after z_getoperationresult: {after}"
     );
+    // Once reaped there is nothing to wait for, so z_waitforoperation says so (-8) instead of
+    // blocking for the whole timeout - the one place it deviates from z_getoperationstatus's
+    // silent omission.
+    let err = zecd
+        .call("z_waitforoperation", json!([opid, 120]))
+        .await
+        .expect_err("waiting on a reaped operation must fail fast");
+    assert_eq!(err.code(), Some(-8), "reaped opid -> -8: {err}");
 
     mine_until_confirmed(&zebrad, &zecd, &op_txid, "z_sendmany async operation").await;
 

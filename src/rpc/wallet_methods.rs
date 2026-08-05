@@ -2061,6 +2061,141 @@ pub(crate) fn z_getoperationresult(
     serde_json::to_value(statuses).map_err(|e| RpcError::misc(e.to_string()))
 }
 
+/// How long `z_waitforoperation` blocks when the caller doesn't say. Generous enough to cover a
+/// shielded send end to end (catch-up sync + proving + broadcast) on a release build, short
+/// enough that a client which forgets its own timeout still gets an answer.
+const DEFAULT_WAIT_OPERATION_TIMEOUT_SECS: i64 = 120;
+
+/// Hard ceiling on a `z_waitforoperation` wait. A blocking call holds one of the server's
+/// work-queue permits (`[rpc] work_queue`) for its whole duration, so an unbounded wait would let
+/// a handful of clients starve the queue into 503s. Larger requested timeouts are clamped, not
+/// rejected (Bitcoin Core's `walletpassphrase` treats its own cap the same way).
+const MAX_WAIT_OPERATION_TIMEOUT_SECS: i64 = 3600;
+
+/// `z_waitforoperation "opid" ( timeout )` - block until an async operation
+/// (`z_sendmany`/`z_shieldcoinbase`) finishes, then return its status object: the same shape
+/// `z_getoperationstatus` returns per operation, **plus a `finished` boolean**, so it is a
+/// drop-in for the poll-sleep loop every client otherwise writes by hand. A **zecd extension** -
+/// zcashd has no such RPC.
+///
+/// `timeout` is in seconds (default [`DEFAULT_WAIT_OPERATION_TIMEOUT_SECS`], clamped to
+/// [`MAX_WAIT_OPERATION_TIMEOUT_SECS`]); `0` returns the current status immediately, which is the
+/// single-operation, non-destructive read `z_getoperationstatus` only offers as an array.
+///
+/// ## Reading the outcome
+///
+/// There are exactly four, and `finished` + `status` name them without the caller having to know
+/// which status strings are terminal:
+///
+/// | `finished` | `status` | meaning |
+/// |---|---|---|
+/// | `true` | `success` | the operation completed; `result` holds it (e.g. `{"txid": ...}`) |
+/// | `true` | `failed` | the operation ran and failed; `error` holds the `{code, message}` - a send's `-6`/`-4`/`-25` surfaces *here*, not as an error on this call |
+/// | `true` | `cancelled` | the operation was cancelled before it ran |
+/// | `false` | `queued` / `executing` | **the wait gave up** - the timeout elapsed (or the daemon began shutting down) while the operation was still running. Nothing is wrong with the operation; call again to keep waiting |
+///
+/// **Timing out is therefore not an error**, mirroring Bitcoin Core's `waitforblock` family and
+/// the last iteration of the loop this replaces: the caller gets one shape and branches on
+/// `finished`, rather than having to handle a second failure path just to learn "not yet".
+///
+/// ## Errors (none of which mean "the operation failed")
+///
+/// - `-1` no `opid` argument, or more positional arguments than the method takes.
+/// - `-3` `opid` present but not a string (it takes one bare id, not the tracking trio's array).
+/// - `-8` malformed `opid`; negative or non-integer `timeout`; or an `opid` this wallet has no
+///   operation for - never issued, owned by another wallet, or already reaped. That last case
+///   is deliberately *not* `z_getoperationstatus`'s silent omission: there is nothing to wait
+///   for, and reporting "not finished" would block the caller for the whole timeout on what is
+///   really a client bug.
+/// - `-18` the `/wallet/<name>` route names a wallet that is not loaded.
+///
+/// The wait is **non-destructive**: the operation stays in the registry, exactly as if it had
+/// been polled. `z_getoperationresult` remains the one destructive reader, so a client can wait
+/// and then reap, or wait twice.
+pub(crate) async fn z_waitforoperation(
+    state: &AppState,
+    wallet: Option<&str>,
+    req: &RpcRequest,
+) -> Result<Value, RpcError> {
+    let wallet_name = state.registry.get(wallet)?.name.clone();
+
+    // opid (arg 0): required; a malformed id is -8 (same as the tracking trio's array elements).
+    let opid: OperationId = req
+        .require_str(0, "z_waitforoperation requires an operation id")?
+        .parse()?;
+
+    let timeout_secs = wait_timeout_secs(req, 1)?;
+
+    // The signal carries its *current* value, so an operation that finished before this call
+    // (or between the lookup and the await) resolves immediately - there is no lost-wakeup
+    // window, and no need to pre-check the status. See `OperationRegistry::subscribe`.
+    let mut finished = state
+        .operations
+        .subscribe(&wallet_name, &opid)
+        .ok_or_else(|| wait_unknown_operation(&opid))?;
+
+    if timeout_secs > 0 {
+        let wait = tokio::time::timeout(
+            std::time::Duration::from_secs(timeout_secs as u64),
+            finished.wait_for(|done| *done),
+        );
+        tokio::select! {
+            // Both arms are "stop waiting"; the status re-read below reports which happened.
+            _ = wait => {}
+            _ = state.shutdown_signal() => {}
+        }
+    }
+
+    let status = state
+        .operations
+        .status_of(&wallet_name, &opid)
+        .ok_or_else(|| wait_unknown_operation(&opid))?;
+
+    // `finished` is the answer to "did the wait observe the operation end, or did it give up?",
+    // stated outright so a caller never has to know which `status` strings are terminal. It is
+    // `false` exactly when the wait hit its timeout (or the daemon began shutting down) while
+    // the operation was still queued/executing; `true` covers success, failure, and
+    // cancellation alike, with `status` distinguishing those three.
+    let finished = status.is_finished();
+    let mut value = serde_json::to_value(status).map_err(|e| RpcError::misc(e.to_string()))?;
+    value
+        .as_object_mut()
+        .expect("an operation status serializes to a JSON object")
+        .insert("finished".to_string(), json!(finished));
+    Ok(value)
+}
+
+/// Parse `z_waitforoperation`'s optional `timeout` (seconds) at positional index `i`: absent or
+/// null is [`DEFAULT_WAIT_OPERATION_TIMEOUT_SECS`], a negative value is `-8`, a non-integer is
+/// `-8`, and anything above [`MAX_WAIT_OPERATION_TIMEOUT_SECS`] is clamped rather than rejected.
+fn wait_timeout_secs(req: &RpcRequest, i: usize) -> Result<i64, RpcError> {
+    match req.param(i) {
+        None | Some(Value::Null) => Ok(DEFAULT_WAIT_OPERATION_TIMEOUT_SECS),
+        Some(v) => {
+            let n = v.as_i64().ok_or_else(|| {
+                RpcError::invalid_parameter(
+                    "Invalid parameter, timeout must be an integer number of seconds",
+                )
+            })?;
+            if n < 0 {
+                return Err(RpcError::invalid_parameter("Timeout cannot be negative."));
+            }
+            Ok(n.min(MAX_WAIT_OPERATION_TIMEOUT_SECS))
+        }
+    }
+}
+
+/// The `-8` `z_waitforoperation` returns for an id this wallet has no operation for. Shared by
+/// the pre-wait lookup and the post-wait re-read, which can also miss if a concurrent
+/// `z_getoperationresult` reaped the operation while this call was blocked on it.
+fn wait_unknown_operation(opid: &OperationId) -> RpcError {
+    RpcError::invalid_parameter(format!(
+        "No operation exists for id {}. It may never have existed, may belong to another \
+         wallet, or may already have been returned by z_getoperationresult.",
+        opid.as_str()
+    ))
+}
+
 /// `z_listoperationids (["status"])` - the opid strings of the wallet's operations, optionally
 /// filtered by status string (`queued`/`executing`/`success`/`failed`/`cancelled`); an
 /// unrecognized filter returns an empty list.
@@ -2331,6 +2466,44 @@ mod tests {
         for bad in [json!(["not-an-opid"]), json!([123]), json!("notarray")] {
             let err = parse_opid_filter(&req(vec![bad]), 0).unwrap_err();
             assert_eq!(err.code, codes::RPC_INVALID_PARAMETER);
+        }
+    }
+
+    #[test]
+    fn wait_timeout_parses_defaults_clamps_and_rejects() {
+        use crate::error::codes;
+        let req = |params: Vec<Value>| RpcRequest {
+            id: Value::Null,
+            method: "z_waitforoperation".into(),
+            params,
+        };
+        // Absent or null takes the default; an explicit value is honored, including 0 (which
+        // means "return the current status without blocking").
+        assert_eq!(
+            wait_timeout_secs(&req(vec![json!("opid-x")]), 1).unwrap(),
+            DEFAULT_WAIT_OPERATION_TIMEOUT_SECS
+        );
+        assert_eq!(
+            wait_timeout_secs(&req(vec![json!("opid-x"), Value::Null]), 1).unwrap(),
+            DEFAULT_WAIT_OPERATION_TIMEOUT_SECS
+        );
+        assert_eq!(
+            wait_timeout_secs(&req(vec![json!("opid-x"), json!(0)]), 1).unwrap(),
+            0
+        );
+        assert_eq!(
+            wait_timeout_secs(&req(vec![json!("opid-x"), json!(5)]), 1).unwrap(),
+            5
+        );
+        // Past the ceiling it clamps (a blocking call holds a work-queue permit), never errors.
+        assert_eq!(
+            wait_timeout_secs(&req(vec![json!("opid-x"), json!(i64::MAX)]), 1).unwrap(),
+            MAX_WAIT_OPERATION_TIMEOUT_SECS
+        );
+        // A negative or non-integer timeout is -8.
+        for bad in [json!(-1), json!("soon"), json!(1.5), json!([30])] {
+            let err = wait_timeout_secs(&req(vec![json!("opid-x"), bad.clone()]), 1).unwrap_err();
+            assert_eq!(err.code, codes::RPC_INVALID_PARAMETER, "{bad}");
         }
     }
 

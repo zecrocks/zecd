@@ -39,6 +39,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Serialize, Serializer};
 use serde_json::Value;
+use tokio::sync::watch;
 use uuid::Uuid;
 
 use crate::error::RpcError;
@@ -109,7 +110,7 @@ impl OperationState {
     }
 
     /// A finished operation: eligible for `z_getoperationresult` reaping and cap eviction.
-    fn is_finished(self) -> bool {
+    pub fn is_finished(self) -> bool {
         matches!(self, Self::Cancelled | Self::Failed | Self::Success)
     }
 }
@@ -146,6 +147,14 @@ pub struct AsyncOperation {
     context: Option<ContextInfo>,
     creation_time: SystemTime,
     data: Arc<Mutex<OperationData>>,
+    /// Flips from `false` to `true` once the operation reaches a terminal state, so a waiter
+    /// (`z_waitforoperation`) can block instead of polling. A `watch` channel - not `Notify` -
+    /// so a waiter that subscribes *after* the operation already finished still resolves
+    /// immediately (`wait_for` inspects the current value first), exactly as for the daemon's
+    /// shutdown signal. Held as an `Arc` so the background task can flip it while the registry
+    /// entry owns the channel; the value is authoritative only as "is this finished", the
+    /// status object itself is always re-read from `data`.
+    finished_tx: Arc<watch::Sender<bool>>,
 }
 
 impl AsyncOperation {
@@ -164,13 +173,19 @@ impl AsyncOperation {
             result: None,
         }));
 
+        let (finished_tx, _) = watch::channel(false);
+        let finished_tx = Arc::new(finished_tx);
+
         let handle = data.clone();
+        let done = finished_tx.clone();
         tokio::spawn(async move {
             // Transition to Executing. The guard is dropped before `.await` below (a
             // `std::sync::MutexGuard` is `!Send`), keeping the spawned future `Send`.
             {
                 let mut d = handle.lock().expect("operation lock poisoned");
                 if matches!(d.state, OperationState::Cancelled) {
+                    // Cancelled before it ever ran: still terminal, so wake any waiter.
+                    done.send_replace(true);
                     return;
                 }
                 d.state = OperationState::Executing;
@@ -186,14 +201,19 @@ impl AsyncOperation {
                     .expect("async return values should be serializable to JSON")
             });
 
-            let mut d = handle.lock().expect("operation lock poisoned");
-            d.state = if res.is_ok() {
-                OperationState::Success
-            } else {
-                OperationState::Failed
-            };
-            d.end_time = Some(end_time);
-            d.result = Some(res);
+            {
+                let mut d = handle.lock().expect("operation lock poisoned");
+                d.state = if res.is_ok() {
+                    OperationState::Success
+                } else {
+                    OperationState::Failed
+                };
+                d.end_time = Some(end_time);
+                d.result = Some(res);
+            }
+            // Publish *after* the state and result are visible, so a woken waiter that re-reads
+            // the status never sees "finished" without its result.
+            done.send_replace(true);
         });
 
         Self {
@@ -201,6 +221,7 @@ impl AsyncOperation {
             context,
             creation_time,
             data,
+            finished_tx,
         }
     }
 
@@ -210,6 +231,11 @@ impl AsyncOperation {
 
     fn state(&self) -> OperationState {
         self.data.lock().expect("operation lock poisoned").state
+    }
+
+    /// A receiver that resolves (`true`) once this operation reaches a terminal state.
+    fn finished_signal(&self) -> watch::Receiver<bool> {
+        self.finished_tx.subscribe()
     }
 
     /// Build the current status object (the JSON element returned by `z_getoperationstatus`).
@@ -284,6 +310,15 @@ pub struct OperationStatus {
     /// Wall-clock execution time of a successful operation, in seconds.
     #[serde(skip_serializing_if = "Option::is_none")]
     execution_secs: Option<u64>,
+}
+
+impl OperationStatus {
+    /// Whether this operation has reached a terminal state (success/failed/cancelled). Lets
+    /// `z_waitforoperation` report the outcome of the wait itself without its caller having to
+    /// know which `status` strings are terminal.
+    pub fn is_finished(&self) -> bool {
+        self.status.is_finished()
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -382,6 +417,31 @@ impl OperationRegistry {
     pub fn status(&self, wallet: &str, ids: Option<&[OperationId]>) -> Vec<OperationStatus> {
         let map = self.inner.lock().expect("operation registry poisoned");
         Self::collect(&map, wallet, ids, |_| true)
+    }
+
+    /// The status object for exactly one of this wallet's operations, or `None` when the id is
+    /// unknown to it (never existed, belongs to another wallet, or was already reaped/evicted).
+    /// Non-destructive.
+    pub fn status_of(&self, wallet: &str, id: &OperationId) -> Option<OperationStatus> {
+        let map = self.inner.lock().expect("operation registry poisoned");
+        map.get(id)
+            .filter(|e| e.wallet == wallet)
+            .map(|e| e.op.to_status())
+    }
+
+    /// A signal that resolves once one of this wallet's operations finishes, for a caller that
+    /// wants to block rather than poll (`z_waitforoperation`). `None` when the id is unknown to
+    /// this wallet, same as [`Self::status_of`].
+    ///
+    /// The receiver is cloned out from under the registry lock and awaited without it, so a
+    /// waiter never blocks another operation from being launched, finishing, or reaped. It
+    /// carries no result: the caller re-reads the status with [`Self::status_of`] once woken,
+    /// which is what keeps the wait non-destructive (`z_getoperationresult` still owns reaping).
+    pub fn subscribe(&self, wallet: &str, id: &OperationId) -> Option<watch::Receiver<bool>> {
+        let map = self.inner.lock().expect("operation registry poisoned");
+        map.get(id)
+            .filter(|e| e.wallet == wallet)
+            .map(|e| e.op.finished_signal())
     }
 
     /// Finished operations (success/failed/cancelled) for this wallet, returned as status
@@ -501,6 +561,7 @@ mod tests {
                     end_time: Some(now),
                     result: Some(result),
                 })),
+                finished_tx: Arc::new(watch::channel(true).0),
             }
         }
 
@@ -518,6 +579,7 @@ mod tests {
                     end_time: None,
                     result: None,
                 })),
+                finished_tx: Arc::new(watch::channel(false).0),
             }
         }
     }
@@ -678,6 +740,80 @@ mod tests {
         assert!(reg
             .try_insert("w", None, std::future::pending::<Result<Value, RpcError>>())
             .is_ok());
+    }
+
+    #[test]
+    fn status_of_is_wallet_scoped_and_non_destructive() {
+        let reg = OperationRegistry::new();
+        let opid = reg.insert(
+            "w",
+            AsyncOperation::finished(None, Ok(json!({"txid": "ab"}))),
+        );
+        let id: OperationId = opid.parse().unwrap();
+
+        // Reading one operation by id returns it, repeatedly (nothing is consumed).
+        for _ in 0..2 {
+            let st = reg.status_of("w", &id).expect("the wallet's own operation");
+            assert_eq!(st.id, opid);
+            assert_eq!(st.result, Some(json!({"txid": "ab"})));
+        }
+        // Another wallet cannot read it, and an unknown id is None rather than a panic.
+        assert!(reg.status_of("other", &id).is_none());
+        assert!(reg.status_of("w", &OperationId::new()).is_none());
+
+        // Reaping it makes it unreadable, which is what the wait RPC reports as "no such op".
+        assert_eq!(reg.take_results("w", None).len(), 1);
+        assert!(reg.status_of("w", &id).is_none());
+        assert!(reg.subscribe("w", &id).is_none());
+    }
+
+    #[tokio::test]
+    async fn subscribe_resolves_for_an_operation_that_already_finished() {
+        let reg = OperationRegistry::new();
+        let opid = reg.insert("w", AsyncOperation::finished(None, Ok(json!(1))));
+        let id: OperationId = opid.parse().unwrap();
+
+        // Subscribing after the fact must not hang: the channel carries the current value, so
+        // `wait_for` returns immediately. This is why the signal is a `watch`, not a `Notify`.
+        let mut rx = reg
+            .subscribe("w", &id)
+            .expect("a signal for a known operation");
+        rx.wait_for(|done| *done).await.expect("already finished");
+
+        // Wrong wallet gets no signal at all (isolation, same as every other tracking RPC).
+        assert!(reg.subscribe("other", &id).is_none());
+    }
+
+    #[tokio::test]
+    async fn subscribe_wakes_when_a_spawned_operation_finishes() {
+        let reg = OperationRegistry::new();
+        let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+        let opid = reg
+            .try_insert("w", None, async move {
+                let _ = rx.await;
+                Ok::<Value, RpcError>(json!({ "txid": "cd" }))
+            })
+            .expect("insert");
+        let id: OperationId = opid.parse().unwrap();
+
+        let mut signal = reg.subscribe("w", &id).expect("signal");
+        // Not finished yet: the signal is still false while the operation is in flight.
+        assert!(!*signal.borrow_and_update());
+
+        tx.send(()).expect("release the operation");
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            signal.wait_for(|done| *done),
+        )
+        .await
+        .expect("the waiter is woken within the deadline")
+        .expect("the signal channel stays open");
+
+        // The result is visible to the waiter the moment it is woken - the task publishes the
+        // signal only after writing the state and result.
+        let st = reg.status_of("w", &id).expect("status");
+        assert_eq!(st.status.as_str(), "success");
+        assert_eq!(st.result, Some(json!({ "txid": "cd" })));
     }
 
     /// Bounded-poll a real spawned operation to a terminal state.

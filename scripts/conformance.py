@@ -854,6 +854,47 @@ def main() -> int:
        rpc.call("z_getoperationstatus", [_unknown_opid]) == [])
     ck("z_getoperationresult unknown opid omitted",
        rpc.call("z_getoperationresult", [_unknown_opid]) == [])
+    # z_waitforoperation is zecd's blocking alternative to the poll loop: it takes ONE opid (not
+    # an array) plus an optional timeout in seconds. Unlike the tracking trio it rejects an
+    # unknown opid rather than omitting it - there would be nothing to wait for, so blocking for
+    # the full timeout would just hide a client bug. None of these checks ever blocks: they all
+    # fail argument validation, or name an operation that does not exist.
+    try:
+        rpc.call("z_waitforoperation")
+        ck("z_waitforoperation no args raises", False)
+    except JSONRPCException as e:
+        ck("z_waitforoperation no args -> code -1", e.code == -1, e.code)
+    try:
+        rpc.call("z_waitforoperation", "not-an-opid")
+        ck("z_waitforoperation bad opid raises", False)
+    except JSONRPCException as e:
+        ck("z_waitforoperation bad opid -> code -8", e.code == -8, e.code)
+    try:
+        # It takes a bare opid, not the trio's array - a present-but-non-string arg is Core's -3.
+        rpc.call("z_waitforoperation", [_unknown_opid])
+        ck("z_waitforoperation array opid raises", False)
+    except JSONRPCException as e:
+        ck("z_waitforoperation array opid -> code -3", e.code == -3, e.code)
+    try:
+        rpc.call("z_waitforoperation", _unknown_opid)
+        ck("z_waitforoperation unknown opid raises", False)
+    except JSONRPCException as e:
+        ck("z_waitforoperation unknown opid -> code -8", e.code == -8, e.code)
+    try:
+        rpc.call("z_waitforoperation", _unknown_opid, -1)
+        ck("z_waitforoperation negative timeout raises", False)
+    except JSONRPCException as e:
+        ck("z_waitforoperation negative timeout -> code -8", e.code == -8, e.code)
+    try:
+        rpc.call("z_waitforoperation", _unknown_opid, "soon")
+        ck("z_waitforoperation non-integer timeout raises", False)
+    except JSONRPCException as e:
+        ck("z_waitforoperation non-integer timeout -> code -8", e.code == -8, e.code)
+    try:
+        rpc.call("z_waitforoperation", _unknown_opid, 0, "extra")
+        ck("z_waitforoperation extra arg raises", False)
+    except JSONRPCException as e:
+        ck("z_waitforoperation extra arg -> code -1", e.code == -1, e.code)
     try:
         rpc.call("getrawtransaction", "00" * 32)
         ck("getrawtransaction unknown raises", False)

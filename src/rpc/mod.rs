@@ -71,6 +71,7 @@ pub const ALL_METHODS: &[&str] = &[
     "z_getoperationstatus",
     "z_getoperationresult",
     "z_listoperationids",
+    "z_waitforoperation",
     // Wallet - address derivation (zcashd-style)
     "z_getaddressforaccount",
 ];
@@ -143,6 +144,7 @@ const MAX_POSITIONAL_ARGS: &[(&str, usize)] = &[
     ("z_getoperationstatus", 1),
     ("z_getoperationresult", 1),
     ("z_listoperationids", 1),
+    ("z_waitforoperation", 2),
     // Wallet - address derivation (zcashd-style)
     ("z_getaddressforaccount", 3),
 ];
@@ -263,6 +265,7 @@ async fn dispatch_zecd(
         "z_getoperationstatus" => wallet_methods::z_getoperationstatus(state, wallet, req),
         "z_getoperationresult" => wallet_methods::z_getoperationresult(state, wallet, req),
         "z_listoperationids" => wallet_methods::z_listoperationids(state, wallet, req),
+        "z_waitforoperation" => wallet_methods::z_waitforoperation(state, wallet, req).await,
 
         // Wallet - address derivation (zcashd-style; exact-or-next diversified UA)
         "z_getaddressforaccount" => {

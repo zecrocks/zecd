@@ -528,6 +528,206 @@ mod tests {
         assert_eq!(body_json(r).await["result"].as_u64(), Some(500));
     }
 
+    /// `z_waitforoperation` over the full HTTP path: the blocking alternative to the
+    /// `z_getoperationstatus` poll loop. Everything it needs is offline - an inert test wallet
+    /// handle (only its *name* is read) plus an operation the test itself gates - so the wait's
+    /// semantics are pinned here rather than only in the regtest tier.
+    #[tokio::test]
+    async fn z_waitforoperation_blocks_until_the_operation_finishes() {
+        use crate::error::RpcError;
+        use crate::network::ZNetwork;
+        use crate::wallet::{SyncStatus, WalletHandle};
+
+        let mut reg = WalletRegistry::new("default".into());
+        reg.insert(WalletHandle::for_test(
+            "default",
+            ZNetwork::Test,
+            SyncStatus::default(),
+        ));
+        reg.insert(WalletHandle::for_test(
+            "w2",
+            ZNetwork::Test,
+            SyncStatus::default(),
+        ));
+        let mut state = test_state();
+        state.registry = Arc::new(reg);
+
+        // An operation the test releases by hand, so the "still running" and "finished" halves
+        // are both deterministic.
+        let (release, gate) = tokio::sync::oneshot::channel::<()>();
+        let opid = state
+            .operations
+            .try_insert("default", None, async move {
+                let _ = gate.await;
+                Ok::<Value, RpcError>(serde_json::json!({ "txid": "ab" }))
+            })
+            .expect("the registry has room for one operation");
+
+        let call = |state: AppState, uri: &'static str, params: String| async move {
+            let body = format!(r#"{{"method":"z_waitforoperation","params":{params},"id":1}}"#);
+            let r = router(state)
+                .oneshot(req_to(uri, &body, Some(("u", "p"))))
+                .await
+                .unwrap();
+            body_json(r).await
+        };
+
+        // timeout 0 is the immediate single-operation read: it returns the current status
+        // without waiting for the still-gated operation.
+        let v = call(state.clone(), "/", format!(r#"["{opid}",0]"#)).await;
+        assert_eq!(v["result"]["id"], serde_json::json!(opid));
+        assert_eq!(
+            v["result"]["finished"],
+            serde_json::json!(false),
+            "the gated operation has not finished: {v}"
+        );
+        assert!(
+            matches!(v["result"]["status"].as_str(), Some("queued" | "executing")),
+            "the gated operation is still running: {v}"
+        );
+
+        // A non-zero timeout that expires is NOT an error: the current, non-terminal status
+        // comes back with `finished: false` saying outright that the *wait* gave up, so callers
+        // never have to know which status strings are terminal (Core's waitforblock behaviour).
+        let v = call(state.clone(), "/", format!(r#"["{opid}",1]"#)).await;
+        assert_eq!(v["error"], Value::Null, "a timeout is not an error: {v}");
+        assert_eq!(
+            v["result"]["finished"],
+            serde_json::json!(false),
+            "a timed-out wait reports finished=false: {v}"
+        );
+        assert!(
+            matches!(v["result"]["status"].as_str(), Some("queued" | "executing")),
+            "a timed-out wait reports the operation as unfinished: {v}"
+        );
+
+        // Released, the wait returns as soon as the operation finishes - with its result
+        // visible, since the signal is published after the result is written.
+        release.send(()).expect("release the operation");
+        let v = call(state.clone(), "/", format!(r#"["{opid}",30]"#)).await;
+        assert_eq!(v["result"]["finished"], serde_json::json!(true), "{v}");
+        assert_eq!(v["result"]["status"], serde_json::json!("success"), "{v}");
+        assert_eq!(v["result"]["result"]["txid"], serde_json::json!("ab"));
+
+        // Non-destructive: waiting again returns the same terminal status, and the operation is
+        // still there for z_getoperationresult to reap.
+        let v = call(state.clone(), "/", format!(r#"["{opid}",0]"#)).await;
+        assert_eq!(v["result"]["finished"], serde_json::json!(true), "{v}");
+        assert_eq!(v["result"]["status"], serde_json::json!("success"), "{v}");
+        assert_eq!(state.operations.take_results("default", None).len(), 1);
+
+        // Once reaped there is nothing to wait for: -8 rather than a full-timeout block.
+        let v = call(state.clone(), "/", format!(r#"["{opid}",30]"#)).await;
+        assert_eq!(v["error"]["code"], serde_json::json!(-8), "{v}");
+    }
+
+    /// A *failed* operation is a successful `z_waitforoperation` call: the wait observed the
+    /// operation end (`finished: true`), and the send's own error rides in the status object's
+    /// `error` rather than as an error on this call. This is the distinction the `finished`
+    /// flag exists to make unambiguous - "the wait gave up" and "the operation failed" are
+    /// different outcomes and must not look alike.
+    #[tokio::test]
+    async fn z_waitforoperation_reports_a_failed_operation_as_finished() {
+        use crate::error::RpcError;
+        use crate::network::ZNetwork;
+        use crate::wallet::{SyncStatus, WalletHandle};
+
+        let mut reg = WalletRegistry::new("default".into());
+        reg.insert(WalletHandle::for_test(
+            "default",
+            ZNetwork::Test,
+            SyncStatus::default(),
+        ));
+        let mut state = test_state();
+        state.registry = Arc::new(reg);
+
+        let opid = state
+            .operations
+            .try_insert("default", None, async {
+                Err::<Value, _>(RpcError::insufficient_funds("broke"))
+            })
+            .expect("insert");
+
+        let body = format!(r#"{{"method":"z_waitforoperation","params":["{opid}",30],"id":1}}"#);
+        let r = router(state)
+            .oneshot(req(&body, Some(("u", "p"))))
+            .await
+            .unwrap();
+        let v = body_json(r).await;
+
+        assert_eq!(v["error"], Value::Null, "the call itself succeeds: {v}");
+        assert_eq!(v["result"]["finished"], serde_json::json!(true), "{v}");
+        assert_eq!(v["result"]["status"], serde_json::json!("failed"), "{v}");
+        assert_eq!(
+            v["result"]["error"]["code"],
+            serde_json::json!(crate::error::codes::RPC_WALLET_INSUFFICIENT_FUNDS),
+            "the operation's own error is carried in the status object: {v}"
+        );
+        assert!(
+            v["result"]["result"].is_null(),
+            "a failed operation carries no result: {v}"
+        );
+    }
+
+    /// The wait is wallet-scoped like the rest of the operation-tracking surface, and rejects
+    /// an opid it has no operation for instead of blocking on it.
+    #[tokio::test]
+    async fn z_waitforoperation_is_wallet_scoped_and_rejects_unknown_ids() {
+        use crate::error::RpcError;
+        use crate::network::ZNetwork;
+        use crate::wallet::{SyncStatus, WalletHandle};
+
+        let mut reg = WalletRegistry::new("default".into());
+        for name in ["default", "w2"] {
+            reg.insert(WalletHandle::for_test(
+                name,
+                ZNetwork::Test,
+                SyncStatus::default(),
+            ));
+        }
+        let mut state = test_state();
+        state.registry = Arc::new(reg);
+
+        let opid = state
+            .operations
+            .try_insert("default", None, async {
+                Ok::<Value, RpcError>(serde_json::json!({ "txid": "ab" }))
+            })
+            .expect("insert");
+
+        let call = |state: AppState, uri: &'static str, params: String| async move {
+            let body = format!(r#"{{"method":"z_waitforoperation","params":{params},"id":1}}"#);
+            let r = router(state)
+                .oneshot(req_to(uri, &body, Some(("u", "p"))))
+                .await
+                .unwrap();
+            body_json(r).await
+        };
+
+        // The default wallet's own operation resolves...
+        let v = call(state.clone(), "/", format!(r#"["{opid}",30]"#)).await;
+        assert_eq!(v["result"]["finished"], serde_json::json!(true), "{v}");
+        assert_eq!(v["result"]["status"], serde_json::json!("success"), "{v}");
+
+        // ...but /wallet/w2 must not be able to wait on it, even naming the id exactly. A -8
+        // (not a 30s block on someone else's operation) is the whole point.
+        let v = call(state.clone(), "/wallet/w2", format!(r#"["{opid}",30]"#)).await;
+        assert_eq!(v["error"]["code"], serde_json::json!(-8), "{v}");
+
+        // A well-formed-but-unknown id and a malformed one are both -8.
+        let unknown = "opid-00000000-0000-0000-0000-000000000000";
+        let v = call(state.clone(), "/", format!(r#"["{unknown}",30]"#)).await;
+        assert_eq!(v["error"]["code"], serde_json::json!(-8), "{v}");
+        let v = call(state.clone(), "/", r#"["not-an-opid"]"#.to_string()).await;
+        assert_eq!(v["error"]["code"], serde_json::json!(-8), "{v}");
+
+        // A negative timeout is -8; an over-arity call is Core's help error (-1).
+        let v = call(state.clone(), "/", format!(r#"["{opid}",-1]"#)).await;
+        assert_eq!(v["error"]["code"], serde_json::json!(-8), "{v}");
+        let v = call(state, "/", format!(r#"["{opid}",0,"extra"]"#)).await;
+        assert_eq!(v["error"]["code"], serde_json::json!(-1), "{v}");
+    }
+
     /// One-shot a single RPC call against a state whose `[rpc] allowed_methods` safelist is
     /// `safelist`, returning `(http_status, envelope_error_code)`.
     async fn call_with_safelist(safelist: Vec<String>, body: &str) -> (StatusCode, Option<i64>) {
