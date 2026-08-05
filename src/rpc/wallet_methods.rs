@@ -94,8 +94,11 @@ pub(crate) async fn getnewaddress(
 /// `Transparent` for a bare `transparent`, `Shielded(set)` for an explicit shielded pool or
 /// comma-separated list, or a `-5` for an unknown token. Transparent cannot be combined with
 /// shielded receivers (zecd hands out one receiver type at a time). Whether the wallet actually
-/// enables the requested type is checked by the caller.
-fn parse_receiver_tokens(address_type: Option<&str>) -> Result<ReceiverRequest, RpcError> {
+/// enables the requested type is checked by the caller. `zecd derive-address` parses its
+/// `--address-type` flag with this same function, so the CLI and the RPC can't drift.
+pub(crate) fn parse_receiver_tokens(
+    address_type: Option<&str>,
+) -> Result<ReceiverRequest, RpcError> {
     use crate::pools::{Pool, PoolSet};
     let Some(raw) = address_type.map(str::trim).filter(|s| !s.is_empty()) else {
         return Ok(ReceiverRequest::Default);

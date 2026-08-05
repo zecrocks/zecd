@@ -9,6 +9,7 @@ pub mod backoff;
 pub mod chain;
 pub mod config;
 pub mod daemon;
+pub mod derive_address;
 pub mod error;
 pub mod example_config;
 pub mod hardening;

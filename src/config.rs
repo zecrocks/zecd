@@ -740,6 +740,10 @@ pub enum Command {
     /// Print a wallet's Unified Full Viewing Key (for pairing a watch-only instance via
     /// `init --ufvk`), then exit.
     ExportUfvk(ExportUfvkArgs),
+    /// Derive receiving addresses offline - no chain, no wallet database, no daemon - from an
+    /// initialized wallet's `keys.toml`, a BIP-39 mnemonic, or a Unified Full Viewing Key, then
+    /// exit.
+    DeriveAddress(DeriveAddressArgs),
     /// Generate a salted bitcoind-style `[rpc] auth` credential line (no external
     /// `rpcauth.py` needed), then exit.
     Rpcauth(RpcauthArgs),
@@ -815,6 +819,52 @@ pub struct ExportUfvkArgs {
     /// Wallet name (selects <datadir>/<name>).
     #[arg(long, default_value = "default")]
     pub wallet: String,
+}
+
+#[derive(Debug, clap::Args)]
+pub struct DeriveAddressArgs {
+    /// Wallet name (selects <datadir>/<name>). The default key source is this wallet's
+    /// `keys.toml`; with `--mnemonic`/`--ufvk` the wallet is only consulted for its receiver
+    /// configuration and to check the supplied key against its pinned viewing key. Omitted, the
+    /// `default` wallet's configuration is used.
+    #[arg(long)]
+    pub wallet: Option<String>,
+
+    /// Derive from a BIP-39 mnemonic instead of the wallet's `keys.toml`. The phrase is read
+    /// from `ZECD_MNEMONIC`, else `--mnemonic-file`, else stdin.
+    #[arg(long)]
+    pub mnemonic: bool,
+
+    /// Read the mnemonic phrase from this file (trailing newline trimmed) instead of stdin,
+    /// for non-interactive derivation. Implies `--mnemonic`; `ZECD_MNEMONIC` takes precedence.
+    #[arg(long, value_name = "FILE")]
+    pub mnemonic_file: Option<PathBuf>,
+
+    /// Derive from this Unified Full Viewing Key (see `export-ufvk`) instead of a mnemonic or
+    /// the wallet's `keys.toml`. Addresses are the same either way - only spending needs a seed.
+    #[arg(long, value_name = "UFVK", conflicts_with_all = ["mnemonic", "mnemonic_file"])]
+    pub ufvk: Option<String>,
+
+    /// Which receivers to derive, in `getnewaddress`'s `address_type` syntax: `unified`
+    /// (alias `default`) for the wallet's configured receivers, `transparent` for a bare
+    /// t-address, or a shielded pool list such as `orchard` / `sapling,orchard`. Defaults to
+    /// what `getnewaddress` would hand out for this wallet.
+    #[arg(long, value_name = "TYPE")]
+    pub address_type: Option<String>,
+
+    /// The first index to derive: a diversifier index for a Unified Address, or the BIP-44
+    /// external child index for a bare transparent address (the same index the daemon exposes).
+    #[arg(long, default_value_t = 0)]
+    pub index: u64,
+
+    /// How many consecutive indices to derive (one address per line), for pre-provisioning a
+    /// batch of deposit addresses.
+    #[arg(long, default_value_t = 1)]
+    pub count: u32,
+
+    /// Emit a JSON object instead of one address per line.
+    #[arg(long)]
+    pub json: bool,
 }
 
 #[derive(Debug, clap::Args)]

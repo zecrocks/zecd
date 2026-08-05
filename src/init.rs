@@ -83,19 +83,23 @@ fn read_encryption_passphrase() -> anyhow::Result<Passphrase> {
     Ok(Passphrase::from(p1))
 }
 
-/// Read the mnemonic phrase for `init --restore`. Prefers the `ZECD_MNEMONIC` environment
-/// variable, then `--mnemonic-file` (both for non-interactive/automated restore), then an
-/// interactive prompt on stderr reading one line from stdin. Surrounding whitespace is trimmed.
-fn read_restore_mnemonic(args: &InitArgs) -> anyhow::Result<Mnemonic<English>> {
+/// Read a mnemonic phrase from the non-interactive sources first - the `ZECD_MNEMONIC`
+/// environment variable, then `file` - and otherwise print `prompt` on stderr and read one line
+/// from stdin. Surrounding whitespace is trimmed. Shared by `init --restore` and
+/// `derive-address --mnemonic` so both accept the same inputs in the same precedence.
+pub(crate) fn read_mnemonic_phrase(
+    file: Option<&Path>,
+    prompt: &str,
+) -> anyhow::Result<Mnemonic<English>> {
     let phrase = if let Some(p) = std::env::var_os("ZECD_MNEMONIC") {
         p.to_string_lossy().trim().to_string()
-    } else if let Some(path) = &args.mnemonic_file {
+    } else if let Some(path) = file {
         std::fs::read_to_string(path)
             .with_context(|| format!("reading mnemonic file {}", path.display()))?
             .trim()
             .to_string()
     } else {
-        eprintln!("Enter the mnemonic phrase to restore, then press Enter:");
+        eprintln!("{prompt}");
         let mut line = String::new();
         std::io::stdin().read_line(&mut line)?;
         line.trim().to_string()
@@ -103,10 +107,18 @@ fn read_restore_mnemonic(args: &InitArgs) -> anyhow::Result<Mnemonic<English>> {
     Ok(<Mnemonic<English>>::from_phrase(&phrase)?)
 }
 
+/// Read the mnemonic phrase for `init --restore`.
+fn read_restore_mnemonic(args: &InitArgs) -> anyhow::Result<Mnemonic<English>> {
+    read_mnemonic_phrase(
+        args.mnemonic_file.as_deref(),
+        "Enter the mnemonic phrase to restore, then press Enter:",
+    )
+}
+
 /// Resolve the [`WalletEntry`] for `wallet`: the configured `[wallets.<name>]` entry, or the
 /// default layout (`<datadir>/<name>`, global pool settings) for a wallet the config doesn't
 /// name - exactly the entry the daemon would build for it.
-fn resolve_wallet_entry(config: &AppConfig, wallet: &str) -> WalletEntry {
+pub(crate) fn resolve_wallet_entry(config: &AppConfig, wallet: &str) -> WalletEntry {
     config
         .wallets
         .get(wallet)
