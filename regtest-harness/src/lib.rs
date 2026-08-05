@@ -495,6 +495,26 @@ const FUNDER_BIRTHDAY: u32 = 2;
 /// `getnewaddress "" "transparent"` issues (index 0 being already exposed, the issuance frontier
 /// starts past it), which is what makes the daemon-vs-offline derivation check possible.
 pub fn derive_funder_transparent_address(index: u32) -> Result<String> {
+    let addr = derive_address_offline(FUNDER_MNEMONIC, "transparent", index)?;
+    anyhow::ensure!(
+        addr.starts_with("tm"),
+        "derive-address printed {addr:?}, not a regtest t-address"
+    );
+    Ok(addr)
+}
+
+/// Derive a wallet address **offline** from `mnemonic` - no chain, no wallet database, no daemon -
+/// via `zecd derive-address`. `address_type` takes `getnewaddress`'s `address_type` syntax
+/// (`transparent`, `orchard`, `sapling,orchard`, ...) and `index` is the diversifier index (a
+/// BIP-44 external child index for `transparent`).
+///
+/// This is what lets a test point zebra's `miner_address` at a wallet that does not exist yet, so
+/// the chain is already in its final shape before the daemon ever scans a block. The alternative -
+/// start the daemon, ask it for an address, then restart zebra to mine there - hands the daemon a
+/// chain that is about to be rewound underneath it: zebra's non-finalized-state backup is written
+/// asynchronously, so the restart drops the very blocks the daemon just scanned, and a young
+/// wallet cannot rewind below its own birthday checkpoint.
+pub fn derive_address_offline(mnemonic: &str, address_type: &str, index: u32) -> Result<String> {
     let out = Command::new(zecd_bin())
         // `--conf /dev/null` bypasses any zecd.toml a default datadir might hold: this derivation
         // has no deployment context, so nothing but the network flag may influence it.
@@ -505,11 +525,11 @@ pub fn derive_funder_transparent_address(index: u32) -> Result<String> {
             "derive-address",
             "--mnemonic",
             "--address-type",
-            "transparent",
+            address_type,
             "--index",
             &index.to_string(),
         ])
-        .env("ZECD_MNEMONIC", FUNDER_MNEMONIC)
+        .env("ZECD_MNEMONIC", mnemonic)
         .stdin(Stdio::null())
         .output()
         .context("spawn zecd derive-address")?;
@@ -520,12 +540,7 @@ pub fn derive_funder_transparent_address(index: u32) -> Result<String> {
             tail(&String::from_utf8_lossy(&out.stderr), 30)
         );
     }
-    let addr = String::from_utf8_lossy(&out.stdout).trim().to_string();
-    anyhow::ensure!(
-        addr.starts_with("tm"),
-        "derive-address printed {addr:?}, not a regtest t-address"
-    );
-    Ok(addr)
+    Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
 }
 
 /// Coinbase blocks the funder gets to actually spend. Every block mined once zebra points at the

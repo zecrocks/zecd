@@ -21,15 +21,24 @@
 //! zecd's own unified address, receives the Orchard coinbase notes, and spends them long before
 //! 100 confirmations. Requires a zebrad whose block template can build shielded coinbase
 //! (zebra ≥ 6.0.0 - 5.0.0 builds an Orchard coinbase whose proof fails its own validation), so
-//! the test probes by mining one block and self-skips on a rejected template; set
+//! the test probes by mining its seed blocks and self-skips on a rejected template; set
 //! `ZECD_REGTEST_REQUIRE_SHIELDED_COINBASE=1` to make that a hard failure instead (for runs
 //! against a zebrad known to support it, e.g. the weekly `latest` leg).
 //!
-//! Both tests restart zebra exactly once - to point `miner_address` at zecd - and do it *before*
-//! any block the test relies on is mined: zebra's non-finalized-state backup is written by an
-//! asynchronous task, so a restart can silently drop recently-mined non-finalized blocks (on
-//! zebra 6.0.0 the flush can lag by many seconds). After the single restart every block pays
-//! zecd, so the coinbase set the assertions key on is deterministic.
+//! **Neither test restarts zebra.** Both derive zecd's miner address *offline* from
+//! [`COINBASE_MNEMONIC`] (`derive_address_offline`, the same trick the funder uses) and start
+//! zebra mining there from genesis, so the chain is in its final shape before the daemon exists.
+//! Do not go back to "start zecd, ask it for an address, restart zebra to mine there": that hands
+//! the daemon a chain about to be rewound underneath it - zebra's non-finalized-state backup is
+//! written by an asynchronous task, so the restart silently drops the blocks the daemon just
+//! scanned, and a wallet that young cannot rewind below its own birthday checkpoint. It wedges,
+//! retrying `unrecoverable reorg` forever, and the test dies on a sync timeout. That was
+//! previously hidden only by the seconds the daemon spent building its proving key before it
+//! first scanned.
+//!
+//! The wallet's birthday is one past the seed blocks, so the handful of coinbases mined before it
+//! exists are below its birthday and invisible - the coinbase set the assertions key on stays
+//! exactly the blocks mined after startup.
 //!
 //! Neither test needs the funding wallet: zebra's own `generate` mines straight
 //! to zecd. Skips cleanly unless `ZEBRAD_BIN` is set.
@@ -37,7 +46,27 @@
 use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
-use zecd_regtest_harness::{pick_port, resolve_bin, Zebrad, Zecd, ZecdConfig, SEED_MINER_ADDRESS};
+use zecd_regtest_harness::{
+    derive_address_offline, pick_port, resolve_bin, Zebrad, Zecd, ZecdConfig, SEED_MINER_ADDRESS,
+};
+
+/// The wallet under test is restored from a known phrase so its miner address can be derived
+/// before the daemon exists (see the module docs). This is the repo's committed throwaway testnet
+/// phrase - regtest only, it controls nothing of value.
+const COINBASE_MNEMONIC: &str = "mechanic vehicle helmet decide plug gorilla frost dial october \
+midnight culture idea mountain fame park social drip bid doctor scatter glance defy moment stage";
+
+/// Blocks mined before zecd starts, so `zecd init --restore` has a chain to anchor on. They pay
+/// zecd (zebra mines to it from genesis) but sit below its birthday, so the wallet ignores them.
+/// Two is the lowest workable count: the birthday is [`BIRTHDAY`] = `SEED_BLOCKS + 1`, and the
+/// restore anchors on the tree state at `birthday - 1`, which genesis does not have.
+const SEED_BLOCKS: u32 = 2;
+
+/// The restored wallet's birthday. **Inclusive** - the wallet scans this height - so it is one
+/// past the seed blocks, leaving every counted coinbase among the blocks mined after startup.
+/// (At `SEED_BLOCKS` the last seed block is scanned too, which showed up as one coinbase more
+/// than the assertions expect.)
+const BIRTHDAY: u32 = SEED_BLOCKS + 1;
 
 /// Coinbases mined to zecd before the maturity/aging phase (the deterministic assertion set).
 const ZECD_COINBASES: u64 = 8;
@@ -46,6 +75,11 @@ const OP_TIMEOUT: Duration = Duration::from_secs(240);
 const SPEND_TIMEOUT: Duration = Duration::from_secs(240);
 
 /// Poll `getpeerinfo` until zecd reports `conn_state == "ready"`.
+///
+/// **Call this only once a block at or above the wallet's birthday has been mined.** Both tests
+/// restore at a birthday one past the seed blocks, and a wallet whose birthday is above the chain
+/// tip has nothing to scan and never leaves `syncing` - so waiting for readiness before mining
+/// burns the whole timeout and fails the test.
 async fn wait_ready(zecd: &Zecd) {
     let deadline = Instant::now() + SYNC_TIMEOUT;
     loop {
@@ -152,48 +186,51 @@ async fn regtest_transparent_coinbase_shield_and_spend() {
         return;
     };
 
-    // 1. zebra mining to a throwaway; a couple of blocks so zecd can init off a live chain.
-    let mut zebrad = Zebrad::start_with_miner(&zebrad_bin, SEED_MINER_ADDRESS)
+    // 1. zecd's addresses, derived offline before anything runs (see the module docs). Index 0 is
+    //    the miner address: librustzcash exposes it at account creation, so the wallet credits
+    //    coinbase mined there from the moment it exists, without ever issuing it.
+    let taddr = derive_address_offline(COINBASE_MNEMONIC, "transparent", 0)
+        .expect("derive zecd's miner t-address offline");
+    let own_ua =
+        derive_address_offline(COINBASE_MNEMONIC, "orchard", 0).expect("derive zecd's UA offline");
+
+    // 2. zebra mining to zecd from genesis, plus a couple of blocks so zecd can init off a live
+    //    chain. No restart, so no block the assertions rely on can be dropped.
+    let zebrad = Zebrad::start_with_miner(&zebrad_bin, &taddr)
         .await
         .expect("start zebrad");
-    zebrad.generate_blocks(2).await.expect("seed the chain");
+    zebrad
+        .generate_blocks(SEED_BLOCKS)
+        .await
+        .expect("seed the chain");
 
-    // 2. zecd with transparent receiving. `AllowFullyTransparent` so the t→t path is *reachable*
-    //    - the point of the immature/mature `-6` assertions below is that even the most
-    //    permissive transparent-spend policy refuses coinbase UTXOs.
+    // 3. zecd with transparent receiving, restored from the phrase the addresses came from.
+    //    `AllowFullyTransparent` so the t→t path is *reachable* - the point of the
+    //    immature/mature `-6` assertions below is that even the most permissive
+    //    transparent-spend policy refuses coinbase UTXOs. The birthday is the seed height, so the
+    //    seed blocks' coinbases stay invisible and every counted coinbase is mined below.
     let mut cfg = ZecdConfig::new(zebrad.rpc_port, pick_port().expect("pick zecd rpc port"));
     cfg.transparent = true;
     cfg.privacy_policy = Some("AllowFullyTransparent".to_string());
+    cfg.restore_mnemonic = Some(COINBASE_MNEMONIC.to_string());
+    cfg.birthday = Some(BIRTHDAY);
     let zecd = Zecd::start(&cfg).await.expect("start zecd");
-    wait_ready(&zecd).await;
+    // A read RPC, so it needs no readiness - which the wallet cannot report yet, see below.
+    assert_eq!(
+        zecd.call("getaddressinfo", json!([taddr.clone()]))
+            .await
+            .expect("getaddressinfo")["ismine"],
+        json!(true),
+        "the offline-derived miner address must belong to the restored wallet"
+    );
 
-    let taddr = zecd
-        .call("getnewaddress", json!(["", "transparent"]))
-        .await
-        .expect("getnewaddress transparent")
-        .as_str()
-        .expect("address string")
-        .to_string();
-    let own_ua = zecd
-        .call("getnewaddress", json!([]))
-        .await
-        .expect("getnewaddress")
-        .as_str()
-        .expect("ua string")
-        .to_string();
-
-    // 3. The single restart (see module docs): from here on EVERY mined block pays zecd's
-    //    t-address, so the assertion set below is deterministic - no later restart can drop it.
-    zebrad
-        .restart_with_miner(&taddr)
-        .await
-        .expect("restart zebrad mining to zecd");
     let window_start = zebra_tip(&zebrad).await + 1;
     zebrad
         .generate_blocks(ZECD_COINBASES as u32)
         .await
         .expect("mine zecd's coinbases");
     let hmax = window_start + ZECD_COINBASES - 1;
+    wait_ready(&zecd).await;
     sync_to_tip(&zecd, &zebrad).await;
 
     // 4. Immature: the receives are discovered and classified coinbase - value rides in
@@ -554,36 +591,27 @@ async fn regtest_shielded_coinbase_receive_and_spend() {
     };
     let require = std::env::var("ZECD_REGTEST_REQUIRE_SHIELDED_COINBASE").is_ok();
 
-    // 1. zebra to a throwaway; seed the chain; zecd with the default Orchard-only config.
-    let mut zebrad = Zebrad::start_with_miner(&zebrad_bin, SEED_MINER_ADDRESS)
-        .await
-        .expect("start zebrad");
-    zebrad.generate_blocks(2).await.expect("seed the chain");
-    let cfg = ZecdConfig::new(zebrad.rpc_port, pick_port().expect("pick zecd rpc port"));
-    let zecd = Zecd::start(&cfg).await.expect("start zecd");
-    wait_ready(&zecd).await;
+    // 1. zecd's unified address, derived offline before anything runs, so zebra can mine ZIP-213
+    //    shielded coinbase straight to it from genesis (see the module docs). A shielded receive
+    //    is found by trial decryption, so it needs no prior exposure - any diversifier index of
+    //    the account will do.
+    let own_ua =
+        derive_address_offline(COINBASE_MNEMONIC, "orchard", 0).expect("derive zecd's UA offline");
 
-    let own_ua = zecd
-        .call("getnewaddress", json!([]))
-        .await
-        .expect("getnewaddress")
-        .as_str()
-        .expect("ua")
-        .to_string();
-
-    // 2. Point zebra's miner_address at zecd's unified address (ZIP-213 shielded coinbase) and
-    //    probe with one block. zebra 5.0.0 accepts the config but its Orchard coinbase proof
-    //    fails its own validation ("could not validate orchard proof"), so a rejected probe
-    //    skips the test unless the env override demands it. This is the tests' single restart
-    //    (see module docs); every block from here on mines an Orchard coinbase note to zecd.
-    if let Err(e) = zebrad.restart_with_miner(&own_ua).await {
-        let msg =
-            format!("this zebrad cannot mine to a unified address (shielded coinbase): {e:#}");
-        assert!(!require, "{msg}");
-        eprintln!("SKIP regtest_shielded_coinbase_receive_and_spend: {msg}");
-        return;
-    }
-    if let Err(e) = zebrad.generate_blocks(1).await {
+    // 2. zebra mining to that UA, probed by the seed blocks. zebra 5.0.0 accepts the config but
+    //    its Orchard coinbase proof fails its own validation ("could not validate orchard
+    //    proof"), so a rejected block skips the test unless the env override demands it.
+    let zebrad = match Zebrad::start_with_miner(&zebrad_bin, &own_ua).await {
+        Ok(z) => z,
+        Err(e) => {
+            let msg =
+                format!("this zebrad cannot mine to a unified address (shielded coinbase): {e:#}");
+            assert!(!require, "{msg}");
+            eprintln!("SKIP regtest_shielded_coinbase_receive_and_spend: {msg}");
+            return;
+        }
+    };
+    if let Err(e) = zebrad.generate_blocks(SEED_BLOCKS).await {
         let msg = format!(
             "this zebrad cannot build a valid shielded-coinbase block (needs zebra >= 6.0.0): \
              {e:#}"
@@ -593,8 +621,16 @@ async fn regtest_shielded_coinbase_receive_and_spend() {
         return;
     }
 
-    // 3. A few more shielded coinbases, then a confirmations tail - which also pays zecd (no
-    //    second restart; see module docs). The ZIP-315 untrusted-note policy needs 10
+    // 3. zecd restored from the phrase the address came from, with the default Orchard-only
+    //    config. Its birthday is the seed height, so the seed blocks' coinbase notes are below it
+    //    and every note the assertions count is mined after startup.
+    let mut cfg = ZecdConfig::new(zebrad.rpc_port, pick_port().expect("pick zecd rpc port"));
+    cfg.restore_mnemonic = Some(COINBASE_MNEMONIC.to_string());
+    cfg.birthday = Some(BIRTHDAY);
+    let zecd = Zecd::start(&cfg).await.expect("start zecd");
+
+    // 4. A few more shielded coinbases, then a confirmations tail - which also pays zecd. The
+    //    ZIP-315 untrusted-note policy needs 10
     //    confirmations before an external receive is spendable - that is a *confirmations*
     //    floor, not coinbase maturity; the whole point here is that no 100-block rule applies
     //    to shielded coinbase.
@@ -607,9 +643,10 @@ async fn regtest_shielded_coinbase_receive_and_spend() {
         .generate_blocks(12)
         .await
         .expect("confirmations tail");
+    wait_ready(&zecd).await;
     sync_to_tip(&zecd, &zebrad).await;
 
-    // 4. The shielded coinbase notes are ordinary notes: full spendable balance at 1+
+    // 5. The shielded coinbase notes are ordinary notes: full spendable balance at 1+
     //    confirmations, listed with the shielded pool their mining height implies, and - the key
     //    contrast with transparent coinbase at the same depth - NO immature bucket.
     let unspent = zecd
@@ -622,8 +659,8 @@ async fn regtest_shielded_coinbase_receive_and_spend() {
         "every mined shielded coinbase note is listed with no maturity gate: {unspent}"
     );
     // Pool is keyed on the height that minted each note, because this coinbase set **straddles
-    // the NU6.3 activation height**: the chain is seeded with a couple of blocks before the miner
-    // is pointed at zecd, so the notes below start a few blocks under NU6_3_ACTIVATION_HEIGHT and
+    // the NU6.3 activation height**: zebra mines to zecd from genesis and the wallet's birthday is
+    // the seed height, so the notes below start a few blocks under NU6_3_ACTIVATION_HEIGHT and
     // run past it. A block mined at or after activation carries an Orchard-V3 (ironwood) coinbase
     // output; an earlier one carries Orchard-V2. So a uniform assertion is wrong in both
     // directions - asserting all-orchard and asserting all-ironwood each fail on whichever note
@@ -685,10 +722,22 @@ async fn regtest_shielded_coinbase_receive_and_spend() {
     // The received-by aggregation likewise applies no maturity rule to shielded coinbase: the
     // full received total counts at depths far below 100 (its transparent-coinbase counterpart
     // reports 0 at the same depth - the pool-scoping of the exclusion, asserted live).
+    //
+    // Aggregate on the address the wallet *recorded* for these notes, not on the `own_ua` string
+    // we derived offline to mine to. Both name the same Orchard receiver, but the recorded
+    // address is the account's own index-0 entry, whose receiver set need not match the
+    // orchard-only unified address `derive-address --address-type orchard` prints - and
+    // `getreceivedbyaddress` filters on the recorded string, so the wrong one silently totals 0.
+    let recv_addr = entries
+        .iter()
+        .filter_map(|e| e["address"].as_str())
+        .find(|a| !a.is_empty())
+        .expect("a shielded coinbase note records its receiving address")
+        .to_string();
     let recv = zecd
-        .call("getreceivedbyaddress", json!([own_ua]))
+        .call("getreceivedbyaddress", json!([recv_addr]))
         .await
-        .expect("getreceivedbyaddress on the shielded-coinbase UA")
+        .expect("getreceivedbyaddress on the shielded-coinbase address")
         .as_f64()
         .expect("received number");
     assert!(
@@ -696,7 +745,7 @@ async fn regtest_shielded_coinbase_receive_and_spend() {
         "shielded coinbase counts as received with no maturity gate ({recv} vs {coinbase_total})"
     );
 
-    // 5. Spend one - far inside the 100-block window that would gate a *transparent* coinbase.
+    // 6. Spend one - far inside the 100-block window that would gate a *transparent* coinbase.
     let spend_ua = zecd
         .call("getnewaddress", json!([]))
         .await
