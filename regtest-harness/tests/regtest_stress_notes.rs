@@ -2,8 +2,7 @@
 //!
 //! This reproduces (a scaled version of) the measured finding that a `zecd` send's latency grows
 //! with the wallet's note count, and that - with `[spend] pipeline_proving` on - the proof runs
-//! **off** the single-writer actor so background sync is no longer frozen for the whole send. See
-//! `docs/CONCURRENT_SENDS.md`.
+//! **off** the single-writer actor so background sync is no longer frozen for the whole send.
 //!
 //! It is gated **separately** from the extended tier (`ZECD_REGTEST_STRESS=1`, not
 //! `ZECD_REGTEST_EXTENDED`): building thousands of notes and timing multi-minute sends is far too
