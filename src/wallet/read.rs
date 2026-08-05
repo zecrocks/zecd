@@ -15,6 +15,7 @@ use zcash_keys::encoding::AddressCodec as _;
 use zcash_keys::keys::UnifiedFullViewingKey;
 use zcash_primitives::transaction::builder::DEFAULT_TX_EXPIRY_DELTA;
 use zcash_protocol::{ShieldedPool, TxId};
+use zcash_transparent::keys::TransparentKeyScope;
 use zip32::{DiversifierIndex, Scope};
 
 use crate::network::ZNetwork;
@@ -1384,6 +1385,95 @@ pub fn classify_unified_receivers(network: ZNetwork, wallet_dir: &Path, addr: &s
         }
     }
     UaReceivers::Foreign
+}
+
+/// Where a transparent address the wallet owns sits in its BIP 44 derivation - the answer to
+/// "which index did `getnewaddress "" "transparent"` just hand me?", which is otherwise
+/// unanswerable (the RPC returns a bare string, and zecd persists no off-chain issuance log).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TransparentDerivation {
+    /// The ZIP 32 account index the address derives from, when the account records its
+    /// derivation (`None` on a watch-only wallet imported from a UFVK, which has no seed path).
+    pub account_index: Option<u32>,
+    /// The BIP 44 change level: `0` external (receiving), `1` internal (change).
+    pub scope: u32,
+    /// The BIP 44 non-hardened child index within that scope.
+    pub address_index: u32,
+}
+
+impl TransparentDerivation {
+    /// Whether this is an internal (change) address - Bitcoin Core's `getaddressinfo.ischange`.
+    pub fn is_change(&self) -> bool {
+        self.scope != 0
+    }
+
+    /// The BIP 44 path, in Bitcoin Core's `getaddressinfo.hdkeypath` format
+    /// (`m/44'/<coin_type>'/<account>'/<scope>/<index>`), or `None` when the account's own
+    /// derivation is unknown so the path cannot be stated in full.
+    pub fn hd_keypath(&self, network: ZNetwork) -> Option<String> {
+        use zcash_protocol::consensus::NetworkConstants as _;
+        let account = self.account_index?;
+        let coin_type = network.coin_type();
+        Some(format!(
+            "m/44'/{coin_type}'/{account}'/{}/{}",
+            self.scope, self.address_index
+        ))
+    }
+}
+
+/// The BIP 44 derivation of a transparent address this wallet owns, or `None` when the address
+/// is not a transparent address, is not one of ours, or was imported without derivation metadata.
+///
+/// Covers both scopes: an external (receiving) address handed out by `getnewaddress` /
+/// `z_getaddressforaccount`, and an internal one used for transparent change. Best-effort like
+/// the other read helpers - storage errors degrade to `None`.
+pub fn transparent_derivation(
+    network: ZNetwork,
+    wallet_dir: &Path,
+    addr: &str,
+) -> Option<TransparentDerivation> {
+    let taddr = match Address::decode(&network, addr)? {
+        Address::Transparent(t) => t,
+        _ => return None,
+    };
+    let db = open_read(network, wallet_dir).ok()?;
+    for id in db.get_account_ids().ok()? {
+        let Ok(Some(meta)) = db.get_transparent_address_metadata(id, &taddr) else {
+            continue;
+        };
+        // `scope()`/`address_index()` are `None` for a standalone (imported-key) address, which
+        // has no derivation path to report.
+        let (Some(scope), Some(index)) = (meta.scope(), meta.address_index()) else {
+            continue;
+        };
+        let Some(scope) = transparent_scope_index(scope) else {
+            continue;
+        };
+        let account_index = db.get_account(id).ok().flatten().and_then(|a| {
+            a.source()
+                .key_derivation()
+                .map(|d| d.account_index().into())
+        });
+        return Some(TransparentDerivation {
+            account_index,
+            scope,
+            address_index: index.index(),
+        });
+    }
+    None
+}
+
+/// The BIP 44 `change` path element for a transparent key scope: 0 external, 1 internal,
+/// 2 ephemeral (ZIP-320). [`TransparentKeyScope`] exposes no accessor for its raw value, so the
+/// standard scopes are mapped explicitly; a custom scope has no standard path element to report
+/// and yields `None`.
+fn transparent_scope_index(scope: TransparentKeyScope) -> Option<u32> {
+    match scope {
+        s if s == TransparentKeyScope::EXTERNAL => Some(0),
+        s if s == TransparentKeyScope::INTERNAL => Some(1),
+        s if s == TransparentKeyScope::EPHEMERAL => Some(2),
+        _ => None,
+    }
 }
 
 #[cfg(test)]

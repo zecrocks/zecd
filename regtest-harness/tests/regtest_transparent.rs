@@ -110,12 +110,70 @@ async fn regtest_transparent_receive_and_autoshield_spend() {
         "bare t-addr receiver_types == [transparent]: {v}"
     );
 
-    // getaddressinfo.ismine recognizes the handed-out transparent address as ours.
+    // getaddressinfo.ismine recognizes the handed-out transparent address as ours, and reports
+    // WHERE it sits in the BIP 44 chain. `getnewaddress` returns a bare string and zecd persists
+    // no issuance log, so this is the only way a caller learns which index it was handed - and
+    // what an exchange reconciles an issued range against.
     let ai = zecd
         .call("getaddressinfo", json!([taddr]))
         .await
         .expect("getaddressinfo t-addr");
     assert_eq!(ai["ismine"], json!(true), "own t-addr is ismine: {ai}");
+    let taddr_index = ai["address_index"]
+        .as_u64()
+        .unwrap_or_else(|| panic!("getaddressinfo reports the BIP 44 child index: {ai}"));
+    assert_eq!(
+        ai["ischange"],
+        json!(false),
+        "a handed-out receiving address is external, not change: {ai}"
+    );
+    assert_eq!(
+        ai["hdkeypath"],
+        // Regtest shares testnet's BIP 44 coin type (1); account 0, external scope.
+        json!(format!("m/44'/1'/0'/0/{taddr_index}")),
+        "getaddressinfo reports the full derivation path: {ai}"
+    );
+
+    // z_getaddressforaccount 0 ["p2pkh"] <index> derives the bare transparent address at an
+    // explicit BIP 44 external child index. Asking for the index getnewaddress just used must
+    // return that same address - the property a caller otherwise had to assume.
+    let derived = zecd
+        .call("z_getaddressforaccount", json!([0, ["p2pkh"], taddr_index]))
+        .await
+        .expect("z_getaddressforaccount p2pkh at an explicit index");
+    assert_eq!(
+        derived["address"],
+        json!(taddr),
+        "explicit-index derivation must reproduce the address getnewaddress handed out: {derived}"
+    );
+    assert_eq!(
+        derived["diversifier_index"],
+        json!(taddr_index),
+        "the response echoes the index derived at: {derived}"
+    );
+    assert_eq!(
+        derived["receiver_types"],
+        json!(["p2pkh"]),
+        "a transparent derivation reports zcashd's p2pkh receiver type: {derived}"
+    );
+    // Re-deriving is idempotent (the whole point: an operator can rebuild its issued range).
+    let again = zecd
+        .call("z_getaddressforaccount", json!([0, ["p2pkh"], taddr_index]))
+        .await
+        .expect("z_getaddressforaccount is idempotent at a fixed index");
+    assert_eq!(again, derived, "re-derivation returns the same object");
+    // p2pkh cannot be combined with a shielded receiver (no such address shape exists), and the
+    // index must be inside the BIP 44 non-hardened range.
+    let err = zecd
+        .call("z_getaddressforaccount", json!([0, ["p2pkh", "orchard"]]))
+        .await
+        .expect_err("p2pkh + orchard has no representable address");
+    assert_eq!(err.code(), Some(-8), "p2pkh+orchard -> -8: {err}");
+    let err = zecd
+        .call("z_getaddressforaccount", json!([0, ["p2pkh"], 1u64 << 31]))
+        .await
+        .expect_err("a hardened child index is not derivable");
+    assert_eq!(err.code(), Some(-8), "hardened index -> -8: {err}");
 
     // signmessage / verifymessage round-trip over the wallet's own transparent address. Signing
     // exercises the real actor key-derivation path (derive the USK from the seed, then the input
@@ -435,6 +493,67 @@ async fn regtest_transparent_receive_and_autoshield_spend() {
             Instant::now() < deadline,
             "a receive to a beyond-recovery-window address was never discovered - the issued \
              address was absent from the matcher set (transparent issuance must refresh it): {lu0}"
+        );
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+
+    // 10. An address derived at an **explicit** index is a real receiving address, not just a
+    //     derivation preview: deriving it must expose it (record it in the wallet DB) and refresh
+    //     the matcher set, exactly as `getnewaddress` issuance does - otherwise an exchange that
+    //     addresses its index range directly would silently miss every payment. Pick an index far
+    //     past everything issued so far, so nothing but this call can have exposed it.
+    const EXPLICIT_INDEX: u64 = 5_000;
+    let indexed = zecd
+        .call(
+            "z_getaddressforaccount",
+            json!([0, ["p2pkh"], EXPLICIT_INDEX]),
+        )
+        .await
+        .expect("derive a transparent address at a far-out explicit index");
+    let indexed_taddr = indexed["address"]
+        .as_str()
+        .expect("address string")
+        .to_string();
+    assert!(
+        indexed_taddr.starts_with("tm") && indexed_taddr != taddr && indexed_taddr != beyond_taddr,
+        "a distinct bare t-addr at index {EXPLICIT_INDEX}: {indexed}"
+    );
+    // getaddressinfo round-trips the index back, so an operator can resolve an address it sees
+    // on-chain to the index it issued.
+    let ai = zecd
+        .call("getaddressinfo", json!([indexed_taddr]))
+        .await
+        .expect("getaddressinfo on the index-derived address");
+    assert_eq!(
+        ai["ismine"],
+        json!(true),
+        "index-derived addr is ours: {ai}"
+    );
+    assert_eq!(
+        ai["address_index"],
+        json!(EXPLICIT_INDEX),
+        "getaddressinfo resolves the address back to the index it was derived at: {ai}"
+    );
+
+    funder
+        .send(lwd.grpc_port, &indexed_taddr, FUND_ZATOSHIS)
+        .expect("fund the index-derived transparent address");
+    let deadline = Instant::now() + FUND_TIMEOUT;
+    loop {
+        let lu0 = zecd
+            .call("listunspent", json!([0]))
+            .await
+            .expect("listunspent minconf=0");
+        let found = lu0
+            .as_array()
+            .is_some_and(|notes| notes.iter().any(|u| u["address"] == json!(indexed_taddr)));
+        if found {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "a receive to an explicitly-derived address was never discovered - deriving at an \
+             index must expose the address and refresh the matcher set: {lu0}"
         );
         tokio::time::sleep(Duration::from_millis(500)).await;
     }

@@ -157,9 +157,9 @@ pub struct RawTx {
     pub mined_height: Option<u32>,
 }
 
-/// What kind of receiving address `getnewaddress` should derive. Resolved at the RPC layer from
-/// the `address_type` argument and the wallet's configured defaults; the actor is the authority
-/// that turns it into an actual address.
+/// What kind of receiving address `getnewaddress` (and `z_getaddressforaccount`) should derive.
+/// Resolved at the RPC layer from the `address_type` / `receiver_types` argument and the wallet's
+/// configured defaults; the actor is the authority that turns it into an actual address.
 #[derive(Debug, Clone)]
 pub enum ReceiverRequest {
     /// No per-call override: the wallet's configured default - a bare transparent address when
@@ -171,6 +171,24 @@ pub enum ReceiverRequest {
     /// A bare transparent (`t1…`/`tm…`) address. Only valid when the wallet enables transparent
     /// receiving (checked at the RPC layer and re-checked by the actor).
     Transparent,
+}
+
+/// One derived receiving address plus the derivation index it came from, as returned by
+/// `z_getaddressforaccount`. The index is the shielded **diversifier index** for a Unified
+/// Address and the BIP 44 **external child index** for a bare transparent address (which is why
+/// it is reported at all: `getnewaddress` returns a bare string, so a caller reconciling its
+/// issued transparent range against the chain otherwise has no way to learn which index it was
+/// handed).
+#[derive(Debug, Clone)]
+pub struct DerivedAddress {
+    /// The encoded address (a Unified Address, or a bare `t1…`/`tm…` for a transparent request).
+    pub address: String,
+    /// The index the address was derived at (diversifier index, or transparent child index).
+    pub index: u128,
+    /// The receiver types actually derived, in the RPC's vocabulary: `sapling`/`orchard` for a
+    /// UA, `p2pkh` for a bare transparent address. Echoed back so a caller that let the wallet's
+    /// defaults decide (an omitted `receiver_types`) still learns what it got.
+    pub receiver_types: Vec<&'static str>,
 }
 
 /// The source-address selector for `z_shieldcoinbase` (zcashd's `fromaddress` argument).
@@ -208,14 +226,16 @@ pub enum WalletCommand {
         request: ReceiverRequest,
         reply: oneshot::Sender<Result<String, RpcError>>,
     },
-    /// Derive a Unified Address for the wallet's (single) account, backing `z_getaddressforaccount`.
+    /// Derive an address for the wallet's (single) account, backing `z_getaddressforaccount`.
     /// `diversifier_index` selects an exact index (re-deriving the same address idempotently);
-    /// `None` picks the next unused index, like `getnewaddress`. `receivers` is the already-resolved,
-    /// already-validated receiver set. Returns the encoded UA and the diversifier index used.
+    /// `None` picks the next unused index, like `getnewaddress`. `request` is the already-parsed
+    /// receiver selection - a shielded set (validated against the enabled pools), a bare
+    /// transparent receiver, or `Default` for the wallet's configured default. Returns the
+    /// encoded address, the index used, and the receivers actually derived.
     GetAddressForAccount {
-        receivers: PoolSet,
+        request: ReceiverRequest,
         diversifier_index: Option<DiversifierIndex>,
-        reply: oneshot::Sender<Result<(String, u128), RpcError>>,
+        reply: oneshot::Sender<Result<DerivedAddress, RpcError>>,
     },
     Send {
         request: TransactionRequest,
@@ -387,16 +407,17 @@ impl WalletHandle {
             .await
     }
 
-    /// Derive a Unified Address for the wallet's single account (`z_getaddressforaccount`).
-    /// `diversifier_index` selects an exact index; `None` picks the next unused one. `receivers`
-    /// must already have been validated against the wallet's enabled pools by the caller.
+    /// Derive an address for the wallet's single account (`z_getaddressforaccount`).
+    /// `diversifier_index` selects an exact index; `None` picks the next unused one. A shielded
+    /// `request` must already have been validated against the wallet's enabled pools by the
+    /// caller, and a transparent one against the wallet's transparent capability.
     pub async fn get_address_for_account(
         &self,
-        receivers: PoolSet,
+        request: ReceiverRequest,
         diversifier_index: Option<DiversifierIndex>,
-    ) -> Result<(String, u128), RpcError> {
+    ) -> Result<DerivedAddress, RpcError> {
         self.dispatch(|reply| WalletCommand::GetAddressForAccount {
-            receivers,
+            request,
             diversifier_index,
             reply,
         })

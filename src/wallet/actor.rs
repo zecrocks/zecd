@@ -59,8 +59,8 @@ use crate::wallet::keys::{self, SeedKeeper};
 use crate::wallet::open::{self, WriteDb};
 use crate::wallet::read;
 use crate::wallet::{
-    make_handle, store, ConnState, FirstSeen, RawTx, ReceiverRequest, SharedSeed, SyncStatus,
-    WalletCommand, WalletHandle,
+    make_handle, store, ConnState, DerivedAddress, FirstSeen, RawTx, ReceiverRequest, SharedSeed,
+    SyncStatus, WalletCommand, WalletHandle,
 };
 
 /// Note-management defaults for change splitting (match zcash-devtool's send defaults).
@@ -1230,6 +1230,24 @@ fn map_address_for_index_error(e: SqliteClientError) -> RpcError {
         )),
         other => RpcError::wallet(format!("address generation failed: {other}")),
     }
+}
+
+/// The `-8` returned when a transparent address is requested on a wallet that does not enable
+/// transparent receiving. Shared by every entry point that can derive one (`getnewaddress`,
+/// `z_getaddressforaccount`) so the remedy is worded once.
+fn transparent_not_enabled() -> RpcError {
+    RpcError::invalid_parameter(
+        "transparent addresses are not enabled on this wallet (set [pools] transparent = true)",
+    )
+}
+
+/// A diversifier index viewed as a BIP 44 **non-hardened child index** - the index a transparent
+/// receiver is derived at. `None` when the value does not fit that range (`>= 2^31`, i.e. the
+/// hardened half), which no transparent address can be derived at.
+fn transparent_child_index(j: DiversifierIndex) -> Option<u32> {
+    u32::try_from(u128::from(j))
+        .ok()
+        .filter(|i| *i < (1u32 << 31))
 }
 
 /// Extract the bare transparent receiver from a UA derived for a transparent-requiring request.
@@ -2952,11 +2970,11 @@ impl WalletActor {
                 let _ = reply.send(res);
             }
             WalletCommand::GetAddressForAccount {
-                receivers,
+                request,
                 diversifier_index,
                 reply,
             } => {
-                let res = self.get_address_for_account(receivers, diversifier_index);
+                let res = self.get_address_for_account(request, diversifier_index);
                 let _ = reply.send(res);
             }
             WalletCommand::Send {
@@ -3042,9 +3060,9 @@ impl WalletActor {
         // so it re-validates an explicit shielded override and re-checks transparent enablement
         // (the RPC layer validates these too, before dispatch).
         let receivers = match request {
-            ReceiverRequest::Transparent => return self.new_transparent_address(),
+            ReceiverRequest::Transparent => return Ok(self.new_transparent_address()?.0),
             ReceiverRequest::Default if self.transparent_default => {
-                return self.new_transparent_address()
+                return Ok(self.new_transparent_address()?.0)
             }
             ReceiverRequest::Default => self.default_receivers.clone(),
             ReceiverRequest::Shielded(set) => {
@@ -3081,12 +3099,14 @@ impl WalletActor {
     /// Orchard receiver is always available), then extract and bare-encode the transparent
     /// receiver. Generating the UA persists `addresses.cached_transparent_receiver_address`, which
     /// is what lets the read paths and the receive-servicing loop recognise the address.
-    fn new_transparent_address(&mut self) -> Result<String, RpcError> {
+    ///
+    /// Returns the encoded address together with the BIP 44 external child index it was derived
+    /// at. `getnewaddress` discards the index (Bitcoin Core's contract is a bare string), but
+    /// `z_getaddressforaccount` reports it - the index is what an operator needs to reconcile an
+    /// issued address against its derivation path.
+    fn new_transparent_address(&mut self) -> Result<(String, u32), RpcError> {
         if !self.transparent_enabled {
-            return Err(RpcError::invalid_parameter(
-                "transparent addresses are not enabled on this wallet \
-                 (set [pools] transparent = true)",
-            ));
+            return Err(transparent_not_enabled());
         }
         let account_id = self.require_account()?;
         // Handing out a transparent receiver may expose a new address (notably the beyond-gap
@@ -3098,11 +3118,21 @@ impl WalletActor {
         self.transparent_set_dirty = true;
         let request = crate::pools::transparent_extraction_request();
         match self.db_data.get_next_available_address(account_id, request) {
-            Ok(Some((ua, _))) => {
+            Ok(Some((ua, j))) => {
                 let taddr = transparent_receiver(&ua)?;
                 self.warn_if_gap_low(account_id, &taddr);
                 use zcash_keys::encoding::AddressCodec as _;
-                Ok(taddr.encode(&self.network))
+                // The request requires a p2pkh receiver, so librustzcash can only have honoured
+                // it at an index inside the BIP 44 non-hardened range - the conversion cannot
+                // fail for an address it just derived.
+                let index = transparent_child_index(j).ok_or_else(|| {
+                    RpcError::wallet(format!(
+                        "derived transparent address at diversifier index {} outside the BIP 44 \
+                         non-hardened child range",
+                        u128::from(j)
+                    ))
+                })?;
+                Ok((taddr.encode(&self.network), index))
             }
             Ok(None) => Err(RpcError::wallet(
                 "no transparent address available for account; the account's viewing key may \
@@ -3138,14 +3168,28 @@ impl WalletActor {
     fn new_transparent_address_beyond_gap(
         &mut self,
         account_id: AccountUuid,
-    ) -> Result<String, RpcError> {
+    ) -> Result<(String, u32), RpcError> {
         let next = self.next_external_transparent_index(account_id);
+        Ok((self.expose_transparent_index(account_id, next)?, next))
+    }
+
+    /// Derive, persist, and expose the external transparent receiver at `index`, applying the
+    /// stateless-restore recovery-horizon policy described on
+    /// [`Self::new_transparent_address_beyond_gap`]. Shared by that sequential beyond-gap path
+    /// and by `z_getaddressforaccount`'s explicit-index derivation, so an operator asking for a
+    /// specific index gets exactly the same recoverability guarantees (and refusals) as one
+    /// taking the next address from `getnewaddress`.
+    fn expose_transparent_index(
+        &mut self,
+        account_id: AccountUuid,
+        index: u32,
+    ) -> Result<String, RpcError> {
         let horizon = self
             .transparent_initial_scan
             .saturating_add(self.transparent_gap_limit);
-        if next >= horizon && !self.transparent_allow_beyond_recovery_window {
+        if index >= horizon && !self.transparent_allow_beyond_recovery_window {
             return Err(RpcError::wallet(format!(
-                "transparent address gap limit reached: the next external index ({next}) is \
+                "transparent address gap limit reached: external index ({index}) is \
                  beyond the recovery horizon (transparent_initial_scan + transparent_gap_limit \
                  = {horizon}), so it would not be recoverable from seed. Raise [pools] \
                  transparent_initial_scan to your issuance high-water mark (preferred - a \
@@ -3155,24 +3199,27 @@ impl WalletActor {
                  anyway."
             )));
         }
+        // Exposing an index outside the current gap window widens what the block-scan / mempool
+        // matcher must recognize; mark its address set stale so the next sync pass rebuilds it.
+        self.transparent_set_dirty = true;
         let request = crate::pools::transparent_extraction_request();
-        let div = DiversifierIndex::from(next);
+        let div = DiversifierIndex::from(index);
         let ua = self
             .db_data
             .get_address_for_index(account_id, div, request)
             .map_err(map_address_for_index_error)?
             .ok_or_else(|| {
-                RpcError::wallet(format!("Error: no address at diversifier index {next}."))
+                RpcError::wallet(format!("Error: no address at diversifier index {index}."))
             })?;
         let taddr = transparent_receiver(&ua)?;
-        if next < horizon {
+        if index < horizon {
             info!(
-                "[{}] issued transparent address at external index {next}, past the \
+                "[{}] issued transparent address at external index {index}, past the \
                  funded-anchored gap window but within the recovery horizon ({horizon}) - \
                  recoverable from seed.",
                 self.name
             );
-            let remaining = horizon_slots_remaining(horizon, next);
+            let remaining = horizon_slots_remaining(horizon, index);
             if remaining <= self.transparent_gap_warn_threshold {
                 warn!(
                     "[{}] transparent recovery horizon nearly exhausted: {remaining} recoverable \
@@ -3184,7 +3231,7 @@ impl WalletActor {
             }
         } else {
             warn!(
-                "[{}] issued transparent address at external index {next}, OUTSIDE the \
+                "[{}] issued transparent address at external index {index}, OUTSIDE the \
                  stateless-restore recovery horizon ({horizon}). Funds received here may be \
                  UNRECOVERABLE from seed unless you raise [pools] transparent_initial_scan \
                  past this index (preferred - a large transparent_gap_limit makes every \
@@ -3291,17 +3338,38 @@ impl WalletActor {
         }
     }
 
-    /// Derive a Unified Address for this wallet's account, backing `z_getaddressforaccount`.
+    /// Derive an address for this wallet's account, backing `z_getaddressforaccount`.
     /// With `diversifier_index = Some(j)` it derives at exactly that index (re-deriving an
     /// already-exposed index returns the same address; requesting a different receiver set at an
     /// exposed index is a reuse error); with `None` it picks the next unused index, exactly like
-    /// `get_new_address`. `receivers` has already been validated against the enabled pools.
-    /// Returns the encoded UA plus the diversifier index actually used (as a `u128`).
+    /// `get_new_address`. A shielded `request` has already been validated against the enabled
+    /// pools, and a transparent one against the wallet's transparent capability - both are
+    /// re-checked here, since the actor is the authority on the wallet's configuration.
+    /// Returns the encoded address, the index used, and the receivers derived.
     fn get_address_for_account(
         &mut self,
-        receivers: PoolSet,
+        request: ReceiverRequest,
         diversifier_index: Option<DiversifierIndex>,
-    ) -> Result<(String, u128), RpcError> {
+    ) -> Result<DerivedAddress, RpcError> {
+        let receivers = match request {
+            ReceiverRequest::Transparent => {
+                return self.transparent_address_for_account(diversifier_index)
+            }
+            ReceiverRequest::Default if self.transparent_default => {
+                return self.transparent_address_for_account(diversifier_index)
+            }
+            ReceiverRequest::Default => self.default_receivers.clone(),
+            ReceiverRequest::Shielded(set) => {
+                if !set.is_subset_of(&self.enabled_pools) {
+                    return Err(RpcError::invalid_parameter(format!(
+                        "requested receivers ({}) include a pool not enabled on this wallet ({})",
+                        set.display_names(),
+                        self.enabled_pools.display_names()
+                    )));
+                }
+                set
+            }
+        };
         let account_id = self.require_account()?;
         let request = receivers.to_unified_address_request();
         let (ua, j) = match diversifier_index {
@@ -3332,7 +3400,57 @@ impl WalletActor {
                 (ua, j)
             }
         };
-        Ok((ua.encode(&self.network), u128::from(j)))
+        Ok(DerivedAddress {
+            address: ua.encode(&self.network),
+            index: u128::from(j),
+            receiver_types: receivers.iter().map(|p| p.as_str()).collect(),
+        })
+    }
+
+    /// The transparent half of [`Self::get_address_for_account`]: derive a **bare** transparent
+    /// receiver, either at an explicit BIP 44 external child index or (index omitted) the next
+    /// one `getnewaddress` would hand out.
+    ///
+    /// ZIP-316 forbids a transparent-only Unified Address, so - exactly as `getnewaddress "" \
+    /// "transparent"` does - the derived UA's transparent receiver is extracted and encoded bare;
+    /// zecd never mixes a transparent receiver into a UA it hands out. Deriving at an explicit
+    /// index goes through [`Self::expose_transparent_index`], so the recovery-horizon policy
+    /// (`transparent_allow_beyond_recovery_window` and its warnings) applies identically, and the
+    /// address is *exposed*: the block-scan / mempool matcher will credit a payment to it.
+    ///
+    /// Re-deriving an index this wallet already exposed as a *shielded* address is librustzcash's
+    /// `DiversifierIndexReuse` error (mapped to zcashd's wording): one index carries one receiver
+    /// set. Transparent indices are dense from 0, while shielded ones are clock-derived, so the
+    /// two ranges do not collide in practice.
+    fn transparent_address_for_account(
+        &mut self,
+        diversifier_index: Option<DiversifierIndex>,
+    ) -> Result<DerivedAddress, RpcError> {
+        if !self.transparent_enabled {
+            return Err(transparent_not_enabled());
+        }
+        let (address, index) = match diversifier_index {
+            None => self.new_transparent_address()?,
+            Some(j) => {
+                let index = transparent_child_index(j).ok_or_else(|| {
+                    RpcError::invalid_parameter(format!(
+                        "diversifier index {} is not a valid transparent child index: a \
+                         transparent receiver is derived at a BIP 44 non-hardened index, so it \
+                         must be less than {}.",
+                        u128::from(j),
+                        1u32 << 31
+                    ))
+                })?;
+                let account_id = self.require_account()?;
+                (self.expose_transparent_index(account_id, index)?, index)
+            }
+        };
+        Ok(DerivedAddress {
+            address,
+            index: u128::from(index),
+            // zcashd's token for a transparent receiver (there is no "p2sh" derivation).
+            receiver_types: vec!["p2pkh"],
+        })
     }
 
     /// Best-effort catch-up sync run once before each spend so the transaction is built
@@ -5444,6 +5562,8 @@ mod tests {
     use super::preexpose_progress_stats;
     use super::sanitize_upstream_msg;
     use super::select_transparent_inputs;
+    use super::transparent_child_index;
+    use super::DiversifierIndex;
 
     #[test]
     fn preexpose_progress_stats_computes_pct_rate_eta() {
@@ -5550,6 +5670,28 @@ mod tests {
         assert_eq!(horizon_slots_remaining(20, 19), 0);
         // Overflow-safe at the top of the index space.
         assert_eq!(horizon_slots_remaining(u32::MAX, u32::MAX), 0);
+    }
+
+    /// `z_getaddressforaccount 0 ["p2pkh"] <index>` reuses the diversifier-index argument for a
+    /// BIP 44 child index, so the hardened half (and anything above the 32-bit range the shielded
+    /// diversifier space allows) has to be rejected rather than silently truncated.
+    #[test]
+    fn transparent_child_index_accepts_only_the_non_hardened_range() {
+        for i in [0u32, 1, 20, 70_000, (1u32 << 31) - 1] {
+            assert_eq!(
+                transparent_child_index(DiversifierIndex::from(i)),
+                Some(i),
+                "index {i} is a valid transparent child index"
+            );
+        }
+        // The hardened bit, and values beyond u32 (the diversifier space runs to ~2^88).
+        for j in [
+            DiversifierIndex::from(1u32 << 31),
+            DiversifierIndex::from(u32::MAX),
+            DiversifierIndex::from(u64::from(u32::MAX) + 1),
+        ] {
+            assert_eq!(transparent_child_index(j), None, "{:?}", u128::from(j));
+        }
     }
 
     // ZIP-317 standard parameters (mirrors `zip317::FeeRule::standard`), so the selection tests

@@ -194,11 +194,13 @@ async fn regtest_sapling_and_orchard_balances() {
         json!(1_000_000),
         "explicit diversifier index honored: {o}"
     );
-    // Transparent is never exposed, even though the wallet enables two pools: -8.
+    // p2pkh derives a bare transparent address, but only on a wallet that enables transparent
+    // receiving. This one has two shielded pools and no [pools] transparent, so it is -8.
+    // (The enabled case is covered by regtest_transparent.)
     let err = zecd
         .call("z_getaddressforaccount", json!([0, ["p2pkh"]]))
         .await
-        .expect_err("p2pkh must be rejected");
+        .expect_err("p2pkh must be rejected on a wallet without [pools] transparent");
     assert_eq!(err.code(), Some(-8), "p2pkh -> -8: {err}");
 
     // 6. Wait until zecd is caught up (so the mempool stream is open) before funding.

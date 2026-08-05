@@ -287,6 +287,11 @@ def main() -> int:
     # (these hold on watch-only wallets too - the signal is private_keys_enabled).
     ck("getaddressinfo.solvable on own address", ai["solvable"] is True)
     ck("getaddressinfo.iswatchonly always False", ai["iswatchonly"] is False)
+    # The BIP 44 derivation fields describe a transparent address's place in the address chain, so
+    # they are absent entirely for a shielded one (rather than present-and-null). Their populated
+    # form is asserted in the transparent regtest e2e.
+    for f in ("hdkeypath", "address_index", "ischange"):
+        ck(f"getaddressinfo omits {f} for a shielded address", f not in ai)
     try:
         rpc.call("getaddressinfo", "not-an-address")
         ck("getaddressinfo invalid raises", False)
@@ -363,12 +368,28 @@ def main() -> int:
     zx = rpc.call("z_getaddressforaccount", 0, ["orchard"], jx)
     ck("z_getaddressforaccount at a fixed index (orchard)", zx["diversifier_index"] == jx)
     ck("z_getaddressforaccount fixed index receiver_types", zx["receiver_types"] == ["orchard"])
-    # Transparent receivers are never exposed: "p2pkh" is rejected -8 (zecd is shielded-only).
+    # "p2pkh" derives a bare t-address, but only on a wallet with [pools] transparent = true.
+    # This daemon is shielded-only, so it is rejected -8 with the enabling remedy. (The
+    # transparent-enabled behaviour - deriving the bare address at an explicit BIP 44 child index -
+    # is exercised live in regtest_transparent.rs.)
     try:
         rpc.call("z_getaddressforaccount", 0, ["p2pkh"])
         ck("z_getaddressforaccount p2pkh raises", False)
     except JSONRPCException as e:
-        ck("z_getaddressforaccount p2pkh -> -8", e.code == -8, e.code)
+        ck("z_getaddressforaccount p2pkh (transparent off) -> -8", e.code == -8, e.code)
+    # p2pkh can never be combined with a shielded receiver: ZIP-316 forbids a transparent-only
+    # unified address, and zecd hands transparent receivers out bare rather than mixing them in.
+    try:
+        rpc.call("z_getaddressforaccount", 0, ["p2pkh", "orchard"])
+        ck("z_getaddressforaccount p2pkh+orchard raises", False)
+    except JSONRPCException as e:
+        ck("z_getaddressforaccount p2pkh+orchard -> -8", e.code == -8, e.code)
+    # p2sh is never derivable (zecd holds no redeem scripts).
+    try:
+        rpc.call("z_getaddressforaccount", 0, ["p2sh"])
+        ck("z_getaddressforaccount p2sh raises", False)
+    except JSONRPCException as e:
+        ck("z_getaddressforaccount p2sh -> -8", e.code == -8, e.code)
     # A pool not enabled on this wallet (Sapling, in the Orchard-only default) is also -8.
     try:
         rpc.call("z_getaddressforaccount", 0, ["sapling"])

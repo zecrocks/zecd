@@ -133,13 +133,25 @@ fn parse_receiver_tokens(address_type: Option<&str>) -> Result<ReceiverRequest, 
 /// - **One account per wallet:** `account` must be `0` (the wallet's only account). A different
 ///   in-range account is `-4`; an out-of-range value is `-8`. Select a different wallet via the
 ///   `/wallet/<name>` path instead.
-/// - **Shielded-only:** zecd never exposes a transparent receiver, so the only valid
-///   `receiver_type`s are this wallet's enabled shielded pools (`sapling`/`orchard`). `p2pkh`
-///   and any other token are rejected `-8`, and the result is always a shielded-only UA.
+/// - **One receiver kind per call:** the valid `receiver_type`s are this wallet's enabled
+///   shielded pools (`sapling`/`orchard`) or - on a wallet with `[pools] transparent = true` -
+///   `p2pkh` **alone**, which derives the *bare* `t1…`/`tm…` address at the requested index
+///   (ZIP-316 forbids a transparent-only UA, and zecd never mixes a transparent receiver into a
+///   UA it hands out). Mixing `p2pkh` with a shielded pool is `-8`, as are `p2sh` (zecd derives
+///   no script addresses), a pool the wallet has not enabled, and any unknown token.
 ///
-/// `receiver_types` empty/omitted uses the wallet's configured `default_receivers` (as
-/// `getnewaddress` does). `diversifier_index` omitted picks the next unused index; given, it
-/// re-derives the exact address at that index (idempotent for the same receiver set).
+/// `receiver_types` empty/omitted uses the wallet's configured default (its `default_receivers`,
+/// or a bare transparent address when `[pools] transparent_default` is set - exactly what
+/// `getnewaddress` would hand out), and the response echoes what was actually derived.
+/// `diversifier_index` omitted picks the next unused index; given, it re-derives the exact
+/// address at that index (idempotent for the same receiver set).
+///
+/// For `p2pkh` the index is the BIP 44 **external child index**, not a shielded diversifier
+/// index: it must be below `2^31` (the non-hardened range) and it is subject to the wallet's
+/// recovery-horizon policy, exactly as sequential issuance through `getnewaddress` is - deriving
+/// at an index beyond `transparent_initial_scan + transparent_gap_limit` warns loudly, or is
+/// refused `-4` under `transparent_allow_beyond_recovery_window = false`. The address is exposed
+/// by the call, so a payment to it is credited by the block-scan / mempool matcher.
 pub(crate) async fn z_getaddressforaccount(
     state: &AppState,
     wallet: Option<&str>,
@@ -148,19 +160,18 @@ pub(crate) async fn z_getaddressforaccount(
     let handle = state.registry.get(wallet)?.clone();
 
     let account = parse_account_arg(req.param(0))?;
-    let receivers = parse_receiver_types_array(req.param(1), &handle)?;
+    let request = parse_receiver_types_array(req.param(1), &handle)?;
     let diversifier_index = parse_diversifier_index_arg(req.param(2))?;
 
-    let (address, j) = handle
-        .get_address_for_account(receivers.clone(), diversifier_index)
+    let derived = handle
+        .get_address_for_account(request, diversifier_index)
         .await?;
 
-    let receiver_types: Vec<&str> = receivers.iter().map(|p| p.as_str()).collect();
     Ok(json!({
         "account": account,
-        "diversifier_index": j,
-        "receiver_types": receiver_types,
-        "address": address,
+        "diversifier_index": derived.index,
+        "receiver_types": derived.receiver_types,
+        "address": derived.address,
     }))
 }
 
@@ -190,17 +201,24 @@ fn parse_account_arg(v: Option<&Value>) -> Result<u64, RpcError> {
     Ok(0)
 }
 
-/// Parse `z_getaddressforaccount`'s `receiver_types` array into a validated [`PoolSet`]. An
-/// omitted/empty array uses the wallet's `default_receivers`. Each element must name a shielded
-/// pool enabled on this wallet; `p2pkh`/`p2sh`/any unknown token is rejected `-8` (zecd is
-/// shielded-only and never exposes a transparent receiver).
+/// Parse `z_getaddressforaccount`'s `receiver_types` array into a [`ReceiverRequest`] validated
+/// against this wallet. An omitted/empty array is [`ReceiverRequest::Default`] - whatever
+/// `getnewaddress` would hand out (the wallet's `default_receivers`, or a bare transparent
+/// address under `transparent_default`).
+///
+/// `p2pkh` (zcashd's transparent token; `transparent` is accepted as a synonym) selects a bare
+/// transparent address, and must appear **alone**: ZIP-316 forbids a transparent-only UA and zecd
+/// never mixes a transparent receiver into one, so there is no address shape that could carry
+/// both. Every other element must name a shielded pool enabled on this wallet. `p2sh` and any
+/// unknown token are rejected `-8`, as is `p2pkh` on a wallet that has not enabled transparent
+/// receiving.
 fn parse_receiver_types_array(
     v: Option<&Value>,
     handle: &WalletHandle,
-) -> Result<crate::pools::PoolSet, RpcError> {
+) -> Result<ReceiverRequest, RpcError> {
     use crate::pools::{Pool, PoolSet};
     let arr = match v {
-        None | Some(Value::Null) => return Ok(handle.default_receivers.clone()),
+        None | Some(Value::Null) => return Ok(ReceiverRequest::Default),
         Some(Value::Array(a)) => a,
         Some(_) => {
             return Err(RpcError::invalid_parameter(
@@ -209,7 +227,7 @@ fn parse_receiver_types_array(
         }
     };
     if arr.is_empty() {
-        return Ok(handle.default_receivers.clone());
+        return Ok(ReceiverRequest::Default);
     }
     let mut pools = Vec::with_capacity(arr.len());
     let mut invalid = Vec::new();
@@ -217,24 +235,45 @@ fn parse_receiver_types_array(
         let s = item
             .as_str()
             .ok_or_else(|| RpcError::type_error("receiver type must be a string"))?;
+        // zcashd names the transparent receiver "p2pkh"; accept zecd's own "transparent" spelling
+        // (the `getnewaddress` address_type token) as a synonym.
+        if s.eq_ignore_ascii_case("p2pkh") {
+            pools.push(Pool::Transparent);
+            continue;
+        }
         match Pool::from_config_str(s) {
             Ok(p) => pools.push(p),
             Err(_) => invalid.push(s.to_string()),
         }
     }
     if !invalid.is_empty() {
-        // "p2pkh"/"p2sh"/"transparent" and any unknown token land here. zcashd accepts p2pkh;
-        // zecd never exposes a transparent receiver, so the only valid types are shielded.
+        // "p2sh" and any unknown token land here: zecd derives no script addresses, and the
+        // shielded receivers are named by pool.
         let verb = if invalid.len() == 1 {
             "is an invalid receiver type"
         } else {
             "are invalid receiver types"
         };
         return Err(RpcError::invalid_parameter(format!(
-            "{} {verb}. zecd addresses are shielded-only; arguments must be \"sapling\" or \
-             \"orchard\".",
+            "{} {verb}. Arguments must be \"p2pkh\", \"sapling\" or \"orchard\".",
             invalid.join(", ")
         )));
+    }
+    if pools.iter().any(|p| p.is_transparent()) {
+        if pools.iter().any(|p| !p.is_transparent()) {
+            return Err(RpcError::invalid_parameter(
+                "p2pkh cannot be combined with a shielded receiver: a transparent receiver is \
+                 handed out as a bare t-address (ZIP-316 forbids a transparent-only unified \
+                 address, and zecd never mixes a transparent receiver into one). Request \
+                 [\"p2pkh\"] alone for a transparent address.",
+            ));
+        }
+        if !handle.transparent_enabled {
+            return Err(RpcError::invalid_parameter(
+                "transparent addresses are not enabled on this wallet; set [pools] transparent = true",
+            ));
+        }
+        return Ok(ReceiverRequest::Transparent);
     }
     let set = PoolSet::new(pools)
         .map_err(|e| RpcError::invalid_parameter(format!("invalid receiver_types: {e}")))?;
@@ -244,7 +283,7 @@ fn parse_receiver_types_array(
             handle.enabled_pools.display_names()
         )));
     }
-    Ok(set)
+    Ok(ReceiverRequest::Shielded(set))
 }
 
 /// Parse `z_getaddressforaccount`'s optional `diversifier_index` argument. `None`/null means
@@ -502,16 +541,36 @@ pub(crate) fn getaddressinfo(
         None
     };
     let ismine = v.is_valid && read::is_mine(handle.network, &handle.dir, addr);
-    addressinfo_json(v, addr, ismine, receivers_consistent)
+    // For a transparent address the wallet derived, surface where it sits in the BIP 44 chain.
+    // `getnewaddress "" "transparent"` returns a bare string (Bitcoin Core's contract) and zecd
+    // keeps no off-chain issuance log, so this is how a caller learns which index it was handed -
+    // and how an operator reconciles an issued range against `z_getaddressforaccount`.
+    let derivation = if ismine {
+        read::transparent_derivation(handle.network, &handle.dir, addr)
+    } else {
+        None
+    };
+    addressinfo_json(
+        v,
+        addr,
+        ismine,
+        receivers_consistent,
+        derivation.map(|d| (d, handle.network)),
+    )
 }
 
 /// Build the `getaddressinfo` response. Bitcoin Core throws `-5 Invalid address` for an
 /// undecodable address (`isvalid` belongs to `validateaddress`, not this method).
+///
+/// `derivation` carries the BIP 44 path of an own **transparent** address (with the network the
+/// path's coin type comes from); it is `None` for shielded addresses, foreign ones, and imported
+/// keys without derivation metadata, and the derivation fields are then omitted entirely.
 fn addressinfo_json(
     v: crate::address::Validation,
     addr: &str,
     ismine: bool,
     receivers_consistent: Option<bool>,
+    derivation: Option<(read::TransparentDerivation, crate::network::ZNetwork)>,
 ) -> Result<Value, RpcError> {
     if !v.is_valid {
         return Err(RpcError::invalid_address_or_key("Invalid address"));
@@ -544,6 +603,17 @@ fn addressinfo_json(
     // computable against this wallet's keys (omitted for foreign or single-receiver addresses).
     if let Some(consistent) = receivers_consistent {
         out["receivers_consistent"] = json!(consistent);
+    }
+    // Derivation of an own transparent address. `hdkeypath` and `ischange` are Bitcoin Core's
+    // fields; `address_index` is a zecd extension naming the BIP 44 child index on its own, which
+    // is what `z_getaddressforaccount 0 ["p2pkh"] <index>` takes and what an exchange reconciles
+    // its issued range against. All three are omitted for anything without a derivation path.
+    if let Some((d, network)) = derivation {
+        if let Some(path) = d.hd_keypath(network) {
+            out["hdkeypath"] = json!(path);
+        }
+        out["ischange"] = json!(d.is_change());
+        out["address_index"] = json!(d.address_index);
     }
     Ok(out)
 }
@@ -2319,6 +2389,92 @@ mod tests {
         assert_eq!(err.code, crate::error::codes::RPC_INVALID_ADDRESS_OR_KEY);
     }
 
+    /// A test [`WalletHandle`] carrying just the pool configuration the receiver-type parsing
+    /// consults (no actor, no DB - see [`WalletHandle::for_test`]).
+    fn handle_with_pools(
+        transparent_enabled: bool,
+        enabled: crate::pools::PoolSet,
+    ) -> WalletHandle {
+        let mut h = WalletHandle::for_test("default", NET, SyncStatus::default());
+        h.enabled_pools = enabled.clone();
+        h.default_receivers = enabled;
+        h.transparent_enabled = transparent_enabled;
+        h
+    }
+
+    /// `z_getaddressforaccount`'s `receiver_types`: `p2pkh` (zcashd's transparent token) selects
+    /// a bare transparent address on a transparent-enabled wallet, and is refused everywhere it
+    /// cannot be honoured.
+    #[test]
+    fn receiver_types_array_transparent() {
+        use crate::error::codes::RPC_INVALID_PARAMETER;
+        let enabled = crate::pools::PoolSet::single(Pool::Orchard);
+        let t_wallet = handle_with_pools(true, enabled.clone());
+
+        // "p2pkh" - and zecd's own "transparent" spelling - alone request a bare t-address.
+        for token in [json!(["p2pkh"]), json!(["P2PKH"]), json!(["transparent"])] {
+            assert!(
+                matches!(
+                    parse_receiver_types_array(Some(&token), &t_wallet).unwrap(),
+                    ReceiverRequest::Transparent
+                ),
+                "{token} should request a transparent address"
+            );
+        }
+
+        // Mixing it with a shielded receiver has no representable address shape -> -8.
+        let err =
+            parse_receiver_types_array(Some(&json!(["p2pkh", "orchard"])), &t_wallet).unwrap_err();
+        assert_eq!(err.code, RPC_INVALID_PARAMETER);
+        assert!(err.message.contains("bare t-address"), "{}", err.message);
+
+        // p2sh is never derivable (zecd holds no redeem scripts).
+        let err = parse_receiver_types_array(Some(&json!(["p2sh"])), &t_wallet).unwrap_err();
+        assert_eq!(err.code, RPC_INVALID_PARAMETER);
+
+        // On a wallet without [pools] transparent, p2pkh is -8 with the enabling remedy.
+        let shielded_only = handle_with_pools(false, enabled);
+        let err = parse_receiver_types_array(Some(&json!(["p2pkh"])), &shielded_only).unwrap_err();
+        assert_eq!(err.code, RPC_INVALID_PARAMETER);
+        assert!(
+            err.message.contains("[pools] transparent = true"),
+            "{}",
+            err.message
+        );
+    }
+
+    /// The shielded half of the same argument: omitted/empty defers to the wallet's default,
+    /// enabled pools pass, a disabled pool and an unknown token are `-8`.
+    #[test]
+    fn receiver_types_array_shielded() {
+        use crate::error::codes::RPC_INVALID_PARAMETER;
+        let wallet = handle_with_pools(false, crate::pools::PoolSet::single(Pool::Orchard));
+
+        for omitted in [None, Some(json!(null)), Some(json!([]))] {
+            let parsed = parse_receiver_types_array(omitted.as_ref(), &wallet).unwrap();
+            assert!(matches!(parsed, ReceiverRequest::Default), "{omitted:?}");
+        }
+
+        let set =
+            shielded_set(parse_receiver_types_array(Some(&json!(["orchard"])), &wallet).unwrap());
+        assert!(set.contains(Pool::Orchard));
+
+        // Sapling is a valid pool but not enabled on this wallet.
+        let err = parse_receiver_types_array(Some(&json!(["sapling"])), &wallet).unwrap_err();
+        assert_eq!(err.code, RPC_INVALID_PARAMETER);
+
+        // An unknown token, and a non-array argument.
+        for bad in [json!(["bogus"]), json!("orchard")] {
+            assert_eq!(
+                parse_receiver_types_array(Some(&bad), &wallet)
+                    .unwrap_err()
+                    .code,
+                RPC_INVALID_PARAMETER,
+                "{bad} should be -8"
+            );
+        }
+    }
+
     #[test]
     fn requested_receivers_must_be_subset_of_enabled() {
         // The enablement check (a `-8`) is what getnewaddress applies once it has the handle.
@@ -2863,7 +3019,7 @@ mod tests {
             script_pub_key: None,
             is_script: false,
         };
-        let e = addressinfo_json(invalid, "nonsense", false, None).unwrap_err();
+        let e = addressinfo_json(invalid, "nonsense", false, None, None).unwrap_err();
         assert_eq!(e.code, crate::error::codes::RPC_INVALID_ADDRESS_OR_KEY);
 
         // Valid: Bitcoin Core's field set, without an isvalid field. The shape is identical
@@ -2877,7 +3033,7 @@ mod tests {
             script_pub_key: None,
             is_script: false,
         };
-        let o = addressinfo_json(valid, "utest1abc", true, Some(false)).unwrap();
+        let o = addressinfo_json(valid, "utest1abc", true, Some(false), None).unwrap();
         assert!(o.get("isvalid").is_none());
         assert_eq!(o["address"], json!("utest1abc"));
         assert_eq!(o["ismine"], json!(true));
@@ -2892,6 +3048,79 @@ mod tests {
         assert_eq!(o["receiver_types"], json!(["orchard"]));
         // zecd is stateless: the labels field is always empty.
         assert_eq!(o["labels"], json!([]));
+        // A shielded address carries no BIP 44 derivation, so the transparent derivation fields
+        // are absent entirely rather than present-and-null.
+        assert!(o.get("hdkeypath").is_none());
+        assert!(o.get("address_index").is_none());
+        assert!(o.get("ischange").is_none());
+    }
+
+    /// An own transparent address reports where it sits in the BIP 44 chain: Bitcoin Core's
+    /// `hdkeypath`/`ischange` plus the `address_index` extension, which is the index
+    /// `z_getaddressforaccount 0 ["p2pkh"] <index>` re-derives it at.
+    #[test]
+    fn getaddressinfo_reports_transparent_derivation() {
+        use crate::address::Validation;
+        use crate::wallet::read::TransparentDerivation;
+        let valid = || Validation {
+            is_valid: true,
+            is_orchard: false,
+            receiver_types: vec!["transparent"],
+            script_pub_key: Some("76a914...88ac".to_string()),
+            is_script: false,
+        };
+        let external = TransparentDerivation {
+            account_index: Some(0),
+            scope: 0,
+            address_index: 7,
+        };
+        let o = addressinfo_json(
+            valid(),
+            "tmExample",
+            true,
+            None,
+            Some((external, crate::network::ZNetwork::Test)),
+        )
+        .unwrap();
+        // Testnet's BIP 44 coin type is 1 (mainnet's is 133).
+        assert_eq!(o["hdkeypath"], json!("m/44'/1'/0'/0/7"));
+        assert_eq!(o["address_index"], json!(7));
+        assert_eq!(o["ischange"], json!(false));
+
+        // An internal (change) address is flagged as such, and its path carries change level 1.
+        let internal = TransparentDerivation {
+            account_index: Some(0),
+            scope: 1,
+            address_index: 3,
+        };
+        let o = addressinfo_json(
+            valid(),
+            "tmChange",
+            true,
+            None,
+            Some((internal, crate::network::ZNetwork::Main)),
+        )
+        .unwrap();
+        assert_eq!(o["hdkeypath"], json!("m/44'/133'/0'/1/3"));
+        assert_eq!(o["ischange"], json!(true));
+
+        // A watch-only account imported from a UFVK records no ZIP 32 derivation, so the full
+        // path can't be stated - the index still can.
+        let no_account = TransparentDerivation {
+            account_index: None,
+            scope: 0,
+            address_index: 9,
+        };
+        let o = addressinfo_json(
+            valid(),
+            "tmWatchOnly",
+            true,
+            None,
+            Some((no_account, crate::network::ZNetwork::Test)),
+        )
+        .unwrap();
+        assert!(o.get("hdkeypath").is_none());
+        assert_eq!(o["address_index"], json!(9));
     }
 
     #[test]
