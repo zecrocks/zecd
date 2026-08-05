@@ -80,8 +80,8 @@ zcash_encoding = "0.4"
 # and the received-by-address read paths; zecd's own wallets never expose transparent receivers.
 # `pczt` exposes `create_pczt_from_proposal` / `extract_and_store_transaction_from_pczt`, the
 # build/prove/store seam that lets the proving step take a cached Orchard proving key.
-zcash_client_backend = { version = "0.24.0-rc.6", features = ["orchard", "transparent-inputs", "pczt"] }
-zcash_client_sqlite = { version = "0.22.0-rc.6", features = ["unstable", "orchard", "serde", "transparent-inputs"] }
+zcash_client_backend = { version = "0.24.0-rc.7", features = ["orchard", "transparent-inputs", "pczt"] }
+zcash_client_sqlite = { version = "0.22.0-rc.7", features = ["unstable", "orchard", "serde", "transparent-inputs"] }
 zcash_keys = { version = "0.16", features = ["unstable", "orchard"] }
 zcash_primitives = "0.30"
 zcash_proofs = { version = "0.30", features = ["bundled-prover"] }
@@ -92,8 +92,8 @@ zcash_transparent = "0.10"
 zcash_script = "0.4.5"
 sapling = { package = "sapling-crypto", version = "0.7" }
 # PCZT roles (Prover/Signer) for the cached-proving-key send path. Versions track the
-# zcash_client_backend `pczt` feature's own pin (0.9.1).
-pczt = { version = "0.9.1", default-features = false, features = ["prover", "signer", "orchard", "sapling"] }
+# zcash_client_backend `pczt` feature's own pin (0.9.2).
+pczt = { version = "0.9.2", default-features = false, features = ["prover", "signer", "orchard", "sapling"] }
 zip32 = "0.2"
 zip321 = "0.9.0-rc.1"
 libc = "0.2.186"
@@ -140,8 +140,8 @@ incrementalmerkletree = "0.8"
 # The ironwood / NU6.3 librustzcash line is now consumed **straight from crates.io** - the leaf
 # crates as finals (`zcash_primitives`/`zcash_proofs 0.30.0`, `orchard 0.15.0`, `zcash_protocol
 # 0.10`, `zcash_keys 0.16`, `zcash_address 0.13.0`, `zcash_transparent 0.10.0`) and the wallet
-# crates as release candidates (`zcash_client_backend 0.24.0-rc.6`, `zcash_client_sqlite
-# 0.22.0-rc.6`, `pczt 0.9.1`, `zip321 0.9.0-rc.1`). This replaced the
+# crates as release candidates (`zcash_client_backend 0.24.0-rc.7`, `zcash_client_sqlite
+# 0.22.0-rc.7`, `pczt 0.9.2`, `zip321 0.9.0-rc.1`). This replaced the
 # previous all-or-nothing `[patch.crates-io]` git pin of the whole librustzcash workspace to the
 # `dw/ironwood-scan-model` rev `1105d8203` (zcash/librustzcash#2539), which existed only because the
 # wallet crates had no ironwood release yet. The shardtree/incrementalmerkletree git pins went with
@@ -163,6 +163,14 @@ incrementalmerkletree = "0.8"
 #   gate in `actor.rs` is gone and post-NU6.3 sends no longer pay the fused path's ~4.5 s/send
 #   keygen. `ProvingKeyCache` caches both circuit keys (`FixedPostNu6_2` for the V2 Orchard bundle,
 #   `PostNu6_3` for the V3 Ironwood bundle); see the send-proving-path notes in the project docs.
+# - **rc.7 closes the extractor's Ironwood-output gap.** Through rc.6,
+#   `extract_and_store_transaction_from_pczt` built its `SentTransaction` outputs from the Sapling
+#   and Orchard bundles only, so a post-NU6.3 send's Ironwood payment/change outputs reached the DB
+#   with no `sent_notes` row and no memo; rc.7 records them (and tags every shielded sent output
+#   with its note commitment tree). `actor::backfill_ironwood_memos` - the workaround that
+#   re-decrypted the just-stored transaction - is deleted with this bump. If a future bump ever
+#   regresses the extractor, the symptom is a missing memo on an ironwood send's own outputs on the
+#   authoring node, and only the regtest ironwood tier can see it.
 # - **Single-pool-group input selection** (upstream `00c789f9`): shielded inputs come from one of
 #   two mutually-exclusive groups - {Orchard} or {Sapling+Ironwood}, never mixed - the NU6.3
 #   migration model (past NU6.3 a new Orchard-address output becomes an ironwood V3 note, so Orchard

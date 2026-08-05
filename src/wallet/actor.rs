@@ -3717,8 +3717,6 @@ impl WalletActor {
         let (pczt, shape, build) = self.build_proposal_and_pczt(request, policy, privacy)?;
         let keys = self.orchard_keys.clone().expect("cached path");
         let prover = self.prover.clone();
-        // Copied out before the `self.db_data` borrow below; `ZNetwork` is `Copy`.
-        let network = self.network;
         let db = &mut self.db_data;
         let (txid, raw, prove, store): (TxId, Vec<u8>, Duration, Duration) =
             tokio::task::block_in_place(move || -> Result<_, RpcError> {
@@ -3726,7 +3724,7 @@ impl WalletActor {
                 let signed = prove_sign_pczt(pczt, &usk, &prover, &keys)?;
                 let prove = p0.elapsed();
                 let s0 = Instant::now();
-                let txid = store_pczt(db, network, signed, &keys)?;
+                let txid = store_pczt(db, signed, &keys)?;
                 let raw = read_raw_tx(db, txid)?;
                 Ok((txid, raw, prove, s0.elapsed()))
             })?;
@@ -4020,14 +4018,12 @@ impl WalletActor {
             .orchard_keys
             .clone()
             .expect("pipeline requires cached keys");
-        // Copied out before the `self.db_data` borrow below; `ZNetwork` is `Copy`.
-        let network = self.network;
         let db = &mut self.db_data;
         let _ = policy; // store rarely surfaces -6; kept for symmetry with the inline path.
         let (txid, raw, store): (TxId, Vec<u8>, Duration) =
             tokio::task::block_in_place(move || -> Result<_, RpcError> {
                 let s0 = Instant::now();
-                let txid = store_pczt(db, network, signed, &keys)?;
+                let txid = store_pczt(db, signed, &keys)?;
                 let raw = read_raw_tx(db, txid)?;
                 Ok((txid, raw, s0.elapsed()))
             })?;
@@ -5192,70 +5188,28 @@ fn prove_sign_pczt(
 /// correct verifying key *per bundle* from each bundle's own version (a `VerifyingKey::build` per
 /// bundle - the cheaper `keygen_vk`, and only on Ironwood sends). A pre-NU6.3 send has only a
 /// `FixedPostNu6_2` Orchard bundle, so it reuses the cached `orchard_vk` and rebuilds nothing.
+///
+/// The Ironwood bundle's own outputs are recorded by the extractor as of `zcash_client_backend
+/// 0.24.0-rc.7`. Through rc.6 it built its `SentTransaction` outputs from the Sapling and Orchard
+/// bundles only, so a post-NU6.3 send's payment and change - which ride the Ironwood bundle -
+/// landed with no `sent_notes` row and no memo, and nothing downstream repaired it on the authoring
+/// node (the compact scan materializes the notes but carries no memos, and enhancement skips a tx
+/// whose raw bytes the send pre-stored). zecd covered that by re-decrypting the just-stored
+/// transaction here; the pass is gone with the version that made it unnecessary.
 fn store_pczt(
     db: &mut WriteDb,
-    network: ZNetwork,
     pczt: pczt::Pczt,
     keys: &ProvingKeyCache,
 ) -> Result<TxId, RpcError> {
-    let has_ironwood = !pczt.ironwood().actions().is_empty();
-    let orchard_vk = if has_ironwood {
-        None
-    } else {
+    let orchard_vk = if pczt.ironwood().actions().is_empty() {
         Some(&keys.orchard_vk)
+    } else {
+        None
     };
-    let txid = extract_and_store_transaction_from_pczt::<_, zcash_client_sqlite::ReceivedNoteId>(
+    extract_and_store_transaction_from_pczt::<_, zcash_client_sqlite::ReceivedNoteId>(
         db, pczt, None, orchard_vk,
     )
-    .map_err(|e| RpcError::wallet(format!("storing transaction failed: {e}")))?;
-    if has_ironwood {
-        backfill_ironwood_memos(db, network, txid);
-    }
-    Ok(txid)
-}
-
-/// Record the memos on an Ironwood send's own outputs, which [`store_pczt`]'s extract step does
-/// not write.
-///
-/// `extract_and_store_transaction_from_pczt` builds its `SentTransaction` outputs from the
-/// transaction's **Sapling and Orchard** bundles only - it has no Ironwood handling at all
-/// (`zcash_client_backend 0.24.0-rc.6`), unlike the fused `create_proposed_transaction`, which
-/// does record them. Post-NU6.3 a send's payment and change ride the **Ironwood** bundle, so on
-/// the PCZT path those outputs reach the DB with no `sent_notes` row, and with it no memo. Nothing
-/// downstream repairs that on the authoring node: the compact block scan later materializes the
-/// notes but compact outputs carry no memos, and the enhancement pass that would re-decrypt the
-/// full transaction skips it (the raw bytes were pre-stored by the send, so `queue_tx_retrieval`
-/// classifies it `Status`-only). The memo is therefore lost from *both* sides of the sender's
-/// history - the outgoing record and, for a self-send, the receive - until a from-seed restore or
-/// rescan recovers it via enhancement.
-///
-/// So re-decrypt the just-stored transaction with the wallet's own keys, exactly as the mempool
-/// path does for the same transaction shape: that fills the received notes' memos and OVK-decrypts
-/// the outgoing ones. Cheap next to the proof (one trial decrypt of a transaction already known to
-/// be ours) and only on Ironwood sends, so pre-NU6.3 sends are untouched.
-///
-/// Best-effort: the transaction is already stored and about to broadcast, so a failure here costs
-/// a memo, not a send - it is logged, not propagated.
-///
-/// TODO(upstream): drop this once `extract_and_store_transaction_from_pczt` harvests the Ironwood
-/// bundle like the fused builder does.
-fn backfill_ironwood_memos(db: &mut WriteDb, network: ZNetwork, txid: TxId) {
-    let tx = match db.get_transaction(txid) {
-        Ok(Some(tx)) => tx,
-        Ok(None) => {
-            warn!("ironwood memo backfill: transaction {txid} missing from the wallet DB");
-            return;
-        }
-        Err(e) => {
-            warn!("ironwood memo backfill: could not read transaction {txid}: {e}");
-            return;
-        }
-    };
-    // The send is unmined at this point (it has not even broadcast yet), so pass no mined height -
-    // the same call the mempool path makes for an unmined transaction.
-    if let Err(e) = decrypt_and_store_transaction(&network, db, &tx, None) {
-        warn!("ironwood memo backfill failed for {txid}: {e}");
-    }
+    .map_err(|e| RpcError::wallet(format!("storing transaction failed: {e}")))
 }
 
 /// A send's size, for the latency log line. Proving cost scales with `orchard_actions`; a large,
