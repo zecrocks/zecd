@@ -843,8 +843,8 @@ pub struct ConfigCheckArgs {
     #[arg(long)]
     pub strict: bool,
 
-    /// Suppress the effective-configuration summary and the success line; problems and the
-    /// exit code are still reported.
+    /// Suppress the effective-configuration summary (stdout) and the success line; problems
+    /// and the exit code are still reported on stderr.
     #[arg(short = 'q', long)]
     pub quiet: bool,
 }

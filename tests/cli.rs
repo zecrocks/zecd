@@ -753,7 +753,6 @@ fn config_check_accepts_a_valid_config_and_prints_the_effective_settings() {
     let out = config_check(&conf, &[]);
     assert!(out.status.success(), "stderr: {}", stderr_of(&out));
     let stdout = stdout_of(&out);
-    assert!(stdout.contains("OK:"), "{stdout}");
     // Resolved from the file...
     assert!(
         stdout.contains("network") && stdout.contains("test"),
@@ -762,6 +761,48 @@ fn config_check_accepts_a_valid_config_and_prints_the_effective_settings() {
     // ...and defaulted by this binary.
     assert!(stdout.contains("AllowRevealedRecipients"), "{stdout}");
     assert!(stdout.contains("zebra-rpc 127.0.0.1:18234"), "{stdout}");
+    assert!(stderr_of(&out).contains("OK:"), "{}", stderr_of(&out));
+}
+
+/// The stream contract (`nginx -t`/`-T`): stdout is the effective configuration and *only* that,
+/// so `zecd config check > effective.txt` captures settings a later version's output can be
+/// diffed against; the verdict, the findings, and the header are diagnostics on stderr. `-q`
+/// drops the settings, leaving stdout empty - what a CI gate wants.
+#[test]
+fn config_check_puts_the_settings_on_stdout_and_the_verdict_on_stderr() {
+    let dir = tempfile::tempdir().unwrap();
+    let conf = dir.path().join("zecd.toml");
+    std::fs::write(
+        &conf,
+        format!(
+            "network = \"test\"\ndatadir = {:?}\n[rpc]\nuser = \"u\"\npassword = \"p\"\n",
+            dir.path()
+        ),
+    )
+    .unwrap();
+
+    let out = config_check(&conf, &[]);
+    let (stdout, stderr) = (stdout_of(&out), stderr_of(&out));
+    assert!(stdout.contains("[backend]"), "{stdout}");
+    for diagnostic in ["OK:", "warning:", "config file:", "zecd "] {
+        assert!(
+            !stdout.contains(diagnostic),
+            "stdout must carry settings only, found {diagnostic:?}: {stdout}"
+        );
+    }
+    assert!(
+        stderr.contains("warning:") && stderr.contains("OK:"),
+        "{stderr}"
+    );
+
+    let out = config_check(&conf, &["-q"]);
+    assert!(out.status.success(), "stderr: {}", stderr_of(&out));
+    assert!(
+        out.stdout.is_empty(),
+        "-q leaves stdout empty: {}",
+        stdout_of(&out)
+    );
+    assert!(!stderr_of(&out).is_empty(), "problems still reach stderr");
 }
 
 /// The reason the command exists: an unknown key is rejected by `resolve`, and `config check`
@@ -775,12 +816,15 @@ fn config_check_rejects_an_unknown_key_and_names_it() {
 
     let out = config_check(&conf, &[]);
     assert_eq!(out.status.code(), Some(1), "stderr: {}", stderr_of(&out));
-    let stdout = stdout_of(&out);
-    assert!(stdout.contains("bogus_field"), "{stdout}");
+    let stderr = stderr_of(&out);
+    assert!(stderr.contains("bogus_field"), "{stderr}");
     assert!(
-        stdout.contains("error:"),
-        "the report classifies the finding: {stdout}"
+        stderr.contains("error:"),
+        "the report classifies the finding: {stderr}"
     );
+    // A config that doesn't resolve has no effective settings, so the capture stays empty
+    // rather than half-written.
+    assert!(out.stdout.is_empty(), "stdout: {}", stdout_of(&out));
 }
 
 /// Checking a file that isn't there is a typo'd path, not a request to validate the built-in
