@@ -65,32 +65,35 @@ pub async fn run(config: AppConfig) -> anyhow::Result<()> {
 
     let mut registry = WalletRegistry::new(config.default_wallet.clone());
     let mut actor_tasks = Vec::new();
-    // Build the Orchard proving/verifying keys once (they're wallet-independent) and share them
-    // across every actor, so each send reuses the cached key instead of rebuilding it per
-    // transaction. Built off the async runtime; on by default (`[spend] cache_proving_key`).
+    // Build the Orchard proving keys once (they're wallet-independent) and share them across
+    // every actor, so each send reuses the cached key instead of rebuilding it per transaction.
+    // On by default (`[spend] cache_proving_key`).
+    //
+    // The keygen runs **in the background**: it is seconds of CPU, and only sends need its
+    // result, so blocking here would delay spawning the actors and binding the health and RPC
+    // listeners below - leaving the daemon unreachable and not syncing for the whole window. The
+    // first send awaits `ProvingKeys::get`; by then it is normally long finished.
     let orchard_keys = if config.spend.cache_proving_key {
         // Also build the PostNu6_3 (Ironwood) proving key when this network can activate NU6.3, so
         // post-NU6.3 sends prove the Ironwood bundle from the cache instead of rebuilding a key per
-        // send. NU6.3 is live on mainnet (3_428_143) and testnet (4_134_000), so both build it and
-        // pay the extra ~4.5 s at startup; only a regtest chain without `ZECD_REGTEST_NU63_HEIGHT`
-        // skips a keygen no send there could use.
+        // send. NU6.3 is live on mainnet (3_428_143) and testnet (4_134_000), so both build it;
+        // only a regtest chain without `ZECD_REGTEST_NU63_HEIGHT` skips a keygen no send there
+        // could use.
         let build_ironwood = config
             .network
             .activation_height(NetworkUpgrade::Nu6_3)
             .is_some();
         info!(
-            "building Orchard proving key{} (cached for all sends)",
+            "building Orchard proving key{} in the background (cached for all sends)",
             if build_ironwood {
                 " + Ironwood (PostNu6_3) proving key"
             } else {
                 ""
             }
         );
-        Some(Arc::new(
-            tokio::task::spawn_blocking(move || actor::ProvingKeyCache::build(build_ironwood))
-                .await
-                .map_err(|e| anyhow::anyhow!("failed to build Orchard proving key: {e}"))?,
-        ))
+        let keys = actor::ProvingKeys::new(build_ironwood);
+        keys.spawn_build();
+        Some(keys)
     } else {
         None
     };

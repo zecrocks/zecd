@@ -67,13 +67,18 @@ use crate::wallet::{
 const TARGET_NOTE_COUNT: usize = 4;
 const MIN_SPLIT_OUTPUT_VALUE: u64 = 10_000_000; // 0.1 ZEC
 
-/// The Orchard (+ Ironwood) proving/verifying keys, built once and shared (read-only) across
+/// The Orchard (+ Ironwood) proving keys, built once and shared (read-only) across
 /// every wallet actor via `Arc`. These are wallet-independent (they're the circuit's keys), and
 /// `ProvingKey::build()` is a full `keygen_vk`+`keygen_pk` - seconds of work - so the fused
 /// librustzcash send path (which rebuilds the proving key on *every* transaction) pays that
 /// cost per send. Building them here once and feeding them to the PCZT prove path eliminates that
-/// per-send overhead (the `[spend] cache_proving_key` knob, default on). The Orchard verifying key
-/// is kept too so the PCZT extract step doesn't regenerate it each non-Ironwood send.
+/// per-send overhead (the `[spend] cache_proving_key` knob, default on).
+///
+/// Deliberately **no verifying key**: the extract step's only use for one was a PCZT with no
+/// Ironwood actions, and post-NU6.3 - live on both public networks - every send's outputs are
+/// Ironwood, so it went unread while costing ~1.2 s of every startup. [`store_pczt`] now always
+/// passes `None`, and the extractor generates the right key per bundle on the fly, exactly as it
+/// already did for every Ironwood send.
 ///
 /// Two circuit versions exist (orchard `bundle.rs`): a **V2 Orchard** bundle uses `FixedPostNu6_2`,
 /// a **V3 Ironwood** bundle uses `PostNu6_3`, and `Bundle::create_proof` rejects a key whose circuit
@@ -87,8 +92,6 @@ const MIN_SPLIT_OUTPUT_VALUE: u64 = 10_000_000; // 0.1 ZEC
 pub struct ProvingKeyCache {
     /// `FixedPostNu6_2` proving key - proves the V2 Orchard bundle.
     orchard_pk: orchard::circuit::ProvingKey,
-    /// `FixedPostNu6_2` verifying key - verifies the V2 Orchard bundle in the extract step.
-    orchard_vk: orchard::circuit::VerifyingKey,
     /// `PostNu6_3` proving key - proves the V3 Ironwood bundle. `None` only when the network has
     /// no NU6.3 activation height at all (so no send produces an Ironwood bundle); mainnet and
     /// testnet both have one. See [`ProvingKeyCache::build`].
@@ -96,20 +99,102 @@ pub struct ProvingKeyCache {
 }
 
 impl ProvingKeyCache {
-    /// Build the cached proving/verifying keys. Expensive (full key generation); call once at
-    /// startup, off the async runtime (e.g. under `spawn_blocking`). `build_ironwood` also builds
-    /// the `PostNu6_3` proving key (another ~4.5 s) for the Ironwood bundle; pass it iff the network
-    /// has a NU6.3 activation height - **true on both mainnet and testnet**, and on regtest only
-    /// when `ZECD_REGTEST_NU63_HEIGHT` is set - so only a NU6.3-less regtest chain skips a keygen
-    /// it can't use.
+    /// Build the cached proving keys. Expensive (full key generation); call off the async runtime
+    /// (e.g. under `spawn_blocking`) - [`ProvingKeys::spawn_build`] is the wiring that does.
+    /// `build_ironwood` also builds the `PostNu6_3` proving key for the Ironwood bundle; pass it
+    /// iff the network has a NU6.3 activation height - **true on both mainnet and testnet**, and
+    /// on regtest only when `ZECD_REGTEST_NU63_HEIGHT` is set - so only a NU6.3-less regtest
+    /// chain skips a keygen it can't use.
+    ///
+    /// The two keygens are independent, so they run on **separate threads**: the wall clock is the
+    /// slower of the two rather than their sum (measured on 4 cores: 1.8 s + 2.0 s sequential).
+    /// Each `keygen_pk` is itself rayon-parallel (orchard's `multicore`, on via
+    /// `zcash_primitives`' default features), so on a single-core host the two simply interleave
+    /// and cost what they always did.
     pub fn build(build_ironwood: bool) -> Self {
-        use orchard::circuit::{OrchardCircuitVersion, ProvingKey, VerifyingKey};
+        use orchard::circuit::{OrchardCircuitVersion, ProvingKey};
+        let (orchard_pk, ironwood_pk) = std::thread::scope(|scope| {
+            let ironwood = build_ironwood
+                .then(|| scope.spawn(|| ProvingKey::build(OrchardCircuitVersion::PostNu6_3)));
+            let orchard_pk = ProvingKey::build(OrchardCircuitVersion::FixedPostNu6_2);
+            // A keygen panic is not recoverable (it means this build cannot prove at all), so
+            // propagate it to the caller's `spawn_blocking`, which reports it as a failed build.
+            let ironwood_pk = ironwood.map(|h| h.join().expect("Ironwood keygen panicked"));
+            (orchard_pk, ironwood_pk)
+        });
         ProvingKeyCache {
-            orchard_pk: ProvingKey::build(OrchardCircuitVersion::FixedPostNu6_2),
-            orchard_vk: VerifyingKey::build(OrchardCircuitVersion::FixedPostNu6_2),
-            ironwood_pk: build_ironwood
-                .then(|| ProvingKey::build(OrchardCircuitVersion::PostNu6_3)),
+            orchard_pk,
+            ironwood_pk,
         }
+    }
+}
+
+/// The handle the daemon and every actor hold: a [`ProvingKeyCache`] that is **built in the
+/// background** rather than on the startup critical path.
+///
+/// Key generation is seconds of CPU (measured on 4 cores, release: 1.8 s for the Orchard key,
+/// 2.0 s for the Ironwood one; several times that single-threaded or on a small VPS). Doing it
+/// before the daemon bound its listeners made zecd unreachable - no `/healthz`, no RPC, no
+/// sync - for that whole window, to serve a key that **only sends need**. So `daemon::run` now
+/// kicks off [`Self::spawn_build`] and carries straight on to spawning actors and binding the
+/// servers; the first send awaits [`Self::get`], which resolves immediately once the background
+/// build has finished (and, on a daemon that never sends, is never awaited at all).
+///
+/// [`tokio::sync::OnceCell`] gives the needed semantics for free: concurrent callers of
+/// `get_or_try_init` wait for the in-flight initializer instead of starting a second keygen, and
+/// a send arriving before the background task even ran simply drives the build itself.
+pub struct ProvingKeys {
+    cell: tokio::sync::OnceCell<Arc<ProvingKeyCache>>,
+    build_ironwood: bool,
+}
+
+impl ProvingKeys {
+    /// Create the (empty) handle. Nothing is built until [`Self::spawn_build`] or [`Self::get`].
+    pub fn new(build_ironwood: bool) -> Arc<Self> {
+        Arc::new(ProvingKeys {
+            cell: tokio::sync::OnceCell::new(),
+            build_ironwood,
+        })
+    }
+
+    /// Start building the keys in the background. Returns immediately; the daemon carries on
+    /// binding its listeners while the keygen runs on a blocking thread.
+    pub fn spawn_build(self: &Arc<Self>) {
+        let keys = Arc::clone(self);
+        tokio::spawn(async move {
+            let started = Instant::now();
+            match keys.get().await {
+                Ok(_) => info!(
+                    "Orchard proving key{} ready in {:?}",
+                    if keys.build_ironwood {
+                        " + Ironwood (PostNu6_3) proving key"
+                    } else {
+                        ""
+                    },
+                    started.elapsed()
+                ),
+                // Only a panic inside the keygen gets here. Sends will retry (and fail the same
+                // way); everything else - sync, reads - keeps working, so this is not fatal.
+                Err(e) => error!("building the Orchard proving key failed: {e}"),
+            }
+        });
+    }
+
+    /// The built keys, awaiting the background build if it is still running.
+    pub async fn get(&self) -> Result<Arc<ProvingKeyCache>, RpcError> {
+        let build_ironwood = self.build_ironwood;
+        self.cell
+            .get_or_try_init(|| async move {
+                tokio::task::spawn_blocking(move || {
+                    Arc::new(ProvingKeyCache::build(build_ironwood))
+                })
+                .await
+                .map_err(|e| {
+                    RpcError::wallet(format!("building the Orchard proving key failed: {e}"))
+                })
+            })
+            .await
+            .cloned()
     }
 }
 
@@ -440,11 +525,12 @@ pub struct ActorConfig {
     pub orchard_action_limit: usize,
     /// Shared cached Orchard proving/verifying keys (`[spend] cache_proving_key`). `Some`
     /// selects the PCZT prove path with the cached key; `None` selects the legacy fused path
-    /// (`create_proposed_transactions`), which rebuilds the proving key per send. Built once in
-    /// `daemon::run` and cloned into every actor (the key is wallet-independent). NB: the PCZT
-    /// path here signs only Orchard spends, so a wallet that can spend Sapling notes
-    /// (`enabled_pools` includes Sapling) falls back to the fused path regardless - see `do_send`.
-    pub orchard_keys: Option<Arc<ProvingKeyCache>>,
+    /// (`create_proposed_transactions`), which rebuilds the proving key per send. Created once in
+    /// `daemon::run` and cloned into every actor (the key is wallet-independent), with the keygen
+    /// itself running in the background - a send awaits it. NB: the PCZT path here signs only
+    /// Orchard spends, so a wallet that can spend Sapling notes (`enabled_pools` includes
+    /// Sapling) falls back to the fused path regardless - see `do_send`.
+    pub orchard_keys: Option<Arc<ProvingKeys>>,
     /// Run the proving step off the actor so a long send doesn't freeze sync (`[spend]
     /// pipeline_proving`). Only engages on the cached-Orchard PCZT path; off by default.
     pub pipeline_proving: bool,
@@ -573,9 +659,9 @@ struct WalletActor {
     /// Shared (`Arc`) so the proving step can be moved onto a blocking thread when
     /// `pipeline_proving` is on (`LocalTxProver` is built once and is read-only during proving).
     prover: Arc<LocalTxProver>,
-    /// Cached Orchard keys for the PCZT send path (`None` = legacy fused path). See
-    /// [`ProvingKeyCache`].
-    orchard_keys: Option<Arc<ProvingKeyCache>>,
+    /// Cached Orchard keys for the PCZT send path (`None` = legacy fused path). Built in the
+    /// background; a send awaits it. See [`ProvingKeys`].
+    orchard_keys: Option<Arc<ProvingKeys>>,
     /// `[spend] pipeline_proving`: run a send's prove+sign off the actor so it doesn't freeze
     /// sync. Only engages on the cached-Orchard PCZT path (see [`Self::pipeline_eligible`]).
     pipeline_proving: bool,
@@ -3715,7 +3801,14 @@ impl WalletActor {
         // (store), all on the actor. Each phase is timed so the send-latency log shows where the
         // cost lands on a large, note-fragmented wallet.
         let (pczt, shape, build) = self.build_proposal_and_pczt(request, policy, privacy)?;
-        let keys = self.orchard_keys.clone().expect("cached path");
+        // Awaits the background keygen if this is the first send of a young daemon; a no-op once
+        // it has finished. Only sends wait - reads and sync never touch the key.
+        let keys = self
+            .orchard_keys
+            .clone()
+            .expect("cached path")
+            .get()
+            .await?;
         let prover = self.prover.clone();
         let db = &mut self.db_data;
         let (txid, raw, prove, store): (TxId, Vec<u8>, Duration, Duration) =
@@ -3724,7 +3817,7 @@ impl WalletActor {
                 let signed = prove_sign_pczt(pczt, &usk, &prover, &keys)?;
                 let prove = p0.elapsed();
                 let s0 = Instant::now();
-                let txid = store_pczt(db, signed, &keys)?;
+                let txid = store_pczt(db, signed)?;
                 let raw = read_raw_tx(db, txid)?;
                 Ok((txid, raw, prove, s0.elapsed()))
             })?;
@@ -3938,10 +4031,22 @@ impl WalletActor {
         };
 
         let prover = self.prover.clone();
-        let keys = self
+        // As on the inline path, this awaits the background keygen only on a young daemon's
+        // first send. It happens before `send_in_flight` is set, so a keygen failure leaves the
+        // pipeline free rather than wedged.
+        let keys = match self
             .orchard_keys
             .clone()
-            .expect("pipeline requires cached keys");
+            .expect("pipeline requires cached keys")
+            .get()
+            .await
+        {
+            Ok(k) => k,
+            Err(e) => {
+                let _ = reply.send(Err(e));
+                return;
+            }
+        };
         let done_tx = self.send_done_tx.clone();
         let name = self.name.clone();
         self.send_in_flight = true;
@@ -4014,16 +4119,12 @@ impl WalletActor {
         build: Duration,
         prove: Duration,
     ) -> Result<TxId, RpcError> {
-        let keys = self
-            .orchard_keys
-            .clone()
-            .expect("pipeline requires cached keys");
         let db = &mut self.db_data;
         let _ = policy; // store rarely surfaces -6; kept for symmetry with the inline path.
         let (txid, raw, store): (TxId, Vec<u8>, Duration) =
             tokio::task::block_in_place(move || -> Result<_, RpcError> {
                 let s0 = Instant::now();
-                let txid = store_pczt(db, signed, &keys)?;
+                let txid = store_pczt(db, signed)?;
                 let raw = read_raw_tx(db, txid)?;
                 Ok((txid, raw, s0.elapsed()))
             })?;
@@ -5181,13 +5282,16 @@ fn prove_sign_pczt(
 /// unconstrained here - it only appears in the error type - so pin it to our `WalletDb`'s note ref,
 /// as `error::ProposalError` does for the fused path.
 ///
-/// Orchard verifying key: the extractor verifies *both* the Orchard and the Ironwood bundles with
-/// the single `orchard_vk` argument, but they use different circuit versions (`FixedPostNu6_2` vs
-/// `PostNu6_3`), so a single cached VK can't cover a post-NU6.3 send that carries both bundles. So
-/// pass `None` whenever the PCZT actually has an Ironwood bundle: the extractor then rebuilds the
-/// correct verifying key *per bundle* from each bundle's own version (a `VerifyingKey::build` per
-/// bundle - the cheaper `keygen_vk`, and only on Ironwood sends). A pre-NU6.3 send has only a
-/// `FixedPostNu6_2` Orchard bundle, so it reuses the cached `orchard_vk` and rebuilds nothing.
+/// Orchard verifying key: **always `None`**. The extractor verifies *both* the Orchard and the
+/// Ironwood bundles through that one argument, but they use different circuit versions
+/// (`FixedPostNu6_2` vs `PostNu6_3`), so no single key can cover a post-NU6.3 send carrying both -
+/// and passing `None` makes the extractor generate the right verifying key *per bundle* from each
+/// bundle's own version (a `keygen_vk`, cheaper than the proving keygen). zecd used to cache the
+/// `FixedPostNu6_2` key and pass it for the Ironwood-free case, but NU6.3 is live on both public
+/// networks, so every send now carries an Ironwood bundle and that cache went unread while costing
+/// ~1.2 s of every startup. The one path that still hits the on-the-fly `keygen_vk` for an Orchard
+/// V2 bundle is a pre-NU6.3 chain, i.e. a regtest chain started without
+/// `ZECD_REGTEST_NU63_HEIGHT`.
 ///
 /// The Ironwood bundle's own outputs are recorded by the extractor as of `zcash_client_backend
 /// 0.24.0-rc.7`. Through rc.6 it built its `SentTransaction` outputs from the Sapling and Orchard
@@ -5196,18 +5300,9 @@ fn prove_sign_pczt(
 /// node (the compact scan materializes the notes but carries no memos, and enhancement skips a tx
 /// whose raw bytes the send pre-stored). zecd covered that by re-decrypting the just-stored
 /// transaction here; the pass is gone with the version that made it unnecessary.
-fn store_pczt(
-    db: &mut WriteDb,
-    pczt: pczt::Pczt,
-    keys: &ProvingKeyCache,
-) -> Result<TxId, RpcError> {
-    let orchard_vk = if pczt.ironwood().actions().is_empty() {
-        Some(&keys.orchard_vk)
-    } else {
-        None
-    };
+fn store_pczt(db: &mut WriteDb, pczt: pczt::Pczt) -> Result<TxId, RpcError> {
     extract_and_store_transaction_from_pczt::<_, zcash_client_sqlite::ReceivedNoteId>(
-        db, pczt, None, orchard_vk,
+        db, pczt, None, None,
     )
     .map_err(|e| RpcError::wallet(format!("storing transaction failed: {e}")))
 }
@@ -5518,6 +5613,27 @@ mod tests {
     use super::select_transparent_inputs;
     use super::transparent_child_index;
     use super::DiversifierIndex;
+    use super::ProvingKeys;
+
+    /// Every `get` shares one [`super::ProvingKeyCache`] rather than generating a key per send.
+    /// The regtest tier cannot catch a regression here - rebuilding per send is slower, not
+    /// wrong, and e2e send timings are noise-dominated.
+    ///
+    /// `#[ignore]` because a *debug* keygen is ~25 s (measured on 4 cores) - too slow for the
+    /// offline tier, whose value is being fast and always green. Run it with
+    /// `cargo test -- --include-ignored`, and after any `orchard`/`halo2_proofs` bump.
+    #[ignore = "runs a real Orchard keygen: ~25s in a debug build"]
+    #[tokio::test]
+    async fn proving_keys_are_built_once_and_shared() {
+        // `false`: skip the Ironwood keygen, which this assertion doesn't need.
+        let keys = ProvingKeys::new(false);
+        let first = keys.get().await.expect("keygen");
+        let second = keys.get().await.expect("keygen");
+        assert!(
+            std::sync::Arc::ptr_eq(&first, &second),
+            "each call rebuilt the proving key instead of sharing the cached one"
+        );
+    }
 
     #[test]
     fn preexpose_progress_stats_computes_pct_rate_eta() {
