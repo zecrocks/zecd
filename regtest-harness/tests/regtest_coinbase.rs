@@ -31,16 +31,14 @@
 //! zebra 6.0.0 the flush can lag by many seconds). After the single restart every block pays
 //! zecd, so the coinbase set the assertions key on is deterministic.
 //!
-//! Neither test needs the devtool funder or lightwalletd: zebra's own `generate` mines straight
+//! Neither test needs the funding wallet: zebra's own `generate` mines straight
 //! to zecd. Skips cleanly unless `ZEBRAD_BIN` is set.
 
 use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
-use zecd_regtest_harness::{pick_port, resolve_bin, Zebrad, Zecd, ZecdConfig};
+use zecd_regtest_harness::{pick_port, resolve_bin, Zebrad, Zecd, ZecdConfig, SEED_MINER_ADDRESS};
 
-/// Throwaway P2SH miner address for the pre-zecd seed blocks.
-const SEED_MINER_ADDRESS: &str = "t27eWDgjFYJGVXmzrXeVjnb5J3uXDM9xH9v";
 /// Coinbases mined to zecd before the maturity/aging phase (the deterministic assertion set).
 const ZECD_COINBASES: u64 = 8;
 const SYNC_TIMEOUT: Duration = Duration::from_secs(240);

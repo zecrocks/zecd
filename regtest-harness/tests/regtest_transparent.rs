@@ -16,66 +16,36 @@
 //! configured with `[pools] transparent = true` (Orchard-only enabled, as default), zecd hands out
 //! a `t…` receiving address, and the funder pays *that* - an ordinary shielded→transparent send.
 //!
-//! Skips cleanly unless `ZEBRAD_BIN`, `LIGHTWALLETD_BIN` and `DEVTOOL_BIN` are all set.
+//! Skips cleanly unless `ZEBRAD_BIN` is set.
 
 use std::time::{Duration, Instant};
 
 use serde_json::json;
 use zecd_regtest_harness::{
-    pick_port, resolve_bin, resolve_node_bin, Funder, Lightwalletd, RegtestNode, Zebrad, Zecd,
-    ZecdConfig,
+    pick_port, resolve_node_bin, start_funded_chain, RegtestNode, Zecd, ZecdConfig,
 };
 
-const FUNDER_COINBASES: u32 = 120;
-const MATURITY_TAIL: u32 = 130;
-const TAIL_MINER_ADDRESS: &str = "t27eWDgjFYJGVXmzrXeVjnb5J3uXDM9xH9v";
 const FUND_ZATOSHIS: u64 = 100_000_000; // 1 ZEC
 const FUND_TIMEOUT: Duration = Duration::from_secs(240);
 
 #[tokio::test]
 async fn regtest_transparent_receive_and_autoshield_spend() {
-    let (Some(zebrad_bin), Some(lwd_bin), Some(devtool_bin)) = (
-        resolve_node_bin(),
-        resolve_bin("LIGHTWALLETD_BIN"),
-        resolve_bin("DEVTOOL_BIN"),
-    ) else {
+    let Some(zebrad_bin) = resolve_node_bin() else {
         eprintln!(
-            "SKIP regtest_transparent_receive_and_autoshield_spend: set {}, \
-             LIGHTWALLETD_BIN and DEVTOOL_BIN to run the transparent e2e (see README.md). The \
+            "SKIP regtest_transparent_receive_and_autoshield_spend: set {} to run the transparent e2e (see README.md). The \
              harness still compiled.",
             RegtestNode::from_env().bin_env()
         );
         return;
     };
 
-    // 1-4. Identical funder bring-up to regtest_funded: mine + mature + shield the funder.
-    let funder_taddr = Funder::derive_transparent_address(&devtool_bin)
-        .expect("derive funder transparent address");
-    let mut zebrad = Zebrad::start_with_miner(&zebrad_bin, &funder_taddr)
+    // 1-4. Bring up the chain and its funding wallet: mine + mature the funder's coinbase and
+    //      shield it into Orchard. See `start_funded_chain`.
+    let (zebrad, funder) = start_funded_chain(&zebrad_bin)
         .await
-        .expect("start zebrad mining to the funder");
-    zebrad
-        .generate_blocks(FUNDER_COINBASES)
-        .await
-        .expect("mine the funder's coinbases");
-    zebrad
-        .restart_with_miner(TAIL_MINER_ADDRESS)
-        .await
-        .expect("restart zebrad mining to the throwaway address");
-    zebrad
-        .generate_blocks(MATURITY_TAIL)
-        .await
-        .expect("mine the maturity tail");
-    let lwd = Lightwalletd::start(&lwd_bin, zebrad.rpc_port)
-        .await
-        .expect("start lightwalletd");
-    let funder = Funder::init(&devtool_bin, lwd.grpc_port).expect("initialise funding wallet");
-    funder.sync(lwd.grpc_port).expect("funder sync (coinbase)");
-    funder
-        .shield(lwd.grpc_port)
-        .expect("shield transparent coinbase");
-    zebrad.generate_blocks(6).await.expect("confirm shield");
-    funder.sync(lwd.grpc_port).expect("funder sync (shielded)");
+        .expect("bring up a funded regtest chain");
+    // The funder's own bare t-address, used here as an external transparent counterparty.
+    let funder_taddr = funder.transparent_address().to_string();
 
     // 5. zecd with transparent receiving enabled (Orchard-only otherwise).
     let mut cfg = ZecdConfig::new(zebrad.rpc_port, pick_port().expect("pick zecd rpc port"));
@@ -288,7 +258,8 @@ async fn regtest_transparent_receive_and_autoshield_spend() {
     //    via the block scan. (`listunspent minconf=0` reads the wallet DB directly and lists unmined
     //    transparent UTXOs, so it is the authoritative 0-conf signal here.)
     funder
-        .send(lwd.grpc_port, &taddr, FUND_ZATOSHIS)
+        .send(&taddr, FUND_ZATOSHIS)
+        .await
         .expect("send to zecd's transparent address");
 
     // 7a. 0-conf: before any block confirms the funding tx, the transparent receive shows in
@@ -331,6 +302,13 @@ async fn regtest_transparent_receive_and_autoshield_spend() {
         .generate_blocks(12)
         .await
         .expect("confirm transparent receive");
+    // Wait for the *scan* to reach the tip, not just for a balance. zecd already counts this
+    // receive from the mempool while it is unmined, so the balance poll below is satisfied the
+    // moment the blocks are mined - before the funding block has been scanned - and `listunspent`
+    // (minconf 1) would still be empty.
+    zecd.wait_until_synced_to_node(&zebrad, FUND_TIMEOUT)
+        .await
+        .expect("zecd scans the block confirming the transparent receive");
 
     // 8. The confirmed transparent receive shows up in the balance/listunspent/history RPCs.
     let deadline = Instant::now() + FUND_TIMEOUT;
@@ -471,7 +449,8 @@ async fn regtest_transparent_receive_and_autoshield_spend() {
         "issued a distinct beyond-window t-addr: {beyond_taddr}"
     );
     funder
-        .send(lwd.grpc_port, &beyond_taddr, FUND_ZATOSHIS)
+        .send(&beyond_taddr, FUND_ZATOSHIS)
+        .await
         .expect("fund the beyond-window transparent address");
 
     // Discovery (at 0-conf, via the mempool matcher) of the beyond-window receive is the proof that
@@ -536,7 +515,8 @@ async fn regtest_transparent_receive_and_autoshield_spend() {
     );
 
     funder
-        .send(lwd.grpc_port, &indexed_taddr, FUND_ZATOSHIS)
+        .send(&indexed_taddr, FUND_ZATOSHIS)
+        .await
         .expect("fund the index-derived transparent address");
     let deadline = Instant::now() + FUND_TIMEOUT;
     loop {
@@ -557,8 +537,6 @@ async fn regtest_transparent_receive_and_autoshield_spend() {
         );
         tokio::time::sleep(Duration::from_millis(500)).await;
     }
-
-    lwd.stop();
     drop(zecd);
     // `zebrad` and `funder` clean up on drop.
 }

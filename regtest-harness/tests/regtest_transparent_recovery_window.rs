@@ -19,9 +19,9 @@ use std::time::{Duration, Instant};
 use serde_json::json;
 use zecd_regtest_harness::{
     pick_port, resolve_node_bin, RegtestNode, RpcError, Zebrad, Zecd, ZecdConfig,
+    SEED_MINER_ADDRESS,
 };
 
-const TAIL_MINER_ADDRESS: &str = "t27eWDgjFYJGVXmzrXeVjnb5J3uXDM9xH9v";
 const READY_TIMEOUT: Duration = Duration::from_secs(120);
 /// Small gap so the window is reached after only a few addresses (CI speed). The mechanism is
 /// identical at the default of 20.
@@ -41,7 +41,7 @@ async fn regtest_transparent_recovery_window_hard_stop_and_allow_beyond() {
     };
 
     // A minimal chain so zecd has a tip to sync to and can serve getnewaddress.
-    let zebrad = Zebrad::start_with_miner(&zebrad_bin, TAIL_MINER_ADDRESS)
+    let zebrad = Zebrad::start_with_miner(&zebrad_bin, SEED_MINER_ADDRESS)
         .await
         .expect("start zebrad");
     zebrad

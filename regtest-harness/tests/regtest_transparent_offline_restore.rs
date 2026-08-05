@@ -17,20 +17,16 @@
 //! believing it still held money it had already spent, and able to select the spent output for a
 //! send that would fail at broadcast.
 //!
-//! Skips cleanly unless the node binary, `LIGHTWALLETD_BIN` and `DEVTOOL_BIN` are all set
-//! (lightwalletd is needed for the devtool funder even on the zebra leg).
+//! Skips cleanly unless the node binary is set.
 
 use std::time::{Duration, Instant};
 
 use serde_json::json;
 use zecd_regtest_harness::{
-    pick_port, resolve_bin, resolve_node_bin, Funder, Lightwalletd, RegtestNode, Zebrad, Zecd,
+    pick_port, resolve_node_bin, start_funded_chain, RegtestNode, Zebrad, Zecd,
     ZecdConfig,
 };
 
-const FUNDER_COINBASES: u32 = 120;
-const MATURITY_TAIL: u32 = 130;
-const TAIL_MINER_ADDRESS: &str = "t27eWDgjFYJGVXmzrXeVjnb5J3uXDM9xH9v";
 /// 1 ZEC, in zatoshis.
 const FUND_ZATOSHIS: u64 = 100_000_000;
 const FUND_TIMEOUT: Duration = Duration::from_secs(240);
@@ -40,52 +36,21 @@ const RECOVER_TIMEOUT: Duration = Duration::from_secs(120);
 
 #[tokio::test]
 async fn regtest_transparent_offline_receive_and_spend_are_restored() {
-    let (Some(node_bin), Some(lwd_bin), Some(devtool_bin)) = (
-        resolve_node_bin(),
-        resolve_bin("LIGHTWALLETD_BIN"),
-        resolve_bin("DEVTOOL_BIN"),
-    ) else {
+    let Some(node_bin) = resolve_node_bin() else {
         eprintln!(
-            "SKIP regtest_transparent_offline_receive_and_spend_are_restored: set {}, \
-             LIGHTWALLETD_BIN and DEVTOOL_BIN to run the offline-restore e2e (see README.md). \
+            "SKIP regtest_transparent_offline_receive_and_spend_are_restored: set {} to run the offline-restore e2e (see README.md). \
              The harness still compiled.",
             RegtestNode::from_env().bin_env()
         );
         return;
     };
 
-    // Funder bring-up, identical to the other transparent suites: mine + mature + shield.
-    let funder_taddr = Funder::derive_transparent_address(&devtool_bin)
-        .expect("derive funder transparent address");
-    let mut zebrad = Zebrad::start_with_miner(&node_bin, &funder_taddr)
+    // Funder bring-up, identical to the other transparent suites. See `start_funded_chain`.
+    let (zebrad, funder) = start_funded_chain(&node_bin)
         .await
-        .expect("start the node mining to the funder");
-    zebrad
-        .generate_blocks(FUNDER_COINBASES)
-        .await
-        .expect("mine the funder's coinbases");
-    zebrad
-        .restart_with_miner(TAIL_MINER_ADDRESS)
-        .await
-        .expect("restart the node mining to the throwaway address");
-    zebrad
-        .generate_blocks(MATURITY_TAIL)
-        .await
-        .expect("mine the maturity tail");
-    let funder_lwd = Lightwalletd::start(&lwd_bin, zebrad.rpc_port)
-        .await
-        .expect("start the funder's lightwalletd");
-    let funder = Funder::init(&devtool_bin, funder_lwd.grpc_port).expect("initialise the funder");
-    funder
-        .sync(funder_lwd.grpc_port)
-        .expect("funder sync (coinbase)");
-    funder
-        .shield(funder_lwd.grpc_port)
-        .expect("shield transparent coinbase");
-    zebrad.generate_blocks(6).await.expect("confirm shield");
-    funder
-        .sync(funder_lwd.grpc_port)
-        .expect("funder sync (shielded)");
+        .expect("bring up a funded regtest chain");
+    // The funder's bare t-address doubles as the external counterparty this wallet pays.
+    let funder_taddr = funder.transparent_address().to_string();
 
     // A. The authoring wallet: transparent receiving plus fully-transparent spends, so the t→t
     //    send keeps its change transparent and never touches a shielded pool.
@@ -110,7 +75,8 @@ async fn regtest_transparent_offline_receive_and_spend_are_restored() {
 
     // Fund the t-addr and wait for the mined receive.
     funder
-        .send(funder_lwd.grpc_port, &taddr, FUND_ZATOSHIS / 2)
+        .send(&taddr, FUND_ZATOSHIS / 2)
+        .await
         .expect("fund the authoring wallet's t-addr");
     zebrad
         .generate_blocks(2)

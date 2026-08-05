@@ -23,22 +23,16 @@
 //! select+build … prove+sign … store … broadcast …`) are the Layer-0 profiling artifact - set
 //! `ZECD_STDERR=1` to stream them into the CI log.
 //!
-//! Skips cleanly unless `ZEBRAD_BIN`, `LIGHTWALLETD_BIN`, `DEVTOOL_BIN` are all set *and*
+//! Skips cleanly unless `ZEBRAD_BIN` is set *and*
 //! `ZECD_REGTEST_STRESS=1`.
 
 use std::time::{Duration, Instant};
 
 use serde_json::json;
 use zecd_regtest_harness::{
-    pick_port, resolve_bin, resolve_node_bin, stress_enabled, stress_note_count, Funder,
-    Lightwalletd, RegtestNode, Zebrad, Zecd, ZecdConfig,
+    pick_port, resolve_node_bin, start_funded_chain, stress_enabled, stress_note_count,
+    RegtestNode, Zebrad, Zecd, ZecdConfig,
 };
-
-/// Coinbases mined to the funder, then aged past maturity - same single-chain shaping as the
-/// funded e2e (see `regtest_funded.rs`); ~21 of these finalize and become spendable.
-const FUNDER_COINBASES: u32 = 120;
-const MATURITY_TAIL: u32 = 130;
-const TAIL_MINER_ADDRESS: &str = "t27eWDgjFYJGVXmzrXeVjnb5J3uXDM9xH9v";
 
 /// Value of each note the wallet is fragmented into (0.001 ZEC - comfortably above dust and the
 /// ZIP-317 marginal fee, so notes don't decay as the build loop recycles them).
@@ -68,13 +62,9 @@ async fn regtest_stress_many_notes() {
         );
         return;
     }
-    let (Some(zebrad_bin), Some(lwd_bin), Some(devtool_bin)) = (
-        resolve_node_bin(),
-        resolve_bin("LIGHTWALLETD_BIN"),
-        resolve_bin("DEVTOOL_BIN"),
-    ) else {
+    let Some(zebrad_bin) = resolve_node_bin() else {
         eprintln!(
-            "SKIP regtest_stress_many_notes: set {}, LIGHTWALLETD_BIN and DEVTOOL_BIN \
+            "SKIP regtest_stress_many_notes: set {}, \
              to run the stress e2e (see README.md).",
             RegtestNode::from_env().bin_env()
         );
@@ -85,34 +75,14 @@ async fn regtest_stress_many_notes() {
     eprintln!("stress: building a wallet of >= {note_target} notes");
 
     // --- Single-chain funding (mirrors regtest_funded.rs) ---
-    let funder_taddr = Funder::derive_transparent_address(&devtool_bin)
-        .expect("derive funder transparent address");
-    let mut zebrad = Zebrad::start_with_miner(&zebrad_bin, &funder_taddr)
+    // 1-4. Bring up the chain and its funding wallet: seed blocks to a throwaway address,
+    //      create the funder against them, mine and mature its coinbase, shield it into
+    //      Orchard. See `start_funded_chain`.
+    let (zebrad, funder) = start_funded_chain(&zebrad_bin)
         .await
-        .expect("start zebrad mining to the funder");
-    zebrad
-        .generate_blocks(FUNDER_COINBASES)
-        .await
-        .expect("mine the funder's coinbases");
-    zebrad
-        .restart_with_miner(TAIL_MINER_ADDRESS)
-        .await
-        .expect("restart zebrad mining to the throwaway address");
-    zebrad
-        .generate_blocks(MATURITY_TAIL)
-        .await
-        .expect("mine the maturity tail");
-
-    let lwd = Lightwalletd::start(&lwd_bin, zebrad.rpc_port)
-        .await
-        .expect("start lightwalletd");
-    let funder = Funder::init(&devtool_bin, lwd.grpc_port).expect("initialise funding wallet");
-    funder.sync(lwd.grpc_port).expect("funder sync (coinbase)");
-    funder
-        .shield(lwd.grpc_port)
-        .expect("shield transparent coinbase into Orchard");
-    zebrad.generate_blocks(6).await.expect("confirm shield");
-    funder.sync(lwd.grpc_port).expect("funder sync (shielded)");
+        .expect("bring up a funded regtest chain");
+    // The funder's own bare t-address, used here as an external transparent counterparty.
+    let funder_taddr = funder.transparent_address().to_string();
 
     // --- zecd with the pipeline on (and the action cap lifted so big fan-out/sweep sends aren't
     //     rejected by `orchard_action_limit`). cache_proving_key stays default-on: the pipeline
@@ -142,7 +112,8 @@ async fn regtest_stress_many_notes() {
     let headroom = (note_target as u64) * 20_000 + 50_000_000;
     let fund_zat = (note_target as u64) * PER_NOTE_ZAT + headroom;
     funder
-        .send(lwd.grpc_port, &zecd_ua, fund_zat)
+        .send(&zecd_ua, fund_zat)
+        .await
         .expect("fund zecd with the seed note");
     zebrad.generate_blocks(6).await.expect("confirm the fund");
     let tip = zebrad_tip(&zebrad).await;
@@ -278,30 +249,32 @@ async fn getbalance_zec(zecd: &Zecd) -> f64 {
         .expect("getbalance number")
 }
 
-/// Poll an async operation (`z_sendmany`) to completion, panicking on failure/timeout.
+/// Await an async operation (`z_sendmany`) via `z_waitforoperation`, panicking on
+/// failure/timeout. Called in a loop of bounded server-side waits rather than one long one: the
+/// stress test's proving runs are multi-minute, a blocking call holds a work-queue permit, and
+/// re-issuing keeps the harness's own deadline the authority. Timing out server-side is not an
+/// error - `finished: false` just means "still running", per the RPC's contract.
 async fn await_opid(zecd: &Zecd, opid: &str, timeout: Duration) {
     let deadline = Instant::now() + timeout;
     loop {
-        let st = zecd
-            .call("z_getoperationstatus", json!([[opid]]))
-            .await
-            .expect("z_getoperationstatus");
-        let status = st
-            .as_array()
-            .and_then(|a| a.first())
-            .and_then(|o| o.get("status"))
-            .and_then(|s| s.as_str())
-            .unwrap_or("");
-        match status {
-            "success" => return,
-            "failed" => panic!("operation {opid} failed: {st}"),
-            _ => {}
-        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
         assert!(
-            Instant::now() < deadline,
-            "operation {opid} did not finish within {timeout:?}: {st}"
+            !remaining.is_zero(),
+            "operation {opid} did not finish within {timeout:?}"
         );
-        tokio::time::sleep(Duration::from_millis(500)).await;
+        let wait_secs = remaining.as_secs().clamp(1, 30);
+        let st = zecd
+            .call("z_waitforoperation", json!([opid, wait_secs]))
+            .await
+            .expect("z_waitforoperation");
+        if st["finished"] == json!(true) {
+            assert_eq!(
+                st["status"],
+                json!("success"),
+                "operation {opid} failed: {st}"
+            );
+            return;
+        }
     }
 }
 

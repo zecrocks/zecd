@@ -14,8 +14,7 @@
 //!     on both pools (its Orchard funding is itself an ironwood note post-NU6.3), so the
 //!     "held no ironwood beforehand" precondition could not hold there.
 //!
-//! Requires a node that accepts the `"NU6.3"` regtest activation-height key (zebrad >= 6.2.2), a
-//! V6-parsing lightwalletd, a `regtest_support` `zcash-devtool` funder, and
+//! Requires a node that accepts the `"NU6.3"` regtest activation-height key (zebrad >= 6.2.2) and
 //! `ZECD_REGTEST_NU63_HEIGHT=8` in zecd's environment - the same stack every other funded binary in
 //! this tier now uses.
 //!
@@ -27,75 +26,32 @@ use std::time::{Duration, Instant};
 
 use serde_json::json;
 use zecd_regtest_harness::{
-    pick_port, resolve_bin, resolve_node_bin, Funder, Lightwalletd, RegtestNode, Zebrad, Zecd,
-    ZecdConfig,
+    pick_port, resolve_node_bin, start_funded_chain, RegtestNode, Zecd, ZecdConfig,
 };
 
-/// Coinbase blocks mined to the funder up front (see `regtest_funded.rs` for the finalization
-/// rationale). The tip ends far past `NU6_3_ACTIVATION_HEIGHT` (8), so NU6.3 is active for the send.
-const FUNDER_COINBASES: u32 = 120;
-/// Maturity tail mined to a throwaway address after the miner swap, so the funder's coinbases age
-/// past the 100-block maturity.
-const MATURITY_TAIL: u32 = 130;
-/// A throwaway P2SH address that mines the maturity tail (the funder does not control it).
-const TAIL_MINER_ADDRESS: &str = "t27eWDgjFYJGVXmzrXeVjnb5J3uXDM9xH9v";
 /// 1 ZEC, in zatoshis.
 const FUND_ZATOSHIS: u64 = 100_000_000;
-/// Generous: lightwalletd ingestion + zecd scan + Orchard/ironwood proving.
+/// Generous: chain scan + Orchard/ironwood proving.
 const FUND_TIMEOUT: Duration = Duration::from_secs(240);
 
 #[tokio::test]
 async fn regtest_ironwood_receive_and_orchard_send() {
-    let (Some(zebrad_bin), Some(lwd_bin), Some(devtool_bin)) = (
-        resolve_node_bin(),
-        resolve_bin("LIGHTWALLETD_BIN"),
-        resolve_bin("DEVTOOL_BIN"),
-    ) else {
+    let Some(zebrad_bin) = resolve_node_bin() else {
         eprintln!(
-            "SKIP: set {}, LIGHTWALLETD_BIN and DEVTOOL_BIN (plus ZECD_REGTEST_NU63_HEIGHT=8) to \
+            "SKIP: set {} (plus ZECD_REGTEST_NU63_HEIGHT=8) to \
              run the ironwood pool-structure e2e (see README.md). The harness still compiled.",
             RegtestNode::from_env().bin_env()
         );
         return;
     };
 
-    // 1. Learn the funder's transparent address offline, so zebra mines straight to it (one chain).
-    let funder_taddr =
-        Funder::derive_transparent_address(&devtool_bin).expect("derive funder transparent addr");
-
-    // 2. Start an NU6.3-active regtest node, mine the funder's coinbases, then restart
-    //    mining to a throwaway address and grow a maturity tail. NU6.3 is active from height 8, so
-    //    every spend below lands on a V6/ironwood-capable chain.
-    let mut zebrad = Zebrad::start_with_miner(&zebrad_bin, &funder_taddr)
+    // 1-4. Bring up an NU6.3-active chain and its funding wallet: seed blocks to a throwaway
+    //      address, create the funder against them, point the miner at it, then mature and shield
+    //      its coinbase. NU6.3 activates at height 8, so every spend below lands on a
+    //      V6/ironwood-capable chain. See `start_funded_chain`.
+    let (zebrad, funder) = start_funded_chain(&zebrad_bin)
         .await
-        .expect("start ironwood zebrad mining to the funder");
-    zebrad
-        .generate_blocks(FUNDER_COINBASES)
-        .await
-        .expect("mine the funder's coinbases");
-    zebrad
-        .restart_with_miner(TAIL_MINER_ADDRESS)
-        .await
-        .expect("restart zebrad mining to the throwaway address");
-    zebrad
-        .generate_blocks(MATURITY_TAIL)
-        .await
-        .expect("mine the maturity tail");
-
-    // 3. lightwalletd (V6-aware) in front of zebra, for the funder.
-    let lwd = Lightwalletd::start(&lwd_bin, zebrad.rpc_port)
-        .await
-        .expect("start lightwalletd");
-
-    // 4. Funder shields its matured transparent coinbase into Orchard. The ironwood devtool requires
-    //    `init` to carry the regtest `--activation-heights` (matching this chain's NU6.3 height).
-    let funder = Funder::init(&devtool_bin, lwd.grpc_port).expect("initialise funding wallet");
-    funder.sync(lwd.grpc_port).expect("funder sync (coinbase)");
-    funder
-        .shield(lwd.grpc_port)
-        .expect("shield transparent coinbase into Orchard");
-    zebrad.generate_blocks(6).await.expect("confirm shield");
-    funder.sync(lwd.grpc_port).expect("funder sync (shielded)");
+        .expect("bring up a funded regtest chain");
 
     // 5. zecd (ironwood compiled unconditionally) against zebra; get its unified address.
     let cfg = ZecdConfig::new(zebrad.rpc_port, pick_port().expect("pick zecd rpc port"));
@@ -148,7 +104,8 @@ async fn regtest_ironwood_receive_and_orchard_send() {
     //    ironwood output (no `migrate` needed), so zecd should receive an ironwood note at its
     //    Orchard receiver.
     funder
-        .send(lwd.grpc_port, &zecd_ua, FUND_ZATOSHIS)
+        .send(&zecd_ua, FUND_ZATOSHIS)
+        .await
         .expect("send funds to zecd (auto-routed to ironwood post-NU6.3)");
     zebrad
         .generate_blocks(6)
@@ -405,47 +362,19 @@ async fn regtest_ironwood_receive_and_orchard_send() {
 /// before the send, any ironwood note afterwards is proof the send itself minted it.
 #[tokio::test]
 async fn regtest_ironwood_sapling_send() {
-    let (Some(zebrad_bin), Some(lwd_bin), Some(devtool_bin)) = (
-        resolve_node_bin(),
-        resolve_bin("LIGHTWALLETD_BIN"),
-        resolve_bin("DEVTOOL_BIN"),
-    ) else {
+    let Some(zebrad_bin) = resolve_node_bin() else {
         eprintln!(
-            "SKIP: set {}, LIGHTWALLETD_BIN and DEVTOOL_BIN (plus ZECD_REGTEST_NU63_HEIGHT=8) to \
+            "SKIP: set {} (plus ZECD_REGTEST_NU63_HEIGHT=8) to \
              run the ironwood pool-structure e2e (see README.md). The harness still compiled.",
             RegtestNode::from_env().bin_env()
         );
         return;
     };
 
-    // Same NU6.3-active regtest bring-up + funder shield as the receive test.
-    let funder_taddr =
-        Funder::derive_transparent_address(&devtool_bin).expect("derive funder transparent addr");
-    let mut zebrad = Zebrad::start_with_miner(&zebrad_bin, &funder_taddr)
+    // Same NU6.3-active bring-up + funder shield as the receive test.
+    let (zebrad, funder) = start_funded_chain(&zebrad_bin)
         .await
-        .expect("start ironwood zebrad mining to the funder");
-    zebrad
-        .generate_blocks(FUNDER_COINBASES)
-        .await
-        .expect("mine the funder's coinbases");
-    zebrad
-        .restart_with_miner(TAIL_MINER_ADDRESS)
-        .await
-        .expect("restart zebrad mining to the throwaway address");
-    zebrad
-        .generate_blocks(MATURITY_TAIL)
-        .await
-        .expect("mine the maturity tail");
-    let lwd = Lightwalletd::start(&lwd_bin, zebrad.rpc_port)
-        .await
-        .expect("start lightwalletd");
-    let funder = Funder::init(&devtool_bin, lwd.grpc_port).expect("initialise funding wallet");
-    funder.sync(lwd.grpc_port).expect("funder sync (coinbase)");
-    funder
-        .shield(lwd.grpc_port)
-        .expect("shield transparent coinbase");
-    zebrad.generate_blocks(6).await.expect("confirm shield");
-    funder.sync(lwd.grpc_port).expect("funder sync (shielded)");
+        .expect("bring up a funded regtest chain");
 
     // zecd with BOTH shielded pools enabled, so it can hand out a Sapling receiver and route Orchard
     // outputs (which become ironwood past NU6.3).
@@ -490,7 +419,8 @@ async fn regtest_ironwood_sapling_send() {
     // Fund zecd's Sapling receiver. The funder spends its (ironwood) notes to a Sapling recipient -
     // a cross-pool payment that lands as a plain Sapling note in zecd.
     funder
-        .send(lwd.grpc_port, &sapling_ua, FUND_ZATOSHIS)
+        .send(&sapling_ua, FUND_ZATOSHIS)
+        .await
         .expect("fund zecd's Sapling receiver");
     zebrad
         .generate_blocks(6)

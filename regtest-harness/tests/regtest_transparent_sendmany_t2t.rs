@@ -21,33 +21,25 @@
 //! shielded note), the change is hidden as change in history (two sends - the two recipients - no
 //! phantom self-payment), and a second `sendmany` re-spends that change.
 //!
-//! Skips cleanly unless `ZEBRAD_BIN`, `LIGHTWALLETD_BIN` and `DEVTOOL_BIN` are all set.
+//! Skips cleanly unless `ZEBRAD_BIN` is set.
 
 use std::time::{Duration, Instant};
 
 use serde_json::json;
 use zecd_regtest_harness::{
-    pick_port, resolve_bin, resolve_node_bin, Funder, Lightwalletd, RegtestNode, Zebrad, Zecd,
-    ZecdConfig,
+    pick_port, resolve_node_bin, start_funded_chain, RegtestNode, Zecd, ZecdConfig,
+    SEED_MINER_ADDRESS,
 };
 
-const FUNDER_COINBASES: u32 = 120;
-const MATURITY_TAIL: u32 = 130;
-const TAIL_MINER_ADDRESS: &str = "t27eWDgjFYJGVXmzrXeVjnb5J3uXDM9xH9v";
 const FUND_ZATOSHIS: u64 = 100_000_000; // 1 ZEC
 const FUND_TIMEOUT: Duration = Duration::from_secs(240);
 const SPEND_TIMEOUT: Duration = Duration::from_secs(240);
 
 #[tokio::test]
 async fn regtest_fully_transparent_sendmany_keeps_change_transparent() {
-    let (Some(zebrad_bin), Some(lwd_bin), Some(devtool_bin)) = (
-        resolve_node_bin(),
-        resolve_bin("LIGHTWALLETD_BIN"),
-        resolve_bin("DEVTOOL_BIN"),
-    ) else {
+    let Some(zebrad_bin) = resolve_node_bin() else {
         eprintln!(
-            "SKIP regtest_fully_transparent_sendmany_keeps_change_transparent: set {}, \
-             LIGHTWALLETD_BIN and DEVTOOL_BIN to run the fully-transparent sendmany e2e (see \
+            "SKIP regtest_fully_transparent_sendmany_keeps_change_transparent: set {} to run the fully-transparent sendmany e2e (see \
              README.md). The harness still compiled.",
             RegtestNode::from_env().bin_env()
         );
@@ -55,33 +47,14 @@ async fn regtest_fully_transparent_sendmany_keeps_change_transparent() {
     };
 
     // 1-4. Identical funder bring-up to regtest_transparent_t2t: mine + mature + shield the funder.
-    let funder_taddr = Funder::derive_transparent_address(&devtool_bin)
-        .expect("derive funder transparent address");
-    let mut zebrad = Zebrad::start_with_miner(&zebrad_bin, &funder_taddr)
+    // 1-4. Bring up the chain and its funding wallet: seed blocks to a throwaway address,
+    //      create the funder against them, mine and mature its coinbase, shield it into
+    //      Orchard. See `start_funded_chain`.
+    let (zebrad, funder) = start_funded_chain(&zebrad_bin)
         .await
-        .expect("start zebrad mining to the funder");
-    zebrad
-        .generate_blocks(FUNDER_COINBASES)
-        .await
-        .expect("mine the funder's coinbases");
-    zebrad
-        .restart_with_miner(TAIL_MINER_ADDRESS)
-        .await
-        .expect("restart zebrad mining to the throwaway address");
-    zebrad
-        .generate_blocks(MATURITY_TAIL)
-        .await
-        .expect("mine the maturity tail");
-    let lwd = Lightwalletd::start(&lwd_bin, zebrad.rpc_port)
-        .await
-        .expect("start lightwalletd");
-    let funder = Funder::init(&devtool_bin, lwd.grpc_port).expect("initialise funding wallet");
-    funder.sync(lwd.grpc_port).expect("funder sync (coinbase)");
-    funder
-        .shield(lwd.grpc_port)
-        .expect("shield transparent coinbase");
-    zebrad.generate_blocks(6).await.expect("confirm shield");
-    funder.sync(lwd.grpc_port).expect("funder sync (shielded)");
+        .expect("bring up a funded regtest chain");
+    // The funder's own bare t-address, used here as an external transparent counterparty.
+    let funder_taddr = funder.transparent_address().to_string();
 
     // 5. zecd with transparent receiving AND the fully-transparent spend policy. `sendmany` has no
     //    per-call privacyPolicy argument, so this config knob is its ONLY route to a t→t spend.
@@ -128,7 +101,8 @@ async fn regtest_fully_transparent_sendmany_keeps_change_transparent() {
 
     // 7. Fund zecd's transparent address and confirm it (transparent receives are found once mined).
     funder
-        .send(lwd.grpc_port, &taddr, FUND_ZATOSHIS)
+        .send(&taddr, FUND_ZATOSHIS)
+        .await
         .expect("send to zecd's transparent address");
     zebrad
         .generate_blocks(12)
@@ -163,7 +137,7 @@ async fn regtest_fully_transparent_sendmany_keeps_change_transparent() {
     //    config. The received UTXO is third-party (untrusted), so it becomes spendable only at the
     //    confirmations-policy depth; mine toward it and retry on -6 (a failed attempt builds and
     //    broadcasts nothing, so retrying is safe).
-    let second_taddr = TAIL_MINER_ADDRESS; // a valid regtest transparent address (t2… P2SH)
+    let second_taddr = SEED_MINER_ADDRESS; // a valid regtest transparent address (t2… P2SH)
     let deadline = Instant::now() + SPEND_TIMEOUT;
     let txid = loop {
         let tip = zebrad
@@ -353,8 +327,6 @@ async fn regtest_fully_transparent_sendmany_keeps_change_transparent() {
         );
         tokio::time::sleep(Duration::from_millis(500)).await;
     }
-
-    lwd.stop();
     drop(zecd);
     // `zebrad` and `funder` clean up on drop.
 }

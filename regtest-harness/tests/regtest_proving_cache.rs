@@ -15,20 +15,16 @@
 //! shared-runner proving + actor-sync noise swamps the keygen delta across a couple of sends, so
 //! the precise saving is measured by the controlled microbench instead.
 //!
-//! Skips cleanly unless `ZEBRAD_BIN`, `LIGHTWALLETD_BIN` and `DEVTOOL_BIN` are all set.
+//! Skips cleanly unless `ZEBRAD_BIN` is set.
 
 use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
 use zecd_regtest_harness::{
-    pick_port, resolve_bin, resolve_node_bin, Funder, Lightwalletd, RegtestNode, Zebrad, Zecd,
-    ZecdConfig,
+    pick_port, resolve_node_bin, start_funded_chain, RegtestNode, Zebrad, Zecd, ZecdConfig,
 };
 
 /// See `regtest_funded.rs` for the coinbase-maturity dance these encode.
-const FUNDER_COINBASES: u32 = 120;
-const MATURITY_TAIL: u32 = 130;
-const TAIL_MINER_ADDRESS: &str = "t27eWDgjFYJGVXmzrXeVjnb5J3uXDM9xH9v";
 /// Fund the wallet generously (5 ZEC) so it can do several sends without running dry.
 const FUND_ZATOSHIS: u64 = 500_000_000;
 const FUND_TIMEOUT: Duration = Duration::from_secs(240);
@@ -91,52 +87,26 @@ async fn timed_sends(zecd: &Zecd, zebrad: &Zebrad, to_ua: &str, n: u32) -> Vec<D
 
 #[tokio::test]
 async fn regtest_proving_key_cache_benchmark() {
-    let (Some(zebrad_bin), Some(lwd_bin), Some(devtool_bin)) = (
-        resolve_node_bin(),
-        resolve_bin("LIGHTWALLETD_BIN"),
-        resolve_bin("DEVTOOL_BIN"),
-    ) else {
+    let Some(zebrad_bin) = resolve_node_bin() else {
         eprintln!(
-            "SKIP regtest_proving_key_cache_benchmark: set {}, LIGHTWALLETD_BIN and \
-             DEVTOOL_BIN to run it (see README.md). The harness still compiled and linked.",
+            "SKIP regtest_proving_key_cache_benchmark: set {} to run the benchmark \
+             (see README.md). The harness still compiled and linked.",
             RegtestNode::from_env().bin_env()
         );
         return;
     };
 
     // --- Fund a zecd wallet (the regtest_funded.rs flow: mine→mature→shield→send). ---
-    let funder_taddr = Funder::derive_transparent_address(&devtool_bin)
-        .expect("derive funder transparent address");
-    let mut zebrad = Zebrad::start_with_miner(&zebrad_bin, &funder_taddr)
+    // 1-4. Bring up the chain and its funding wallet: seed blocks to a throwaway address,
+    //      create the funder against them, mine and mature its coinbase, shield it into
+    //      Orchard. See `start_funded_chain`.
+    let (zebrad, funder) = start_funded_chain(&zebrad_bin)
         .await
-        .expect("start zebrad mining to the funder");
-    zebrad
-        .generate_blocks(FUNDER_COINBASES)
-        .await
-        .expect("mine the funder's coinbases");
-    zebrad
-        .restart_with_miner(TAIL_MINER_ADDRESS)
-        .await
-        .expect("restart zebrad mining to a throwaway address");
-    zebrad
-        .generate_blocks(MATURITY_TAIL)
-        .await
-        .expect("mine the maturity tail");
-
-    let lwd = Lightwalletd::start(&lwd_bin, zebrad.rpc_port)
-        .await
-        .expect("start lightwalletd");
-    let funder = Funder::init(&devtool_bin, lwd.grpc_port).expect("initialise funding wallet");
-    funder.sync(lwd.grpc_port).expect("funder sync (coinbase)");
-    funder
-        .shield(lwd.grpc_port)
-        .expect("shield transparent coinbase into Orchard");
-    zebrad.generate_blocks(6).await.expect("confirm shield");
-    funder.sync(lwd.grpc_port).expect("funder sync (shielded)");
-    let funder_ua = funder.unified_address().expect("funder unified address");
+        .expect("bring up a funded regtest chain");
+    let funder_ua = funder.unified_address().to_string();
 
     // --- Start zecd with the cache ON (explicit), fund it, wait until it sees the funds. ---
-    // zecd is zebra-only (talks straight to zebrad); the funder still uses lightwalletd's gRPC.
+    // Both zecd instances talk straight to zebrad over JSON-RPC.
     let mut cfg = ZecdConfig::new(zebrad.rpc_port, pick_port().expect("pick zecd rpc port"));
     cfg.cache_proving_key = Some(true);
     let mut zecd = Zecd::start(&cfg).await.expect("start zecd (cache on)");
@@ -148,7 +118,8 @@ async fn regtest_proving_key_cache_benchmark() {
         .expect("address string")
         .to_string();
     funder
-        .send(lwd.grpc_port, &zecd_ua, FUND_ZATOSHIS)
+        .send(&zecd_ua, FUND_ZATOSHIS)
+        .await
         .expect("fund zecd");
     let target = tip(&zebrad).await + 12;
     zebrad.generate_blocks(12).await.expect("confirm funding");

@@ -10,19 +10,17 @@
 //! zebra (the tip drops to ~21) mining to a *different* coinbase address, and mine a
 //! 130-block replacement tail - every block above the finalized height changes (different
 //! coinbase output → different hashes; the different address makes that guaranteed rather
-//! than timestamp-luck) and the new tip ends higher than the old one. lightwalletd is
-//! restarted with a fresh cache on the same port, and zecd must rewind off the orphaned
-//! blocks and follow the replacement chain.
+//! than timestamp-luck) and the new tip ends higher than the old one. zecd must rewind off the
+//! orphaned blocks and follow the replacement chain.
 //!
-//! Extended tier: set `ZECD_REGTEST_EXTENDED=1` (plus ZEBRAD_BIN / LIGHTWALLETD_BIN /
-//! DEVTOOL_BIN - devtool only derives the second miner address). Skips cleanly otherwise.
+//! Extended tier: set `ZECD_REGTEST_EXTENDED=1` (plus ZEBRAD_BIN). Skips cleanly otherwise.
 
 use std::time::{Duration, Instant};
 
 use serde_json::json;
 use zecd_regtest_harness::{
-    extended_enabled, pick_port, resolve_bin, resolve_node_bin, Funder, RegtestNode, Zebrad, Zecd,
-    ZecdConfig,
+    extended_enabled, pick_port, resolve_node_bin, RegtestNode, Zebrad, Zecd, ZecdConfig,
+    ALT_MINER_ADDRESS,
 };
 
 /// The original chain. Must exceed zebra's finality depth (99) so a finalized prefix
@@ -49,21 +47,18 @@ async fn regtest_reorg_rewinds_and_follows() {
         );
         return;
     }
-    let (Some(zebrad_bin), Some(devtool_bin)) = (resolve_node_bin(), resolve_bin("DEVTOOL_BIN"))
-    else {
+    let Some(zebrad_bin) = resolve_node_bin() else {
         eprintln!(
-            "SKIP regtest_reorg_rewinds_and_follows: set {} and DEVTOOL_BIN \
-             (see README.md). The harness still compiled and linked.",
+            "SKIP regtest_reorg_rewinds_and_follows: set {} (see README.md). The harness still compiled and linked.",
             RegtestNode::from_env().bin_env()
         );
         return;
     };
 
-    // A second, distinct coinbase address for the replacement chain (derived offline; the
-    // funder wallet itself is never used). Different coinbase output => guaranteed-different
-    // replacement blocks.
-    let replacement_miner = Funder::derive_transparent_address(&devtool_bin)
-        .expect("derive the replacement miner address");
+    // A second coinbase address for the replacement chain, distinct from the one `Zebrad::start`
+    // mines to. Different coinbase output => guaranteed-different replacement blocks. No wallet
+    // needs to control it - the test only cares that the blocks differ.
+    let replacement_miner = ALT_MINER_ADDRESS;
 
     // 1. The original chain: zebra mining to the default throwaway address.
     let mut zebrad = Zebrad::start(&zebrad_bin).await.expect("launch zebrad");
@@ -108,7 +103,7 @@ async fn regtest_reorg_rewinds_and_follows() {
     //    miner address so it drops the non-finalized tail and mines a divergent one. zecd
     //    talks straight to zebra, so there is no indexer cache to invalidate.
     zebrad
-        .restart_with_miner(&replacement_miner)
+        .restart_with_miner(replacement_miner)
         .await
         .expect("restart zebra (drops the non-finalized tail)");
     zebrad

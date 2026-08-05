@@ -9,8 +9,8 @@
 //! Orchard note. That lets us assert that getbalance / getbalances / getwalletinfo / listunspent /
 //! getreceivedbyaddress all aggregate across pools.
 //!
-//! The funder (zcash-devtool) spends its Orchard notes; sending to a Sapling-only receiver is an
-//! ordinary cross-pool transfer (devtool's `propose_transfer` takes no privacy policy - the same
+//! The funder spends its Orchard notes; sending to a Sapling-only receiver is an
+//! ordinary cross-pool transfer (its `propose_transfer` takes no privacy policy - the same
 //! call zecd uses when it sends Orchard->transparent in `regtest_funded`), so the value simply
 //! lands as a Sapling note.
 //!
@@ -27,65 +27,38 @@
 //! receipt is verifiable via `getreceivedbyaddress` (zebra's verbose getrawtransaction doesn't
 //! decode shielded bundles into JSON, so this behavioral check stands in for a structural one).
 //!
-//! Skips cleanly unless `ZEBRAD_BIN`, `LIGHTWALLETD_BIN` and `DEVTOOL_BIN` are all set.
+//! Skips cleanly unless `ZEBRAD_BIN` is set.
 
 use std::time::{Duration, Instant};
 
 use serde_json::json;
 use zecd_regtest_harness::{
-    pick_port, resolve_bin, resolve_node_bin, Funder, Lightwalletd, RegtestNode, Zebrad, Zecd,
-    ZecdConfig,
+    pick_port, resolve_node_bin, start_funded_chain, RegtestNode, Zecd, ZecdConfig,
 };
 
-const FUNDER_COINBASES: u32 = 120;
-const MATURITY_TAIL: u32 = 130;
-const TAIL_MINER_ADDRESS: &str = "t27eWDgjFYJGVXmzrXeVjnb5J3uXDM9xH9v";
 const FUND_ZATOSHIS: u64 = 100_000_000; // 1 ZEC per receiver
 const FUND_TIMEOUT: Duration = Duration::from_secs(240);
 
 #[tokio::test]
 async fn regtest_sapling_and_orchard_balances() {
-    let (Some(zebrad_bin), Some(lwd_bin), Some(devtool_bin)) = (
-        resolve_node_bin(),
-        resolve_bin("LIGHTWALLETD_BIN"),
-        resolve_bin("DEVTOOL_BIN"),
-    ) else {
+    let Some(zebrad_bin) = resolve_node_bin() else {
         eprintln!(
-            "SKIP regtest_sapling_and_orchard_balances: set {}, LIGHTWALLETD_BIN and \
-             DEVTOOL_BIN to run the multi-pool e2e (see README.md). The harness still compiled.",
+            "SKIP regtest_sapling_and_orchard_balances: set {} to run the live e2e \
+             (see README.md). The harness still compiled.",
             RegtestNode::from_env().bin_env()
         );
         return;
     };
 
     // 1-4. Identical funder bring-up to regtest_funded: mine + mature + shield the funder.
-    let funder_taddr = Funder::derive_transparent_address(&devtool_bin)
-        .expect("derive funder transparent address");
-    let mut zebrad = Zebrad::start_with_miner(&zebrad_bin, &funder_taddr)
+    // 1-4. Bring up the chain and its funding wallet: seed blocks to a throwaway address,
+    //      create the funder against them, mine and mature its coinbase, shield it into
+    //      Orchard. See `start_funded_chain`.
+    let (zebrad, funder) = start_funded_chain(&zebrad_bin)
         .await
-        .expect("start zebrad mining to the funder");
-    zebrad
-        .generate_blocks(FUNDER_COINBASES)
-        .await
-        .expect("mine the funder's coinbases");
-    zebrad
-        .restart_with_miner(TAIL_MINER_ADDRESS)
-        .await
-        .expect("restart zebrad mining to the throwaway address");
-    zebrad
-        .generate_blocks(MATURITY_TAIL)
-        .await
-        .expect("mine the maturity tail");
-    let lwd = Lightwalletd::start(&lwd_bin, zebrad.rpc_port)
-        .await
-        .expect("start lightwalletd");
-    let funder = Funder::init(&devtool_bin, lwd.grpc_port).expect("initialise funding wallet");
-    funder.sync(lwd.grpc_port).expect("funder sync (coinbase)");
-    funder
-        .shield(lwd.grpc_port)
-        .expect("shield transparent coinbase");
-    zebrad.generate_blocks(6).await.expect("confirm shield");
-    funder.sync(lwd.grpc_port).expect("funder sync (shielded)");
+        .expect("bring up a funded regtest chain");
+    // The funder's own bare t-address, used here as an external transparent counterparty.
+    let funder_taddr = funder.transparent_address().to_string();
 
     // 5. zecd with BOTH shielded pools enabled.
     let mut cfg = ZecdConfig::new(zebrad.rpc_port, pick_port().expect("pick zecd rpc port"));
@@ -234,20 +207,23 @@ async fn regtest_sapling_and_orchard_balances() {
     // Sapling group's 1 ZEC can't cover it, so selection falls to the 2-ZEC Orchard group,
     // producing an Orchard->Sapling *turnstile*), which is what phase 8a/8b exercise.
     funder
-        .send(lwd.grpc_port, &orchard_ua, 2 * FUND_ZATOSHIS)
+        .send(&orchard_ua, 2 * FUND_ZATOSHIS)
+        .await
         .expect("send to zecd's Orchard receiver");
     zebrad
         .generate_blocks(12)
         .await
         .expect("confirm Orchard send");
     funder
-        .sync(lwd.grpc_port)
+        .sync(&zebrad)
+        .await
         .expect("funder sync after Orchard send");
 
     // Fund the SAPLING-only receiver: the value can only land as a Sapling note. Observe it at
     // 0 conf via the mempool stream first, then confirm.
     funder
-        .send(lwd.grpc_port, &sapling_ua, FUND_ZATOSHIS)
+        .send(&sapling_ua, FUND_ZATOSHIS)
+        .await
         .expect("send to zecd's Sapling receiver");
     {
         let deadline = Instant::now() + FUND_TIMEOUT;
@@ -475,7 +451,7 @@ async fn regtest_sapling_and_orchard_balances() {
     //     strongest enabled pool), which phase 9's tri-pool send then draws on. (The default policy
     //     would also permit the turnstile 8a rejected; that permission is covered by the funded
     //     e2e's transparent-recipient sends.)
-    let funder_ua = funder.unified_address().expect("funder unified address");
+    let funder_ua = funder.unified_address().to_string();
     let txid = zecd
         .call("sendtoaddress", json!([funder_ua, 1.5]))
         .await
@@ -640,8 +616,6 @@ async fn regtest_sapling_and_orchard_balances() {
         lu.iter().any(|u| u["pool"] == "sapling"),
         "the Sapling-receiver output landed as a sapling note: {lu:?}"
     );
-
-    lwd.stop();
     drop(zecd);
     // `zebrad` and `funder` clean up on drop.
 }

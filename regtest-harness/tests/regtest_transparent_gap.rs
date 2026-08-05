@@ -25,7 +25,7 @@
 //! from-seed restore with the **same** small-gap config recovers it via the matcher's gap
 //! lookahead - the `initial_scan = 70000, gap_limit = 1000` exchange shape at CI-sized indices.
 //!
-//! Skips cleanly unless `ZEBRAD_BIN`/`LIGHTWALLETD_BIN`/`DEVTOOL_BIN` are all set. Standard tier:
+//! Skips cleanly unless `ZEBRAD_BIN` is set. Standard tier:
 //! it's the load-bearing guard for the (recently-broken) transparent receive-discovery path plus
 //! the gap-limit / initial-scan logic, so it runs on every regtest CI run rather than only the weekly tier.
 
@@ -33,13 +33,9 @@ use std::time::{Duration, Instant};
 
 use serde_json::json;
 use zecd_regtest_harness::{
-    pick_port, resolve_bin, resolve_node_bin, Funder, Lightwalletd, RegtestNode, Zebrad, Zecd,
-    ZecdConfig,
+    pick_port, resolve_node_bin, start_funded_chain, RegtestNode, Zecd, ZecdConfig,
 };
 
-const FUNDER_COINBASES: u32 = 120;
-const MATURITY_TAIL: u32 = 130;
-const TAIL_MINER_ADDRESS: &str = "t27eWDgjFYJGVXmzrXeVjnb5J3uXDM9xH9v";
 const FUND_ZATOSHIS: u64 = 100_000_000; // 1 ZEC
 const FUND_TIMEOUT: Duration = Duration::from_secs(240);
 
@@ -54,47 +50,21 @@ const LARGE_GAP: u32 = 25;
 
 #[tokio::test]
 async fn regtest_transparent_gap_limit_bounds_restore_recovery() {
-    let (Some(zebrad_bin), Some(lwd_bin), Some(devtool_bin)) = (
-        resolve_node_bin(),
-        resolve_bin("LIGHTWALLETD_BIN"),
-        resolve_bin("DEVTOOL_BIN"),
-    ) else {
+    let Some(zebrad_bin) = resolve_node_bin() else {
         eprintln!(
-            "SKIP regtest_transparent_gap_limit_bounds_restore_recovery: set {}, \
-             LIGHTWALLETD_BIN and DEVTOOL_BIN to run the transparent gap-limit e2e (see README.md).",
+            "SKIP regtest_transparent_gap_limit_bounds_restore_recovery: set {} to run the transparent gap-limit e2e (see README.md).",
             RegtestNode::from_env().bin_env()
         );
         return;
     };
 
     // 1-4. Funder bring-up (identical to regtest_transparent): mine + mature + shield the funder.
-    let funder_taddr = Funder::derive_transparent_address(&devtool_bin)
-        .expect("derive funder transparent address");
-    let mut zebrad = Zebrad::start_with_miner(&zebrad_bin, &funder_taddr)
+    // 1-4. Bring up the chain and its funding wallet: seed blocks to a throwaway address,
+    //      create the funder against them, mine and mature its coinbase, shield it into
+    //      Orchard. See `start_funded_chain`.
+    let (zebrad, funder) = start_funded_chain(&zebrad_bin)
         .await
-        .expect("start zebrad mining to the funder");
-    zebrad
-        .generate_blocks(FUNDER_COINBASES)
-        .await
-        .expect("mine the funder's coinbases");
-    zebrad
-        .restart_with_miner(TAIL_MINER_ADDRESS)
-        .await
-        .expect("restart zebrad mining to the throwaway address");
-    zebrad
-        .generate_blocks(MATURITY_TAIL)
-        .await
-        .expect("mine the maturity tail");
-    let lwd = Lightwalletd::start(&lwd_bin, zebrad.rpc_port)
-        .await
-        .expect("start lightwalletd");
-    let funder = Funder::init(&devtool_bin, lwd.grpc_port).expect("initialise funding wallet");
-    funder.sync(lwd.grpc_port).expect("funder sync (coinbase)");
-    funder
-        .shield(lwd.grpc_port)
-        .expect("shield transparent coinbase");
-    zebrad.generate_blocks(6).await.expect("confirm shield");
-    funder.sync(lwd.grpc_port).expect("funder sync (shielded)");
+        .expect("bring up a funded regtest chain");
 
     // 5. The "authoring" wallet: transparent enabled (default gap). It hands out NUM_ADDRESSES bare
     //    transparent addresses; because each is explicitly exposed by getnewaddress, the authoring
@@ -144,7 +114,8 @@ async fn regtest_transparent_gap_limit_bounds_restore_recovery() {
 
     // 6. Fund the high-index transparent address and confirm it.
     funder
-        .send(lwd.grpc_port, &funded_addr, FUND_ZATOSHIS)
+        .send(&funded_addr, FUND_ZATOSHIS)
+        .await
         .expect("send to the high-index transparent address");
     zebrad
         .generate_blocks(12)
@@ -328,7 +299,8 @@ async fn regtest_transparent_gap_limit_bounds_restore_recovery() {
         "the floor address must be a fresh index, not a reissue of the authoring run: {floor_addr}"
     );
     funder
-        .send(lwd.grpc_port, &floor_addr, FUND_ZATOSHIS)
+        .send(&floor_addr, FUND_ZATOSHIS)
+        .await
         .expect("send to the floor-index transparent address");
     zebrad
         .generate_blocks(12)
@@ -370,8 +342,6 @@ async fn regtest_transparent_gap_limit_bounds_restore_recovery() {
         "the gap lookahead past the initial_scan floor recovers the floor-index receive \
          (expected 2 ZEC = high-index + floor-index): {horizon_balance}"
     );
-
-    lwd.stop();
     drop(horizon);
     // `zebrad` and `funder` clean up on drop.
 }

@@ -21,7 +21,7 @@
 //! (the original report measured a full ~3-minute outage), so the test fails on the first stalled
 //! read. With the fix, reads stay sub-second throughout.
 //!
-//! Only needs `ZEBRAD_BIN` (no lightwalletd/funder - there's nothing to fund; we only watch the
+//! Only needs `ZEBRAD_BIN` (no funder - there's nothing to fund; we only watch the
 //! pre-exposure window). Skips cleanly if it's unset.
 
 use std::time::{Duration, Instant};
