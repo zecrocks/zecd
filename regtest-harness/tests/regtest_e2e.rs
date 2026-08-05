@@ -2,7 +2,7 @@
 //!
 //! Skips cleanly when the node binary isn't provisioned (so plain `cargo test` and the
 //! build-only CI path still validate that the harness compiles). Provide `ZEBRAD_BIN` to run
-//! the full flow - see README.md.
+//! the full flow.
 
 use std::time::Duration;
 
@@ -18,8 +18,8 @@ const SYNC_TIMEOUT: Duration = Duration::from_secs(120);
 async fn regtest_end_to_end() {
     let Some(zebrad_bin) = resolve_node_bin() else {
         eprintln!(
-            "SKIP regtest_end_to_end: set {} to run the live e2e (see README.md). \
-             The harness still compiled and linked.",
+            "SKIP regtest_end_to_end: set {} to run the live e2e. The harness still compiled and \
+             linked.",
             RegtestNode::from_env().bin_env()
         );
         return;

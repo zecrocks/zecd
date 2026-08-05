@@ -32,8 +32,8 @@ const FUND_TIMEOUT: Duration = Duration::from_secs(240);
 async fn regtest_transparent_receive_and_autoshield_spend() {
     let Some(zebrad_bin) = resolve_node_bin() else {
         eprintln!(
-            "SKIP regtest_transparent_receive_and_autoshield_spend: set {} to run the transparent e2e (see README.md). The \
-             harness still compiled.",
+            "SKIP regtest_transparent_receive_and_autoshield_spend: set {} to run the transparent \
+             e2e. The harness still compiled.",
             RegtestNode::from_env().bin_env()
         );
         return;

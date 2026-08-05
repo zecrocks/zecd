@@ -24,15 +24,15 @@ const SYNC_TIMEOUT: Duration = Duration::from_secs(120);
 async fn regtest_multiwallet_routing_and_isolation() {
     if !extended_enabled() {
         eprintln!(
-            "SKIP regtest_multiwallet_routing_and_isolation: set ZECD_REGTEST_EXTENDED=1 to \
-             run the extended tier (see README.md)."
+            "SKIP regtest_multiwallet_routing_and_isolation: set ZECD_REGTEST_EXTENDED=1 to run \
+             the extended tier."
         );
         return;
     }
     let Some(zebrad_bin) = resolve_node_bin() else {
         eprintln!(
-            "SKIP regtest_multiwallet_routing_and_isolation: set {} \
-             (see README.md). The harness still compiled and linked.",
+            "SKIP regtest_multiwallet_routing_and_isolation: set {}. The harness still compiled \
+             and linked.",
             RegtestNode::from_env().bin_env()
         );
         return;
@@ -174,15 +174,15 @@ async fn regtest_multiwallet_routing_and_isolation() {
 async fn regtest_second_spending_wallet_refused_at_init() {
     if !extended_enabled() {
         eprintln!(
-            "SKIP regtest_second_spending_wallet_refused_at_init: set ZECD_REGTEST_EXTENDED=1 \
-             to run the extended tier (see README.md)."
+            "SKIP regtest_second_spending_wallet_refused_at_init: set ZECD_REGTEST_EXTENDED=1 to \
+             run the extended tier."
         );
         return;
     }
     let Some(zebrad_bin) = resolve_node_bin() else {
         eprintln!(
-            "SKIP regtest_second_spending_wallet_refused_at_init: set {} \
-             (see README.md). The harness still compiled and linked.",
+            "SKIP regtest_second_spending_wallet_refused_at_init: set {}. The harness still \
+             compiled and linked.",
             RegtestNode::from_env().bin_env()
         );
         return;

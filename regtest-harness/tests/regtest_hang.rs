@@ -10,7 +10,7 @@
 //! 2. the hang is *detected* (the peer list empties although the process never died);
 //! 3. the daemon recovers on its own once the upstream resumes.
 //!
-//! Skips cleanly when `ZEBRAD_BIN` isn't provisioned (see README.md).
+//! Skips cleanly when `ZEBRAD_BIN` isn't provisioned.
 
 use std::time::{Duration, Instant};
 
@@ -28,8 +28,8 @@ const DETECT_TIMEOUT: Duration = Duration::from_secs(90);
 async fn regtest_hung_upstream_detected_and_recovered() {
     let Some(zebrad_bin) = resolve_node_bin() else {
         eprintln!(
-            "SKIP regtest_hung_upstream_detected_and_recovered: set {} \
-             (see README.md). The harness still compiled and linked.",
+            "SKIP regtest_hung_upstream_detected_and_recovered: set {}. The harness still compiled \
+             and linked.",
             RegtestNode::from_env().bin_env()
         );
         return;

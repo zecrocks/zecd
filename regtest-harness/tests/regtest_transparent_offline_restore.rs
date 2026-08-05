@@ -37,8 +37,8 @@ const RECOVER_TIMEOUT: Duration = Duration::from_secs(120);
 async fn regtest_transparent_offline_receive_and_spend_are_restored() {
     let Some(node_bin) = resolve_node_bin() else {
         eprintln!(
-            "SKIP regtest_transparent_offline_receive_and_spend_are_restored: set {} to run the offline-restore e2e (see README.md). \
-             The harness still compiled.",
+            "SKIP regtest_transparent_offline_receive_and_spend_are_restored: set {} to run the \
+             offline-restore e2e. The harness still compiled.",
             RegtestNode::from_env().bin_env()
         );
         return;

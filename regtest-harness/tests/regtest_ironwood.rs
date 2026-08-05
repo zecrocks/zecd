@@ -38,8 +38,8 @@ const FUND_TIMEOUT: Duration = Duration::from_secs(240);
 async fn regtest_ironwood_receive_and_orchard_send() {
     let Some(zebrad_bin) = resolve_node_bin() else {
         eprintln!(
-            "SKIP: set {} (plus ZECD_REGTEST_NU63_HEIGHT=8) to \
-             run the ironwood pool-structure e2e (see README.md). The harness still compiled.",
+            "SKIP: set {} (plus ZECD_REGTEST_NU63_HEIGHT=8) to run the ironwood pool-structure \
+             e2e. The harness still compiled.",
             RegtestNode::from_env().bin_env()
         );
         return;
@@ -364,8 +364,8 @@ async fn regtest_ironwood_receive_and_orchard_send() {
 async fn regtest_ironwood_sapling_send() {
     let Some(zebrad_bin) = resolve_node_bin() else {
         eprintln!(
-            "SKIP: set {} (plus ZECD_REGTEST_NU63_HEIGHT=8) to \
-             run the ironwood pool-structure e2e (see README.md). The harness still compiled.",
+            "SKIP: set {} (plus ZECD_REGTEST_NU63_HEIGHT=8) to run the ironwood pool-structure \
+             e2e. The harness still compiled.",
             RegtestNode::from_env().bin_env()
         );
         return;

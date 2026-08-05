@@ -33,8 +33,8 @@ const BEYOND: u32 = 3;
 async fn regtest_transparent_recovery_window_hard_stop_and_allow_beyond() {
     let Some(zebrad_bin) = resolve_node_bin() else {
         eprintln!(
-            "SKIP regtest_transparent_recovery_window_hard_stop_and_allow_beyond: set {} \
-             to run the transparent recovery-window e2e (see README.md).",
+            "SKIP regtest_transparent_recovery_window_hard_stop_and_allow_beyond: set {} to run \
+             the transparent recovery-window e2e.",
             RegtestNode::from_env().bin_env()
         );
         return;

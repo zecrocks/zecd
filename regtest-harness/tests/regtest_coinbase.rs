@@ -181,7 +181,7 @@ async fn regtest_transparent_coinbase_shield_and_spend() {
     let Some(zebrad_bin) = resolve_bin("ZEBRAD_BIN") else {
         eprintln!(
             "SKIP regtest_transparent_coinbase_shield_and_spend: set ZEBRAD_BIN to run the \
-             coinbase e2e (see README.md). The harness still compiled."
+             coinbase e2e. The harness still compiled."
         );
         return;
     };
@@ -584,8 +584,8 @@ async fn regtest_shielded_coinbase_receive_and_spend() {
     // Zebra-only in CI (ZEBRAD_BIN unset on the zakura leg -> skips there); see the sibling test.
     let Some(zebrad_bin) = resolve_bin("ZEBRAD_BIN") else {
         eprintln!(
-            "SKIP regtest_shielded_coinbase_receive_and_spend: set ZEBRAD_BIN to run the \
-             coinbase e2e (see README.md). The harness still compiled."
+            "SKIP regtest_shielded_coinbase_receive_and_spend: set ZEBRAD_BIN to run the coinbase \
+             e2e. The harness still compiled."
         );
         return;
     };

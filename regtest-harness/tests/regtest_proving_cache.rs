@@ -89,8 +89,8 @@ async fn timed_sends(zecd: &Zecd, zebrad: &Zebrad, to_ua: &str, n: u32) -> Vec<D
 async fn regtest_proving_key_cache_benchmark() {
     let Some(zebrad_bin) = resolve_node_bin() else {
         eprintln!(
-            "SKIP regtest_proving_key_cache_benchmark: set {} to run the benchmark \
-             (see README.md). The harness still compiled and linked.",
+            "SKIP regtest_proving_key_cache_benchmark: set {} to run the benchmark. The harness \
+             still compiled and linked.",
             RegtestNode::from_env().bin_env()
         );
         return;
