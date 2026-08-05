@@ -23,6 +23,9 @@
 //! What it deliberately cannot do is anything requiring the network or the wallet: whether zebra
 //! is actually reachable, whether the seed matches the account, whether the chain is the one the
 //! wallet expects. Those need a running daemon, and saying so is more useful than guessing.
+//!
+//! Output follows the `nginx -t`/`-T` convention: **stdout is the effective configuration,
+//! stderr is the verdict** (see [`run`]).
 
 use std::io::Write;
 use std::path::Path;
@@ -403,17 +406,26 @@ fn describe_rpc_auth(config: &AppConfig) -> String {
 }
 
 /// `zecd config check`.
+///
+/// **stdout carries the effective configuration; stderr carries the verdict.** That is `nginx`'s
+/// split (`nginx -t`'s "syntax is ok" goes to stderr precisely so `nginx -T` can put pure config
+/// on stdout), and it is what makes the two jobs this command does separable:
+/// `zecd config check --conf f > effective.txt` captures exactly the settings, so diffing two
+/// binaries' output is diffing configuration and nothing else, while the findings and the pass/
+/// fail line stay where diagnostics belong. With `-q` stdout is empty, so a CI gate is silent on
+/// success and still loud on stderr when it isn't.
 pub fn run(cli: &Cli, args: &ConfigCheckArgs) -> anyhow::Result<()> {
     let conf_path = AppConfig::conf_path(cli);
-    let mut out = String::new();
-    out.push_str(&format!("zecd {}\n", env!("CARGO_PKG_VERSION")));
-    out.push_str(&format!("config file: {}\n", conf_path.display()));
+    emit_err(&format!(
+        "zecd {}\nconfig file: {}\n",
+        env!("CARGO_PKG_VERSION"),
+        conf_path.display()
+    ));
 
     // Unlike the daemon, a missing file is a failure rather than "use the built-in defaults":
     // checking a config that isn't there is a typo'd path or a bad assumption about where the
     // file lives, and silently validating the defaults instead would confirm neither.
     if !conf_path.exists() {
-        emit(&out);
         anyhow::bail!(
             "no config file at {} (the daemon would fall back to built-in defaults; \
              pass --conf FILE or --datadir DIR to point at the file to check)",
@@ -424,8 +436,9 @@ pub fn run(cli: &Cli, args: &ConfigCheckArgs) -> anyhow::Result<()> {
     let config = match AppConfig::resolve(cli) {
         Ok(config) => config,
         Err(e) => {
-            out.push_str(&format!("\n{}: {e:#}\n", Level::Error.label()));
-            emit(&out);
+            // Nothing reaches stdout: a config that doesn't resolve has no effective settings
+            // to report, so the capture is empty rather than half-written.
+            emit_err(&format!("\n{}: {e:#}\n", Level::Error.label()));
             anyhow::bail!(
                 "{} is not valid for zecd {}",
                 conf_path.display(),
@@ -436,26 +449,27 @@ pub fn run(cli: &Cli, args: &ConfigCheckArgs) -> anyhow::Result<()> {
 
     let findings = inspect(&config);
     if !args.quiet {
-        out.push_str(&summary(&config, &conf_path));
+        emit(&summary(&config, &conf_path));
     }
+    let mut report = String::new();
     if !findings.is_empty() {
-        out.push('\n');
+        report.push('\n');
         for f in &findings {
-            out.push_str(&format!("{}: {}\n", f.level.label(), f.message));
+            report.push_str(&format!("{}: {}\n", f.level.label(), f.message));
         }
     }
 
     let errors = findings.iter().filter(|f| f.level == Level::Error).count();
     let warnings = findings.len() - errors;
     if errors == 0 && !(args.strict && warnings > 0) && !args.quiet {
-        out.push_str(&format!(
+        report.push_str(&format!(
             "\nOK: {} is valid for zecd {}{}\n",
             conf_path.display(),
             env!("CARGO_PKG_VERSION"),
             plural_suffix(warnings, " ({} warning{})"),
         ));
     }
-    emit(&out);
+    emit_err(&report);
 
     if errors > 0 {
         anyhow::bail!(
@@ -484,11 +498,19 @@ fn plural_suffix(n: usize, template: &str) -> String {
         .replacen("{}", if n == 1 { "" } else { "s" }, 1)
 }
 
-/// Write the report to stdout, treating a closed pipe as a clean exit (`zecd config check | head`
-/// would otherwise *panic* through `print!`, since the macros panic on EPIPE).
+/// Write the effective configuration to stdout, treating a closed pipe as a clean exit
+/// (`zecd config check | head` would otherwise *panic* through `print!`, since the macros panic
+/// on EPIPE).
 fn emit(text: &str) {
     let mut out = std::io::stdout().lock();
     let _ = out.write_all(text.as_bytes()).and_then(|()| out.flush());
+}
+
+/// Write a diagnostic - the header, the findings, the verdict - to stderr. Flushed as it goes, so
+/// it interleaves with [`emit`] in the order written when both are a terminal.
+fn emit_err(text: &str) {
+    let mut err = std::io::stderr().lock();
+    let _ = err.write_all(text.as_bytes()).and_then(|()| err.flush());
 }
 
 #[cfg(test)]
