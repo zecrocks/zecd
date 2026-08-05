@@ -183,6 +183,12 @@ impl PoolSet {
         self.pools.iter().all(|p| other.contains(*p))
     }
 
+    /// The canonical names, in set order - the spelling `PoolSet::parse` accepts, so this is
+    /// what renders back into a config file (`zecd config show`).
+    pub fn names(&self) -> Vec<&'static str> {
+        self.pools.iter().map(|p| p.as_str()).collect()
+    }
+
     /// Comma-separated canonical names, e.g. `"sapling, orchard"`.
     pub fn display_names(&self) -> String {
         self.pools

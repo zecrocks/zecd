@@ -834,6 +834,9 @@ pub enum ConfigCommand {
     /// Validate a configuration file against this zecd build without starting the daemon, and
     /// print the settings it resolves to. Exits non-zero if the daemon would refuse to start.
     Check(ConfigCheckArgs),
+    /// Print the effective configuration - the file, CLI flags and environment resolved
+    /// together, with every unset key filled in by this build's default - as TOML, then exit.
+    Show(ConfigShowArgs),
 }
 
 #[derive(Debug, clap::Args)]
@@ -848,6 +851,11 @@ pub struct ConfigCheckArgs {
     #[arg(short = 'q', long)]
     pub quiet: bool,
 }
+
+/// `zecd config show` takes no options of its own - the configuration it renders is selected by
+/// the global flags (`--conf`, `--datadir`, `--network`, ...), exactly as the daemon selects it.
+#[derive(Debug, clap::Args)]
+pub struct ConfigShowArgs {}
 
 #[derive(Debug, clap::Args)]
 pub struct ExportUfvkArgs {
