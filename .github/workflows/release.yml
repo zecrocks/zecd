@@ -14,7 +14,12 @@ name: Release
 #     natively on an arm64 runner. Not StageX-grade trust (upstream binaries, not
 #     full-source-bootstrapped), but bit-for-bit reproducible.
 # Each target ships a `.tar.gz` (reproducible tar: sorted, fixed mtime, root-owned) and a
-# reproducible `.deb` (see scripts/build-deb.sh), each with a `.sha256` sidecar.
+# reproducible `.deb` (see scripts/build-deb.sh). Instead of a per-file `.sha256` sidecar the
+# release carries one `SHA256SUMS` covering every artifact, in the standard `sha256sum -c`
+# format (generated in the `release` job once all arches are gathered). Artifacts use one arch
+# token per target - the Debian/Go names amd64/arm64, the fixed point set by the `.deb`
+# convention - so a release lists `zecd-<ver>-linux-{amd64,arm64}.tar.gz` next to
+# `zecd_<ver>_{amd64,arm64}.deb` (no rust target triples in filenames).
 #
 # It can also be run manually (Actions tab -> Release -> Run workflow), e.g. to dry-run the
 # packaging without cutting a real tag: supply a `version` and, off by default, choose
@@ -68,12 +73,10 @@ jobs:
         include:
           - runner: ubuntu-latest
             dockerfile: Dockerfile
-            target_triple: x86_64-unknown-linux-musl
-            deb_arch: amd64
+            arch: amd64
           - runner: ubuntu-24.04-arm
             dockerfile: Dockerfile.arm64
-            target_triple: aarch64-unknown-linux-musl
-            deb_arch: arm64
+            arch: arm64
     runs-on: ${{ matrix.runner }}
     env:
       # Determinism anchor - matches the Dockerfiles and scripts/build-deb.sh.
@@ -91,13 +94,13 @@ jobs:
           file: ${{ matrix.dockerfile }}
           target: export
           outputs: type=local,dest=out
-          cache-from: type=gha,scope=binary-${{ matrix.deb_arch }}
-          cache-to: type=gha,mode=max,scope=binary-${{ matrix.deb_arch }}
+          cache-from: type=gha,scope=binary-${{ matrix.arch }}
+          cache-to: type=gha,mode=max,scope=binary-${{ matrix.arch }}
 
-      - name: Package tarball + checksum (reproducible)
+      - name: Package tarball (reproducible)
         run: |
           VERSION="${{ needs.setup.outputs.version }}"
-          STAGE="zecd-${VERSION}-${{ matrix.target_triple }}"
+          STAGE="zecd-${VERSION}-linux-${{ matrix.arch }}"
           install -D -m 0755 out/zecd "$STAGE/zecd"
           cp README.md CHANGELOG.md LICENSE-MIT LICENSE-APACHE zecd.example.toml "$STAGE/"
           # Reproducible tar: stable order, fixed mtime, root owner; gzip -n drops the
@@ -105,24 +108,19 @@ jobs:
           tar --sort=name --owner=0 --group=0 --numeric-owner \
               --mtime="@${SOURCE_DATE_EPOCH}" -cf "$STAGE.tar" "$STAGE"
           gzip -9n "$STAGE.tar"
-          sha256sum "$STAGE.tar.gz" > "$STAGE.tar.gz.sha256"
 
       - name: Build .deb (reproducible)
         run: |
           VERSION="${{ needs.setup.outputs.version }}"
-          ./scripts/build-deb.sh out/zecd "$VERSION" "${{ matrix.deb_arch }}" .
-          DEB="zecd_${VERSION}_${{ matrix.deb_arch }}.deb"
-          sha256sum "$DEB" > "$DEB.sha256"
+          ./scripts/build-deb.sh out/zecd "$VERSION" "${{ matrix.arch }}" .
 
       - name: Upload release artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: release-${{ matrix.deb_arch }}
+          name: release-${{ matrix.arch }}
           path: |
             zecd-*.tar.gz
-            zecd-*.tar.gz.sha256
             zecd_*.deb
-            zecd_*.deb.sha256
           if-no-files-found: error
 
   # Collect every target's artifacts and attach them to a single draft release.
@@ -134,11 +132,22 @@ jobs:
         with:
           # Only the packaged release artifacts - NOT the `.dockerbuild` metadata
           # artifacts that docker/build-push-action auto-uploads from the `binary` jobs.
-          # Without this filter, download-artifact fetches all 4 artifacts and a flaky
-          # `.dockerbuild` download (which the release doesn't need) fails the whole job.
+          # Without this filter, download-artifact also fetches the flaky `.dockerbuild`
+          # download (which the release doesn't need) and fails the whole job.
           pattern: release-*
           path: dist
           merge-multiple: true
+
+      # One SHA256SUMS covering every arch's artifacts, in the standard `sha256sum` format
+      # (verify with `sha256sum -c SHA256SUMS`, or `shasum -a 256 -c` on macOS/BSD). Generated
+      # here rather than per-target so a single file covers amd64 + arm64. Filenames are bare
+      # (cd dist) so the file verifies against downloads sitting in one directory, and the list
+      # is sorted by filename for a byte-stable, reproducible SHA256SUMS.
+      - name: Generate SHA256SUMS
+        run: |
+          cd dist
+          sha256sum zecd-*.tar.gz zecd_*.deb | sort -k2 > SHA256SUMS
+          cat SHA256SUMS
 
       - name: Create draft GitHub release
         uses: softprops/action-gh-release@v2
@@ -151,9 +160,8 @@ jobs:
           name: ${{ needs.setup.outputs.tag }}
           files: |
             dist/zecd-*.tar.gz
-            dist/zecd-*.tar.gz.sha256
             dist/zecd_*.deb
-            dist/zecd_*.deb.sha256
+            dist/SHA256SUMS
 
   # amd64: the reproducible StageX image, pushed *by digest* (no tags of its own). The
   # `manifest` job stitches amd64 + arm64 into one multi-arch tag, so consumers pull a single
