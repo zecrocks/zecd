@@ -276,6 +276,19 @@ zecd diagnoses the two known causes and says so in the log:
    the build would refuse the file, and prints the **effective** settings so you can diff the
    old and new binaries' output and see which defaults moved. Add `--strict` to fail on the
    warnings too.
+
+   To see the defaults that moved, diff the effective configurations (stdout is the settings,
+   stderr the verdict, so redirecting stderr leaves a clean comparison):
+
+   ```sh
+   diff <(./zecd-old config show --conf /etc/zecd/zecd.toml 2>/dev/null) \
+        <(./zecd-new config show --conf /etc/zecd/zecd.toml 2>/dev/null)
+   ```
+
+   Anything that changed is a default this upgrade moves under you. To keep the old behaviour,
+   pin it: `./zecd-old config show --conf /etc/zecd/zecd.toml > effective.toml` renders the
+   current settings as TOML you can adopt as the config file, with the values now explicit
+   rather than inherited. Re-add the credential lines by hand - they are redacted, deliberately.
 2. `zecd stop` (or SIGINT) - graceful: in-flight requests finish, new ones get 503.
 3. Replace the binary / pull the new image.
 4. Start. Wallet DB migrations run automatically at open; the first start after a big

@@ -784,10 +784,14 @@ fn config_check_puts_the_settings_on_stdout_and_the_verdict_on_stderr() {
     let out = config_check(&conf, &[]);
     let (stdout, stderr) = (stdout_of(&out), stderr_of(&out));
     assert!(stdout.contains("[backend]"), "{stdout}");
-    for diagnostic in ["OK:", "warning:", "config file:", "zecd "] {
+    // Every stdout line is config or comment - no diagnostic leaks in. (Line-based, so the
+    // header comment mentioning "zecd" isn't mistaken for the "zecd <version>" banner.)
+    for line in stdout.lines() {
         assert!(
-            !stdout.contains(diagnostic),
-            "stdout must carry settings only, found {diagnostic:?}: {stdout}"
+            !["OK:", "warning:", "error:", "config file:", "zecd "]
+                .iter()
+                .any(|d| line.starts_with(d)),
+            "stdout must carry settings only, found {line:?}"
         );
     }
     assert!(
@@ -948,6 +952,100 @@ fn config_check_accepts_global_flags_after_the_subcommand() {
     );
     assert!(out.status.success(), "stderr: {}", stderr_of(&out));
     assert!(stdout_of(&out).contains("main"), "{}", stdout_of(&out));
+}
+
+// ---------------------------------------------------------------------------
+// config show
+// ---------------------------------------------------------------------------
+
+fn config_show(conf: &std::path::Path) -> Output {
+    run_with_timeout(
+        {
+            let mut c = zecd();
+            c.args(["config", "show", "--conf", conf.to_str().unwrap()]);
+            c
+        },
+        Duration::from_secs(10),
+    )
+}
+
+/// The end-to-end property, run through the real binary: what `config show` prints is a config
+/// zecd itself accepts, and feeding it back produces the same thing. That is what makes the
+/// output safe to capture before an upgrade and diff against the new build's.
+#[test]
+fn config_show_output_is_a_config_zecd_accepts_and_reproduces() {
+    let dir = tempfile::tempdir().unwrap();
+    let conf = dir.path().join("zecd.toml");
+    std::fs::write(
+        &conf,
+        format!(
+            "network = \"test\"\ndatadir = {:?}\n[spend]\nprivacy_policy = \"FullPrivacy\"\n",
+            dir.path()
+        ),
+    )
+    .unwrap();
+
+    let out = config_show(&conf);
+    assert!(out.status.success(), "stderr: {}", stderr_of(&out));
+    let first = stdout_of(&out);
+    assert!(
+        first.contains("privacy_policy = \"FullPrivacy\""),
+        "{first}"
+    );
+    // Defaults the file never mentioned are filled in - the reason to capture this at all.
+    assert!(first.contains("trusted_confirmations = 3"), "{first}");
+
+    // Feed it back: it must both pass `config check` and render identically.
+    let echoed = dir.path().join("effective.toml");
+    std::fs::write(&echoed, &first).unwrap();
+    let checked = config_check(&echoed, &[]);
+    assert!(
+        checked.status.success(),
+        "the rendered config must be one zecd accepts; stderr: {}",
+        stderr_of(&checked)
+    );
+    let second = stdout_of(&config_show(&echoed));
+    assert_eq!(first, second, "config show must be idempotent");
+}
+
+/// Same stream contract as `check`: configuration on stdout, provenance on stderr. And unlike
+/// `check`, a missing file is not an error - "what would this binary do" is well defined with no
+/// config at all, and is the most direct way to see the built-in defaults.
+#[test]
+fn config_show_streams_and_tolerates_a_missing_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let missing = dir.path().join("nope.toml");
+
+    let out = config_show(&missing);
+    assert!(out.status.success(), "stderr: {}", stderr_of(&out));
+    assert!(stdout_of(&out).contains("[backend]"), "{}", stdout_of(&out));
+    assert!(
+        stderr_of(&out).contains("no config file at"),
+        "the fallback is announced, not silent: {}",
+        stderr_of(&out)
+    );
+}
+
+/// `config show` output is the kind of thing that gets pasted into a bug report, and the RPC
+/// password is spend authority - so credentials are named, never printed.
+#[test]
+fn config_show_redacts_credentials() {
+    let dir = tempfile::tempdir().unwrap();
+    let conf = dir.path().join("zecd.toml");
+    std::fs::write(
+        &conf,
+        format!(
+            "network = \"test\"\ndatadir = {:?}\n[rpc]\nuser = \"alice\"\npassword = \"hunter2\"\n",
+            dir.path()
+        ),
+    )
+    .unwrap();
+
+    let out = config_show(&conf);
+    assert!(out.status.success(), "stderr: {}", stderr_of(&out));
+    let stdout = stdout_of(&out);
+    assert!(!stdout.contains("hunter2"), "leaked the password: {stdout}");
+    assert!(stdout.contains("# user, password = <redacted>"), "{stdout}");
 }
 
 /// The committed testnet development mnemonic (valueless TAZ only), used here as

@@ -33,11 +33,17 @@ async fn main() -> anyhow::Result<()> {
         return zecd::example_config::run(args);
     }
 
-    // `config check` reports on the configuration - including a configuration `resolve` rejects,
-    // which is the case it exists for - so it must run *before* `resolve`, and without tracing
-    // (its report is the command's output; log lines would interleave with it).
-    if let Some(Command::Config(ConfigCommand::Check(args))) = &cli.command {
-        return zecd::config_check::run(&cli, args);
+    // The `config` subcommands report on the configuration - including one `resolve` rejects,
+    // which is the case `check` exists for - so they must run *before* `resolve`, and without
+    // tracing (their output is the command's product; log lines would interleave with it).
+    match &cli.command {
+        Some(Command::Config(ConfigCommand::Check(args))) => {
+            return zecd::config_check::run(&cli, args)
+        }
+        Some(Command::Config(ConfigCommand::Show(args))) => {
+            return zecd::config_show::run(&cli, args)
+        }
+        _ => {}
     }
 
     let config = AppConfig::resolve(&cli)?;

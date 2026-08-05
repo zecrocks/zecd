@@ -28,7 +28,6 @@
 //! stderr is the verdict** (see [`run`]).
 
 use std::io::Write;
-use std::path::Path;
 
 use crate::config::{AppConfig, Cli, ConfigCheckArgs};
 
@@ -190,219 +189,12 @@ fn check_paths(config: &AppConfig, findings: &mut Vec<Finding>) {
     }
 }
 
-/// Render the settings the config resolves to. This is the half of the command that matters on
-/// an upgrade or a rollback: the file is only half the story, since every unset key takes the
-/// *binary's* default, and those move between versions.
-fn summary(config: &AppConfig, conf_path: &Path) -> String {
-    let mut s = String::new();
-
-    section(&mut s, "general");
-    field(&mut s, "network", config.network.name());
-    field(&mut s, "datadir", config.datadir.display());
-    field(&mut s, "config file", conf_path.display());
-    field(&mut s, "default wallet", &config.default_wallet);
-
-    section(&mut s, "backend");
-    field(&mut s, "server", &config.backend.server);
-    field(
-        &mut s,
-        "endpoint",
-        match crate::backend::resolve_configured(config) {
-            Ok(server) => server.describe(),
-            Err(e) => format!("unresolved ({e})"),
-        },
-    );
-    field(
-        &mut s,
-        "connect timeout",
-        format!("{}s", config.backend.connect_timeout_secs),
-    );
-    field(
-        &mut s,
-        "reconnect backoff",
-        format!(
-            "{}s..{}s",
-            config.backend.reconnect_base_secs, config.backend.reconnect_max_secs
-        ),
-    );
-    field(
-        &mut s,
-        "cleartext policy",
-        format!(
-            "rfc1918_is_local={} allow_remote_cleartext={}",
-            config.backend.rfc1918_is_local, config.backend.allow_remote_cleartext
-        ),
-    );
-
-    section(&mut s, "rpc");
-    field(
-        &mut s,
-        "listen",
-        format!("{}:{}", config.rpc.bind, config.rpc.port),
-    );
-    field(&mut s, "auth", describe_rpc_auth(config));
-    field(&mut s, "work queue", config.rpc.work_queue);
-    field(
-        &mut s,
-        "allowed methods",
-        if config.rpc.allowed_methods.is_empty() {
-            "(unrestricted)".to_string()
-        } else {
-            config.rpc.allowed_methods.join(", ")
-        },
-    );
-
-    section(&mut s, "spend");
-    field(
-        &mut s,
-        "confirmations",
-        format!(
-            "trusted={} untrusted={}",
-            config.spend.trusted_confirmations, config.spend.untrusted_confirmations
-        ),
-    );
-    field(
-        &mut s,
-        "privacy policy",
-        format!("{:?}", config.spend.privacy),
-    );
-    field(
-        &mut s,
-        "orchard action limit",
-        match config.spend.orchard_action_limit {
-            0 => "(disabled)".to_string(),
-            n => n.to_string(),
-        },
-    );
-    field(
-        &mut s,
-        "proving",
-        format!(
-            "cache_proving_key={} pipeline_proving={}",
-            config.spend.cache_proving_key, config.spend.pipeline_proving
-        ),
-    );
-
-    section(&mut s, "sync");
-    field(
-        &mut s,
-        "interval",
-        format!("{}s", config.sync.interval_secs),
-    );
-    field(
-        &mut s,
-        "rebroadcast",
-        format!("{}s", config.sync.rebroadcast_secs),
-    );
-
-    section(&mut s, "keys");
-    field(
-        &mut s,
-        "age identity",
-        config
-            .keys
-            .age_identity
-            .as_ref()
-            .map_or_else(|| "(none)".to_string(), |p| p.display().to_string()),
-    );
-    field(&mut s, "auto unlock", config.keys.auto_unlock);
-    field(
-        &mut s,
-        "bootstrap from keys",
-        config.keys.bootstrap_from_keys,
-    );
-
-    section(&mut s, "health");
-    if config.health.enabled {
-        field(
-            &mut s,
-            "listen",
-            format!("{}:{}", config.health.bind, config.health.port),
-        );
-        field(
-            &mut s,
-            "readiness",
-            format!(
-                "{} (max_scan_lag={})",
-                config.health.readiness.as_str(),
-                config.health.max_scan_lag
-            ),
-        );
-    } else {
-        field(&mut s, "enabled", false);
-    }
-
-    section(&mut s, "log");
-    field(&mut s, "level", &config.log.level);
-    field(&mut s, "format", &config.log.format);
-
-    section(&mut s, "wallets");
-    for (name, wallet) in &config.wallets {
-        s.push_str(&format!("  {name}\n"));
-        subfield(&mut s, "dir", wallet.dir.display());
-        subfield(&mut s, "keys", wallet.keys_path().display());
-        subfield(&mut s, "pools", wallet.pools.display_names());
-        subfield(
-            &mut s,
-            "default receivers",
-            wallet.default_receivers.display_names(),
-        );
-        subfield(
-            &mut s,
-            "transparent",
-            if wallet.transparent_enabled {
-                format!(
-                    "enabled (default={} gap_limit={} initial_scan={} recovery_horizon={} \
-                     allow_beyond_window={})",
-                    wallet.transparent_default,
-                    wallet.transparent_gap_limit,
-                    wallet.transparent_initial_scan,
-                    wallet
-                        .transparent_initial_scan
-                        .saturating_add(wallet.transparent_gap_limit),
-                    wallet.transparent_allow_beyond_recovery_window,
-                )
-            } else {
-                "disabled".to_string()
-            },
-        );
-    }
-    s
-}
-
-/// Start a summary section, named for the TOML table it reports on.
-fn section(s: &mut String, name: &str) {
-    s.push_str(&format!("\n[{name}]\n"));
-}
-
-/// One `name  value` line of the summary. Values are taken as `Display` so callers can hand over
-/// a `Path::display()`, a number, or a bool without a `to_string()` at every site.
-fn field(s: &mut String, name: &str, value: impl std::fmt::Display) {
-    s.push_str(&format!("  {name:<24}{value}\n"));
-}
-
-/// A summary line nested under a named entry (a wallet).
-fn subfield(s: &mut String, name: &str, value: impl std::fmt::Display) {
-    s.push_str(&format!("    {name:<22}{value}\n"));
-}
-
-/// The credentials the daemon would accept, in the same union `Authenticator::from_config`
-/// builds: salted `rpcauth` entries, plus either a bare user/password pair or a generated
-/// cookie.
-fn describe_rpc_auth(config: &AppConfig) -> String {
-    let mut parts = Vec::new();
-    if !config.rpc.auth.is_empty() {
-        parts.push(format!("{} rpcauth credential(s)", config.rpc.auth.len()));
-    }
-    if config.rpc.user.is_some() && config.rpc.password.is_some() {
-        parts.push("rpcuser/rpcpassword".to_string());
-    } else if let Some(cookie) = &config.rpc.cookiefile {
-        parts.push(format!("cookie file {}", cookie.display()));
-    }
-    if parts.is_empty() {
-        parts.push("(none)".to_string());
-    }
-    parts.join(" + ")
+/// The effective settings, rendered by [`crate::config_show`] - the same text `zecd config
+/// show` prints. One renderer rather than two: a check that described the configuration in its
+/// own vocabulary would invent labels that map to no config key, and would drift from `show` the
+/// first time a knob was added. What `check` adds is the verdict, on stderr.
+fn summary(config: &AppConfig) -> String {
+    crate::config_show::render(config)
 }
 
 /// `zecd config check`.
@@ -449,7 +241,7 @@ pub fn run(cli: &Cli, args: &ConfigCheckArgs) -> anyhow::Result<()> {
 
     let findings = inspect(&config);
     if !args.quiet {
-        emit(&summary(&config, &conf_path));
+        emit(&summary(&config));
     }
     let mut report = String::new();
     if !findings.is_empty() {
@@ -517,6 +309,7 @@ fn emit_err(text: &str) {
 mod tests {
     use super::*;
     use clap::Parser;
+    use std::path::Path;
 
     /// Parse a CLI the way `main` does, so the tests exercise the real argument surface
     /// (including that the global flags are accepted *after* the subcommand).
@@ -694,29 +487,22 @@ mod tests {
         );
     }
 
-    /// The summary is the upgrade/rollback half of the command: it must show values the file
-    /// never mentions, since those are exactly the ones that move between builds.
+    /// What `check` prints as the effective settings is exactly what `config show` prints -
+    /// one renderer, so the two commands can never describe the same config differently.
     #[test]
-    fn the_summary_reports_defaults_the_file_does_not_set() {
+    fn the_summary_is_the_config_show_rendering() {
         let dir = tempfile::tempdir().unwrap();
-        let path = write_config(
-            dir.path(),
-            &format!("network = \"test\"\ndatadir = {:?}\n", dir.path()),
-        );
         let config = resolve(
             &format!("network = \"test\"\ndatadir = {:?}\n", dir.path()),
             dir.path(),
         );
-        let text = summary(&config, &path);
-        // Unset in the file, defaulted by this build.
-        assert!(text.contains("AllowRevealedRecipients"), "{text}");
-        assert!(text.contains("trusted=3 untrusted=10"), "{text}");
-        assert!(text.contains("zebra-rpc 127.0.0.1:18234"), "{text}");
-        assert!(text.contains("orchard"), "{text}");
-        // The wallet block names the implicit default wallet.
+        assert_eq!(summary(&config), crate::config_show::render(&config));
+        // ...and it carries what the file never said, which is the upgrade/rollback half of the
+        // command (`config_show`'s own tests pin the format).
         assert!(
-            text.contains("[wallets]") && text.contains("default"),
-            "{text}"
+            summary(&config).contains("privacy_policy = \"AllowRevealedRecipients\""),
+            "{}",
+            summary(&config)
         );
     }
 
