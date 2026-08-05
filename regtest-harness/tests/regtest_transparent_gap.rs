@@ -52,7 +52,8 @@ const LARGE_GAP: u32 = 25;
 async fn regtest_transparent_gap_limit_bounds_restore_recovery() {
     let Some(zebrad_bin) = resolve_node_bin() else {
         eprintln!(
-            "SKIP regtest_transparent_gap_limit_bounds_restore_recovery: set {} to run the transparent gap-limit e2e (see README.md).",
+            "SKIP regtest_transparent_gap_limit_bounds_restore_recovery: set {} to run the \
+             transparent gap-limit e2e.",
             RegtestNode::from_env().bin_env()
         );
         return;

@@ -54,8 +54,8 @@ const PREEXPOSE_TIMEOUT: Duration = Duration::from_secs(240);
 async fn regtest_transparent_preexpose_stays_responsive() {
     let Some(zebrad_bin) = resolve_node_bin() else {
         eprintln!(
-            "SKIP regtest_transparent_preexpose_stays_responsive: set {} to run the \
-             transparent pre-exposure responsiveness e2e (see README.md).",
+            "SKIP regtest_transparent_preexpose_stays_responsive: set {} to run the transparent \
+             pre-exposure responsiveness e2e.",
             RegtestNode::from_env().bin_env()
         );
         return;

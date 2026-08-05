@@ -5,7 +5,7 @@
 //!
 //! Skips cleanly when the node binary isn't provisioned (so plain `cargo test` and the
 //! build-only CI path still validate that the harness compiles). Provide `ZEBRAD_BIN` to run
-//! the full flow (see README.md). Runs in the default (non-extended) tier: it needs only one
+//! the full flow. Runs in the default (non-extended) tier: it needs only one
 //! zebra and two short-lived zecd instances.
 
 use std::path::Path;
@@ -48,8 +48,8 @@ fn strip_pin(keys_toml: &Path) {
 async fn regtest_account_binding() {
     let Some(zebrad_bin) = resolve_node_bin() else {
         eprintln!(
-            "SKIP regtest_account_binding: set {} to run the live e2e (see README.md). \
-             The harness still compiled and linked.",
+            "SKIP regtest_account_binding: set {} to run the live e2e. The harness still compiled \
+             and linked.",
             RegtestNode::from_env().bin_env()
         );
         return;

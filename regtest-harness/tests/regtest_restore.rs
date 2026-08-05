@@ -28,15 +28,13 @@ const SYNC_TIMEOUT: Duration = Duration::from_secs(120);
 async fn regtest_stop_and_restore() {
     if !extended_enabled() {
         eprintln!(
-            "SKIP regtest_stop_and_restore: set ZECD_REGTEST_EXTENDED=1 to run the extended \
-             tier (see README.md)."
+            "SKIP regtest_stop_and_restore: set ZECD_REGTEST_EXTENDED=1 to run the extended tier."
         );
         return;
     }
     let Some(zebrad_bin) = resolve_node_bin() else {
         eprintln!(
-            "SKIP regtest_stop_and_restore: set {} (see \
-             README.md). The harness still compiled and linked.",
+            "SKIP regtest_stop_and_restore: set {}. The harness still compiled and linked.",
             RegtestNode::from_env().bin_env()
         );
         return;

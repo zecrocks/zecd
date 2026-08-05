@@ -12,7 +12,7 @@
 //! the address" chain would hand the wallet a wrong note-commitment anchor and the shield/send
 //! proofs would be invalid).
 //!
-//! Skips cleanly unless `ZEBRAD_BIN` is set (see README.md). Both zecd instances talk straight to
+//! Skips cleanly unless `ZEBRAD_BIN` is set. Both zecd instances talk straight to
 //! zebra, so a node binary is the only thing the tier needs.
 //!
 //! Phase 1: funded receive (funder → zecd) - first observed at **0 conf via the mempool
@@ -60,8 +60,8 @@ const ENCRYPT_PASSPHRASE: &str = "regtest-pass";
 async fn regtest_funded_orchard_receive() {
     let Some(zebrad_bin) = resolve_node_bin() else {
         eprintln!(
-            "SKIP regtest_funded_orchard_receive: set {} to run the funded e2e (see README.md). \
-             The harness still compiled and linked.",
+            "SKIP regtest_funded_orchard_receive: set {} to run the funded e2e. The harness still \
+             compiled and linked.",
             RegtestNode::from_env().bin_env()
         );
         return;

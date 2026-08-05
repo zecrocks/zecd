@@ -43,13 +43,14 @@ async fn regtest_reorg_rewinds_and_follows() {
     if !extended_enabled() {
         eprintln!(
             "SKIP regtest_reorg_rewinds_and_follows: set ZECD_REGTEST_EXTENDED=1 to run the \
-             extended tier (see README.md)."
+             extended tier."
         );
         return;
     }
     let Some(zebrad_bin) = resolve_node_bin() else {
         eprintln!(
-            "SKIP regtest_reorg_rewinds_and_follows: set {} (see README.md). The harness still compiled and linked.",
+            "SKIP regtest_reorg_rewinds_and_follows: set {}. The harness still compiled and \
+             linked.",
             RegtestNode::from_env().bin_env()
         );
         return;

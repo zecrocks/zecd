@@ -43,8 +43,8 @@ const FUND_TIMEOUT: Duration = Duration::from_secs(240);
 async fn regtest_sapling_and_orchard_balances() {
     let Some(zebrad_bin) = resolve_node_bin() else {
         eprintln!(
-            "SKIP regtest_sapling_and_orchard_balances: set {} to run the live e2e \
-             (see README.md). The harness still compiled.",
+            "SKIP regtest_sapling_and_orchard_balances: set {} to run the live e2e. The harness \
+             still compiled.",
             RegtestNode::from_env().bin_env()
         );
         return;

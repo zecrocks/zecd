@@ -31,8 +31,8 @@ const SPEND_TIMEOUT: Duration = Duration::from_secs(240);
 async fn regtest_fully_transparent_spend_keeps_change_transparent() {
     let Some(zebrad_bin) = resolve_node_bin() else {
         eprintln!(
-            "SKIP regtest_fully_transparent_spend_keeps_change_transparent: set {} to run the fully-transparent spend e2e (see \
-             README.md). The harness still compiled.",
+            "SKIP regtest_fully_transparent_spend_keeps_change_transparent: set {} to run the \
+             fully-transparent spend e2e. The harness still compiled.",
             RegtestNode::from_env().bin_env()
         );
         return;

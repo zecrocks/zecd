@@ -57,15 +57,14 @@ const OBSERVE_TIMEOUT: Duration = Duration::from_secs(180);
 async fn regtest_stress_many_notes() {
     if !stress_enabled() {
         eprintln!(
-            "SKIP regtest_stress_many_notes: set ZECD_REGTEST_STRESS=1 to run the stress tier \
-             (see README.md). The harness still compiled and linked."
+            "SKIP regtest_stress_many_notes: set ZECD_REGTEST_STRESS=1 to run the stress tier. The \
+             harness still compiled and linked."
         );
         return;
     }
     let Some(zebrad_bin) = resolve_node_bin() else {
         eprintln!(
-            "SKIP regtest_stress_many_notes: set {}, \
-             to run the stress e2e (see README.md).",
+            "SKIP regtest_stress_many_notes: set {}, to run the stress e2e.",
             RegtestNode::from_env().bin_env()
         );
         return;
