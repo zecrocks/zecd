@@ -1,4 +1,5 @@
-//! Blockchain RPCs: getblockchaininfo, getblockcount, getbestblockhash, getblockhash.
+//! Blockchain RPCs: getblockchaininfo, getblockcount, getbestblockhash, getblockhash,
+//! getblockheader, and the `waitfor*` family.
 //!
 //! Heights come from the wallet's published sync status: `blocks` is the fully-scanned
 //! height (the height up to which balances/history are accurate) and `headers` is the known
@@ -6,8 +7,17 @@
 //! `getbestblockhash` and `getblockhash(getblockcount())` describe that same fully-scanned
 //! block (hashes/times come from the wallet's `blocks` table), so the common poller pattern
 //! `getblockhash(getblockcount())` always works.
+//!
+//! That fully-scanned height is also the only correct answer to "has the wallet caught up?" -
+//! a balance is not, because the mempool stream credits an incoming payment at 0 confirmations,
+//! before the block confirming it has been scanned. `waitfornewblock`/`waitforblock`/
+//! `waitforblockheight` make that question first-class (Bitcoin Core's RPCs, same arguments and
+//! `{hash, height}` result) so callers stop reinventing a poll loop over `getblockchaininfo`.
+
+use std::time::Duration;
 
 use serde_json::{json, Value};
+use tokio::time::Instant;
 
 use crate::error::RpcError;
 use crate::server::jsonrpc::RpcRequest;
@@ -181,6 +191,155 @@ pub(crate) fn getblockheader(
     Ok(obj)
 }
 
+/// How long a `waitfor*` wait may sleep before re-checking the wallet's best block regardless of
+/// notifications. The wait is event-driven - it wakes on every [`crate::wallet::SyncStatus`] the
+/// wallet actor publishes, which is at least once per sync pass - so this is only a backstop
+/// bounding how long a *missed* publish (or an actor wedged mid-batch) could stall a waiter. It
+/// is not the polling loop these RPCs exist to replace.
+const WAIT_RECHECK_INTERVAL: Duration = Duration::from_secs(1);
+
+/// The `{hash, height}` result Bitcoin Core's `waitfor*` RPCs return - describing the wallet's
+/// best (fully-scanned) block, both when the wait was satisfied and when it timed out.
+fn wait_result(height: u32, hash: Option<String>) -> Value {
+    json!({ "hash": hash.unwrap_or_default(), "height": height })
+}
+
+/// Parse a `waitfor*` timeout argument: milliseconds, with an omitted/null/`0` value meaning
+/// "wait indefinitely" (Bitcoin Core's convention). Follows Core's argument taxonomy - a
+/// non-integer is a type error (-3), and a negative timeout is the `-1` "Negative timeout" Core
+/// raises before waiting at all.
+fn wait_timeout(req: &RpcRequest, i: usize) -> Result<Option<Duration>, RpcError> {
+    let millis = match req.param(i) {
+        None | Some(Value::Null) => 0,
+        Some(v) => v.as_i64().ok_or_else(|| {
+            RpcError::type_error("Timeout must be an integer number of milliseconds")
+        })?,
+    };
+    if millis < 0 {
+        return Err(RpcError::misc("Negative timeout"));
+    }
+    Ok((millis > 0).then(|| Duration::from_millis(millis as u64)))
+}
+
+/// Drive a `waitfor*` wait: re-evaluate `satisfied` against the wallet's best (fully-scanned)
+/// block - as `(height, hash)` - whenever the wallet actor publishes a new sync status, until it
+/// holds, the timeout expires, or the daemon shuts down. A timeout is **not** an error in
+/// Bitcoin Core: all three outcomes return the current best block, so a caller that cares
+/// distinguishes them by inspecting the returned height.
+///
+/// Note the wait holds a work-queue slot for its duration, exactly as Core's does (where it
+/// holds an RPC thread); a caller that passes no timeout and never gets its block occupies that
+/// slot until the daemon stops.
+async fn wait_for_best_block(
+    state: &AppState,
+    wallet: Option<&str>,
+    timeout: Option<Duration>,
+    mut satisfied: impl FnMut(u32, Option<&str>) -> bool,
+) -> Result<Value, RpcError> {
+    let mut status = state.registry.get(wallet)?.subscribe_status();
+    let deadline = timeout.map(|t| Instant::now() + t);
+    let shutdown = state.shutdown_signal();
+    tokio::pin!(shutdown);
+    loop {
+        // Mark the current status seen *before* reading the block it describes, so an update
+        // that lands while we read wakes the wait below instead of being missed.
+        drop(status.borrow_and_update());
+        let (height, hash, _) = best_block(state, wallet)?;
+        if satisfied(height, hash.as_deref()) {
+            return Ok(wait_result(height, hash));
+        }
+        let now = Instant::now();
+        // Checked after the read above, so a timeout answers with the wallet's current view
+        // rather than one taken a re-check interval ago.
+        let remaining = match deadline {
+            Some(d) if d <= now => return Ok(wait_result(height, hash)),
+            Some(d) => Some(d - now),
+            None => None,
+        };
+        let nap = remaining
+            .unwrap_or(WAIT_RECHECK_INTERVAL)
+            .min(WAIT_RECHECK_INTERVAL);
+        tokio::select! {
+            _ = &mut shutdown => return Ok(wait_result(height, hash)),
+            _ = tokio::time::sleep(nap) => {}
+            res = status.changed() => {
+                // The actor is gone (shut down, or it died): the height will never advance, so
+                // answer with what the wallet has instead of waiting out the timeout.
+                if res.is_err() {
+                    return Ok(wait_result(height, hash));
+                }
+            }
+        }
+    }
+}
+
+/// `waitfornewblock ( timeout )` - block until the wallet's best *scanned* block differs from
+/// the one it is on now (by height or, across a reorg, by hash), then return `{hash, height}`.
+/// `timeout` is in milliseconds; `0` (the default) waits indefinitely, and a timeout returns the
+/// current block rather than an error.
+pub(crate) async fn waitfornewblock(
+    state: &AppState,
+    wallet: Option<&str>,
+    req: &RpcRequest,
+) -> Result<Value, RpcError> {
+    let timeout = wait_timeout(req, 0)?;
+    let (start_height, start_hash, _) = best_block(state, wallet)?;
+    wait_for_best_block(state, wallet, timeout, move |height, hash| {
+        height != start_height || hash != start_hash.as_deref()
+    })
+    .await
+}
+
+/// `waitforblock <blockhash> ( timeout )` - block until `blockhash` is the wallet's best scanned
+/// block. Like Bitcoin Core this watches only the tip, so a hash the wallet has already scanned
+/// past never matches; use `waitforblockheight` to wait for a height to be reached.
+pub(crate) async fn waitforblock(
+    state: &AppState,
+    wallet: Option<&str>,
+    req: &RpcRequest,
+) -> Result<Value, RpcError> {
+    let target = req.require_str(0, "waitforblock requires a block hash")?;
+    parse_blockhash_param(target)?;
+    // Core parses the argument into a hash, so its comparison is case-insensitive; the wallet
+    // stores display hex in lower case.
+    let target = target.to_ascii_lowercase();
+    let timeout = wait_timeout(req, 1)?;
+    wait_for_best_block(state, wallet, timeout, move |_, hash| {
+        hash == Some(target.as_str())
+    })
+    .await
+}
+
+/// `waitforblockheight <height> ( timeout )` - block until the wallet has *scanned* to at least
+/// `height`, i.e. until `getblockchaininfo.blocks` (equivalently `getblockcount`) reaches it.
+/// This is the RPC to use before asserting on a balance or history: an incoming payment is
+/// credited from the mempool at 0 confirmations, so a balance alone never proves the confirming
+/// block was scanned.
+pub(crate) async fn waitforblockheight(
+    state: &AppState,
+    wallet: Option<&str>,
+    req: &RpcRequest,
+) -> Result<Value, RpcError> {
+    // Same argument taxonomy as `getblockhash`: omitted is the help error (-1), a non-integer is
+    // a type error (-3), and an integer outside the representable range is -8.
+    let target = match req.param(0) {
+        None | Some(Value::Null) => {
+            return Err(RpcError::missing_param(
+                "waitforblockheight requires a height",
+            ))
+        }
+        Some(v) => {
+            let n = v
+                .as_i64()
+                .ok_or_else(|| RpcError::type_error("Block height must be an integer"))?;
+            u32::try_from(n)
+                .map_err(|_| RpcError::invalid_parameter("Block height out of range"))?
+        }
+    };
+    let timeout = wait_timeout(req, 1)?;
+    wait_for_best_block(state, wallet, timeout, move |height, _| height >= target).await
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -194,5 +353,39 @@ mod tests {
         assert_eq!(e.code, crate::error::codes::RPC_INVALID_PARAMETER);
         assert!(e.message.contains("must be hexadecimal"), "{}", e.message);
         assert!(parse_blockhash_param(&"ab".repeat(32)).is_ok());
+    }
+
+    fn req_with(params: Vec<Value>) -> RpcRequest {
+        RpcRequest {
+            id: json!(1),
+            method: "waitforblockheight".into(),
+            params,
+        }
+    }
+
+    /// Bitcoin Core's `waitfor*` timeout convention: milliseconds, with omitted/null/`0` all
+    /// meaning "no timeout". Getting `0` wrong in either direction is the whole risk here - a
+    /// `0` read as an instant deadline turns a blocking wait into a poll, and an omitted
+    /// argument read as `0` milliseconds does the same.
+    #[test]
+    fn wait_timeout_treats_zero_and_omitted_as_no_timeout() {
+        assert_eq!(wait_timeout(&req_with(vec![]), 0).unwrap(), None);
+        assert_eq!(wait_timeout(&req_with(vec![Value::Null]), 0).unwrap(), None);
+        assert_eq!(wait_timeout(&req_with(vec![json!(0)]), 0).unwrap(), None);
+        assert_eq!(
+            wait_timeout(&req_with(vec![json!(1500)]), 0).unwrap(),
+            Some(Duration::from_millis(1500))
+        );
+    }
+
+    /// The argument errors follow Core: a non-integer timeout is a type error, and a negative
+    /// one is rejected outright rather than silently becoming an instant timeout.
+    #[test]
+    fn wait_timeout_rejects_negative_and_non_integer() {
+        let e = wait_timeout(&req_with(vec![json!(-1)]), 0).unwrap_err();
+        assert_eq!(e.code, crate::error::codes::RPC_MISC_ERROR);
+        assert_eq!(e.message, "Negative timeout");
+        let e = wait_timeout(&req_with(vec![json!("soon")]), 0).unwrap_err();
+        assert_eq!(e.code, crate::error::codes::RPC_TYPE_ERROR);
     }
 }

@@ -105,6 +105,44 @@ def main() -> int:
     at_count = rpc.call("getblockhash", count)
     ck("getblockhash(getblockcount()) == getbestblockhash", best == at_count, f"{best} != {at_count}")
 
+    print("== waitfor block RPCs ==")
+    # These answer "has the wallet scanned to height N?" - the question a balance poll cannot,
+    # since an incoming payment is credited from the mempool before its block is scanned. All
+    # three return {hash, height} describing the fully-scanned block, and a timeout returns that
+    # block rather than raising (Bitcoin Core's contract).
+    w = rpc.call("waitforblockheight", count)
+    ck("waitforblockheight returns {hash,height}", isinstance(w, dict) and set(w) == {"hash", "height"}, w)
+    ck("waitforblockheight(getblockcount()) returns now", w["height"] >= count, f"{w['height']} < {count}")
+    ck("waitforblockheight hash is 64-hex", isinstance(w["hash"], str) and len(w["hash"]) == 64)
+    # An unreachable height with a short timeout must come back with the current tip, not an error.
+    w = rpc.call("waitforblockheight", count + 1_000_000, 250)
+    ck("waitforblockheight timeout returns the current tip", w["height"] >= count, w)
+    w = rpc.call("waitfornewblock", 250)
+    ck("waitfornewblock timeout returns the current tip", w["height"] >= count, w)
+    # waitforblock watches the tip for one hash: either it is still the tip, or the chain moved on.
+    w = rpc.call("waitforblock", best, 250)
+    ck("waitforblock(tip) returns that block", w["hash"] == best or w["height"] > count, f"{w} vs {best}@{count}")
+    try:
+        rpc.call("waitforblockheight")
+        ck("waitforblockheight without a height raises", False)
+    except JSONRPCException as e:
+        ck("waitforblockheight without a height -> code -1", e.code == -1, e.code)
+    try:
+        rpc.call("waitforblockheight", "soon")
+        ck("waitforblockheight non-integer height raises", False)
+    except JSONRPCException as e:
+        ck("waitforblockheight non-integer height -> code -3", e.code == -3, e.code)
+    try:
+        rpc.call("waitfornewblock", -1)
+        ck("negative timeout raises", False)
+    except JSONRPCException as e:
+        ck("negative timeout -> code -1", e.code == -1, e.code)
+    try:
+        rpc.call("waitforblock", "xyz", 250)
+        ck("waitforblock bad hash raises", False)
+    except JSONRPCException as e:
+        ck("waitforblock bad hash -> code -8", e.code == -8, e.code)
+
     print("== control methods ==")
     h = rpc.call("help")
     ck("help is a string naming methods", isinstance(h, str) and "getblockchaininfo" in h)

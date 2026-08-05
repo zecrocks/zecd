@@ -34,6 +34,9 @@ pub const ALL_METHODS: &[&str] = &[
     "getbestblockhash",
     "getblockhash",
     "getblockheader",
+    "waitfornewblock",
+    "waitforblock",
+    "waitforblockheight",
     // Utility
     "validateaddress",
     "signmessage",
@@ -107,6 +110,9 @@ const MAX_POSITIONAL_ARGS: &[(&str, usize)] = &[
     ("getbestblockhash", 0),
     ("getblockhash", 1),
     ("getblockheader", 2),
+    ("waitfornewblock", 1),
+    ("waitforblock", 2),
+    ("waitforblockheight", 2),
     // Utility
     ("validateaddress", 1),
     ("settxfee", 1),
@@ -223,6 +229,9 @@ async fn dispatch_zecd(
         "getbestblockhash" => blockchain::getbestblockhash(state, wallet),
         "getblockhash" => blockchain::getblockhash(state, wallet, req),
         "getblockheader" => blockchain::getblockheader(state, wallet, req),
+        "waitfornewblock" => blockchain::waitfornewblock(state, wallet, req).await,
+        "waitforblock" => blockchain::waitforblock(state, wallet, req).await,
+        "waitforblockheight" => blockchain::waitforblockheight(state, wallet, req).await,
 
         // Utility
         "validateaddress" => util::validateaddress(state, wallet, req),

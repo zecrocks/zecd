@@ -215,7 +215,7 @@ mod tests {
     use super::*;
     use std::collections::BTreeMap;
     use std::sync::Arc;
-    use std::time::Instant;
+    use std::time::{Duration, Instant};
 
     use axum::body::Body as AxumBody;
     use axum::http::Request;
@@ -526,6 +526,206 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(body_json(r).await["result"].as_u64(), Some(500));
+    }
+
+    /// A state whose default wallet publishes `status`, plus the sender - so a test can move the
+    /// wallet's view of the chain the way the actor's `update_status` does. `fully_scanned` is
+    /// deliberately left `None` by callers: `best_block` then answers purely from the published
+    /// status, keeping these tests off the wallet DB.
+    fn state_publishing(
+        status: crate::wallet::SyncStatus,
+    ) -> (
+        AppState,
+        tokio::sync::watch::Sender<crate::wallet::SyncStatus>,
+    ) {
+        use crate::network::ZNetwork;
+        use crate::wallet::WalletHandle;
+
+        let (handle, tx) = WalletHandle::for_test_publishing("default", ZNetwork::Test, status);
+        let mut reg = WalletRegistry::new("default".into());
+        reg.insert(handle);
+        let mut state = test_state();
+        state.registry = Arc::new(reg);
+        (state, tx)
+    }
+
+    /// One `waitfor*` call against `state`, returning the envelope's `result`.
+    async fn wait_call(state: AppState, body: &str) -> Value {
+        let r = router(state)
+            .oneshot(req(body, Some(("u", "p"))))
+            .await
+            .unwrap();
+        body_json(r).await["result"].clone()
+    }
+
+    fn status_at(hash: &str) -> crate::wallet::SyncStatus {
+        crate::wallet::SyncStatus {
+            best_block_hash: Some(hash.to_string()),
+            ..Default::default()
+        }
+    }
+
+    /// The point of `waitforblockheight`: a height the wallet has already *scanned* to answers
+    /// immediately, and a height it has not is waited on - with a timeout returning the current
+    /// block rather than raising, exactly as Bitcoin Core does. (A timeout that errored would
+    /// push callers straight back to the poll loops these RPCs replace.)
+    #[tokio::test]
+    async fn waitforblockheight_answers_now_when_reached_and_times_out_otherwise() {
+        let hash = "ab".repeat(32);
+        let (state, _tx) = state_publishing(status_at(&hash));
+
+        let started = Instant::now();
+        let res = wait_call(
+            state.clone(),
+            r#"{"method":"waitforblockheight","params":[0],"id":1}"#,
+        )
+        .await;
+        assert_eq!(res["height"].as_u64(), Some(0));
+        assert_eq!(res["hash"].as_str(), Some(hash.as_str()));
+        assert!(
+            started.elapsed() < Duration::from_millis(500),
+            "an already-reached height must not wait"
+        );
+
+        // A height the wallet has not scanned: the wait runs, and the timeout answers with the
+        // wallet's current block instead of an error.
+        let res = wait_call(
+            state,
+            r#"{"method":"waitforblockheight","params":[9000,150],"id":1}"#,
+        )
+        .await;
+        assert_eq!(res["height"].as_u64(), Some(0));
+        assert_eq!(res["hash"].as_str(), Some(hash.as_str()));
+    }
+
+    /// `waitfornewblock` must wake on the actor's published status, not on the wait loop's
+    /// backstop re-check - that is what makes it a blocking question rather than a poll with
+    /// extra steps. The publish lands well inside the backstop interval, so a wait that only
+    /// woke on the backstop would blow the bound here.
+    #[tokio::test]
+    async fn waitfornewblock_wakes_on_the_published_status() {
+        let (state, tx) = state_publishing(status_at(&"ab".repeat(32)));
+        let next = "cd".repeat(32);
+        let publisher = {
+            let next = next.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                tx.send_replace(status_at(&next));
+                // Held open so the wait sees a live channel, not a dropped-sender error.
+                tokio::time::sleep(Duration::from_millis(2000)).await;
+                drop(tx);
+            })
+        };
+
+        let started = Instant::now();
+        // No timeout: only the published status can end this wait.
+        let res = wait_call(state, r#"{"method":"waitfornewblock","id":1}"#).await;
+        let elapsed = started.elapsed();
+        assert_eq!(res["hash"].as_str(), Some(next.as_str()));
+        assert!(
+            elapsed < Duration::from_millis(700),
+            "woke after {elapsed:?}; expected the publish to wake it, not the backstop re-check"
+        );
+        publisher.abort();
+    }
+
+    /// `waitforblock` watches the tip for one specific hash: the wallet's current best block
+    /// answers immediately, any other hash waits (here, out to its timeout).
+    #[tokio::test]
+    async fn waitforblock_matches_the_current_best_block() {
+        let hash = "ab".repeat(32);
+        let (state, _tx) = state_publishing(status_at(&hash));
+
+        let res = wait_call(
+            state.clone(),
+            &format!(r#"{{"method":"waitforblock","params":["{hash}"],"id":1}}"#),
+        )
+        .await;
+        assert_eq!(res["hash"].as_str(), Some(hash.as_str()));
+
+        // Core parses the argument as a hash, so the comparison is case-insensitive.
+        let upper = hash.to_ascii_uppercase();
+        let res = wait_call(
+            state.clone(),
+            &format!(r#"{{"method":"waitforblock","params":["{upper}",150],"id":1}}"#),
+        )
+        .await;
+        assert_eq!(res["hash"].as_str(), Some(hash.as_str()));
+
+        let other = "cd".repeat(32);
+        let res = wait_call(
+            state,
+            &format!(r#"{{"method":"waitforblock","params":["{other}",150],"id":1}}"#),
+        )
+        .await;
+        assert_eq!(
+            res["hash"].as_str(),
+            Some(hash.as_str()),
+            "a timed-out wait reports the current tip, not the requested hash"
+        );
+    }
+
+    /// Argument errors follow Bitcoin Core's taxonomy, and none of them may block: a bad
+    /// argument must be rejected before the wait starts.
+    #[tokio::test]
+    async fn waitfor_rpcs_reject_bad_arguments_without_waiting() {
+        let (state, _tx) = state_publishing(status_at(&"ab".repeat(32)));
+        let cases: &[(&str, i64)] = &[
+            // Missing height -> the help error; non-integer -> type error.
+            (r#"{"method":"waitforblockheight","id":1}"#, -1),
+            (
+                r#"{"method":"waitforblockheight","params":["soon"],"id":1}"#,
+                -3,
+            ),
+            // Negative height is out of the representable range, like getblockhash's.
+            (
+                r#"{"method":"waitforblockheight","params":[-1],"id":1}"#,
+                -8,
+            ),
+            // A negative timeout is rejected rather than silently becoming an instant timeout.
+            (
+                r#"{"method":"waitforblockheight","params":[0,-1],"id":1}"#,
+                -1,
+            ),
+            (r#"{"method":"waitfornewblock","params":["x"],"id":1}"#, -3),
+            // Block-hash validation matches getblockheader's.
+            (r#"{"method":"waitforblock","params":["abcd"],"id":1}"#, -8),
+            (r#"{"method":"waitforblock","id":1}"#, -1),
+            // Over-arity positional calls are Core's help error.
+            (r#"{"method":"waitfornewblock","params":[1,2],"id":1}"#, -1),
+        ];
+        for (body, code) in cases {
+            let started = Instant::now();
+            let r = router(state.clone())
+                .oneshot(req(body, Some(("u", "p"))))
+                .await
+                .unwrap();
+            let env = body_json(r).await;
+            assert_eq!(
+                env["error"]["code"].as_i64(),
+                Some(*code),
+                "unexpected code for {body}: {env}"
+            );
+            assert!(
+                started.elapsed() < Duration::from_millis(500),
+                "a rejected argument must not wait: {body}"
+            );
+        }
+    }
+
+    /// A `waitfor*` call with no timeout must still end when the daemon is stopping - otherwise
+    /// it pins a work-queue slot through graceful shutdown and holds the process open.
+    #[tokio::test]
+    async fn waitfor_rpcs_return_on_shutdown() {
+        let (state, _tx) = state_publishing(status_at(&"ab".repeat(32)));
+        let shutting = state.clone();
+        let stopper = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            shutting.trigger_shutdown();
+        });
+        let res = wait_call(state, r#"{"method":"waitfornewblock","id":1}"#).await;
+        assert_eq!(res["height"].as_u64(), Some(0));
+        stopper.await.unwrap();
     }
 
     /// `z_waitforoperation` over the full HTTP path: the blocking alternative to the

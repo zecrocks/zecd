@@ -1392,20 +1392,40 @@ impl Zecd {
             .ok_or_else(|| anyhow!("getblockcount did not return a number"))
     }
 
-    /// Poll until `getblockchaininfo.blocks` reaches `target` (zecd has scanned to the tip).
+    /// Block until zecd has *scanned* to `target` - `getblockchaininfo.blocks`, the height at
+    /// which balances and history are accurate.
+    ///
+    /// This asks the daemon the question directly (`waitforblockheight`) instead of polling a
+    /// proxy for it. Never substitute a balance poll: the mempool stream credits an incoming
+    /// payment at 0 confirmations, so a balance is satisfied *before* the confirming block is
+    /// scanned - which is how a test can go on to read a height-dependent field (confirmations,
+    /// `listsinceblock`, a `blockhash`) that the wallet has not written yet.
+    ///
+    /// The server-side wait is capped per call so a hung daemon still surfaces as this
+    /// function's own timeout rather than an indefinite block.
     pub async fn wait_until_synced(&self, target: u64, timeout: Duration) -> Result<()> {
+        const MAX_SERVER_WAIT: Duration = Duration::from_secs(5);
         let deadline = Instant::now() + timeout;
         loop {
-            if let Ok(info) = self.call("getblockchaininfo", json!([])).await {
-                let blocks = info.get("blocks").and_then(|b| b.as_u64()).unwrap_or(0);
-                if blocks >= target {
-                    return Ok(());
-                }
-            }
-            if Instant::now() >= deadline {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
                 bail!("zecd did not sync to height {target} within {timeout:?}");
             }
-            tokio::time::sleep(Duration::from_millis(500)).await;
+            // Never 0: that is `waitforblockheight`'s "wait indefinitely".
+            let wait_ms = remaining.min(MAX_SERVER_WAIT).as_millis().max(1) as u64;
+            match self
+                .call("waitforblockheight", json!([target, wait_ms]))
+                .await
+            {
+                Ok(v) => {
+                    if v.get("height").and_then(|h| h.as_u64()).unwrap_or(0) >= target {
+                        return Ok(());
+                    }
+                }
+                // The daemon may not be serving yet (restart tests reuse this); retry until the
+                // deadline rather than failing on the first refused connection.
+                Err(_) => tokio::time::sleep(Duration::from_millis(200)).await,
+            }
         }
     }
 

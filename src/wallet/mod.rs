@@ -338,17 +338,39 @@ impl WalletHandle {
         self.status_rx.borrow().clone()
     }
 
+    /// A private receiver on the actor's published [`SyncStatus`], for RPC handlers that must
+    /// *wait* for the wallet's view of the chain to move rather than poll it (the `waitfor*`
+    /// blockchain RPCs). The clone inherits this handle's seen-version, which is the channel's
+    /// initial one - so mark the current value seen (`borrow_and_update`) before reading the
+    /// state you are about to wait on, or the first `changed()` resolves on an update you have
+    /// already accounted for.
+    pub fn subscribe_status(&self) -> watch::Receiver<SyncStatus> {
+        self.status_rx.clone()
+    }
+
     /// Build a handle wired to a fixed [`SyncStatus`] for unit tests - no actor, no DB behind it.
     /// The command channel is inert (its receiver is dropped, so any `dispatch` would fail), and
     /// `dir` is empty; only `status()`/`name`/`network` reads are meaningful. Used to exercise
     /// `/wallet/<name>` routing in RPC handlers that read solely from the published sync status.
     #[cfg(test)]
     pub(crate) fn for_test(name: &str, network: ZNetwork, status: SyncStatus) -> Self {
+        WalletHandle::for_test_publishing(name, network, status).0
+    }
+
+    /// [`WalletHandle::for_test`] plus the live sender, for tests that need to *publish* a new
+    /// status to a handle (the `waitfor*` RPCs wake on exactly that). Holding the sender also
+    /// keeps the channel open, so `subscribe_status().changed()` waits rather than erroring.
+    #[cfg(test)]
+    pub(crate) fn for_test_publishing(
+        name: &str,
+        network: ZNetwork,
+        status: SyncStatus,
+    ) -> (Self, watch::Sender<SyncStatus>) {
         let (cmd_tx, _cmd_rx) = mpsc::channel(1);
         // The receiver keeps borrowing the seeded value after the sender drops (tokio watch
         // retains the last value), so the seeded status stays readable for the handle's life.
-        let (_status_tx, status_rx) = watch::channel(status);
-        WalletHandle {
+        let (status_tx, status_rx) = watch::channel(status);
+        let handle = WalletHandle {
             name: name.to_string(),
             dir: PathBuf::new(),
             network,
@@ -363,7 +385,8 @@ impl WalletHandle {
             seed: None,
             cmd_tx,
             status_rx,
-        }
+        };
+        (handle, status_tx)
     }
 
     /// Snapshot of the transient first-seen times for unmined txs (display-hex txid → unix time),

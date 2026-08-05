@@ -116,6 +116,9 @@ password = "change-me"
 #   "getbestblockhash",
 #   "getblockhash",
 #   "getblockheader",
+#   "waitfornewblock",         # blocks until the wallet scans a new block
+#   "waitforblock",
+#   "waitforblockheight",      # blocks until the wallet has scanned to a height
 #   "getnetworkinfo",
 #   "getconnectioncount",
 #   "getpeerinfo",
