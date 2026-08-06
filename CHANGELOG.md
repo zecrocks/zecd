@@ -5,6 +5,23 @@ All notable changes to zecd are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com), and this
 project adheres to [Semantic Versioning](https://semver.org).
 
+## [0.6.0-rc2] - 2026-08-06
+
+Adds an optional lightwalletd backend. Everything in 0.6.0-rc1 is unchanged, and full mode
+against a local zebra remains the default and the recommendation, so an existing deployment
+that does not set a new `[backend] server` token is unaffected.
+
+This is a 0.6.x-only addition: the 0.5.x line does not carry it.
+
+### Added
+- `[backend] server` accepts a lightwalletd gRPC endpoint as well as a local zebrad, so zecd can run without a fully synced local full node. The token selects the mode: `zebra` and `zebra://host:port` are full mode; `https://host[:port]`, `http://host:port`, a bare `host:port`, and the `zecrocks` preset are light mode. Every feature, including transparent addresses, works in both.
+- TLS controls for a light upstream: `tls` forces or disables it (the default decides by locality, so loopback and private networks stay plaintext and public hosts get TLS), `tls_roots` picks the OS store or the embedded bundle, `tls_ca_file` adds a private CA, and `tls_pinned_sha256` pins the leaf certificate. Plaintext to a globally routable host is refused unless `allow_remote_cleartext` is set, because what it leaks is which addresses the wallet is asking about.
+- `assume_transparent_in_compact_blocks` lets an operator assert that their lightwalletd serves transparent and Ironwood data inside compact blocks. The connect-time probe reads the advertised protocol version, and a transparent-enabled wallet refuses to run against a server that does not advertise it rather than silently never discovering those receives. No released lightwalletd populates that advertisement yet, so the assertion is currently required in practice.
+- `zecd config check` gained the light-mode gates: it warns about a transparent wallet on a light upstream without the capability assertion, about `tls_insecure_skip_verify`, about a capability assertion that will be ignored on a zebra upstream, and about a large transparent address set on a light backend.
+
+### Changed
+- Transparent spend detection costs one upstream query per funded address, which is a local index lookup on zebra and a remote round trip on a light backend. A wallet tracking many funded transparent addresses is therefore still better served by its own zebra; both the daemon and `config check` say so once, at startup and on demand.
+
 ## [0.6.0-rc1] - 2026-08-05
 
 A feature release: four additions to the RPC surface, two new offline subcommands, and a faster
@@ -317,6 +334,7 @@ Zcash, backed entirely by librustzcash and running as a light client.
 ### Security
 - Pre-release audit hardening; refuse to start on mainnet with the placeholder RPC password; enforce a 12-character passphrase minimum.
 
+[0.6.0-rc2]: https://github.com/zecrocks/zecd/compare/v0.6.0-rc1...v0.6.0-rc2
 [0.6.0-rc1]: https://github.com/zecrocks/zecd/compare/v0.5.2...v0.6.0-rc1
 [0.5.2]: https://github.com/zecrocks/zecd/compare/v0.5.1...v0.5.2
 [0.5.1]: https://github.com/zecrocks/zecd/compare/v0.5.0...v0.5.1
