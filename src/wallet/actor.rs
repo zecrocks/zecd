@@ -259,6 +259,19 @@ const PERSISTENT_SYNC_ERROR_THRESHOLD: u32 = 3;
 const UPGRADE_GUIDANCE: &str = "Update to the latest zecd release; if you are already on the \
      latest release, please report this at https://forum.zcashcommunity.com";
 
+/// Whether a sync failure is **terminal** - retrying it can never succeed, so the actor halts
+/// this wallet's scan instead of pacing the same failure forever.
+///
+/// Exactly one class qualifies today: [`engine::UnrecoverableReorg`], where no truncation target
+/// below the conflicting block exists, so the block cannot be removed and every batch re-hits it.
+/// Everything else is retried - a transport error is fixed by reconnecting, and even a repeated
+/// apply-side failure (`engine::WalletApplyError`) can clear once the operator updates zecd for a
+/// network upgrade the running build cannot parse. Keep it that way: halting on a class that can
+/// recover on its own would strand a wallet that only needed to wait.
+fn sync_failure_is_terminal(e: &anyhow::Error) -> bool {
+    e.downcast_ref::<engine::UnrecoverableReorg>().is_some()
+}
+
 /// Build the recovery guidance (if any) to append to a failed sync pass's log line.
 ///
 /// Only *apply-side* failures ([`engine::WalletApplyError`]: the upstream served the blocks,
@@ -724,6 +737,17 @@ struct WalletActor {
     /// from the raw error to recovery guidance (see [`sync_failure_hint`]).
     last_sync_error: Option<String>,
     sync_error_streak: u32,
+    /// Sync is stopped for this wallet because a failure that **cannot** succeed on retry was
+    /// hit: an [`engine::UnrecoverableReorg`], where no truncation target below the conflict
+    /// exists, so the conflicting block can never be removed and every batch re-hits it. The rest
+    /// of the actor keeps running - reads, address issuance, the RPC surface - but no further
+    /// scan is attempted until the operator rebuilds the wallet database (`zecd rescan`) and
+    /// restarts, which clears this (it is in-memory, so a restart always re-tries once).
+    ///
+    /// Without this the actor retried the identical failure forever, dropping and rebuilding the
+    /// upstream connection each time (280 attempts over ten minutes, observed in CI), which looks
+    /// like a flaky upstream rather than a wallet that needs rebuilding.
+    sync_halted: bool,
     /// Serviceable transaction-data requests already attempted in the current enhancement drain.
     /// Mirrors zcash-devtool/zkv's per-pass `satisfied` set, but carried across `enhance_step`
     /// batches so a request the upstream can't satisfy (left in the DB after servicing) is
@@ -1064,6 +1088,7 @@ pub async fn spawn(
         unsupported_upgrades: Vec::new(),
         last_sync_error: None,
         sync_error_streak: 0,
+        sync_halted: false,
         enhance_satisfied: std::collections::BTreeSet::new(),
         enhance_progress: None,
         shutdown: cfg.shutdown,
@@ -1477,6 +1502,13 @@ impl WalletActor {
             // iteration (between sync batches) so the seed doesn't linger long past expiry; the
             // `select!` branch below handles the idle case, and `do_send` has a hard backstop.
             self.relock_if_expired();
+            // A halted wallet serves commands and reads but never re-attempts the scan: the
+            // failure that halted it cannot succeed on retry (see `sync_halted`). Clearing
+            // `more_work` every pass keeps the loop parked in the `select!` below rather than
+            // spinning, and still lets a command wake it.
+            if self.sync_halted {
+                more_work = false;
+            }
             if more_work {
                 // Commit any pipelined send whose proof just finished, before the next sync
                 // batch - phase C is short (store + bounded broadcast) and the caller is waiting.
@@ -1543,6 +1575,23 @@ impl WalletActor {
                         // guidance when the failure is diagnosable: an unsupported network
                         // upgrade (update zecd / report on the forum) or a persistent
                         // wallet-database apply error (`zecd rescan`).
+                        // An unrecoverable reorg is the one sync failure retrying cannot fix, so
+                        // it stops the scan instead of pacing it forever. Logged once, at ERROR,
+                        // naming the operator action; the reason also rides `mark_disconnected`
+                        // onto `/readyz` and `/status`.
+                        if !self.sync_halted && sync_failure_is_terminal(&e) {
+                            self.sync_halted = true;
+                            error!(
+                                "[{name}] {e}; sync is HALTED for this wallet - retrying cannot \
+                                 remove the conflicting block. Stop the daemon and run `zecd \
+                                 rescan --wallet {name}` to rebuild the wallet database from the \
+                                 seed (keys.toml is kept) and resync from the wallet birthday. \
+                                 Reads, address issuance and the rest of the RPC surface keep \
+                                 working meanwhile; balances and history are frozen at the last \
+                                 scanned block",
+                                name = self.name
+                            );
+                        }
                         let reason = self.note_sync_error(&e);
                         self.mark_disconnected(reason);
                         self.reconnect_at = self
@@ -5696,6 +5745,33 @@ mod tests {
     use super::transparent_child_index;
     use super::DiversifierIndex;
     use super::ProvingKeys;
+
+    /// The halt is keyed on the failure *type*, and only the terminal one. A transport failure or
+    /// a wallet-apply failure must stay retryable: reconnecting fixes the first, and updating
+    /// zecd fixes the second, so halting on either would strand a wallet that only needed to wait.
+    #[test]
+    fn only_an_unrecoverable_reorg_halts_sync() {
+        use crate::sync::engine::{UnrecoverableReorg, WalletApplyError};
+        use zcash_protocol::consensus::BlockHeight;
+
+        let terminal: anyhow::Error = UnrecoverableReorg {
+            at_height: BlockHeight::from_u32(3),
+            requested: BlockHeight::from_u32(0),
+            safe_rewind_height: Some(BlockHeight::from_u32(0)),
+        }
+        .into();
+        assert!(super::sync_failure_is_terminal(&terminal));
+
+        let apply: anyhow::Error = WalletApplyError("commitment tree conflict".into()).into();
+        assert!(
+            !super::sync_failure_is_terminal(&apply),
+            "an apply-side failure can clear on its own (e.g. after a zecd update)"
+        );
+        assert!(
+            !super::sync_failure_is_terminal(&anyhow::anyhow!("connection reset")),
+            "a transport failure is fixed by reconnecting"
+        );
+    }
 
     /// Every `get` shares one [`super::ProvingKeyCache`] rather than generating a key per send.
     /// The regtest tier cannot catch a regression here - rebuilding per send is slower, not
