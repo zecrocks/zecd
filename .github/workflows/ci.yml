@@ -10,14 +10,16 @@ on:
     # below, so listing them here too would run every job twice on a PR push.
     branches: [main, master]
     # Skip the Rust build/test/clippy/deny/msrv tier for changes that can't affect it:
-    # docs, deploy samples, the release/docker/regtest workflows, the Dockerfiles, and the
-    # release packaging script. (Editing ci.yml itself still runs - it's not ignored.)
+    # docs, the release/docker/regtest workflows, the Dockerfiles, and the release packaging
+    # script. (Editing ci.yml itself still runs - it's not ignored.)
+    #
+    # `zecd.example.toml` and `deploy/**` are deliberately NOT ignored: tests/cli.rs runs
+    # `zecd config check` over the sample configs this repo ships, so editing one of them can
+    # fail this tier and must therefore run it.
     paths-ignore:
       - "**.md"
       - "docs/**"
-      - "deploy/**"
       - "LICENSE-*"
-      - "zecd.example.toml"
       - "Dockerfile*"
       - ".dockerignore"
       - "scripts/build-deb.sh"
@@ -28,9 +30,7 @@ on:
     paths-ignore:
       - "**.md"
       - "docs/**"
-      - "deploy/**"
       - "LICENSE-*"
-      - "zecd.example.toml"
       - "Dockerfile*"
       - ".dockerignore"
       - "scripts/build-deb.sh"

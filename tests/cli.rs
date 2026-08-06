@@ -1050,6 +1050,108 @@ fn config_show_redacts_credentials() {
     assert!(stdout.contains("# user, password = <redacted>"), "{stdout}");
 }
 
+// ---------------------------------------------------------------------------
+// the configuration files this repo ships
+// ---------------------------------------------------------------------------
+//
+// `zecd.example.toml` (shipped in the tarball and the .deb, and printed by `example-config`)
+// and `deploy/*.toml` (mounted by the docker-compose stack) are handed to operators as
+// starting points. zecd rejects unknown keys, so a knob that is renamed or retired turns every
+// config mentioning it into one the daemon refuses to start on - and nothing here parsed these
+// files, so that drift was invisible until someone deployed. `example-config` is asserted
+// byte-for-byte against the shipped file elsewhere, but byte-equality between two copies that
+// nothing ever parses proves only that the copies agree.
+//
+// `config check` is exactly the tool for this, so point it at them.
+
+/// A path in the repository, resolved against the crate root rather than the test's working
+/// directory.
+fn repo_file(rel: &str) -> std::path::PathBuf {
+    std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(rel)
+}
+
+/// Every sample config this repo ships must be one *this* build accepts.
+#[test]
+fn the_sample_configs_this_repo_ships_are_valid_for_this_build() {
+    // deploy/zecd.mainnet.toml is deliberately absent - it carries the CHANGE-ME placeholder
+    // and is covered by the test below.
+    for rel in ["zecd.example.toml", "deploy/zecd.toml"] {
+        let out = config_check(&repo_file(rel), &[]);
+        assert!(
+            out.status.success(),
+            "{rel} is shipped to operators but this build would refuse it:\n{}{}",
+            stdout_of(&out),
+            stderr_of(&out)
+        );
+    }
+}
+
+/// `deploy/zecd.mainnet.toml` is the one shipped sample that must *not* pass as written: it
+/// carries the `CHANGE-ME` RPC password, and refusing that on mainnet is a deliberate guard (an
+/// RPC password is spend authority for clients, and this one is printed in the repo). Assert
+/// both halves - the guard fires on the file as shipped, and everything else about the file is
+/// valid once the operator supplies the one value they are told to change. Without the second
+/// half a sample that had quietly rotted would still "fail as expected".
+#[test]
+fn the_mainnet_sample_config_is_refused_only_for_its_placeholder_password() {
+    let conf = repo_file("deploy/zecd.mainnet.toml");
+
+    let out = config_check(&conf, &[]);
+    assert!(
+        !out.status.success(),
+        "the mainnet sample ships a placeholder password; the check must refuse it:\n{}",
+        stderr_of(&out)
+    );
+    let stderr = stderr_of(&out);
+    assert!(
+        stderr.contains("placeholder"),
+        "refused for some other reason than the placeholder password: {stderr}"
+    );
+
+    // The same file, with the password supplied the way a deployment would (the config itself
+    // documents ZECD_RPC_PASSWORD as the ConfigMap-safe way to keep it out of the TOML).
+    let out = run_with_timeout(
+        {
+            let mut c = zecd();
+            c.args(["config", "check", "--conf", conf.to_str().unwrap()]);
+            c.env("ZECD_RPC_PASSWORD", "not-the-placeholder");
+            c
+        },
+        Duration::from_secs(10),
+    );
+    assert!(
+        out.status.success(),
+        "with a real password the mainnet sample must be valid:\n{}{}",
+        stdout_of(&out),
+        stderr_of(&out)
+    );
+}
+
+/// The renderer's schema contract, run over the shipped samples: what `config show` prints for
+/// a real deployment config is still a config this build accepts. The fixtures that pin this
+/// elsewhere are small; these files are the widest configs in the tree.
+#[test]
+fn config_show_renders_the_shipped_samples_into_configs_zecd_accepts() {
+    let dir = tempfile::tempdir().unwrap();
+    for rel in ["zecd.example.toml", "deploy/zecd.toml"] {
+        let shown = config_show(&repo_file(rel));
+        assert!(
+            shown.status.success(),
+            "config show failed on {rel}: {}",
+            stderr_of(&shown)
+        );
+        let rendered = dir.path().join(rel.replace('/', "_"));
+        std::fs::write(&rendered, stdout_of(&shown)).unwrap();
+
+        let checked = config_check(&rendered, &[]);
+        assert!(
+            checked.status.success(),
+            "the config rendered from {rel} is not one zecd accepts:\n{}",
+            stderr_of(&checked)
+        );
+    }
+}
+
 /// Full `zecd init` flow against the public testnet lightwalletd (`--server zecrocks`,
 /// light mode), then a re-init refusal. Network: follows the repo convention for live tests
 /// (`cargo test -- --include-ignored`).

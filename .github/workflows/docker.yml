@@ -20,6 +20,8 @@ on:
       - Cargo.lock
       - rust-toolchain.toml
       - .github/workflows/docker.yml
+      # the config the smoke test feeds to `zecd config check` in the container
+      - deploy/zecd.toml
   push:
     branches: [main, master]
     paths:
@@ -30,6 +32,8 @@ on:
       - Cargo.lock
       - rust-toolchain.toml
       - .github/workflows/docker.yml
+      # the config the smoke test feeds to `zecd config check` in the container
+      - deploy/zecd.toml
   workflow_dispatch:
 
 concurrency:
@@ -66,6 +70,17 @@ jobs:
 
       - name: Run zecd inside the container
         run: docker run --rm zecd --version
+
+      # `--version` proves the static binary loads; it touches nothing else. The first thing
+      # zecd does on a real host is read a config file, so check one - `config check` parses a
+      # production-shaped config, resolves every default and probes the datadir, and is
+      # read-only (no datadir lock, no wallet DB, no cookie file), so it is safe to run in a
+      # throwaway container and is the cheapest proof that the runtime image is more than a
+      # version stamp. deploy/zecd.toml is the file the compose stack mounts at this path.
+      - name: Check a production config inside the container
+        run: |
+          docker run --rm -v "$PWD/deploy/zecd.toml:/etc/zecd/zecd.toml:ro" zecd \
+            config check --conf /etc/zecd/zecd.toml
 
       - name: Extract static binaries via the export stage
         run: |

@@ -794,6 +794,13 @@ impl Funder {
         };
 
         write_funder_toml(dir.path(), &cfg)?;
+        // The funder runs a *pinned older release*, so the invariant on `write_funder_toml` -
+        // only long-stable keys, because a knob added on this branch would be an unknown field
+        // to that release - is exactly the "valid for one build, refused by another" case
+        // `config check` exists for. Ask the funder's own binary whether it accepts the file,
+        // which turns a violation into a named unknown key instead of the opaque daemon startup
+        // timeout every funded test would otherwise report.
+        assert_funder_config_check_passes(&bin, dir.path())?;
         funder_init_with_retry(&bin, dir.path(), &cfg).await?;
 
         // Discard the daemon's logs unless ZECD_STDERR asks for them, exactly like `Zecd::start`
@@ -1627,12 +1634,12 @@ impl Zecd {
         }
 
         write_zecd_toml(datadir.path(), cfg).context("write zecd.toml")?;
-        // Every regtest is a free assertion that `zecd config check` agrees with the daemon:
-        // this exact file is about to be handed to a zecd that must start on it, so a check
-        // that rejects it (or a daemon that refuses a file the check passed) is a real
+        // Every regtest is a free assertion that the `zecd config` commands agree with the
+        // daemon: this exact file is about to be handed to a zecd that must start on it, so a
+        // check that rejects it (or a daemon that refuses a file the check passed) is a real
         // disagreement between the two - on a production-shaped config rather than a fixture,
-        // across both backends and every tier.
-        assert_config_check_passes(&bin, datadir.path())?;
+        // across both backends and every tier. Same for what `config show` renders from it.
+        assert_config_commands_agree(&bin, datadir.path())?;
         let mnemonic = init_default_with_retry(&bin, datadir.path(), cfg).await?;
 
         // Watch-only replicas derive from the default wallet's exported UFVK (read straight from
@@ -2234,26 +2241,89 @@ fn run_zecd_init_watch_only(
     Ok(())
 }
 
-/// Run `zecd config check` against a datadir's freshly written `zecd.toml` and require it to
-/// pass. Offline and read-only (it takes no datadir lock and writes nothing), so it costs one
-/// process spawn.
+/// Run the `zecd config` commands against a datadir's freshly written `zecd.toml` and require
+/// them to agree with the daemon that is about to start on that same file: `config check` must
+/// pass it, and what `config show` renders from it must itself be a config `config check`
+/// accepts. Offline and read-only (no datadir lock, nothing written to the datadir), so it
+/// costs three process spawns.
+///
+/// The second half is the renderer's schema contract - `config show` prints every resolved
+/// setting by its real key, so a renderer that drifts from what the parser accepts emits
+/// something that looks authoritative and that zecd would refuse. Offline fixtures pin that
+/// property already; running it here puts it on the widest configs in the tree, and on the
+/// shapes only the harness builds - light mode, transparent pools, multiwallet, the `[spend]`
+/// knobs.
 ///
 /// Warnings are expected here and do not fail the check - at this point no wallet has been
 /// initialised yet, which the command reports as exactly that. `--strict` would turn that
 /// normal state into a failure.
-fn assert_config_check_passes(bin: &Path, datadir: &Path) -> Result<()> {
+fn assert_config_commands_agree(bin: &Path, datadir: &Path) -> Result<()> {
+    let conf = datadir.join("zecd.toml");
+    run_config_check(bin, &conf)
+        .context("zecd config check rejected the config this test is about to run zecd on")?;
+
     let out = Command::new(bin)
-        .args([
-            "config",
-            "check",
-            "--conf",
-            datadir.join("zecd.toml").to_str().unwrap(),
-        ])
+        .args(["config", "show", "--conf", conf.to_str().unwrap()])
+        .output()
+        .context("spawn zecd config show")?;
+    if !out.status.success() {
+        bail!(
+            "zecd config show failed on the config this test is about to run zecd on ({}):\n{}",
+            out.status,
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+    // Rendered outside the datadir: the daemon reads only `zecd.toml`, but a test that asserts
+    // on datadir contents should not have to know about this check.
+    let rendered_dir = tempfile::tempdir().context("temp dir for the rendered config")?;
+    let rendered = rendered_dir.path().join("effective.toml");
+    std::fs::write(&rendered, &out.stdout).context("write the rendered config")?;
+    run_config_check(bin, &rendered)
+        .context("zecd config check rejected the config zecd config show rendered")?;
+    Ok(())
+}
+
+/// Run `zecd config check` on the funder's `zecd.toml` **with the funder's own binary**, which
+/// is the whole point: that binary is a pinned older release, so this is the "a config valid for
+/// one build is refused by another" case, checked offline before the daemon starts.
+///
+/// It gives [`write_funder_toml`]'s invariant - only long-stable keys, because a knob added on
+/// this branch is an unknown field to the pinned release - an enforcer other than a comment.
+/// Without it, violating that invariant surfaces as every funded test timing out waiting for a
+/// funder that exited at startup.
+///
+/// A funder release that predates `config check` cannot answer, so probe for the subcommand and
+/// say so rather than reporting its usage error as a config failure. The assertion goes live on
+/// its own when the funder pin next advances past the release that carries the command.
+fn assert_funder_config_check_passes(bin: &Path, dir: &Path) -> Result<()> {
+    let probe = Command::new(bin)
+        .args(["config", "check", "--help"])
+        .output()
+        .context("spawn zecd config check --help")?;
+    if !probe.status.success() {
+        eprintln!(
+            "WARN the pinned funder zecd has no `config check` (exit {}); skipping the funder \
+             config assertion - it starts working when the funder image pin advances",
+            probe.status
+        );
+        return Ok(());
+    }
+    run_config_check(bin, &dir.join("zecd.toml")).context(
+        "the pinned funder release rejects the config the harness wrote for it - \
+         write_funder_toml must use only keys that release knows",
+    )
+}
+
+/// One `zecd config check --conf <file>` run; `Err` carries the command's own output, which is
+/// the part worth reading when it fails.
+fn run_config_check(bin: &Path, conf: &Path) -> Result<()> {
+    let out = Command::new(bin)
+        .args(["config", "check", "--conf", conf.to_str().unwrap()])
         .output()
         .context("spawn zecd config check")?;
     if !out.status.success() {
         bail!(
-            "zecd config check rejected the config this test is about to run zecd on ({}):\n{}{}",
+            "({}):\n{}{}",
             out.status,
             String::from_utf8_lossy(&out.stdout),
             String::from_utf8_lossy(&out.stderr)
