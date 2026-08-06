@@ -1,6 +1,6 @@
 # Utility & control
 
-Address validation, the fee-probe stubs (Zcash fees are [ZIP-317](sending.md), never client-settable), and the daemon control surface. Envelope, auth, and error conventions are on the [RPC conventions page](index.md).
+Address validation, message signing, the fee-probe stubs (Zcash fees are [ZIP-317](sending.md), never client-settable), and the daemon control surface. Envelope, auth, and error conventions are on the [RPC conventions page](index.md).
 
 ## validateaddress
 
@@ -59,6 +59,106 @@ Ownership is not reported here; use [`getaddressinfo`](wallet-addresses.md) for 
 **vs Bitcoin Core**: same base shape, including the `error`/`error_locations` fields on invalid input. Core additionally emits `witness_version`/`witness_program` for segwit addresses (never applicable here) and populates `scriptPubKey` for every valid address (zecd leaves it empty for shielded). `isvalid_orchard`, `receiver_types`, and `receivers_consistent` are zecd extensions.
 
 **vs zcashd**: zcashd splits validation in two: its `validateaddress` accepts only transparent addresses (and mixes in wallet fields like `ismine`/`iswatchonly`), while `z_validateaddress` handles shielded and Unified Addresses with an `address_type` field and per-pool key material. zecd's single `validateaddress` covers every kind, so a valid UA gets `isvalid: true`.
+
+## signmessage
+
+```
+signmessage "t-address" "message"
+```
+
+Sign `message` with the private key of a **transparent** address this wallet owns, returning
+a base64 signature in Bitcoin Core's shape. Ported from zallet's implementation so the two
+agree byte for byte.
+
+**The digest is Zcash's, not Bitcoin's.** Each of the magic string `"Zcash Signed Message:\n"`
+and the caller's message is CompactSize-length-prefixed, the two are concatenated, and the
+result is double-SHA256 hashed (zcashd's `rpc/misc.cpp`). The magic prefix is what stops a
+signature over user text from being replayed as a signature over a transaction. A Bitcoin
+verifier will therefore *not* validate a zecd signature, and vice versa, even though the
+encoding is identical.
+
+The signature is a recoverable ECDSA signature over that digest, serialized as a 65-byte
+`[header][r||s]` blob with `header = 31 + recovery_id` (the compressed-pubkey form), then
+base64-encoded.
+
+**Shielded addresses cannot sign.** There is no equivalent operation for a Sapling or Orchard
+address, and no unified-address form; this is transparent-only in zecd, zcashd and Core alike.
+
+**Parameters**
+
+| # | Name | Type | Default | Description |
+|---|------|------|---------|-------------|
+| 1 | t-address | string | required | A bare transparent P2PKH address this wallet owns. |
+| 2 | message | string | required | The message to sign, verbatim. |
+
+**Result**
+
+```json
+"H9L5yLFjti0QTHhPyFrZCT1V/MMnBtXKmoiKDZ78NDBjERki6ZTQZdSMCtkgoNmp3RTMPMWfnAeQBQdMHhJ4CjA="
+```
+
+**Errors**
+
+| Code | When |
+|------|------|
+| -1 | address or message missing |
+| -5 | address does not decode as a transparent address on this network |
+| -3 | the address is a P2SH (`t3`/`t2`) script address ("Address does not refer to key"), or a shielded address |
+| -4 | the wallet does not own the address, or the wallet is [watch-only](../guide/watch-only.md) (no private keys) |
+| -13 | the wallet is encrypted and locked (unlock with [`walletpassphrase`](wallet-addresses.md#walletpassphrase)) |
+
+The address is validated before the seed is touched, so a malformed address answers `-5`/`-3`
+regardless of lock state.
+
+**vs Bitcoin Core**: same signature, same result encoding, same error taxonomy. The digest
+differs (Zcash's magic string, so signatures are not interchangeable), and zecd signs only
+with transparent keys it derived from the wallet seed - there is no imported-key case.
+
+**vs zcashd**: same method, same digest, same encoding; interoperable.
+
+## verifymessage
+
+```
+verifymessage "t-address" "signature" "message"
+```
+
+Check a signature against a transparent address. **Stateless**: it recovers the signer's
+public key from the recoverable signature, derives the transparent address that key implies,
+and compares. No wallet key material is used and the address need not be the wallet's, so this
+verifies a signature produced by anyone. Only the wallet's network parameters are consulted,
+to decode the address.
+
+**Parameters**
+
+| # | Name | Type | Default | Description |
+|---|------|------|---------|-------------|
+| 1 | t-address | string | required | The transparent address the signature claims to be from. |
+| 2 | signature | string | required | Base64, as returned by `signmessage`. |
+| 3 | message | string | required | The message the signature covers, verbatim. |
+
+**Result**
+
+```json
+true
+```
+
+`false` means the signature is well-formed but does not match: a wrong address, a tampered
+message, a wrong-length blob, or an unrecoverable signature. Only malformed *input* raises an
+error, so an attacker cannot distinguish failure modes from the error code.
+
+**Errors**
+
+| Code | When |
+|------|------|
+| -1 | an argument is missing |
+| -3 | the address does not decode ("Invalid address"), is a P2SH script address ("Address does not refer to key"), or the signature header says uncompressed key ("Uncompressed key signatures are not supported.") |
+| -5 | the signature is not valid base64 ("Malformed base64 encoding") |
+
+**vs Bitcoin Core**: same signature, same `true`/`false` contract, same distinction between a
+mismatching signature (`false`) and a malformed one (an error). Core still accepts
+uncompressed-key signature headers (27-30); zecd rejects them, as zallet does.
+
+**vs zcashd**: same method and semantics; interoperable.
 
 ## estimatesmartfee
 

@@ -1,6 +1,6 @@
 # Method index: zecd vs bitcoind vs zcashd
 
-Every RPC method zecd dispatches (44 methods, the `ALL_METHODS` table in `src/rpc/mod.rs`),
+Every RPC method zecd dispatches (50 methods, the `ALL_METHODS` table in `src/rpc/mod.rs`),
 compared against Bitcoin Core master and zcashd. Each method name links to its full reference
 entry.
 
@@ -37,6 +37,9 @@ is covered in [Conventions & wire format](index.md).
 | [getbestblockhash](blockchain.md#getbestblockhash) | ✓ | ✓ | Hash at the fully scanned height |
 | [getblockhash](blockchain.md#getblockhash) | ✓ | ✓ | From the wallet's scanned blocks; pre-birthday or beyond-tip heights answer `-8` |
 | [getblockheader](blockchain.md#getblockheader) | ✓ | ✓ | Verbose only, compact-block fields; `verbose=false` answers `-8` |
+| [waitfornewblock](blockchain.md#waitfornewblock-waitforblock-waitforblockheight) | ✓ | ✓ | Blocks until the **fully-scanned** height advances; timeout in ms, `0` = indefinite; timing out is not an error |
+| [waitforblock](blockchain.md#waitfornewblock-waitforblock-waitforblockheight) | ✓ | ✓ | Blocks until the named hash is the scanned tip |
+| [waitforblockheight](blockchain.md#waitfornewblock-waitforblock-waitforblockheight) | ✓ | ✓ | Blocks until the scanned height reaches N; the correct "has the wallet caught up?" primitive |
 | **Utility** | | | |
 | [validateaddress](util-control.md#validateaddress) | ✓ | same name, differs (transparent-only; shielded via `z_validateaddress`) | Validates every Zcash address kind; adds `isvalid_orchard` and `receiver_types` extension fields |
 | [settxfee](util-control.md#settxfee) | *removed* | same name, differs (functional in zcashd) | Always `-8`: fees are ZIP-317, never client-settable |
@@ -66,10 +69,13 @@ is covered in [Conventions & wire format](index.md).
 | [sendmany](sending.md#sendmany) | ✓ | same name, differs (transparent-only) | Same, multi-recipient; dummy `""` first arg as in Core |
 | [walletpassphrase](wallet-addresses.md#walletpassphrase) | ✓ | ✓ | Unlock with a timeout (capped at 100,000,000 seconds, as in Core); wrong passphrase `-14`, unencrypted wallet `-15` |
 | [walletlock](wallet-addresses.md#walletlock) | ✓ | ✓ | Zeroizes the seed immediately, even mid-proof; unencrypted wallet `-15` |
+| [signmessage](util-control.md#signmessage) | ✓ | same name, differs (transparent-only, same scheme) | Signs with an own **transparent** address's key; shielded addresses answer `-3` |
+| [verifymessage](util-control.md#verifymessage) | ✓ | ✓ | Recovers the signer's pubkey and compares the address; needs no wallet |
 | **Async operations** | | | |
 | [z_sendmany](async-operations.md#z_sendmany) | n/a | ✓ | Async: returns an opid, proves/broadcasts in the background; `fromaddress` must be the wallet's own (`ANY_TADDR` rejected `-5`); explicit `fee` answers `-8` |
 | [z_shieldcoinbase](async-operations.md#z_shieldcoinbase) | n/a | ✓ | Async: sweeps mature transparent coinbase into one shielded output, no change in any pool; `toaddress` must have a shielded receiver; explicit `fee` answers `-8`; nothing mature to shield answers `-6` |
 | [z_getoperationstatus](async-operations.md#z_getoperationstatus) | n/a | ✓ | Non-destructive status objects; wallet-scoped |
+| [z_waitforoperation](async-operations.md#z_waitforoperation) | n/a | n/a | **zecd extension.** Blocks until one operation finishes; adds a `finished` flag; timeout in seconds (default 120, clamped to 3600); non-destructive |
 | [z_getoperationresult](async-operations.md#z_getoperationresult) | n/a | ✓ | Finished operations only; destructive one-shot reap, matching zcashd |
 | [z_listoperationids](async-operations.md#z_listoperationids) | n/a | ✓ | The wallet's operation ids; optional status filter |
 | **Address derivation** | | | |

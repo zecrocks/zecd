@@ -223,16 +223,47 @@ recovery.
 
 ## Upgrades
 
-1. Stop with SIGINT or SIGTERM (both are graceful: in-flight requests finish, new ones get
+1. **Check the new binary against your existing config, before stopping anything.**
+   `zecd config check` resolves the file with the exact build you are about to deploy and
+   exits non-zero if that build would refuse it. It takes no datadir lock and writes nothing,
+   so it is safe to run against a live deployment:
+
+   ```sh
+   ./zecd-new config check --conf /etc/zecd/zecd.toml
+   ```
+
+   This matters because zecd rejects unknown config keys. That is what stops a typo'd knob
+   from being silently ignored, but it also means a config valid for one build can be refused
+   by another **in either direction**: an upgrade may not know a key yet, a rollback may have
+   dropped one. Catching that here turns a failed restart into a no-op.
+
+2. **Diff the effective configuration** to see which *defaults* the upgrade moves. Your file
+   is only half the configuration; every key it leaves unset takes the binary's default:
+
+   ```sh
+   diff <(./zecd-old config show --conf /etc/zecd/zecd.toml 2>/dev/null) \
+        <(./zecd-new config show --conf /etc/zecd/zecd.toml 2>/dev/null)
+   ```
+
+   To pin today's behaviour explicitly before upgrading, capture
+   `zecd-old config show > effective.toml` and deploy that: it is round-trippable TOML that
+   zecd itself accepts. (Secrets come out as commented-out key names, so a captured file needs
+   its credentials re-added.)
+
+3. Stop with SIGINT or SIGTERM (both are graceful: in-flight requests finish, new ones get
    503). The `stop` RPC is regtest-only, so a stray RPC call cannot take down a production
    daemon.
-2. Replace the binary or pull the new image.
-3. Start. Wallet DB migrations run automatically at open; the first start after a large
+4. Replace the binary or pull the new image.
+5. Start. Wallet DB migrations run automatically at open; the first start after a large
    librustzcash bump can take longer.
 
 Downgrades across DB migrations are not supported. If you need a rollback path, stop the
 daemon and snapshot the datadir first. The worst case of a lost datadir is a from-seed
 restore, not lost funds.
+
+Steps 1 and 2 need zecd 0.6.0 or later on the *new* side; `config show` on the old side only
+works if the old binary is also 0.6.0+, so the first upgrade onto 0.6.0 has nothing to diff
+against.
 
 ## Single-instance datadir lock
 
@@ -241,11 +272,17 @@ zecd takes an exclusive advisory lock on `<datadir>/.lock` while it owns the dat
 `zecd init` on the same datadir fails fast with `Cannot lock data directory ...`. The lock is
 an OS advisory lock the kernel releases when the process exits, including a crash or kill, so
 there is never a stale lockfile to delete: if the error appears and no zecd is running, just
-retry. Two commands are exempt because they never write the datadir: `zecd export-ufvk`
-(read-only DB access, so you can export a UFVK while the daemon runs) and `zecd rpcauth`.
+retry. Several commands are exempt because they never write the datadir: `zecd export-ufvk`
+(read-only DB access, so you can export a UFVK while the daemon runs), `zecd rpcauth`, and,
+since 0.6.0, `zecd derive-address`, `zecd config check` and `zecd config show`. All of them
+are safe to run against a live deployment. `config check` deliberately does not mint a cookie
+file either, which would otherwise invalidate the credential a running daemon already handed
+out.
 
 ## Mainnet checklist
 
+- [ ] `zecd config check --conf <file> --strict` passes against the exact binary being
+      deployed (`--strict` also fails on warnings, which is the right setting for a CI gate).
 - [ ] `network = "main"` and a real `[rpc] password` (the daemon refuses to start with the
       `CHANGE-ME` placeholder).
 - [ ] RPC bound to `127.0.0.1` or a private network; TLS or a reverse proxy in front if it

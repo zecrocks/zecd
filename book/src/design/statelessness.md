@@ -93,7 +93,7 @@ so none break the invariant:
 |---|---|---|
 | Tx first-seen times | Wall-clock stamp when the mempool stream first stores a pending tx (`wallet::FirstSeen`), surfaced as `time`/`timereceived` until a block time supersedes it | Rebuilt as the mempool stream re-observes still-pending txs; a mined tx uses its block time. A foreign unmined tx not yet re-observed reports `time` 0 until then |
 | Async-operation registry | `z_sendmany` operation IDs and results ([async operations](../rpc/async-operations.md)) | Lost, matching zcashd's behavior; broadcast transactions are unaffected |
-| Orchard proving key | `ProvingKeyCache`, built once at startup and shared across wallets | Rebuilt at startup (a pure performance cache) |
+| Orchard proving key | `ProvingKeyCache`, built once on a background task at startup and shared across wallets | Rebuilt at startup (a pure performance cache) |
 
 An unmined transaction has no block time yet; that is expected, not an off-chain gap, which is
 why first-seen is the deliberate exception rather than a violation. The rule for future

@@ -74,24 +74,55 @@ addresses; its shielded flow is `z_getnewaccount` + `z_getaddressforaccount`. ze
 z_getaddressforaccount account ( ["receiver_type",...] diversifier_index )
 ```
 
-Derives a Unified Address for the wallet's account in zcashd's syntax, optionally at an exact
-diversifier index. Unlike `getnewaddress`, the returned object includes the diversifier index,
-so a client can re-derive the same address deterministically later.
+Derives an address for the wallet's account in zcashd's syntax, optionally at an exact index.
+Unlike `getnewaddress`, the returned object includes the index, so a client can re-derive the
+same address deterministically later.
+
+It serves two distinct cases depending on `receiver_types`:
+
+- **Shielded (the default).** A Unified Address carrying the requested shielded receivers,
+  indexed by ZIP-32 **diversifier index**.
+- **Transparent** (`["p2pkh"]`, *new in 0.6.0*). A bare t-address at a **BIP 44 external
+  child index**. See [transparent derivation](#transparent-derivation-at-an-explicit-index)
+  below - the parameter is the same slot, but it means a different thing.
 
 **Parameters**
 
 | # | Name | Type | Default | Description |
 |---|------|------|---------|-------------|
 | 1 | account | number | required | Must be `0`. zecd has one account per wallet; select another wallet via `/wallet/<name>` instead. |
-| 2 | receiver_types | array of strings | wallet default | Shielded pools for the UA: `"sapling"` and/or `"orchard"`, each enabled on this wallet. Empty/omitted uses the configured `default_receivers`. `"p2pkh"`/`"p2sh"` and unknown tokens are rejected: this method never exposes a transparent receiver. |
-| 3 | diversifier_index | number | next unused | Non-negative integer within the 11-byte (2^88) diversifier space. Omitted picks the next unused index; given, it derives exactly that index. |
+| 2 | receiver_types | array of strings | wallet default | Either shielded pools for a UA (`"sapling"` and/or `"orchard"`, each enabled on this wallet; empty/omitted uses the configured `default_receivers`), **or** exactly `["p2pkh"]` (equivalently `["transparent"]`) for a bare t-address. The two cannot be mixed. `"p2sh"` and unknown tokens are `-8`. |
+| 3 | diversifier_index | number | next unused | For a shielded request: a non-negative integer within the 11-byte (2^88) diversifier space. For a transparent request: a BIP 44 external child index, so the hardened half (`>= 2^31`) is `-8`. Omitted picks the next unused index; given, it derives exactly that index. |
 
 Re-deriving at the same index with the same receiver set is idempotent (byte-identical
 response, zcashd's invariant). Requesting a *different* receiver set at an already-exposed
 index is a `-4` reuse error. Auto-selected shielded indices are not sequential (the
 next-unused selection is clock-seeded; see
 [Addresses & shielded pools](../guide/addresses.md)), so record the returned
-`diversifier_index` if you need to re-derive.
+`diversifier_index` if you need to re-derive. Transparent indices *are* sequential.
+
+### Transparent derivation at an explicit index
+
+*New in 0.6.0.* On a wallet with `[pools] transparent = true`,
+`z_getaddressforaccount 0 ["p2pkh"] N` returns the bare t-address at BIP 44 external child
+index `N`.
+
+**Why the receiver set must be exactly `["p2pkh"]`.** ZIP-316 forbids a transparent-only
+unified address, and zecd never mixes a transparent receiver into a UA, so there is no address
+shape that could carry both. Asking for `["p2pkh", "orchard"]` is therefore `-8` rather than
+something zecd could silently reinterpret.
+
+**It shares the exposure path with sequential issuance.** Deriving here and calling
+`getnewaddress "" "transparent"` run the same code, so the two agree by construction: the same
+recovery-horizon classification, the same warnings, the same `-4` when
+`transparent_allow_beyond_recovery_window = false` would put the index out of restore range,
+and the same refresh of the address matcher. That last one matters - without it a payment to a
+directly addressed index would be silently dropped by the scanner. See
+[Transparent support](../guide/transparent.md) for the two windows involved.
+
+Together with [`getaddressinfo`](#getaddressinfo)'s `address_index`, this closes the loop for
+an operator reconciling an issued range against the chain: ask for index `N`, and ask which
+index an address was.
 
 **Result**
 
@@ -111,19 +142,31 @@ next-unused selection is clock-seeded; see
 | -1 | `account` missing |
 | -8 | `account` outside zcashd's range `0 <= account <= (2^31)-2`, or not an integer |
 | -4 | `account` in range but not `0` ("has not been generated"; zecd wallets have a single account) |
-| -8 | `receiver_types` not an array; contains `"p2pkh"`, `"p2sh"`, or an unknown token; names a pool not enabled on this wallet |
+| -8 | `receiver_types` not an array; contains `"p2sh"` or an unknown token; names a pool not enabled on this wallet |
+| -8 | `"p2pkh"`/`"transparent"` mixed with a shielded receiver, or requested on a wallet without `[pools] transparent = true` |
 | -3 | A `receiver_types` element is not a string |
-| -8 | `diversifier_index` fractional, negative, non-numeric, or beyond the 2^88 space ("too large") |
+| -8 | `diversifier_index` fractional, negative, non-numeric, or beyond the 2^88 space ("too large"); for a transparent request, also `>= 2^31` (the hardened half) |
 | -4 | Index already exposed with different receiver types ("was already generated with different receiver types.") |
 | -4 | No address derivable at the requested index for the requested receivers (e.g. an invalid Sapling diversifier): "no address at diversifier index N." |
+| -4 | Transparent index at or beyond the recovery horizon while `transparent_allow_beyond_recovery_window = false` |
+
+**Example**
+
+```sh
+# The t-address at BIP 44 external child index 7.
+curl -u u:p -d '{
+  "jsonrpc": "1.0", "id": 1, "method": "z_getaddressforaccount",
+  "params": [0, ["p2pkh"], 7]
+}' http://127.0.0.1:8232/
+```
 
 **vs Bitcoin Core**: no equivalent.
 
 **vs zcashd**: same syntax and result shape, and the reuse/no-address error strings match
-zcashd's wording under the same `-4`. Two deliberate divergences: zcashd accepts any
-previously generated account number, zecd only account `0`; and zcashd's default (and
-accepted) receiver set includes `p2pkh`, while zecd is shielded-only here and rejects it
-with `-8`. Use `getnewaddress "" "transparent"` for a t-address.
+zcashd's wording under the same `-4`. Deliberate divergences: zcashd accepts any previously
+generated account number, zecd only account `0`; zcashd can return a UA that *includes* a
+`p2pkh` receiver alongside shielded ones, while zecd treats `["p2pkh"]` as a request for a
+bare t-address and rejects the mixture, because it never puts a transparent receiver in a UA.
 
 ## getaddressinfo
 
@@ -175,6 +218,32 @@ reports `ismine: true`. Bare transparent addresses are recognized via recorded a
   (receivers from different diversifier indices, or one of ours mixed with a stranger's)
   that this wallet can never have issued.
 
+**Derivation fields for an own transparent address** (*new in 0.6.0*)
+
+On a bare t-address this wallet owns, three more fields report where it came from:
+
+```json
+{
+  "address": "tmEjFVCkiVKmTPMHtnFHYJgvvyRJvpUZ4nD",
+  "ismine": true,
+  "hdkeypath": "m/44'/133'/0'/0/7",
+  "ischange": false,
+  "address_index": 7,
+  "receiver_types": ["transparent"]
+}
+```
+
+- `hdkeypath` and `ischange` are Bitcoin Core's fields, with Core's meaning: the full BIP 44
+  path, and whether the address is on the internal (change) chain rather than the external
+  one.
+- `address_index` is a zecd extension carrying the BIP 44 child index on its own, so a caller
+  does not have to parse it back out of the path string. It is the same index
+  [`z_getaddressforaccount`](#z_getaddressforaccount) takes, which is what makes issuance and
+  reconciliation a closed loop.
+
+All three are absent for shielded addresses (a diversifier index is not a BIP 44 path) and
+for transparent addresses this wallet does not own.
+
 **Errors**
 
 | Code | When |
@@ -182,10 +251,10 @@ reports `ismine: true`. Bare transparent addresses are recognized via recorded a
 | -1 | `address` missing |
 | -5 | Address does not decode on this network ("Invalid address"; validity reporting belongs to `validateaddress`) |
 
-**vs Bitcoin Core**: same core fields and the same `-5` on an undecodable address, but zecd
-emits a fixed subset: no `desc`/`parent_desc`, no HD key path or pubkey fields, no
-`ischange`/`timestamp`. `isvalid_orchard`/`receiver_types`/`receivers_consistent` are
-additions.
+**vs Bitcoin Core**: same core fields and the same `-5` on an undecodable address, plus
+Core's `hdkeypath`/`ischange` on own transparent addresses. zecd still emits a subset
+overall: no `desc`/`parent_desc`, no pubkey fields, no `timestamp`.
+`isvalid_orchard`/`receiver_types`/`receivers_consistent`/`address_index` are additions.
 
 **vs zcashd**: no equivalent; zcashd has only `validateaddress`/`z_validateaddress`, with
 no ownership attribution for Unified Addresses in this shape.

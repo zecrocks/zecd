@@ -16,6 +16,14 @@ format](rpc/index.md)). The conformance suite drives a live daemon with the same
 `python-bitcoinrpc` uses, so an unmodified `AuthServiceProxy` client works out of the box (see
 [testing and conformance](testing.md)).
 
+If your integration polls a height, Core's
+[`waitfornewblock` / `waitforblock` / `waitforblockheight`](rpc/blockchain.md#waitfornewblock-waitforblock-waitforblockheight)
+work here too, and block on the wallet's **fully-scanned** height, which is the one that makes
+history and confirmations safe to read. Do not substitute a balance poll for them: an incoming
+payment is credited at 0 confirmations from the mempool, so a balance is satisfied before the
+confirming block is scanned and the height-dependent fields you read next may not be written
+yet.
+
 ## Edges
 
 Behaviors an integrator should design around. Each follows from being a shielded-first light

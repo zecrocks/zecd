@@ -6,6 +6,10 @@ adopt zcashd's asynchronous send model: they match zcashd's syntax, status shape
 state strings, so clients written for zcashd's `z_sendmany` work unchanged. For synchronous
 sends in Bitcoin Core's dialect, see [Sending](sending.md).
 
+A sixth method, [`z_waitforoperation`](#z_waitforoperation), is a **zecd extension** with no
+zcashd counterpart: it blocks until one operation finishes, so a client does not have to
+write a poll-sleep loop.
+
 ## The operation model
 
 `z_sendmany` and `z_shieldcoinbase` validate their arguments, then return an operation id
@@ -32,10 +36,13 @@ Properties of the registry:
   methods, routed per-wallet via `/wallet/<name>`, only ever see their own wallet's
   operations, even when an opid from another wallet is named explicitly (it is silently
   omitted). zcashd's queue is node-wide; zcashd only has one wallet.
-- **Poll vs reap.** `z_getoperationstatus` is non-destructive: call it as often as you like.
+- **Poll, wait, or reap.** `z_getoperationstatus` is non-destructive: call it as often as you
+  like. `z_waitforoperation` is also non-destructive, and blocks instead of returning
+  immediately, which is usually what you want for a single send.
   `z_getoperationresult` is destructive and one-shot: it returns each *finished* operation's
   status once and removes it; a second call for the same opid returns nothing. This matches
-  zcashd exactly.
+  zcashd exactly. Waiting never reaps, so a wait followed by a `z_getoperationresult` still
+  gets the result.
 - **Bounded.** Two caps protect the daemon from an authenticated flood of `z_sendmany`:
   - At most **1024** operations are retained. Past that, the oldest *finished* results are
     auto-evicted (logged at WARN). A client that never reaps cannot wedge the daemon; the
@@ -129,12 +136,13 @@ opid = rpc.z_sendmany(my_ua, [
     {"address": dest_ua, "amount": 0.5,
      "memo": "7a6563642070617965652072656631323334"},
 ])
-while True:
-    status = rpc.z_getoperationstatus([opid])[0]
-    if status["status"] in ("success", "failed"):
-        break
-    time.sleep(1)
-rpc.z_getoperationresult([opid])   # reap it
+status = rpc.z_waitforoperation(opid)       # blocks; no poll loop
+if not status["finished"]:
+    ...                                     # timed out, still running: call again
+elif status["status"] == "failed":
+    raise RuntimeError(status["error"]["message"])
+txid = status["result"]["txid"]
+rpc.z_getoperationresult([opid])            # optional: reap it
 ```
 
 ## z_shieldcoinbase
@@ -288,6 +296,95 @@ async operation types (`z_mergetoaddress`, the Sapling migration); zecd only eve
 `z_sendmany` and `z_shieldcoinbase` operations, scoped to the routed wallet. zcashd silently
 ignores a malformed opid string; zecd rejects it with `-8`. zcashd reports `execution_secs` as
 a fractional number; zecd reports whole seconds.
+
+## z_waitforoperation
+
+```
+z_waitforoperation "opid" ( timeout )
+```
+
+Block until one operation reaches a terminal state, then return its status object. A **zecd
+extension**, in the same vein as `sendtoaddress`'s memo argument and `listunspent`'s `pool`
+field: zcashd has no equivalent, so a client that must also work against zcashd should keep
+using `z_getoperationstatus`.
+
+This exists because `z_sendmany` and `z_shieldcoinbase` return an opid the caller has to
+poll, so every client ends up reimplementing the same poll-sleep-check loop. One call
+replaces it.
+
+**Parameters**
+
+| # | Name | Type | Default | Description |
+|---|------|------|---------|-------------|
+| 1 | opid | string | required | A single opid, as a bare string. Note this is **not** the array the tracking trio takes; an array is `-3`. |
+| 2 | timeout | number | 120 | Seconds to wait. Clamped to 3600 rather than rejected, so an over-large value waits an hour instead of erroring. `0` returns the current status immediately, which is the single-operation, non-destructive read `z_getoperationstatus` only offers as an array. Negative or non-integer is `-8`. |
+
+The 3600-second ceiling exists because a blocking call holds one `[rpc] work_queue` permit
+for its whole duration. Without a bound, a few clients waiting forever would starve the queue
+and every other request would start returning 503. Size `[rpc] work_queue` with that in mind
+if many clients wait concurrently; see [Configuration](../configuration.md).
+
+**Result**: the same status object [`z_getoperationstatus`](#z_getoperationstatus) returns per
+operation, plus a `finished` boolean.
+
+```json
+{
+  "id": "opid-9c2f0d61-1c2b-4f3e-9a3e-2d4b8c7a5e10",
+  "method": "z_sendmany",
+  "params": { "fromaddress": "u1v0m9...", "amounts": [{"address": "u1x7pq...", "amount": 0.5}], "minconf": 1 },
+  "status": "success",
+  "creation_time": 1751600000,
+  "result": { "txid": "5f8de306fcd7e716f9c39ea55c30d97a5a80439b7c8ec24b3decd80d20f0f1a8" },
+  "execution_secs": 3,
+  "finished": true
+}
+```
+
+`finished` and `status` together name all four outcomes, so a caller never has to know which
+status strings are terminal:
+
+| `finished` | `status` | Meaning |
+|---|---|---|
+| `true` | `success` | Done. The txid is in `result`. |
+| `true` | `failed` | The operation ran and failed. The send's `-6`/`-4`/`-25` is in `error`, **not** an error on this call. |
+| `true` | `cancelled` | Terminal in the schema; zecd never cancels, so this does not occur. |
+| `false` | `queued` or `executing` | **The wait gave up**, not the operation. Either the timeout elapsed or the daemon began shutting down while the operation was still running. Call again to keep waiting. |
+
+**Timing out is not an error.** The current `queued`/`executing` status object comes back
+instead, mirroring Bitcoin Core's [`waitforblock` family](blockchain.md#waitfornewblock-waitforblock-waitforblockheight) and the
+last iteration of the loop this replaces. Callers therefore branch on `finished`/`status`
+rather than on two different failure shapes. Daemon shutdown ends the wait the same way, so a
+long wait cannot hold a work-queue slot through a graceful stop.
+
+**Non-destructive.** The operation stays in the registry;
+[`z_getoperationresult`](#z_getoperationresult) remains the only reader that reaps.
+
+**Errors**
+
+| Code | When |
+|------|------|
+| -1 | no opid given, or too many arguments |
+| -3 | `opid` is not a string (it takes one bare id, not the trio's array) |
+| -8 | malformed opid; negative or non-integer `timeout`; or a well-formed opid this wallet has no operation for |
+| -18 | unknown `/wallet/<name>` |
+
+That last `-8` is deliberately *not* `z_getoperationstatus`'s silent omission: an opid this
+wallet never issued, another wallet's, or one already reaped has nothing to wait for, so
+silently returning would leave the caller blocked on a fiction.
+
+**vs Bitcoin Core**: no equivalent (Core has no async operation model), though the
+timeout-is-not-an-error contract is taken from Core's `waitforblock` family.
+
+**vs zcashd**: no equivalent. zcashd clients poll `z_getoperationstatus`.
+
+**Example**
+
+```sh
+curl -u u:p -d '{
+  "jsonrpc": "1.0", "id": 1, "method": "z_waitforoperation",
+  "params": ["opid-9c2f0d61-1c2b-4f3e-9a3e-2d4b8c7a5e10", 300]
+}' http://127.0.0.1:8232/
+```
 
 ## z_getoperationresult
 

@@ -119,22 +119,33 @@ the same source.
 
 Pushing a `v*` tag runs the Release workflow. It extracts the binary from each
 Dockerfile's `export` stage (so published binaries inherit the reproducible image
-pipeline) and attaches, per target (`x86_64-unknown-linux-musl` and
-`aarch64-unknown-linux-musl`, both static):
+pipeline) and attaches, per architecture (`amd64` and `arm64`, both static musl builds):
 
-- `zecd-<version>-<target>.tar.gz` + `.sha256`: the binary plus `README.md`,
+- `zecd-<version>-linux-<amd64|arm64>.tar.gz`: the binary plus `README.md`,
   `CHANGELOG.md`, both license files, and `zecd.example.toml`. The tar is reproducible
   (sorted entries, fixed mtime, root-owned, `gzip -n`).
-- `zecd_<version>_<amd64|arm64>.deb` + `.sha256`: a reproducible Debian package
+- `zecd_<version>_<amd64|arm64>.deb`: a reproducible Debian package
   (`scripts/build-deb.sh`: fixed mtimes, `--root-owner-group`, `SOURCE_DATE_EPOCH`
   anchored; verified bit-for-bit).
+- `SHA256SUMS`: one file covering every artifact in the release, in the standard
+  `sha256sum -c` format.
 
-Verify the checksum, then install:
+> **Changed in 0.6.0.** Artifacts now use the Debian/Go architecture names
+> (`amd64`/`arm64`) rather than Rust target triples, so the tarball and the `.deb` agree
+> on how they spell an architecture and the redundant `unknown-linux-musl` segment is
+> gone. The per-file `.sha256` sidecars were replaced by the single `SHA256SUMS`. Through
+> 0.5.2 the tarball was named `zecd-<version>-x86_64-unknown-linux-musl.tar.gz` with a
+> `.sha256` beside it; a script that fetches release assets by filename needs updating.
+
+Verify the checksums, then install:
 
 ```sh
-sha256sum -c zecd_<version>_amd64.deb.sha256
+sha256sum -c SHA256SUMS --ignore-missing    # `shasum -a 256 -c` on macOS/BSD
 sudo apt install ./zecd_<version>_amd64.deb     # or _arm64.deb on ARM
 ```
+
+`--ignore-missing` checks only the files you actually downloaded; drop it to require
+every artifact in the release to be present.
 
 The `.deb` installs:
 
@@ -226,12 +237,21 @@ readinessProbe:
   periodSeconds: 10
 ```
 
-Give the startup probe headroom: with the default `[spend] cache_proving_key = true`,
-zecd builds the Orchard proving key at startup, before the health listener binds. The
-clean keygen costs about 4.5 s single-threaded (see `docs/PROVING_KEY_CACHE.md`), so
-`/healthz` is not answerable for the first seconds of process life. After a restore or an
-upgrade with a long offline gap, prefer `readiness = "connected"` or a generous
-readiness budget; in `"synced"` mode a catching-up wallet is 503 until it reaches the tip.
+> **Changed in 0.6.0: the proving key no longer delays startup.** It is built on a background
+> task, so the daemon spawns its wallet actors and binds the health and RPC listeners
+> immediately; `/healthz` answers within the first moments of process life. Through 0.5.2 the
+> keygen ran *before* the listeners bound - seconds of CPU on a fast machine and considerably
+> more on a small VPS - during which the process was unreachable and not syncing, and startup
+> probes had to be sized around it. If you widened `failureThreshold` or
+> `initialDelaySeconds` for that reason, you can tighten it back.
+>
+> Only the **first send** can now observe the build, and only if it arrives before the build
+> finishes, which on any real deployment it does not.
+
+Startup-probe headroom is still worth keeping for the *scan*, which is unrelated to keygen:
+after a restore or an upgrade with a long offline gap, prefer `readiness = "connected"` or a
+generous readiness budget, since in `"synced"` mode a catching-up wallet answers 503 until it
+reaches the tip.
 
 ## Allocator: why the images use mimalloc-secure
 

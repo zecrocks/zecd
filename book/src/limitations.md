@@ -67,9 +67,9 @@ actor, so a long send no longer freezes background sync, reads of status, and me
 processing for its whole duration. Sends still serialize (at most one uncommitted transaction
 at a time), so it does not raise multi-send throughput. It engages only on the cached-Orchard
 PCZT proving path (`cache_proving_key = true`, the default). True concurrent sends
-(disjoint-note selection across in-flight sends) remain a design proposal in
-`docs/CONCURRENT_SENDS.md`. Workaround: shard the hot float across multiple wallets; K actors
-already overlap their proofs across cores with no shared state.
+(disjoint-note selection across in-flight sends) remain a design proposal, not something zecd
+implements. Workaround: shard the hot float across multiple wallets; K actors already overlap
+their proofs across cores with no shared state.
 
 ## No -rpcthreads worker pool
 

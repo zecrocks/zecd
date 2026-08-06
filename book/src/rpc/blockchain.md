@@ -1,9 +1,11 @@
 # Blockchain
 
-Reference for the chain-state methods. All five are read-only and answer from the wallet's
-sync status and its scanned-blocks table, not from a validator's block index: zecd is a
-wallet server in front of a [Zebra node](../design/zebra-backend.md), so its heights are
-wallet-scan heights. For the wire format, auth, and multiwallet `/wallet/<name>` routing, see
+Reference for the chain-state methods. They answer from the wallet's sync status and its
+scanned-blocks table, not from a validator's block index: zecd is a wallet server in front of
+a [Zebra node](../design/zebra-backend.md), so its heights are wallet-scan heights. The five
+read-only methods are followed by the three blocking
+[`waitfor*` methods](#waitfornewblock-waitforblock-waitforblockheight). For the wire format,
+auth, and multiwallet `/wallet/<name>` routing, see
 [Conventions & wire format](index.md).
 
 Two height conventions run through this page:
@@ -216,3 +218,79 @@ at all (they are `-5`).
 
 **vs zcashd**: zcashd's header additionally carries `finalsaplingroot`, `solution`, and the
 Equihash `nonce`; the same subset relationship and the same `verbose=false` difference apply.
+
+## waitfornewblock, waitforblock, waitforblockheight
+
+```
+waitfornewblock    ( timeout )
+waitforblock       "blockhash" ( timeout )
+waitforblockheight height ( timeout )
+```
+
+Block until the wallet reaches a chain state, then return it. All three exist in Bitcoin
+Core with these signatures, so this is a conformance gap closed as much as a convenience.
+
+**They wait on the fully-scanned height, not the chain tip.** That is the whole point. "Has
+the wallet caught up to height N?" is answered by `blocks`/`getblockcount`, not by `headers`,
+and you previously had to know that from reading the source, so every consumer reinvented a
+poll loop against the wrong field or the right one by luck.
+
+> **Do not poll a balance instead.** The mempool stream credits an incoming payment at **0
+> confirmations**, so a balance is satisfied *before* the confirming block is scanned. Any
+> height-dependent field read next - `confirmations`, `blockhash`,
+> [`listsinceblock`](wallet-history.md#listsinceblock) - may not be written yet. That shape
+> has cost real CI failures. Wait on the height, then read.
+
+**Parameters**
+
+| Method | # | Name | Type | Default | Description |
+|---|---|------|------|---------|-------------|
+| all | last | timeout | number | 0 | Milliseconds to wait, as in Core. `0` or omitted waits indefinitely. |
+| `waitforblock` | 1 | blockhash | string | required | Wait until this block is the scanned tip. |
+| `waitforblockheight` | 1 | height | number | required | Wait until the fully-scanned height is **at least** this. Already satisfied returns immediately. |
+
+`waitfornewblock` waits for the scanned height to advance past whatever it is when the call
+arrives.
+
+**Result**
+
+```json
+{
+  "hash": "0000000001a2b3c4d5e6f708192a3b4c5d6e7f8091a2b3c4d5e6f70819aabbcc",
+  "height": 2913000
+}
+```
+
+**Timing out is not an error**, exactly as in Core: the current `{hash, height}` comes back,
+so a caller compares `height` against what it asked for rather than branching on an error.
+[`z_waitforoperation`](async-operations.md#z_waitforoperation) follows the same contract.
+
+**How the wait works.** It is event-driven, waking on the sync status the wallet actor
+already publishes, with a one-second backstop re-check that bounds a missed publish. It ends
+promptly on daemon shutdown, so a no-timeout call cannot hold an `[rpc] work_queue` slot
+through a graceful stop. As with `z_waitforoperation`, a blocking call occupies a work-queue
+permit while it waits - size `[rpc] work_queue` accordingly if many clients wait at once.
+
+**Errors**
+
+| Code | When |
+|------|------|
+| -8 | `blockhash` is not 64 characters or not hex; `height` is negative |
+| -3 | an argument is the wrong JSON type |
+
+**vs Bitcoin Core**: same three signatures, same millisecond timeout, same `{hash, height}`
+result, same timeout-is-not-an-error contract. The difference is what "the tip" means: Core
+waits on its validated chain tip, zecd on the wallet's fully-scanned height, which is the
+useful one for a wallet client and is strictly behind the node's tip while syncing.
+
+**vs zcashd**: zcashd has `waitfornewblock`, `waitforblock` and `waitforblockheight` as
+hidden/debug RPCs with the same shapes.
+
+**Example**
+
+```python
+# Mine or await a payment, then read history safely.
+tip = rpc.getblockcount()
+rpc.waitforblockheight(tip + 6, 120000)      # 6 confirmations, 120s cap
+rpc.listsinceblock()                          # heights are now written
+```

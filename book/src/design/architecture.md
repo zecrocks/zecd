@@ -147,12 +147,20 @@ refreshes the tip and drives `sync_step` until the tip captured at entry is scan
 a no-op; best-effort (an unreachable upstream falls back to the last-scanned height).
 
 **Cached Orchard proving key.** With `[spend] cache_proving_key` (on by default), sends run
-through the PCZT roles with an `orchard::circuit::ProvingKey` built once in `daemon::run` and
-shared by `Arc` across all actors. The fused librustzcash path (flag off) rebuilds the proving
-key inline on every transaction, about 4.5 s of key generation single-threaded (on the order
-of 1 s on a fast multicore node). Analysis and benchmarks: `docs/PROVING_KEY_CACHE.md` in the
-repo. Proving runs under `tokio::task::block_in_place`, so it does not stall the async
-runtime, but it does hold the actor.
+through the PCZT roles with an `orchard::circuit::ProvingKey` shared by `Arc` across all
+actors. The fused librustzcash path (flag off) rebuilds the proving key inline on every
+transaction, about 4.5 s of key generation single-threaded (on the order of 1 s on a fast
+multicore node). Proving runs under `tokio::task::block_in_place`, so it does not stall the
+async runtime, but it does hold the actor.
+
+Since 0.6.0 the key is built **off the startup critical path**. `daemon::run` kicks off the
+build and carries straight on to spawn wallet actors and bind the listeners; the first send
+awaits the handle, which on any real deployment resolves immediately because the build
+finished long before. The handle is a `tokio::sync::OnceCell`, so concurrent senders wait on
+the one in-flight build rather than starting a second, and a send arriving before the
+background task ran simply drives the build itself. A keygen panic now fails that send rather
+than the whole daemon. The Orchard and Ironwood keygens are independent, so they run on
+separate threads.
 
 **`[spend] pipeline_proving` (default off).** By default the whole send (select, build, prove,
 sign, store, broadcast) runs on the actor, so a long proof freezes background sync for its

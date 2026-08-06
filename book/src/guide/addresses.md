@@ -42,7 +42,7 @@ default_receivers = ["sapling", "orchard"]  # receivers in the UAs getnewaddress
   keys, addresses, and note cryptography, so there is no ironwood receiver typecode to request or
   enable. Ironwood notes are received at **ordinary Orchard addresses**; the distinction lives at
   the transaction-bundle level, and surfaces as `pool == "ironwood"` in balances and history once
-  NU6.3 activates. See [Ironwood (NU6.3) on testnet](../quickstart.md#ironwood-nu63-on-testnet).
+  NU6.3 activates. See [Ironwood (NU6.3)](../quickstart.md#ironwood-nu63).
 - The default (`[pools]` omitted entirely) is **Orchard-only**.
 - `default_receivers` must be a subset of `enabled`; naming a disabled pool is a startup error.
   `default_receivers` omitted defaults to `enabled`.

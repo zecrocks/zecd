@@ -105,7 +105,8 @@ return method-not-found (`-32601`, HTTP 404).
 | `encryptwallet`, `walletpassphrasechange` | not supported | Encryption is set once at `zecd init --encrypt`; the passphrase never crosses the network |
 | `walletpassphrase`, `walletlock` | same | Bitcoin Core semantics (`-13` locked send, `-14` wrong passphrase, `-15` unencrypted) |
 | `walletconfirmbackup` | not supported | zcashd's `-18` "backup required" flow does not exist |
-| `getrawchangeaddress`, `addmultisigaddress`, `signmessage`, `keypoolrefill`, `lockunspent`, `listlockunspent` | not supported | `-32601` |
+| `getrawchangeaddress`, `addmultisigaddress`, `keypoolrefill`, `lockunspent`, `listlockunspent` | not supported | `-32601` |
+| `signmessage`, `verifymessage` | same | Transparent addresses only, using zcashd's digest and encoding, so signatures are interoperable. See [Utility & control](rpc/util-control.md#signmessage) |
 | `settxfee` | dispatched, always `-8` | Fees are ZIP-317, computed by the wallet |
 
 ## Migrating funds

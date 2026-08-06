@@ -161,7 +161,7 @@ Send policy: confirmations, privacy, and the proving pipeline. See
 | `untrusted_confirmations` | integer | `10` | Confirmations before third-party outputs are spendable (ZIP 315 default). Must be at least `trusted_confirmations` (validated at startup). Anchors balances and spend proposals; `getbalance`'s explicit `minconf` overrides per call. |
 | `privacy_policy` | string | `"AllowRevealedRecipients"` | What sends may reveal on-chain: `"FullPrivacy"`, `"AllowRevealedAmounts"`, `"AllowRevealedRecipients"`, or `"AllowFullyTransparent"`. `z_sendmany`'s per-call `privacyPolicy` overrides it. |
 | `orchard_action_limit` | integer | `50` | Cap on Orchard actions (`max(inputs, outputs)`) a single send may build; bounds memory/proving cost and yields a clean `-8` for oversized sends. `0` disables the cap. |
-| `cache_proving_key` | bool | `true` | Build the Orchard proving key once at startup and prove sends through the PCZT path, instead of rebuilding the key (~seconds of keygen) on every transaction. Both paths produce identical transactions. |
+| `cache_proving_key` | bool | `true` | Build the Orchard proving key once (on a background task at startup, so it does not delay the listeners) and prove sends through the PCZT path, instead of rebuilding the key (~seconds of keygen) on every transaction. Both paths produce identical transactions. |
 | `pipeline_proving` | bool | `false` | Run a send's proving step off the single-writer actor so a long proof no longer freezes background sync and status. Sends still serialize. Only engages on the cached-Orchard PCZT path (`cache_proving_key = true`, Orchard-only spends). |
 
 ## `[health]`
@@ -207,20 +207,138 @@ Flags use Bitcoin-Core-style names and always win over the corresponding TOML ke
 
 ### Subcommands
 
-Running `zecd` with no subcommand (or `zecd run`) starts the daemon. The global flags above
-are accepted on every invocation and must precede the subcommand (`zecd --datadir ./data
---testnet init`). `init`, `export-ufvk` and `rescan` honor the datadir/network/keys flags; the
-RPC flags are inert for them. `rpcauth` and `example-config` run before config resolution and
-ignore all of them, so they work when there is no config file yet.
+Running `zecd` with no subcommand (or `zecd run`) starts the daemon.
+
+Every flag in the table above is **global**: it is accepted on either side of the subcommand,
+so `zecd --conf /etc/zecd.toml config check` and `zecd config check --conf /etc/zecd.toml`
+are the same command. (Before 0.6.0 the flags had to precede the subcommand, which made
+`zecd config check --conf FILE` - the way anyone would naturally write it - a usage error.)
+
+`init`, `export-ufvk`, `rescan`, `derive-address` and the `config` group honor the
+datadir/network/keys flags; the RPC flags are inert for them. `rpcauth` and `example-config`
+run before config resolution and ignore all of them, so they work when there is no config
+file yet.
 
 | Subcommand | Flags | Description |
 |------------|-------|-------------|
 | `init` | `--wallet <NAME>` (default `default`), `--restore`, `--mnemonic-file <FILE>`, `--encrypt`, `--ufvk <UFVK>`, `--birthday <HEIGHT>` | Create and initialize a wallet, then exit. `--restore` reads the mnemonic from `ZECD_MNEMONIC`, else `--mnemonic-file`, else stdin. `--encrypt` reads the passphrase from `ZECD_WALLET_PASSPHRASE`, else prompts. `--ufvk` creates a watch-only wallet and conflicts with `--restore`/`--encrypt`. `--birthday` defaults to the current chain tip for new wallets; a restore without it scans from Sapling activation. |
 | `export-ufvk` | `--wallet <NAME>` (default `default`) | Print a wallet's Unified Full Viewing Key (reads the wallet DB; no identity/passphrase needed, and not blocked by a running daemon's datadir lock). |
 | `rescan` | `--wallet <NAME>` (default `default`), `--yes` | **Destructive.** Delete the wallet database so the next daemon start rebuilds the account from the seed and rescans from the wallet birthday. `keys.toml` and the seed are kept, and all funds and history are re-derived from the chain, so nothing is lost that a restore could not rebuild. Prompts for confirmation unless `--yes`. Takes the datadir lock like `init`, so it refuses to run while a daemon holds it: stop the daemon first. See [Recovering a stuck sync](guide/operations.md#recovering-a-stuck-sync). |
+| `derive-address` | `--wallet <NAME>`, `--mnemonic`, `--mnemonic-file <FILE>`, `--ufvk <UFVK>`, `--address-type <TYPE>`, `--index <N>`, `--count <N>`, `--json` | Derive addresses **offline**. Touches no network, no wallet database and no daemon, and takes no datadir lock, so it runs beside a live daemon. See [Offline address derivation](#offline-address-derivation) below. |
+| `config check` | `--strict`, `-q, --quiet` | Validate a config against *this* build without starting the daemon; exits non-zero if the daemon would refuse it. Prints the effective settings on stdout and the verdict on stderr. `--strict` also fails on warnings. See [Validating a config](#validating-a-config). |
+| `config show` | | Print the effective configuration as round-trippable TOML, then exit. Secrets are emitted as commented-out key names, never values. |
 | `rpcauth <username> [password]` | | Generate a salted `[rpc] auth` credential line. Omitting the password generates a strong random one, printed once. Needs no datadir or config. |
 | `example-config` | `-o, --output-file <FILE>`, `--force` | Print the annotated example config, then exit. Goes to stdout by default (`-o -` is the same), so it can be redirected or piped. With `-o <FILE>` it writes there instead and refuses to overwrite an existing file unless `--force`; the "wrote example config to ..." confirmation goes to stderr, so stdout carries config text and nothing else in every mode. The output is the shipped `zecd.example.toml`, byte for byte. Needs no datadir or config. |
 | `run` | | Run the JSON-RPC daemon (the default when no subcommand is given). |
+
+### Validating a config
+
+`zecd config check --conf FILE` answers "would this build accept this config?" without
+starting the daemon.
+
+The question is not hypothetical: zecd rejects unknown config keys, which is what keeps a
+typo'd knob from being silently ignored, but it also means a config valid for one build can be
+refused by another **in either direction** - an upgrade may not know a key yet, a rollback may
+have dropped one. Before 0.6.0 the only way to find out was to start the daemon on the target
+host.
+
+Two properties are structural rather than promised:
+
+- **It reaches the daemon's verdict, not a second opinion.** Every check is either the config
+  resolver itself or a helper the daemon calls at startup, so the two cannot drift.
+- **It changes nothing.** No datadir lock (so it runs against a live deployment), no wallet
+  database, and no cookie file - minting one would invalidate the credential a running daemon
+  already handed out.
+
+Errors mean "the daemon would refuse, or would start and never sync". Warnings cover the
+legal-but-risky shapes: an uninitialized wallet, a `transparent_gap_limit` wide enough to
+stall restores, a bare RPC password on a non-loopback bind. `--strict` fails on warnings too;
+`-q` reports through the exit code alone.
+
+A missing config file is an **error** here, unlike at startup where a missing file falls back
+to defaults: checking a file that is not there is a typo, and silently validating the defaults
+would confirm nothing.
+
+```sh
+zecd config check --conf /etc/zecd/zecd.toml || exit 1     # CI gate
+zecd config check --conf /etc/zecd/zecd.toml --strict       # also fail on warnings
+```
+
+**stdout carries settings, stderr carries the verdict** - the `nginx -t` / `nginx -T` split.
+That is what makes the diff below a diff of configuration and nothing else:
+
+```sh
+diff <(zecd-old config show --conf zecd.toml 2>/dev/null) \
+     <(zecd-new config show --conf zecd.toml 2>/dev/null)
+```
+
+`config show` is the `sshd -T` to `config check`'s `sshd -t`: it prints the **effective**
+configuration - the file, CLI flags and environment resolved together, with every unset key
+filled in by this build's default - as TOML. That is what an operator actually needs before an
+upgrade, because a config file is only half the configuration and defaults move between
+versions. Capturing it pins today's behaviour as an explicit file before taking the upgrade:
+
+```sh
+zecd-old config show --conf zecd.toml > effective.toml
+```
+
+The output re-parses: a round-trip test feeds it back through the resolver and requires an
+identical second render, so a renderer that drifts from the schema fails a test rather than
+emitting a config zecd would itself reject. Secrets - the RPC password, rpcauth hashes,
+`[zebra]` credentials - are emitted as **commented-out key names, never values**, since this
+output is the kind of thing that gets pasted into a bug report. They are commented rather than
+redacted-in-place because a placeholder that parses would silently become a real, wrong
+credential if the file were deployed, where an absent password falls back to cookie auth and
+fails loudly. The cost is that a secret-bearing config does not round-trip byte for byte.
+
+Unlike `check`, a missing config file is fine for `show`: "what would this binary do with no
+config" is well defined, and is the quickest way to see the built-in defaults.
+
+### Offline address derivation
+
+`zecd derive-address` answers "what address will this wallet hand out?" before the wallet has
+a chain.
+
+`zecd init` needs a live upstream (it anchors the account on the tree state at `birthday - 1`)
+and `getnewaddress` needs a running daemon, so until 0.6.0 there was no way to learn an address
+first. That is a chicken-and-egg for pre-provisioning deposit addresses, air-gapped and cold
+setup, pointing a miner at a wallet that does not exist yet, and checking that a `keys.toml`
+derives the addresses you expect before trusting it.
+
+It touches no network, no wallet database and no daemon, and takes no datadir lock (like
+`export-ufvk`), so it runs safely beside a live daemon.
+
+**Key sources**, in the order it tries them:
+
+| Source | Flag | Notes |
+|---|---|---|
+| An initialized wallet's `keys.toml` | *(default)* | Uses the account **UFVK** pinned there, so no seed is decrypted and a locked, passphrase-encrypted, or watch-only wallet works. |
+| A BIP-39 mnemonic | `--mnemonic` | Read from `ZECD_MNEMONIC`, else `--mnemonic-file`, else stdin. |
+| A Unified Full Viewing Key | `--ufvk <UFVK>` | As printed by `export-ufvk`. Addresses are the same either way; only *spending* needs a seed. |
+
+`--index` and `--count` derive a batch at consecutive indices (default: one address at index
+0). `--address-type` reuses the same syntax and the same parsing code as
+[`getnewaddress`](rpc/wallet-addresses.md#getnewaddress)'s `address_type`, so the CLI and the
+RPC cannot drift, and it defaults to what that wallet's `getnewaddress` would hand out. For a
+bare t-address the index is the BIP 44 external child index - the same index the daemon
+exposes and the same one
+[`z_getaddressforaccount`](rpc/wallet-addresses.md#transparent-derivation-at-an-explicit-index)
+takes.
+
+stdout is exactly the addresses, one per line, so it pipes; `--json` reports the derivation
+key and indices alongside them.
+
+```sh
+# Ten deposit addresses, before the daemon exists.
+zecd derive-address --address-type transparent --index 0 --count 10
+
+# Check a keys.toml derives what you expect, from the mnemonic in your safe.
+ZECD_MNEMONIC="$(cat /mnt/secure/phrase)" zecd derive-address --mnemonic --json
+```
+
+What it deliberately **cannot** reproduce is `getnewaddress`'s *next shielded* address: those
+diversifier indices are clock-derived, so only an explicit index is deterministic - which is
+what an offline caller wants anyway.
 
 ## Environment variables
 

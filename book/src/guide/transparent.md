@@ -51,6 +51,26 @@ Transparent addresses come from the account's sequential BIP-44 external chain, 
 addresses, whose diversifier indexes are clock-derived. That sequentiality is exactly what makes
 the gap limit below meaningful.
 
+### Asking for a specific index, and asking which index you got
+
+*New in 0.6.0.* `getnewaddress` hands out the next address and returns a bare string, which
+leaves an operator reconciling an issued range against the chain without either half of the
+loop. Both halves now exist, and neither adds persistent state:
+
+| Question | Call |
+|---|---|
+| "Give me the address at index 7." | [`z_getaddressforaccount 0 ["p2pkh"] 7`](../rpc/wallet-addresses.md#transparent-derivation-at-an-explicit-index) |
+| "Which index is this address?" | [`getaddressinfo`](../rpc/wallet-addresses.md#getaddressinfo) - `address_index`, plus Core's `hdkeypath` and `ischange` |
+| "What will index 7 be, before the wallet exists?" | [`zecd derive-address`](../configuration.md#offline-address-derivation) - offline, no daemon |
+
+Deriving at an explicit index runs the **same exposure path** as sequential issuance, so the
+two agree by construction: the same recovery-horizon classification, the same warnings, the
+same refusal when `transparent_allow_beyond_recovery_window = false` would put the index out
+of restore range, and the same refresh of the address matcher. Directly addressing an index
+therefore moves the issuance frontier exactly as `getnewaddress` would, which is what keeps
+the two windows below coherent - and without the matcher refresh a payment to a directly
+addressed index would simply be missed.
+
 ## Receive discovery: block scan + mempool matching
 
 Compact blocks omit transparent inputs/outputs, and librustzcash's shielded scan never records
@@ -326,7 +346,9 @@ is best spent raising `transparent_initial_scan` (or getting a lower index funde
   transparently (under `AllowFullyTransparent`) or left in place. Coinbase is the exception,
   and it is explicit rather than automatic: `z_shieldcoinbase` (above).
 - **Mixed inputs.** Transparent UTXOs and shielded notes cannot fund a single send together.
-- **Address-index reconciliation.** No periodic cross-check of exposed addresses against Zebra's
-  transparent address index to backfill receives the forward-only scan missed.
+- **Automatic address-index reconciliation.** No *periodic* cross-check of exposed addresses
+  against Zebra's transparent address index to backfill receives the forward-only scan missed.
+  Since 0.6.0 the primitives to do it yourself exist - derive or look up an address by index,
+  and ask which index an address is (above) - but nothing runs that loop for you.
 
 See [Known limitations](../limitations.md) for the details and planned direction of each.

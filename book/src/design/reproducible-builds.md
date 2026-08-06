@@ -107,8 +107,15 @@ Pushing a `v*` tag runs the `Release` workflow. For each Linux target
    bit-for-bit across independent builds. The package carries the systemd unit and
    maintainer scripts inline; see the [deployment guide](../guide/deployment.md) for what it
    installs.
-4. Writes a `.sha256` sidecar for each artifact and attaches everything to a **draft**
-   GitHub release (a human reviews and publishes).
+4. Gathers every architecture's artifacts, writes one `SHA256SUMS` over them (bare
+   filenames, sorted, so the file is itself byte-stable and verifies against downloads
+   sitting in a single directory), and attaches everything to a **draft** GitHub release
+   (a human reviews and publishes).
+
+Artifacts are named with the Debian/Go architecture token - `zecd-<version>-linux-amd64.tar.gz`
+beside `zecd_<version>_amd64.deb` - rather than the Rust target triple, so one release
+listing spells each architecture exactly one way. Through 0.5.2 the tarballs used triples
+and each artifact carried its own `.sha256` sidecar.
 
 Separate `docker` and `docker-arm64` jobs in the same workflow push the GHCR images (the
 amd64 push uses `rewrite-timestamp=true` and forced compression so the pushed layers are
@@ -150,9 +157,11 @@ docker build -f Dockerfile.arm64 --target export -o ./out .
 sha256sum out/zecd
 ```
 
-Compare the hash against the binary inside the released `.tar.gz` (whose `.sha256` sidecar
-covers the archive itself, so also compare the extracted `zecd`). To verify a `.deb`,
-rebuild it from your extracted binary and compare the whole file:
+Compare the hash against the binary inside the released `.tar.gz`. Note what each check
+covers: `SHA256SUMS` covers the *archive*, which proves you downloaded what was published,
+while the rebuild above proves the *binary inside it* is the one this source produces. Both
+are worth doing, and only the second is a reproducibility claim. To verify a `.deb`, rebuild
+it from your extracted binary and compare the whole file:
 
 ```sh
 ./scripts/build-deb.sh out/zecd <version> amd64 .
