@@ -5,6 +5,34 @@ All notable changes to zecd are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com), and this
 project adheres to [Semantic Versioning](https://semver.org).
 
+## [0.5.3-rc1] - 2026-08-06
+
+Brings the 0.6.0 feature set onto the 0.5.x line: four additions to the RPC surface, two new
+offline subcommands, a faster start, and the librustzcash bump behind them. Existing response
+shapes and defaults are unchanged, and release artifacts keep the 0.5.x names, so upgrading
+from 0.5.2 is a drop-in.
+
+One caveat worth reading before deploying: the dependency bump runs an **additive wallet-database
+migration** the first time a wallet is opened, adding a column and renaming columns on tables zecd
+never populates. It is a no-op in practice, but it is a schema change, and downgrading across it
+is not supported. Snapshot the datadir first if you need a rollback path.
+
+### Added
+- `z_waitforoperation "opid" ( timeout )` blocks until an async operation finishes and returns its status object, so a caller writes two calls instead of a poll-sleep loop. Timing out is not an error: the current queued or executing status comes back, and a `finished` flag distinguishes the two outcomes. The timeout defaults to 120 seconds and clamps at 3600, since a blocking call holds an RPC work-queue permit for its whole duration. The wait is non-destructive; `z_getoperationresult` remains the only reader that reaps.
+- `waitfornewblock`, `waitforblock` and `waitforblockheight`, matching Bitcoin Core. All three block on the wallet's fully-scanned height rather than the chain tip, which is the answer to "has the wallet caught up to N?" that previously required reading the source. Polling a balance instead is wrong, because the mempool credits an incoming payment at zero confirmations, so a balance is satisfied before the confirming block is scanned and any height-dependent field read next may not be written yet.
+- `z_getaddressforaccount` derives a transparent address at an explicit BIP 44 child index, and `getaddressinfo` on an own transparent address now reports `hdkeypath`, `ischange` and an `address_index` extension. Together these close the loop for an operator reconciling an issued transparent range against the chain: previously there was no way to ask for index N, and no way to learn which index `getnewaddress` had just handed out.
+- `zecd derive-address` derives addresses with no network, no wallet database, no daemon and no datadir lock, so it runs beside a live one. Key material comes from an initialized wallet's account UFVK, so no seed is decrypted and a locked or watch-only wallet works, or from a mnemonic or a bare UFVK. It answers the chicken-and-egg for pre-provisioning deposit addresses, air-gapped setup, and pointing a miner at a wallet that does not exist yet.
+- `zecd config check` resolves a config file with the exact binary about to be deployed and exits non-zero if that build would refuse it, without starting the daemon, taking the datadir lock, or writing anything. Every check is either the resolver itself or a helper the daemon calls at startup, so the check cannot reach a different verdict than the daemon would.
+- `zecd config show` prints the effective configuration as round-trippable TOML: the file, flags and environment resolved together, with every unset key filled in by the build's default. Diffing two versions' output shows exactly which defaults an upgrade moves. Secrets are emitted as commented-out key names, never values.
+
+### Changed
+- The Orchard proving key builds in the background instead of before the daemon binds its listeners. Startup previously spent seconds of CPU, and considerably more on a small machine, unreachable and not syncing, to produce a key that only sends need. The first send awaits the build, which on any real deployment has long since finished. Startup probes sized around the old behaviour can be tightened.
+- Every top-level CLI flag is now global, so it is accepted on either side of the subcommand; `zecd config check --conf FILE` works as spelled.
+- The librustzcash wallet crates move to `zcash_client_backend 0.24.0-rc.7` and `zcash_client_sqlite 0.22.0-rc.7`. rc.7 records a transaction's Ironwood outputs when extracting a PCZT, so the workaround that re-decrypted a just-stored send to recover its memos is gone.
+
+### Unchanged from 0.5.2
+- Release artifacts keep the 0.5.x names (`zecd-<version>-<target-triple>.tar.gz` with a per-file `.sha256` sidecar). The 0.6.0 rename to architecture tokens and a single `SHA256SUMS` is deliberately **not** part of this line, so tooling that downloads 0.5.x assets by filename keeps working.
+
 ## [0.5.2] - 2026-08-03
 
 Three fixes for wallets holding Ironwood notes, which since NU6.3 activated on mainnet at height
@@ -297,6 +325,7 @@ Zcash, backed entirely by librustzcash and running as a light client.
 ### Security
 - Pre-release audit hardening; refuse to start on mainnet with the placeholder RPC password; enforce a 12-character passphrase minimum.
 
+[0.5.3-rc1]: https://github.com/zecrocks/zecd/compare/v0.5.2...v0.5.3-rc1
 [0.5.2]: https://github.com/zecrocks/zecd/compare/v0.5.1...v0.5.2
 [0.5.1]: https://github.com/zecrocks/zecd/compare/v0.5.0...v0.5.1
 [0.5.1-rc4]: https://github.com/zecrocks/zecd/compare/v0.5.1-rc3...v0.5.1-rc4
