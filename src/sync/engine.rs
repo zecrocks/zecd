@@ -82,6 +82,46 @@ impl std::fmt::Display for WalletApplyError {
 
 impl std::error::Error for WalletApplyError {}
 
+/// A reorg the wallet cannot rewind past: every truncation target at or below the conflict was
+/// refused, so the conflicting block cannot be removed and no retry will ever apply the range.
+/// Only an operator-driven `zecd rescan` clears it.
+///
+/// Typed (recoverable via `anyhow`'s `downcast_ref`) because it is the one sync failure that is
+/// **terminal**: every other class - transport, a transient apply error - is worth retrying, and
+/// the actor's loop is built around retrying. Without this distinction a wedged wallet retries
+/// the identical failure forever (measured: 280 identical attempts over ten minutes, each
+/// dropping and re-establishing the upstream connection), which reads in the log like a flaky
+/// upstream rather than a wallet that needs rebuilding. See [`super::super::wallet::actor`]'s
+/// halt handling.
+#[derive(Debug)]
+pub struct UnrecoverableReorg {
+    /// Height of the block whose continuity check failed.
+    pub at_height: BlockHeight,
+    /// The rewind target the caller asked for (the reorg margin below `at_height`).
+    pub requested: BlockHeight,
+    /// The lowest height the storage layer said it could rewind to, if it named one. It is
+    /// reported even when it is the very height that was just refused, so it is guidance for a
+    /// human, not a target to retry blindly.
+    pub safe_rewind_height: Option<BlockHeight>,
+}
+
+impl std::fmt::Display for UnrecoverableReorg {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "unrecoverable reorg at {}: no note-commitment-tree checkpoint with a scanned block \
+             exists below the conflict (requested rewind to {}",
+            self.at_height, self.requested
+        )?;
+        if let Some(safe) = self.safe_rewind_height {
+            write!(f, "; storage reported {safe} as its lowest safe target")?;
+        }
+        f.write_str(")")
+    }
+}
+
+impl std::error::Error for UnrecoverableReorg {}
+
 /// Download Sapling + Orchard note-commitment subtree roots and hand them to the wallet.
 /// Run once at startup (and cheaply repeatable).
 pub async fn update_subtree_roots<C: ChainSource>(
@@ -451,32 +491,43 @@ fn perform_rewind(
     at_height: BlockHeight,
     requested: BlockHeight,
 ) -> anyhow::Result<BlockHeight> {
-    match db_data.truncate_to_height(requested) {
-        Ok(h) => Ok(h),
-        Err(SqliteClientError::RequestedRewindInvalid { .. }) => {
-            let bound = BlockHeight::from(u32::from(at_height).saturating_sub(2));
-            match db_data.truncate_to_height(bound) {
-                Ok(h) => {
-                    info!(
-                        "[{name}] Shallow rewind to {h} (no valid target at or below {requested})"
-                    );
-                    Ok(h)
-                }
-                // No scanned block below the conflict can be rewound to: the reorg is
-                // deeper than the wallet's rewindable history. Recovering needs a
-                // from-birthday resync.
-                Err(SqliteClientError::RequestedRewindInvalid { .. }) => Err(anyhow!(
-                    "unrecoverable reorg at {at_height}: no note-commitment-tree checkpoint \
-                     with a scanned block exists below the conflict (requested rewind to \
-                     {requested}); stop the daemon and run `zecd rescan --wallet {name}` to \
-                     rebuild the wallet database from the seed (keys.toml is kept) and resync \
-                     from the wallet birthday"
-                )),
-                Err(e) => Err(e.into()),
+    let safe_rewind_height = match db_data.truncate_to_height(requested) {
+        Ok(h) => return Ok(h),
+        Err(SqliteClientError::RequestedRewindInvalid {
+            safe_rewind_height, ..
+        }) => safe_rewind_height,
+        Err(e) => return Err(e.into()),
+    };
+    // Candidates, in order. The shallow bound must be *strictly below* the known-stale block at
+    // `at_height - 1`, or the conflicting block survives the rewind and the next batch re-hits it.
+    // The storage layer's own `safe_rewind_height` is tried too, but only when it is below what it
+    // just refused: it is documented as "the lowest height it is possible to safely rewind to",
+    // and it can name the very height that failed (measured: `truncate_to_height(0)` refused with
+    // `safe_rewind_height: Some(0)`), which would retry the identical call forever.
+    let shallow = BlockHeight::from(u32::from(at_height).saturating_sub(2));
+    let candidates = [
+        Some(shallow),
+        safe_rewind_height.filter(|h| *h < requested && *h < shallow),
+    ];
+    for target in candidates.into_iter().flatten() {
+        match db_data.truncate_to_height(target) {
+            Ok(h) => {
+                info!("[{name}] Shallow rewind to {h} (no valid target at or below {requested})");
+                return Ok(h);
             }
+            Err(SqliteClientError::RequestedRewindInvalid { .. }) => continue,
+            Err(e) => return Err(e.into()),
         }
-        Err(e) => Err(e.into()),
     }
+    // No scanned block below the conflict can be rewound to: the reorg is deeper than the
+    // wallet's rewindable history. Retrying cannot help - the actor halts this wallet's sync on
+    // this error rather than re-attempting it forever - and recovery is a from-birthday resync.
+    Err(UnrecoverableReorg {
+        at_height,
+        requested,
+        safe_rewind_height,
+    }
+    .into())
 }
 
 /// The result of scanning one downloaded range.
@@ -1307,11 +1358,46 @@ mod tests {
             BlockHeight::from_u32(0),
         )
         .expect_err("nothing below the conflict to rewind to");
+        // Typed, not just worded: the actor halts this wallet's sync on exactly this type, and
+        // retries every other failure. A bare `anyhow!` here would be retried forever.
+        let unrecoverable = err
+            .downcast_ref::<UnrecoverableReorg>()
+            .expect("the terminal class must be recoverable by type, not by message text");
+        assert_eq!(u32::from(unrecoverable.at_height), 2);
         assert!(
             err.to_string().contains("unrecoverable reorg"),
             "unexpected error: {err:#}"
         );
         assert_eq!(max_scanned(&db_data), Some(1), "wallet state untouched");
+    }
+
+    /// The storage layer's `safe_rewind_height` is *not* a target to retry blindly: it can name
+    /// the very height that was just refused. Truncating a 1-block wallet to 0 does exactly that
+    /// (`RequestedRewindInvalid { safe_rewind_height: Some(0), requested_height: 0 }`), so a
+    /// candidate list that fed it back in would re-issue the identical failing call - the same
+    /// shape of infinite retry this whole change removes. Pin the upstream behaviour that makes
+    /// the guard necessary, so a bump that changes it shows up here.
+    #[test]
+    fn safe_rewind_height_can_name_the_refused_height() {
+        let dir = tempfile::tempdir().unwrap();
+        let wd = dir.path();
+        let mut db_data = short_chain_wallet(wd, 1);
+
+        match db_data.truncate_to_height(BlockHeight::from_u32(0)) {
+            Err(SqliteClientError::RequestedRewindInvalid {
+                safe_rewind_height,
+                requested_height,
+            }) => {
+                assert_eq!(u32::from(requested_height), 0);
+                assert_eq!(
+                    safe_rewind_height.map(u32::from),
+                    Some(0),
+                    "upstream named a safe height other than the refused one; \
+                     `perform_rewind`'s `< requested` filter may now be over-cautious"
+                );
+            }
+            other => panic!("expected the truncation to 0 to be refused, got {other:?}"),
+        }
     }
 
     /// `delete_cached_blocks` must drop the batch's `compactblocks_meta` rows along with the
