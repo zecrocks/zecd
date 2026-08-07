@@ -5,6 +5,20 @@ All notable changes to zecd are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com), and this
 project adheres to [Semantic Versioning](https://semver.org).
 
+## [0.6.0-rc3] - 2026-08-07
+
+Three fixes and a dependency bump on top of `0.6.0-rc2`. The lightwalletd backend itself is
+unchanged.
+
+### Fixed
+- `getwalletinfo.transparent.restorable` no longer reports `false` for a from-seed restore that has issued no addresses. Creating an account always derives and exposes the account's default Unified Address, whose diversifier index is the seed's first index valid for every receiver; with a Sapling receiver in play that index is 0 for only about half of seeds and 3 or more for roughly one in eight. The reported recovery horizon assumed the floor was always 0, so any seed whose default index exceeded the gap limit was described as beyond its own recovery window. The horizon is now anchored at the restore floor, the larger of `transparent_initial_scan` and the default-address frontier, through a single helper shared by the wallet reads, the beyond-gap issuance classification, and the low-headroom warnings. Only the reported horizon was ever wrong: the exposure itself is re-derived identically by every restore of a seed, so two restores of the same seed always agreed and no funds were at risk.
+- A wallet that meets an unrecoverable reorg halts instead of retrying forever. When a reorg conflicts at a height with no note-commitment-tree checkpoint below it that has a scanned block, every truncation target is refused and no retry can ever apply the range; the wallet nonetheless kept trying, dropping and re-establishing the upstream connection each time, which reads in the log like a flaky node rather than a wallet that needs rebuilding. That failure is now a distinct error carrying the conflict height and the rewind bounds, the sync loop treats it as terminal and says so once, and the wallet keeps serving commands and reads while it waits for an operator to rebuild the database with `zecd rescan`. No other failure class is treated as terminal.
+- The light-mode regtest suite exercises a light upstream again. Six of its seven binaries were not swapping the backend, so under the light-mode setting they still ran against zebra and repeated the standard suite's coverage rather than testing light mode. Test-only; it did not affect a running daemon.
+
+### Changed
+- The librustzcash line moves to `zcash_client_sqlite 0.22.0-rc.8`, `pczt 0.9.3` and `orchard 0.15.5`, plus the pool-migration and proof-system crates those pull in. `zcash_client_backend` stays at `0.24.0-rc.7`, which is what the sqlite crate requires and the newest published. rc.8 is almost entirely pool-migration work over tables zecd never writes; the two changes that touch paths zecd uses are both more forgiving than before, and the orchard change shares setup across a batch of trial decryptions, which is throughput only on the block-scan path. Opening a wallet created on the previous pin migrates it forward on first start.
+- The config-validation tests and the container smoke test now run against the configs that ship, rather than a config written for the test. The container additionally runs `config check` on the config the compose stack mounts, so the runtime image is proved to read a production-shaped config rather than only to report its version.
+
 ## [0.6.0-rc2] - 2026-08-06
 
 Adds an optional lightwalletd backend. Everything in 0.6.0-rc1 is unchanged, and full mode
@@ -334,6 +348,7 @@ Zcash, backed entirely by librustzcash and running as a light client.
 ### Security
 - Pre-release audit hardening; refuse to start on mainnet with the placeholder RPC password; enforce a 12-character passphrase minimum.
 
+[0.6.0-rc3]: https://github.com/zecrocks/zecd/compare/v0.6.0-rc2...v0.6.0-rc3
 [0.6.0-rc2]: https://github.com/zecrocks/zecd/compare/v0.6.0-rc1...v0.6.0-rc2
 [0.6.0-rc1]: https://github.com/zecrocks/zecd/compare/v0.5.2...v0.6.0-rc1
 [0.5.2]: https://github.com/zecrocks/zecd/compare/v0.5.1...v0.5.2
