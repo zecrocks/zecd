@@ -5,6 +5,14 @@ All notable changes to zecd are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com), and this
 project adheres to [Semantic Versioning](https://semver.org).
 
+## [0.5.3-rc2] - 2026-08-07
+
+One fix on top of `0.5.3-rc1`: the transparent recovery horizon is now anchored correctly, so a
+freshly restored wallet is no longer mislabeled as unrecoverable. Nothing else changed.
+
+### Fixed
+- `getwalletinfo.transparent.restorable` no longer reports `false` for a from-seed restore that has issued no addresses. Creating an account always derives and exposes the account's default Unified Address, whose diversifier index is the seed's first index valid for every receiver; with a Sapling receiver in play that index is 0 for only about half of seeds and 3 or more for roughly one in eight. The reported recovery horizon assumed the floor was always 0, so any seed whose default index exceeded the gap limit was described as beyond its own recovery window. The horizon is now anchored at the restore floor, the larger of `transparent_initial_scan` and the default-address frontier, through a single helper shared by the wallet reads, the beyond-gap issuance classification, and the low-headroom warnings. Only the reported horizon was ever wrong: the exposure itself is re-derived identically by every restore of a seed, so two restores of the same seed always agreed with each other and no funds were ever at risk.
+
 ## [0.5.3-rc1] - 2026-08-06
 
 Brings the 0.6.0 feature set onto the 0.5.x line: four additions to the RPC surface, two new
@@ -325,6 +333,7 @@ Zcash, backed entirely by librustzcash and running as a light client.
 ### Security
 - Pre-release audit hardening; refuse to start on mainnet with the placeholder RPC password; enforce a 12-character passphrase minimum.
 
+[0.5.3-rc2]: https://github.com/zecrocks/zecd/compare/v0.5.3-rc1...v0.5.3-rc2
 [0.5.3-rc1]: https://github.com/zecrocks/zecd/compare/v0.5.2...v0.5.3-rc1
 [0.5.2]: https://github.com/zecrocks/zecd/compare/v0.5.1...v0.5.2
 [0.5.1]: https://github.com/zecrocks/zecd/compare/v0.5.0...v0.5.1
