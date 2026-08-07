@@ -93,7 +93,7 @@ zcash_encoding = "0.4"
 # `pczt` exposes `create_pczt_from_proposal` / `extract_and_store_transaction_from_pczt`, the
 # build/prove/store seam that lets the proving step take a cached Orchard proving key.
 zcash_client_backend = { version = "0.24.0-rc.7", features = ["lightwalletd-tonic-tls-webpki-roots", "orchard", "transparent-inputs", "pczt"] }
-zcash_client_sqlite = { version = "0.22.0-rc.7", features = ["unstable", "orchard", "serde", "transparent-inputs"] }
+zcash_client_sqlite = { version = "0.22.0-rc.8", features = ["unstable", "orchard", "serde", "transparent-inputs"] }
 zcash_keys = { version = "0.16", features = ["unstable", "orchard"] }
 zcash_primitives = "0.30"
 zcash_proofs = { version = "0.30", features = ["bundled-prover"] }
@@ -104,8 +104,8 @@ zcash_transparent = "0.10"
 zcash_script = "0.4.5"
 sapling = { package = "sapling-crypto", version = "0.7" }
 # PCZT roles (Prover/Signer) for the cached-proving-key send path. Versions track the
-# zcash_client_backend `pczt` feature's own pin (0.9.2).
-pczt = { version = "0.9.2", default-features = false, features = ["prover", "signer", "orchard", "sapling"] }
+# zcash_client_backend `pczt` feature's own pin (0.9.3).
+pczt = { version = "0.9.3", default-features = false, features = ["prover", "signer", "orchard", "sapling"] }
 zip32 = "0.2"
 zip321 = "0.9.0-rc.1"
 libc = "0.2.186"
@@ -153,7 +153,7 @@ incrementalmerkletree = "0.8"
 # crates as finals (`zcash_primitives`/`zcash_proofs 0.30.0`, `orchard 0.15.0`, `zcash_protocol
 # 0.10`, `zcash_keys 0.16`, `zcash_address 0.13.0`, `zcash_transparent 0.10.0`) and the wallet
 # crates as release candidates (`zcash_client_backend 0.24.0-rc.7`, `zcash_client_sqlite
-# 0.22.0-rc.7`, `pczt 0.9.2`, `zip321 0.9.0-rc.1`). This replaced the
+# 0.22.0-rc.8`, `pczt 0.9.3`, `zip321 0.9.0-rc.1`). This replaced the
 # previous all-or-nothing `[patch.crates-io]` git pin of the whole librustzcash workspace to the
 # `dw/ironwood-scan-model` rev `1105d8203` (zcash/librustzcash#2539), which existed only because the
 # wallet crates had no ironwood release yet. The shardtree/incrementalmerkletree git pins went with
@@ -183,6 +183,23 @@ incrementalmerkletree = "0.8"
 #   re-decrypted the just-stored transaction - is deleted with this bump. If a future bump ever
 #   regresses the extractor, the symptom is a missing memo on an ironwood send's own outputs on the
 #   authoring node, and only the regtest ironwood tier can see it.
+# - **rc.8 is almost entirely pool-migration work, which zecd does not use.** It adds the migration
+#   history/cancel/finalize APIs, a `MigrationUuid` identity, two migration views, and schema
+#   migrations that rework those tables (txid to BLOB, uuid + committed_height columns) - all over
+#   tables zecd never writes, so they run empty. Two changes do touch paths zecd is on.
+#   `WalletWrite::store_transactions_to_be_sent` - the fully-transparent t-to-t send path's store
+#   call - now upserts each transaction's sent-output records rather than failing on a transaction
+#   the wallet already recorded, and classifies each stored transaction against ZIP 318 at store
+#   time instead of waiting for it to mine; both are strictly more forgiving. Separately, a schema
+#   migration relaxes the `addresses` table constraint to admit upstream's new watch-only
+#   transparent address import (`transparent-key-import` feature, which zecd does not enable).
+#   `zcash_client_backend` stays at rc.7 - no rc.8 of that crate is published, and rc.8 of the
+#   sqlite crate requires `^0.24.0-rc.7`.
+# - **`orchard` 0.15.4 speeds up batched trial decryption**, which is how the compact-block scan
+#   decrypts every block's outputs: GLV endomorphism setup is now shared across a whole batch
+#   instead of recomputed per output. Shared secrets are byte-identical to the per-item path, so it
+#   changes throughput only, never what the scan finds. 0.15.5 is a version-requirement bump only
+#   (minimum `halo2_proofs` 0.3.5).
 # - **Single-pool-group input selection** (upstream `00c789f9`): shielded inputs come from one of
 #   two mutually-exclusive groups - {Orchard} or {Sapling+Ironwood}, never mixed - the NU6.3
 #   migration model (past NU6.3 a new Orchard-address output becomes an ironwood V3 note, so Orchard
