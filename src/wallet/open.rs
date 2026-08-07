@@ -230,7 +230,10 @@ mod tests {
             .max()
             .unwrap_or(0);
         let coverage_end = frontier.saturating_add(GAP);
-        let horizon = GAP; // initial_scan = 0
+        // The anchored recovery horizon for this wallet: initial_scan = 0 and the committed
+        // phrase's default address sits at index 0 (restore floor 1), so the horizon is
+        // GAP + 1 (see `actor::recovery_horizon_for`).
+        let horizon = GAP + 1;
 
         // The contract: coverage tracks the issuance frontier, so it reaches past the
         // recovery horizon once an address has been issued past it.
@@ -262,15 +265,20 @@ mod tests {
         );
     }
 
-    /// A from-seed restore must not materialize transparent receiving addresses beyond the
-    /// configured external gap limit.
+    /// A from-seed restore of a seed whose **default address sits at index 0** must not
+    /// materialize transparent receiving addresses beyond the configured external gap limit.
     ///
-    /// This is the property `regtest_transparent_gap` asserts end-to-end (fund index 8, restore
-    /// with `transparent_gap_limit = 3`, require the funds stay missed) - but it asserts it by
-    /// watching a balance stay zero for 20 seconds, which makes it a race rather than a proof.
-    /// The matcher matches against *every recorded receiver*, so if account creation writes rows
-    /// past the gap the scan will find a receive the gap limit says is unrecoverable, and whether
-    /// the e2e catches it depends only on whether the scan gets there inside the window.
+    /// This is the property `regtest_transparent_gap` asserts end-to-end (fund a high index,
+    /// restore with `transparent_gap_limit = 3`, require the funds stay missed). The matcher
+    /// matches against *every recorded receiver*, so if account creation wrote rows past the gap
+    /// the scan would find a receive the gap limit says is unrecoverable.
+    ///
+    /// NB the invariant is conditional on the seed: account creation pre-generates rows up
+    /// through the seed's default-address index and exposes that index (see
+    /// `account_creation_anchors_the_frontier_at_the_default_address_index`), so a seed whose
+    /// default address lands past the gap legitimately materializes rows beyond it. The
+    /// committed development phrase's default index is 0 - asserted below so a phrase swap can't
+    /// silently void the precondition - which makes this the clean-baseline half of the pair.
     ///
     /// Checked here directly and deterministically: create the account exactly as `zecd init`
     /// does for a transparent wallet (`init_dbs_with_gap_limit` + `create_account`) and read back
@@ -291,12 +299,33 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let net = crate::network::regtest();
         let mut db = init_dbs_with_gap_limit(net, dir.path(), Some(GAP)).expect("init dbs");
-        let seed = SecretVec::new(
-            <Mnemonic<English>>::from_phrase(PHRASE)
-                .unwrap()
-                .to_seed("")
-                .to_vec(),
-        );
+        let seed_bytes = <Mnemonic<English>>::from_phrase(PHRASE)
+            .unwrap()
+            .to_seed("");
+
+        // Precondition (see the doc comment): this phrase's default address must sit at index 0,
+        // or the beyond-gap assertion below stops describing a clean baseline.
+        {
+            use zcash_keys::keys::{UnifiedAddressRequest, UnifiedSpendingKey};
+            let usk = UnifiedSpendingKey::from_seed(&net, &seed_bytes, zip32::AccountId::ZERO)
+                .expect("derive USK");
+            let (_, d_idx) = usk
+                .to_unified_full_viewing_key()
+                .to_unified_incoming_viewing_key()
+                .find_address(
+                    zip32::DiversifierIndex::new(),
+                    UnifiedAddressRequest::AllAvailableKeys,
+                )
+                .expect("derive the default address as account creation does");
+            assert_eq!(
+                u32::try_from(u128::from(d_idx)),
+                Ok(0),
+                "the committed phrase's default-address index must be 0 for this test's \
+                 invariant to hold; a different phrase needs re-checking"
+            );
+        }
+
+        let seed = SecretVec::new(seed_bytes.to_vec());
         let birthday = AccountBirthday::from_parts(
             zcash_client_backend::data_api::chain::ChainState::empty(
                 BlockHeight::from_u32(0),
@@ -351,6 +380,125 @@ mod tests {
             frontier <= GAP,
             "a freshly restored wallet that has issued no addresses reports a matcher frontier \
              of {frontier} with gap {GAP}; external chain (index, exposed): {indices:?}"
+        );
+    }
+
+    /// Account creation anchors the transparent frontier at the **default address's** index -
+    /// a per-seed value, not always 0 - and every restore of the seed reproduces it exactly.
+    ///
+    /// `add_account` (upstream) always derives and exposes the account's default Unified
+    /// Address with `UnifiedAddressRequest::AllAvailableKeys`, whose diversifier index is the
+    /// first index valid for every receiver the key has. For a key with a Sapling component
+    /// that is the first Sapling-valid index: geometric with p ~ 1/2, so it is 0 for only about
+    /// half of all seeds (>= 3 for ~1 in 8, >= 5 for ~1 in 32). The exposed transparent
+    /// receiver at that index is what `rebuild_transparent_set` derives its frontier from, so a
+    /// freshly created (or freshly restored) wallet legitimately reports `lookahead_from =
+    /// default index + 1` - the per-run "frontier well above 0 on a fresh restore" that
+    /// intermittently tripped `regtest_transparent_gap` (frontiers 5/6/10, one per fresh CI
+    /// mnemonic) before the recovery horizon was anchored at the same floor.
+    ///
+    /// Pinned here with a seed whose default index (6) lands *past* the configured gap of 3:
+    /// account creation pre-generates rows `0..=6` (so indices beyond the gap DO get rows -
+    /// upstream's "pre-generate prior to the default address" pass), exposes only index 6, and
+    /// a second creation from the same seed reproduces the identical state - which is why this
+    /// anchor is deterministic per seed, keeps restores of one seed consistent with each other,
+    /// and belongs *inside* the recovery horizon (`actor::recovery_horizon_for`) rather than
+    /// being reported as unrestorable.
+    #[test]
+    fn account_creation_anchors_the_frontier_at_the_default_address_index() {
+        use secrecy::SecretVec;
+        use zcash_client_backend::data_api::{AccountBirthday, WalletRead, WalletWrite};
+        use zcash_client_backend::wallet::Exposure;
+        use zcash_keys::keys::{UnifiedAddressRequest, UnifiedSpendingKey};
+        use zcash_primitives::block::BlockHash;
+        use zcash_protocol::consensus::BlockHeight;
+
+        const GAP: u32 = 3;
+        // A fixed seed whose default-address diversifier index is 6 (first Sapling-valid index
+        // for this key; verified below rather than trusted).
+        const SEED_BYTE: u8 = 12;
+        const DEFAULT_INDEX: u32 = 6;
+
+        let net = crate::network::regtest();
+        let usk = UnifiedSpendingKey::from_seed(&net, &[SEED_BYTE; 64], zip32::AccountId::ZERO)
+            .expect("derive USK");
+        let (default_ua, d_idx) = usk
+            .to_unified_full_viewing_key()
+            .to_unified_incoming_viewing_key()
+            .find_address(
+                zip32::DiversifierIndex::new(),
+                UnifiedAddressRequest::AllAvailableKeys,
+            )
+            .expect("derive the default address as account creation does");
+        assert_eq!(
+            u32::try_from(u128::from(d_idx)),
+            Ok(DEFAULT_INDEX),
+            "the fixture seed's default-address index"
+        );
+        assert!(
+            default_ua.transparent().is_some(),
+            "the default UA carries the p2pkh receiver that gets exposed"
+        );
+
+        // Create the account twice from the same seed (two independent "restores") and read
+        // back the external transparent chain each time.
+        let external_chain = || {
+            let dir = tempfile::tempdir().unwrap();
+            let mut db = init_dbs_with_gap_limit(net, dir.path(), Some(GAP)).expect("init dbs");
+            let seed = SecretVec::new(vec![SEED_BYTE; 64]);
+            let birthday = AccountBirthday::from_parts(
+                zcash_client_backend::data_api::chain::ChainState::empty(
+                    BlockHeight::from_u32(0),
+                    BlockHash([0u8; 32]),
+                ),
+                None,
+            );
+            let account = db
+                .create_account("primary", &seed, &birthday, None)
+                .expect("create account")
+                .0;
+            let external = db
+                .get_transparent_receivers(account, false, false)
+                .expect("external receivers");
+            let mut rows: Vec<(u32, bool)> = external
+                .values()
+                .filter_map(|m| {
+                    m.address_index()
+                        .map(|i| (i.index(), matches!(m.exposure(), Exposure::Exposed { .. })))
+                })
+                .collect();
+            rows.sort_unstable();
+            rows
+        };
+        let rows = external_chain();
+
+        // Rows run 0..=default index (exposure only at the default index), so indices past the
+        // gap ARE materialized - the matcher matches every row, and a restore reproduces them.
+        let expected: Vec<(u32, bool)> = (0..=DEFAULT_INDEX)
+            .map(|i| (i, i == DEFAULT_INDEX))
+            .collect();
+        assert_eq!(
+            rows, expected,
+            "account creation materializes rows through the default index and exposes only it"
+        );
+        let frontier = rows
+            .iter()
+            .filter(|(_, exposed)| *exposed)
+            .map(|(i, _)| i.saturating_add(1))
+            .max()
+            .unwrap_or(0);
+        assert_eq!(
+            frontier,
+            DEFAULT_INDEX + 1,
+            "the matcher frontier starts one past the default address"
+        );
+
+        // Restore determinism: a second creation from the same seed reproduces the identical
+        // chain, so the anchor never diverges between two restores of one seed.
+        assert_eq!(
+            external_chain(),
+            rows,
+            "a second create-from-seed reproduces the same external chain"
         );
     }
 

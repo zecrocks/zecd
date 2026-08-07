@@ -615,8 +615,9 @@ struct WalletActor {
     /// Whether a no-argument `getnewaddress` returns a bare transparent address.
     transparent_default: bool,
     /// External transparent gap limit: how far past the issuance frontier (and past each funded
-    /// index) receive discovery looks. Together with `transparent_initial_scan` it defines the
-    /// stateless-restore recovery horizon `initial_scan + gap_limit`.
+    /// index) receive discovery looks. Together with `transparent_initial_scan` and the default
+    /// address's frontier it defines the stateless-restore recovery horizon (see
+    /// [`recovery_horizon_for`]).
     transparent_gap_limit: u32,
     /// Initial transparent scan depth: pre-expose external indices `0..N` once so the receive
     /// scan covers them. `0` = off.
@@ -656,6 +657,17 @@ struct WalletActor {
     transparent_preexpose: Option<PreexposeProgress>,
     /// Last frontier computed by `rebuild_transparent_set`, for `SyncStatus`.
     transparent_frontier: Option<u32>,
+    /// The external transparent frontier a fresh from-seed restore of this account starts with:
+    /// one past the account **default address**'s transparent child index. Account creation
+    /// always derives and exposes the default Unified Address, whose diversifier index is the
+    /// first index valid for *every* receiver the key has - for a key with a Sapling component
+    /// that is the first Sapling-valid index, a per-seed value that is 0 for only about half of
+    /// all seeds (geometric: >= 3 for ~1 in 8, >= 5 for ~1 in 32). Because every restore of the
+    /// seed re-derives and re-exposes the same index, restore coverage - and therefore the
+    /// recovery horizon - is anchored here rather than at zero (see
+    /// [`recovery_horizon_for`]). Computed once when the account is known (spawn, or bootstrap
+    /// adoption); `None` while no account exists or its key has no transparent component.
+    transparent_default_frontier: Option<u32>,
     /// Transient first-seen times for unmined txs, shared with the read-path handle. Stamped when
     /// the mempool stream first stores an unmined tx; pruned once the tx mines. Never persisted
     /// (zecd is stateless). See [`crate::wallet::FirstSeen`].
@@ -784,19 +796,9 @@ pub async fn spawn(
         cfg.transparent_enabled.then_some(cfg.transparent_gap_limit),
     )?;
     if cfg.transparent_enabled {
-        // Surface the transparent receiving config for operator auditing of restore coverage:
-        // a stateless rebuild rediscovers transparent funds only within `gap_limit` of the last
-        // funded address.
-        info!(
-            "[{}] transparent receiving enabled (default_address={}, external_gap_limit={}, \
-             initial_scan={}, recovery_horizon={})",
-            cfg.name,
-            cfg.transparent_default,
-            cfg.transparent_gap_limit,
-            cfg.transparent_initial_scan,
-            cfg.transparent_initial_scan
-                .saturating_add(cfg.transparent_gap_limit)
-        );
+        // (The "transparent receiving enabled" info line - including the effective recovery
+        // horizon - is emitted below, once the account is resolved: the horizon is anchored at
+        // the account default address's frontier, which needs the account's viewing key.)
         // A wide window is a per-receive cost, not just a restore-scan bound: librustzcash's gap
         // maintenance re-derives the whole window every time a transparent receive is recorded
         // (see `config::TRANSPARENT_GAP_LIMIT_SEVERE`). The width stays the operator's choice
@@ -882,6 +884,31 @@ pub async fn spawn(
         Some(id) => Some(binding::account_ufvk_encoded(cfg.network, &db_data, id)?),
         None => None,
     };
+
+    // The restore floor's default-address anchor (see [`recovery_horizon_for`]): resolvable now
+    // for a wallet that already has an account; a bootstrap wallet fills it in at adoption.
+    let transparent_default_frontier = match account_id {
+        Some(id) if cfg.transparent_enabled => default_transparent_frontier(&db_data, id),
+        _ => None,
+    };
+    if cfg.transparent_enabled {
+        // Surface the transparent receiving config for operator auditing of restore coverage:
+        // a stateless rebuild rediscovers transparent funds only below the recovery horizon
+        // (or chained past it by funding).
+        info!(
+            "[{}] transparent receiving enabled (default_address={}, external_gap_limit={}, \
+             initial_scan={}, recovery_horizon={})",
+            cfg.name,
+            cfg.transparent_default,
+            cfg.transparent_gap_limit,
+            cfg.transparent_initial_scan,
+            recovery_horizon_for(
+                cfg.transparent_initial_scan,
+                transparent_default_frontier,
+                cfg.transparent_gap_limit
+            )
+        );
+    }
 
     // Determine the wallet's encryption mode, and for unencrypted wallets optionally decrypt
     // the seed up-front for unattended sending. An encrypted wallet has no passphrase at rest,
@@ -1034,6 +1061,7 @@ pub async fn spawn(
         transparent_preexposed: false,
         transparent_preexpose: None,
         transparent_frontier: None,
+        transparent_default_frontier,
         first_seen: first_seen.clone(),
         account_id,
         account_index,
@@ -1396,6 +1424,49 @@ fn gap_slots_remaining(gap_position: u32, gap_limit: u32) -> u32 {
 /// per-receive window regeneration stalls restores (see `config::TRANSPARENT_GAP_LIMIT_SEVERE`).
 fn horizon_slots_remaining(horizon: u32, index: u32) -> u32 {
     horizon.saturating_sub(index.saturating_add(1))
+}
+
+/// The stateless-restore recovery horizon: external indices strictly below it are recoverable on
+/// a from-seed restore regardless of funding. It is `gap_limit` past the **restore floor** - the
+/// frontier a fresh restore of the seed starts with, which is the larger of the pre-exposed
+/// `transparent_initial_scan` window and the account default address's frontier
+/// (`default_frontier` = default-address child index + 1; `None` when unknown).
+///
+/// The default-address anchor is what makes the horizon exact rather than conservative-but-wrong:
+/// account creation exposes the default Unified Address's transparent receiver at a per-seed
+/// index `d`, so *every* restore's matcher starts its gap lookahead at `d + 1` (and matches the
+/// pre-generated rows `0..=d` too), covering `0 .. max(initial_scan, d + 1) + gap_limit`
+/// contiguously on day one. Without the anchor, a seed whose default address lands at `d >=
+/// gap_limit` reported a fresh restore as beyond its own horizon (`restorable: false`) - the
+/// CI-observed shape that motivated this function.
+fn recovery_horizon_for(initial_scan: u32, default_frontier: Option<u32>, gap_limit: u32) -> u32 {
+    initial_scan
+        .max(default_frontier.unwrap_or(0))
+        .saturating_add(gap_limit)
+}
+
+/// One past the account default address's transparent child index - the frontier a fresh
+/// from-seed restore of this account starts with (see
+/// [`WalletActor::transparent_default_frontier`]). Derived exactly as account creation does:
+/// the first diversifier index valid for every receiver of the account's UIVK
+/// (`UnifiedAddressRequest::AllAvailableKeys`). `None` when the account is unavailable, the
+/// default address carries no transparent receiver, or its index is out of the non-hardened
+/// range (not derivable as a transparent child).
+fn default_transparent_frontier(
+    db_data: &crate::wallet::open::WriteDb,
+    account_id: AccountUuid,
+) -> Option<u32> {
+    use zcash_keys::keys::UnifiedAddressRequest;
+    let account = db_data.get_account(account_id).ok()??;
+    let (ua, d_idx) = account
+        .uivk()
+        .find_address(
+            DiversifierIndex::new(),
+            UnifiedAddressRequest::AllAvailableKeys,
+        )
+        .ok()?;
+    ua.transparent()?;
+    transparent_child_index(d_idx).map(|i| i.saturating_add(1))
 }
 
 /// Render a tree-state frontier (the hex-encoded `final_state` from a `tree_state` reply) for
@@ -2901,6 +2972,12 @@ impl WalletActor {
                 self.account_index = index;
                 self.watch_only = watch_only;
                 self.pending_bootstrap = None;
+                // The rebuilt account's default-address anchor for the recovery horizon (the
+                // same derivation `spawn` runs for a wallet that starts with an account).
+                if self.transparent_enabled {
+                    self.transparent_default_frontier =
+                        default_transparent_frontier(&self.db_data, id);
+                }
                 // First `update_chain_tip` with the account (and its birthday) now present - see
                 // `refresh_tip`. This is what derives the scan queue with a non-NULL
                 // `wallet_birthday`, so the rescan floors at the birthday instead of an
@@ -3051,10 +3128,9 @@ impl WalletActor {
             watch_only: self.watch_only,
             unlocked_until,
             transparent_frontier: self.transparent_frontier,
-            transparent_recovery_horizon: self.transparent_enabled.then(|| {
-                self.transparent_initial_scan
-                    .saturating_add(self.transparent_gap_limit)
-            }),
+            transparent_recovery_horizon: self
+                .transparent_enabled
+                .then(|| self.transparent_recovery_horizon()),
             transparent_preexpose: self
                 .transparent_preexpose
                 .as_ref()
@@ -3307,8 +3383,8 @@ impl WalletActor {
 
     /// Issue a transparent receiving address past librustzcash's funded-anchored gap window
     /// (`get_next_available_address` hit `ReachedGapLimit`), classifying the next sequential
-    /// external index against the stateless-restore **recovery horizon**
-    /// `transparent_initial_scan + transparent_gap_limit`:
+    /// external index against the stateless-restore **recovery horizon** (`gap_limit` past the
+    /// restore floor - see [`recovery_horizon_for`]):
     ///
     ///   * `next < horizon` - recoverable from seed (a restore pre-exposes `0..initial_scan` and
     ///     its gap lookahead matches `gap_limit` indices past that frontier), so the address is
@@ -3339,14 +3415,12 @@ impl WalletActor {
         account_id: AccountUuid,
         index: u32,
     ) -> Result<String, RpcError> {
-        let horizon = self
-            .transparent_initial_scan
-            .saturating_add(self.transparent_gap_limit);
+        let horizon = self.transparent_recovery_horizon();
         if index >= horizon && !self.transparent_allow_beyond_recovery_window {
             return Err(RpcError::wallet(format!(
                 "transparent address gap limit reached: external index ({index}) is \
-                 beyond the recovery horizon (transparent_initial_scan + transparent_gap_limit \
-                 = {horizon}), so it would not be recoverable from seed. Raise [pools] \
+                 beyond the recovery horizon ({horizon} = transparent_gap_limit past the \
+                 restore floor), so it would not be recoverable from seed. Raise [pools] \
                  transparent_initial_scan to your issuance high-water mark (preferred - a \
                  large transparent_gap_limit makes every recorded transparent receive \
                  re-derive the whole window), fund a lower-index address, or set \
@@ -3378,9 +3452,9 @@ impl WalletActor {
             if remaining <= self.transparent_gap_warn_threshold {
                 warn!(
                     "[{}] transparent recovery horizon nearly exhausted: {remaining} recoverable \
-                     address slot(s) remain (transparent_initial_scan + transparent_gap_limit = \
-                     {horizon}). Raise [pools] transparent_initial_scan to your issuance \
-                     high-water mark before handing out more addresses.",
+                     address slot(s) remain (recovery horizon = {horizon}). Raise [pools] \
+                     transparent_initial_scan to your issuance high-water mark before handing \
+                     out more addresses.",
                     self.name
                 );
             }
@@ -3418,6 +3492,16 @@ impl WalletActor {
                 .unwrap_or(0),
             Err(_) => 0,
         }
+    }
+
+    /// This wallet's stateless-restore recovery horizon: `gap_limit` past the restore floor
+    /// (`max(transparent_initial_scan, default-address frontier)`) - see [`recovery_horizon_for`].
+    fn transparent_recovery_horizon(&self) -> u32 {
+        recovery_horizon_for(
+            self.transparent_initial_scan,
+            self.transparent_default_frontier,
+            self.transparent_gap_limit,
+        )
     }
 
     /// One-time startup check: warn if the wallet's transparent recovery window is already nearly
@@ -3471,9 +3555,7 @@ impl WalletActor {
             // Count the recovery horizon as headroom alongside the gap window, so an intended
             // small-gap + large-initial-scan wallet isn't warned on every issuance it can in
             // fact recover (see [`horizon_slots_remaining`]).
-            let horizon = self
-                .transparent_initial_scan
-                .saturating_add(self.transparent_gap_limit);
+            let horizon = self.transparent_recovery_horizon();
             let in_window = gap_slots_remaining(gap_position, gap_limit);
             let under_horizon = meta
                 .address_index()
@@ -5838,6 +5920,33 @@ mod tests {
         assert_eq!(horizon_slots_remaining(20, 19), 0);
         // Overflow-safe at the top of the index space.
         assert_eq!(horizon_slots_remaining(u32::MAX, u32::MAX), 0);
+    }
+
+    /// The recovery horizon is anchored at the restore floor - the larger of the configured
+    /// `transparent_initial_scan` and the account default address's frontier - not at zero.
+    /// Account creation exposes the default Unified Address's transparent receiver at the seed's
+    /// first all-receivers-valid diversifier index, and every restore of the seed re-derives the
+    /// same exposure, so restore coverage genuinely starts there. Without the anchor, a seed
+    /// whose default address lands at an index >= gap_limit reported a *fresh restore* as beyond
+    /// its own horizon (`restorable: false`) - the intermittent `regtest_transparent_gap` CI
+    /// failure (frontiers 5/6/10 with gap 3, one per fresh per-run mnemonic).
+    #[test]
+    fn recovery_horizon_is_anchored_at_the_restore_floor() {
+        use super::recovery_horizon_for;
+        // No anchor known (no account yet / no transparent component): the configured floor.
+        assert_eq!(recovery_horizon_for(0, None, 3), 3);
+        assert_eq!(recovery_horizon_for(70_000, None, 1_000), 71_000);
+        // The common case (default address at index 0 -> frontier 1): a fresh wallet's day-one
+        // coverage is 0..=gap_limit (row 0 plus the lookahead 1..=gap), so the horizon is
+        // gap_limit + 1 - exact where the un-anchored formula understated by one.
+        assert_eq!(recovery_horizon_for(0, Some(1), 3), 4);
+        // A seed whose default address lands past the gap: the horizon follows it, because a
+        // restore's matcher starts its lookahead there (frontier 6 -> coverage through 8).
+        assert_eq!(recovery_horizon_for(0, Some(6), 3), 9);
+        // A deep initial_scan floor dominates a small default-address frontier (A18 shape).
+        assert_eq!(recovery_horizon_for(25, Some(1), 3), 28);
+        // Overflow-safe.
+        assert_eq!(recovery_horizon_for(u32::MAX, Some(1), 3), u32::MAX);
     }
 
     /// `z_getaddressforaccount 0 ["p2pkh"] <index>` reuses the diversifier-index argument for a
