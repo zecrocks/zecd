@@ -1,11 +1,12 @@
-//! Transparent offline-window restore: a wallet receives on a t-address and spends it, then goes
-//! away; a from-seed restore that never saw either transaction live must recover the **full
-//! receive+send pair**.
+//! Transparent offline-window restore, on **whichever backend** `ZECD_REGTEST_BACKEND` selects:
+//! a wallet receives on a t-address and spends it, then goes away; a from-seed restore that never
+//! saw either transaction live must recover the **full receive+send pair**.
 //!
-//! This is deliberately backend-agnostic, because the offline window turned out to be testing
-//! something no backend actually guarantees. Transparent *receives* ride the block scan (zebra
-//! parses full blocks; a versioned-protocol lightwalletd carries transparent data in compact
-//! blocks), so the receive half is covered. Transparent *spends* ride neither: the matcher only
+//! This is the backend-agnostic counterpart to `regtest_lwd.rs`'s offline-window leg, and it
+//! exists because that leg turned out to be testing something neither backend actually
+//! guarantees. Transparent *receives* ride the block scan on both backends (zebra parses full
+//! blocks; a versioned-protocol lightwalletd carries transparent data in compact blocks), so the
+//! receive half is covered. Transparent *spends* ride neither: the block-scan matcher only
 //! inspects outputs (`engine::owned_transparent_output`), so a spend is discovered solely when
 //! librustzcash asks zecd to check an address via `TransactionDataRequest::
 //! TransactionsInvolvingAddress`. When zecd records a UTXO itself - which is exactly what the
@@ -23,7 +24,8 @@ use std::time::{Duration, Instant};
 
 use serde_json::json;
 use zecd_regtest_harness::{
-    pick_port, resolve_node_bin, start_funded_chain, RegtestNode, Zebrad, Zecd, ZecdConfig,
+    attach_backend, pick_port, resolve_node_bin, start_funded_chain, RegtestNode, Zebrad, Zecd,
+    ZecdConfig,
 };
 
 /// 1 ZEC, in zatoshis.
@@ -57,6 +59,9 @@ async fn regtest_transparent_offline_receive_and_spend_are_restored() {
     let mut author_cfg = ZecdConfig::new(zebrad.rpc_port, pick_port().expect("rpc port"));
     author_cfg.transparent = true;
     author_cfg.privacy_policy = Some("AllowFullyTransparent".to_string());
+    let _author_backend = attach_backend(&mut author_cfg, zebrad.rpc_port)
+        .await
+        .expect("attach the author's backend");
     let author = Zecd::start(&author_cfg)
         .await
         .expect("start the authoring zecd");
@@ -179,6 +184,9 @@ async fn regtest_transparent_offline_receive_and_spend_are_restored() {
     restore_cfg.transparent = true;
     restore_cfg.restore_mnemonic = Some(mnemonic);
     restore_cfg.birthday = Some(pre_fund_height.saturating_sub(1).max(1));
+    let _restore_backend = attach_backend(&mut restore_cfg, zebrad.rpc_port)
+        .await
+        .expect("attach the restore's backend");
     let restore = Zecd::start(&restore_cfg)
         .await
         .expect("restore the wallet from seed");
@@ -224,13 +232,25 @@ async fn regtest_transparent_offline_receive_and_spend_are_restored() {
                 .and_then(|v| v.as_array().map(|a| a.len()))
                 .unwrap_or(0);
             panic!(
-                "offline receive+spend history not recovered: \
+                "offline receive+spend history not recovered on the {} backend: \
                  receive={has_receive} send={has_send} (funded address {taddr}, spend \
                  {spend_txid}). Restored balance {restore_balance} vs the authoring wallet's \
-                 {author_balance}; restore reports {unspent} unspent output(s). History: {txs}"
+                 {author_balance}; restore reports {unspent} unspent output(s). History: {txs}",
+                backend_label()
             );
         }
         tokio::time::sleep(Duration::from_secs(1)).await;
+    }
+}
+
+/// Which upstream this run exercised, for the failure message - on the lwd leg the same
+/// choreography runs against a lightwalletd, and telling the two apart matters when only one
+/// fails.
+fn backend_label() -> &'static str {
+    if zecd_regtest_harness::zecd_backend_is_lwd() {
+        "lightwalletd"
+    } else {
+        "zebra"
     }
 }
 

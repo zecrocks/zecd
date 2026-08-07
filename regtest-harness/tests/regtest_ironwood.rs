@@ -14,7 +14,8 @@
 //!     on both pools (its Orchard funding is itself an ironwood note post-NU6.3), so the
 //!     "held no ironwood beforehand" precondition could not hold there.
 //!
-//! Requires a node that accepts the `"NU6.3"` regtest activation-height key (zebrad >= 6.2.2) and
+//! Requires a node that accepts the `"NU6.3"` regtest activation-height key (zebrad >= 6.2.2), a
+//! V6-parsing lightwalletd on the light-mode leg, and
 //! `ZECD_REGTEST_NU63_HEIGHT=8` in zecd's environment - the same stack every other funded binary in
 //! this tier now uses.
 //!
@@ -26,7 +27,7 @@ use std::time::{Duration, Instant};
 
 use serde_json::json;
 use zecd_regtest_harness::{
-    pick_port, resolve_node_bin, start_funded_chain, RegtestNode, Zecd, ZecdConfig,
+    attach_backend, pick_port, resolve_node_bin, start_funded_chain, RegtestNode, Zecd, ZecdConfig,
 };
 
 /// 1 ZEC, in zatoshis.
@@ -54,7 +55,10 @@ async fn regtest_ironwood_receive_and_orchard_send() {
         .expect("bring up a funded regtest chain");
 
     // 5. zecd (ironwood compiled unconditionally) against zebra; get its unified address.
-    let cfg = ZecdConfig::new(zebrad.rpc_port, pick_port().expect("pick zecd rpc port"));
+    let mut cfg = ZecdConfig::new(zebrad.rpc_port, pick_port().expect("pick zecd rpc port"));
+    let _zecd_lwd = attach_backend(&mut cfg, zebrad.rpc_port)
+        .await
+        .expect("attach zecd backend");
     let zecd = Zecd::start(&cfg)
         .await
         .expect("start zecd against ironwood regtest zebra");
@@ -178,7 +182,7 @@ async fn regtest_ironwood_receive_and_orchard_send() {
         tokio::time::sleep(Duration::from_secs(2)).await;
     }
 
-    // 9. Orchard->Ironwood SEND. zecd now holds an ironwood (Orchard-pool V3) note. Spending it on
+    // 9. Orchard→Ironwood SEND. zecd now holds an ironwood (Orchard-pool V3) note. Spending it on
     //    this post-NU6.3 chain necessarily builds a V6 transaction whose Orchard payment + change
     //    land in the **ironwood** bundle (new Orchard V2 outputs are forbidden past NU6.3), so the
     //    send can only prove and broadcast if zecd's ironwood proof step (`create_ironwood_proof`
@@ -204,7 +208,7 @@ async fn regtest_ironwood_receive_and_orchard_send() {
         .expect("zecd at tip before the ironwood send");
     // 8b. Pin the SEND INPUT pool. The wallet's entire spendable shielded set is the single ironwood
     //     note funded above - no Orchard V2 or Sapling notes exist - so the send below can only draw
-    //     an ironwood input. Assert it explicitly, so this stays a genuine ironwood->ironwood send and
+    //     an ironwood input. Assert it explicitly, so this stays a genuine ironwood→ironwood send and
     //     would not silently degrade into an Orchard-V2 drain if the funding/routing ever regressed.
     let pre_send = zecd
         .call("listunspent", json!([0]))
@@ -283,7 +287,7 @@ async fn regtest_ironwood_receive_and_orchard_send() {
         // Change side: the wallet still holds ironwood value after the send.
         let has_ironwood = unspent.iter().any(|u| u["pool"] == "ironwood");
         // Payment side: the 0.3 note paid to `payee` (a self-owned Orchard receiver) landed as an
-        // ironwood note. This is the recipient half of the ironwood->ironwood send - the fee is drawn
+        // ironwood note. This is the recipient half of the ironwood→ironwood send - the fee is drawn
         // from the change, so the payment output is exactly 0.3 and distinct from the ~0.7 change.
         let has_ironwood_payment = unspent.iter().any(|u| {
             u["pool"] == "ironwood" && (u["amount"].as_f64().unwrap_or(0.0) - 0.3).abs() < 0.001
@@ -354,10 +358,10 @@ async fn regtest_ironwood_receive_and_orchard_send() {
         .expect("getbalance after scanning past the anchor-retention interval");
 }
 
-/// Sapling->Ironwood send: prove zecd can spend a **Sapling** note and produce an **ironwood** output
+/// Sapling→Ironwood send: prove zecd can spend a **Sapling** note and produce an **ironwood** output
 /// past NU6.3. The wallet is funded with ONLY a Sapling note (the funder pays zecd's Sapling
 /// receiver), so the send's single input pool is Sapling; paying a fresh Orchard receiver on a
-/// post-NU6.3 chain routes the output into the ironwood bundle (a Sapling->ironwood turnstile,
+/// post-NU6.3 chain routes the output into the ironwood bundle (a Sapling→ironwood turnstile,
 /// permitted under the default privacy policy). Because the wallet held no Orchard/ironwood note
 /// before the send, any ironwood note afterwards is proof the send itself minted it.
 #[tokio::test]
@@ -383,6 +387,9 @@ async fn regtest_ironwood_sapling_send() {
         vec!["sapling".into(), "orchard".into()],
         vec!["sapling".into(), "orchard".into()],
     ));
+    let _zecd_lwd = attach_backend(&mut cfg, zebrad.rpc_port)
+        .await
+        .expect("attach zecd backend");
     let zecd = Zecd::start(&cfg)
         .await
         .expect("start zecd with sapling+orchard against ironwood zebra");
@@ -452,7 +459,7 @@ async fn regtest_ironwood_sapling_send() {
         tokio::time::sleep(Duration::from_secs(2)).await;
     }
 
-    // Sapling->Ironwood send: pay a fresh Orchard receiver. The only fundable input is the Sapling
+    // Sapling→Ironwood send: pay a fresh Orchard receiver. The only fundable input is the Sapling
     // note, and the Orchard-pool output becomes an ironwood note past NU6.3.
     let payee = zecd
         .call("getnewaddress", json!(["", "orchard"]))

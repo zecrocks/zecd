@@ -22,7 +22,7 @@ use std::time::{Duration, Instant};
 
 use serde_json::json;
 use zecd_regtest_harness::{
-    pick_port, resolve_node_bin, start_funded_chain, RegtestNode, Zecd, ZecdConfig,
+    attach_backend, pick_port, resolve_node_bin, start_funded_chain, RegtestNode, Zecd, ZecdConfig,
 };
 
 const FUND_ZATOSHIS: u64 = 100_000_000; // 1 ZEC
@@ -50,6 +50,9 @@ async fn regtest_transparent_receive_and_autoshield_spend() {
     // 5. zecd with transparent receiving enabled (Orchard-only otherwise).
     let mut cfg = ZecdConfig::new(zebrad.rpc_port, pick_port().expect("pick zecd rpc port"));
     cfg.transparent = true;
+    let _zecd_lwd = attach_backend(&mut cfg, zebrad.rpc_port)
+        .await
+        .expect("attach zecd backend");
     let zecd = Zecd::start(&cfg)
         .await
         .expect("start zecd with transparent receiving");
