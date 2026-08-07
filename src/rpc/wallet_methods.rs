@@ -467,7 +467,9 @@ pub(crate) fn getwalletinfo(state: &AppState, wallet: Option<&str>) -> Result<Va
             // Mature coinbase value awaiting `z_shieldcoinbase` - a subset of `balance` that
             // no regular send can select (the same number as `getbalances.mine.coinbase`).
             "coinbase_balance": zats_to_value(info.mature_coinbase),
-            // The bound a from-seed restore recovers within: anchored on *funding*, so it does
+            // The bound a from-seed restore recovers within: `gap_limit` past the restore floor
+            // (the larger of `transparent_initial_scan` and the account default address's
+            // frontier - the exposure every restore of the seed re-derives at creation). It does
             // not move when addresses are merely issued. See the two-window note in the project docs.
             "recovery_horizon": st.transparent_recovery_horizon,
         });
@@ -498,11 +500,13 @@ pub(crate) fn getwalletinfo(state: &AppState, wallet: Option<&str>) -> Result<Va
                 // when `transparent_allow_beyond_recovery_window` is false. `lookahead_from` is
                 // `highest exposed + 1`, so that is `lookahead_from > recovery_horizon`.
                 //
-                // NB not `lookahead_through < horizon`: account creation exposes index 0, so a
-                // healthy fresh wallet already sits at `lookahead_from = 1` and its lookahead
-                // ends at `gap_limit`, which would make that comparison report false on the
-                // default happy path. The frontier, not the window's far edge, is what issuance
-                // moves.
+                // NB not `lookahead_through < horizon`: account creation exposes the default
+                // address (index 0 for about half of all seeds, higher for the rest - the
+                // horizon's restore-floor anchor accounts for it either way), so a healthy fresh
+                // wallet already sits at `lookahead_from = default index + 1` with its lookahead
+                // ending a full gap past that, which would make that comparison report false on
+                // the default happy path. The frontier, not the window's far edge, is what
+                // issuance moves.
                 if let Some(horizon) = st.transparent_recovery_horizon {
                     transparent["restorable"] = json!(from <= horizon);
                 }

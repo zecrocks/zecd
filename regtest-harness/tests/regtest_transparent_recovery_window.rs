@@ -6,7 +6,7 @@
 //!     reached, `getnewaddress "" "transparent"` returns an actionable `-4` error rather than
 //!     issuing an address that a from-seed restore could not recover; and
 //!   * the default (`= true`, warn-only): the **same** small gap keeps issuing past the limit,
-//!     handing out distinct sequential t-addresses (each logged as outside the window).
+//!     handing out distinct sequential t-addresses (warn-only once past the recovery horizon).
 //!
 //! No funding/restore is needed - this exercises the address-generation policy directly, so it
 //! needs only zebrad (for a chain tip) and zecd. Standard tier: it's the guard for the
@@ -59,15 +59,19 @@ async fn regtest_transparent_recovery_window_hard_stop_and_allow_beyond() {
         .expect("start the fail-closed zecd");
     wait_for_ready(&closed, READY_TIMEOUT).await;
 
-    // The account's default address already consumes part of the external window (index 0), so the
-    // exact number of in-window addresses `getnewaddress` can hand out is the gap limit minus what
-    // the account has already exposed. Rather than hard-code that count, keep issuing until the
-    // recovery window fills: at least one address must succeed, and within `gap_limit` calls the
-    // wallet must fail closed with the actionable -4 error (it never issues beyond the window when
+    // The account's default address already consumes part of the external window - and its index
+    // is a per-seed value (the seed's first all-receivers-valid diversifier index, 0 for only
+    // about half of seeds), which both shifts how many in-window addresses remain and anchors
+    // the recovery horizon (`gap_limit` past the default-address frontier - see
+    // `actor::recovery_horizon_for`). Rather than hard-code counts for a per-run random seed,
+    // keep issuing until the horizon fills: at least one address must succeed, and within
+    // `2 * gap_limit` calls (up to `gap_limit` in-window reservations plus up to `gap_limit`
+    // quiet beyond-window issuances under the anchored horizon) the wallet must fail closed
+    // with the actionable -4 error (it never issues beyond the horizon when
     // allow_beyond = false).
     let mut issued = 0u32;
     let mut wall = None;
-    for _ in 0..=SMALL_GAP {
+    for _ in 0..=(2 * SMALL_GAP) {
         match new_transparent(&closed).await {
             Ok(a) => {
                 assert!(a.starts_with("tm"), "bare t-addr expected, got {a}");
@@ -84,7 +88,8 @@ async fn regtest_transparent_recovery_window_hard_stop_and_allow_beyond() {
         "at least one in-window transparent address must be issued before the wall"
     );
     let err = wall.expect(
-        "getnewaddress past the gap must fail closed within the gap limit when allow_beyond = false",
+        "getnewaddress past the gap must fail closed within 2 * gap_limit calls when \
+         allow_beyond = false",
     );
     match err {
         RpcError::Rpc { code, message } => {

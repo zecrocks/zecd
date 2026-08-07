@@ -650,13 +650,10 @@ impl Funder {
         funder_init_with_retry(&bin, dir.path(), &cfg).await?;
 
         // Discard the daemon's logs unless ZECD_STDERR asks for them, exactly like `Zecd::start`
-        // (both then interleave into the test output under `--nocapture`).
-        let (out, err) = if std::env::var_os("ZECD_STDERR").is_some() {
-            (Stdio::inherit(), Stdio::inherit())
-        } else {
-            (Stdio::null(), Stdio::null())
-        };
-        let child = Command::new(&bin)
+        // (both then interleave into the test output under `--nocapture`, each line tagged with
+        // its instance so concurrent daemons stay distinguishable).
+        let (out, err) = zecd_daemon_stdio();
+        let mut child = Command::new(&bin)
             .args([
                 "--datadir",
                 dir.path().to_str().unwrap(),
@@ -667,6 +664,7 @@ impl Funder {
             .stderr(err)
             .spawn()
             .context("spawn funder zecd daemon")?;
+        forward_daemon_logs(&format!("funder:{}", cfg.rpc_port), &mut child);
 
         let mut funder = Funder {
             child,
@@ -1172,6 +1170,48 @@ pub fn zecd_bin() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("zecd"))
 }
 
+/// The stdout/stderr wiring for a zecd daemon spawn: piped when `ZECD_STDERR` asks for the
+/// daemon's logs (hand the spawned child to [`forward_daemon_logs`] to stream them), discarded
+/// otherwise. Split from the forwarding half because `Command` needs the `Stdio`s before spawn
+/// and the forwarder needs the child after.
+fn zecd_daemon_stdio() -> (Stdio, Stdio) {
+    if std::env::var_os("ZECD_STDERR").is_some() {
+        (Stdio::piped(), Stdio::piped())
+    } else {
+        (Stdio::null(), Stdio::null())
+    }
+}
+
+/// Stream a just-spawned daemon's piped stdout/stderr into the test output, prefixing every line
+/// with `[tag]` so the interleaved logs of concurrently running daemons stay attributable to one
+/// instance. Without the prefix the logs are unusable for diagnosis: the CI driver runs several
+/// test binaries at once, each with multiple zecd instances, and **every daemon logs under the
+/// same `[default]` wallet name** - a naive extraction of one wallet's lines yields an
+/// impossible interleaving (e.g. a "frontier" that appears to retreat). The RPC port is the tag
+/// of choice: unique per instance (see `pick_port`) and printed by the harness's own messages.
+///
+/// A no-op when the child's streams were not piped (`ZECD_STDERR` unset - logs discarded).
+fn forward_daemon_logs(tag: &str, child: &mut Child) {
+    let streams: [Option<Box<dyn std::io::Read + Send>>; 2] = [
+        child.stdout.take().map(|s| Box::new(s) as _),
+        child.stderr.take().map(|s| Box::new(s) as _),
+    ];
+    for stream in streams.into_iter().flatten() {
+        let tag = tag.to_string();
+        // A plain thread, not a tokio task: the reads are blocking, and the forwarder must keep
+        // draining (or the child blocks on a full pipe) even while the test's runtime is busy.
+        std::thread::spawn(move || {
+            use std::io::BufRead as _;
+            for line in std::io::BufReader::new(stream).lines() {
+                match line {
+                    Ok(l) => eprintln!("[{tag}] {l}"),
+                    Err(_) => break,
+                }
+            }
+        });
+    }
+}
+
 /// Whether the extended ("big run") regtest tier is enabled: set `ZECD_REGTEST_EXTENDED=1`.
 /// PR runs skip these tests (each spins a full zebra stack); the scheduled and
 /// manually dispatched workflow runs set the variable.
@@ -1201,6 +1241,9 @@ pub fn stress_note_count() -> usize {
 /// A running `zecd` daemon plus the HTTP client and credentials to drive it.
 pub struct Zecd {
     child: Child,
+    /// The instance's RPC port - also its log tag (see [`forward_daemon_logs`]), so a
+    /// respawn on the same datadir keeps the same discriminator.
+    rpc_port: u16,
     base_url: String,
     user: String,
     password: String,
@@ -1331,13 +1374,11 @@ impl Zecd {
         // Set ZECD_STDERR (to any value) to stream the daemon's logs into the test output
         // (use with `--nocapture`); otherwise discard them. The daemon inherits RUST_LOG from
         // the environment, so `RUST_LOG=zecd=debug,info ZECD_STDERR=1` gives a full sync/rewind
-        // trace in CI. Mirrors the ZEBRAD_STDERR hook above.
-        let (out, err) = if std::env::var_os("ZECD_STDERR").is_some() {
-            (Stdio::inherit(), Stdio::inherit())
-        } else {
-            (Stdio::null(), Stdio::null())
-        };
-        let child = Command::new(zecd_bin())
+        // trace in CI. Mirrors the ZEBRAD_STDERR hook above. Every line is prefixed with this
+        // instance's RPC port so concurrent daemons stay distinguishable (see
+        // [`forward_daemon_logs`]).
+        let (out, err) = zecd_daemon_stdio();
+        let mut child = Command::new(zecd_bin())
             .args([
                 "--datadir",
                 datadir.path().to_str().unwrap(),
@@ -1348,9 +1389,11 @@ impl Zecd {
             .stderr(err)
             .spawn()
             .context("spawn zecd daemon")?;
+        forward_daemon_logs(&format!("zecd:{}", cfg.rpc_port), &mut child);
 
         let zecd = Zecd {
             child,
+            rpc_port: cfg.rpc_port,
             base_url: format!("http://127.0.0.1:{}/", cfg.rpc_port),
             user: cfg.rpc_user.clone(),
             password: cfg.rpc_password.clone(),
@@ -1482,11 +1525,7 @@ impl Zecd {
     /// Relaunch the daemon on the kept data directory (after [`Zecd::stop_keeping_datadir`])
     /// with the same config, and wait for the RPC to come back up.
     pub async fn respawn(&mut self) -> Result<()> {
-        let (out, err) = if std::env::var_os("ZECD_STDERR").is_some() {
-            (Stdio::inherit(), Stdio::inherit())
-        } else {
-            (Stdio::null(), Stdio::null())
-        };
+        let (out, err) = zecd_daemon_stdio();
         self.child = Command::new(zecd_bin())
             .args([
                 "--datadir",
@@ -1498,6 +1537,7 @@ impl Zecd {
             .stderr(err)
             .spawn()
             .context("respawn zecd")?;
+        forward_daemon_logs(&format!("zecd:{}", self.rpc_port), &mut self.child);
         self.wait_until_rpc_up().await?;
         Ok(())
     }
@@ -1568,12 +1608,8 @@ impl Zecd {
             }
         }
 
-        let (out, err) = if std::env::var_os("ZECD_STDERR").is_some() {
-            (Stdio::inherit(), Stdio::inherit())
-        } else {
-            (Stdio::null(), Stdio::null())
-        };
-        let child = Command::new(zecd_bin())
+        let (out, err) = zecd_daemon_stdio();
+        let mut child = Command::new(zecd_bin())
             .args([
                 "--datadir",
                 self._datadir.path().to_str().unwrap(),
@@ -1584,6 +1620,7 @@ impl Zecd {
             .stderr(err)
             .spawn()
             .context("respawn zecd on the wiped data directory")?;
+        forward_daemon_logs(&format!("zecd:{}", self.rpc_port), &mut child);
         self.child = child;
         self.wait_until_rpc_up().await?;
         Ok(())
