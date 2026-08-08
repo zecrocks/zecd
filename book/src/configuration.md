@@ -146,7 +146,7 @@ per wallet in `[wallets.<name>]`. See [Addresses & shielded pools](guide/address
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
-| `enabled` | array of string | `["orchard"]` | Shielded pools the wallet receives into and spends from; supported values are `"sapling"` and `"orchard"`. Change goes to the strongest enabled pool (Orchard if enabled). Must be non-empty. |
+| `enabled` | array of string | `["orchard"]` | Shielded pools the wallet receives into and spends from; supported values are `"sapling"` and `"orchard"`. Change goes to the strongest enabled pool (Orchard if enabled). Must be non-empty. **`"ironwood"` is not a value here** and is rejected at startup: Ironwood is not something you enable. It is compiled in unconditionally and switches on by consensus height (already active on mainnet and testnet), so an `"orchard"` wallet is receiving Ironwood notes today, at the same Orchard receiver. It surfaces after the fact as `pool == "ironwood"` in balances and history. See [Addresses & shielded pools](guide/addresses.md). |
 | `default_receivers` | array of string | = `enabled` | Receivers included in the Unified Addresses `getnewaddress` hands out when no per-call override is given. Must be a subset of `enabled` (a violation is a startup error). |
 | `transparent` | bool | `false` | Allow bare transparent (`t1…`/`tm…`) receiving addresses via `getnewaddress "" "transparent"`. Off keeps zecd shielded-only (`address_type = "transparent"` is rejected with `-8`). |
 | `transparent_default` | bool | `false` | Make a bare transparent address the no-argument `getnewaddress` default. Requires `transparent = true` (validated at startup). |
