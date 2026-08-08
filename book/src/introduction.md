@@ -38,8 +38,11 @@ full node**, talking to zebrad's JSON-RPC directly:
 The default `[backend] server = "zebra"` is shorthand for `zebra://127.0.0.1:8234` on mainnet
 (`:18234` on test/regtest). Point zebrad's `rpc.listen_addr` there; Zebra ships with RPC
 disabled. zecd derives compact blocks, tree state, and mempool visibility from the node's
-RPCs itself, so there is no lightwalletd and no zaino to operate. See
-[A Zebra-only backend](design/zebra-backend.md).
+RPCs itself, so in this mode there is no lightwalletd and no zaino to operate.
+
+Since 0.6.0 that is the *default*, not the only option: `[backend] server` also accepts a
+lightwalletd gRPC endpoint, for deployments where running a full node is not practical. See
+[Chain backends](design/zebra-backend.md) for both, and the trade-off between them.
 
 **Run the node yourself.** zecd holds spend authority over real funds, and its entire view of
 the chain (balances, confirmations, incoming payments) is whatever Zebra serves it. The
@@ -55,18 +58,21 @@ default, private/LAN ranges are allowed).
   (see [Testing & conformance](testing.md)). Intentional divergences are enumerated in the
   [compatibility boundary](compatibility.md); the wire format is specified in
   [RPC conventions](rpc/index.md).
-- **Shielded-first, transparent opt-in.** The default wallet is Orchard-only; Sapling
-  receivers and transparent (t-address) receiving/spending are enabled per wallet via
-  `[pools]` config. See [Addresses & shielded pools](guide/addresses.md) and
+- **Shielded-first, transparent opt-in.** The default wallet enables the Orchard receiver
+  only; Sapling receivers and transparent (t-address) receiving/spending are enabled per
+  wallet via `[pools]` config. Note that with NU6.3 active, funds received at an Orchard
+  receiver are **Ironwood** notes: the address is unchanged, the value pool is not. See
+  [Addresses & shielded pools](guide/addresses.md) and
   [Transparent support](guide/transparent.md).
 - **Stateless and seed-recoverable.** zecd persists no off-chain state that a from-seed
   restore couldn't rebuild: there are no address labels, and `zecd init --restore` recovers
   all funds and history from the chain. Shielded funds are recoverable unconditionally;
   transparent funds within the configured gap limit / initial-scan window. See
   [Stateless & recoverable](design/statelessness.md).
-- **A single self-hosted Zebra upstream.** One local zebrad over JSON-RPC; no lightwalletd,
-  no zaino, no trusted third-party servers. See
-  [A Zebra-only backend](design/zebra-backend.md).
+- **A self-hosted Zebra upstream by default.** One local zebrad over JSON-RPC, with no zaino
+  and no trusted third-party server in the path. Since 0.6.0 a lightwalletd endpoint is
+  available as an explicit opt-in for deployments that cannot run a node; running your own
+  remains the recommendation. See [Chain backends](design/zebra-backend.md).
 - **One spending wallet, any number of watch-only wallets.** At most one loaded wallet holds
   spending keys; watch-only replicas are built from an exported Unified Full Viewing Key and
   addressed bitcoind-style at `/wallet/<name>`. See

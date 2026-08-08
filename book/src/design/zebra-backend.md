@@ -1,9 +1,16 @@
-# A Zebra-only backend
+# Chain backends
 
-zecd talks to exactly one upstream: a self-hosted [Zebra](https://github.com/ZcashFoundation/zebra)
-full node, over its stock JSON-RPC. There is no lightwalletd and no zaino in the stack. This page
-explains why, what zecd derives from the node itself, and the connection and security model of
-that one hop.
+zecd talks to exactly one upstream at a time. By default that is a self-hosted
+[Zebra](https://github.com/ZcashFoundation/zebra) full node over its stock JSON-RPC, with no
+lightwalletd and no zaino in the stack - and that remains the recommendation. Since **0.6.0** a
+lightwalletd gRPC endpoint is also accepted, for deployments where running a full node is not
+practical.
+
+This page explains why the full node is the default, what zecd derives from it, the connection
+and security model of that hop, and what changes when you point it at a light server instead.
+
+> **Version note.** The light-mode option is 0.6.x and later. The 0.5.x line is zebra-only, and
+> everything on this page except [Light mode](#light-mode) applies to it unchanged.
 
 ## Why one full node and nothing else
 
@@ -23,9 +30,9 @@ RPCs.
 
 The abstraction that keeps this a choice rather than a hard wire is the `ChainSource` trait
 (`src/chain/mod.rs`): the sync engine, reorg recovery, rebroadcast loop, and 0-conf mempool flow
-are all generic over it. `AnySource` is today a single-variant enum holding `ZebraSource`; a
-future backend (an embedded zaino service, say) is one more variant and one more impl, with no
-changes above the trait.
+are all generic over it. That design paid off in 0.6.0, when the lightwalletd backend below
+arrived as one more variant of `AnySource` and one more impl of the trait, with no changes above
+it - the wallet, the RPC surface and the recovery model are identical on either backend.
 
 ## What zecd derives from Zebra's RPC
 
@@ -163,3 +170,59 @@ allow_remote_cleartext = false
 ```
 
 The full key reference is in [configuration](../configuration.md).
+
+## Light mode
+
+*New in 0.6.0.* Pointing `[backend] server` at a lightwalletd gRPC endpoint runs zecd as a
+light client: no fully synced local node required. Every feature works, including transparent
+addresses. The wallet, the RPC surface, the privacy policy and the from-seed recovery model are
+identical - only where the compact blocks come from changes.
+
+**Full mode is still the recommendation.** A light server is a third party inside your trust
+boundary: it sees which addresses and transactions you ask about, and it is what tells you your
+balance. Choose it when running a node genuinely is not an option, not by default.
+
+### Selecting a backend
+
+The token decides the mode:
+
+| `[backend] server` | Mode | Notes |
+|---|---|---|
+| `zebra` | full | The default: a local zebrad at `127.0.0.1:8234` (`:18234` on test/regtest). |
+| `zebra://host:port` | full | A zebrad elsewhere. |
+| `zecrocks` | light | The zec.rocks public fleet (`zec.rocks:443` mainnet, `testnet.zec.rocks:443` testnet), TLS. |
+| `https://host[:port]` | light | Any lightwalletd, TLS. Port defaults to 443. |
+| `http://host:port` | light | Any lightwalletd, no TLS. Refused toward a public host unless `allow_remote_cleartext`. |
+| `host:port` | light | TLS decided by locality: plaintext toward loopback/private, TLS toward public. |
+
+### TLS
+
+`tls` forces (`"yes"`) or disables (`"no"`) it; the default `"auto"` uses the locality heuristic
+above. `tls_roots` selects the OS trust store or the embedded bundle, `tls_ca_file` adds a
+private CA, and `tls_pinned_sha256` pins the leaf certificate's fingerprint - the right answer
+for a self-signed server, since it authenticates rather than giving up on authenticating.
+`tls_insecure_skip_verify` exists and is off: it leaves the connection encrypted but
+unauthenticated, so an on-path attacker can impersonate the server.
+
+Plaintext to a globally routable host is **refused**, not warned about. What it leaks is not
+credentials but query privacy: which addresses and txids this wallet cares about, to everyone on
+the path. Override with `allow_remote_cleartext` only when the hop is secured out of band.
+
+### Transparent addresses need a capable server
+
+Transparent receives ride the ordinary block scan, which means the server has to put transparent
+data inside compact blocks. That arrived with the versioned lightwallet protocol in lightwalletd
+0.5.0. zecd probes for it at connect and **refuses to run a transparent-enabled wallet against a
+server that does not advertise it**, rather than silently never discovering those receives.
+
+No released lightwalletd populates that advertisement yet, so in practice an operator who knows
+their server serves the data asserts it with `assume_transparent_in_compact_blocks = true`.
+Asserting it wrongly reintroduces exactly the silent-loss failure the probe prevents.
+Shielded-only wallets - the default - are unaffected.
+
+### Cost: transparent spend detection
+
+Spend detection queries each funded transparent address separately. On a local node that is an
+index lookup; on a light server it is a remote round trip apiece. A wallet tracking many funded
+transparent addresses is therefore materially better served by its own zebra, and both the
+daemon and `zecd config check` say so once when the configuration looks like that.

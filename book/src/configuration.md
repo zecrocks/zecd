@@ -73,8 +73,8 @@ may run alongside it; see [Watch-only wallets](guide/watch-only.md).
 ## `[backend]`
 
 The chain upstream: a single self-hosted Zebra node's JSON-RPC. See
-[A Zebra-only backend](design/zebra-backend.md) for the deployment model and the
-cleartext-credential gate.
+[Chain backends](design/zebra-backend.md) for the deployment model, the light-mode option
+(0.6.x and later), and the cleartext-credential gate.
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
@@ -83,7 +83,19 @@ cleartext-credential gate.
 | `reconnect_base_secs` | integer | `1` | Reconnect backoff base delay (seconds); clamped to at least 1. Backoff is exponential with full jitter. |
 | `reconnect_max_secs` | integer | `60` | Reconnect backoff cap (seconds); clamped to at least `reconnect_base_secs`. |
 | `rfc1918_is_local` | bool | `true` | Treat private / non-globally-routable addresses (RFC1918, link-local, CGNAT, IPv6 ULA/link-local) as "local" for the cleartext-credential gate (the Docker/LAN norm). Set `false` for a strict loopback-only posture. |
-| `allow_remote_cleartext` | bool | `false` | Escape hatch: allow `[zebra]` credentials to travel in plaintext to a globally-routable host. Only set this when the hop is secured out-of-band (SSH/WireGuard tunnel, private overlay). |
+| `allow_remote_cleartext` | bool | `false` | Escape hatch: allow `[zebra]` credentials to travel in plaintext to a globally-routable host, and a plaintext light-mode connection to one. Only set this when the hop is secured out-of-band (SSH/WireGuard tunnel, private overlay). |
+
+The remaining keys apply only when `server` names a **lightwalletd** endpoint (0.6.x and later);
+a `zebra://` upstream ignores them. See [Chain backends](design/zebra-backend.md#light-mode).
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `tls` | string | `"auto"` | `"yes"` forces TLS, `"no"` forbids it, `"auto"` decides by locality (plaintext toward loopback/private, TLS toward public). An explicit `https://`/`http://` scheme in `server` overrides it. |
+| `tls_roots` | string | `"native"` | Which root certificates to trust: `"native"` (the OS store, and `SSL_CERT_FILE`) or `"webpki"` (the embedded Mozilla bundle). |
+| `tls_ca_file` | path | unset | PEM of a private CA to trust in addition to the roots, so a privately-issued certificate validates normally, hostname and expiry included. |
+| `tls_pinned_sha256` | array of string | `[]` | Acceptable leaf-certificate SHA-256 fingerprints. Non-empty pins the connection to those certificates. The right answer for a self-signed server: it authenticates the peer rather than giving up on authenticating it. Combined with `tls_ca_file`, the chain is validated against that CA as well. |
+| `tls_insecure_skip_verify` | bool | `false` | Accept **any** certificate: no chain, hostname, or expiry check. The connection stays encrypted but is no longer authenticated, so an on-path attacker can impersonate the server and observe every address and txid this wallet asks about. Prefer `tls_pinned_sha256`. Refused in combination with `tls_ca_file`/`tls_pinned_sha256`. |
+| `assume_transparent_in_compact_blocks` | bool | `false` | Assert that the upstream serves transparent (and Ironwood) data inside compact blocks. zecd normally reads this from the server's advertised protocol version and **refuses to run a transparent-enabled wallet** against a server that does not advertise it, since those receives would otherwise silently never appear. No released lightwalletd populates that advertisement yet, so asserting it is currently the practical path for a transparent wallet on a light upstream. Asserting it wrongly reintroduces exactly the silent-loss failure the check prevents. Shielded-only wallets never need it. |
 
 ## `[zebra]`
 

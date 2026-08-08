@@ -34,7 +34,7 @@
 
 - [Architecture](design/architecture.md)
 - [Stateless & recoverable](design/statelessness.md)
-- [A Zebra-only backend](design/zebra-backend.md)
+- [Chain backends](design/zebra-backend.md)
 - [Privacy policy](design/privacy.md)
 - [Reproducible builds](design/reproducible-builds.md)
 

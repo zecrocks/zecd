@@ -7,18 +7,24 @@ zcashd's `privacyPolicy` names map onto it, and how it is enforced.
 
 ## What a Zcash send can reveal
 
-zecd holds funds as shielded Orchard notes by default (optionally Sapling notes and, opt-in,
-transparent UTXOs; see [addresses](../guide/addresses.md) and
-[transparent support](../guide/transparent.md)). A fully shielded send within one pool reveals
-nothing about amount, sender, or recipient. Three things break that, and they are independent:
+zecd holds funds as shielded notes by default (optionally Sapling notes and, opt-in, transparent
+UTXOs; see [addresses](../guide/addresses.md) and
+[transparent support](../guide/transparent.md)). With NU6.3 active those notes are **Ironwood**
+notes, received at ordinary Orchard receivers - the address is unchanged, the value pool is not.
+Orchard V2 remains a real pool that a wallet can still hold and spend from, which is why a send
+out of it into Ironwood is a genuine pool crossing rather than a relabelling.
+
+A fully shielded send within one pool reveals nothing about amount, sender, or recipient. Three
+things break that, and they are independent:
 
 1. **A transparent recipient.** Paying a bare `t`-address forces a transparent output, which is
    a Bitcoin-style output: the recipient and the amount paid are public forever.
-2. **Crossing the Sapling and Orchard turnstile.** When value moves between shielded pools in one
+2. **Crossing a shielded turnstile.** When value moves between shielded pools in one
    transaction, the net value entering or leaving each pool is published in the transaction's
    `valueBalance` field (consensus requires it). The recipient stays hidden, but the transferred
-   amount is public. Under the default Orchard-only configuration this happens when an
-   Orchard-funded send pays a Sapling address.
+   amount is public. Sapling, Orchard and Ironwood are three distinct pools here, so this covers
+   an Ironwood-funded send paying a Sapling address, and equally a send that drains legacy
+   Orchard V2 notes into Ironwood.
 3. **Funding a send directly from transparent UTXOs.** A t-to-t send with kept-transparent change
    never touches a shielded pool: inputs, outputs, amounts, and change are all public, exactly as
    in Bitcoin.

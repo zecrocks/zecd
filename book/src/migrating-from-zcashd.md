@@ -151,7 +151,7 @@ Two seed-related cautions:
 - **You run two processes, not one.** zecd needs a self-hosted Zebra node reachable over
   local/private JSON-RPC (`zebra://…`; plaintext HTTP guarded by a cleartext-credential gate).
   Everything zecd believes about the chain comes from that node. See
-  [A Zebra-only backend](design/zebra-backend.md) and [Deployment](guide/deployment.md).
+  [Chain backends](design/zebra-backend.md) and [Deployment](guide/deployment.md).
 - **Light-client sync.** zecd derives compact blocks from the node and trial-decrypts them; it
   keeps no chain index. After a restore, an *enhancement* backlog (re-fetching full
   transactions to backfill memos and outgoing details) can keep the wallet in
