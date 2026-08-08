@@ -385,7 +385,7 @@ mod tests {
         );
 
         // ...and it really did carry the settings, rather than round-tripping empty. Note the
-        // pool list comes back in `PoolSet`'s canonical order, not the order the file wrote -
+        // pool list comes back in `ReceiverSet`'s canonical order, not the order the file wrote -
         // which is itself worth rendering, since that is the order zecd works in.
         assert!(
             first.contains("privacy_policy = \"FullPrivacy\""),

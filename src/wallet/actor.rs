@@ -53,7 +53,7 @@ use crate::chain::{
 use crate::config::SendPrivacy;
 use crate::error::{codes, RpcError};
 use crate::network::ZNetwork;
-use crate::pools::{Pool, PoolSet};
+use crate::pools::{Receiver, ReceiverSet};
 use crate::sync::engine;
 use crate::wallet::binding;
 use crate::wallet::keys::{self, SeedKeeper};
@@ -576,9 +576,9 @@ pub struct ActorConfig {
     /// pipeline_proving`). Only engages on the cached-Orchard PCZT path; off by default.
     pub pipeline_proving: bool,
     /// Shielded pools this wallet receives into and spends from (change pool selection).
-    pub enabled_pools: PoolSet,
+    pub enabled_pools: ReceiverSet,
     /// Receivers included by default in this wallet's Unified Addresses.
-    pub default_receivers: PoolSet,
+    pub default_receivers: ReceiverSet,
     /// Whether this wallet may hand out bare transparent receiving addresses.
     pub transparent_enabled: bool,
     /// Whether a no-argument `getnewaddress` returns a bare transparent address.
@@ -620,9 +620,9 @@ struct WalletActor {
     /// Cap on Orchard actions per send (`[spend] orchard_action_limit`; 0 disables it).
     orchard_action_limit: usize,
     /// Shielded pools this wallet receives into and spends from.
-    enabled_pools: PoolSet,
+    enabled_pools: ReceiverSet,
     /// Receivers included by default in this wallet's Unified Addresses.
-    default_receivers: PoolSet,
+    default_receivers: ReceiverSet,
     /// Whether this wallet may hand out bare transparent receiving addresses.
     transparent_enabled: bool,
     /// Whether a no-argument `getnewaddress` returns a bare transparent address.
@@ -3808,7 +3808,7 @@ impl WalletActor {
     /// (`request_pays_sapling_output`), because the cached path's extractor is handed no Sapling
     /// verifying key.
     fn cached_pczt_path(&self) -> bool {
-        self.orchard_keys.is_some() && !self.enabled_pools.contains(Pool::Sapling)
+        self.orchard_keys.is_some() && !self.enabled_pools.contains(Receiver::Sapling)
     }
 
     /// Whether a send should be pipelined: `[spend] pipeline_proving` on *and* the cached PCZT

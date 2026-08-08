@@ -14,7 +14,7 @@ use serde::Deserialize;
 use zcash_client_backend::data_api::wallet::ConfirmationsPolicy;
 
 use crate::network::ZNetwork;
-use crate::pools::{Pool, PoolSet};
+use crate::pools::{Receiver, ReceiverSet};
 
 /// Default chain upstream: a local zebrad's JSON-RPC ("full mode"). Public keeps the bare
 /// `zebra` shorthand as the default rather than spelling the authority out; `backend::resolve`
@@ -98,10 +98,10 @@ pub struct AppConfig {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PoolsConfig {
     /// Shielded pools the wallet receives into and spends from.
-    pub enabled: PoolSet,
+    pub enabled: ReceiverSet,
     /// Receivers included in the UAs handed out by `getnewaddress` when no per-call override is
     /// given. Always a subset of `enabled`.
-    pub default_receivers: PoolSet,
+    pub default_receivers: ReceiverSet,
     /// Whether the wallet may hand out bare transparent (`t1…`/`tm…`) receiving addresses - via
     /// `getnewaddress "" "transparent"`, and (when `transparent_default`) as the no-argument
     /// default. Off preserves zecd's shielded-only behaviour: `address_type = "transparent"` is
@@ -179,8 +179,8 @@ impl Default for PoolsConfig {
     fn default() -> Self {
         // Preserves zecd's historical behaviour: Orchard-only receiving, no transparent.
         Self {
-            enabled: PoolSet::single(Pool::Orchard),
-            default_receivers: PoolSet::single(Pool::Orchard),
+            enabled: ReceiverSet::single(Receiver::Orchard),
+            default_receivers: ReceiverSet::single(Receiver::Orchard),
             transparent_enabled: false,
             transparent_default: false,
             transparent_gap_limit: DEFAULT_TRANSPARENT_GAP_LIMIT,
@@ -261,9 +261,9 @@ pub struct WalletEntry {
     /// be mounted as a Kubernetes Secret separately from the (disposable) data directory.
     pub keys_file: Option<PathBuf>,
     /// Shielded pools this wallet receives into and spends from (resolved per wallet).
-    pub pools: PoolSet,
+    pub pools: ReceiverSet,
     /// Receivers included by default in this wallet's Unified Addresses (a subset of `pools`).
-    pub default_receivers: PoolSet,
+    pub default_receivers: ReceiverSet,
     /// Whether this wallet may hand out bare transparent receiving addresses (resolved per wallet).
     pub transparent_enabled: bool,
     /// Whether a no-argument `getnewaddress` on this wallet returns a bare transparent address.
@@ -1445,11 +1445,11 @@ fn validate_backend_tls(backend: &BackendConfig) -> anyhow::Result<()> {
 
 fn resolve_global_pools(file: Option<&PoolsFile>) -> anyhow::Result<PoolsConfig> {
     let enabled = match file.and_then(|f| f.enabled.as_deref()) {
-        Some(tokens) => PoolSet::parse(tokens).context("[pools] enabled")?,
-        None => PoolSet::single(Pool::Orchard),
+        Some(tokens) => ReceiverSet::parse(tokens).context("[pools] enabled")?,
+        None => ReceiverSet::single(Receiver::Orchard),
     };
     let default_receivers = match file.and_then(|f| f.default_receivers.as_deref()) {
-        Some(tokens) => PoolSet::parse(tokens).context("[pools] default_receivers")?,
+        Some(tokens) => ReceiverSet::parse(tokens).context("[pools] default_receivers")?,
         None => enabled.clone(),
     };
     if !default_receivers.is_subset_of(&enabled) {
@@ -1528,17 +1528,16 @@ fn resolve_wallet_pools(
     transparent_allow_beyond_recovery_window: Option<bool>,
     transparent_gap_warn_threshold: Option<u32>,
     global: &PoolsConfig,
-) -> anyhow::Result<(PoolSet, PoolSet, bool, bool, u32, u32, bool, u32)> {
+) -> anyhow::Result<(ReceiverSet, ReceiverSet, bool, bool, u32, u32, bool, u32)> {
     let enabled = match pools {
         Some(tokens) => {
-            PoolSet::parse(tokens).with_context(|| format!("[wallets.{name}] pools"))?
+            ReceiverSet::parse(tokens).with_context(|| format!("[wallets.{name}] pools"))?
         }
         None => global.enabled.clone(),
     };
     let receivers = match (default_receivers, pools) {
-        (Some(tokens), _) => {
-            PoolSet::parse(tokens).with_context(|| format!("[wallets.{name}] default_receivers"))?
-        }
+        (Some(tokens), _) => ReceiverSet::parse(tokens)
+            .with_context(|| format!("[wallets.{name}] default_receivers"))?,
         // Wallet customized its pools but not its receivers: receive into everything it enabled.
         (None, Some(_)) => enabled.clone(),
         // Wallet customized neither: inherit the global default receivers.
@@ -1591,8 +1590,8 @@ mod tests {
     fn global_pools_default_to_orchard_only() {
         let p = resolve_global_pools(None).unwrap();
         assert_eq!(p, PoolsConfig::default());
-        assert!(p.enabled.contains(Pool::Orchard));
-        assert!(!p.enabled.contains(Pool::Sapling));
+        assert!(p.enabled.contains(Receiver::Orchard));
+        assert!(!p.enabled.contains(Receiver::Sapling));
         assert_eq!(p.default_receivers, p.enabled);
     }
 
@@ -1604,7 +1603,7 @@ mod tests {
             ..Default::default()
         };
         let p = resolve_global_pools(Some(&f)).unwrap();
-        assert!(p.enabled.contains(Pool::Sapling) && p.enabled.contains(Pool::Orchard));
+        assert!(p.enabled.contains(Receiver::Sapling) && p.enabled.contains(Receiver::Orchard));
         // Receivers fall back to the full enabled set.
         assert_eq!(p.default_receivers, p.enabled);
     }
@@ -1648,8 +1647,8 @@ mod tests {
     #[test]
     fn wallet_inherits_global_when_unset() {
         let global = PoolsConfig {
-            enabled: PoolSet::parse(&s(&["sapling", "orchard"])).unwrap(),
-            default_receivers: PoolSet::single(Pool::Orchard),
+            enabled: ReceiverSet::parse(&s(&["sapling", "orchard"])).unwrap(),
+            default_receivers: ReceiverSet::single(Receiver::Orchard),
             transparent_enabled: false,
             transparent_default: false,
             transparent_gap_limit: DEFAULT_TRANSPARENT_GAP_LIMIT,
@@ -1682,7 +1681,7 @@ mod tests {
             &global,
         )
         .unwrap();
-        assert!(enabled.contains(Pool::Sapling) && !enabled.contains(Pool::Orchard));
+        assert!(enabled.contains(Receiver::Sapling) && !enabled.contains(Receiver::Orchard));
         assert_eq!(receivers, enabled);
     }
 

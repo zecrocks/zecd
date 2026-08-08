@@ -163,7 +163,7 @@ impl WalletStore {
         // `init` always records a birthday; this fallback only fires for a hand-edited
         // `keys.toml` missing the field. Default to Orchard activation (NU5) - an Orchard-only
         // wallet (zecd's default) can hold no notes before it - rather than the older, slower
-        // Sapling-activation default. (Pool-aware resolution lives in `init`, which knows the
+        // Sapling-activation default. (Receiver-aware resolution lives in `init`, which knows the
         // wallet's enabled pools; this layer does not.)
         let birthday = encoding.birthday.map(BlockHeight::from).unwrap_or_else(|| {
             network

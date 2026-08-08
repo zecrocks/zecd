@@ -40,7 +40,7 @@ use zip32::DiversifierIndex;
 
 use crate::config::{AppConfig, DeriveAddressArgs, WalletEntry};
 use crate::network::ZNetwork;
-use crate::pools::PoolSet;
+use crate::pools::ReceiverSet;
 use crate::wallet::store::WalletStore;
 use crate::wallet::ReceiverRequest;
 
@@ -70,7 +70,7 @@ impl KeySource {
 /// shielded receiver set.
 enum Receivers {
     Transparent,
-    Shielded(PoolSet),
+    Shielded(ReceiverSet),
 }
 
 impl Receivers {
@@ -370,7 +370,7 @@ fn address_at(
         .map_err(|e| {
             let hint = match receivers {
                 Receivers::Transparent => " (a transparent receiver requires an index below 2^31)",
-                Receivers::Shielded(set) if set.contains(crate::pools::Pool::Sapling) => {
+                Receivers::Shielded(set) if set.contains(crate::pools::Receiver::Sapling) => {
                     " (about half of all diversifier indexes are invalid for Sapling; try \
                      another index, or --address-type orchard)"
                 }
@@ -450,7 +450,7 @@ impl Report<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::pools::Pool;
+    use crate::pools::Receiver;
 
     // The committed testnet development mnemonic (valueless TAZ only). Used here
     // purely as a fixed key source, so the expected addresses below are stable constants.
@@ -465,7 +465,7 @@ mod tests {
     }
 
     fn orchard() -> Receivers {
-        Receivers::Shielded(PoolSet::single(Pool::Orchard))
+        Receivers::Shielded(ReceiverSet::single(Receiver::Orchard))
     }
 
     /// The whole point of the command: the same phrase always yields the same addresses, with no
@@ -542,8 +542,8 @@ mod tests {
         let mut entry = WalletEntry {
             dir: std::path::PathBuf::from("/nonexistent"),
             keys_file: None,
-            pools: PoolSet::single(Pool::Orchard),
-            default_receivers: PoolSet::single(Pool::Orchard),
+            pools: ReceiverSet::single(Receiver::Orchard),
+            default_receivers: ReceiverSet::single(Receiver::Orchard),
             transparent_enabled: false,
             transparent_default: false,
             transparent_gap_limit: 20,

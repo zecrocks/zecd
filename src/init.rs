@@ -21,7 +21,7 @@ use crate::backend;
 use crate::chain::ChainSource as _;
 use crate::config::{AppConfig, ExportUfvkArgs, InitArgs, RescanArgs, WalletEntry};
 use crate::network::ZNetwork;
-use crate::pools::{Pool, PoolSet};
+use crate::pools::{Receiver, ReceiverSet};
 use crate::wallet::keys;
 use crate::wallet::open;
 use crate::wallet::store::{Passphrase, WalletStore};
@@ -32,8 +32,8 @@ use crate::wallet::store::{Passphrase, WalletStore};
 /// starts there - much faster than the old Sapling-activation default while never missing an
 /// Orchard note. A Sapling-enabled wallet must start at Sapling activation, where it could
 /// first hold notes.
-fn restore_birthday_default(network: ZNetwork, pools: &PoolSet) -> (u32, &'static str) {
-    let (upgrade, label) = if pools.contains(Pool::Sapling) {
+fn restore_birthday_default(network: ZNetwork, pools: &ReceiverSet) -> (u32, &'static str) {
+    let (upgrade, label) = if pools.contains(Receiver::Sapling) {
         (NetworkUpgrade::Sapling, "Sapling")
     } else {
         (NetworkUpgrade::Nu5, "Orchard (NU5)")
@@ -723,10 +723,11 @@ mod tests {
 
     #[test]
     fn restore_birthday_default_is_pool_aware() {
-        use crate::pools::{Pool, PoolSet};
+        use crate::pools::{Receiver, ReceiverSet};
         // Orchard-only (the default): scan from NU5/Orchard activation - no Orchard note can
         // predate it.
-        let (h, label) = restore_birthday_default(ZNetwork::Main, &PoolSet::single(Pool::Orchard));
+        let (h, label) =
+            restore_birthday_default(ZNetwork::Main, &ReceiverSet::single(Receiver::Orchard));
         assert!(label.contains("Orchard"), "{label}");
         assert_eq!(
             h,
@@ -738,7 +739,7 @@ mod tests {
         );
         // Sapling enabled: scan from the earlier Sapling activation, where a Sapling note could
         // first exist (defaulting to NU5 would silently skip pre-NU5 Sapling funds).
-        let sap = PoolSet::parse(&["sapling".to_string(), "orchard".to_string()]).unwrap();
+        let sap = ReceiverSet::parse(&["sapling".to_string(), "orchard".to_string()]).unwrap();
         let (hs, label_s) = restore_birthday_default(ZNetwork::Main, &sap);
         assert_eq!(label_s, "Sapling");
         assert_eq!(
@@ -773,8 +774,8 @@ mod tests {
     use crate::network;
 
     /// The Orchard-only pool set these tests use (pool config is irrelevant to them).
-    fn orchard_pools() -> crate::pools::PoolSet {
-        crate::pools::PoolSet::single(crate::pools::Pool::Orchard)
+    fn orchard_pools() -> crate::pools::ReceiverSet {
+        crate::pools::ReceiverSet::single(crate::pools::Receiver::Orchard)
     }
 
     /// The committed testnet test mnemonic (valueless), reused here purely as a deterministic

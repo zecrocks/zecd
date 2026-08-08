@@ -874,7 +874,7 @@ pub fn list_unspent(network: ZNetwork, wallet_dir: &Path) -> anyhow::Result<Vec<
     // All shielded pools zecd supports; a note only exists if the wallet received it, so querying
     // every pool is safe regardless of which pools are enabled in config.
     #[allow(unused_mut)]
-    let mut protocols: Vec<ShieldedPool> = crate::pools::Pool::SUPPORTED
+    let mut protocols: Vec<ShieldedPool> = crate::pools::Receiver::SUPPORTED
         .iter()
         .filter_map(|p| p.shielded_protocol())
         .collect();
@@ -883,7 +883,7 @@ pub fn list_unspent(network: ZNetwork, wallet_dir: &Path) -> anyhow::Result<Vec<
     // `SpendableNotes::ironwood()`, *not* folded into `orchard()`. `select_unspent_notes` only
     // queries a pool when it appears in `sources`, so an ironwood receive is invisible to
     // `listunspent` unless we ask for it here (and read `notes.ironwood()` below). It is not a
-    // `Pool::SUPPORTED` member (ironwood has no UA receiver - see `pools.rs`), so add it explicitly.
+    // `Receiver::SUPPORTED` member (ironwood has no UA receiver - see `pools.rs`), so add it explicitly.
     // Harmless pre-NU6.3: the ironwood note table is simply empty on mainnet / pre-activation testnet.
     protocols.push(ShieldedPool::Ironwood);
     for account in db.get_account_ids()? {

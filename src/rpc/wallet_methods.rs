@@ -99,7 +99,7 @@ pub(crate) async fn getnewaddress(
 pub(crate) fn parse_receiver_tokens(
     address_type: Option<&str>,
 ) -> Result<ReceiverRequest, RpcError> {
-    use crate::pools::{Pool, PoolSet};
+    use crate::pools::{Receiver, ReceiverSet};
     let Some(raw) = address_type.map(str::trim).filter(|s| !s.is_empty()) else {
         return Ok(ReceiverRequest::Default);
     };
@@ -113,7 +113,7 @@ pub(crate) fn parse_receiver_tokens(
     let mut pools = Vec::new();
     for token in raw.split(',') {
         let token = token.trim();
-        let pool = Pool::from_config_str(token).map_err(|_| {
+        let pool = Receiver::from_config_str(token).map_err(|_| {
             RpcError::invalid_address_or_key(format!("Unknown address type '{token}'"))
         })?;
         if pool.is_transparent() {
@@ -124,7 +124,7 @@ pub(crate) fn parse_receiver_tokens(
         }
         pools.push(pool);
     }
-    let set = PoolSet::new(pools)
+    let set = ReceiverSet::new(pools)
         .map_err(|e| RpcError::invalid_address_or_key(format!("Invalid address type: {e}")))?;
     Ok(ReceiverRequest::Shielded(set))
 }
@@ -219,7 +219,7 @@ fn parse_receiver_types_array(
     v: Option<&Value>,
     handle: &WalletHandle,
 ) -> Result<ReceiverRequest, RpcError> {
-    use crate::pools::{Pool, PoolSet};
+    use crate::pools::{Receiver, ReceiverSet};
     let arr = match v {
         None | Some(Value::Null) => return Ok(ReceiverRequest::Default),
         Some(Value::Array(a)) => a,
@@ -241,10 +241,10 @@ fn parse_receiver_types_array(
         // zcashd names the transparent receiver "p2pkh"; accept zecd's own "transparent" spelling
         // (the `getnewaddress` address_type token) as a synonym.
         if s.eq_ignore_ascii_case("p2pkh") {
-            pools.push(Pool::Transparent);
+            pools.push(Receiver::Transparent);
             continue;
         }
-        match Pool::from_config_str(s) {
+        match Receiver::from_config_str(s) {
             Ok(p) => pools.push(p),
             Err(_) => invalid.push(s.to_string()),
         }
@@ -278,7 +278,7 @@ fn parse_receiver_types_array(
         }
         return Ok(ReceiverRequest::Transparent);
     }
-    let set = PoolSet::new(pools)
+    let set = ReceiverSet::new(pools)
         .map_err(|e| RpcError::invalid_parameter(format!("invalid receiver_types: {e}")))?;
     if !set.is_subset_of(&handle.enabled_pools) {
         return Err(RpcError::invalid_parameter(format!(
@@ -2327,7 +2327,7 @@ pub(crate) async fn walletlock(state: &AppState, wallet: Option<&str>) -> Result
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::pools::Pool;
+    use crate::pools::Receiver;
     use crate::wallet::read::{TxOutputRecord, TxRecord};
 
     // History-display tests use fake recipient strings that don't decode as Zcash addresses,
@@ -2336,7 +2336,7 @@ mod tests {
     const NET: crate::network::ZNetwork = crate::network::ZNetwork::Test;
 
     /// Extract the shielded set from a [`ReceiverRequest`], or panic (test helper).
-    fn shielded_set(r: ReceiverRequest) -> crate::pools::PoolSet {
+    fn shielded_set(r: ReceiverRequest) -> crate::pools::ReceiverSet {
         match r {
             ReceiverRequest::Shielded(s) => s,
             _ => panic!("expected a shielded receiver request"),
@@ -2377,14 +2377,14 @@ mod tests {
     #[test]
     fn receiver_tokens_single_and_list() {
         let one = shielded_set(parse_receiver_tokens(Some("sapling")).unwrap());
-        assert!(one.contains(Pool::Sapling) && !one.contains(Pool::Orchard));
+        assert!(one.contains(Receiver::Sapling) && !one.contains(Receiver::Orchard));
 
         let both = shielded_set(parse_receiver_tokens(Some("sapling,orchard")).unwrap());
-        assert!(both.contains(Pool::Sapling) && both.contains(Pool::Orchard));
+        assert!(both.contains(Receiver::Sapling) && both.contains(Receiver::Orchard));
 
         // Whitespace around list members is tolerated.
         let spaced = shielded_set(parse_receiver_tokens(Some(" orchard , sapling ")).unwrap());
-        assert!(spaced.contains(Pool::Sapling) && spaced.contains(Pool::Orchard));
+        assert!(spaced.contains(Receiver::Sapling) && spaced.contains(Receiver::Orchard));
     }
 
     #[test]
@@ -2400,7 +2400,7 @@ mod tests {
     /// consults (no actor, no DB - see [`WalletHandle::for_test`]).
     fn handle_with_pools(
         transparent_enabled: bool,
-        enabled: crate::pools::PoolSet,
+        enabled: crate::pools::ReceiverSet,
     ) -> WalletHandle {
         let mut h = WalletHandle::for_test("default", NET, SyncStatus::default());
         h.enabled_pools = enabled.clone();
@@ -2415,7 +2415,7 @@ mod tests {
     #[test]
     fn receiver_types_array_transparent() {
         use crate::error::codes::RPC_INVALID_PARAMETER;
-        let enabled = crate::pools::PoolSet::single(Pool::Orchard);
+        let enabled = crate::pools::ReceiverSet::single(Receiver::Orchard);
         let t_wallet = handle_with_pools(true, enabled.clone());
 
         // "p2pkh" - and zecd's own "transparent" spelling - alone request a bare t-address.
@@ -2455,7 +2455,7 @@ mod tests {
     #[test]
     fn receiver_types_array_shielded() {
         use crate::error::codes::RPC_INVALID_PARAMETER;
-        let wallet = handle_with_pools(false, crate::pools::PoolSet::single(Pool::Orchard));
+        let wallet = handle_with_pools(false, crate::pools::ReceiverSet::single(Receiver::Orchard));
 
         for omitted in [None, Some(json!(null)), Some(json!([]))] {
             let parsed = parse_receiver_types_array(omitted.as_ref(), &wallet).unwrap();
@@ -2464,7 +2464,7 @@ mod tests {
 
         let set =
             shielded_set(parse_receiver_types_array(Some(&json!(["orchard"])), &wallet).unwrap());
-        assert!(set.contains(Pool::Orchard));
+        assert!(set.contains(Receiver::Orchard));
 
         // Sapling is a valid pool but not enabled on this wallet.
         let err = parse_receiver_types_array(Some(&json!(["sapling"])), &wallet).unwrap_err();
@@ -2485,7 +2485,7 @@ mod tests {
     #[test]
     fn requested_receivers_must_be_subset_of_enabled() {
         // The enablement check (a `-8`) is what getnewaddress applies once it has the handle.
-        let enabled = crate::pools::PoolSet::single(Pool::Orchard);
+        let enabled = crate::pools::ReceiverSet::single(Receiver::Orchard);
         let requested = shielded_set(parse_receiver_tokens(Some("sapling")).unwrap());
         assert!(!requested.is_subset_of(&enabled));
         let ok = shielded_set(parse_receiver_tokens(Some("orchard")).unwrap());

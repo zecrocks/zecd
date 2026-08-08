@@ -30,8 +30,8 @@ use crate::config::SendPrivacy;
 use crate::error::RpcError;
 use crate::network::ZNetwork;
 #[cfg(test)]
-use crate::pools::Pool;
-use crate::pools::PoolSet;
+use crate::pools::Receiver;
+use crate::pools::ReceiverSet;
 use crate::wallet::store::Passphrase;
 
 /// Transient, in-memory first-seen wall-clock times for **unmined** wallet transactions, keyed
@@ -167,7 +167,7 @@ pub enum ReceiverRequest {
     /// `default_receivers`.
     Default,
     /// An explicit shielded receiver set (already validated as a subset of the enabled pools).
-    Shielded(PoolSet),
+    Shielded(ReceiverSet),
     /// A bare transparent (`t1…`/`tm…`) address. Only valid when the wallet enables transparent
     /// receiving (checked at the RPC layer and re-checked by the actor).
     Transparent,
@@ -311,9 +311,9 @@ pub struct WalletHandle {
     pub confirmations: ConfirmationsPolicy,
     /// Shielded pools enabled on this wallet - used to validate a `getnewaddress` per-call
     /// receiver override before dispatching it to the actor.
-    pub enabled_pools: PoolSet,
+    pub enabled_pools: ReceiverSet,
     /// Receivers this wallet's Unified Addresses include by default (a subset of `enabled_pools`).
-    pub default_receivers: PoolSet,
+    pub default_receivers: ReceiverSet,
     /// Whether this wallet may hand out bare transparent receiving addresses - gates a
     /// `getnewaddress "" "transparent"` request (`-8` when off).
     pub transparent_enabled: bool,
@@ -375,8 +375,8 @@ impl WalletHandle {
             dir: PathBuf::new(),
             network,
             confirmations: ConfirmationsPolicy::default(),
-            enabled_pools: PoolSet::single(Pool::Orchard),
-            default_receivers: PoolSet::single(Pool::Orchard),
+            enabled_pools: ReceiverSet::single(Receiver::Orchard),
+            default_receivers: ReceiverSet::single(Receiver::Orchard),
             first_seen: Arc::new(Mutex::new(HashMap::new())),
             transparent_enabled: false,
             transparent_default: false,
@@ -601,8 +601,8 @@ pub(crate) fn make_handle(
     dir: PathBuf,
     network: ZNetwork,
     confirmations: ConfirmationsPolicy,
-    enabled_pools: PoolSet,
-    default_receivers: PoolSet,
+    enabled_pools: ReceiverSet,
+    default_receivers: ReceiverSet,
     transparent_enabled: bool,
     transparent_default: bool,
     transparent_gap_limit: u32,
@@ -635,7 +635,7 @@ mod tests {
 
     use secrecy::SecretVec;
 
-    use crate::pools::Pool;
+    use crate::pools::Receiver;
 
     fn handle_with_seed(seed: Option<SharedSeed>) -> (WalletHandle, mpsc::Receiver<WalletCommand>) {
         let (cmd_tx, cmd_rx) = mpsc::channel(4);
@@ -647,8 +647,8 @@ mod tests {
             PathBuf::from("/nonexistent"),
             crate::network::regtest(),
             ConfirmationsPolicy::default(),
-            PoolSet::single(Pool::Orchard),
-            PoolSet::single(Pool::Orchard),
+            ReceiverSet::single(Receiver::Orchard),
+            ReceiverSet::single(Receiver::Orchard),
             false,
             false,
             20,
