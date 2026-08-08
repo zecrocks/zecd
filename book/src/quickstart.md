@@ -34,11 +34,17 @@ Two port families are in play: 8234/18234 are **Zebra's** RPC (what zecd dials),
 are **zecd's own** RPC defaults (what your clients dial), mirroring bitcoind's 8332/18332
 convention.
 
-## Build from source
+## Install
 
-zecd is not yet published on crates.io. Build from source, use the
-[release tarballs / `.deb` packages](guide/deployment.md), or use the
-[Docker stack](#docker-compose-quickstart) below.
+Four ways to get a binary, in rough order of convenience:
+
+```sh
+cargo install zecd                  # from crates.io
+```
+
+The [release tarballs and `.deb` packages](guide/deployment.md) are prebuilt, reproducible
+static binaries for amd64 and arm64, and the [Docker stack](#docker-compose-quickstart) below
+brings up zecd and Zebra together. To build from source:
 
 ```sh
 git clone https://github.com/zecrocks/zecd && cd zecd
@@ -46,7 +52,11 @@ cargo build --release --bin zecd
 ```
 
 Always use `--release`: a debug build takes more than 20 seconds to prove a single shielded
-send.
+send. The same applies to `cargo install`, which builds in release mode by default.
+
+**Release candidates are opt-in.** `cargo install zecd` resolves to the newest *stable* release,
+so a pre-release has to be asked for by name (`cargo install zecd --version 0.6.0-rc3`). The
+same holds for a dependency: a `zecd = "0.6"` requirement will not pick up a `-rc`.
 
 ## Initialize a wallet
 
