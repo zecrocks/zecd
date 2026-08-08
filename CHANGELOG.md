@@ -5,6 +5,44 @@ All notable changes to zecd are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com), and this
 project adheres to [Semantic Versioning](https://semver.org).
 
+## [0.6.0] - 2026-08-08
+
+The 0.6.0 line, released as `0.6.0-rc1` through `0.6.0-rc3`. Everything below is relative to
+0.5.2; the release-candidate sections that follow are kept for history. Two changes land here
+that were not in any candidate, both listed under Changed and neither behavioural.
+
+A feature release: an optional lightwalletd backend, four additions to the RPC surface, two new
+offline subcommands, and a faster start. No existing response shape or default changes, so
+upgrading from 0.5.2 is a drop-in for a full-node deployment.
+
+Two things to read before deploying. Release artifacts are **named differently** from 0.5.x,
+which matters to anything that downloads them by filename. And the librustzcash wallet crates
+this release depends on are still **published as release candidates** upstream: the NU6.3 line
+has no finals yet, and the newest stable versions predate ironwood entirely, so there is nothing
+to move to. That is a deliberate choice, not an oversight, and it is unchanged from every release
+since 0.5.0-rc3.
+
+### Added
+- An optional **lightwalletd backend**. `[backend] server` accepts a lightwalletd gRPC endpoint as well as a local zebrad, so zecd can run without a fully synced full node; the full node remains the default and the recommendation. The token selects the mode: `zebra` and `zebra://host:port` are full mode, while `https://host[:port]`, `http://host:port`, a bare `host:port` and the `zecrocks` preset are light mode. Every feature works on both, including transparent addresses.
+- TLS controls for a light upstream: `tls`, `tls_roots`, `tls_ca_file`, `tls_pinned_sha256` and `tls_insecure_skip_verify`. Plaintext to a globally routable host is refused unless `allow_remote_cleartext` is set, because what it leaks is which addresses the wallet is asking about. `assume_transparent_in_compact_blocks` lets an operator assert a server serves transparent and Ironwood data in compact blocks, which a transparent-enabled wallet requires.
+- `z_waitforoperation "opid" ( timeout )` blocks until an async operation finishes and returns its status object, so a caller writes two calls instead of a poll-sleep loop. Timing out is not an error, and a `finished` flag distinguishes the two outcomes.
+- `waitfornewblock`, `waitforblock` and `waitforblockheight`, matching Bitcoin Core. All three block on the wallet's fully-scanned height rather than the chain tip, which is the answer to "has the wallet caught up to N?". Polling a balance instead is wrong: the mempool credits a payment at zero confirmations, so a balance is satisfied before the confirming block is scanned.
+- `z_getaddressforaccount` derives a transparent address at an explicit BIP 44 child index, and `getaddressinfo` on an own transparent address reports `hdkeypath`, `ischange` and an `address_index` extension. Together these close the loop for reconciling an issued transparent range against the chain.
+- `zecd derive-address` derives addresses with no network, no wallet database, no daemon and no datadir lock, so it runs beside a live one. Key material comes from an initialized wallet's account UFVK, a mnemonic, or a bare UFVK.
+- `zecd config check` resolves a config with the exact binary about to be deployed and exits non-zero if that build would refuse it, without starting the daemon or writing anything. `zecd config show` prints the effective configuration as round-trippable TOML, with secrets emitted as commented-out key names.
+
+### Changed
+- The Orchard proving key builds in the background instead of before the daemon binds its listeners. Startup previously spent seconds of CPU, much more on a small machine, unreachable and not syncing, to produce a key only sends need. Startup probes sized around the old behaviour can be tightened.
+- Release artifacts use one architecture token per target, so a listing reads `zecd-<version>-linux-amd64.tar.gz` next to `zecd_<version>_amd64.deb` rather than mixing Debian names with Rust target triples, and the per-file `.sha256` sidecars are replaced by a single `SHA256SUMS`. **The 0.5.x line deliberately keeps the old names**, so this is the release where filename-based tooling needs updating.
+- Every top-level CLI flag is global, so it is accepted on either side of the subcommand.
+- The librustzcash line moves to `zcash_client_backend 0.24.0-rc.7`, `zcash_client_sqlite 0.22.0-rc.8`, `pczt 0.9.3` and `orchard 0.15.5`. Opening a wallet created on an older pin migrates it forward on first start.
+- *New since rc3:* the example config no longer promises a future `ironwood` pool under `[pools]`. It was never going to arrive, and a unit test already rejects `enabled = ["ironwood"]`. The replacement keeps the two senses of the word apart: ironwood is a value pool, with its own bundle and its own `valueBalance`, but it has no receiver, and that key selects receivers. This file is embedded in the binary and printed by `zecd example-config`, so the wrong version shipped to operators in every 0.6.0 candidate.
+- *New since rc3:* the internal `Pool` type is renamed `Receiver`, which is what it models. No config key, RPC field or behaviour changes: `[pools]` is still `[pools]`, and the `pool` field in `listunspent` and `z_listtransactions` still reports `ironwood`.
+
+### Fixed
+- `getwalletinfo.transparent.restorable` no longer reports `false` for a from-seed restore that has issued no addresses. The reported recovery horizon assumed a floor of 0, so any seed whose default-address index exceeded the gap limit was described as beyond its own recovery window. Only the reported horizon was wrong: the exposure is re-derived identically by every restore of a seed, so two restores always agreed and no funds were at risk.
+- A wallet that meets an unrecoverable reorg halts instead of retrying forever. Where no note-commitment-tree checkpoint below the conflict has a scanned block, every truncation target is refused and no retry can succeed; the wallet kept trying, re-establishing the upstream connection each time, which reads in the log like a flaky node. It now halts, says so once, and keeps serving reads until an operator rebuilds with `zecd rescan`.
+
 ## [0.6.0-rc3] - 2026-08-07
 
 Three fixes and a dependency bump on top of `0.6.0-rc2`. The lightwalletd backend itself is
@@ -348,6 +386,7 @@ Zcash, backed entirely by librustzcash and running as a light client.
 ### Security
 - Pre-release audit hardening; refuse to start on mainnet with the placeholder RPC password; enforce a 12-character passphrase minimum.
 
+[0.6.0]: https://github.com/zecrocks/zecd/compare/v0.5.2...v0.6.0
 [0.6.0-rc3]: https://github.com/zecrocks/zecd/compare/v0.6.0-rc2...v0.6.0-rc3
 [0.6.0-rc2]: https://github.com/zecrocks/zecd/compare/v0.6.0-rc1...v0.6.0-rc2
 [0.6.0-rc1]: https://github.com/zecrocks/zecd/compare/v0.5.2...v0.6.0-rc1
