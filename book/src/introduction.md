@@ -5,9 +5,10 @@ zecd is a shielded-first Zcash wallet server that speaks Bitcoin Core's JSON-RPC
 ## What zecd is
 
 zecd is a wallet daemon for Zcash built on [librustzcash](https://github.com/zcash/librustzcash):
-shielded-first (Orchard by default, with opt-in Sapling receivers and opt-in transparent
-t-address support), exposed through **bitcoind's RPC dialect**: the same method names, response
-shapes, JSON-RPC 1.0 envelope, HTTP Basic/cookie auth, and error codes as Bitcoin Core. An
+shielded-first (Ironwood by default, at the wallet's Orchard receiver, with opt-in Sapling
+receivers and opt-in transparent t-address support), exposed through **bitcoind's RPC dialect**:
+the same method names, response shapes, JSON-RPC 1.0 envelope, HTTP Basic/cookie auth, and error
+codes as Bitcoin Core. An
 integration that drives a coin purely through Bitcoin RPC (`getnewaddress`, poll
 `listtransactions`/`gettransaction`/`getbalance`, `sendtoaddress`) works against zecd with
 little or no change, and existing Bitcoin RPC client libraries (e.g. `python-bitcoinrpc`)
@@ -58,10 +59,11 @@ default, private/LAN ranges are allowed).
   (see [Testing & conformance](testing.md)). Intentional divergences are enumerated in the
   [compatibility boundary](compatibility.md); the wire format is specified in
   [RPC conventions](rpc/index.md).
-- **Shielded-first, transparent opt-in.** The default wallet enables the Orchard receiver
-  only; Sapling receivers and transparent (t-address) receiving/spending are enabled per
-  wallet via `[pools]` config. Note that with NU6.3 active, funds received at an Orchard
-  receiver are **Ironwood** notes: the address is unchanged, the value pool is not. See
+- **Shielded-first, transparent opt-in.** A default wallet holds **Ironwood** notes, received
+  at its Orchard receiver: NU6.3 changed the value pool, not the address, which is why
+  `[pools]` still names `orchard`. Sapling receivers and transparent (t-address)
+  receiving/spending are enabled per wallet via `[pools]` config. Legacy Orchard V2 notes
+  remain spendable, and moving them into Ironwood is a real pool crossing. See
   [Addresses & shielded pools](guide/addresses.md) and
   [Transparent support](guide/transparent.md).
 - **Stateless and seed-recoverable.** zecd persists no off-chain state that a from-seed
