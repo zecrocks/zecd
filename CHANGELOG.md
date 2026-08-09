@@ -5,6 +5,33 @@ All notable changes to zecd are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com), and this
 project adheres to [Semantic Versioning](https://semver.org).
 
+## [0.5.3] - 2026-08-09
+
+The 0.5.3 line, released as `0.5.3-rc1` and `0.5.3-rc2`. Everything below is relative to 0.5.2;
+the release-candidate sections that follow are kept for history. Two changes land here that were
+not in either candidate, both marked below.
+
+This line deliberately does **not** carry the lightwalletd backend or the renamed release
+artifacts that 0.6.0 introduces. A 0.5.x deployment keeps its zebra-only posture, and anything
+that downloads release assets by filename keeps working. If you want light mode, move to 0.6.x.
+
+### Added
+- `z_waitforoperation "opid" ( timeout )` blocks until an async operation finishes and returns its status object, so a caller writes two calls instead of a poll-sleep loop. Timing out is not an error, and a `finished` flag distinguishes the two outcomes.
+- `waitfornewblock`, `waitforblock` and `waitforblockheight`, matching Bitcoin Core. All three block on the wallet's fully-scanned height rather than the chain tip, which is the answer to "has the wallet caught up to N?". Polling a balance instead is wrong: the mempool credits a payment at zero confirmations, so a balance is satisfied before the confirming block is scanned.
+- `z_getaddressforaccount` derives a transparent address at an explicit BIP 44 child index, and `getaddressinfo` on an own transparent address reports `hdkeypath`, `ischange` and an `address_index` extension. Together these close the loop for reconciling an issued transparent range against the chain.
+- `zecd derive-address` derives addresses with no network, no wallet database, no daemon and no datadir lock, so it runs beside a live one. Key material comes from an initialized wallet's account UFVK, a mnemonic, or a bare UFVK.
+- `zecd config check` resolves a config with the exact binary about to be deployed and exits non-zero if that build would refuse it, without starting the daemon or writing anything. `zecd config show` prints the effective configuration as round-trippable TOML, with secrets emitted as commented-out key names.
+
+### Changed
+- The Orchard proving key builds in the background instead of before the daemon binds its listeners. Startup previously spent seconds of CPU, much more on a small machine, unreachable and not syncing, to produce a key only sends need. Startup probes sized around the old behaviour can be tightened.
+- Every top-level CLI flag is global, so it is accepted on either side of the subcommand.
+- The librustzcash wallet crates move to `zcash_client_backend 0.24.0-rc.7` and `zcash_client_sqlite 0.22.0-rc.7`. Opening an existing wallet runs an additive schema migration on first start.
+- *New since rc2:* the example config no longer promises a future `ironwood` pool under `[pools]`. It was never going to arrive, and a unit test already rejects `enabled = ["ironwood"]`. The replacement keeps the two senses of the word apart: ironwood is a value pool, but it has no receiver, and that key selects receivers. This file is embedded in the binary and printed by `zecd example-config`, so the wrong version shipped in both candidates.
+
+### Fixed
+- `getwalletinfo.transparent.restorable` no longer reports `false` for a from-seed restore that has issued no addresses. The reported recovery horizon assumed a floor of 0, so any seed whose default-address index exceeded the gap limit was described as beyond its own recovery window. Only the reported horizon was wrong: the exposure is re-derived identically by every restore of a seed, so two restores always agreed and no funds were at risk.
+- *New since rc2:* a wallet that meets an unrecoverable reorg halts instead of retrying forever. Where no note-commitment-tree checkpoint below the conflict has a scanned block, every truncation target is refused and no retry can succeed; the wallet nonetheless kept trying, dropping and re-establishing the upstream connection each time, which reads in the log like a flaky node rather than a wallet that needs rebuilding. It now halts, says so once, and keeps serving commands and reads until an operator rebuilds the database with `zecd rescan`. No other failure class is treated as terminal.
+
 ## [0.5.3-rc2] - 2026-08-07
 
 One fix on top of `0.5.3-rc1`: the transparent recovery horizon is now anchored correctly, so a
@@ -333,6 +360,7 @@ Zcash, backed entirely by librustzcash and running as a light client.
 ### Security
 - Pre-release audit hardening; refuse to start on mainnet with the placeholder RPC password; enforce a 12-character passphrase minimum.
 
+[0.5.3]: https://github.com/zecrocks/zecd/compare/v0.5.2...v0.5.3
 [0.5.3-rc2]: https://github.com/zecrocks/zecd/compare/v0.5.3-rc1...v0.5.3-rc2
 [0.5.3-rc1]: https://github.com/zecrocks/zecd/compare/v0.5.2...v0.5.3-rc1
 [0.5.2]: https://github.com/zecrocks/zecd/compare/v0.5.1...v0.5.2
