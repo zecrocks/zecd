@@ -481,16 +481,17 @@ impl Default for SpendConfig {
 pub const DEFAULT_ORCHARD_ACTION_LIMIT: usize = 50;
 
 /// `[spend] privacy_policy` - Zallet/zcashd's privacy-policy idea (zcash/zcash#6240) reduced to
-/// the two points that matter for a shielded-only wallet that can hold both Sapling and Orchard
-/// notes: whether a send may include a transparent recipient, and whether it may cross between
-/// shielded pools. Crossing pools (Sapling↔Orchard) reveals the transferred amount on-chain via
-/// `valueBalance`; a transparent recipient additionally reveals the recipient. zcashd/Zallet
-/// require an explicit `AllowRevealed*` opt-in for either, and this knob is zecd's equivalent.
-/// The two leaks are independent, so the policy is a three-rung ladder, not a boolean:
-/// `FullPrivacy` (neither), `AllowRevealedAmounts` (cross-pool only), `AllowRevealedRecipients`
-/// (both). zcashd's stricter-sender policies (`AllowRevealedSenders` and weaker) have no analog
-/// here - zecd spends only shielded Orchard notes, so it has no transparent sender to reveal -
-/// and `z_sendmany` maps them onto `AllowRevealedRecipients`.
+/// the leaks a zecd send can actually cause: whether a send may cross between shielded pools
+/// (Sapling↔Orchard, revealing the transferred amount on-chain via `valueBalance`), whether it
+/// may include a transparent recipient (additionally revealing the recipient), whether it may be
+/// *funded* from the wallet's transparent UTXOs (revealing the sender's addresses and input
+/// amounts - `z_sendmany`'s transparent `fromaddress`/`ANY_TADDR` coin control), and whether the
+/// change of such a send may stay transparent (a fully transparent spend). zcashd/Zallet require
+/// an explicit `AllowRevealed*` opt-in for each, and this knob is zecd's equivalent: a five-rung
+/// ladder - `FullPrivacy` < `AllowRevealedAmounts` < `AllowRevealedRecipients` <
+/// `AllowRevealedSenders` < `AllowFullyTransparent`. Unlike zcashd's policy lattice the ladder is
+/// linear, so each rung implies everything below it (`AllowRevealedSenders` here permits
+/// transparent recipients too, where zcashd keeps senders and recipients orthogonal).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SendPrivacy {
     /// Only fully-shielded transactions confined to a **single** shielded value pool: no
@@ -508,11 +509,20 @@ pub enum SendPrivacy {
     /// "send to any valid address". A transparent recipient is paid from shielded notes, so the
     /// *sender* side stays shielded; the wallet's leftover change also stays shielded.
     AllowRevealedRecipients,
+    /// Additionally permits funding a send from the wallet's received transparent (t-address)
+    /// UTXOs - `z_sendmany` with a transparent `fromaddress` or `ANY_TADDR` - which reveals the
+    /// sender's addresses and input amounts on-chain. The change of such a send is **shielded**
+    /// (it goes to the wallet's shielded change pool), so a send from a t-address to a shielded
+    /// recipient under this rung is the t->z *shielding* send. Kept-transparent change (a fully
+    /// transparent spend) still requires `AllowFullyTransparent`. Mirrors zcashd's
+    /// `AllowRevealedSenders`, except zecd's linear ladder means this rung also permits
+    /// transparent recipients (paid from shielded notes when the source is shielded).
+    AllowRevealedSenders,
     /// Additionally permits a **fully transparent** spend: funding a send directly from the
     /// wallet's received transparent (t-address) UTXOs, with the change kept transparent - the
     /// most revealing send possible (amount, sender UTXOs, recipient, and change are all public,
-    /// and never touch a shielded pool). Strictly opt-in; this is the only policy under which zecd
-    /// spends transparent inputs without first shielding them. Mirrors zcashd/Zallet
+    /// and never touch a shielded pool). Strictly opt-in; this is the only policy under which
+    /// transparent change is possible. Mirrors zcashd/Zallet
     /// `AllowFullyTransparent`/`NoPrivacy`.
     AllowFullyTransparent,
 }
@@ -523,25 +533,40 @@ impl SendPrivacy {
             "FullPrivacy" => Ok(Self::FullPrivacy),
             "AllowRevealedAmounts" => Ok(Self::AllowRevealedAmounts),
             "AllowRevealedRecipients" => Ok(Self::AllowRevealedRecipients),
+            "AllowRevealedSenders" => Ok(Self::AllowRevealedSenders),
             "AllowFullyTransparent" => Ok(Self::AllowFullyTransparent),
             other => anyhow::bail!(
                 "[spend] privacy_policy must be \"FullPrivacy\", \"AllowRevealedAmounts\", \
-                 \"AllowRevealedRecipients\", or \"AllowFullyTransparent\" (got \"{other}\")"
+                 \"AllowRevealedRecipients\", \"AllowRevealedSenders\", or \
+                 \"AllowFullyTransparent\" (got \"{other}\")"
             ),
         }
     }
 
-    /// recipient and the amount on-chain. `AllowRevealedRecipients` (pay a transparent recipient
-    /// from shielded notes) and the strictly-more-permissive `AllowFullyTransparent` (additionally
-    /// fund it from transparent UTXOs with kept-transparent change) both do; `FullPrivacy` and
-    /// `AllowRevealedAmounts` reject a transparent recipient (the latter opts into revealed
-    /// *amounts* only). Omitting `AllowFullyTransparent` here would make the fully-transparent send
-    /// path unreachable - the `build_payment` pre-check would `-8`-reject the recipient before the
-    /// t->t spend could run.
+    /// recipient and the amount on-chain. `AllowRevealedRecipients` and every rung above it
+    /// (`AllowRevealedSenders`, `AllowFullyTransparent` - the ladder is linear, each rung implies
+    /// the ones below) permit a transparent recipient; `FullPrivacy` and `AllowRevealedAmounts`
+    /// reject one (the latter opts into revealed *amounts* only). Omitting `AllowFullyTransparent`
+    /// here would make the fully-transparent send path unreachable - the `build_payment` pre-check
+    /// would `-8`-reject the recipient before the t->t spend could run.
     pub fn allows_transparent_recipient(self) -> bool {
         matches!(
             self,
-            Self::AllowRevealedRecipients | Self::AllowFullyTransparent
+            Self::AllowRevealedRecipients
+                | Self::AllowRevealedSenders
+                | Self::AllowFullyTransparent
+        )
+    }
+
+    /// Whether a send under this policy may be *funded* from the wallet's transparent UTXOs
+    /// (`z_sendmany` with a transparent `fromaddress`/`ANY_TADDR`), revealing the sender's
+    /// addresses and input amounts on-chain. This is the gate for spending transparent inputs at
+    /// all; the kept-transparent-change t->t path additionally requires `AllowFullyTransparent`
+    /// (under `AllowRevealedSenders` the change of a transparent-funded send is shielded).
+    pub fn allows_transparent_inputs(self) -> bool {
+        matches!(
+            self,
+            Self::AllowRevealedSenders | Self::AllowFullyTransparent
         )
     }
 
@@ -551,6 +576,7 @@ impl SendPrivacy {
             Self::FullPrivacy => "FullPrivacy",
             Self::AllowRevealedAmounts => "AllowRevealedAmounts",
             Self::AllowRevealedRecipients => "AllowRevealedRecipients",
+            Self::AllowRevealedSenders => "AllowRevealedSenders",
             Self::AllowFullyTransparent => "AllowFullyTransparent",
         }
     }
@@ -1940,6 +1966,10 @@ mod tests {
             SendPrivacy::AllowRevealedRecipients
         );
         assert_eq!(
+            SendPrivacy::parse("AllowRevealedSenders").unwrap(),
+            SendPrivacy::AllowRevealedSenders
+        );
+        assert_eq!(
             SendPrivacy::parse("AllowFullyTransparent").unwrap(),
             SendPrivacy::AllowFullyTransparent
         );
@@ -1947,19 +1977,32 @@ mod tests {
         // AllowFullyTransparent at the RPC layer but is not a canonical config token), are a
         // startup error, never a silent default.
         assert!(SendPrivacy::parse("NoPrivacy").is_err());
-        assert!(SendPrivacy::parse("AllowRevealedSenders").is_err());
+        assert!(SendPrivacy::parse("AllowLinkingAccountAddresses").is_err());
         assert!(SendPrivacy::parse("fullprivacy").is_err());
     }
 
     #[test]
     fn allows_transparent_recipient_ladder() {
-        // The two upper rungs permit a transparent recipient; the two private rungs reject it.
+        // The three upper rungs permit a transparent recipient; the two private rungs reject it.
         // Regression guard: `AllowFullyTransparent` (top rung) must be included, or `build_payment`
         // rejects the very t->t sends the policy exists to allow.
         assert!(!SendPrivacy::FullPrivacy.allows_transparent_recipient());
         assert!(!SendPrivacy::AllowRevealedAmounts.allows_transparent_recipient());
         assert!(SendPrivacy::AllowRevealedRecipients.allows_transparent_recipient());
+        assert!(SendPrivacy::AllowRevealedSenders.allows_transparent_recipient());
         assert!(SendPrivacy::AllowFullyTransparent.allows_transparent_recipient());
+    }
+
+    #[test]
+    fn allows_transparent_inputs_ladder() {
+        // Only the two top rungs permit funding a send from transparent UTXOs (revealing the
+        // sender). The default (`AllowRevealedRecipients`) must stay false: spending transparent
+        // inputs is strictly opt-in via config or a per-call `privacyPolicy`.
+        assert!(!SendPrivacy::FullPrivacy.allows_transparent_inputs());
+        assert!(!SendPrivacy::AllowRevealedAmounts.allows_transparent_inputs());
+        assert!(!SendPrivacy::AllowRevealedRecipients.allows_transparent_inputs());
+        assert!(SendPrivacy::AllowRevealedSenders.allows_transparent_inputs());
+        assert!(SendPrivacy::AllowFullyTransparent.allows_transparent_inputs());
     }
 
     #[test]

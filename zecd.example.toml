@@ -260,9 +260,11 @@ default_receivers = ["orchard"]
 #
 # Transparent (t-address) receiving. OFF by default - zecd stays shielded-only. When enabled,
 # `getnewaddress "" "transparent"` hands out a bare transparent address (t1.../tm...), funds
-# received there are detected via the node's address index, and they become spendable by
-# auto-shielding them into a shielded send (the change shields to the change pool). Note: a send
-# that draws on transparent inputs is NOT permitted under [spend] privacy_policy = "FullPrivacy".
+# received there are discovered by the block scan (and at 0-conf via the mempool), and they are
+# spent explicitly through z_sendmany's fromaddress: a t-address (or ANY_TADDR) as the source
+# shields them into the change pool when paying a shielded recipient (requires [spend]
+# privacy_policy = "AllowRevealedSenders" or the per-call privacyPolicy), or spends them t->t
+# with kept-transparent change under "AllowFullyTransparent" (see [spend] below).
 #   transparent = true            # allow getnewaddress "" "transparent"
 #   transparent_default = true    # make a bare t-address the no-argument getnewaddress default
 #                                 #   (implies transparent = true)
@@ -338,8 +340,9 @@ rebroadcast_secs = 60
 trusted_confirmations = 3
 # Confirmations before third-party payments are spendable (must be >= trusted_confirmations).
 untrusted_confirmations = 10
-# What sends may reveal on-chain (zcashd/Zallet's privacy-policy opt-in, zcash/zcash#6240). The
-# two leaks are independent, so this is a three-rung ladder from most to least private:
+# What sends may reveal on-chain (zcashd/Zallet's privacy-policy opt-in, zcash/zcash#6240). A
+# five-rung ladder from most to least private; unlike zcashd's policy lattice it is linear, so
+# each rung also permits everything the rungs above it forbid:
 #   "FullPrivacy" - only fully-shielded sends confined to a single shielded pool: no transparent
 #       recipients, and no Sapling<->Orchard crossing. Anything that would reveal an amount or a
 #       recipient is rejected with -8.
@@ -347,10 +350,17 @@ untrusted_confirmations = 10
 #       amount on-chain via valueBalance) but still reject transparent recipients (which would
 #       additionally reveal the recipient) with -8.
 #   "AllowRevealedRecipients" (default) - additionally allow transparent recipients; such a send
-#       reveals both the amount and the recipient.
-# z_sendmany's per-call privacyPolicy accepts these plus zcashd's stricter-sender names
-# (AllowRevealedSenders and weaker), which have no analog for a source-less wallet and map onto
-# AllowRevealedRecipients.
+#       reveals both the amount and the recipient (and is paid from shielded notes).
+#   "AllowRevealedSenders" - additionally allow funding a send from the wallet's transparent
+#       UTXOs (z_sendmany with a t-address or ANY_TADDR fromaddress), which reveals the sender's
+#       addresses and input amounts; the change is shielded. With a shielded recipient this is
+#       the t->z shielding send. A transparent source without this rung is -4.
+#   "AllowFullyTransparent" - additionally allow the fully transparent t->t send: transparent
+#       inputs, a transparent recipient, and kept-transparent change (never touching a shielded
+#       pool) - the most revealing send possible.
+# z_sendmany's per-call privacyPolicy accepts these plus zcashd's AllowLinkingAccountAddresses
+# (maps onto AllowRevealedSenders - zecd is single-account, so there is nothing extra to link)
+# and NoPrivacy (maps onto AllowFullyTransparent).
 privacy_policy = "AllowRevealedRecipients"
 # Cap on the number of Orchard actions (max of Orchard inputs vs. Orchard outputs) a single
 # send may build, mirroring Zallet's [builder.limits] orchard_actions. It bounds the memory and

@@ -191,6 +191,30 @@ pub struct DerivedAddress {
     pub receiver_types: Vec<&'static str>,
 }
 
+/// The funding source for a send - input-side coin control, resolved from `z_sendmany`'s
+/// `fromaddress`. One source per send: transparent UTXOs and shielded notes are never mixed in
+/// one transaction, so a shortfall on the named source is `-6` rather than a silent top-up from
+/// the other pool.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SendSource {
+    /// No source named (`sendtoaddress`/`sendmany`, which have no `fromaddress`): shielded notes
+    /// fund the send. One legacy exception: under `AllowFullyTransparent` with all-transparent
+    /// recipients, the fully-transparent t->t branch still engages (the pre-`SendSource`
+    /// behaviour of the Bitcoin-dialect sends, pinned by the t2t regtests).
+    Unspecified,
+    /// An explicitly shielded source (`z_sendmany` from a UA / shielded address): the account's
+    /// shielded notes only - never transparent UTXOs, whatever the policy. Per-address shielded
+    /// coin control is not supported (notes are account-scoped): the account is the source, and
+    /// the address only names it.
+    Shielded,
+    /// Fund the send from the wallet's non-coinbase transparent UTXOs (`z_sendmany` from a
+    /// wallet-owned t-address, or `ANY_TADDR`). `None` = any of the account's transparent
+    /// receivers (`ANY_TADDR`); `Some(addr)` = only that address's UTXOs. Requires
+    /// `AllowRevealedSenders` (or `AllowFullyTransparent`); with a shielded recipient this is
+    /// the t->z shielding send (change shields either way, except on the t->t path).
+    Transparent(Option<TransparentAddress>),
+}
+
 /// The source-address selector for `z_shieldcoinbase` (zcashd's `fromaddress` argument).
 #[derive(Clone, Debug)]
 pub enum ShieldCoinbaseFrom {
@@ -245,6 +269,9 @@ pub enum WalletCommand {
         /// Privacy policy for this send; `FullPrivacy` is enforced on the built proposal
         /// (no transparent component, no cross-pool turnstile).
         privacy: SendPrivacy,
+        /// Funding source (`z_sendmany`'s `fromaddress`): shielded notes, or transparent UTXOs
+        /// (requires `privacy.allows_transparent_inputs()`, re-checked on the actor).
+        source: SendSource,
         reply: oneshot::Sender<Result<TxId, RpcError>>,
     },
     /// Fetch the raw bytes of a transaction (from the wallet, else lightwalletd).
@@ -451,16 +478,20 @@ impl WalletHandle {
     /// confirmations policy for this send's note selection (`z_sendmany`'s `minconf`); `None`
     /// uses the configured policy, as the synchronous `sendtoaddress`/`sendmany` do. `privacy`
     /// is the resolved send privacy policy (`FullPrivacy` enforced on the built proposal).
+    /// `source` is the funding source resolved from `z_sendmany`'s `fromaddress`
+    /// (`SendSource::Unspecified` for the Bitcoin-dialect sends, which have none).
     pub async fn send(
         &self,
         request: TransactionRequest,
         confirmations: Option<ConfirmationsPolicy>,
         privacy: SendPrivacy,
+        source: SendSource,
     ) -> Result<TxId, RpcError> {
         self.dispatch(|reply| WalletCommand::Send {
             request,
             confirmations,
             privacy,
+            source,
             reply,
         })
         .await

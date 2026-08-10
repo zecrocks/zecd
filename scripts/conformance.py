@@ -793,11 +793,43 @@ def main() -> int:
     except JSONRPCException as e:
         ck("z_sendmany no args -> code -1", e.code == -1, e.code)
     try:
-        # ANY_TADDR is unsupported (zecd has no transparent source) -> -5.
+        # A transparent funding source (ANY_TADDR / a t-address fromaddress) requires the
+        # AllowRevealedSenders rung; the daemon under test runs the default policy
+        # (AllowRevealedRecipients), so this is a synchronous -4, zcashd's code for it.
         rpc.call("z_sendmany", "ANY_TADDR", [{"address": addr, "amount": "0.1"}])
-        ck("z_sendmany ANY_TADDR raises", False)
+        ck("z_sendmany ANY_TADDR default policy raises", False)
     except JSONRPCException as e:
-        ck("z_sendmany ANY_TADDR -> code -5", e.code == -5, e.code)
+        ck("z_sendmany ANY_TADDR default policy -> code -4", e.code == -4, e.code)
+        ck("z_sendmany ANY_TADDR default policy names the gate",
+           "Insufficient privacy policy" in str(e), str(e))
+    try:
+        # The privacy gate fires before recipient checks under FullPrivacy too.
+        rpc.call("z_sendmany", "ANY_TADDR", [{"address": addr, "amount": "0.1"}],
+                 1, None, "FullPrivacy")
+        ck("z_sendmany ANY_TADDR FullPrivacy raises", False)
+    except JSONRPCException as e:
+        ck("z_sendmany ANY_TADDR FullPrivacy -> code -4", e.code == -4, e.code)
+    # Under AllowRevealedSenders the gate passes and an operation is spawned; the amount is far
+    # above any transparent balance the wallet under test could hold, so the operation fails
+    # async with -6 (insufficient funds) - or -13 if the wallet happens to be locked - and no
+    # money can move.
+    opid = rpc.call("z_sendmany", "ANY_TADDR", [{"address": addr, "amount": "100.0"}],
+                    1, None, "AllowRevealedSenders")
+    ck("z_sendmany ANY_TADDR AllowRevealedSenders -> opid", opid.startswith("opid-"), opid)
+    st = rpc.call("z_waitforoperation", opid, 60)
+    ck("z_sendmany ANY_TADDR op finished", st.get("finished") is True, st)
+    ck("z_sendmany ANY_TADDR op failed -6/-13 (no transparent funds)",
+       st.get("status") == "failed"
+       and st.get("error", {}).get("code") in (-6, -13), st)
+    # A shielded fromaddress under AllowRevealedSenders spawns too (the policy name is a real
+    # rung now, not collapsed onto AllowRevealedRecipients); same guaranteed async failure.
+    opid = rpc.call("z_sendmany", addr, [{"address": addr, "amount": "100.0"}],
+                    1, None, "AllowRevealedSenders")
+    ck("z_sendmany shielded from AllowRevealedSenders -> opid", opid.startswith("opid-"), opid)
+    st = rpc.call("z_waitforoperation", opid, 60)
+    ck("z_sendmany shielded from AllowRevealedSenders op failed -6/-13",
+       st.get("finished") is True
+       and st.get("error", {}).get("code") in (-6, -13), st)
     try:
         rpc.call("z_sendmany", addr, "notarray")
         ck("z_sendmany non-array amounts raises", False)

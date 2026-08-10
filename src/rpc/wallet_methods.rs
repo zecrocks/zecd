@@ -17,7 +17,7 @@ use crate::operations::{ContextInfo, OperationId};
 use crate::server::jsonrpc::RpcRequest;
 use crate::state::AppState;
 use crate::wallet::store::Passphrase;
-use crate::wallet::{read, ReceiverRequest, SyncStatus, WalletHandle};
+use crate::wallet::{read, ReceiverRequest, SendSource, SyncStatus, WalletHandle};
 
 pub(crate) fn opt_str(req: &RpcRequest, i: usize) -> Option<String> {
     req.param(i).and_then(|v| v.as_str()).map(|s| s.to_string())
@@ -1679,7 +1679,12 @@ pub(crate) async fn sendtoaddress(
     let request = TransactionRequest::new(vec![payment])
         .map_err(|e| RpcError::wallet(format!("invalid payment request: {e}")))?;
     let txid = handle
-        .send(request, None, state.config.spend.privacy)
+        .send(
+            request,
+            None,
+            state.config.spend.privacy,
+            SendSource::Unspecified,
+        )
         .await?;
     Ok(send_result(txid.to_string(), verbose))
 }
@@ -1738,33 +1743,38 @@ pub(crate) async fn sendmany(
     let request = TransactionRequest::new(payments)
         .map_err(|e| RpcError::wallet(format!("invalid payment request: {e}")))?;
     let txid = handle
-        .send(request, None, state.config.spend.privacy)
+        .send(
+            request,
+            None,
+            state.config.spend.privacy,
+            SendSource::Unspecified,
+        )
         .await?;
     Ok(send_result(txid.to_string(), verbose))
 }
 
 // ---- Asynchronous operations (zcashd-style `z_sendmany` + `z_getoperation*`) ----
 
-/// Map a zcashd `privacyPolicy` string onto zecd's [`SendPrivacy`] ladder. zecd spends shielded
-/// Orchard notes (and, opt-in, transparent UTXOs), so the leaks it can act on are whether the send
-/// crosses the Sapling↔Orchard turnstile (revealing the *amount*), whether it pays a transparent
-/// recipient (additionally revealing the *recipient*), and whether it may be funded directly from
-/// transparent UTXOs with kept-transparent change (a fully transparent spend). These map onto four
-/// rungs: `FullPrivacy` (neither shielded leak), `AllowRevealedAmounts` (cross-pool only),
-/// `AllowRevealedRecipients` (both shielded leaks), and `AllowFullyTransparent`/`NoPrivacy` (the
-/// two most-permissive policies, the only ones that also permit a transparent-funded spend).
-/// zcashd's stricter-sender policies (`AllowRevealedSenders` and weaker) differ only in sender-side
-/// leakage, which has no analog here (zecd has no transparent source to reveal), so they collapse
-/// onto `AllowRevealedRecipients`. Omitted or `LegacyCompat` fall back to the wallet's configured
-/// `[spend] privacy_policy`; an unknown value is `-8`.
+/// Map a zcashd `privacyPolicy` string onto zecd's [`SendPrivacy`] ladder. The leaks a zecd send
+/// can cause map onto five rungs: `FullPrivacy` (no leak), `AllowRevealedAmounts` (the
+/// Sapling↔Orchard turnstile, revealing the *amount*), `AllowRevealedRecipients` (additionally a
+/// transparent *recipient*), `AllowRevealedSenders` (additionally funding the send from
+/// transparent UTXOs - `z_sendmany`'s transparent `fromaddress` - revealing the *sender*, with
+/// the change shielded), and `AllowFullyTransparent`/`NoPrivacy` (additionally kept-transparent
+/// change - a fully transparent spend). zcashd's `AllowLinkingAccountAddresses` implies revealed
+/// senders and additionally permits linking a *multi-account* wallet's addresses; zecd is
+/// single-account, so there is nothing extra to link and it maps onto `AllowRevealedSenders`.
+/// Omitted or `LegacyCompat` fall back to the wallet's configured `[spend] privacy_policy`; an
+/// unknown value is `-8`.
 fn privacy_from_policy(s: Option<&str>, default: SendPrivacy) -> Result<SendPrivacy, RpcError> {
     match s {
         None | Some("LegacyCompat") => Ok(default),
         Some("FullPrivacy") => Ok(SendPrivacy::FullPrivacy),
         Some("AllowRevealedAmounts") => Ok(SendPrivacy::AllowRevealedAmounts),
-        Some("AllowRevealedRecipients")
-        | Some("AllowRevealedSenders")
-        | Some("AllowLinkingAccountAddresses") => Ok(SendPrivacy::AllowRevealedRecipients),
+        Some("AllowRevealedRecipients") => Ok(SendPrivacy::AllowRevealedRecipients),
+        Some("AllowRevealedSenders") | Some("AllowLinkingAccountAddresses") => {
+            Ok(SendPrivacy::AllowRevealedSenders)
+        }
         // The two most-permissive zcashd policies are the only ones that permit funding a send
         // from transparent UTXOs with kept-transparent change (a fully transparent spend).
         Some("AllowFullyTransparent") | Some("NoPrivacy") => Ok(SendPrivacy::AllowFullyTransparent),
@@ -1797,11 +1807,14 @@ fn parse_opid_filter(req: &RpcRequest, i: usize) -> Result<Option<Vec<OperationI
 }
 
 /// `z_sendmany "<fromaddress>" [{"address":..,"amount":..,"memo":..}, ..] (minconf) (fee) (privacyPolicy)`
-/// zcashd's asynchronous shielded send. Returns an operation id (`opid-...`) immediately; the
+/// zcashd's asynchronous send. Returns an operation id (`opid-...`) immediately; the
 /// transaction is proposed, proved, and broadcast on a background task whose status/result are
-/// fetched with `z_getoperationstatus`/`z_getoperationresult`. zecd spends from its single
-/// Orchard account, so `fromaddress` must be one of this wallet's own addresses. Fees are
-/// ZIP-317 (an explicit `fee` is `-8`); `minconf` overrides note-selection depth for this send.
+/// fetched with `z_getoperationstatus`/`z_getoperationresult`. `fromaddress` must be one of this
+/// wallet's own addresses (or `ANY_TADDR`) and selects the funding source: a shielded/unified
+/// address spends the account's shielded notes, while a t-address (or `ANY_TADDR`) spends the
+/// wallet's transparent UTXOs - requiring privacyPolicy `AllowRevealedSenders` or weaker - which
+/// with a shielded recipient is the t->z *shielding* send (change shields). Fees are ZIP-317 (an
+/// explicit `fee` is `-8`); `minconf` overrides input-selection depth for this send.
 pub(crate) fn z_sendmany(
     state: &AppState,
     wallet: Option<&str>,
@@ -1809,31 +1822,36 @@ pub(crate) fn z_sendmany(
 ) -> Result<Value, RpcError> {
     let handle = state.registry.get(wallet)?.clone();
 
-    // fromaddress (arg 0): reject ANY_TADDR (zecd has no transparent source to select) and
-    // validate that the address belongs to this wallet's account, mirroring Zallet's
-    // `get_account_for_address`.
+    // fromaddress (arg 0): the send's funding source (input-side coin control, zcashd
+    // semantics). `ANY_TADDR` selects any of the wallet's transparent UTXOs; a wallet-owned
+    // t-address selects only that address's UTXOs; a shielded/unified address selects the
+    // account's shielded notes (per-address shielded coin control is not supported - notes are
+    // account-scoped, so the address only names the account). Anything else is validated as
+    // wallet-owned, mirroring Zallet's `get_account_for_address`.
     let fromaddress = req.require_str(0, "z_sendmany requires a fromaddress")?;
-    if fromaddress == "ANY_TADDR" {
-        return Err(RpcError::invalid_address_or_key(
-            "Invalid from address: ANY_TADDR is not supported (zecd spends from its Orchard \
-             account)",
-        ));
-    }
-    if crate::address::decode_on_network(&handle.network, fromaddress).is_none() {
-        return Err(RpcError::invalid_address_or_key(
-            "Invalid from address: should be a taddr, zaddr, or unified address",
-        ));
-    }
-    if let read::UaReceivers::Inconsistent(why) =
-        read::classify_unified_receivers(handle.network, &handle.dir, fromaddress)
-    {
-        return Err(RpcError::invalid_address_or_key(why));
-    }
-    if !read::is_mine(handle.network, &handle.dir, fromaddress) {
-        return Err(RpcError::invalid_address_or_key(
-            "Invalid from address, no payment source found for address.",
-        ));
-    }
+    let source = if fromaddress == "ANY_TADDR" {
+        SendSource::Transparent(None)
+    } else {
+        let Some(decoded) = crate::address::decode_on_network(&handle.network, fromaddress) else {
+            return Err(RpcError::invalid_address_or_key(
+                "Invalid from address: should be a taddr, zaddr, or unified address",
+            ));
+        };
+        if let read::UaReceivers::Inconsistent(why) =
+            read::classify_unified_receivers(handle.network, &handle.dir, fromaddress)
+        {
+            return Err(RpcError::invalid_address_or_key(why));
+        }
+        if !read::is_mine(handle.network, &handle.dir, fromaddress) {
+            return Err(RpcError::invalid_address_or_key(
+                "Invalid from address, no payment source found for address.",
+            ));
+        }
+        match decoded {
+            zcash_keys::address::Address::Transparent(t) => SendSource::Transparent(Some(t)),
+            _ => SendSource::Shielded,
+        }
+    };
 
     // amounts (arg 1): a non-empty array of {address, amount, memo?} objects (zcashd's shape,
     // not Bitcoin Core's `{addr: amount}` map).
@@ -1860,12 +1878,21 @@ pub(crate) fn z_sendmany(
         state.config.spend.privacy,
     )?;
 
+    // A transparent funding source spends transparent UTXOs, revealing the sender's addresses
+    // and input amounts on-chain - zcashd gates that behind `AllowRevealedSenders`, and so does
+    // zecd. Rejected synchronously (zcashd surfaces it from the async operation; front-loading
+    // the cheap check is friendlier) with the same `-4` the actor's authoritative re-check uses.
+    if matches!(source, SendSource::Transparent(_)) && !privacy.allows_transparent_inputs() {
+        return Err(crate::wallet::actor::insufficient_privacy_for_transparent_sender(privacy));
+    }
+
     // minconf (arg 2): honored - mapped onto a per-call symmetric confirmations policy
     // (default = the wallet's configured policy when omitted).
     let policy = minconf_policy(req.param(2), handle.confirmations)?;
 
     // Build the payments, rejecting unknown keys and duplicate recipients (zcashd does both).
     let mut seen = BTreeSet::new();
+    let mut has_transparent_recipient = false;
     let mut payments = Vec::with_capacity(outputs.len());
     for out in outputs {
         let obj = out
@@ -1897,6 +1924,8 @@ pub(crate) fn z_sendmany(
             )));
         }
         // z_sendmany permits a zero-valued output (zcashd's memo-only-send pattern).
+        has_transparent_recipient |= crate::address::decode_on_network(&handle.network, addr)
+            .is_some_and(|a| !crate::address::has_shielded_receiver(&a));
         payments.push(build_payment(
             &handle.network,
             privacy,
@@ -1905,6 +1934,18 @@ pub(crate) fn z_sendmany(
             memo,
             true,
         )?);
+    }
+
+    // Transparent inputs plus a transparent recipient is a *fully transparent* transaction,
+    // which needs the top rung even though `AllowRevealedSenders` permits each side separately
+    // (zcashd's split of the two; the actor re-checks). Note the recipient may be one of a
+    // mixed set - the all-transparent case would take the t->t path, but a mixed one would
+    // otherwise slip onto the proposal path.
+    if matches!(source, SendSource::Transparent(_))
+        && has_transparent_recipient
+        && privacy != SendPrivacy::AllowFullyTransparent
+    {
+        return Err(crate::wallet::actor::insufficient_privacy_for_fully_transparent());
     }
 
     let request = TransactionRequest::new(payments)
@@ -1928,7 +1969,9 @@ pub(crate) fn z_sendmany(
     let opid = state
         .operations
         .try_insert(&handle.name, Some(context), async move {
-            let txid = send_handle.send(request, Some(policy), privacy).await?;
+            let txid = send_handle
+                .send(request, Some(policy), privacy, source)
+                .await?;
             Ok::<Value, RpcError>(json!({ "txid": txid.to_string() }))
         })?;
     Ok(Value::String(opid))
@@ -2578,16 +2621,18 @@ mod tests {
             privacy_from_policy(Some("AllowRevealedAmounts"), FullPrivacy).unwrap(),
             AllowRevealedAmounts
         );
-        // The stricter-sender zcashd policies have no analog for a source-less wallet, so they
-        // map onto AllowRevealedRecipients (the most a zecd send can reveal).
-        for p in [
-            "AllowRevealedRecipients",
-            "AllowRevealedSenders",
-            "AllowLinkingAccountAddresses",
-        ] {
+        // AllowRevealedRecipients is its own rung: it must NOT imply transparent inputs.
+        assert_eq!(
+            privacy_from_policy(Some("AllowRevealedRecipients"), FullPrivacy).unwrap(),
+            AllowRevealedRecipients
+        );
+        // AllowRevealedSenders is a real rung (it gates transparent-funded sends - z_sendmany's
+        // transparent fromaddress). AllowLinkingAccountAddresses implies revealed senders in
+        // zcashd; zecd is single-account (nothing extra to link), so it maps onto the same rung.
+        for p in ["AllowRevealedSenders", "AllowLinkingAccountAddresses"] {
             assert_eq!(
                 privacy_from_policy(Some(p), FullPrivacy).unwrap(),
-                AllowRevealedRecipients,
+                AllowRevealedSenders,
                 "{p}"
             );
         }

@@ -876,6 +876,7 @@ async fn watch_only_wallet_disables_spending_rpcs() {
             TransactionRequest::new(vec![payment]).unwrap(),
             None,
             crate::config::SendPrivacy::AllowRevealedRecipients,
+            crate::wallet::SendSource::Unspecified,
         )
         .await
         .unwrap_err();

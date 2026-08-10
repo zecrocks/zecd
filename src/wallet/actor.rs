@@ -15,7 +15,9 @@ use tracing::{error, info, warn};
 use zcash_client_backend::data_api::wallet::{
     create_pczt_from_proposal, create_proposed_transactions, decrypt_and_store_transaction,
     extract_and_store_transaction_from_pczt,
-    input_selection::{GreedyInputSelector, LockFilter, SpendPolicy},
+    input_selection::{
+        CoinbasePolicy, GreedyInputSelector, LockFilter, SpendPolicy, TransparentSpendPolicy,
+    },
     propose_transfer, ConfirmationsPolicy, SpendingKeys,
 };
 use zcash_client_backend::data_api::{
@@ -60,8 +62,8 @@ use crate::wallet::keys::{self, SeedKeeper};
 use crate::wallet::open::{self, WriteDb};
 use crate::wallet::read;
 use crate::wallet::{
-    make_handle, store, ConnState, DerivedAddress, FirstSeen, RawTx, ReceiverRequest, SharedSeed,
-    SyncStatus, WalletCommand, WalletHandle,
+    make_handle, store, ConnState, DerivedAddress, FirstSeen, RawTx, ReceiverRequest, SendSource,
+    SharedSeed, SyncStatus, WalletCommand, WalletHandle,
 };
 
 /// Note-management defaults for change splitting (match zcash-devtool's send defaults).
@@ -1245,6 +1247,29 @@ fn private_keys_disabled() -> RpcError {
     RpcError::wallet("Error: Private keys are disabled for this wallet")
 }
 
+/// zcashd's refusal (`-4`, message shape included) for a transparent funding source under a
+/// policy that does not permit revealing the sender. Shared by the synchronous `z_sendmany`
+/// pre-check and the actor's authoritative re-check so the two can't drift.
+pub(crate) fn insufficient_privacy_for_transparent_sender(privacy: SendPrivacy) -> RpcError {
+    RpcError::wallet(format!(
+        "Insufficient privacy policy to allow transparent sender: {} does not permit funding a \
+         send from transparent UTXOs (which reveals the sender's addresses and amounts). Use \
+         privacyPolicy \"AllowRevealedSenders\" or weaker to allow this transaction to proceed.",
+        privacy.policy_name()
+    ))
+}
+
+/// zcashd's refusal (`-4`) for a transparent recipient paid *from* transparent funds - a fully
+/// transparent transaction - under any policy short of `AllowFullyTransparent`. Shared by the
+/// synchronous `z_sendmany` pre-check and the actor's authoritative re-check.
+pub(crate) fn insufficient_privacy_for_fully_transparent() -> RpcError {
+    RpcError::wallet(
+        "Insufficient privacy policy to allow a transparent recipient paid from transparent \
+         funds (a fully transparent transaction). Use privacyPolicy \"AllowFullyTransparent\" \
+         or \"NoPrivacy\" to allow this transaction to proceed.",
+    )
+}
+
 /// Pick a wallet-owned **internal** (change-scope) transparent address for change: the gap-start
 /// (lowest unfunded) internal receiver among the account's exposed transparent receivers. Routing
 /// change here (rather than to an external receive address) lets a from-seed restore recover it via
@@ -1371,6 +1396,28 @@ fn transparent_only_recipients(
         }
     }
     Ok(Some(out))
+}
+
+/// The librustzcash [`SpendPolicy`] a send's funding source implies. A transparent source
+/// permits **no** shielded pools (an empty set): one source per send, so a shortfall is a `-6`
+/// insufficient-funds on the named source, never a silent top-up from shielded notes (and
+/// vice versa - the default policy never pulls in transparent UTXOs). Coinbase is excluded
+/// explicitly (it is also the constructor default): consensus requires a transparent-coinbase
+/// spend to have an empty `vout`, and coinbase funds stay `z_shieldcoinbase`'s alone.
+fn spend_policy_for_source(source: SendSource) -> SpendPolicy {
+    match source {
+        SendSource::Unspecified | SendSource::Shielded => SpendPolicy::default(),
+        SendSource::Transparent(None) => SpendPolicy::shielded_pools(std::iter::empty())
+            .with_transparent(
+                TransparentSpendPolicy::any_account_addr()
+                    .with_coinbase(CoinbasePolicy::NonCoinbase),
+            ),
+        SendSource::Transparent(Some(t)) => SpendPolicy::shielded_pools(std::iter::empty())
+            .with_transparent(
+                TransparentSpendPolicy::from_one_address(t)
+                    .with_coinbase(CoinbasePolicy::NonCoinbase),
+            ),
+    }
 }
 
 /// Log an internal upstream (zebra) connection/transport failure server-side and return a
@@ -3261,9 +3308,10 @@ impl WalletActor {
                 request,
                 confirmations,
                 privacy,
+                source,
                 reply,
             } => {
-                self.begin_or_queue_send(request, confirmations, privacy, reply)
+                self.begin_or_queue_send(request, confirmations, privacy, source, reply)
                     .await;
             }
             WalletCommand::GetRawTx { txid, reply } => {
@@ -3855,10 +3903,12 @@ impl WalletActor {
                 &change_strategy,
                 request,
                 policy,
-                // Shielded-only input selection (transparent UTXOs are spent via the separate
-                // lower-level `do_send_transparent` path), matching `do_send_fused`. `SpendPolicy`'s
-                // default permits every shielded pool with no transparent spending - the historical
-                // fully-shielded behavior (replaces the removed `TransparentSpendPolicy::ShieldedOnly`).
+                // Shielded-only input selection, always: `SpendPolicy`'s default permits every
+                // shielded pool with no transparent spending. A transparent-funded send
+                // (`SendSource::Transparent`) never reaches this path - `do_send` routes it to
+                // the fused path, whose `create_proposed_transactions` signs transparent inputs;
+                // the PCZT prove+sign step has no transparent signing pass, so keeping the
+                // default here makes an unsigned-transparent PCZT unconstructible by design.
                 &SpendPolicy::default(),
                 // No input locking: zecd serializes sends through the single-writer actor, so
                 // there is no concurrent proposer to race for inputs.
@@ -3950,11 +4000,30 @@ impl WalletActor {
         request: TransactionRequest,
         confirmations: Option<ConfirmationsPolicy>,
         privacy: SendPrivacy,
+        source: SendSource,
     ) -> Result<TxId, RpcError> {
         // Hard backstop: if an encrypted wallet's unlock has expired but proactive relock
         // hasn't fired yet (e.g. a long sync batch was in progress), lock now so the spend
         // can't slip through past its timeout. `derive_usk` then returns -13 as expected.
         self.relock_if_expired();
+
+        // Authoritative privacy gates for a transparent funding source (`z_sendmany` from a
+        // t-address / `ANY_TADDR`). The RPC layer rejects both cases synchronously with the same
+        // errors; re-checking here keeps the actor sound against any future caller. Spending
+        // transparent UTXOs reveals the sender's addresses and input amounts, so it needs the
+        // `AllowRevealedSenders` rung; paying a transparent recipient *from* transparent inputs
+        // is a fully transparent transaction, which needs `AllowFullyTransparent` (zcashd's
+        // split of the two).
+        if matches!(source, SendSource::Transparent(_)) {
+            if !privacy.allows_transparent_inputs() {
+                return Err(insufficient_privacy_for_transparent_sender(privacy));
+            }
+            if privacy != SendPrivacy::AllowFullyTransparent
+                && request_pays_transparent_output(&self.network, &request)
+            {
+                return Err(insufficient_privacy_for_fully_transparent());
+            }
+        }
 
         // Catch up to zebra's real chain tip before building the spend, so the transaction's
         // target height - and therefore its expiry (target + expiry delta) - is computed
@@ -3974,15 +4043,23 @@ impl WalletActor {
         // Fully transparent send (opt-in): when the policy explicitly allows it and *every*
         // recipient is a bare transparent address, fund the payment directly from the wallet's
         // received transparent UTXOs and keep the change transparent - never touching a shielded
-        // pool. librustzcash's high-level proposal API can't express this (it has no transparent
-        // input selection, and its change accounting has no persistent transparent-change
-        // variant), so zecd builds and signs the transaction itself. Any other policy, or any
-        // shielded recipient, falls through to the shielded proposal path below (under which a
-        // transparent recipient is still paid from shielded notes with shielded change).
-        if privacy == SendPrivacy::AllowFullyTransparent {
+        // pool. librustzcash's high-level proposal API can't express this (its change accounting
+        // has no persistent transparent-change variant), so zecd builds and signs the transaction
+        // itself. An explicitly *shielded* source (`z_sendmany` from a UA / shielded address)
+        // must mean what it says, so it never takes this branch: its transparent recipients are
+        // paid from shielded notes with shielded change, like any other policy's. Any other
+        // policy, or any shielded recipient, falls through to the proposal path below.
+        if privacy == SendPrivacy::AllowFullyTransparent && source != SendSource::Shielded {
             if let Some(recipients) = transparent_only_recipients(&self.network, &request)? {
+                // A t-address `fromaddress` narrows the t->t selection to that address's UTXOs
+                // (coin control); `ANY_TADDR` and the source-less Bitcoin-dialect sends spend
+                // across every receiver, the pre-`SendSource` behaviour.
+                let from = match source {
+                    SendSource::Transparent(from) => from,
+                    _ => None,
+                };
                 return self
-                    .do_send_transparent(recipients, confirmations, usk, account_id)
+                    .do_send_transparent(recipients, confirmations, usk, account_id, from)
                     .await;
             }
         }
@@ -3992,9 +4069,23 @@ impl WalletActor {
 
         // The cached-Orchard PCZT path can't finalize a Sapling output: its extractor is handed no
         // Sapling verifying key. A send to a Sapling-only recipient therefore takes the fused path,
-        // which proves and verifies Sapling outputs itself.
-        if !self.cached_pczt_path() || request_pays_sapling_output(&self.network, &request) {
-            return self.do_send_fused(usk, request, policy, privacy).await;
+        // which proves and verifies Sapling outputs itself. A transparent-funded send takes it
+        // too: the PCZT prove+sign step has no transparent signing pass, while the fused
+        // `create_proposed_transactions` derives the transparent input keys from the USK itself
+        // (the same way `z_shieldcoinbase` executes its coinbase-shielding proposals).
+        if !self.cached_pczt_path()
+            || request_pays_sapling_output(&self.network, &request)
+            || matches!(source, SendSource::Transparent(_))
+        {
+            return self
+                .do_send_fused(
+                    usk,
+                    request,
+                    policy,
+                    privacy,
+                    &spend_policy_for_source(source),
+                )
+                .await;
         }
 
         // Cached-Orchard PCZT path: phase A (select+build) -> phase B (prove+sign) -> phase C
@@ -4039,14 +4130,18 @@ impl WalletActor {
 
     /// The legacy fused send path: librustzcash's `create_proposed_transactions` builds, proves,
     /// and stores under one `&mut` (rebuilding the proving key per send). Used by a Sapling-
-    /// spending wallet (the PCZT path here signs only Orchard spends) or when
-    /// `cache_proving_key` is off. Not pipelined - there is no prove/store seam to split.
+    /// spending wallet (the PCZT path here signs only Orchard spends), by a transparent-funded
+    /// send (`create_proposed_transactions` signs transparent inputs from the USK; the PCZT
+    /// prove+sign step cannot), or when `cache_proving_key` is off. Not pipelined - there is no
+    /// prove/store seam to split. `spend_policy` is the input-side selection policy for this
+    /// send's source (see [`spend_policy_for_source`]).
     async fn do_send_fused(
         &mut self,
         usk: zcash_keys::keys::UnifiedSpendingKey,
         request: TransactionRequest,
         policy: ConfirmationsPolicy,
         privacy: SendPrivacy,
+        spend_policy: &SpendPolicy,
     ) -> Result<TxId, RpcError> {
         let net = self.network;
         let change_pool = self.enabled_pools.change_pool();
@@ -4077,12 +4172,11 @@ impl WalletActor {
                     &change_strategy,
                     request,
                     policy,
-                    // zecd's proposal path funds payments from shielded notes only (transparent
-                    // UTXOs are spent via the separate lower-level `do_send_transparent` path), so
-                    // the input selector must never pull in transparent UTXOs. `SpendPolicy::default`
-                    // permits every shielded pool with no transparent spending, preserving the prior
-                    // fully-shielded selection behavior (replaces `TransparentSpendPolicy::ShieldedOnly`).
-                    &SpendPolicy::default(),
+                    // The caller-selected input policy: `SpendPolicy::default()` (every shielded
+                    // pool, no transparent spending - the historical fully-shielded selection)
+                    // for a shielded source, or a transparent-only policy for a transparent
+                    // `fromaddress` source (see `spend_policy_for_source`).
+                    spend_policy,
                     // No input locking: zecd serializes sends through the single-writer actor,
                     // so there is no concurrent proposer to race for inputs.
                     None,
@@ -4145,20 +4239,27 @@ impl WalletActor {
         request: TransactionRequest,
         confirmations: Option<ConfirmationsPolicy>,
         privacy: SendPrivacy,
+        source: SendSource,
         reply: oneshot::Sender<Result<TxId, RpcError>>,
     ) {
         // `AllowFullyTransparent` sends are handled inline by `do_send` (they build via the
         // transparent Builder, not the cached-Orchard PCZT prove path that pipelining accelerates),
         // so never queue them for off-actor proving.
         //
+        // A transparent *source* (`z_sendmany` from a t-address / `ANY_TADDR`) can't ride the
+        // pipeline either: the PCZT prove+sign step has no transparent signing pass, so `do_send`
+        // diverts transparent-funded proposals to the fused path, which signs transparent inputs
+        // itself. Routing here (before the queue) also keeps every queued send shielded-source.
+        //
         // A Sapling-output send can't ride the pipeline either (it commits via the same PCZT
         // extractor that has no Sapling verifying key). Route it through `do_send`, which diverts
         // it to the fused path.
         if privacy == SendPrivacy::AllowFullyTransparent
+            || matches!(source, SendSource::Transparent(_))
             || !self.pipeline_eligible()
             || request_pays_sapling_output(&self.network, &request)
         {
-            let res = self.do_send(request, confirmations, privacy).await;
+            let res = self.do_send(request, confirmations, privacy, source).await;
             let _ = reply.send(res);
             return;
         }
@@ -4376,12 +4477,17 @@ impl WalletActor {
     /// record the result via `store_transactions_to_be_sent` (which locks the spent UTXOs and
     /// stores raw bytes for the rebroadcast loop). The change UTXO is rediscovered after mining by
     /// the existing `getaddressutxos` receive scan, so this adds no off-chain persistence.
+    ///
+    /// `from` narrows the selection to one wallet-owned t-address's UTXOs (`z_sendmany` with a
+    /// t-address `fromaddress` - coin control); `None` spends across every exposed receiver
+    /// (`ANY_TADDR` and the source-less `sendtoaddress`/`sendmany`).
     async fn do_send_transparent(
         &mut self,
         recipients: Vec<(TransparentAddress, Zatoshis)>,
         confirmations: Option<ConfirmationsPolicy>,
         usk: zcash_keys::keys::UnifiedSpendingKey,
         account_id: AccountUuid,
+        from: Option<TransparentAddress>,
     ) -> Result<TxId, RpcError> {
         use rand::rngs::OsRng;
 
@@ -4420,6 +4526,11 @@ impl WalletActor {
                     .map_err(RpcError::database_internal)?;
                 let mut utxos = Vec::new();
                 for addr in receivers.keys() {
+                    // Coin control: a t-address `fromaddress` restricts selection to that
+                    // address's UTXOs. (The RPC layer has already verified it is wallet-owned.)
+                    if from.is_some_and(|f| f != *addr) {
+                        continue;
+                    }
                     let outs = db
                         .get_spendable_transparent_outputs(
                             addr,
@@ -5373,6 +5484,29 @@ fn request_pays_sapling_output(net: &ZNetwork, request: &TransactionRequest) -> 
     })
 }
 
+/// Whether any payment in `request` targets an address with no shielded receiver (a bare
+/// transparent recipient, forcing a transparent output). Used to gate a transparent *source*:
+/// transparent inputs plus a transparent output is a fully transparent transaction, which
+/// requires `AllowFullyTransparent` even when the change would shield (zcashd's split between
+/// `AllowRevealedSenders` and `AllowFullyTransparent`). Unlike `transparent_only_recipients`
+/// this flags a *mixed* request too (one transparent recipient among shielded ones), which
+/// falls past that all-transparent check onto the proposal path.
+fn request_pays_transparent_output(net: &ZNetwork, request: &TransactionRequest) -> bool {
+    let net_type = net.network_type();
+    request.payments().values().any(|p| {
+        match p
+            .recipient_address()
+            .clone()
+            .convert_if_network::<Address>(net_type)
+        {
+            Ok(addr) => !crate::address::has_shielded_receiver(&addr),
+            // Unparseable on this network (already rejected at the RPC layer): don't gate; the
+            // normal build path surfaces the error.
+            Err(_) => false,
+        }
+    })
+}
+
 /// Prove (Orchard, plus Sapling outputs if any) and sign the Orchard spends with the account's
 /// key, returning the signed PCZT ready to extract+store. This is the **pure-CPU** half of a PCZT
 /// send (phase B): it touches no DB, so it can run off the single-writer actor (see
@@ -6210,6 +6344,82 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+    }
+
+    /// A transparent source plus *any* transparent recipient is a fully transparent transaction
+    /// (needs `AllowFullyTransparent`), including the mixed case that falls past
+    /// `transparent_only_recipients` onto the proposal path - the gate this predicate backs.
+    #[test]
+    fn request_pays_transparent_output_flags_any_bare_transparent_recipient() {
+        use super::request_pays_transparent_output;
+        use crate::network::ZNetwork;
+        use zcash_keys::address::Address;
+        use zcash_keys::keys::{ReceiverRequirement::*, UnifiedAddressRequest, UnifiedSpendingKey};
+        use zcash_protocol::value::Zatoshis;
+        use zcash_transparent::address::TransparentAddress;
+        use zip32::{AccountId, DiversifierIndex};
+        use zip321::{Payment, TransactionRequest};
+
+        let net = ZNetwork::Test;
+        let taddr =
+            Address::Transparent(TransparentAddress::PublicKeyHash([9; 20])).to_zcash_address(&net);
+        let shielded = UnifiedSpendingKey::from_seed(&net, &[7u8; 32], AccountId::ZERO)
+            .unwrap()
+            .to_unified_full_viewing_key()
+            .find_address(
+                DiversifierIndex::new(),
+                UnifiedAddressRequest::unsafe_custom(Require, Require, Omit),
+            )
+            .unwrap()
+            .0;
+        let shielded = Address::Unified(shielded).to_zcash_address(&net);
+        let pay = |a: &zcash_address::ZcashAddress| {
+            Payment::without_memo(a.clone(), Zatoshis::const_from_u64(10_000_000))
+        };
+
+        // All-shielded → no transparent output.
+        let req = TransactionRequest::new(vec![pay(&shielded)]).unwrap();
+        assert!(!request_pays_transparent_output(&net, &req));
+        // Mixed (shielded + bare transparent) → flagged, unlike `transparent_only_recipients`.
+        let req = TransactionRequest::new(vec![pay(&shielded), pay(&taddr)]).unwrap();
+        assert!(request_pays_transparent_output(&net, &req));
+        // All-transparent → flagged too (normally caught earlier by the t->t branch).
+        let req = TransactionRequest::new(vec![pay(&taddr)]).unwrap();
+        assert!(request_pays_transparent_output(&net, &req));
+    }
+
+    /// `spend_policy_for_source` is the one-source-per-send invariant: a transparent source
+    /// permits no shielded pools (a shortfall is `-6`, never a top-up from notes) and excludes
+    /// coinbase (which stays `z_shieldcoinbase`'s alone); a shielded/unspecified source keeps
+    /// the default fully-shielded selection with no transparent spending.
+    #[test]
+    fn spend_policy_for_source_maps_sources_to_selection_policies() {
+        use super::spend_policy_for_source;
+        use crate::wallet::SendSource;
+        use zcash_client_backend::data_api::wallet::input_selection::{
+            CoinbasePolicy, TransparentSource,
+        };
+        use zcash_transparent::address::TransparentAddress;
+
+        let default = spend_policy_for_source(SendSource::Unspecified);
+        assert!(default.transparent().is_none());
+        assert!(!default.shielded().is_empty());
+        let shielded = spend_policy_for_source(SendSource::Shielded);
+        assert!(shielded.transparent().is_none());
+        assert!(!shielded.shielded().is_empty());
+
+        let any = spend_policy_for_source(SendSource::Transparent(None));
+        assert!(any.shielded().is_empty(), "one source per send");
+        let tsp = any.transparent().expect("transparent spending enabled");
+        assert!(matches!(tsp.source(), TransparentSource::AnyAccountAddr));
+        assert_eq!(tsp.coinbase(), CoinbasePolicy::NonCoinbase);
+
+        let addr = TransparentAddress::PublicKeyHash([3; 20]);
+        let one = spend_policy_for_source(SendSource::Transparent(Some(addr)));
+        assert!(one.shielded().is_empty(), "one source per send");
+        let tsp = one.transparent().expect("transparent spending enabled");
+        assert!(matches!(tsp.source(), TransparentSource::FromAddresses(_)));
+        assert_eq!(tsp.coinbase(), CoinbasePolicy::NonCoinbase);
     }
 
     #[test]
