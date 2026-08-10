@@ -38,7 +38,8 @@ use zecd_regtest_harness::{
 const PER_NOTE_ZAT: u64 = 100_000;
 /// Notes created per build round. Each round spends the single large change note (the chunk total
 /// is tiny next to it, so the greedy selector covers it with that one note) and fans out into this
-/// many small notes, netting ~`BUILD_CHUNK` per round.
+/// many small notes, netting ~`BUILD_CHUNK` per round. Also the number of distinct destination
+/// addresses the round pays - one per output, since `z_sendmany` rejects a duplicated recipient.
 const BUILD_CHUNK: usize = 40;
 /// Blocks mined per build round so the change note re-confirms before the next round spends it.
 const MINE_PER_ROUND: u32 = 4;
@@ -119,6 +120,24 @@ async fn regtest_stress_many_notes() {
         .await
         .expect("zecd sync (funded)");
 
+    // --- Fan-out destinations: `BUILD_CHUNK` *distinct* wallet addresses, issued once and reused
+    //     every round. Distinct is a hard requirement, not a stylistic choice - `z_sendmany`
+    //     rejects a duplicated recipient address with `-8` (zcashd does the same), so a round that
+    //     paid one address `BUILD_CHUNK` times would never leave the RPC layer. Reuse *across*
+    //     rounds is fine: the check is per-call, and a repeat payment to an address still mints a
+    //     fresh note, which is the only property this loop needs. ---
+    let mut fan_out_dests = Vec::with_capacity(BUILD_CHUNK);
+    for _ in 0..BUILD_CHUNK {
+        fan_out_dests.push(
+            zecd.call("getnewaddress", json!([]))
+                .await
+                .expect("getnewaddress (fan-out dest)")
+                .as_str()
+                .expect("address string")
+                .to_string(),
+        );
+    }
+
     // --- Build the fragmented note set: fan out `BUILD_CHUNK` notes per round until we reach the
     //     target. Each round spends the (single, large) change note and creates many small ones. ---
     let build_start = Instant::now();
@@ -132,16 +151,10 @@ async fn regtest_stress_many_notes() {
             "note build stalled at {notes}/{note_target} after {round} rounds (insufficient \
              funds, or the selector stopped spending the large change note?)"
         );
-        let dest = zecd
-            .call("getnewaddress", json!([]))
-            .await
-            .expect("getnewaddress (fan-out dest)")
-            .as_str()
-            .expect("address string")
-            .to_string();
         let amount = zec_str(PER_NOTE_ZAT);
-        let outputs: Vec<_> = (0..BUILD_CHUNK)
-            .map(|_| json!({ "address": dest, "amount": amount }))
+        let outputs: Vec<_> = fan_out_dests
+            .iter()
+            .map(|dest| json!({ "address": dest, "amount": amount }))
             .collect();
         // minconf=1 so a change note confirmed this round is immediately spendable next round.
         let opid = zecd
