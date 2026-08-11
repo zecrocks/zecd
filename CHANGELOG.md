@@ -5,6 +5,30 @@ All notable changes to zecd are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com), and this
 project adheres to [Semantic Versioning](https://semver.org).
 
+## [0.6.1] - 2026-08-11
+
+Received transparent funds can now be moved into the shielded pool. Until this release a wallet
+holding t-address UTXOs could pay out of its notes but never out of the coins it had actually
+received, because `z_sendmany` accepted a `fromaddress` and then honoured it only as an account
+selector.
+
+Nothing changes for a wallet that does not pass a transparent `fromaddress`, and spending
+transparent inputs is off unless the operator opts in. Read the Changed section before upgrading
+if `[spend] privacy_policy` is set to `AllowRevealedSenders` or `AllowFullyTransparent`: both
+mean something different now.
+
+### Added
+- **Coin control on `z_sendmany`.** `fromaddress` is a real input-side selector, as it is in zcashd. A wallet-owned t-address funds the send from that address's non-coinbase UTXOs, `ANY_TADDR` (previously refused) funds it from any of them, and a shielded or unified address keeps meaning the account's shielded notes. With a shielded recipient a transparent source is the shielding send: the payment and the change both land in the shielded change pool, which is how received transparent funds reach Orchard. Paying a t-address from shielded notes already worked and is unchanged. One source funds one send, so a shortfall is an error rather than a silent top-up from the other pool, and transparent coinbase remains `z_shieldcoinbase`'s alone.
+- An `AllowRevealedSenders` rung on `[spend] privacy_policy`, between `AllowRevealedRecipients` and `AllowFullyTransparent`. Spending transparent inputs publishes the sender's addresses and input amounts, which is a disclosure a caller opts into separately from revealing a recipient. A transparent `fromaddress` under anything weaker, the default included, is refused before the send is queued, with the policy name that would allow it named in the error.
+- A regtest end-to-end for the whole ladder: the refusal matrix, a per-address shield that leaves an un-named UTXO untouched, an `ANY_TADDR` shield down to zero transparent UTXOs, and a deshielding round trip under the default policy. It runs on both the full-node and light-mode legs.
+
+### Changed
+- `AllowRevealedSenders` in `[spend] privacy_policy` was previously accepted as an alias and collapsed onto `AllowRevealedRecipients`, on the reasoning that a wallet with no transparent source had no sender to reveal. That is no longer true, so the name now selects the distinct, strictly more permissive rung described above. A configuration carrying it gains the ability to fund sends from transparent UTXOs; set `AllowRevealedRecipients` to keep the previous meaning.
+- Under `AllowFullyTransparent` with all-transparent recipients, an explicitly shielded `fromaddress` now pays from shielded notes, as zcashd does, instead of silently taking the fully transparent branch; a t-address `fromaddress` on that branch narrows selection to that address. Sends made without a source, including `sendtoaddress` and `sendmany`, are unaffected.
+
+### Fixed
+- The stress regtest tier built no notes. Each fan-out round paid the same freshly issued address once per output, which `z_sendmany` refuses as a duplicated recipient, so the call never left the RPC layer. Rounds now pay a set of distinct addresses. Test-only; no effect on a running daemon.
+
 ## [0.6.0] - 2026-08-08
 
 The 0.6.0 line, released as `0.6.0-rc1` through `0.6.0-rc3`. Everything below is relative to
@@ -386,6 +410,7 @@ Zcash, backed entirely by librustzcash and running as a light client.
 ### Security
 - Pre-release audit hardening; refuse to start on mainnet with the placeholder RPC password; enforce a 12-character passphrase minimum.
 
+[0.6.1]: https://github.com/zecrocks/zecd/compare/v0.6.0...v0.6.1
 [0.6.0]: https://github.com/zecrocks/zecd/compare/v0.5.2...v0.6.0
 [0.6.0-rc3]: https://github.com/zecrocks/zecd/compare/v0.6.0-rc2...v0.6.0-rc3
 [0.6.0-rc2]: https://github.com/zecrocks/zecd/compare/v0.6.0-rc1...v0.6.0-rc2
