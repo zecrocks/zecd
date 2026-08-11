@@ -165,13 +165,13 @@ per wallet in `[wallets.<name>]`. See [Addresses & shielded pools](guide/address
 ## `[spend]`
 
 Send policy: confirmations, privacy, and the proving pipeline. See
-[Privacy policy](design/privacy.md) for the four-rung ladder and its enforcement points.
+[Privacy policy](design/privacy.md) for the five-rung ladder and its enforcement points.
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
 | `trusted_confirmations` | integer | `3` | Confirmations before the wallet's *own* outputs (change) are spendable (ZIP 315 default). Clamped to at least 1. |
 | `untrusted_confirmations` | integer | `10` | Confirmations before third-party outputs are spendable (ZIP 315 default). Must be at least `trusted_confirmations` (validated at startup). Anchors balances and spend proposals; `getbalance`'s explicit `minconf` overrides per call. |
-| `privacy_policy` | string | `"AllowRevealedRecipients"` | What sends may reveal on-chain: `"FullPrivacy"`, `"AllowRevealedAmounts"`, `"AllowRevealedRecipients"`, or `"AllowFullyTransparent"`. `z_sendmany`'s per-call `privacyPolicy` overrides it. |
+| `privacy_policy` | string | `"AllowRevealedRecipients"` | What sends may reveal on-chain: `"FullPrivacy"`, `"AllowRevealedAmounts"`, `"AllowRevealedRecipients"`, `"AllowRevealedSenders"` (permits funding a send from transparent UTXOs, with shielded change), or `"AllowFullyTransparent"`. `z_sendmany`'s per-call `privacyPolicy` overrides it. Note `"AllowRevealedSenders"` was a synonym for `"AllowRevealedRecipients"` before 0.6.1 and is now a rung of its own. |
 | `orchard_action_limit` | integer | `50` | Cap on Orchard actions (`max(inputs, outputs)`) a single send may build; bounds memory/proving cost and yields a clean `-8` for oversized sends. `0` disables the cap. |
 | `cache_proving_key` | bool | `true` | Build the Orchard proving key once (on a background task at startup, so it does not delay the listeners) and prove sends through the PCZT path, instead of rebuilding the key (~seconds of keygen) on every transaction. Both paths produce identical transactions. |
 | `pipeline_proving` | bool | `false` | Run a send's proving step off the single-writer actor so a long proof no longer freezes background sync and status. Sends still serialize. Only engages on the cached-Orchard PCZT path (`cache_proving_key = true`, Orchard-only spends). |

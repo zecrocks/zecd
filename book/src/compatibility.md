@@ -82,9 +82,9 @@ between two shielded pools (spending one, paying the other) reveals the crossed 
 post-NU6.3 wallet paying a Sapling or Orchard recipient from ironwood notes is crossing one.
 Both leaks are permitted under the default policy, `AllowRevealedRecipients`.
 The `[spend] privacy_policy` setting (and `z_sendmany`'s per-call `privacyPolicy`) is a
-four-rung ladder that lets you forbid either leak, or additionally opt in to fully
-transparent spends. See [privacy policy](design/privacy.md) for the rungs and where each is
-enforced.
+five-rung ladder that lets you forbid either leak, or opt in to the two sender-side ones:
+funding a send from transparent UTXOs, and additionally keeping its change transparent. See
+[privacy policy](design/privacy.md) for the rungs and where each is enforced.
 
 ### Memos are extensions
 

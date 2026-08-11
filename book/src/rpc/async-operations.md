@@ -63,31 +63,58 @@ z_sendmany "fromaddress" [{"address":..,"amount":..,"memo":..},...] ( minconf ) 
 ```
 
 Send to one or more recipients asynchronously. Returns an opid immediately; the outcome
-(txid or error) surfaces through the tracking methods. zecd spends from its single account,
-so `fromaddress` is an ownership check, not a fund selector: any of the wallet's own
-addresses works and selects the same funds.
+(txid or error) surfaces through the tracking methods.
+
+`fromaddress` selects the **funding source**, as it does in zcashd:
+
+| `fromaddress` | Funds the send from |
+|---|---|
+| a unified or Sapling address of this wallet | the account's shielded notes |
+| a bare transparent address of this wallet | that address's non-coinbase UTXOs only |
+| `ANY_TADDR` | any of the account's non-coinbase transparent UTXOs |
+
+A transparent source requires privacy policy `AllowRevealedSenders` or weaker, since spending
+transparent inputs reveals the sender's addresses and amounts; see the
+[privacy policy ladder](../design/privacy.md). Paired with a **shielded recipient** it is the
+shielding (t-to-z) send: the payment and the change both land in the shielded pool, which is how
+received transparent funds get shielded. Paired with an all-transparent recipient set it is a
+fully transparent transaction and additionally needs `AllowFullyTransparent`.
+
+One source funds one send. Shielded notes and transparent UTXOs are never mixed, so if the named
+source cannot cover the payment the operation fails `-6` rather than quietly topping up from the
+other pool. Transparent **coinbase** is never selected here; it is
+[`z_shieldcoinbase`](#z_shieldcoinbase)'s alone, because consensus forbids a transparent output
+in a transaction spending it.
+
+Shielded coin control is per *account*, not per address: notes are account-scoped, so a shielded
+`fromaddress` names the account and any of the wallet's shielded addresses selects the same
+notes.
 
 **Parameters**
 
 | # | Name | Type | Default | Description |
 |---|------|------|---------|-------------|
-| 1 | fromaddress | string | required | One of this wallet's own addresses (unified, Sapling, or bare transparent). A foreign, undecodable, or hand-spliced address is `-5`. zcashd's `ANY_TADDR` sentinel is rejected with `-5`. |
+| 1 | fromaddress | string | required | One of this wallet's own addresses (unified, Sapling, or bare transparent), or `ANY_TADDR`. Selects the funding source per the table above. A foreign, undecodable, or hand-spliced address is `-5`. |
 | 2 | amounts | array | required | Non-empty array of `{"address":.., "amount":.., "memo":..}` objects. `amount` is decimal ZEC, 8 places; zero is allowed (the memo-only pattern, shielded recipients only). `memo` is an optional hex-encoded ZIP-302 memo, at most 512 bytes, shielded recipients only. Unknown keys and duplicate recipient addresses are `-8`. |
 | 3 | minconf | number | wallet policy | Only spend notes with at least this many confirmations, overriding both bounds of the wallet's confirmations policy symmetrically for this send. Omitted or `null` uses the configured ZIP-315 policy (3 trusted / 10 untrusted). Values below 1 are served as 1; a non-number is `-3`. |
 | 4 | fee | null | null | Must be omitted or `null`. Fees are always ZIP-317, computed by the wallet; any explicit value (including 0) is `-8`. |
 | 5 | privacyPolicy | string | LegacyCompat | Per-call override of `[spend] privacy_policy`. See the mapping below. |
 
 `privacyPolicy` accepts every zcashd policy name and maps it onto zecd's
-[four-rung ladder](../design/privacy.md):
+[five-rung ladder](../design/privacy.md):
 
 | Value | Effect in zecd |
 |-------|----------------|
 | `FullPrivacy` | No shielded leak: a transparent recipient is `-8` up front, and a proposal that crosses a turnstile between two shielded pools is rejected (Sapling, Orchard and Ironwood are three distinct pools). |
 | `AllowRevealedAmounts` | Turnstile crossing allowed (reveals the amount). A transparent recipient is still `-8`. |
-| `AllowRevealedRecipients`, `AllowRevealedSenders`, `AllowLinkingAccountAddresses` | Transparent recipients allowed, paid from shielded funds with shielded change. zcashd's sender-side rungs collapse here because zecd's shielded sends have no transparent sender to reveal. |
-| `AllowFullyTransparent`, `NoPrivacy` | Additionally permits a fully transparent spend: funding the send from transparent UTXOs with kept-transparent change (see [Transparent support](../guide/transparent.md)). |
+| `AllowRevealedRecipients` | Transparent recipients allowed, paid from shielded funds with shielded change. A transparent `fromaddress` is still `-4`. |
+| `AllowRevealedSenders`, `AllowLinkingAccountAddresses` | Additionally permits funding the send from transparent UTXOs, with the change shielded: the shielding send. `AllowLinkingAccountAddresses` collapses here because zecd spends from one account, so there are no accounts to link. |
+| `AllowFullyTransparent`, `NoPrivacy` | Additionally permits keeping the change transparent, making the whole transaction transparent (see [Transparent support](../guide/transparent.md)). |
 | `LegacyCompat` or omitted | The wallet's configured `[spend] privacy_policy` (default `AllowRevealedRecipients`). |
 | anything else | `-8` |
+
+Since 0.6.1 `AllowRevealedSenders` is a rung of its own; earlier versions accepted the name and
+treated it as `AllowRevealedRecipients`.
 
 **Result**
 
@@ -106,9 +133,9 @@ surfaces later in the operation's `error` object, never as an error on this call
 |------|------|
 | -1 | `fromaddress` missing or null |
 | -3 | `fromaddress`, `minconf`, or a `memo` field is the wrong JSON type |
-| -5 | `fromaddress` is `ANY_TADDR`, undecodable, not this wallet's, or a Unified Address with inconsistently spliced receivers |
+| -5 | `fromaddress` undecodable, not this wallet's, or a Unified Address with inconsistently spliced receivers |
 | -8 | `amounts` missing or not an array; empty `amounts`; unknown key or missing `address`/`amount` in an entry; duplicate recipient; non-hex or over-512-byte memo; memo on a transparent recipient; explicit `fee`; unknown `privacyPolicy`; transparent recipient under `FullPrivacy`/`AllowRevealedAmounts` |
-| -4 | the wallet already has 16 unfinished operations (back-pressure); or the payment set is not a valid transaction request |
+| -4 | transparent `fromaddress`/`ANY_TADDR` under a policy below `AllowRevealedSenders`; transparent source with an all-transparent recipient set below `AllowFullyTransparent`; the wallet already has 16 unfinished operations (back-pressure); or the payment set is not a valid transaction request |
 
 **vs Bitcoin Core**: no equivalent; Core has no asynchronous RPC model. The synchronous
 counterparts are [`sendtoaddress` and `sendmany`](sending.md).
@@ -116,17 +143,19 @@ counterparts are [`sendtoaddress` and `sendmany`](sending.md).
 **vs zcashd**: same signature, same opid model, same status shapes; this is the page where
 zecd tracks zcashd rather than Bitcoin Core. Differences:
 
-- `fromaddress` must be this wallet's own address and only gates ownership; zcashd selects
-  funds *from* that specific address or account, and accepts `ANY_TADDR` to sweep
-  non-coinbase transparent UTXOs across the wallet (zecd rejects it with `-5`).
+- `fromaddress` must be this wallet's own address (`ANY_TADDR` aside); zcashd will also spend
+  from an address in another of its accounts. Selection itself matches: a t-address funds from
+  that address, `ANY_TADDR` from any of them, a shielded address from the account's notes.
 - `fee` may be an explicit amount in zcashd (default `null` means ZIP-317); zecd rejects any
   explicit fee with `-8`.
 - `minconf` defaults to 10 in zcashd (`DEFAULT_NOTE_CONFIRMATIONS`); zecd defaults to the
   wallet's configured ZIP-315 policy and clamps explicit values to at least 1.
 - zcashd's `LegacyCompat` default resolves to `FullPrivacy` when a Unified Address is
   involved and `AllowFullyTransparent` otherwise; zecd's resolves to the configured
-  `[spend] privacy_policy`. The sender-side policies are accepted but collapse onto
-  `AllowRevealedRecipients`.
+  `[spend] privacy_policy`.
+- zecd's ladder is linear, so `AllowRevealedSenders` also permits a transparent recipient paid
+  from shielded notes; zcashd treats the two disclosures as incomparable lattice points.
+  `AllowLinkingAccountAddresses` has no separate meaning here, since there is one account.
 - The zero-valued memo-only output is accepted by both.
 
 **Example**
@@ -144,6 +173,29 @@ elif status["status"] == "failed":
 txid = status["result"]["txid"]
 rpc.z_getoperationresult([opid])            # optional: reap it
 ```
+
+**Example: shielding received transparent funds**
+
+Move transparent coins into the wallet's own shielded pool. The source is transparent and the
+recipient is shielded, so this is the shielding send; the change shields too.
+
+```python
+opid = rpc.z_sendmany("ANY_TADDR",
+                      [{"address": rpc.z_getnewaddress(), "amount": 1.0}],
+                      None, None, "AllowRevealedSenders")
+status = rpc.z_waitforoperation(opid)
+```
+
+Drop the `"AllowRevealedSenders"` argument if `[spend] privacy_policy` already permits a
+transparent source; passing it makes the call work whatever the wallet is configured for, since
+the argument is a per-call override. Naming one of the wallet's own `t1` addresses instead of
+`ANY_TADDR` shields only that address's coins and leaves the rest untouched.
+
+There is no "shield everything" amount: the ZIP-317 fee comes out of the inputs, so a sweep has
+to ask for slightly less than the transparent total. Sum the transparent entries of
+[`listunspent`](wallet-history.md#listunspent) (they are the ones carrying a bare t-address, and
+skip any with `generated: true`, which only
+[`z_shieldcoinbase`](#z_shieldcoinbase) can spend) and leave room for the fee.
 
 ## z_shieldcoinbase
 

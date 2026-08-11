@@ -72,7 +72,7 @@ is covered in [Conventions & wire format](index.md).
 | [signmessage](util-control.md#signmessage) | ✓ | same name, differs (transparent-only, same scheme) | Signs with an own **transparent** address's key; shielded addresses answer `-3` |
 | [verifymessage](util-control.md#verifymessage) | ✓ | ✓ | Recovers the signer's pubkey and compares the address; needs no wallet |
 | **Async operations** | | | |
-| [z_sendmany](async-operations.md#z_sendmany) | n/a | ✓ | Async: returns an opid, proves/broadcasts in the background; `fromaddress` must be the wallet's own (`ANY_TADDR` rejected `-5`); explicit `fee` answers `-8` |
+| [z_sendmany](async-operations.md#z_sendmany) | n/a | ✓ | Async: returns an opid, proves/broadcasts in the background; `fromaddress` selects the funding source and must be the wallet's own (or `ANY_TADDR`); explicit `fee` answers `-8` |
 | [z_shieldcoinbase](async-operations.md#z_shieldcoinbase) | n/a | ✓ | Async: sweeps mature transparent coinbase into one shielded output, no change in any pool; `toaddress` must have a shielded receiver; explicit `fee` answers `-8`; nothing mature to shield answers `-6` |
 | [z_getoperationstatus](async-operations.md#z_getoperationstatus) | n/a | ✓ | Non-destructive status objects; wallet-scoped |
 | [z_waitforoperation](async-operations.md#z_waitforoperation) | n/a | n/a | **zecd extension.** Blocks until one operation finishes; adds a `finished` flag; timeout in seconds (default 120, clamped to 3600); non-destructive |

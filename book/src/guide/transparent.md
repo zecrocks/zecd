@@ -103,23 +103,41 @@ the outgoing entry. That test is bounded by the outputs held rather than the add
 costs no request of its own, since the block is already parsed for the shielded scan. Shielded
 spends need none of this: they are found through note nullifiers.
 
-## Spending: fully-transparent only, strictly opt-in
+## Spending: two ways out, both opt-in
 
-A received transparent UTXO can be spent to a transparent recipient with the change kept
-transparent (a normal bitcoin-style t→t send that never touches a shielded pool), but **only**
-under the top rung of the [privacy policy ladder](../design/privacy.md):
+Transparent funds leave the wallet by naming a transparent source on
+[`z_sendmany`](../rpc/async-operations.md#z_sendmany): one of the wallet's own t-addresses to
+spend that address's coins, or `ANY_TADDR` for any of them. Which rung of the
+[privacy policy ladder](../design/privacy.md) you need depends on where the value lands.
 
-- `[spend] privacy_policy = "AllowFullyTransparent"` in config, the only route for
-  `sendtoaddress`/`sendmany`, which take no per-call policy argument; or
-- a [`z_sendmany`](../rpc/async-operations.md) `privacyPolicy` of `AllowFullyTransparent` (or
-  zcashd's `NoPrivacy`, which maps onto the same rung).
+**Shielding (t→z), `AllowRevealedSenders`.** With a shielded recipient, the payment and the
+change both land in the shielded pool. This is the way received transparent funds get shielded,
+and it is the direction most integrations want: the coins stop being transparent. What it
+reveals is the sender side, the addresses being spent and the amounts held at them, which is why
+it is a rung above the default rather than free.
 
-This is the most revealing kind of send (recipient, amount, and funding inputs all public), hence
-the explicit opt-in. Under the **default** policy (`AllowRevealedRecipients`) a transparent-only
-wallet's send still fails with `-6` (insufficient funds): transparent UTXOs are never selected
-as inputs. (Paying *to* a transparent recipient **from shielded funds** works under the default
-policy, with shielded change; `FullPrivacy` and `AllowRevealedAmounts` reject transparent
-recipients with `-8`.)
+```
+z_sendmany "ANY_TADDR" '[{"address":"<own UA>","amount":1.0}]' null null "AllowRevealedSenders"
+```
+
+**Fully transparent (t→t), `AllowFullyTransparent`.** With every recipient a bare transparent
+address, the change is kept transparent and the transaction never touches a shielded pool. This
+is the most revealing kind of send (recipient, amount, funding inputs and change all public),
+which is why it sits on the top rung. It is also the only route for `sendtoaddress`/`sendmany`,
+which take no `fromaddress` and no per-call policy argument, so for them the config value
+`[spend] privacy_policy = "AllowFullyTransparent"` is the whole switch. zcashd's `NoPrivacy`
+maps onto the same rung.
+
+Under the **default** policy (`AllowRevealedRecipients`) a transparent source is refused with
+`-4`, naming the rung that would allow it, and a transparent-only wallet's
+`sendtoaddress`/`sendmany` fails `-6`: those methods only ever select shielded notes. Paying
+*to* a transparent recipient **from shielded funds** works under the default policy, with
+shielded change; `FullPrivacy` and `AllowRevealedAmounts` reject transparent recipients with
+`-8`.
+
+Transparent **coinbase** is never selected by either route.
+[`z_shieldcoinbase`](../rpc/async-operations.md#z_shieldcoinbase) is its only spend path,
+because consensus forbids a transparent output in a transaction spending it.
 
 Because librustzcash's high-level transfer API funds payments from shielded notes only and has no
 persistent transparent-change form, zecd builds the fully-transparent transaction itself: greedy

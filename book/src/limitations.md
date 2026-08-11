@@ -13,26 +13,27 @@ received on when recorded, and empty for change/internal notes. Treat the pair a
 opaque identifier for dedupe, not as something you can feed to transparent-UTXO tooling. See
 [wallet history and unspent](rpc/wallet-history.md).
 
-## Transparent spending is fully-transparent only
+## Shielding is explicit, never automatic
 
-With [transparent support](guide/transparent.md) enabled, a transparent UTXO can be spent to
-a transparent recipient with the change kept transparent, but only under the explicit
-`AllowFullyTransparent` [privacy policy](design/privacy.md). Two directions are not
-implemented:
+Since 0.6.1 a received transparent UTXO can be moved into the shielded pool, by naming a
+transparent source on [`z_sendmany`](rpc/async-operations.md#z_sendmany) under the
+`AllowRevealedSenders` [privacy policy](design/privacy.md). What is still missing:
 
-- **No auto-shielding.** Ordinary (non-coinbase) transparent UTXOs are not automatically
-  shielded into Orchard, so such a receive cannot feed a shielded send. librustzcash's
-  `propose_shielding` exists and wiring it into a caught-up sync pass is the planned path.
-  Coinbase already has an explicit
-  route, [`z_shieldcoinbase`](rpc/async-operations.md#z_shieldcoinbase), because consensus
-  leaves it no other one: a transaction spending transparent coinbase may not have any
-  transparent output, change included.
-- **No mixed inputs.** Transparent UTXOs and shielded notes cannot fund a single send
-  together.
+- **No auto-shielding.** Nothing sweeps transparent receives into the shielded pool on its own;
+  every shield is a call an operator or an integration makes. Wiring librustzcash's
+  `propose_shielding` into a caught-up sync pass is the planned path to a background sweep.
+  Coinbase keeps its own route, [`z_shieldcoinbase`](rpc/async-operations.md#z_shieldcoinbase),
+  because consensus leaves it no other one: a transaction spending transparent coinbase may not
+  have any transparent output, change included.
+- **No mixed inputs.** Transparent UTXOs and shielded notes cannot fund a single send together.
+  One source funds one send, so a shortfall on the named source is `-6` rather than a top-up
+  from the other pool.
+- **No per-address shielded coin control.** Notes are account-scoped, so a shielded
+  `fromaddress` names the account rather than selecting that address's notes. Per-address
+  selection works on the transparent side only.
 
-Until then, treat transparent as a receive-only on-ramp (funds stay put until you spend them
-transparently), or opt in to `AllowFullyTransparent` for t-to-t spends. Under the default
-policy, a transparent-only wallet's `sendtoaddress`/`sendmany` returns `-6`.
+Under the **default** policy a transparent-only wallet's `sendtoaddress`/`sendmany` still
+returns `-6`: those methods take no `fromaddress`, so they only ever spend shielded notes.
 
 ## No transparent receive reconciliation pass
 

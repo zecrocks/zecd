@@ -71,6 +71,10 @@ Ironwood are three distinct pools). Neither method takes a
 per-call policy argument; the config value applies. See the
 [privacy policy ladder](../design/privacy.md).
 
+**Neither method selects a funding source.** They have no `fromaddress`, so they spend the
+account's shielded notes, with the one legacy exception below. Spending transparent UTXOs, and
+shielding them, is [`z_sendmany`](async-operations.md#z_sendmany)'s `fromaddress`.
+
 **Action limit.** `[spend] orchard_action_limit` (default 50, 0 disables) caps the Orchard
 actions of a single send to bound its memory and proving cost. A proposal that exceeds it
 returns `-8` naming whether inputs or outputs overflowed.
