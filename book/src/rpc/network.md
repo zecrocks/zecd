@@ -1,6 +1,6 @@
 # Network
 
-zecd has no P2P layer: its only network relationship is the single [Zebra upstream](../design/zebra-backend.md) it derives chain data from. The four network RPCs exist for client compatibility and report that upstream as if it were the node's one peer. Envelope, auth, and error conventions are on the [RPC conventions page](index.md).
+zecd has no P2P layer: its only network relationship is the single [chain backend](../design/zebra-backend.md) it derives chain data from, a local Zebra node by default or a lightwalletd server in light mode. The four network RPCs exist for client compatibility and report that upstream as if it were the node's one peer. Envelope, auth, and error conventions are on the [RPC conventions page](index.md).
 
 ## getnetworkinfo
 

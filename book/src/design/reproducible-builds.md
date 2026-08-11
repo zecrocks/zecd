@@ -32,9 +32,14 @@ The primary image is a multi-stage build on [StageX](https://stagex.tools) base 
   `-C codegen-units=1`, and `-C link-arg=-Wl,--build-id=none`. Dependencies are pinned by
   the committed `Cargo.lock` (`cargo fetch --locked`, `cargo install --frozen`).
 - The runtime stage is a bare `scratch` image: the static `zecd` binary, empty
-  `/var/lib/zecd` and `/tmp` skeleton dirs, user `10001:10001`, nothing else. No CA bundle
-  is needed because zecd's only upstream is a [local Zebra node over plaintext
-  HTTP](zebra-backend.md); the daemon makes no outbound TLS connections.
+  `/var/lib/zecd` and `/tmp` skeleton dirs, user `10001:10001`, a CA bundle at
+  `/etc/ssl/certs/ca-certificates.crt` with `SSL_CERT_FILE` pointed at it, and nothing else.
+  The bundle is there for [light mode](zebra-backend.md), which dials lightwalletd over TLS and
+  trusts the OS store by default (`tls_roots = "native"`); a full-node deployment never reads
+  it, since that connection is plaintext HTTP to a local node. It comes from a digest-pinned
+  source on both targets (a StageX `core-ca-certificates` stage on amd64, the pinned Alpine
+  builder base on arm64), so it is a pinned input like every other and does not weaken the
+  bit-for-bit guarantee.
 - The build enables `--features mimalloc-secure`. musl's default allocator (`malloc-ng`)
   contends under Orchard proving's multi-threaded (rayon) allocation churn: roughly 80x more
   futex syscalls than mimalloc, costing about 10% per shielded send on bare metal and

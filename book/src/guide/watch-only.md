@@ -64,7 +64,7 @@ zecd --datadir ./watch init --ufvk "uview1..." --birthday 2500000
 
 - `--ufvk` conflicts with `--restore` and `--encrypt` (there is no mnemonic and nothing to
   encrypt). The malformed-key check runs before any directory or network I/O.
-- Unlike `export-ufvk`, `init --ufvk` **needs the Zebra upstream reachable**: it fetches the
+- Unlike `export-ufvk`, `init --ufvk` **needs the chain backend reachable**: it fetches the
   chain tip and the tree state at the birthday to anchor the wallet.
 - An imported key may have history, so it is treated like a restore: **pass `--birthday`** (a
   height at or before the account's first transaction) to avoid the safe-but-slow default,

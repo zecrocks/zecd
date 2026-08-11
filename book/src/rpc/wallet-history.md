@@ -322,8 +322,8 @@ raw `hex`.
   the top level. `memo`/`memoStr` appear per detail entry.
 - `hex` is the stored raw transaction when the wallet has it (wallet-authored sends, and
   receives stored via the mempool stream or the enhancement pass). For a transaction the
-  wallet only ever saw as a compact block, the bytes are fetched on demand from the Zebra
-  upstream. The fetch is best-effort: an unreachable upstream yields `""`, not an error.
+  wallet only ever saw as a compact block, the bytes are fetched on demand from the chain
+  backend. The fetch is best-effort: an unreachable upstream yields `""`, not an error.
 - Mined/unmined block fields and `trusted` follow the shared conventions above.
 
 **Errors**

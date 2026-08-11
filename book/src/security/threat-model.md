@@ -39,12 +39,36 @@ entries, or the generated cookie). The transport is plaintext HTTP, same as bitc
 is assumed to be a trusted network segment (loopback, or a private segment fronted by
 TLS/reverse proxy). Authentication proves identity; it does not encrypt the wire.
 
-**zecd to Zebra.** Plaintext local JSON-RPC. Zebra is **fully trusted for the chain view**:
-balances, confirmation counts, incoming payments, and mempool visibility are whatever Zebra
-serves. zecd validates response shapes, not consensus. This is why the deployment model is
-self-hosted-only: you point zecd at a node you run, not a public endpoint. See
-[the Zebra backend](../design/zebra-backend.md). Zebra never sees key material; a compromised
-node cannot steal funds, only lie about the chain.
+**zecd to the chain backend.** The backend is **fully trusted for the chain view**: balances,
+confirmation counts, incoming payments, and mempool visibility are whatever it serves. zecd
+validates response shapes, not consensus. It never sees key material, so a compromised backend
+cannot steal funds, only lie about the chain. See
+[chain backends](../design/zebra-backend.md).
+
+Which backend you run changes the rest of this hop:
+
+- **Full node (default).** Plaintext local JSON-RPC to a Zebra you run yourself, so the trust
+  above is trust in your own machine. Note the hop is not metadata-free even here: shielded
+  scanning pulls whole blocks and filters locally, but a transparent-enabled wallet also queries
+  the node's address index by address. That is a non-issue when the node is yours, and it is the
+  same traffic that becomes an exposure in light mode. Credentials over cleartext to a non-local
+  host are refused unless deliberately overridden.
+- **Light mode (0.6.x and later).** gRPC to a lightwalletd, which may be someone else's server.
+  The chain-view trust is now trust in a third party, and there is a second, distinct exposure:
+  **the server learns which addresses this wallet cares about**, because transparent spend
+  detection queries it per funded address. TLS is the wire mitigation and can be pinned to a
+  certificate fingerprint or a private CA; plaintext to a globally routable host is refused
+  rather than silently downgraded, precisely because what it leaks is the address set. But TLS
+  protects the hop, not the metadata: the server itself still sees every query.
+
+  Be specific about how much it sees. Those address queries are currently issued as a single
+  call spanning the address's funding height through to the chain tip, rather than as the
+  sequence of narrow windows the protocol provides for decorrelation. That is the right call
+  against an always-on index you run yourself, and it is what makes a deep restore finish in
+  reasonable time, but it is not gated on who the backend is. Against a third-party
+  lightwalletd it means the server learns each funded address's full history range in one
+  query. **A wallet whose address set is sensitive should run its own node**, which is the
+  standing recommendation for transparent-enabled wallets on other grounds too.
 
 **zecd to disk.** The datadir holds the encrypted seed, the wallet DB, and the RPC cookie.
 Filesystem permissions are the boundary; zecd sets 0600 on the cookie and the identity file
@@ -97,7 +121,9 @@ Explicit non-goals:
 - **Zcash protocol or librustzcash vulnerabilities.** Report those upstream per the
   [Zcash ecosystem security policy](https://z.cash/support/security/), not against zecd.
 - **Hiding metadata from your own Zebra node.** zecd fetches full blocks and polls the
-  mempool from a node you run; the node necessarily learns the wallet's sync pattern.
+  mempool from a node you run; the node necessarily learns the wallet's sync pattern. Metadata
+  exposure to a *third-party* backend is a different matter and is not a non-goal: see the
+  light-mode paragraph in Trust boundaries above for what such a server learns.
 
 Supply-chain integrity of the shipped binaries is addressed separately by the
 [reproducible build pipeline](../design/reproducible-builds.md). To report a vulnerability in

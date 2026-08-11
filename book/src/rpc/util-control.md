@@ -253,7 +253,7 @@ Every value is constant: an empty but "loaded" pool with the conventional ZIP-31
 
 **vs Bitcoin Core**: same first eight fields; Core master adds more (`incrementalrelayfee`, `unbroadcastcount`, and newer policy/cluster fields) and reports live numbers.
 
-**vs zcashd**: zcashd's `getmempoolinfo` reports its real mempool with only `size`/`bytes`/`usage` (plus a regtest-only `fullyNotified`). Query the Zebra node directly for actual Zcash mempool contents.
+**vs zcashd**: zcashd's `getmempoolinfo` reports its real mempool with only `size`/`bytes`/`usage` (plus a regtest-only `fullyNotified`). Query the upstream node directly for actual Zcash mempool contents.
 
 ## stop
 

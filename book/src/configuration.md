@@ -72,13 +72,14 @@ may run alongside it; see [Watch-only wallets](guide/watch-only.md).
 
 ## `[backend]`
 
-The chain upstream: a single self-hosted Zebra node's JSON-RPC. See
-[Chain backends](design/zebra-backend.md) for the deployment model, the light-mode option
-(0.6.x and later), and the cleartext-credential gate.
+The chain upstream: a single node, either a self-hosted Zebra's JSON-RPC (the default and the
+recommendation) or, since 0.6.0, a lightwalletd gRPC server. **The `server` token picks which**,
+so read its row below before changing it. See [Chain backends](design/zebra-backend.md) for the
+deployment model, the trade-off between the two, and the cleartext-credential gate.
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
-| `server` | string | `"zebra"` | Upstream endpoint. `"zebra"` means a local zebrad at `127.0.0.1:8234` (mainnet) or `127.0.0.1:18234` (testnet/regtest); set zebrad's `rpc.listen_addr` accordingly. Any explicit `zebra://host:port` (or bare `host:port`) works. Overridden by `--server`. |
+| `server` | string | `"zebra"` | Upstream endpoint; **the token also selects the mode**. Full node: `"zebra"` (a local zebrad at `127.0.0.1:8234` mainnet, `127.0.0.1:18234` testnet/regtest; set zebrad's `rpc.listen_addr` accordingly) or an explicit `zebra://host:port`. Light mode: `https://host[:port]`, `http://host:port`, the `"zecrocks"` preset, and **a bare `host:port`** - note that last one is lightwalletd, not zebrad. Overridden by `--server`. |
 | `connect_timeout_secs` | integer | `10` | Per-attempt dial timeout (seconds); clamped to at least 1. |
 | `reconnect_base_secs` | integer | `1` | Reconnect backoff base delay (seconds); clamped to at least 1. Backoff is exponential with full jitter. |
 | `reconnect_max_secs` | integer | `60` | Reconnect backoff cap (seconds); clamped to at least `reconnect_base_secs`. |
