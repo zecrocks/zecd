@@ -5,6 +5,17 @@ All notable changes to zecd are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com), and this
 project adheres to [Semantic Versioning](https://semver.org).
 
+## [0.6.2] - 2026-08-19
+
+A dependency security fix. No first-party code changes, no configuration or response shape
+moves, so upgrading from 0.6.1 is a drop-in.
+
+### Security
+- **h2 is upgraded to 0.4.16**, for RUSTSEC-2026-0258. Versions through 0.4.15 accept and queue empty DATA frames without limit, so a stream that is not actively drained can grow memory without bound. zecd reaches h2 only transitively, but by two paths that both carry real traffic: hyper under axum, which serves the JSON-RPC port, and hyper under tonic, which is light mode's upstream connection. Low severity upstream, and the fix is the upgrade.
+
+### Changed
+- The funded regtest tier pays from the 0.6.1 release image rather than 0.5.2, and a funder binary that cannot answer `zecd config check` now fails the run instead of quietly skipping that assertion. Test-only; nothing about a running daemon changes.
+
 ## [0.6.1] - 2026-08-11
 
 Received transparent funds can now be moved into the shielded pool. Until this release a wallet
@@ -410,6 +421,7 @@ Zcash, backed entirely by librustzcash and running as a light client.
 ### Security
 - Pre-release audit hardening; refuse to start on mainnet with the placeholder RPC password; enforce a 12-character passphrase minimum.
 
+[0.6.2]: https://github.com/zecrocks/zecd/compare/v0.6.1...v0.6.2
 [0.6.1]: https://github.com/zecrocks/zecd/compare/v0.6.0...v0.6.1
 [0.6.0]: https://github.com/zecrocks/zecd/compare/v0.5.2...v0.6.0
 [0.6.0-rc3]: https://github.com/zecrocks/zecd/compare/v0.6.0-rc2...v0.6.0-rc3
