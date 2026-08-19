@@ -98,10 +98,18 @@ env:
   # and the wallet paying it - and makes the funded tier cross-version coverage: last release funds
   # HEAD, the shape a real deployment upgrades through. Bump this in the same PR as any consensus
   # change, or the funder stops understanding the chain it is funding. Prefer the newest release:
-  # v0.5.2 is the first that rebroadcasts a transaction spending Ironwood notes, which every funder
+  # 0.5.2 was the first that rebroadcasts a transaction spending Ironwood notes, which every funder
   # payment is on this NU6.3-active chain - before it, a send whose broadcast failed was never
-  # retransmitted and simply sat unmined until it expired.
-  ZECD_FUNDER_IMAGE: ${{ inputs.funder-image || 'ghcr.io/zecrocks/zecd@sha256:94ea96227b3244ec95c7784396d9e18b04aa42bc0ff837ca88bd1cfe272c4e07' }}  # v0.5.2
+  # retransmitted and simply sat unmined until it expired. 0.6.0 additionally carries `config
+  # check`, which is what makes `assert_funder_config_check_passes` (regtest-harness/src/lib.rs)
+  # stop warn-and-skipping and start really asserting that the pinned release accepts the config
+  # `write_funder_toml` writes for it - the enforcer behind that function's only-long-stable-keys
+  # rule. Resolve a new digest with:
+  #   TOKEN=$(curl -sL "https://ghcr.io/token?scope=repository:zecrocks/zecd:pull&service=ghcr.io" | jq -r .token)
+  #   curl -sI -H "Authorization: Bearer $TOKEN" \
+  #     -H "Accept: application/vnd.oci.image.index.v1+json" \
+  #     https://ghcr.io/v2/zecrocks/zecd/manifests/<tag> | grep -i docker-content-digest
+  ZECD_FUNDER_IMAGE: ${{ inputs.funder-image || 'ghcr.io/zecrocks/zecd@sha256:b5352653659b18dc1c0ebee916dc5841519dd1cf3b524ff1d3b8877a45ef0dd1' }}  # 0.6.1
   # lightwalletd, built from source at this release tag. Needed only where the *zecd under test* is
   # a light client - the `zecd-lwd` suite and the dedicated regtest_lwd e2e - since the funder now
   # talks straight to the node. 0.5.0 is the first release serving the versioned lightwallet

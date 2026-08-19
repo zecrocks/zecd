@@ -2292,18 +2292,36 @@ fn assert_config_commands_agree(bin: &Path, datadir: &Path) -> Result<()> {
 /// Without it, violating that invariant surfaces as every funded test timing out waiting for a
 /// funder that exited at startup.
 ///
-/// A funder release that predates `config check` cannot answer, so probe for the subcommand and
-/// say so rather than reporting its usage error as a config failure. The assertion goes live on
-/// its own when the funder pin next advances past the release that carries the command.
+/// A funder release predating `config check` answers with a usage error, which
+/// [`run_config_check`] would report as a *config* failure - sending the reader to
+/// [`write_funder_toml`] when the real cause is the pin. So probe for the subcommand first and
+/// name that cause instead.
+///
+/// A missing subcommand is a hard failure, not a skip. `ZECD_FUNDER_IMAGE` is pinned by this
+/// repo, so a funder that cannot answer is a pin someone edited rather than an environment we
+/// happen to run in (the distinction from `ZECD_REGTEST_REQUIRE_SHIELDED_COINBASE`, which keys
+/// on whichever zebrad image is present and so defaults the other way) - and a silent skip
+/// inside a green run is exactly how this assertion sat inert for its whole life.
+/// [`allow_funder_without_config_check`] is the deliberate escape hatch.
 fn assert_funder_config_check_passes(bin: &Path, dir: &Path) -> Result<()> {
     let probe = Command::new(bin)
         .args(["config", "check", "--help"])
         .output()
         .context("spawn zecd config check --help")?;
     if !probe.status.success() {
+        if !allow_funder_without_config_check() {
+            bail!(
+                "the pinned funder zecd has no `config check` (exit {}): ZECD_FUNDER_IMAGE points \
+                 at a release older than 0.6.0. Advance the pin, or set \
+                 ZECD_REGTEST_ALLOW_FUNDER_WITHOUT_CONFIG_CHECK=1 to skip this assertion - which \
+                 is what a bisect walking the pin backwards wants.",
+                probe.status
+            );
+        }
         eprintln!(
-            "WARN the pinned funder zecd has no `config check` (exit {}); skipping the funder \
-             config assertion - it starts working when the funder image pin advances",
+            "WARN skipping the funder config assertion by request \
+             (ZECD_REGTEST_ALLOW_FUNDER_WITHOUT_CONFIG_CHECK): the pinned funder zecd has no \
+             `config check` (exit {})",
             probe.status
         );
         return Ok(());
@@ -2312,6 +2330,15 @@ fn assert_funder_config_check_passes(bin: &Path, dir: &Path) -> Result<()> {
         "the pinned funder release rejects the config the harness wrote for it - \
          write_funder_toml must use only keys that release knows",
     )
+}
+
+/// Whether a funder binary without `config check` is tolerated:
+/// `ZECD_REGTEST_ALLOW_FUNDER_WITHOUT_CONFIG_CHECK=1`. Every release from 0.6.0 on carries the
+/// command, so the only thing this is for is walking `ZECD_FUNDER_IMAGE` *backwards* - a bisect
+/// chasing some unrelated symptom, which should not have every funded stack die at funder init.
+fn allow_funder_without_config_check() -> bool {
+    std::env::var("ZECD_REGTEST_ALLOW_FUNDER_WITHOUT_CONFIG_CHECK")
+        .is_ok_and(|v| !v.is_empty() && v != "0")
 }
 
 /// One `zecd config check --conf <file>` run; `Err` carries the command's own output, which is
