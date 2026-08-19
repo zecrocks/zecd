@@ -20,8 +20,10 @@ use zcash_address::ZcashAddress;
 use zcash_client_backend::data_api::wallet::ConfirmationsPolicy;
 use zcash_client_backend::fees::StandardFeeRule;
 use zcash_client_backend::proposal::Proposal;
+use zcash_client_backend::wallet::WalletTransparentOutput;
+use zcash_client_sqlite::{AccountUuid, ReceivedNoteId};
 use zcash_protocol::memo::MemoBytes;
-use zcash_protocol::TxId;
+use zcash_protocol::{ShieldedPool, TxId};
 use zcash_transparent::address::TransparentAddress;
 use zip32::DiversifierIndex;
 use zip321::TransactionRequest;
@@ -243,6 +245,60 @@ pub struct ShieldCoinbasePlan {
     pub remaining_value: u64,
 }
 
+/// The source selector for `z_mergetoaddress` (zcashd's `fromaddresses` argument), resolved at
+/// the RPC layer. One source **class** per merge: transparent UTXOs and shielded notes are never
+/// combined in one transaction (the same one-source-per-send invariant as [`SendSource`];
+/// consolidating both takes two calls).
+#[derive(Clone, Debug)]
+pub enum MergeSource {
+    /// Merge non-coinbase transparent UTXOs. `None` = `ANY_TADDR` (every wallet receiver);
+    /// `Some(addrs)` = only the named wallet-owned addresses' UTXOs.
+    Transparent(Option<Vec<TransparentAddress>>),
+    /// Merge shielded notes from the given pools (`ANY_SAPLING` = `[Sapling]`, `ANY_ORCHARD` =
+    /// `[Orchard, Ironwood]` - one family, since post-NU6.3 an Orchard receiver holds Ironwood
+    /// notes; a wallet-owned shielded/UA address = the account's enabled pools, the address only
+    /// naming the account as in `z_sendmany`).
+    Shielded(Vec<ShieldedPool>),
+}
+
+/// The work a `z_mergetoaddress` proposal fixed at call time, executed later under the opid.
+/// Selection happens in the synchronous half (like [`ShieldCoinbasePlan`]), so the RPC's
+/// `merging*`/`remaining*` stats describe exactly what the operation will spend; a send racing
+/// the opid fails cleanly at execute.
+pub enum MergeWork {
+    /// A transparent-inputs → one-shielded-payment proposal (t→z merge), executed via the fused
+    /// path like `z_shieldcoinbase` (no change in any pool; payment = inputs - fee).
+    UtxoProposal(Proposal<StandardFeeRule, std::convert::Infallible>),
+    /// A shielded-notes → one-payment proposal (z→z / z→t merge), executed via the fused path
+    /// (no change; payment = inputs - fee).
+    NoteProposal(Proposal<StandardFeeRule, ReceivedNoteId>),
+    /// A fully-transparent t→t merge: the fixed input set and single payout for the native
+    /// transparent builder (no change output - the payout IS `inputs - fee`).
+    TransparentTx {
+        inputs: Vec<WalletTransparentOutput<AccountUuid>>,
+        to: TransparentAddress,
+        amount: zcash_protocol::value::Zatoshis,
+        fee: zcash_protocol::value::Zatoshis,
+    },
+}
+
+/// The synchronous half of `z_mergetoaddress`: the fixed work plus the selection stats zcashd
+/// reports in the RPC's immediate response. `merging*` counts/values are the selected inputs
+/// (value pre-fee, like `shieldingValue`); `remaining*` are the eligible-but-unselected ones a
+/// follow-up call would merge. The inapplicable side is zero (a transparent-source merge has no
+/// note stats and vice versa).
+pub struct MergePlan {
+    pub work: MergeWork,
+    pub merging_utxos: u64,
+    pub merging_transparent_value: u64,
+    pub merging_notes: u64,
+    pub merging_shielded_value: u64,
+    pub remaining_utxos: u64,
+    pub remaining_transparent_value: u64,
+    pub remaining_notes: u64,
+    pub remaining_shielded_value: u64,
+}
+
 /// Commands sent from RPC handlers to the per-wallet actor (the sole DB writer).
 pub enum WalletCommand {
     GetNewAddress {
@@ -321,6 +377,33 @@ pub enum WalletCommand {
     /// the selected UTXOs can't be double-spent by a concurrent send.
     ExecuteShieldCoinbase {
         proposal: Box<Proposal<StandardFeeRule, std::convert::Infallible>>,
+        reply: oneshot::Sender<Result<TxId, RpcError>>,
+    },
+    /// Build a `z_mergetoaddress` plan (selection + fee math, no proving) and return it with
+    /// the merging/remaining stats. The fast synchronous half of the RPC; requires an unlocked
+    /// spending wallet, like a send.
+    ProposeMergeToAddress {
+        source: MergeSource,
+        to_address: ZcashAddress,
+        memo: Option<MemoBytes>,
+        /// Cap on transparent inputs to merge (`None` = unlimited by count; both are still
+        /// bounded by the block-space cap). zcashd's `transparent_limit`, default 50.
+        transparent_limit: Option<usize>,
+        /// Cap on shielded notes to merge (`None` = unlimited by count). zcashd's
+        /// `shielded_limit`, default 200; additionally clamped to `[spend]
+        /// orchard_action_limit` for Orchard-family selections.
+        shielded_limit: Option<usize>,
+        /// The resolved privacy policy: the RPC layer gates the transparent-source cases, and
+        /// the actor enforces `FullPrivacy`'s no-cross-pool rule on the built proposal (the
+        /// input pools aren't known until then), exactly as for a send.
+        privacy: SendPrivacy,
+        reply: oneshot::Sender<Result<MergePlan, RpcError>>,
+    },
+    /// Prove (where applicable), store, and broadcast a previously-built `z_mergetoaddress`
+    /// plan (the async half, run under the operation's opid). Serializes with every other send
+    /// on the actor.
+    ExecuteMergeToAddress {
+        work: Box<MergeWork>,
         reply: oneshot::Sender<Result<TxId, RpcError>>,
     },
 }
@@ -522,6 +605,38 @@ impl WalletHandle {
     ) -> Result<TxId, RpcError> {
         self.dispatch(|reply| WalletCommand::ExecuteShieldCoinbase {
             proposal: Box::new(proposal),
+            reply,
+        })
+        .await
+    }
+
+    /// Build a `z_mergetoaddress` plan + merging/remaining stats (the RPC's synchronous half).
+    #[allow(clippy::too_many_arguments)]
+    pub async fn propose_merge_to_address(
+        &self,
+        source: MergeSource,
+        to_address: ZcashAddress,
+        memo: Option<MemoBytes>,
+        transparent_limit: Option<usize>,
+        shielded_limit: Option<usize>,
+        privacy: SendPrivacy,
+    ) -> Result<MergePlan, RpcError> {
+        self.dispatch(|reply| WalletCommand::ProposeMergeToAddress {
+            source,
+            to_address,
+            memo,
+            transparent_limit,
+            shielded_limit,
+            privacy,
+            reply,
+        })
+        .await
+    }
+
+    /// Execute a `z_mergetoaddress` plan (the async half).
+    pub async fn execute_merge_to_address(&self, work: MergeWork) -> Result<TxId, RpcError> {
+        self.dispatch(|reply| WalletCommand::ExecuteMergeToAddress {
+            work: Box::new(work),
             reply,
         })
         .await

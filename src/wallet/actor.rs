@@ -12,33 +12,40 @@ use anyhow::{anyhow, Context};
 use tokio::sync::{mpsc, oneshot, watch};
 use tracing::{error, info, warn};
 
+use nonempty::NonEmpty;
 use zcash_client_backend::data_api::wallet::{
     create_pczt_from_proposal, create_proposed_transactions, decrypt_and_store_transaction,
     extract_and_store_transaction_from_pczt,
     input_selection::{
-        CoinbasePolicy, GreedyInputSelector, LockFilter, SpendPolicy, TransparentSpendPolicy,
+        CoinbasePolicy, GreedyInputSelector, LockFilter, LockedInputPolicy, SpendPolicy,
+        TransparentSpendPolicy,
     },
-    propose_transfer, ConfirmationsPolicy, SpendingKeys,
+    propose_send_max_transfer, propose_transfer, ConfirmationsPolicy, SpendingKeys, TargetHeight,
 };
 use zcash_client_backend::data_api::{
     Account, AccountBirthday, AccountPurpose, AccountSource, CoinbaseFilter, InputSource,
-    SentTransaction, SentTransactionOutput, TransactionDataRequest, TransactionStatus, WalletRead,
-    WalletWrite,
+    MaxSpendMode, NoteRetention, SentTransaction, SentTransactionOutput, TargetValue,
+    TransactionDataRequest, TransactionStatus, WalletRead, WalletWrite,
 };
 use zcash_client_backend::fees::{
     standard::MultiOutputChangeStrategy, DustOutputPolicy, SplitPolicy, StandardFeeRule,
+    TransactionBalance,
 };
-use zcash_client_backend::proposal::Proposal;
+use zcash_client_backend::proposal::{Proposal, ShieldedInputs};
 use zcash_client_backend::proto::service;
-use zcash_client_backend::wallet::{OvkPolicy, Recipient, TransparentAddressSource};
+use zcash_client_backend::wallet::{
+    OvkPolicy, Recipient, TransparentAddressSource, WalletTransparentOutput,
+};
 use zcash_client_sqlite::error::SqliteClientError;
 use zcash_client_sqlite::{AccountUuid, FsBlockDb};
 use zcash_keys::address::Address;
 use zcash_primitives::transaction::builder::{BuildConfig, Builder, BundlePadding};
+use zcash_primitives::transaction::components::orchard::bundle_version_for_branch;
 use zcash_primitives::transaction::fees::zip317::FeeRule as Zip317FeeRule;
+use zcash_primitives::transaction::fees::{transparent as transparent_fees, FeeRule as _};
 use zcash_primitives::transaction::Transaction;
 use zcash_proofs::prover::LocalTxProver;
-use zcash_protocol::consensus::{BlockHeight, BranchId, Parameters};
+use zcash_protocol::consensus::{BlockHeight, BranchId, NetworkUpgrade, Parameters};
 use zcash_protocol::value::Zatoshis;
 use zcash_protocol::{PoolType, ShieldedPool, TxId};
 use zcash_transparent::address::TransparentAddress;
@@ -62,8 +69,8 @@ use crate::wallet::keys::{self, SeedKeeper};
 use crate::wallet::open::{self, WriteDb};
 use crate::wallet::read;
 use crate::wallet::{
-    make_handle, store, ConnState, DerivedAddress, FirstSeen, RawTx, ReceiverRequest, SendSource,
-    SharedSeed, SyncStatus, WalletCommand, WalletHandle,
+    make_handle, store, ConnState, DerivedAddress, FirstSeen, MergePlan, MergeSource, MergeWork,
+    RawTx, ReceiverRequest, SendSource, SharedSeed, SyncStatus, WalletCommand, WalletHandle,
 };
 
 /// Note-management defaults for change splitting (match zcash-devtool's send defaults).
@@ -1302,6 +1309,274 @@ fn transparent_txout_size(addr: &TransparentAddress) -> usize {
     match addr {
         TransparentAddress::PublicKeyHash(_) => 8 + 1 + 25,
         TransparentAddress::ScriptHash(_) => 8 + 1 + 23,
+    }
+}
+
+/// Build, sign, and record a **fully transparent** transaction from an already-fixed input set:
+/// `selected` UTXOs in, `recipients` plus an optional pre-resolved transparent `change` output
+/// out, balancing at exactly `fee_amount` (the `Builder` rejects a mismatch). This is the shared
+/// core of `do_send_transparent` (which selects greedily to cover an amount and routes change to
+/// the internal chain) and the t→t arm of `z_mergetoaddress` (which fixes the input set at
+/// propose time and pays out `inputs - fee` with **no** change) - single-sourcing the signing
+/// (USK-derived key at each input address's recorded `(scope, index)`) and the
+/// `store_transactions_to_be_sent` recording (which locks the spent UTXOs and keeps the raw
+/// bytes for the rebroadcast loop). Must run under `block_in_place`; broadcasting is the
+/// caller's job.
+#[allow(clippy::too_many_arguments)]
+fn build_signed_transparent_tx(
+    db: &mut WriteDb,
+    net: ZNetwork,
+    target_height: TargetHeight,
+    usk: &zcash_keys::keys::UnifiedSpendingKey,
+    account_id: AccountUuid,
+    selected: &[WalletTransparentOutput<AccountUuid>],
+    recipients: &[(TransparentAddress, Zatoshis)],
+    change: Option<(TransparentAddress, Zatoshis)>,
+    fee_amount: Zatoshis,
+    prover: &LocalTxProver,
+) -> Result<(TxId, Vec<u8>), RpcError> {
+    use rand::rngs::OsRng;
+
+    let fee_rule = Zip317FeeRule::standard();
+    let mut builder = Builder::new(
+        net,
+        BlockHeight::from(target_height),
+        BuildConfig::Standard {
+            sapling_anchor: None,
+            orchard_anchor: None,
+            // Upstream `BuildConfig::Standard` now carries `ironwood_anchor` unconditionally;
+            // this is a transparent-only send (no shielded spends), so there's no anchor.
+            ironwood_anchor: None,
+            orchard_padding: BundlePadding::DEFAULT,
+            ironwood_padding: BundlePadding::DEFAULT,
+        },
+    );
+
+    // Add and key each transparent input. The signing key is derived from the USK transparent
+    // component at the input address's recorded `(scope, index)`; the builder matches each
+    // input to its key by public key.
+    let mut signing_set = TransparentSigningSet::new();
+    let mut spent: Vec<zcash_transparent::bundle::OutPoint> = Vec::new();
+    let acct_priv = usk.transparent();
+    for utxo in selected {
+        let addr = utxo.recipient_address();
+        let meta = db
+            .get_transparent_address_metadata(account_id, addr)
+            .map_err(RpcError::database_internal)?
+            .ok_or_else(|| {
+                RpcError::wallet("missing key metadata for an owned transparent UTXO")
+            })?;
+        let (scope, index) = match meta.source() {
+            TransparentAddressSource::Derived {
+                scope,
+                address_index,
+            } => (*scope, *address_index),
+            // Other sources (imported standalone keys/scripts) only exist with the
+            // `transparent-key-import` feature, which zecd does not enable.
+            #[allow(unreachable_patterns)]
+            _ => {
+                return Err(RpcError::wallet(
+                    "cannot sign a non-derived transparent UTXO",
+                ))
+            }
+        };
+        let sk = acct_priv
+            .derive_secret_key(scope, index)
+            .map_err(|e| RpcError::wallet(format!("transparent key derivation failed: {e}")))?;
+        let pubkey = signing_set.add_key(sk);
+        builder
+            .add_transparent_p2pkh_input(pubkey, utxo.outpoint().clone(), utxo.txout().clone())
+            .map_err(|e| RpcError::wallet(format!("add transparent input: {e}")))?;
+        spent.push(utxo.outpoint().clone());
+    }
+
+    // Recipient outputs (vout 0..n), then the transparent change output (if any).
+    for (addr, amt) in recipients {
+        builder
+            .add_transparent_output(addr, *amt)
+            .map_err(|e| RpcError::wallet(format!("add transparent output: {e}")))?;
+    }
+    if let Some((change_addr, change_val)) = &change {
+        builder
+            .add_transparent_output(change_addr, *change_val)
+            .map_err(|e| RpcError::wallet(format!("add change output: {e}")))?;
+    }
+
+    let result = builder
+        .build(&signing_set, &[], &[], OsRng, prover, prover, &fee_rule)
+        .map_err(|e| RpcError::wallet(format!("transparent transaction build failed: {e}")))?;
+    let tx = result.transaction();
+    let txid = tx.txid();
+    let mut raw = Vec::new();
+    tx.write(&mut raw)
+        .map_err(|e| RpcError::misc(format!("failed to serialize transaction: {e}")))?;
+
+    // Record the send so the spent UTXOs are locked (no double-spend), the raw tx rides the
+    // rebroadcast loop, and history reflects the outgoing payment. A change output is recorded
+    // as an external transparent output to our own address; the receive scan re-adds it as a
+    // spendable UTXO once mined.
+    let mut outputs: Vec<SentTransactionOutput<AccountUuid>> = Vec::new();
+    for (i, (addr, amt)) in recipients.iter().enumerate() {
+        outputs.push(SentTransactionOutput::from_parts(
+            i,
+            Recipient::External {
+                recipient_address: Address::Transparent(*addr).to_zcash_address(&net),
+                output_pool: PoolType::Transparent,
+            },
+            *amt,
+            None,
+        ));
+    }
+    if let Some((change_addr, change_val)) = change {
+        outputs.push(SentTransactionOutput::from_parts(
+            recipients.len(),
+            Recipient::External {
+                recipient_address: Address::Transparent(change_addr).to_zcash_address(&net),
+                output_pool: PoolType::Transparent,
+            },
+            change_val,
+            None,
+        ));
+    }
+    let sent = SentTransaction::new(
+        tx,
+        time::OffsetDateTime::now_utc(),
+        target_height,
+        account_id,
+        &outputs,
+        fee_amount,
+        &spent,
+    );
+    db.store_transactions_to_be_sent(std::slice::from_ref(&sent))
+        .map_err(RpcError::database_internal)?;
+
+    Ok((txid, raw))
+}
+
+/// The most transparent inputs one `z_mergetoaddress` call may select, mirroring librustzcash's
+/// shielding block-space bound (`shielding_max_inputs` at its default 10% of the 2,000,000-byte
+/// block over the ~150-byte P2PKH input size). Both the caller's `transparent_limit` and this
+/// cap apply; zcashd's `transparent_limit = 0` means "as many as will fit", which is this.
+const MERGE_MAX_TRANSPARENT_INPUTS: usize = (2_000_000 * 10 / 100) / 150;
+
+/// The exact ZIP-317 fee for a fully-transparent merge: `n_in` standard P2PKH inputs and ONE
+/// transparent output of `out_bytes` serialized bytes, no change. The logical action count is
+/// `max(n_in, ceil(out_bytes / p2pkh_out_size))`, floored at `grace`, times `marginal` - the
+/// same arithmetic as `select_transparent_inputs`'s fee closure, which the transaction
+/// `Builder` requires to balance exactly.
+fn merge_transparent_fee(
+    n_in: usize,
+    out_bytes: usize,
+    p2pkh_out_size: usize,
+    marginal: u64,
+    grace: usize,
+) -> u64 {
+    marginal * grace.max(n_in.max(out_bytes.div_ceil(p2pkh_out_size))) as u64
+}
+
+/// Resolve the output pool a shielded `z_mergetoaddress` destination pays into, mirroring
+/// librustzcash's `resolve_shielded_destination`: an Orchard receiver takes delivery precedence
+/// and lands in the Ironwood pool once NU6.3 is active (an Orchard receiver holds Ironwood
+/// notes post-activation), else the Orchard pool; a Sapling-only recipient lands in Sapling.
+/// The caller has already peeled off bare transparent destinations.
+fn merge_shielded_destination_pool(
+    dest: &Address,
+    ironwood_active: bool,
+) -> Result<PoolType, RpcError> {
+    if crate::address::has_orchard_receiver(dest) {
+        Ok(if ironwood_active {
+            PoolType::IRONWOOD
+        } else {
+            PoolType::ORCHARD
+        })
+    } else if crate::address::has_shielded_receiver(dest) {
+        Ok(PoolType::SAPLING)
+    } else {
+        Err(RpcError::invalid_parameter(
+            "Invalid parameter, toaddress has no shielded receiver",
+        ))
+    }
+}
+
+/// The per-bundle output/action counts a merge's ZIP-317 fee must price, mirroring
+/// librustzcash's `propose_send_max` (padded `BundleType::DEFAULT`, per-height bundle
+/// versions): Sapling outputs via `num_outputs(spends, requested)`, Orchard and Ironwood
+/// actions via `transactional_action_count(spends, outputs)` on their respective bundle
+/// versions. `dest_pool` decides which bundle carries the single payment output; spends are
+/// the selected notes per pool (all zero for a transparent-source merge).
+fn merge_action_counts(
+    net: &ZNetwork,
+    target_height: TargetHeight,
+    dest_pool: PoolType,
+    sapling_spends: usize,
+    orchard_spends: usize,
+    ironwood_spends: usize,
+) -> Result<(usize, usize, usize), RpcError> {
+    // The `num_actions` calls are librustzcash's own `transactional_action_count` inlined (it is
+    // crate-private there): the padded default bundle's action count for the given spends and
+    // outputs under that bundle version's flags. The builder enforces an exact balance against
+    // the fee computed from these counts, so they must match its configuration.
+    let branch = BranchId::for_height(net, BlockHeight::from(target_height));
+    let sapling_out = sapling::builder::BundleType::DEFAULT
+        .num_outputs(sapling_spends, usize::from(dest_pool == PoolType::SAPLING))
+        .map_err(|e| RpcError::wallet(format!("sapling bundle shape: {e}")))?;
+    let orchard_version = bundle_version_for_branch(branch, orchard::ValuePool::Orchard)
+        .unwrap_or(orchard::bundle::BundleVersion::orchard_v2());
+    let orchard_act = orchard::builder::BundleType::DEFAULT
+        .num_actions(
+            orchard_version.default_flags(),
+            orchard_spends,
+            usize::from(dest_pool == PoolType::ORCHARD),
+        )
+        .map_err(|e| RpcError::wallet(format!("orchard bundle shape: {e}")))?;
+    // The Ironwood pool has no bundle version before NU6.3; an empty bundle counts zero actions
+    // under any version, so the fallback only matters for the count math, never for consensus.
+    let ironwood_version = bundle_version_for_branch(branch, orchard::ValuePool::Ironwood)
+        .unwrap_or(orchard::bundle::BundleVersion::ironwood_v3());
+    let ironwood_act = orchard::builder::BundleType::DEFAULT
+        .num_actions(
+            ironwood_version.default_flags(),
+            ironwood_spends,
+            usize::from(dest_pool == PoolType::IRONWOOD),
+        )
+        .map_err(|e| RpcError::wallet(format!("ironwood bundle shape: {e}")))?;
+    Ok((sapling_out, orchard_act, ironwood_act))
+}
+
+/// A [`NoteRetention`] that keeps everything: the merge's manual selection already truncated
+/// the note set, so `into_vec` must convert it losslessly to the unified note shape
+/// [`ShieldedInputs`] carries.
+struct RetainAllNotes;
+
+impl<NoteRef> NoteRetention<NoteRef> for RetainAllNotes {
+    fn should_retain_sapling(
+        &self,
+        _: &zcash_client_backend::wallet::ReceivedNote<NoteRef, sapling::Note>,
+    ) -> bool {
+        true
+    }
+    fn should_retain_orchard(
+        &self,
+        _: &zcash_client_backend::wallet::ReceivedNote<NoteRef, orchard::note::Note>,
+    ) -> bool {
+        true
+    }
+    fn should_retain_ironwood(
+        &self,
+        _: &zcash_client_backend::wallet::ReceivedNote<NoteRef, orchard::note::Note>,
+    ) -> bool {
+        true
+    }
+}
+
+/// Map a `create_proposed_transactions` failure on a merge plan onto the RPC error surface:
+/// shortfalls (a selected input spent by a racing send) are `-6`, everything else `-4`.
+fn classify_merge_execute_err<E: std::fmt::Display>(e: E) -> RpcError {
+    let s = e.to_string();
+    if s.to_lowercase().contains("insufficient") {
+        RpcError::insufficient_funds(s)
+    } else {
+        RpcError::wallet(s)
     }
 }
 
@@ -3358,6 +3633,31 @@ impl WalletActor {
                 let res = self.do_execute_shield_coinbase(*proposal).await;
                 let _ = reply.send(res);
             }
+            WalletCommand::ProposeMergeToAddress {
+                source,
+                to_address,
+                memo,
+                transparent_limit,
+                shielded_limit,
+                privacy,
+                reply,
+            } => {
+                let res = self
+                    .do_propose_merge_to_address(
+                        source,
+                        to_address,
+                        memo,
+                        transparent_limit,
+                        shielded_limit,
+                        privacy,
+                    )
+                    .await;
+                let _ = reply.send(res);
+            }
+            WalletCommand::ExecuteMergeToAddress { work, reply } => {
+                let res = self.do_execute_merge_to_address(*work).await;
+                let _ = reply.send(res);
+            }
         }
         false
     }
@@ -4489,8 +4789,6 @@ impl WalletActor {
         account_id: AccountUuid,
         from: Option<TransparentAddress>,
     ) -> Result<TxId, RpcError> {
-        use rand::rngs::OsRng;
-
         let net = self.network;
         let policy = confirmations.unwrap_or(self.confirmations_policy);
         // `self.prover` is an `Arc<LocalTxProver>` (shared for the pipeline); the transaction
@@ -4604,70 +4902,6 @@ impl WalletActor {
                 let fee_amount = Zatoshis::from_u64(fee_amount)
                     .map_err(|e| RpcError::misc(format!("fee value: {e}")))?;
 
-                let mut builder = Builder::new(
-                    net,
-                    BlockHeight::from(target_height),
-                    BuildConfig::Standard {
-                        sapling_anchor: None,
-                        orchard_anchor: None,
-                        // Upstream `BuildConfig::Standard` now carries `ironwood_anchor`
-                        // unconditionally; this is a transparent-only send (no shielded spends),
-                        // so there's no anchor.
-                        ironwood_anchor: None,
-                        orchard_padding: BundlePadding::DEFAULT,
-                        ironwood_padding: BundlePadding::DEFAULT,
-                    },
-                );
-
-                // Add and key each transparent input. The signing key is derived from the USK
-                // transparent component at the input address's recorded `(scope, index)`; the
-                // builder matches each input to its key by public key.
-                let mut signing_set = TransparentSigningSet::new();
-                let mut spent: Vec<zcash_transparent::bundle::OutPoint> = Vec::new();
-                let acct_priv = usk.transparent();
-                for utxo in &selected {
-                    let addr = utxo.recipient_address();
-                    let meta = db
-                        .get_transparent_address_metadata(account_id, addr)
-                        .map_err(RpcError::database_internal)?
-                        .ok_or_else(|| {
-                            RpcError::wallet("missing key metadata for an owned transparent UTXO")
-                        })?;
-                    let (scope, index) = match meta.source() {
-                        TransparentAddressSource::Derived {
-                            scope,
-                            address_index,
-                        } => (*scope, *address_index),
-                        // Other sources (imported standalone keys/scripts) only exist with the
-                        // `transparent-key-import` feature, which zecd does not enable.
-                        #[allow(unreachable_patterns)]
-                        _ => {
-                            return Err(RpcError::wallet(
-                                "cannot sign a non-derived transparent UTXO",
-                            ))
-                        }
-                    };
-                    let sk = acct_priv.derive_secret_key(scope, index).map_err(|e| {
-                        RpcError::wallet(format!("transparent key derivation failed: {e}"))
-                    })?;
-                    let pubkey = signing_set.add_key(sk);
-                    builder
-                        .add_transparent_p2pkh_input(
-                            pubkey,
-                            utxo.outpoint().clone(),
-                            utxo.txout().clone(),
-                        )
-                        .map_err(|e| RpcError::wallet(format!("add transparent input: {e}")))?;
-                    spent.push(utxo.outpoint().clone());
-                }
-
-                // Recipient outputs (vout 0..n), then the transparent change output (if any) to a
-                // wallet-owned address.
-                for (addr, amt) in &recipients {
-                    builder
-                        .add_transparent_output(addr, *amt)
-                        .map_err(|e| RpcError::wallet(format!("add transparent output: {e}")))?;
-                }
                 let change_recipient: Option<(TransparentAddress, Zatoshis)> = if has_change {
                     let change_val = Zatoshis::from_u64(change_amount)
                         .map_err(|e| RpcError::misc(format!("change value: {e}")))?;
@@ -4700,66 +4934,24 @@ impl WalletActor {
                                 )
                             })
                         })?;
-                    builder
-                        .add_transparent_output(&change_addr, change_val)
-                        .map_err(|e| RpcError::wallet(format!("add change output: {e}")))?;
                     Some((change_addr, change_val))
                 } else {
                     None
                 };
 
-                let result = builder
-                    .build(&signing_set, &[], &[], OsRng, prover, prover, &fee_rule)
-                    .map_err(|e| {
-                        RpcError::wallet(format!("transparent transaction build failed: {e}"))
-                    })?;
-                let tx = result.transaction();
-                let txid = tx.txid();
-                let mut raw = Vec::new();
-                tx.write(&mut raw)
-                    .map_err(|e| RpcError::misc(format!("failed to serialize transaction: {e}")))?;
-
-                // Record the send so the spent UTXOs are locked (no double-spend), the raw tx rides
-                // the rebroadcast loop, and history reflects the outgoing payment. The change output
-                // is recorded as an external transparent output to our own address; the receive scan
-                // re-adds it as a spendable UTXO once mined.
-                let mut outputs: Vec<SentTransactionOutput<AccountUuid>> = Vec::new();
-                for (i, (addr, amt)) in recipients.iter().enumerate() {
-                    outputs.push(SentTransactionOutput::from_parts(
-                        i,
-                        Recipient::External {
-                            recipient_address: Address::Transparent(*addr).to_zcash_address(&net),
-                            output_pool: PoolType::Transparent,
-                        },
-                        *amt,
-                        None,
-                    ));
-                }
-                if let Some((change_addr, change_val)) = change_recipient {
-                    outputs.push(SentTransactionOutput::from_parts(
-                        recipients.len(),
-                        Recipient::External {
-                            recipient_address: Address::Transparent(change_addr)
-                                .to_zcash_address(&net),
-                            output_pool: PoolType::Transparent,
-                        },
-                        change_val,
-                        None,
-                    ));
-                }
-                let sent = SentTransaction::new(
-                    tx,
-                    time::OffsetDateTime::now_utc(),
+                // The shared build+sign+store core (also the t→t arm of `z_mergetoaddress`).
+                build_signed_transparent_tx(
+                    db,
+                    net,
                     target_height,
+                    &usk,
                     account_id,
-                    &outputs,
+                    &selected,
+                    &recipients,
+                    change_recipient,
                     fee_amount,
-                    &spent,
-                );
-                db.store_transactions_to_be_sent(std::slice::from_ref(&sent))
-                    .map_err(RpcError::database_internal)?;
-
-                Ok((txid, raw))
+                    prover,
+                )
             })?;
 
         // The send consumed some of the wallet's transparent outputs and created transparent
@@ -4969,6 +5161,581 @@ impl WalletActor {
         self.broadcast_committed(txid, raw).await?;
         self.update_status();
         info!("[{}] z_shieldcoinbase broadcast {txid}", self.name);
+        Ok(txid)
+    }
+
+    /// Build a `z_mergetoaddress` plan: fix the input selection (non-coinbase transparent UTXOs
+    /// or shielded notes - one class per merge), compute the exact ZIP-317 fee, and return the
+    /// work plus the merging/remaining stats. The payment is `inputs - fee` with **no change in
+    /// any pool** (a merge pays everything it selects to one destination), so like
+    /// `z_shieldcoinbase` the whole selection is fixed here in the synchronous half and a send
+    /// racing the opid fails cleanly at execute.
+    ///
+    /// Selection is **smallest-first** (a documented zecd choice; zcashd does not specify an
+    /// order): a merge exists to eliminate outputs, and taking the smallest removes the most
+    /// per round under a count limit. Shielded selection is additionally restricted to **one
+    /// pool family per call** when a limit binds (Sapling, or Orchard+Ironwood together) so the
+    /// hand-computed fee stays a faithful specialization of librustzcash's `propose_send_max`;
+    /// repeated calls drain the other family. When no limit binds, the whole proposal is
+    /// delegated to librustzcash's `propose_send_max_transfer` and none of zecd's fee math runs.
+    async fn do_propose_merge_to_address(
+        &mut self,
+        source: MergeSource,
+        to_address: zcash_address::ZcashAddress,
+        memo: Option<zcash_protocol::memo::MemoBytes>,
+        transparent_limit: Option<usize>,
+        shielded_limit: Option<usize>,
+        privacy: SendPrivacy,
+    ) -> Result<MergePlan, RpcError> {
+        use std::collections::BTreeMap;
+
+        // Fail a locked or watch-only wallet synchronously (zcashd errors before returning an
+        // opid); the derived key is dropped - execution re-derives its own.
+        self.relock_if_expired();
+        let account_index = self.account_index.ok_or_else(private_keys_disabled)?;
+        let _ = seed_guard(&self.seed).derive_usk(self.network, account_index)?;
+
+        // Authoritative privacy gates for a transparent source, mirroring `do_send`'s (the RPC
+        // layer rejects both synchronously with the same errors; re-checking keeps the actor
+        // sound against any future caller). The `FullPrivacy` no-cross-pool rule is enforced on
+        // the built proposal below, where the input pools are known.
+        if matches!(source, MergeSource::Transparent(_)) && !privacy.allows_transparent_inputs() {
+            return Err(insufficient_privacy_for_transparent_sender(privacy));
+        }
+
+        // Same tip catch-up as a send: the plan's target height (and thus the eventual tx's
+        // expiry) must come from the real chain tip, not a lagging scanned height.
+        self.sync_to_tip_for_send().await;
+
+        let account_id = self.require_account()?;
+        let net = self.network;
+        let policy = self.confirmations_policy;
+        let orchard_action_limit = self.orchard_action_limit;
+        let db = &mut self.db_data;
+
+        let (target_height, anchor_height) = db
+            .get_target_and_anchor_heights(policy.trusted())
+            .map_err(RpcError::database_internal)?
+            .ok_or_else(|| {
+                RpcError::wallet("wallet has no chain tip yet; cannot build a transaction")
+            })?;
+        let ironwood_active =
+            net.is_nu_active(NetworkUpgrade::Nu6_3, BlockHeight::from(target_height));
+
+        // Destination classification. The RPC layer already validated the encoding; a bare
+        // transparent destination keeps the whole merge transparent (t→t) or pays a shielded
+        // merge out transparently (z→t), anything else resolves to one shielded output pool.
+        let dest_addr: Address = to_address
+            .clone()
+            .convert_if_network::<Address>(net.network_type())
+            .map_err(|e| {
+                RpcError::invalid_parameter(format!(
+                    "Invalid parameter, unknown address format: {e}"
+                ))
+            })?;
+        let dest_transparent: Option<TransparentAddress> = match &dest_addr {
+            Address::Transparent(t) => Some(*t),
+            _ => None,
+        };
+
+        match source {
+            MergeSource::Transparent(addrs) => {
+                let receivers = db
+                    .get_transparent_receivers(account_id, true, true)
+                    .map_err(RpcError::database_internal)?;
+                let from_addrs: Vec<TransparentAddress> = match addrs {
+                    None => receivers.keys().copied().collect(),
+                    Some(list) => {
+                        for a in &list {
+                            if !receivers.contains_key(a) {
+                                return Err(RpcError::invalid_address_or_key(
+                                    "Invalid from address, no payment source found for address.",
+                                ));
+                            }
+                        }
+                        list
+                    }
+                };
+                let mut utxos: Vec<WalletTransparentOutput<AccountUuid>> = Vec::new();
+                for addr in &from_addrs {
+                    utxos.extend(
+                        db.get_spendable_transparent_outputs(
+                            addr,
+                            target_height,
+                            policy,
+                            // A merge either emits a transparent output (t→t) or is the general
+                            // t→z sweep; either way coinbase stays `z_shieldcoinbase`'s alone.
+                            CoinbaseFilter::NonCoinbaseOnly,
+                            // zecd never locks inputs, so lock state can't exclude anything.
+                            LockFilter::Unfiltered,
+                        )
+                        .map_err(RpcError::database_internal)?,
+                    );
+                }
+                let eligible_count = utxos.len() as u64;
+                let eligible_value: u64 = utxos.iter().map(|u| u64::from(u.value())).sum();
+                if utxos.is_empty() {
+                    return Err(RpcError::insufficient_funds(
+                        "Could not find any funds to merge.",
+                    ));
+                }
+                // Smallest-first (outpoint tiebreak for determinism), then the count limit and
+                // the block-space cap.
+                utxos.sort_by_key(|u| (u.value(), *u.outpoint().hash(), u.outpoint().n()));
+                utxos.truncate(
+                    transparent_limit
+                        .unwrap_or(usize::MAX)
+                        .min(MERGE_MAX_TRANSPARENT_INPUTS),
+                );
+                let merging_count = utxos.len() as u64;
+                let merging_value: u64 = utxos.iter().map(|u| u64::from(u.value())).sum();
+
+                // Transparent inputs plus a transparent destination is a fully transparent
+                // transaction (zcashd's split between `AllowRevealedSenders` and
+                // `AllowFullyTransparent`); re-checked here like the source gate above.
+                if dest_transparent.is_some() && privacy != SendPrivacy::AllowFullyTransparent {
+                    return Err(insufficient_privacy_for_fully_transparent());
+                }
+
+                let work = if let Some(to_t) = dest_transparent {
+                    // t→t: exact ZIP-317 fee for n P2PKH inputs and one transparent output,
+                    // matching the transaction `Builder`'s own arithmetic (see
+                    // `select_transparent_inputs`; there is no change output here).
+                    let fee_rule = Zip317FeeRule::standard();
+                    let fee = merge_transparent_fee(
+                        utxos.len(),
+                        transparent_txout_size(&to_t),
+                        fee_rule.p2pkh_standard_output_size(),
+                        u64::from(fee_rule.marginal_fee()),
+                        fee_rule.grace_actions(),
+                    );
+                    let amount = merging_value
+                        .checked_sub(fee)
+                        .filter(|a| *a > 0)
+                        .ok_or_else(|| {
+                            RpcError::insufficient_funds(format!(
+                                "Insufficient funds: {merging_value} zatoshis selected, \
+                                 {fee} required (including fee)"
+                            ))
+                        })?;
+                    MergeWork::TransparentTx {
+                        inputs: utxos,
+                        to: to_t,
+                        amount: Zatoshis::from_u64(amount)
+                            .map_err(|e| RpcError::misc(format!("merge amount: {e}")))?,
+                        fee: Zatoshis::from_u64(fee)
+                            .map_err(|e| RpcError::misc(format!("merge fee: {e}")))?,
+                    }
+                } else {
+                    // t→z: a hand-built single-step proposal, the general-funds analogue of
+                    // librustzcash's `propose_shielding_coinbase` (transparent inputs, one
+                    // shielded payment of `inputs - fee`, no change), executed via the fused
+                    // path which signs the transparent inputs from the USK.
+                    let dest_pool = merge_shielded_destination_pool(&dest_addr, ironwood_active)?;
+                    let (sapling_out, orchard_act, ironwood_act) =
+                        merge_action_counts(&net, target_height, dest_pool, 0, 0, 0)?;
+                    let fee = StandardFeeRule::Zip317
+                        .fee_required(
+                            &net,
+                            BlockHeight::from(target_height),
+                            utxos
+                                .iter()
+                                .map(transparent_fees::InputView::serialized_size),
+                            std::iter::empty::<usize>(),
+                            0,
+                            sapling_out,
+                            orchard_act,
+                            ironwood_act,
+                        )
+                        .map_err(|e| RpcError::wallet(format!("fee computation failed: {e}")))?;
+                    let input_total = Zatoshis::from_u64(merging_value)
+                        .map_err(|e| RpcError::misc(format!("merge input total: {e}")))?;
+                    let payment_amount = (input_total - fee)
+                        .filter(|a| *a > Zatoshis::ZERO)
+                        .ok_or_else(|| {
+                            RpcError::insufficient_funds(format!(
+                                "Insufficient funds: {} zatoshis selected, {} required \
+                                 (including fee)",
+                                u64::from(input_total),
+                                u64::from(fee),
+                            ))
+                        })?;
+                    let payment = zip321::Payment::new(
+                        to_address.clone(),
+                        Some(payment_amount),
+                        memo,
+                        None,
+                        None,
+                        vec![],
+                    )
+                    .map_err(|e| RpcError::invalid_parameter(format!("invalid payment: {e}")))?;
+                    let request = TransactionRequest::new(vec![payment])
+                        .map_err(|e| RpcError::wallet(format!("invalid payment request: {e}")))?;
+                    let mut payment_pools = BTreeMap::new();
+                    payment_pools.insert(0usize, dest_pool);
+                    // Rebuild the inputs in the account-agnostic shape a proposal carries
+                    // (`WalletTransparentOutput<()>`; the redaction upstream applies itself).
+                    let t_inputs: Vec<WalletTransparentOutput<()>> = utxos
+                        .iter()
+                        .map(|u| {
+                            WalletTransparentOutput::from_parts(
+                                u.outpoint().clone(),
+                                u.txout().clone(),
+                                u.mined_height(),
+                                u.recipient_account().map(|_| ()),
+                                u.recipient_key_scope(),
+                                None,
+                            )
+                            .ok_or_else(|| {
+                                RpcError::wallet("owned transparent UTXO has no known script form")
+                            })
+                        })
+                        .collect::<Result<_, _>>()?;
+                    let balance = TransactionBalance::new(vec![], fee)
+                        .map_err(|_| RpcError::misc("merge fee overflows".to_string()))?;
+                    let proposal = Proposal::single_step(
+                        request,
+                        payment_pools,
+                        t_inputs,
+                        None,
+                        anchor_height,
+                        balance,
+                        StandardFeeRule::Zip317,
+                        target_height,
+                        policy,
+                        // `is_shielding = true` is reserved for the "no payment, all value in
+                        // change" shape of `propose_shielding`; this is an explicit payment.
+                        false,
+                        ironwood_active,
+                    )
+                    .map_err(|e| RpcError::wallet(format!("merge proposal invalid: {e}")))?;
+                    enforce_orchard_action_limit(&proposal, orchard_action_limit)?;
+                    MergeWork::UtxoProposal(proposal)
+                };
+
+                Ok(MergePlan {
+                    work,
+                    merging_utxos: merging_count,
+                    merging_transparent_value: merging_value,
+                    merging_notes: 0,
+                    merging_shielded_value: 0,
+                    remaining_utxos: eligible_count.saturating_sub(merging_count),
+                    remaining_transparent_value: eligible_value.saturating_sub(merging_value),
+                    remaining_notes: 0,
+                    remaining_shielded_value: 0,
+                })
+            }
+            MergeSource::Shielded(pools) => {
+                let notes = db
+                    .select_spendable_notes(
+                        account_id,
+                        TargetValue::AllFunds(MaxSpendMode::MaxSpendable),
+                        &pools,
+                        target_height,
+                        policy,
+                        &[],
+                        LockFilter::Unfiltered,
+                    )
+                    .map_err(RpcError::database_internal)?;
+                let sapling_n = notes.sapling().len();
+                let orchard_family_n = notes.orchard().len() + notes.ironwood().len();
+                let eligible_count = (sapling_n + orchard_family_n) as u64;
+                let eligible_value = u64::from(
+                    notes
+                        .total_value()
+                        .map_err(|e| RpcError::misc(format!("note value overflow: {e:?}")))?,
+                );
+                if eligible_count == 0 {
+                    return Err(RpcError::insufficient_funds(
+                        "Could not find any funds to merge.",
+                    ));
+                }
+
+                let limit = shielded_limit.unwrap_or(usize::MAX);
+                // The Orchard-family action cap: one payment output at most, so the family's
+                // proposal actions = max(spends, 1) = spends; `enforce_orchard_action_limit`
+                // runs on the built proposal as a backstop.
+                let family_fits_action_limit =
+                    orchard_action_limit == 0 || orchard_family_n <= orchard_action_limit;
+
+                if sapling_n + orchard_family_n <= limit && family_fits_action_limit {
+                    // No limit binds: delegate the whole proposal (selection, fee, pool
+                    // routing, TEX rejection) to librustzcash's send-max primitive.
+                    let proposal = propose_send_max_transfer::<_, _, _, Infallible>(
+                        db,
+                        &net,
+                        account_id,
+                        &pools,
+                        &StandardFeeRule::Zip317,
+                        to_address.clone(),
+                        memo,
+                        MaxSpendMode::MaxSpendable,
+                        policy,
+                        &LockedInputPolicy::default(),
+                        // zecd does not lock inputs: the single-writer actor serializes sends.
+                        None,
+                    )
+                    .map_err(|e| {
+                        let s = e.to_string();
+                        if s.to_lowercase().contains("insufficient") {
+                            RpcError::insufficient_funds(s)
+                        } else {
+                            RpcError::wallet(s)
+                        }
+                    })?;
+                    // The input pools are only known now: enforce FullPrivacy's no-cross-pool
+                    // rule (and the action-limit backstop) on the built proposal, as `do_send`
+                    // does.
+                    if privacy == SendPrivacy::FullPrivacy {
+                        enforce_full_privacy(&proposal)?;
+                    }
+                    enforce_orchard_action_limit(&proposal, orchard_action_limit)?;
+                    Ok(MergePlan {
+                        work: MergeWork::NoteProposal(proposal),
+                        merging_utxos: 0,
+                        merging_transparent_value: 0,
+                        merging_notes: eligible_count,
+                        merging_shielded_value: eligible_value,
+                        remaining_utxos: 0,
+                        remaining_transparent_value: 0,
+                        remaining_notes: 0,
+                        remaining_shielded_value: 0,
+                    })
+                } else {
+                    // A limit binds: manual truncated selection, one pool family per call (the
+                    // family holding more notes), smallest-first within it.
+                    let family_is_sapling = sapling_n >= orchard_family_n;
+                    let cap = if family_is_sapling {
+                        limit
+                    } else if orchard_action_limit > 0 {
+                        limit.min(orchard_action_limit)
+                    } else {
+                        limit
+                    };
+                    let mut fam: Vec<_> = notes
+                        .into_vec(&RetainAllNotes)
+                        .into_iter()
+                        .filter(|n| {
+                            let orchard_family = matches!(
+                                n.note().pool(),
+                                ShieldedPool::Orchard | ShieldedPool::Ironwood
+                            );
+                            family_is_sapling != orchard_family
+                        })
+                        .collect();
+                    fam.sort_by_key(|n| u64::from(n.note().value()));
+                    fam.truncate(cap);
+                    let merging_count = fam.len() as u64;
+                    let merging_value: u64 = fam.iter().map(|n| u64::from(n.note().value())).sum();
+                    let sapling_spends = fam
+                        .iter()
+                        .filter(|n| n.note().pool() == ShieldedPool::Sapling)
+                        .count();
+                    let orchard_spends = fam
+                        .iter()
+                        .filter(|n| n.note().pool() == ShieldedPool::Orchard)
+                        .count();
+                    let ironwood_spends = fam
+                        .iter()
+                        .filter(|n| n.note().pool() == ShieldedPool::Ironwood)
+                        .count();
+
+                    let (dest_pool, out_sizes): (PoolType, Vec<usize>) = match dest_transparent {
+                        Some(t) => (PoolType::Transparent, vec![transparent_txout_size(&t)]),
+                        None => (
+                            merge_shielded_destination_pool(&dest_addr, ironwood_active)?,
+                            vec![],
+                        ),
+                    };
+                    let (sapling_out, orchard_act, ironwood_act) = merge_action_counts(
+                        &net,
+                        target_height,
+                        dest_pool,
+                        sapling_spends,
+                        orchard_spends,
+                        ironwood_spends,
+                    )?;
+                    let fee = StandardFeeRule::Zip317
+                        .fee_required(
+                            &net,
+                            BlockHeight::from(target_height),
+                            std::iter::empty(),
+                            out_sizes,
+                            sapling_spends,
+                            sapling_out,
+                            orchard_act,
+                            ironwood_act,
+                        )
+                        .map_err(|e| RpcError::wallet(format!("fee computation failed: {e}")))?;
+                    let input_total = Zatoshis::from_u64(merging_value)
+                        .map_err(|e| RpcError::misc(format!("merge input total: {e}")))?;
+                    let payment_amount = (input_total - fee)
+                        .filter(|a| *a > Zatoshis::ZERO)
+                        .ok_or_else(|| {
+                            RpcError::insufficient_funds(format!(
+                                "Insufficient funds: {} zatoshis selected, {} required \
+                                 (including fee)",
+                                u64::from(input_total),
+                                u64::from(fee),
+                            ))
+                        })?;
+                    let payment = zip321::Payment::new(
+                        to_address.clone(),
+                        Some(payment_amount),
+                        memo,
+                        None,
+                        None,
+                        vec![],
+                    )
+                    .map_err(|e| RpcError::invalid_parameter(format!("invalid payment: {e}")))?;
+                    let request = TransactionRequest::new(vec![payment])
+                        .map_err(|e| RpcError::wallet(format!("invalid payment request: {e}")))?;
+                    let mut payment_pools = BTreeMap::new();
+                    payment_pools.insert(0usize, dest_pool);
+                    let shielded_inputs = ShieldedInputs::from_parts(
+                        NonEmpty::from_vec(fam)
+                            .ok_or_else(|| RpcError::misc("empty merge selection".to_string()))?,
+                    );
+                    let balance = TransactionBalance::new(vec![], fee)
+                        .map_err(|_| RpcError::misc("merge fee overflows".to_string()))?;
+                    let proposal = Proposal::single_step(
+                        request,
+                        payment_pools,
+                        vec![],
+                        Some(shielded_inputs),
+                        anchor_height,
+                        balance,
+                        StandardFeeRule::Zip317,
+                        target_height,
+                        policy,
+                        false,
+                        ironwood_active,
+                    )
+                    .map_err(|e| RpcError::wallet(format!("merge proposal invalid: {e}")))?;
+                    if privacy == SendPrivacy::FullPrivacy {
+                        enforce_full_privacy(&proposal)?;
+                    }
+                    enforce_orchard_action_limit(&proposal, orchard_action_limit)?;
+
+                    Ok(MergePlan {
+                        work: MergeWork::NoteProposal(proposal),
+                        merging_utxos: 0,
+                        merging_transparent_value: 0,
+                        merging_notes: merging_count,
+                        merging_shielded_value: merging_value,
+                        remaining_utxos: 0,
+                        remaining_transparent_value: 0,
+                        remaining_notes: eligible_count.saturating_sub(merging_count),
+                        remaining_shielded_value: eligible_value.saturating_sub(merging_value),
+                    })
+                }
+            }
+        }
+    }
+
+    /// Execute a `z_mergetoaddress` plan: prove/sign/store/broadcast the fixed work. Proposal
+    /// shapes ride the fused `create_proposed_transactions` path (which signs transparent
+    /// inputs from the USK and proves shielded spends - merges are rare enough that the
+    /// per-send proving-key rebuild is acceptable, exactly as for `z_shieldcoinbase`); the
+    /// fully-transparent t→t shape uses the native transparent builder with **no change**
+    /// output. Runs on the actor under the operation's opid, serialized with every other send.
+    async fn do_execute_merge_to_address(&mut self, work: MergeWork) -> Result<TxId, RpcError> {
+        self.relock_if_expired();
+        let account_index = self.account_index.ok_or_else(private_keys_disabled)?;
+        let usk = seed_guard(&self.seed).derive_usk(self.network, account_index)?;
+
+        let net = self.network;
+        let (txid, raw): (TxId, Vec<u8>) = match work {
+            MergeWork::UtxoProposal(proposal) => {
+                let prover: &LocalTxProver = &self.prover;
+                let db = &mut self.db_data;
+                tokio::task::block_in_place(move || -> Result<_, RpcError> {
+                    let txids = create_proposed_transactions::<_, _, Infallible, _, Infallible, _>(
+                        db,
+                        &net,
+                        prover,
+                        prover,
+                        &SpendingKeys::from_unified_spending_key(usk),
+                        OvkPolicy::Sender,
+                        &proposal,
+                        None,
+                    )
+                    .map_err(classify_merge_execute_err)?;
+                    if txids.len() > 1 {
+                        return Err(RpcError::wallet(
+                            "multi-transaction proposals are not supported",
+                        ));
+                    }
+                    let txid = *txids.first();
+                    let raw = read_raw_tx(db, txid)?;
+                    Ok((txid, raw))
+                })?
+            }
+            MergeWork::NoteProposal(proposal) => {
+                let prover: &LocalTxProver = &self.prover;
+                let db = &mut self.db_data;
+                tokio::task::block_in_place(move || -> Result<_, RpcError> {
+                    let txids = create_proposed_transactions::<_, _, Infallible, _, Infallible, _>(
+                        db,
+                        &net,
+                        prover,
+                        prover,
+                        &SpendingKeys::from_unified_spending_key(usk),
+                        OvkPolicy::Sender,
+                        &proposal,
+                        None,
+                    )
+                    .map_err(classify_merge_execute_err)?;
+                    if txids.len() > 1 {
+                        return Err(RpcError::wallet(
+                            "multi-transaction proposals are not supported",
+                        ));
+                    }
+                    let txid = *txids.first();
+                    let raw = read_raw_tx(db, txid)?;
+                    Ok((txid, raw))
+                })?
+            }
+            MergeWork::TransparentTx {
+                inputs,
+                to,
+                amount,
+                fee,
+            } => {
+                let account_id = self.require_account()?;
+                let prover: &LocalTxProver = &self.prover;
+                let db = &mut self.db_data;
+                let (target_height, _anchor) = db
+                    .get_target_and_anchor_heights(std::num::NonZeroU32::MIN)
+                    .map_err(RpcError::database_internal)?
+                    .ok_or_else(|| {
+                        RpcError::wallet("wallet has no chain tip yet; cannot build a transaction")
+                    })?;
+                let recipients = [(to, amount)];
+                tokio::task::block_in_place(move || -> Result<_, RpcError> {
+                    build_signed_transparent_tx(
+                        db,
+                        net,
+                        target_height,
+                        &usk,
+                        account_id,
+                        &inputs,
+                        &recipients,
+                        // A merge pays out `inputs - fee`: no change output by construction.
+                        None,
+                        fee,
+                        prover,
+                    )
+                })?
+            }
+        };
+
+        // Every merge shape can consume transparent UTXOs the engine's input matcher watches
+        // (t→t and t→z always do), so refresh the watch set before the next scan.
+        self.transparent_unspent_dirty = true;
+        self.broadcast_committed(txid, raw).await?;
+        self.update_status();
+        info!("[{}] z_mergetoaddress broadcast {txid}", self.name);
         Ok(txid)
     }
 
@@ -6343,6 +7110,78 @@ mod tests {
             transparent_only_recipients(&net, &TransactionRequest::empty())
                 .unwrap()
                 .is_none()
+        );
+    }
+
+    /// The t→t merge fee is the transaction `Builder`'s own ZIP-317 arithmetic for n P2PKH
+    /// inputs and exactly one output, no change - a mismatch makes the builder reject the
+    /// transaction at execute, so this math is load-bearing, not advisory.
+    #[test]
+    fn merge_transparent_fee_matches_builder_arithmetic() {
+        use super::merge_transparent_fee;
+        // One input, one P2PKH output (34 bytes → 1 output action): the grace floor of 2
+        // actions applies.
+        assert_eq!(
+            merge_transparent_fee(1, P2PKH_OUT, P2PKH_OUT, MARGINAL, GRACE),
+            MARGINAL * 2
+        );
+        // 50 inputs dominate the single output: 50 actions.
+        assert_eq!(
+            merge_transparent_fee(50, P2PKH_OUT, P2PKH_OUT, MARGINAL, GRACE),
+            MARGINAL * 50
+        );
+        // A P2SH output (32 bytes) still prices as one output action.
+        assert_eq!(
+            merge_transparent_fee(3, 8 + 1 + 23, P2PKH_OUT, MARGINAL, GRACE),
+            MARGINAL * 3
+        );
+    }
+
+    /// The merge's destination-pool resolution mirrors librustzcash's
+    /// `resolve_shielded_destination`: Orchard receivers take precedence and land in Ironwood
+    /// once NU6.3 is active (else Orchard); Sapling-only recipients land in Sapling. Getting
+    /// this wrong desynchronizes the hand-computed fee from the transaction the builder makes.
+    #[test]
+    fn merge_shielded_destination_pool_resolves_by_receiver_and_activation() {
+        use super::merge_shielded_destination_pool;
+        use crate::network::ZNetwork;
+        use zcash_keys::address::{Address, UnifiedAddress};
+        use zcash_keys::keys::{ReceiverRequirement::*, UnifiedAddressRequest, UnifiedSpendingKey};
+        use zcash_protocol::PoolType;
+        use zip32::{AccountId, DiversifierIndex};
+
+        let net = ZNetwork::Test;
+        let ufvk = UnifiedSpendingKey::from_seed(&net, &[7u8; 32], AccountId::ZERO)
+            .unwrap()
+            .to_unified_full_viewing_key();
+        let (ua, _) = ufvk
+            .find_address(
+                DiversifierIndex::new(),
+                UnifiedAddressRequest::unsafe_custom(Require, Require, Omit),
+            )
+            .unwrap();
+        let orchard_dest = Address::Unified(
+            UnifiedAddress::from_receivers(ua.orchard().cloned(), None, None).unwrap(),
+        );
+        let sapling_dest = Address::Sapling(ua.sapling().cloned().unwrap());
+
+        assert_eq!(
+            merge_shielded_destination_pool(&orchard_dest, true).unwrap(),
+            PoolType::IRONWOOD
+        );
+        assert_eq!(
+            merge_shielded_destination_pool(&orchard_dest, false).unwrap(),
+            PoolType::ORCHARD
+        );
+        // Sapling-only stays Sapling regardless of activation.
+        assert_eq!(
+            merge_shielded_destination_pool(&sapling_dest, true).unwrap(),
+            PoolType::SAPLING
+        );
+        // A dual UA resolves to the Orchard-family side (delivery precedence).
+        assert_eq!(
+            merge_shielded_destination_pool(&Address::Unified(ua), true).unwrap(),
+            PoolType::IRONWOOD
         );
     }
 

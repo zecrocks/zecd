@@ -4280,6 +4280,7 @@ dependencies = [
  "incrementalmerkletree",
  "libc",
  "mimalloc",
+ "nonempty",
  "orchard",
  "pczt",
  "prost",

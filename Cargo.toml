@@ -103,6 +103,10 @@ zcash_transparent = "0.10"
 # tree via zcash_transparent; same crate Zallet uses for this).
 zcash_script = "0.4.5"
 sapling = { package = "sapling-crypto", version = "0.7" }
+# `NonEmpty` is the shape librustzcash's proposal API speaks (`ShieldedInputs::from_parts`,
+# `Proposal` steps); needed by the hand-built z_mergetoaddress proposals. Same version the
+# librustzcash workspace pins, so the types unify.
+nonempty = "0.11"
 # PCZT roles (Prover/Signer) for the cached-proving-key send path. Versions track the
 # zcash_client_backend `pczt` feature's own pin (0.9.3).
 pczt = { version = "0.9.3", default-features = false, features = ["prover", "signer", "orchard", "sapling"] }

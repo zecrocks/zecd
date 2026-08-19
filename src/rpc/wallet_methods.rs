@@ -2154,6 +2154,307 @@ pub(crate) async fn z_shieldcoinbase(
     }))
 }
 
+/// zcashd's default `transparent_limit` for `z_mergetoaddress`: at most this many transparent
+/// UTXOs are merged per call when the caller doesn't pass a limit (`0` = as many as fit the
+/// block-space cap).
+const MERGE_DEFAULT_TRANSPARENT_LIMIT: usize = 50;
+
+/// zcashd's default `shielded_limit` for `z_mergetoaddress` (its modern Sapling default): at
+/// most this many notes are merged per call when the caller doesn't pass a limit (`0` =
+/// unlimited by count). Orchard-family selections are additionally clamped to `[spend]
+/// orchard_action_limit` (see the actor).
+const MERGE_DEFAULT_SHIELDED_LIMIT: usize = 200;
+
+/// `z_mergetoaddress ["fromaddress", ...] "toaddress" (fee) (transparent_limit) (shielded_limit)
+/// (memo) (privacyPolicy)` - zcashd's consolidation sweep: merge many UTXOs and/or notes into
+/// ONE output at `toaddress`, paying `inputs - fee` (no amount argument, no change in any
+/// pool). **Async**: the selection and the `merging*`/`remaining*` stats are fixed
+/// synchronously; proving/broadcast runs under the returned `opid`. Call repeatedly (the
+/// `remaining*` stats say what a follow-up would pick up) until the wallet is consolidated.
+///
+/// Sources are one **class** per call - transparent (`ANY_TADDR` or wallet-owned t-addresses)
+/// or shielded (`ANY_SAPLING`, zecd's `ANY_ORCHARD` = the Orchard+Ironwood family, or a
+/// wallet-owned shielded/UA address = the account's notes) - never both in one transaction
+/// (zecd's one-source-per-send invariant; zcashd similarly refuses to mix Sprout and Sapling).
+/// The privacy ladder gates the revealing shapes exactly as for `z_sendmany`: a transparent
+/// source needs `AllowRevealedSenders`, a fully transparent t→t merge needs
+/// `AllowFullyTransparent`, and a transparent payout from shielded notes needs
+/// `AllowRevealedRecipients`.
+pub(crate) async fn z_mergetoaddress(
+    state: &AppState,
+    wallet: Option<&str>,
+    req: &RpcRequest,
+) -> Result<Value, RpcError> {
+    let handle = state.registry.get(wallet)?.clone();
+
+    // fromaddresses (arg 0): a non-empty array of wildcards and/or wallet-owned addresses. A
+    // missing argument is Bitcoin Core's help error (-1); a present-but-non-array one is -8.
+    let entries = req
+        .param(0)
+        .ok_or_else(|| RpcError::misc("z_mergetoaddress requires a fromaddresses array"))?
+        .as_array()
+        .ok_or_else(|| {
+            RpcError::invalid_parameter("Invalid parameter, expected an array of addresses")
+        })?;
+    if entries.is_empty() {
+        return Err(RpcError::invalid_parameter(
+            "Invalid parameter, fromaddresses array is empty.",
+        ));
+    }
+    let mut seen = BTreeSet::new();
+    let mut any_taddr = false;
+    let mut any_sapling = false;
+    let mut any_orchard = false;
+    let mut own_shielded = false;
+    let mut taddrs: Vec<zcash_transparent::address::TransparentAddress> = Vec::new();
+    for v in entries {
+        let s = v.as_str().ok_or_else(|| {
+            RpcError::invalid_parameter("Invalid parameter, expected a string address")
+        })?;
+        if !seen.insert(s.to_string()) {
+            return Err(RpcError::invalid_parameter(format!(
+                "Invalid parameter, duplicated address: {s}"
+            )));
+        }
+        match s {
+            "ANY_TADDR" => any_taddr = true,
+            "ANY_SAPLING" => any_sapling = true,
+            // zecd extension: zcashd's wildcard set predates Orchard. One family - post-NU6.3
+            // an Orchard receiver holds Ironwood notes, so the wildcard spans both.
+            "ANY_ORCHARD" => any_orchard = true,
+            "ANY_SPROUT" => {
+                return Err(RpcError::invalid_parameter(
+                    "Invalid parameter, Sprout is not supported",
+                ))
+            }
+            addr => {
+                let Some(decoded) = crate::address::decode_on_network(&handle.network, addr) else {
+                    return Err(RpcError::invalid_address_or_key(
+                        "Invalid from address: should be a taddr, zaddr, or unified address",
+                    ));
+                };
+                if let read::UaReceivers::Inconsistent(why) =
+                    read::classify_unified_receivers(handle.network, &handle.dir, addr)
+                {
+                    return Err(RpcError::invalid_address_or_key(why));
+                }
+                if !read::is_mine(handle.network, &handle.dir, addr) {
+                    return Err(RpcError::invalid_address_or_key(
+                        "Invalid from address, no payment source found for address.",
+                    ));
+                }
+                match decoded {
+                    zcash_keys::address::Address::Transparent(t) => taddrs.push(t),
+                    _ => own_shielded = true,
+                }
+            }
+        }
+    }
+    let has_transparent_source = any_taddr || !taddrs.is_empty();
+    let has_shielded_source = any_sapling || any_orchard || own_shielded;
+    if has_transparent_source && has_shielded_source {
+        // The one documented divergence from zcashd (whose t+z merge predates the
+        // one-source-per-send model): two calls achieve the same consolidation.
+        return Err(RpcError::invalid_parameter(
+            "Invalid parameter, transparent and shielded sources cannot be merged in one \
+             transaction; call z_mergetoaddress once per source class.",
+        ));
+    }
+    if any_taddr && !taddrs.is_empty() {
+        return Err(RpcError::invalid_parameter(
+            "Invalid parameter, cannot specify both ANY_TADDR and individual t-addresses",
+        ));
+    }
+    if own_shielded && (any_sapling || any_orchard) {
+        return Err(RpcError::invalid_parameter(
+            "Invalid parameter, cannot specify both a shielded wildcard and individual \
+             shielded addresses",
+        ));
+    }
+    let source = if has_transparent_source {
+        crate::wallet::MergeSource::Transparent(if any_taddr { None } else { Some(taddrs) })
+    } else {
+        use zcash_protocol::ShieldedPool;
+        // A wallet-owned shielded/UA address names the account (notes are account-scoped, so
+        // per-address shielded coin control does not exist - same caveat as `z_sendmany`'s
+        // `fromaddress`): merge across every pool the account can hold.
+        let pools = if own_shielded {
+            vec![
+                ShieldedPool::Sapling,
+                ShieldedPool::Orchard,
+                ShieldedPool::Ironwood,
+            ]
+        } else {
+            let mut pools = Vec::new();
+            if any_sapling {
+                pools.push(ShieldedPool::Sapling);
+            }
+            if any_orchard {
+                pools.push(ShieldedPool::Orchard);
+                pools.push(ShieldedPool::Ironwood);
+            }
+            pools
+        };
+        crate::wallet::MergeSource::Shielded(pools)
+    };
+
+    // toaddress (arg 1): any own or foreign taddr/zaddr; an unparseable one is zcashd's -8
+    // "unknown address format" (unlike fromaddresses entries, which are -5). TEX destinations
+    // are rejected - paying one is a two-transaction ZIP-320 proposal, and zecd rejects
+    // multi-transaction proposals everywhere.
+    let toaddress = req.require_str(1, "z_mergetoaddress requires a toaddress")?;
+    let to_addr =
+        crate::address::parse_recipient_on_network(&handle.network, toaddress).map_err(|_| {
+            RpcError::invalid_parameter(format!(
+                "Invalid parameter, unknown address format: {toaddress}"
+            ))
+        })?;
+    let decoded_to = crate::address::decode_on_network(&handle.network, toaddress);
+    if matches!(decoded_to, Some(zcash_keys::address::Address::Tex(_))) {
+        return Err(RpcError::invalid_parameter(
+            "Invalid parameter, TEX addresses are not supported as a merge destination",
+        ));
+    }
+    let to_transparent = decoded_to
+        .as_ref()
+        .is_some_and(|a| !crate::address::has_shielded_receiver(a));
+
+    // fee (arg 2): ZIP-317 only - an explicit fee is rejected, never silently applied.
+    if req.param(2).is_some_and(param_engaged) {
+        return Err(RpcError::invalid_parameter(
+            "fee is not supported (fees are ZIP-317, computed by the wallet)",
+        ));
+    }
+
+    // transparent_limit (arg 3) / shielded_limit (arg 4): zcashd's per-call caps; 0 means "as
+    // many as fit". Accepted (and ignored) for the source class they don't apply to, like
+    // zcashd.
+    let parse_limit = |v: Option<&Value>, default: usize, what: &str| match v {
+        None | Some(Value::Null) => Ok(Some(default)),
+        Some(v) => {
+            let n = v.as_i64().ok_or_else(|| {
+                RpcError::invalid_parameter(format!(
+                    "Invalid parameter, {what} limit must be an integer"
+                ))
+            })?;
+            if n < 0 {
+                return Err(RpcError::invalid_parameter(format!(
+                    "Limit on maximum number of {what} inputs cannot be negative"
+                )));
+            }
+            Ok(if n == 0 { None } else { Some(n as usize) })
+        }
+    };
+    let transparent_limit =
+        parse_limit(req.param(3), MERGE_DEFAULT_TRANSPARENT_LIMIT, "transparent")?;
+    let shielded_limit = parse_limit(req.param(4), MERGE_DEFAULT_SHIELDED_LIMIT, "shielded")?;
+
+    // memo (arg 5): optional hex memo, shielded destinations only (zcashd convention).
+    let memo = match req.param(5) {
+        None | Some(Value::Null) => None,
+        Some(Value::String(s)) if s.is_empty() => None,
+        Some(Value::String(s)) => {
+            let bytes = hex::decode(s).map_err(|_| {
+                RpcError::invalid_parameter(
+                    "Invalid parameter, expected memo data in hexadecimal format.",
+                )
+            })?;
+            Some(MemoBytes::from_bytes(&bytes).map_err(|_| {
+                RpcError::invalid_parameter(
+                    "Invalid parameter, memo is longer than the maximum allowed 512 bytes.",
+                )
+            })?)
+        }
+        Some(_) => return Err(RpcError::type_error("memo must be a hex string")),
+    };
+    if memo.is_some() && to_transparent {
+        return Err(RpcError::invalid_parameter(
+            "Memo cannot be used with a transparent recipient",
+        ));
+    }
+
+    // privacyPolicy (arg 6): per-call override of `[spend] privacy_policy`, the same ladder as
+    // `z_sendmany`.
+    let privacy = privacy_from_policy(
+        req.param(6).and_then(|v| v.as_str()),
+        state.config.spend.privacy,
+    )?;
+
+    // Synchronous privacy gates (the actor re-checks authoritatively): spending transparent
+    // UTXOs reveals the sender (`AllowRevealedSenders`); transparent inputs plus a transparent
+    // destination is a fully transparent transaction (`AllowFullyTransparent`); paying a
+    // transparent destination from shielded notes reveals the recipient
+    // (`AllowRevealedRecipients`, the same `-8` shape as `build_payment`'s).
+    if matches!(source, crate::wallet::MergeSource::Transparent(_)) {
+        if !privacy.allows_transparent_inputs() {
+            return Err(crate::wallet::actor::insufficient_privacy_for_transparent_sender(privacy));
+        }
+        if to_transparent && privacy != SendPrivacy::AllowFullyTransparent {
+            return Err(crate::wallet::actor::insufficient_privacy_for_fully_transparent());
+        }
+    } else if to_transparent && !privacy.allows_transparent_recipient() {
+        return Err(RpcError::invalid_parameter(format!(
+            "Privacy policy {} rejects {toaddress}: it has no shielded receiver, so paying it \
+             would reveal the amount and recipient on-chain. Use privacyPolicy \
+             \"AllowRevealedRecipients\" (or set [spend] privacy_policy) to permit this.",
+            privacy.policy_name()
+        )));
+    }
+
+    // The synchronous half: fix the selection and stats on the actor (SQL + fee math, no
+    // proving). A locked wallet, an unknown source address, or "no funds to merge" all fail
+    // here, synchronously.
+    let plan = handle
+        .propose_merge_to_address(
+            source,
+            to_addr,
+            memo,
+            transparent_limit,
+            shielded_limit,
+            privacy,
+        )
+        .await?;
+
+    let context = ContextInfo::new(
+        "z_mergetoaddress",
+        json!({
+            "fromaddresses": req.param(0).cloned().unwrap_or(Value::Null),
+            "toaddress": toaddress,
+        }),
+    );
+
+    let merging_utxos = plan.merging_utxos;
+    let merging_transparent_value = plan.merging_transparent_value;
+    let merging_notes = plan.merging_notes;
+    let merging_shielded_value = plan.merging_shielded_value;
+    let remaining_utxos = plan.remaining_utxos;
+    let remaining_transparent_value = plan.remaining_transparent_value;
+    let remaining_notes = plan.remaining_notes;
+    let remaining_shielded_value = plan.remaining_shielded_value;
+
+    // The async half: prove + store + broadcast under an opid, funnelled through the actor
+    // like every send (so it serializes with them - no double-spend surface).
+    let exec_handle = handle.clone();
+    let opid = state
+        .operations
+        .try_insert(&handle.name, Some(context), async move {
+            let txid = exec_handle.execute_merge_to_address(plan.work).await?;
+            Ok::<Value, RpcError>(json!({ "txid": txid.to_string() }))
+        })?;
+
+    Ok(json!({
+        "remainingUTXOs": remaining_utxos,
+        "remainingTransparentValue": zats_to_value(remaining_transparent_value),
+        "remainingNotes": remaining_notes,
+        "remainingShieldedValue": zats_to_value(remaining_shielded_value),
+        "mergingUTXOs": merging_utxos,
+        "mergingTransparentValue": zats_to_value(merging_transparent_value),
+        "mergingNotes": merging_notes,
+        "mergingShieldedValue": zats_to_value(merging_shielded_value),
+        "opid": opid,
+    }))
+}
+
 /// `z_getoperationstatus ([opid, ...])` - status objects for the wallet's async operations
 /// (all of them when no array is given). Non-destructive; well-formed-but-unknown ids are
 /// silently omitted, a malformed id is `-8`.

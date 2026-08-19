@@ -923,6 +923,93 @@ def main() -> int:
     except JSONRPCException as e:
         ck("z_shieldcoinbase without coinbase -> code -6/-13",
            e.code in (-6, -13), e.code)
+    # z_mergetoaddress (zcashd's consolidation sweep, async). All of these reject before any
+    # operation is spawned, so they move no money.
+    try:
+        # A missing fromaddresses is Bitcoin Core's help error (-1), like the other required
+        # args; a present-but-non-array one is -8 (below).
+        rpc.call("z_mergetoaddress")
+        ck("z_mergetoaddress no args raises", False)
+    except JSONRPCException as e:
+        ck("z_mergetoaddress no args -> code -1", e.code == -1, e.code)
+    try:
+        rpc.call("z_mergetoaddress", "notarray", addr)
+        ck("z_mergetoaddress non-array fromaddresses raises", False)
+    except JSONRPCException as e:
+        ck("z_mergetoaddress non-array fromaddresses -> code -8", e.code == -8, e.code)
+    try:
+        rpc.call("z_mergetoaddress", [], addr)
+        ck("z_mergetoaddress empty fromaddresses raises", False)
+    except JSONRPCException as e:
+        ck("z_mergetoaddress empty fromaddresses -> code -8", e.code == -8, e.code)
+    try:
+        rpc.call("z_mergetoaddress", ["ANY_SPROUT"], addr)
+        ck("z_mergetoaddress ANY_SPROUT raises", False)
+    except JSONRPCException as e:
+        ck("z_mergetoaddress ANY_SPROUT -> code -8", e.code == -8, e.code)
+    try:
+        # One source class per merge: transparent and shielded sources never mix.
+        rpc.call("z_mergetoaddress", ["ANY_TADDR", "ANY_ORCHARD"], addr)
+        ck("z_mergetoaddress mixed source classes raises", False)
+    except JSONRPCException as e:
+        ck("z_mergetoaddress mixed source classes -> code -8", e.code == -8, e.code)
+    try:
+        rpc.call("z_mergetoaddress", ["ANY_TADDR", "ANY_TADDR"], addr)
+        ck("z_mergetoaddress duplicate entry raises", False)
+    except JSONRPCException as e:
+        ck("z_mergetoaddress duplicate entry -> code -8", e.code == -8, e.code)
+    try:
+        # A wildcard plus an explicit address of the same class is -8 (zcashd's rule); the own
+        # shielded address alongside ANY_SAPLING trips it.
+        rpc.call("z_mergetoaddress", ["ANY_SAPLING", addr], addr)
+        ck("z_mergetoaddress wildcard+explicit raises", False)
+    except JSONRPCException as e:
+        ck("z_mergetoaddress wildcard+explicit -> code -8", e.code == -8, e.code)
+    try:
+        rpc.call("z_mergetoaddress", ["not-an-address"], addr)
+        ck("z_mergetoaddress bad source address raises", False)
+    except JSONRPCException as e:
+        ck("z_mergetoaddress bad source address -> code -5", e.code == -5, e.code)
+    try:
+        rpc.call("z_mergetoaddress", [addr], "not-an-address")
+        ck("z_mergetoaddress bad toaddress raises", False)
+    except JSONRPCException as e:
+        ck("z_mergetoaddress bad toaddress -> code -8", e.code == -8, e.code)
+    try:
+        # An explicit fee is ZIP-317 -8, like every send.
+        rpc.call("z_mergetoaddress", [addr], addr, 0.0001)
+        ck("z_mergetoaddress fee raises", False)
+    except JSONRPCException as e:
+        ck("z_mergetoaddress fee -> code -8", e.code == -8, e.code)
+    try:
+        rpc.call("z_mergetoaddress", [addr], addr, None, -1)
+        ck("z_mergetoaddress negative transparent_limit raises", False)
+    except JSONRPCException as e:
+        ck("z_mergetoaddress negative transparent_limit -> code -8", e.code == -8, e.code)
+    try:
+        rpc.call("z_mergetoaddress", [addr], addr, None, None, "fifty")
+        ck("z_mergetoaddress non-integer shielded_limit raises", False)
+    except JSONRPCException as e:
+        ck("z_mergetoaddress non-integer shielded_limit -> code -8", e.code == -8, e.code)
+    try:
+        rpc.call("z_mergetoaddress", [addr], addr, None, None, None, "not-hex")
+        ck("z_mergetoaddress bad memo hex raises", False)
+    except JSONRPCException as e:
+        ck("z_mergetoaddress bad memo hex -> code -8", e.code == -8, e.code)
+    try:
+        rpc.call("z_mergetoaddress", [addr], addr, None, None, None, None, "Bogus")
+        ck("z_mergetoaddress unknown privacyPolicy raises", False)
+    except JSONRPCException as e:
+        ck("z_mergetoaddress unknown privacyPolicy -> code -8", e.code == -8, e.code)
+    try:
+        # A transparent source needs the AllowRevealedSenders rung; the daemon under test runs
+        # the default policy, so this is a synchronous -4 (same gate as z_sendmany's).
+        rpc.call("z_mergetoaddress", ["ANY_TADDR"], addr)
+        ck("z_mergetoaddress ANY_TADDR default policy raises", False)
+    except JSONRPCException as e:
+        ck("z_mergetoaddress ANY_TADDR default policy -> code -4", e.code == -4, e.code)
+        ck("z_mergetoaddress ANY_TADDR default policy names the gate",
+           "Insufficient privacy policy" in str(e), str(e))
     try:
         # A malformed opid is -8; a well-formed-but-unknown one is silently omitted (below).
         rpc.call("z_getoperationstatus", ["not-an-opid"])
