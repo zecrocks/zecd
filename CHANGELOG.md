@@ -5,6 +5,18 @@ All notable changes to zecd are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com), and this
 project adheres to [Semantic Versioning](https://semver.org).
 
+## [0.6.3] - 2026-08-20
+
+Every librustzcash crate zecd depends on is now a published stable release. The wallet crates
+were the last prerelease versions zecd asked for, carried since 0.5.0-rc3 because the NU6.3 line
+had no finals; upstream published them, so they are gone. There is no first-party code change
+here.
+
+### Changed
+- **The librustzcash wallet crates move from release candidates to their finals**: `zcash_client_backend` 0.24.0, `zcash_client_sqlite` 0.22.0 and `zip321` 0.9.0, bringing `zcash_primitives` 0.30.1, `zcash_protocol` 0.10.5 and `zcash_pool_migration` 0.1.0 with them. Every release note since 0.5.0-rc3 has carried a caveat about depending on release candidates. That caveat no longer applies.
+- A send whose transaction would not fit in a block is refused when the send is proposed, naming that reason, instead of failing later inside the builder. It affects the calls that deliberately select as many inputs as they can: `z_shieldcoinbase` and an `ANY_TADDR` shield.
+- Opening a wallet created by 0.6.2 or earlier runs one new schema migration, which rebuilds the `addresses` table to relax a constraint for an upstream address-import path zecd does not enable. No operator action is needed. Checked against a database written by the previous pin: 70 migrations to 71, with the address rows and their transparent receivers unchanged across the rebuild.
+
 ## [0.6.2] - 2026-08-19
 
 A dependency security fix. No first-party code changes, no configuration or response shape
@@ -421,6 +433,7 @@ Zcash, backed entirely by librustzcash and running as a light client.
 ### Security
 - Pre-release audit hardening; refuse to start on mainnet with the placeholder RPC password; enforce a 12-character passphrase minimum.
 
+[0.6.3]: https://github.com/zecrocks/zecd/compare/v0.6.2...v0.6.3
 [0.6.2]: https://github.com/zecrocks/zecd/compare/v0.6.1...v0.6.2
 [0.6.1]: https://github.com/zecrocks/zecd/compare/v0.6.0...v0.6.1
 [0.6.0]: https://github.com/zecrocks/zecd/compare/v0.5.2...v0.6.0
