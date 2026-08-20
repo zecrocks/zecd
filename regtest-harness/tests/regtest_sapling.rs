@@ -246,6 +246,17 @@ async fn regtest_sapling_and_orchard_balances() {
         .await
         .expect("confirm Sapling send");
 
+    // Wait for the SCAN, not for the balance. A balance poll is not a caught-up check: it can be
+    // satisfied by the tip-priority range while a historic range is still unscanned, and
+    // `get_wallet_summary` zeroes the *entire* shielded balance whenever the spend anchor falls in
+    // an unscanned range - so a poll that just saw 3 ZEC can be followed by a read of 0. That is
+    // exactly how this test failed in CI (`getbalance sums both pools: left Some(0.0), right
+    // Some(3.0)`, with the engine logging `Scanning Historic(161..162)` at the moment of the
+    // assertion). `wait_until_synced_to_node` asks the daemon the question directly.
+    zecd.wait_until_synced_to_node(&zebrad, FUND_TIMEOUT)
+        .await
+        .expect("zecd scans to the chain tip before the balance assertions");
+
     // 7. Both notes confirmed: the wallet holds 3 ZEC across two pools (2 Orchard + 1 Sapling).
     //    Assert EVERY balance RPC aggregates across Sapling + Orchard.
     let deadline = Instant::now() + FUND_TIMEOUT;

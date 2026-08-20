@@ -50,6 +50,100 @@ pub fn value_to_zats(v: &Value) -> Result<Zatoshis, RpcError> {
     Zatoshis::from_nonnegative_i64(zats).map_err(|_| RpcError::type_error("Amount out of range"))
 }
 
+/// An exact, unsigned zatoshi amount for the typed client (`crate::typed`). On the wire it is
+/// Bitcoin Core's bare JSON number with 8 decimal places: `Serialize` goes through
+/// [`zats_to_value`] and `Deserialize` through [`value_to_zats`] (the exact `ParseFixedPoint`
+/// port, including range checks), so an `Amount` never touches `f64` in either direction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct Amount(u64);
+
+impl Amount {
+    pub const fn from_zatoshis(zats: u64) -> Amount {
+        Amount(zats)
+    }
+
+    pub const fn zatoshis(self) -> u64 {
+        self.0
+    }
+}
+
+impl std::fmt::Display for Amount {
+    /// The wire form: 8 decimal places, e.g. `1.50000000`.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}.{:08}", self.0 / COIN, self.0 % COIN)
+    }
+}
+
+impl serde::Serialize for Amount {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        zats_to_value(self.0).serialize(serializer)
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for Amount {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Amount, D::Error> {
+        let v = Value::deserialize(deserializer)?;
+        value_to_zats(&v)
+            .map(|z| Amount(z.into_u64()))
+            .map_err(|e| serde::de::Error::custom(e.message))
+    }
+}
+
+/// A signed zatoshi amount - transaction deltas (`listtransactions`, where sends are negative)
+/// and sentinel-bearing fields (`estimatefee` returns -1). Same exact wire discipline as
+/// [`Amount`]: [`signed_zats_to_value`] out, [`parse_fixed_point`] in, never `f64`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct SignedAmount(i64);
+
+impl SignedAmount {
+    pub const fn from_zatoshis(zats: i64) -> SignedAmount {
+        SignedAmount(zats)
+    }
+
+    pub const fn zatoshis(self) -> i64 {
+        self.0
+    }
+}
+
+impl std::fmt::Display for SignedAmount {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let abs = self.0.unsigned_abs();
+        write!(
+            f,
+            "{}{}.{:08}",
+            if self.0 < 0 { "-" } else { "" },
+            abs / COIN,
+            abs % COIN
+        )
+    }
+}
+
+impl serde::Serialize for SignedAmount {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        signed_zats_to_value(self.0).serialize(serializer)
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for SignedAmount {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<SignedAmount, D::Error> {
+        let v = Value::deserialize(deserializer)?;
+        let literal = match &v {
+            Value::Number(n) => n.to_string(),
+            Value::String(s) => s.clone(),
+            _ => return Err(serde::de::Error::custom("Amount is not a number or string")),
+        };
+        parse_fixed_point(&literal, 8)
+            .map(SignedAmount)
+            .ok_or_else(|| serde::de::Error::custom("Invalid amount"))
+    }
+}
+
 /// Largest arbitrary-decimal mantissa that fits in an `i64`: 10^18 - 1. Larger integers
 /// cannot consist of arbitrary combinations of 0-9 without risking overflow.
 const UPPER_BOUND: i64 = 1_000_000_000_000_000_000 - 1;
@@ -408,6 +502,57 @@ mod tests {
         assert_eq!(parse_fixed_point("1.1e", 8), None);
         assert_eq!(parse_fixed_point("1.1e-", 8), None);
         assert_eq!(parse_fixed_point("1.", 8), None);
+    }
+
+    /// The typed wrappers' `Amount`/`SignedAmount` must agree byte for byte with the wire
+    /// functions in both directions - a serialized amount is the exact 8-dp literal, and
+    /// deserialization preserves sub-f64 precision (the whole reason these exist).
+    #[test]
+    fn typed_amounts_round_trip_exactly() {
+        for zats in [0u64, 1, 150_000_000, COIN, 2_099_999_999_999_999] {
+            let a = Amount::from_zatoshis(zats);
+            // Serialize == the wire function's literal.
+            assert_eq!(
+                serde_json::to_string(&a).unwrap(),
+                zats_to_value(zats).to_string()
+            );
+            // Display is the same 8-dp form.
+            assert_eq!(a.to_string(), zats_to_value(zats).to_string());
+            // And it parses back to the same zatoshis.
+            let back: Amount = serde_json::from_str(&serde_json::to_string(&a).unwrap()).unwrap();
+            assert_eq!(back, a);
+        }
+        // Literal preservation: "0.10000000" is not representable exactly in f64; the typed
+        // path must not go anywhere near it.
+        let a: Amount = serde_json::from_str("0.10000000").unwrap();
+        assert_eq!(a.zatoshis(), 10_000_000);
+        assert_eq!(serde_json::to_string(&a).unwrap(), "0.10000000");
+        // String amounts are accepted, as on the untyped path.
+        let a: Amount = serde_json::from_str("\"0.00000001\"").unwrap();
+        assert_eq!(a.zatoshis(), 1);
+        // Range/precision failures are decode errors, not silent truncation.
+        assert!(serde_json::from_str::<Amount>("-1.0").is_err());
+        assert!(serde_json::from_str::<Amount>("0.000000001").is_err());
+        assert!(serde_json::from_str::<Amount>("21000001").is_err());
+    }
+
+    #[test]
+    fn typed_signed_amounts_carry_sign_and_sentinels() {
+        for zats in [-150_000_000i64, -1, 0, 1, 150_000_000] {
+            let a = SignedAmount::from_zatoshis(zats);
+            assert_eq!(
+                serde_json::to_string(&a).unwrap(),
+                signed_zats_to_value(zats).to_string()
+            );
+            let back: SignedAmount =
+                serde_json::from_str(&serde_json::to_string(&a).unwrap()).unwrap();
+            assert_eq!(back, a);
+        }
+        // estimatefee's -1 sentinel deserializes as exactly -1 ZEC.
+        let a: SignedAmount = serde_json::from_str("-1.00000000").unwrap();
+        assert_eq!(a.zatoshis(), -100_000_000);
+        assert_eq!(a.to_string(), "-1.00000000");
+        assert!(serde_json::from_str::<SignedAmount>("0.000000001").is_err());
     }
 
     #[test]

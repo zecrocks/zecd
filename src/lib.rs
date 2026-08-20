@@ -55,4 +55,5 @@ pub mod rpc;
 pub mod server;
 pub mod state;
 pub mod sync;
+pub mod typed;
 pub mod wallet;

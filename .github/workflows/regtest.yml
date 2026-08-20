@@ -387,6 +387,18 @@ jobs:
         # rest - and exits non-zero if any failed. The lwd leg passes its own shorter list.
         run: regtest-harness/run-tests.sh ${{ matrix.tests || env.HARNESS_TESTS }}
 
+      # The embedded-library e2e: init_wallet -> NodeBuilder::start -> one typed call of each
+      # shape through Node::call, against a throwaway zebrad chain (tests/embedded_regtest.rs).
+      # In-crate rather than in the harness because the harness is deliberately a black-box
+      # driver of the binary and cannot link the library. Zebra leg only (it needs exactly one
+      # zebrad, provisioned above as ZEBRAD_BIN). NB no ZECD_REGTEST_NU63_HEIGHT here: the
+      # test's chain stays pre-NU6.3 by design, and the two sides must agree.
+      - name: Run embedded-library end-to-end test
+        if: matrix.node == 'zebra' && matrix.suite == 'zecd'
+        env:
+          ZECD_EMBEDDED_REGTEST: "1"
+        run: cargo test --release --locked --test embedded_regtest -- --ignored --nocapture
+
       # run-tests.sh already replays each failing binary's output and tails its node log, so this
       # only adds what it can't know about: the machine's state, and whether a binary died so
       # early it left nothing behind.

@@ -370,26 +370,26 @@ impl Node {
     }
 }
 
+/// Test-only builders shared with the typed-client tests: a walletless node over a
+/// hand-built state, so dispatch semantics can be pinned without a wallet or an upstream.
 #[cfg(test)]
-mod tests {
+pub(crate) mod testutil {
     use std::collections::BTreeMap;
     use std::sync::Arc;
     use std::time::Instant;
-
-    use serde_json::Value;
 
     use super::Node;
     use crate::config::{AppConfig, BackendConfig, KeysConfig, RpcConfig, SyncConfig};
     use crate::state::AppState;
     use crate::wallet::WalletRegistry;
 
-    /// A state with no wallets and default (empty) safelist, mirroring the server tests'
-    /// builder - what `Node::for_tests` runs dispatch against.
-    fn test_node() -> Node {
-        test_node_with_safelist(vec![])
+    /// A node over a state with no wallets and the default (empty) safelist, mirroring the
+    /// server tests' builder.
+    pub(crate) fn walletless_node() -> Node {
+        walletless_node_with_safelist(vec![])
     }
 
-    fn test_node_with_safelist(allowed_methods: Vec<String>) -> Node {
+    pub(crate) fn walletless_node_with_safelist(allowed_methods: Vec<String>) -> Node {
         let rpc = RpcConfig {
             bind: "127.0.0.1".parse().unwrap(),
             port: 1,
@@ -456,6 +456,15 @@ mod tests {
             operations: Arc::new(crate::operations::OperationRegistry::new()),
         })
     }
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::Value;
+
+    use super::testutil::{
+        walletless_node as test_node, walletless_node_with_safelist as test_node_with_safelist,
+    };
 
     /// `call` runs the same dispatch table as HTTP: a method that does not exist is -32601,
     /// with the same message shape.
