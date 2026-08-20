@@ -1,24 +1,24 @@
-//! Daemon wiring for the `zecd` binary: tracing init, wallet-actor spawning, the health and
-//! RPC servers, and graceful shutdown.
+//! Daemon wiring for the `zecd` binary: tracing init, the embeddable node
+//! ([`crate::node`]) composed with the health and RPC servers, and graceful shutdown.
 
-use std::sync::Arc;
-use std::time::{Duration, Instant};
+#[cfg(feature = "server")]
+use tracing::{info, warn};
 
-use tracing::{error, info, warn};
-use zcash_protocol::consensus::{NetworkUpgrade, Parameters};
-
-use crate::backend;
-use crate::config::{self, AppConfig};
+#[cfg(any(feature = "cli", feature = "server"))]
+use crate::config;
+#[cfg(feature = "server")]
+use crate::config::AppConfig;
+#[cfg(feature = "server")]
 use crate::health;
+#[cfg(feature = "server")]
 use crate::server;
-use crate::state::AppState;
-use crate::wallet::actor::{self, ActorConfig};
-use crate::wallet::binding;
-use crate::wallet::store::WalletStore;
-use crate::wallet::WalletRegistry;
 
 /// Initialize tracing. The filter defaults to `[log] level` and is overridden by `RUST_LOG`;
 /// `[log] format = "json"` emits structured logs for cloud-native log aggregation.
+///
+/// `cli`-gated (it is the binary's tracing init, on tracing-subscriber): a library consumer
+/// owns its process's tracing subscriber and must not have one installed under it.
+#[cfg(feature = "cli")]
 pub fn init_tracing(log: &config::LogConfig) {
     let filter = tracing_subscriber::EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(&log.level));
@@ -44,179 +44,22 @@ pub fn init_tracing(log: &config::LogConfig) {
     }
 }
 
+#[cfg(feature = "server")]
 pub async fn run(config: AppConfig) -> anyhow::Result<()> {
-    let prog = "zecd";
-    // Single-instance guard: take the exclusive datadir lock before opening any wallet, and hold
-    // it for the whole daemon lifetime (until `run` returns). A second zecd on the same datadir
-    // would corrupt the wallet DB; this makes it refuse to start instead. See `crate::lock`.
-    let _datadir_lock = crate::lock::lock_datadir(&config.datadir)?;
-    // The example/deploy configs ship with a placeholder RPC password; on mainnet that is
-    // spend authority, so refuse to start until it has been changed. Shared with
-    // `zecd config check`, which reports the same refusal without starting anything.
-    config::reject_placeholder_password(&config)?;
-    actor::install_panic_hook();
-    let config = Arc::new(config);
-    let auth = server::auth::Authenticator::from_config(&config.rpc)?;
-    log_auth_mode(&config.rpc, rpcpassword_on_cli(std::env::args_os()));
+    // Fail-fast phase first (datadir lock, placeholder-password refusal, panic hook), then the
+    // HTTP-only startup work, then the wallet spawns - the order the daemon has always had. The
+    // auth construction sits between the two node phases on purpose: a bad rpcauth entry must
+    // fail before any wallet actor is spawned, and its cookie-file side effect belongs to the
+    // binary, never to the embeddable node (see `crate::node`).
+    let prepared = crate::node::NodeBuilder::new(config).prepare()?;
+    let auth = server::auth::Authenticator::from_config(&prepared.config().rpc)?;
+    log_auth_mode(
+        &prepared.config().rpc,
+        rpcpassword_on_cli(std::env::args_os()),
+    );
+    let node = prepared.start().await?;
 
-    // Shutdown broadcast: `true` is sent on Ctrl-C / `stop`. Created before the actors so
-    // each one carries a receiver and can stop its sync loop between batches.
-    let (shutdown_tx, _) = tokio::sync::watch::channel(false);
-
-    let mut registry = WalletRegistry::new(config.default_wallet.clone());
-    let mut actor_tasks = Vec::new();
-    // Build the Orchard proving keys once (they're wallet-independent) and share them across
-    // every actor, so each send reuses the cached key instead of rebuilding it per transaction.
-    // On by default (`[spend] cache_proving_key`).
-    //
-    // The keygen runs **in the background**: it is seconds of CPU, and only sends need its
-    // result, so blocking here would delay spawning the actors and binding the health and RPC
-    // listeners below - leaving the daemon unreachable and not syncing for the whole window. The
-    // first send awaits `ProvingKeys::get`; by then it is normally long finished.
-    let orchard_keys = if config.spend.cache_proving_key {
-        // Also build the PostNu6_3 (Ironwood) proving key when this network can activate NU6.3, so
-        // post-NU6.3 sends prove the Ironwood bundle from the cache instead of rebuilding a key per
-        // send. NU6.3 is live on mainnet (3_428_143) and testnet (4_134_000), so both build it;
-        // only a regtest chain without `ZECD_REGTEST_NU63_HEIGHT` skips a keygen no send there
-        // could use.
-        let build_ironwood = config
-            .network
-            .activation_height(NetworkUpgrade::Nu6_3)
-            .is_some();
-        info!(
-            "building Orchard proving key{} in the background (cached for all sends)",
-            if build_ironwood {
-                " + Ironwood (PostNu6_3) proving key"
-            } else {
-                ""
-            }
-        );
-        let keys = actor::ProvingKeys::new(build_ironwood);
-        keys.spawn_build();
-        Some(keys)
-    } else {
-        None
-    };
-    // zecd permits at most one wallet with spending keys; watch-only (UFVK) wallets may be
-    // loaded without limit. Record each opened wallet's watch-only flag so the invariant can
-    // be enforced once every wallet has been spawned (the flag is only known after the actor
-    // reads the account from the wallet DB).
-    let mut loaded: Vec<(String, bool)> = Vec::new();
-    for (name, entry) in &config.wallets {
-        let keys_path = entry.keys_path();
-        if !WalletStore::exists(&keys_path) {
-            warn!(
-                "wallet '{}' is not initialized ({} missing); skipping (run `{prog} init --wallet {}`)",
-                name,
-                keys_path.display(),
-                name
-            );
-            continue;
-        }
-        let server = backend::resolve_configured(&config)?;
-        // Transparent *receives* now ride the block scan on both backends, so a large address
-        // set no longer means per-block polling. What stays per-address is spend detection:
-        // librustzcash emits one `TransactionsInvolvingAddress` request per funded address, and
-        // on a light backend each is a remote round trip rather than a local index lookup. A
-        // wallet holding many funded transparent addresses is therefore still better served by
-        // a local zebra - worth saying once at startup, before the scan begins.
-        const LIGHT_TRANSPARENT_ADDR_WARN: u32 = 1_000;
-        if server.kind() == backend::ServerKind::Lightwalletd
-            && entry.transparent_enabled
-            && (entry.transparent_initial_scan >= LIGHT_TRANSPARENT_ADDR_WARN
-                || entry.transparent_gap_limit >= LIGHT_TRANSPARENT_ADDR_WARN)
-        {
-            tracing::warn!(
-                "[{name}] transparent_initial_scan = {} / transparent_gap_limit = {} on a \
-                 lightwalletd backend: spend detection queries each funded address separately, \
-                 one remote round trip apiece. Running your own zebra (server = \"zebra\") is \
-                 recommended at this scale",
-                entry.transparent_initial_scan,
-                entry.transparent_gap_limit,
-            );
-        }
-        let actor_cfg = ActorConfig {
-            name: name.clone(),
-            network: config.network,
-            wallet_dir: entry.dir.clone(),
-            keys_path: keys_path.clone(),
-            server,
-            sync_interval: Duration::from_secs(config.sync.interval_secs),
-            rebroadcast_interval: Duration::from_secs(config.sync.rebroadcast_secs),
-            connect_timeout: Duration::from_secs(config.backend.connect_timeout_secs),
-            reconnect_base: Duration::from_secs(config.backend.reconnect_base_secs),
-            reconnect_max: Duration::from_secs(config.backend.reconnect_max_secs),
-            age_identity: config.keys.age_identity.clone(),
-            auto_unlock: config.keys.auto_unlock,
-            bootstrap: config.keys.bootstrap_from_keys,
-            // Validated at config load; re-derive here rather than carrying a second copy.
-            confirmations_policy: config.spend.confirmations_policy()?,
-            orchard_action_limit: config.spend.orchard_action_limit,
-            orchard_keys: orchard_keys.clone(),
-            pipeline_proving: config.spend.pipeline_proving,
-            enabled_pools: entry.pools.clone(),
-            default_receivers: entry.default_receivers.clone(),
-            transparent_enabled: entry.transparent_enabled,
-            transparent_default: entry.transparent_default,
-            transparent_gap_limit: entry.transparent_gap_limit,
-            transparent_initial_scan: entry.transparent_initial_scan,
-            transparent_allow_beyond_recovery_window: entry
-                .transparent_allow_beyond_recovery_window,
-            transparent_gap_warn_threshold: entry.transparent_gap_warn_threshold,
-            shutdown: shutdown_tx.subscribe(),
-        };
-        match actor::spawn(actor_cfg).await {
-            Ok((handle, task)) => {
-                let watch_only = handle.status().watch_only;
-                info!(
-                    "loaded wallet '{}'{}",
-                    name,
-                    if watch_only { " (watch-only)" } else { "" }
-                );
-                loaded.push((name.clone(), watch_only));
-                registry.insert(handle);
-                actor_tasks.push((name.clone(), task));
-            }
-            // A failed account-to-keys binding check is evidence the wallet database (or
-            // keys.toml) was replaced, so it is fatal for the whole daemon, like the
-            // single-spending-wallet invariant: zecd won't quietly keep serving the other
-            // wallets while one of them shows signs of tampering. Any other per-wallet
-            // startup failure (unreadable database, missing files) skips just that wallet.
-            Err(e) if e.downcast_ref::<binding::BindingMismatch>().is_some() => {
-                shutdown_tx.send_replace(true);
-                return Err(e);
-            }
-            Err(e) => error!("failed to start wallet '{}': {e}", name),
-        }
-    }
-
-    if registry.is_empty() {
-        anyhow::bail!(
-            "no usable wallets; run `{prog} init` (datadir: {})",
-            config.datadir.display()
-        );
-    }
-
-    // Enforce the single-spending-wallet invariant before serving any RPC. A second spending
-    // wallet is a misconfiguration the operator must resolve (zecd won't silently pick which
-    // one is "the" spender), so this is fatal - the actors spawned above are torn down by the
-    // shutdown signal sent on the early return.
-    if let Err(e) = ensure_single_spending_wallet(&loaded) {
-        shutdown_tx.send_replace(true);
-        return Err(e);
-    }
-
-    let state = AppState {
-        config: config.clone(),
-        auth,
-        registry: Arc::new(registry),
-        started_at: Instant::now(),
-        shutdown_tx: shutdown_tx.clone(),
-        shutting_down: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-        work_queue: Arc::new(tokio::sync::Semaphore::new(config.rpc.work_queue)),
-        active: crate::state::ActiveCommands::default(),
-        operations: Arc::new(crate::operations::OperationRegistry::new()),
-    };
+    let state = node.app_state().clone();
 
     // Translate a termination signal into a graceful shutdown (flag first, so in-flight new
     // requests 503). Both Ctrl-C (SIGINT) and SIGTERM are handled: init systems (systemd,
@@ -231,21 +74,14 @@ pub async fn run(config: AppConfig) -> anyhow::Result<()> {
     // Liveness/readiness probes on a separate port (best-effort; non-fatal if it can't bind).
     tokio::spawn(health::run(state.clone()));
 
-    let result = server::run(state).await;
+    let result = server::run(server::HttpState { app: state, auth }).await;
 
     // Stop the wallet actors and wait for them so the WalletDb is dropped cleanly rather than
-    // the task being killed mid-write at runtime teardown. The send also covers the case where
-    // `server::run` returned on its own (e.g. a bind error) without a shutdown trigger.
-    shutdown_tx.send_replace(true);
-    let actor_stop_deadline = Duration::from_secs(30);
-    for (name, task) in actor_tasks {
-        match tokio::time::timeout(actor_stop_deadline, task).await {
-            Ok(_) => info!("wallet '{name}' stopped"),
-            Err(_) => {
-                warn!("wallet '{name}' did not stop within {actor_stop_deadline:?}; exiting anyway")
-            }
-        }
-    }
+    // the task being killed mid-write at runtime teardown. `Node::shutdown` re-sends the
+    // shutdown signal, which also covers the case where `server::run` returned on its own
+    // (e.g. a bind error) without a shutdown trigger.
+    let config = node.app_state().config.clone();
+    node.shutdown().await;
 
     // bitcoind removes its generated .cookie on clean shutdown so a stale credential can't
     // linger; do the same. Only applies when cookie auth was in use (no user/password set).
@@ -267,6 +103,7 @@ pub async fn run(config: AppConfig) -> anyhow::Result<()> {
 /// interchangeable stop signals, and process managers stop the daemon with SIGTERM. On non-Unix
 /// platforms only Ctrl-C is available. If the SIGTERM handler can't be installed we fall back to
 /// Ctrl-C alone rather than aborting startup.
+#[cfg(feature = "server")]
 async fn wait_for_shutdown_signal() {
     #[cfg(unix)]
     {
@@ -303,6 +140,7 @@ async fn wait_for_shutdown_signal() {
 /// env fallback into one field, so the raw argv is the only way to tell them apart. Argv is the
 /// more exposed of the two: `/proc/<pid>/cmdline` is world-readable and shows up in `ps`, while
 /// `/proc/<pid>/environ` is readable only by the process owner - hence the env-var recommendation.
+#[cfg(feature = "server")]
 fn rpcpassword_on_cli<I, S>(args: I) -> bool
 where
     I: IntoIterator<Item = S>,
@@ -321,6 +159,7 @@ where
 /// cross the network in the clear. A password passed via `--rpcpassword` on the command line
 /// (`password_on_cli`) is called out separately: it leaks to any local user through
 /// `/proc/<pid>/cmdline` and `ps`, independent of the bind address.
+#[cfg(feature = "server")]
 fn log_auth_mode(rpc: &config::RpcConfig, password_on_cli: bool) {
     if !rpc.auth.is_empty() {
         info!("RPC auth: {} salted rpcauth credential(s)", rpc.auth.len());
@@ -352,7 +191,7 @@ fn log_auth_mode(rpc: &config::RpcConfig, password_on_cli: bool) {
 /// pairs each successfully-opened wallet name with its watch-only flag (`true` = watch-only),
 /// in a stable order so the error names the offending wallets deterministically. Returns an
 /// error naming the two spending wallets when more than one is present.
-fn ensure_single_spending_wallet(loaded: &[(String, bool)]) -> anyhow::Result<()> {
+pub(crate) fn ensure_single_spending_wallet(loaded: &[(String, bool)]) -> anyhow::Result<()> {
     let mut spenders = loaded
         .iter()
         .filter(|(_, watch_only)| !watch_only)
@@ -370,7 +209,9 @@ fn ensure_single_spending_wallet(loaded: &[(String, bool)]) -> anyhow::Result<()
 
 #[cfg(test)]
 mod tests {
-    use super::{ensure_single_spending_wallet, rpcpassword_on_cli};
+    use super::ensure_single_spending_wallet;
+    #[cfg(feature = "server")]
+    use super::rpcpassword_on_cli;
 
     fn wallets(entries: &[(&str, bool)]) -> Vec<(String, bool)> {
         entries
@@ -439,6 +280,7 @@ mod tests {
         assert!(msg.contains("'spend-b'"), "{msg}");
     }
 
+    #[cfg(feature = "server")]
     #[test]
     fn rpcpassword_on_cli_detects_both_flag_forms() {
         // Separate-value form: `--rpcpassword hunter2`.
@@ -453,6 +295,7 @@ mod tests {
         assert!(rpcpassword_on_cli(["zecd", "--rpcpassword=hunter2"]));
     }
 
+    #[cfg(feature = "server")]
     #[test]
     fn rpcpassword_on_cli_ignores_env_and_other_flags() {
         // No `--rpcpassword` on argv (the password came from ZECD_RPC_PASSWORD or a file).

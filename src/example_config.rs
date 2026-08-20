@@ -4,9 +4,12 @@
 //! documented starting config out of the binary itself, so an operator never has to hunt for
 //! `zecd.example.toml` in a source tree they may not have (release tarball, `.deb`, container).
 
+#[cfg(feature = "cli")]
 use std::io::Write;
+#[cfg(feature = "cli")]
 use std::path::Path;
 
+#[cfg(feature = "cli")]
 use crate::config::ExampleConfigArgs;
 
 /// The shipped `zecd.example.toml`, embedded at compile time.
@@ -21,6 +24,7 @@ use crate::config::ExampleConfigArgs;
 pub const EXAMPLE_CONFIG: &str = include_str!("../zecd.example.toml");
 
 /// Print the example config to stdout, or write it to `--output-file`.
+#[cfg(feature = "cli")]
 pub fn run(args: &ExampleConfigArgs) -> anyhow::Result<()> {
     let Some(path) = output_path(args) else {
         return write_stdout(EXAMPLE_CONFIG);
@@ -37,6 +41,7 @@ pub fn run(args: &ExampleConfigArgs) -> anyhow::Result<()> {
 ///
 /// `-` is the conventional spelling for "stdout" where a path is expected, so it is *not*
 /// treated as a file literally named `-`.
+#[cfg(feature = "cli")]
 fn output_path(args: &ExampleConfigArgs) -> Option<&Path> {
     match args.output_file.as_deref() {
         Some(p) if p != Path::new("-") => Some(p),
@@ -49,6 +54,7 @@ fn output_path(args: &ExampleConfigArgs) -> Option<&Path> {
 /// Not `print!`: the payload is ~12 KiB, so `zecd example-config | head` closes the pipe
 /// mid-write, and the `println!`/`print!` macros *panic* on `EPIPE` rather than returning it.
 /// A broken pipe here means the reader stopped caring, which is a clean exit, not an error.
+#[cfg(feature = "cli")]
 fn write_stdout(text: &str) -> anyhow::Result<()> {
     let mut out = std::io::stdout().lock();
     match out.write_all(text.as_bytes()).and_then(|()| out.flush()) {
@@ -61,6 +67,7 @@ fn write_stdout(text: &str) -> anyhow::Result<()> {
 ///
 /// The refusal is the point: this command's natural target is `<datadir>/zecd.toml`, where a
 /// silent overwrite would discard a live deployment's settings (credentials included).
+#[cfg(feature = "cli")]
 fn write_file(path: &Path, force: bool, text: &str) -> anyhow::Result<()> {
     let mut f = if force {
         std::fs::File::create(path)
@@ -79,7 +86,7 @@ fn write_file(path: &Path, force: bool, text: &str) -> anyhow::Result<()> {
         .map_err(|e| anyhow::Error::new(e).context(format!("could not write {}", path.display())))
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "cli"))]
 mod tests {
     use super::*;
 

@@ -59,6 +59,18 @@ impl RpcRequest {
         Ok(RpcRequest { id, method, params })
     }
 
+    /// Build a positional request programmatically - the same shape [`RpcRequest::from_value`]
+    /// produces for `{"method": ..., "params": [...]}` with a null id. The embedding facade
+    /// (`crate::node::Node::call`) constructs requests through this so embedded calls and
+    /// HTTP calls enter dispatch identically.
+    pub fn positional(method: impl Into<String>, params: Vec<Value>) -> RpcRequest {
+        RpcRequest {
+            id: Value::Null,
+            method: method.into(),
+            params,
+        }
+    }
+
     /// Positional parameter accessor.
     pub fn param(&self, i: usize) -> Option<&Value> {
         self.params.get(i)
@@ -179,6 +191,22 @@ mod tests {
         let (id, err) = RpcRequest::from_value(v).unwrap_err();
         assert_eq!(id, serde_json::json!(7));
         assert_eq!(err.code, codes::RPC_INVALID_REQUEST);
+    }
+
+    #[test]
+    fn positional_matches_from_value_modulo_id() {
+        // The programmatic constructor and the wire parser must yield the same request for
+        // the same method and params - the facade's wire-identity depends on it.
+        let params = vec![serde_json::json!("addr"), serde_json::json!(1.5)];
+        let built = RpcRequest::positional("sendtoaddress", params.clone());
+        let parsed = RpcRequest::from_value(serde_json::json!({
+            "method": "sendtoaddress",
+            "params": params,
+        }))
+        .unwrap();
+        assert_eq!(built.method, parsed.method);
+        assert_eq!(built.params, parsed.params);
+        assert_eq!(built.id, Value::Null);
     }
 
     #[test]

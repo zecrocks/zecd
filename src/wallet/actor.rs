@@ -535,15 +535,20 @@ thread_local! {
 }
 
 /// Install a panic hook that suppresses the (caught) librustzcash progress-estimator panic
-/// while leaving all other panics fully reported. Call once at startup.
+/// while leaving all other panics fully reported. Idempotent: repeated calls (an embedder
+/// building several nodes in one process) install the hook once rather than nesting a new
+/// wrapper around the previous one on every call.
 pub fn install_panic_hook() {
-    let default = std::panic::take_hook();
-    std::panic::set_hook(Box::new(move |info| {
-        if SILENCE_PROGRESS_PANIC.with(|f| f.get()) {
-            return;
-        }
-        default(info);
-    }));
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        let default = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            if SILENCE_PROGRESS_PANIC.with(|f| f.get()) {
+                return;
+            }
+            default(info);
+        }));
+    });
 }
 
 /// Parameters needed to launch a wallet actor.

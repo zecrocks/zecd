@@ -1,7 +1,7 @@
 //! `zecd init`: create a new wallet (age identity + mnemonic + account), ported from
 //! `zcash-devtool/src/commands/wallet/init.rs`.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use age::secrecy::ExposeSecret as _;
@@ -19,7 +19,9 @@ use zcash_protocol::consensus::{BlockHeight, NetworkUpgrade, Parameters};
 
 use crate::backend;
 use crate::chain::ChainSource as _;
-use crate::config::{AppConfig, ExportUfvkArgs, InitArgs, RescanArgs, WalletEntry};
+use crate::config::{AppConfig, WalletEntry};
+#[cfg(feature = "cli")]
+use crate::config::{ExportUfvkArgs, InitArgs, RescanArgs};
 use crate::network::ZNetwork;
 use crate::pools::{Receiver, ReceiverSet};
 use crate::wallet::keys;
@@ -50,6 +52,7 @@ fn restore_birthday_default(network: ZNetwork, pools: &ReceiverSet) -> (u32, &'s
 pub const MIN_PASSPHRASE_CHARS: usize = 12;
 
 /// Reject a too-short passphrase before it wraps the mnemonic.
+#[cfg(any(feature = "cli", test))]
 fn validate_passphrase(p: &str) -> anyhow::Result<()> {
     let n = p.chars().count();
     if n < MIN_PASSPHRASE_CHARS {
@@ -62,6 +65,7 @@ fn validate_passphrase(p: &str) -> anyhow::Result<()> {
 /// environment variable (for non-interactive/automated init); otherwise prompts on stderr and
 /// reads it twice from stdin to confirm. Only the trailing newline is stripped, so a passphrase
 /// may contain surrounding spaces.
+#[cfg(feature = "cli")]
 fn read_encryption_passphrase() -> anyhow::Result<Passphrase> {
     if let Some(p) = std::env::var_os("ZECD_WALLET_PASSPHRASE") {
         let s = p.to_string_lossy().into_owned();
@@ -87,6 +91,7 @@ fn read_encryption_passphrase() -> anyhow::Result<Passphrase> {
 /// environment variable, then `file` - and otherwise print `prompt` on stderr and read one line
 /// from stdin. Surrounding whitespace is trimmed. Shared by `init --restore` and
 /// `derive-address --mnemonic` so both accept the same inputs in the same precedence.
+#[cfg(feature = "cli")]
 pub(crate) fn read_mnemonic_phrase(
     file: Option<&Path>,
     prompt: &str,
@@ -105,14 +110,6 @@ pub(crate) fn read_mnemonic_phrase(
         line.trim().to_string()
     };
     Ok(<Mnemonic<English>>::from_phrase(&phrase)?)
-}
-
-/// Read the mnemonic phrase for `init --restore`.
-fn read_restore_mnemonic(args: &InitArgs) -> anyhow::Result<Mnemonic<English>> {
-    read_mnemonic_phrase(
-        args.mnemonic_file.as_deref(),
-        "Enter the mnemonic phrase to restore, then press Enter:",
-    )
 }
 
 /// Resolve the [`WalletEntry`] for `wallet`: the configured `[wallets.<name>]` entry, or the
@@ -139,13 +136,156 @@ pub(crate) fn resolve_wallet_entry(config: &AppConfig, wallet: &str) -> WalletEn
         })
 }
 
+/// The restore phrase for [`init_wallet`], with any interactive input deferred behind a
+/// callback: the CLI reads the phrase from stdin only *after* the upstream connect and tip
+/// fetch (that ordering is observable - a dead upstream fails before the prompt), so a caller
+/// that wants the same behavior supplies `Deferred` and one with the phrase in hand supplies
+/// `Phrase`. The same pattern as [`rescan_wallet`]'s `confirm` callback.
+pub enum MnemonicInput {
+    Phrase(Mnemonic<English>),
+    Deferred(Box<dyn FnOnce() -> anyhow::Result<Mnemonic<English>> + Send>),
+}
+
+impl MnemonicInput {
+    fn resolve(self) -> anyhow::Result<Mnemonic<English>> {
+        match self {
+            MnemonicInput::Phrase(m) => Ok(m),
+            MnemonicInput::Deferred(f) => f(),
+        }
+    }
+}
+
+/// How a seed wallet's mnemonic is protected at rest (ignored for a watch-only init, which has
+/// no at-rest secret). The passphrase variants mirror [`MnemonicInput`]: the CLI prompts for
+/// the passphrase after the wallet database checks and before any network I/O, so `Deferred`
+/// preserves that ordering; a programmatic `Passphrase` is used as given (the caller owns its
+/// strength - the CLI's prompt path enforces [`MIN_PASSPHRASE_CHARS`]).
+pub enum EncryptionInput {
+    /// Wrap to the age identity file for unattended unlock (created if missing).
+    AgeIdentity,
+    Passphrase(Passphrase),
+    DeferredPassphrase(Box<dyn FnOnce() -> anyhow::Result<Passphrase> + Send>),
+}
+
+/// How the new wallet gets its key material.
+pub enum InitKey {
+    /// A fresh 24-word mnemonic; the [`InitOutcome`] carries it for the operator to record.
+    Generate,
+    /// Recover an existing seed wallet; the recovery window extends to the current tip.
+    Restore(MnemonicInput),
+    /// A watch-only wallet from this encoded Unified Full Viewing Key.
+    WatchOnly(String),
+}
+
+/// What to create - the library-facing form of the `zecd init` flags.
+pub struct InitOptions {
+    pub wallet: String,
+    pub key: InitKey,
+    pub encryption: EncryptionInput,
+    /// Birthday height; defaults to near-tip for a fresh wallet and to the earliest enabled
+    /// pool's activation for a restore/import (safe but slow - see the CLI's warning).
+    pub birthday: Option<u32>,
+}
+
+/// What [`init_wallet`] created - everything the CLI prints, as data.
+pub struct InitOutcome {
+    pub wallet: String,
+    pub wallet_dir: PathBuf,
+    pub keys_path: PathBuf,
+    pub network: ZNetwork,
+    /// The account birthday actually recorded (derived from the anchoring tree state).
+    pub birthday: u32,
+    pub watch_only: bool,
+    /// True when the wallet is passphrase-encrypted (starts locked).
+    pub encrypted: bool,
+    /// The age identity file protecting the seed, when [`EncryptionInput::AgeIdentity`] was
+    /// used (created if it did not exist).
+    pub identity_path: Option<PathBuf>,
+    /// The freshly generated mnemonic, present only for [`InitKey::Generate`] - the phrase the
+    /// operator must record. NB `bip0039::Mnemonic` does not zeroize on drop (the CLI prints
+    /// this to stdout, the same exposure); drop it promptly. The derived seed inside
+    /// [`init_wallet`] is a zeroize-on-drop `SecretVec` throughout.
+    pub generated_mnemonic: Option<Mnemonic<English>>,
+}
+
+#[cfg(feature = "cli")]
 pub async fn run(config: &AppConfig, args: &InitArgs) -> anyhow::Result<()> {
+    // Map the flags onto the library options. The interactive inputs stay shell-side, behind
+    // the deferred callbacks, so their prompts fire at the same points they always have.
+    let key = if let Some(encoded) = &args.ufvk {
+        InitKey::WatchOnly(encoded.clone())
+    } else if args.restore {
+        let file = args.mnemonic_file.clone();
+        InitKey::Restore(MnemonicInput::Deferred(Box::new(move || {
+            read_mnemonic_phrase(
+                file.as_deref(),
+                "Enter the mnemonic phrase to restore, then press Enter:",
+            )
+        })))
+    } else {
+        InitKey::Generate
+    };
+    let encryption = if args.encrypt {
+        EncryptionInput::DeferredPassphrase(Box::new(read_encryption_passphrase))
+    } else {
+        EncryptionInput::AgeIdentity
+    };
+
+    let outcome = init_wallet(
+        config,
+        InitOptions {
+            wallet: args.wallet.clone(),
+            key,
+            encryption,
+            birthday: args.birthday,
+        },
+    )
+    .await?;
+
+    eprintln!(
+        "Wallet '{}' initialized at {}",
+        outcome.wallet,
+        outcome.wallet_dir.display()
+    );
+    if outcome.watch_only {
+        eprintln!(
+            "Watch-only wallet (imported UFVK): balances, history, and addresses are \
+             available; spending and wallet-encryption RPCs are disabled."
+        );
+    } else if outcome.encrypted {
+        eprintln!(
+            "Wallet is passphrase-encrypted; it starts locked. Call walletpassphrase \"<pass>\" <timeout> to unlock for sending."
+        );
+    } else if let Some(identity_path) = &outcome.identity_path {
+        eprintln!("age identity: {}", identity_path.display());
+    }
+    if let Some(mnemonic) = &outcome.generated_mnemonic {
+        eprintln!("\nIMPORTANT - record this mnemonic seed phrase and keep it safe:\n");
+        println!("{}", mnemonic.phrase());
+        eprintln!();
+    }
+    Ok(())
+}
+
+/// The library core of `zecd init`: create (or restore/import) a wallet and its account,
+/// returning what was created instead of printing it. No stdout/stderr; the only interactive
+/// I/O possible is whatever the caller put behind the `Deferred` inputs. Everything else is
+/// unchanged from the CLI: the datadir lock is taken for the duration, a live upstream is
+/// dialed once (the account anchors on the tree state at `birthday - 1`), and every refusal
+/// fires before anything is written.
+pub async fn init_wallet(config: &AppConfig, opts: InitOptions) -> anyhow::Result<InitOutcome> {
+    let InitOptions {
+        wallet,
+        key,
+        encryption,
+        birthday: birthday_opt,
+    } = opts;
     // Single-instance guard: take the exclusive datadir lock before creating any wallet, held
     // until `init` returns. This refuses an `init` against a datadir a running daemon (or another
     // `init`) already owns, rather than racing it. See `crate::lock`.
     let _datadir_lock = crate::lock::lock_datadir(&config.datadir)?;
 
-    let entry = resolve_wallet_entry(config, &args.wallet);
+    let entry = resolve_wallet_entry(config, &wallet);
     let keys_path = entry.keys_path();
     let enabled_pools = entry.pools.clone();
     // Create the account under the wallet's external transparent gap limit (only when transparent
@@ -159,23 +299,27 @@ pub async fn run(config: &AppConfig, args: &InitArgs) -> anyhow::Result<()> {
     if WalletStore::exists(&keys_path) {
         return Err(anyhow!(
             "wallet '{}' is already initialized ({} exists)",
-            args.wallet,
+            wallet,
             keys_path.display()
         ));
     }
 
     // Watch-only init: parse the UFVK up front (before any directory or network I/O) so a
-    // malformed key fails fast. `--ufvk` conflicts with `--restore`/`--encrypt` at the clap
-    // level. A `Some` UFVK means this is a watch-only wallet; `None` means it will hold
-    // spending keys.
-    let ufvk = args
-        .ufvk
-        .as_deref()
-        .map(|s| {
-            UnifiedFullViewingKey::decode(&network, s.trim())
-                .map_err(|e| anyhow!("invalid unified full viewing key: {e}"))
-        })
-        .transpose()?;
+    // malformed key fails fast (`--ufvk` conflicts with `--restore`/`--encrypt` at the clap
+    // level; the enum makes the same shapes unrepresentable here). A `Some` UFVK means this is
+    // a watch-only wallet; `None` means it will hold spending keys.
+    let (ufvk, restore_input) = match key {
+        InitKey::WatchOnly(encoded) => (
+            Some(
+                UnifiedFullViewingKey::decode(&network, encoded.trim())
+                    .map_err(|e| anyhow!("invalid unified full viewing key: {e}"))?,
+            ),
+            None,
+        ),
+        InitKey::Restore(input) => (None, Some(input)),
+        InitKey::Generate => (None, None),
+    };
+    let restore = restore_input.is_some();
 
     // zecd permits at most one spending wallet (any number of watch-only UFVK wallets may be
     // added alongside it). When creating a spending wallet, refuse up front if another
@@ -184,13 +328,13 @@ pub async fn run(config: &AppConfig, args: &InitArgs) -> anyhow::Result<()> {
     // boot. Watch-only inits (`--ufvk`) are exempt: any number are allowed. Done before any
     // directory or network I/O so it fails fast and leaves nothing behind.
     if ufvk.is_none() {
-        if let Some(existing) = existing_spending_wallet(network, &config.wallets, &args.wallet) {
+        if let Some(existing) = existing_spending_wallet(network, &config.wallets, &wallet) {
             return Err(anyhow!(
                 "cannot create spending wallet '{}': wallet '{}' already holds spending keys, \
                  and zecd allows at most one spending wallet (any number of watch-only UFVK \
                  wallets may be added alongside it). Create this wallet watch-only with `--ufvk` \
                  (see `zecd export-ufvk`), or remove/convert the existing spending wallet.",
-                args.wallet,
+                wallet,
                 existing
             ));
         }
@@ -205,7 +349,7 @@ pub async fn run(config: &AppConfig, args: &InitArgs) -> anyhow::Result<()> {
     // before any interactive or network I/O so a refusal is fast and leaves no keys.toml
     // behind.
     let mut db = open::init_dbs_with_gap_limit(network, &wallet_dir, init_gap_limit)?;
-    ensure_no_preexisting_account(&db, &args.wallet, &wallet_dir)?;
+    ensure_no_preexisting_account(&db, &wallet, &wallet_dir)?;
 
     let identity_path = config
         .keys
@@ -224,10 +368,14 @@ pub async fn run(config: &AppConfig, args: &InitArgs) -> anyhow::Result<()> {
     }
     let at_rest = if ufvk.is_some() {
         AtRest::ViewOnly
-    } else if args.encrypt {
-        AtRest::Passphrase(read_encryption_passphrase()?)
     } else {
-        AtRest::Identity(ensure_identity(&identity_path).await?)
+        match encryption {
+            EncryptionInput::Passphrase(passphrase) => AtRest::Passphrase(passphrase),
+            EncryptionInput::DeferredPassphrase(read) => AtRest::Passphrase(read()?),
+            EncryptionInput::AgeIdentity => {
+                AtRest::Identity(ensure_identity(&identity_path).await?)
+            }
+        }
     };
 
     // init is a one-shot interactive command that dials the configured upstream once.
@@ -261,11 +409,8 @@ pub async fn run(config: &AppConfig, args: &InitArgs) -> anyhow::Result<()> {
         // A watch-only wallet has no mnemonic; the imported key may have history, so treat
         // it like a restore (recovery window up to the current tip).
         (None, Some(BlockHeight::from(chain_tip)))
-    } else if args.restore {
-        (
-            Some(read_restore_mnemonic(args)?),
-            Some(BlockHeight::from(chain_tip)),
-        )
+    } else if let Some(input) = restore_input {
+        (Some(input.resolve()?), Some(BlockHeight::from(chain_tip)))
     } else {
         (Some(Mnemonic::generate(Count::Words24)), None)
     };
@@ -276,8 +421,8 @@ pub async fn run(config: &AppConfig, args: &InitArgs) -> anyhow::Result<()> {
     // on chain but are never scanned), so without --birthday we scan from the earliest enabled
     // pool's activation (Orchard/NU5 for the Orchard-only default) - never missing a note, at
     // the cost of a long initial sync we warn about.
-    let key_may_have_history = args.restore || ufvk.is_some();
-    let birthday_height = BlockHeight::from(args.birthday.unwrap_or_else(|| {
+    let key_may_have_history = restore || ufvk.is_some();
+    let birthday_height = BlockHeight::from(birthday_opt.unwrap_or_else(|| {
         if key_may_have_history {
             let (height, label) = restore_birthday_default(network, &enabled_pools);
             warn!(
@@ -389,42 +534,47 @@ pub async fn run(config: &AppConfig, args: &InitArgs) -> anyhow::Result<()> {
         );
     }
 
-    eprintln!(
-        "Wallet '{}' initialized at {}",
-        args.wallet,
-        wallet_dir.display()
-    );
-    match &at_rest {
-        AtRest::ViewOnly => eprintln!(
-            "Watch-only wallet (imported UFVK): balances, history, and addresses are \
-             available; spending and wallet-encryption RPCs are disabled."
-        ),
-        AtRest::Passphrase(_) => eprintln!(
-            "Wallet is passphrase-encrypted; it starts locked. Call walletpassphrase \"<pass>\" <timeout> to unlock for sending."
-        ),
-        AtRest::Identity(_) => eprintln!("age identity: {}", identity_path.display()),
-    }
-    if let Some(mnemonic) = mnemonic.filter(|_| !args.restore) {
-        eprintln!("\nIMPORTANT - record this mnemonic seed phrase and keep it safe:\n");
-        println!("{}", mnemonic.phrase());
-        eprintln!();
-    }
-    Ok(())
+    Ok(InitOutcome {
+        wallet,
+        wallet_dir,
+        keys_path,
+        network,
+        birthday: u32::from(birthday.height()),
+        watch_only: matches!(at_rest, AtRest::ViewOnly),
+        encrypted: matches!(at_rest, AtRest::Passphrase(_)),
+        identity_path: matches!(at_rest, AtRest::Identity(_)).then_some(identity_path),
+        generated_mnemonic: mnemonic.filter(|_| !restore),
+    })
 }
 
 /// `zecd export-ufvk`: print the wallet's Unified Full Viewing Key to stdout, for setting up
 /// a watch-only zecd elsewhere (`init --ufvk`). The UFVK is read from the wallet DB (where it
 /// is stored for scanning anyway), so this works for locked and passphrase-encrypted wallets
 /// alike and never touches spending material. Offline: no upstream connection is made.
+#[cfg(feature = "cli")]
 pub fn export_ufvk(config: &AppConfig, args: &ExportUfvkArgs) -> anyhow::Result<()> {
-    let entry = resolve_wallet_entry(config, &args.wallet);
+    let encoded = export_ufvk_string(config, &args.wallet)?;
+    eprintln!(
+        "Unified Full Viewing Key for wallet '{}' (grants full VIEW access - balances and \
+         all transaction history - but cannot spend):",
+        args.wallet
+    );
+    println!("{encoded}");
+    Ok(())
+}
+
+/// The encoded UFVK behind [`export_ufvk`] - the library core, which reads the wallet DB and
+/// prints nothing. Works for locked and passphrase-encrypted wallets alike (the UFVK is stored
+/// for scanning anyway) and never touches spending material.
+pub fn export_ufvk_string(config: &AppConfig, wallet: &str) -> anyhow::Result<String> {
+    let entry = resolve_wallet_entry(config, wallet);
     let keys_path = entry.keys_path();
     let wallet_dir = entry.dir;
 
     if !WalletStore::exists(&keys_path) {
         return Err(anyhow!(
             "wallet '{}' is not initialized ({} missing)",
-            args.wallet,
+            wallet,
             keys_path.display()
         ));
     }
@@ -434,7 +584,7 @@ pub fn export_ufvk(config: &AppConfig, args: &ExportUfvkArgs) -> anyhow::Result<
     if st.network != config.network {
         return Err(anyhow!(
             "wallet '{}' is a {} wallet, but the configuration selects {}",
-            args.wallet,
+            wallet,
             st.network.name(),
             config.network.name()
         ));
@@ -451,14 +601,7 @@ pub fn export_ufvk(config: &AppConfig, args: &ExportUfvkArgs) -> anyhow::Result<
     let ufvk = account
         .ufvk()
         .ok_or_else(|| anyhow!("account has no unified full viewing key"))?;
-
-    eprintln!(
-        "Unified Full Viewing Key for wallet '{}' (grants full VIEW access - balances and \
-         all transaction history - but cannot spend):",
-        args.wallet
-    );
-    println!("{}", ufvk.encode(&config.network));
-    Ok(())
+    Ok(ufvk.encode(&config.network))
 }
 
 /// `zecd rescan`: the recovery path for a broken wallet database - e.g. a persistent
@@ -469,6 +612,7 @@ pub fn export_ufvk(config: &AppConfig, args: &ExportUfvkArgs) -> anyhow::Result<
 /// empty-data-directory bootstrap path: it recreates the account from the seed and rescans the
 /// chain from the wallet birthday, re-deriving all funds and history. This is safe by zecd's
 /// statelessness invariant - everything in the database is rebuildable from seed + chain.
+#[cfg(feature = "cli")]
 pub fn rescan(config: &AppConfig, args: &RescanArgs) -> anyhow::Result<()> {
     // Same single-instance guard as `init`: refuses while the daemon (or another writer) owns
     // the datadir, so the database can't be deleted out from under a live wallet.
@@ -528,9 +672,11 @@ pub fn rescan(config: &AppConfig, args: &RescanArgs) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// The checks + deletion behind [`rescan`], factored so it is unit-testable without an
+/// The checks + deletion behind [`rescan`] - the library core, also unit-testable without an
 /// [`AppConfig`] or stdin. `confirm` is consulted (with the parsed `keys.toml`) after
-/// validation and before anything is deleted; returning `false` aborts cleanly.
+/// validation and before anything is deleted; returning `false` aborts cleanly. NB unlike
+/// [`rescan`] this takes no datadir lock - a caller that owns a running node must not invoke
+/// it on that node's datadir.
 ///
 /// Refusals, in order: an uninitialized wallet (no `keys.toml` - deleting the database would
 /// destroy the only record of the wallet), a network mismatch (the rebuilt scan would run on
@@ -538,7 +684,7 @@ pub fn rescan(config: &AppConfig, args: &RescanArgs) -> anyhow::Result<()> {
 /// path cannot recreate a view-only account, so the recovery there is a fresh
 /// `init --ufvk`). Returns the database files/directories actually removed. Idempotent: an
 /// already-wiped wallet succeeds with an empty list.
-fn rescan_wallet(
+pub fn rescan_wallet(
     network: ZNetwork,
     wallet: &str,
     keys_path: &Path,

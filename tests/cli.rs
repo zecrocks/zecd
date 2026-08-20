@@ -5,6 +5,11 @@
 //! repo convention for tests that hit the public testnet lightwalletd
 //! (`cargo test -- --include-ignored`).
 
+// The bin target declares `required-features = ["server", "cli"]`, so under a build without
+// them `CARGO_BIN_EXE_zecd` is never set and this file must vanish rather than fail to expand
+// that env var.
+#![cfg(all(feature = "server", feature = "cli"))]
+
 use std::process::{Command, Output, Stdio};
 use std::time::{Duration, Instant};
 

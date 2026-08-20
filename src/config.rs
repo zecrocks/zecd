@@ -9,6 +9,7 @@ use std::num::NonZeroU32;
 use std::path::PathBuf;
 
 use anyhow::Context;
+#[cfg(feature = "cli")]
 use clap::Parser;
 use serde::Deserialize;
 use zcash_client_backend::data_api::wallet::ConfirmationsPolicy;
@@ -774,6 +775,66 @@ struct PoolsFile {
 // CLI
 // ---------------------------------------------------------------------------
 
+/// CLI-shaped overrides to configuration resolution, decoupled from clap so a library consumer
+/// can resolve an [`AppConfig`] without the CLI surface. The fields mirror [`Cli`]'s global
+/// flags one for one, and [`Cli`] converts into this, so the daemon and an embedder resolve
+/// configuration identically.
+///
+/// NB the `ZECD_RPC_PASSWORD` / `ZECD_AGE_IDENTITY` / `ZECD_KEYS_FILE` env fallbacks are clap
+/// behavior on the corresponding [`Cli`] flags and do NOT apply here - a library caller sets
+/// the fields explicitly. `ZECD_DATADIR` still applies (it is resolved during resolution, not
+/// by clap).
+#[derive(Debug, Default, Clone)]
+pub struct ConfigOverrides {
+    /// Path to the TOML config file (default: `<datadir>/zecd.toml`).
+    pub conf: Option<PathBuf>,
+    /// Data directory holding per-wallet subdirectories and the cookie file.
+    pub datadir: Option<PathBuf>,
+    /// Use testnet (overrides config `network`).
+    pub testnet: bool,
+    /// Use regtest (overrides config `network`).
+    pub regtest: bool,
+    /// Network: "main", "test", or "regtest".
+    pub network: Option<String>,
+    /// RPC bind address.
+    pub rpc_bind: Option<String>,
+    /// RPC port.
+    pub rpc_port: Option<u16>,
+    /// RPC username (HTTP Basic auth).
+    pub rpc_user: Option<String>,
+    /// RPC password (HTTP Basic auth).
+    pub rpc_password: Option<String>,
+    /// rpcauth credentials (`<user>:<salt>$<hmac-sha256 hex>`).
+    pub rpc_auth: Vec<String>,
+    /// Chain upstream token (`zebra`, `zebra://host:port`, `zecrocks`, `https://...`, ...).
+    pub server: Option<String>,
+    /// age identity file used to decrypt the wallet seed for sending.
+    pub age_identity: Option<PathBuf>,
+    /// Path to the default wallet's `keys.toml`, independent of the datadir.
+    pub keys_file: Option<PathBuf>,
+}
+
+#[cfg(feature = "cli")]
+impl From<&Cli> for ConfigOverrides {
+    fn from(cli: &Cli) -> ConfigOverrides {
+        ConfigOverrides {
+            conf: cli.conf.clone(),
+            datadir: cli.datadir.clone(),
+            testnet: cli.testnet,
+            regtest: cli.regtest,
+            network: cli.network.clone(),
+            rpc_bind: cli.rpc_bind.clone(),
+            rpc_port: cli.rpc_port,
+            rpc_user: cli.rpc_user.clone(),
+            rpc_password: cli.rpc_password.clone(),
+            rpc_auth: cli.rpc_auth.clone(),
+            server: cli.server.clone(),
+            age_identity: cli.age_identity.clone(),
+            keys_file: cli.keys_file.clone(),
+        }
+    }
+}
+
 /// `zecd` - a Bitcoin-Core-style JSON-RPC server for shielded-first Zcash.
 // Every flag here is `global`, so it is accepted before *or* after a subcommand
 // (`zecd --conf f config check` and `zecd config check --conf f` are the same command). That
@@ -782,6 +843,7 @@ struct PoolsFile {
 // command an operator reaches for when something is already wrong. (A normal comment, not a doc
 // comment: clap renders the doc comment as the command's help text, and this is a note for
 // readers of the source.)
+#[cfg(feature = "cli")]
 #[derive(Debug, Parser)]
 #[command(name = "zecd", version)]
 pub struct Cli {
@@ -849,6 +911,7 @@ pub struct Cli {
     pub command: Option<Command>,
 }
 
+#[cfg(feature = "cli")]
 #[derive(Debug, clap::Subcommand)]
 pub enum Command {
     /// Create and initialize a new wallet (mnemonic + accounts), then exit.
@@ -878,6 +941,7 @@ pub enum Command {
     Run,
 }
 
+#[cfg(feature = "cli")]
 #[derive(Debug, clap::Args)]
 pub struct InitArgs {
     /// Wallet name (selects/creates <datadir>/<name>).
@@ -912,6 +976,7 @@ pub struct InitArgs {
     pub birthday: Option<u32>,
 }
 
+#[cfg(feature = "cli")]
 #[derive(Debug, clap::Args)]
 pub struct RpcauthArgs {
     /// RPC username the credential is for.
@@ -921,6 +986,7 @@ pub struct RpcauthArgs {
     pub password: Option<String>,
 }
 
+#[cfg(feature = "cli")]
 #[derive(Debug, clap::Args)]
 pub struct ExampleConfigArgs {
     /// Write the config here instead of stdout. `-` also means stdout. Refuses to overwrite an
@@ -933,6 +999,7 @@ pub struct ExampleConfigArgs {
     pub force: bool,
 }
 
+#[cfg(feature = "cli")]
 #[derive(Debug, clap::Subcommand)]
 pub enum ConfigCommand {
     /// Validate a configuration file against this zecd build without starting the daemon, and
@@ -943,6 +1010,7 @@ pub enum ConfigCommand {
     Show(ConfigShowArgs),
 }
 
+#[cfg(feature = "cli")]
 #[derive(Debug, clap::Args)]
 pub struct ConfigCheckArgs {
     /// Treat warnings as errors, so a config that merely looks risky also exits non-zero
@@ -958,9 +1026,11 @@ pub struct ConfigCheckArgs {
 
 /// `zecd config show` takes no options of its own - the configuration it renders is selected by
 /// the global flags (`--conf`, `--datadir`, `--network`, ...), exactly as the daemon selects it.
+#[cfg(feature = "cli")]
 #[derive(Debug, clap::Args)]
 pub struct ConfigShowArgs {}
 
+#[cfg(feature = "cli")]
 #[derive(Debug, clap::Args)]
 pub struct ExportUfvkArgs {
     /// Wallet name (selects <datadir>/<name>).
@@ -968,6 +1038,7 @@ pub struct ExportUfvkArgs {
     pub wallet: String,
 }
 
+#[cfg(feature = "cli")]
 #[derive(Debug, clap::Args)]
 pub struct DeriveAddressArgs {
     /// Wallet name (selects <datadir>/<name>). The default key source is this wallet's
@@ -1014,6 +1085,7 @@ pub struct DeriveAddressArgs {
     pub json: bool,
 }
 
+#[cfg(feature = "cli")]
 #[derive(Debug, clap::Args)]
 pub struct RescanArgs {
     /// Wallet name (selects <datadir>/<name>).
@@ -1028,16 +1100,26 @@ pub struct RescanArgs {
 impl AppConfig {
     /// Resolve the effective configuration from CLI flags and the TOML file, using zecd's
     /// file/port defaults.
+    #[cfg(feature = "cli")]
     pub fn resolve(cli: &Cli) -> anyhow::Result<AppConfig> {
         Self::resolve_with(cli, &ZECD_DEFAULTS)
     }
 
-    /// The datadir named on the command line or in the environment, before the config file is
-    /// read. The file is located *before* its own `datadir` can apply (like bitcoind: `-conf`
-    /// resolution never depends on a datadir set inside the file), so the lookup uses only
-    /// CLI/env. Datadir precedence overall: CLI > env (`ZECD_DATADIR`) > config file > default.
-    fn cli_datadir(cli: &Cli, defaults: &BinaryDefaults) -> Option<PathBuf> {
-        cli.datadir
+    /// Resolve the effective configuration from clap-free overrides and the TOML file, using
+    /// zecd's file/port defaults - the library consumer's entry point ([`Cli`] converts into
+    /// [`ConfigOverrides`], so this and [`resolve`](Self::resolve) cannot disagree).
+    pub fn resolve_overrides(overrides: &ConfigOverrides) -> anyhow::Result<AppConfig> {
+        Self::resolve_overrides_with(overrides, &ZECD_DEFAULTS)
+    }
+
+    /// The datadir named in the overrides (the command line) or in the environment, before the
+    /// config file is read. The file is located *before* its own `datadir` can apply (like
+    /// bitcoind: `-conf` resolution never depends on a datadir set inside the file), so the
+    /// lookup uses only overrides/env. Datadir precedence overall: CLI > env (`ZECD_DATADIR`) >
+    /// config file > default.
+    fn cli_datadir(overrides: &ConfigOverrides, defaults: &BinaryDefaults) -> Option<PathBuf> {
+        overrides
+            .datadir
             .clone()
             .or_else(|| std::env::var_os(defaults.datadir_env).map(PathBuf::from))
     }
@@ -1045,23 +1127,45 @@ impl AppConfig {
     /// The config file [`resolve`](Self::resolve) would read for this invocation, whether or not
     /// it exists. Exposed so `zecd config check` can name the file it is checking - and can only
     /// ever check the same one the daemon would load.
+    #[cfg(feature = "cli")]
     pub fn conf_path(cli: &Cli) -> PathBuf {
         Self::conf_path_with(cli, &ZECD_DEFAULTS)
     }
 
     /// [`conf_path`](Self::conf_path) with the binary's defaults.
+    #[cfg(feature = "cli")]
     pub fn conf_path_with(cli: &Cli, defaults: &BinaryDefaults) -> PathBuf {
-        cli.conf.clone().unwrap_or_else(|| {
-            Self::cli_datadir(cli, defaults)
+        Self::conf_path_overrides_with(&ConfigOverrides::from(cli), defaults)
+    }
+
+    /// [`conf_path`](Self::conf_path) from clap-free overrides.
+    pub fn conf_path_overrides_with(
+        overrides: &ConfigOverrides,
+        defaults: &BinaryDefaults,
+    ) -> PathBuf {
+        overrides.conf.clone().unwrap_or_else(|| {
+            Self::cli_datadir(overrides, defaults)
                 .unwrap_or_else(|| PathBuf::from(defaults.datadir))
                 .join(defaults.conf_file)
         })
     }
 
     /// Resolve the effective configuration with the binary's defaults (`zecd`).
+    #[cfg(feature = "cli")]
     pub fn resolve_with(cli: &Cli, defaults: &BinaryDefaults) -> anyhow::Result<AppConfig> {
+        Self::resolve_overrides_with(&ConfigOverrides::from(cli), defaults)
+    }
+
+    /// [`resolve_overrides`](Self::resolve_overrides) with caller-supplied binary defaults.
+    pub fn resolve_overrides_with(
+        overrides: &ConfigOverrides,
+        defaults: &BinaryDefaults,
+    ) -> anyhow::Result<AppConfig> {
+        // The overrides mirror the CLI flags one for one, so the body keeps its `cli` naming
+        // (and its diff against the pre-overrides version stays a two-line header change).
+        let cli = overrides;
         let cli_datadir = Self::cli_datadir(cli, defaults);
-        let conf_path = Self::conf_path_with(cli, defaults);
+        let conf_path = Self::conf_path_overrides_with(cli, defaults);
 
         let file: ConfigFile = if conf_path.exists() {
             let text = std::fs::read_to_string(&conf_path)
@@ -2191,6 +2295,7 @@ mod tests {
         assert!(ZebraConfig::default().auth().header().unwrap().is_none());
     }
 
+    #[cfg(feature = "cli")]
     #[test]
     fn file_datadir_is_honored_and_cli_wins() {
         use clap::Parser as _;
@@ -2215,6 +2320,7 @@ mod tests {
         assert_eq!(cfg.datadir, PathBuf::from("/tmp/zecd-from-cli"));
     }
 
+    #[cfg(feature = "cli")]
     #[test]
     fn cleartext_gate_defaults_and_overrides_resolve() {
         use clap::Parser as _;
@@ -2239,6 +2345,7 @@ mod tests {
         assert!(cfg.backend.allow_remote_cleartext);
     }
 
+    #[cfg(feature = "cli")]
     #[test]
     fn readiness_defaults_to_synced_and_is_overridable() {
         use clap::Parser as _;
@@ -2263,6 +2370,7 @@ mod tests {
         assert_eq!(cfg.health.readiness, ReadinessMode::Connected);
     }
 
+    #[cfg(feature = "cli")]
     #[test]
     fn sync_interval_secs_is_clamped_to_at_least_one() {
         use clap::Parser as _;
@@ -2290,6 +2398,7 @@ mod tests {
         assert_eq!(cfg.sync.interval_secs, 20);
     }
 
+    #[cfg(feature = "cli")]
     #[test]
     fn rpc_allowed_methods_parses_and_validates() {
         use clap::Parser as _;
@@ -2348,6 +2457,7 @@ mod tests {
         assert!(read_secret_file(&dir.path().join("nope")).is_err());
     }
 
+    #[cfg(feature = "cli")]
     #[test]
     fn rpc_password_file_is_read_and_overridden_by_cli() {
         use clap::Parser as _;
@@ -2390,6 +2500,7 @@ mod tests {
         assert!(AppConfig::resolve(&cli).is_err());
     }
 
+    #[cfg(feature = "cli")]
     #[test]
     fn keys_file_override_resolves_per_wallet() {
         use clap::Parser as _;

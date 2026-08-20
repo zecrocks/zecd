@@ -23,10 +23,13 @@
 //! secrets does not round-trip byte-for-byte - which is the honest outcome, since the daemon's
 //! behaviour genuinely depends on values that must not be printed.
 
+#[cfg(feature = "cli")]
 use std::io::Write;
 use std::path::Path;
 
-use crate::config::{AppConfig, Cli, ConfigShowArgs};
+use crate::config::AppConfig;
+#[cfg(feature = "cli")]
+use crate::config::{Cli, ConfigShowArgs};
 
 /// Preamble on the rendered config, explaining what the reader is looking at. Deliberately free
 /// of the version and the source path - those are provenance, and they go to stderr like
@@ -311,6 +314,7 @@ fn list_val<S: AsRef<str>>(items: &[S]) -> String {
 /// isn't there is a typo worth failing on), while `show` reports what this binary would do -
 /// which is perfectly well defined with no file at all, and is then the most direct way to see
 /// the built-in defaults.
+#[cfg(feature = "cli")]
 pub fn run(cli: &Cli, _args: &ConfigShowArgs) -> anyhow::Result<()> {
     let conf_path = AppConfig::conf_path(cli);
     let source = if conf_path.exists() {
@@ -331,17 +335,19 @@ pub fn run(cli: &Cli, _args: &ConfigShowArgs) -> anyhow::Result<()> {
 
 /// Write the configuration to stdout, treating a closed pipe as a clean exit (`zecd config show
 /// | head` would otherwise *panic* through `print!`, which panics on EPIPE).
+#[cfg(feature = "cli")]
 fn emit(text: &str) {
     let mut out = std::io::stdout().lock();
     let _ = out.write_all(text.as_bytes()).and_then(|()| out.flush());
 }
 
+#[cfg(feature = "cli")]
 fn emit_err(text: &str) {
     let mut err = std::io::stderr().lock();
     let _ = err.write_all(text.as_bytes()).and_then(|()| err.flush());
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "cli"))]
 mod tests {
     use super::*;
     use clap::Parser;

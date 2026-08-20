@@ -1,27 +1,55 @@
 //! The HTTP/JSON-RPC server: axum router, auth gate, and bitcoind-compatible framing.
+//!
+//! `auth` and `jsonrpc` are transport-agnostic (dispatch and the embeddable node use
+//! `RpcRequest`; `config check` uses `auth::check_config`), so they compile unconditionally;
+//! everything axum-shaped in this file is gated behind the `server` feature.
 
 pub mod auth;
 pub mod jsonrpc;
 
+#[cfg(feature = "server")]
 use std::net::SocketAddr;
 
+#[cfg(feature = "server")]
 use axum::body::Bytes;
+#[cfg(feature = "server")]
 use axum::extract::{ConnectInfo, Path, State};
+#[cfg(feature = "server")]
 use axum::http::{header, HeaderMap, StatusCode};
+#[cfg(feature = "server")]
 use axum::response::{IntoResponse, Response};
+#[cfg(feature = "server")]
 use axum::routing::post;
+#[cfg(feature = "server")]
 use axum::Router;
+#[cfg(feature = "server")]
 use serde_json::Value;
+#[cfg(feature = "server")]
 use tracing::{info, warn};
 
+#[cfg(feature = "server")]
 use crate::rpc;
+#[cfg(feature = "server")]
 use crate::server::jsonrpc::{Body, RpcRequest};
+#[cfg(feature = "server")]
 use crate::state::AppState;
 
+/// State for the HTTP transport: the shared node state plus the HTTP-only auth gate. Auth is
+/// a transport concern - an embedded node (`crate::node::Node`) never constructs an
+/// `Authenticator` (`Authenticator::from_config` writes a cookie file as a side effect), so
+/// the field lives here rather than on [`AppState`].
+#[cfg(feature = "server")]
+#[derive(Clone)]
+pub struct HttpState {
+    pub app: AppState,
+    pub auth: auth::Authenticator,
+}
+
 /// Bind and serve until graceful shutdown is signalled.
-pub async fn run(state: AppState) -> anyhow::Result<()> {
-    let addr = SocketAddr::new(state.config.rpc.bind, state.config.rpc.port);
-    let shutdown = state.shutdown_signal();
+#[cfg(feature = "server")]
+pub async fn run(state: HttpState) -> anyhow::Result<()> {
+    let addr = SocketAddr::new(state.app.config.rpc.bind, state.app.config.rpc.port);
+    let shutdown = state.app.shutdown_signal();
     let app = router(state);
     let listener = tokio::net::TcpListener::bind(addr).await?;
     info!("RPC server listening on http://{addr}");
@@ -42,9 +70,11 @@ pub async fn run(state: AppState) -> anyhow::Result<()> {
 /// so this bounds memory from a hostile or buggy client while staying generous. It makes axum's
 /// otherwise-implicit limit explicit and tunable; oversize requests are rejected with HTTP 413 by
 /// the body-limit layer, before auth or dispatch.
+#[cfg(feature = "server")]
 const MAX_BODY_BYTES: usize = 2 * 1024 * 1024;
 
-fn router(state: AppState) -> Router {
+#[cfg(feature = "server")]
+fn router(state: HttpState) -> Router {
     Router::new()
         .route("/", post(handle_root))
         .route("/wallet/:name", post(handle_wallet))
@@ -52,8 +82,9 @@ fn router(state: AppState) -> Router {
         .with_state(state)
 }
 
+#[cfg(feature = "server")]
 async fn handle_root(
-    State(state): State<AppState>,
+    State(state): State<HttpState>,
     peer: Option<ConnectInfo<SocketAddr>>,
     headers: HeaderMap,
     body: Bytes,
@@ -61,8 +92,9 @@ async fn handle_root(
     handle(state, peer_addr(peer), None, headers, body).await
 }
 
+#[cfg(feature = "server")]
 async fn handle_wallet(
-    State(state): State<AppState>,
+    State(state): State<HttpState>,
     peer: Option<ConnectInfo<SocketAddr>>,
     Path(name): Path<String>,
     headers: HeaderMap,
@@ -73,12 +105,14 @@ async fn handle_wallet(
 
 /// Unwrap the optional `ConnectInfo` extractor into the peer socket address, if known. It is
 /// `None` for requests that arrive without connection info (the in-process `oneshot` tests).
+#[cfg(feature = "server")]
 fn peer_addr(peer: Option<ConnectInfo<SocketAddr>>) -> Option<SocketAddr> {
     peer.map(|ConnectInfo(addr)| addr)
 }
 
+#[cfg(feature = "server")]
 async fn handle(
-    state: AppState,
+    state: HttpState,
     peer: Option<SocketAddr>,
     wallet: Option<String>,
     headers: HeaderMap,
@@ -86,6 +120,7 @@ async fn handle(
 ) -> Response {
     // Reject new work once shutdown has been requested (matches bitcoind).
     if state
+        .app
         .shutting_down
         .load(std::sync::atomic::Ordering::Relaxed)
     {
@@ -99,7 +134,7 @@ async fn handle(
     // must precede the auth check: authentication (and its anti-bruteforce sleep on failure) is
     // real work, so admitting it without a permit would let unauthenticated floods bypass the
     // in-flight bound and starve legitimate clients.
-    let _permit = match state.work_queue.clone().try_acquire_owned() {
+    let _permit = match state.app.work_queue.clone().try_acquire_owned() {
         Ok(p) => p,
         Err(_) => {
             return plain_response(StatusCode::SERVICE_UNAVAILABLE, "Work queue depth exceeded");
@@ -143,14 +178,14 @@ async fn handle(
     match jsonrpc::parse_body(&body) {
         Err(e) => json_response(status_for(&e), &jsonrpc::error(Value::Null, &e)),
         Ok(Body::Single(v)) => {
-            let (resp, status) = process_single(&state, wallet.as_deref(), v).await;
+            let (resp, status) = process_single(&state.app, wallet.as_deref(), v).await;
             json_response(status, &resp)
         }
         Ok(Body::Batch(items)) => {
             // Batches always return HTTP 200; per-item errors live in the array.
             let mut out = Vec::with_capacity(items.len());
             for v in items {
-                let (resp, _) = process_single(&state, wallet.as_deref(), v).await;
+                let (resp, _) = process_single(&state.app, wallet.as_deref(), v).await;
                 out.push(resp);
             }
             json_response(StatusCode::OK, &Value::Array(out))
@@ -159,6 +194,7 @@ async fn handle(
 }
 
 /// HTTP status for an RPC error, matching Bitcoin Core's `JSONErrorReply`.
+#[cfg(feature = "server")]
 fn status_for(err: &crate::error::RpcError) -> StatusCode {
     StatusCode::from_u16(crate::error::http_status_for_code(err.code))
         .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR)
@@ -166,6 +202,7 @@ fn status_for(err: &crate::error::RpcError) -> StatusCode {
 
 /// Validate and dispatch one request, returning `(envelope, http_status)`. Registers the
 /// command as active (for `getrpcinfo`) and emits one structured log line per call.
+#[cfg(feature = "server")]
 async fn process_single(state: &AppState, wallet: Option<&str>, v: Value) -> (Value, StatusCode) {
     match RpcRequest::from_value(v) {
         Err((id, err)) => {
@@ -191,16 +228,19 @@ async fn process_single(state: &AppState, wallet: Option<&str>, v: Value) -> (Va
     }
 }
 
+#[cfg(feature = "server")]
 fn json_response(status: StatusCode, body: &Value) -> Response {
     let bytes = serde_json::to_vec(body).unwrap_or_else(|_| b"{}".to_vec());
     (status, [(header::CONTENT_TYPE, "application/json")], bytes).into_response()
 }
 
 /// A plain-text response (bitcoind uses these for 503/overload and shutdown messages).
+#[cfg(feature = "server")]
 fn plain_response(status: StatusCode, msg: &'static str) -> Response {
     (status, [(header::CONTENT_TYPE, "text/plain")], msg).into_response()
 }
 
+#[cfg(feature = "server")]
 fn unauthorized() -> Response {
     (
         StatusCode::UNAUTHORIZED,
@@ -210,7 +250,7 @@ fn unauthorized() -> Response {
         .into_response()
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "server"))]
 mod tests {
     use super::*;
     use std::collections::BTreeMap;
@@ -227,7 +267,7 @@ mod tests {
     use crate::server::auth::Authenticator;
     use crate::wallet::WalletRegistry;
 
-    fn test_state() -> AppState {
+    fn test_state() -> HttpState {
         let rpc = RpcConfig {
             bind: "127.0.0.1".parse().unwrap(),
             port: 1,
@@ -243,7 +283,7 @@ mod tests {
 
     /// Like `test_state`, but with caller-supplied RPC auth config so tests can exercise the
     /// full HTTP auth gate against specific credentials (e.g. generated `rpcauth` entries).
-    fn test_state_with_rpc(rpc: RpcConfig) -> AppState {
+    fn test_state_with_rpc(rpc: RpcConfig) -> HttpState {
         let config = AppConfig {
             network: crate::network::ZNetwork::Test,
             datadir: std::path::PathBuf::from("/tmp"),
@@ -289,16 +329,18 @@ mod tests {
                 format: "text".into(),
             },
         };
-        AppState {
+        HttpState {
             auth: Authenticator::from_config(&rpc).unwrap(),
-            config: Arc::new(config),
-            registry: Arc::new(WalletRegistry::new("default".into())),
-            started_at: Instant::now(),
-            shutdown_tx: tokio::sync::watch::channel(false).0,
-            shutting_down: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            work_queue: Arc::new(tokio::sync::Semaphore::new(16)),
-            active: crate::state::ActiveCommands::default(),
-            operations: Arc::new(crate::operations::OperationRegistry::new()),
+            app: AppState {
+                config: Arc::new(config),
+                registry: Arc::new(WalletRegistry::new("default".into())),
+                started_at: Instant::now(),
+                shutdown_tx: tokio::sync::watch::channel(false).0,
+                shutting_down: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                work_queue: Arc::new(tokio::sync::Semaphore::new(16)),
+                active: crate::state::ActiveCommands::default(),
+                operations: Arc::new(crate::operations::OperationRegistry::new()),
+            },
         }
     }
 
@@ -453,7 +495,7 @@ mod tests {
         use std::sync::Arc;
         let mut state = test_state();
         // A zero-permit queue: every request is "over capacity".
-        state.work_queue = Arc::new(tokio::sync::Semaphore::new(0));
+        state.app.work_queue = Arc::new(tokio::sync::Semaphore::new(0));
         let r = router(state)
             .oneshot(req(r#"{"method":"uptime","id":1}"#, Some(("u", "p"))))
             .await
@@ -469,7 +511,7 @@ mod tests {
     async fn work_queue_exhaustion_bounds_bad_credentials() {
         use std::sync::Arc;
         let mut state = test_state();
-        state.work_queue = Arc::new(tokio::sync::Semaphore::new(0));
+        state.app.work_queue = Arc::new(tokio::sync::Semaphore::new(0));
         let r = router(state)
             .oneshot(req(
                 r#"{"method":"getnetworkinfo","id":1}"#,
@@ -511,7 +553,7 @@ mod tests {
             },
         ));
         let mut state = test_state();
-        state.registry = Arc::new(reg);
+        state.app.registry = Arc::new(reg);
 
         // The default route reports the default wallet's height…
         let r = router(state.clone())
@@ -542,7 +584,7 @@ mod tests {
     fn state_publishing(
         status: crate::wallet::SyncStatus,
     ) -> (
-        AppState,
+        HttpState,
         tokio::sync::watch::Sender<crate::wallet::SyncStatus>,
     ) {
         use crate::network::ZNetwork;
@@ -552,12 +594,12 @@ mod tests {
         let mut reg = WalletRegistry::new("default".into());
         reg.insert(handle);
         let mut state = test_state();
-        state.registry = Arc::new(reg);
+        state.app.registry = Arc::new(reg);
         (state, tx)
     }
 
     /// One `waitfor*` call against `state`, returning the envelope's `result`.
-    async fn wait_call(state: AppState, body: &str) -> Value {
+    async fn wait_call(state: HttpState, body: &str) -> Value {
         let r = router(state)
             .oneshot(req(body, Some(("u", "p"))))
             .await
@@ -728,7 +770,7 @@ mod tests {
         let shutting = state.clone();
         let stopper = tokio::spawn(async move {
             tokio::time::sleep(Duration::from_millis(50)).await;
-            shutting.trigger_shutdown();
+            shutting.app.trigger_shutdown();
         });
         let res = wait_call(state, r#"{"method":"waitfornewblock","id":1}"#).await;
         assert_eq!(res["height"].as_u64(), Some(0));
@@ -757,12 +799,13 @@ mod tests {
             SyncStatus::default(),
         ));
         let mut state = test_state();
-        state.registry = Arc::new(reg);
+        state.app.registry = Arc::new(reg);
 
         // An operation the test releases by hand, so the "still running" and "finished" halves
         // are both deterministic.
         let (release, gate) = tokio::sync::oneshot::channel::<()>();
         let opid = state
+            .app
             .operations
             .try_insert("default", None, async move {
                 let _ = gate.await;
@@ -770,7 +813,7 @@ mod tests {
             })
             .expect("the registry has room for one operation");
 
-        let call = |state: AppState, uri: &'static str, params: String| async move {
+        let call = |state: HttpState, uri: &'static str, params: String| async move {
             let body = format!(r#"{{"method":"z_waitforoperation","params":{params},"id":1}}"#);
             let r = router(state)
                 .oneshot(req_to(uri, &body, Some(("u", "p"))))
@@ -821,7 +864,7 @@ mod tests {
         let v = call(state.clone(), "/", format!(r#"["{opid}",0]"#)).await;
         assert_eq!(v["result"]["finished"], serde_json::json!(true), "{v}");
         assert_eq!(v["result"]["status"], serde_json::json!("success"), "{v}");
-        assert_eq!(state.operations.take_results("default", None).len(), 1);
+        assert_eq!(state.app.operations.take_results("default", None).len(), 1);
 
         // Once reaped there is nothing to wait for: -8 rather than a full-timeout block.
         let v = call(state.clone(), "/", format!(r#"["{opid}",30]"#)).await;
@@ -846,9 +889,10 @@ mod tests {
             SyncStatus::default(),
         ));
         let mut state = test_state();
-        state.registry = Arc::new(reg);
+        state.app.registry = Arc::new(reg);
 
         let opid = state
+            .app
             .operations
             .try_insert("default", None, async {
                 Err::<Value, _>(RpcError::insufficient_funds("broke"))
@@ -893,16 +937,17 @@ mod tests {
             ));
         }
         let mut state = test_state();
-        state.registry = Arc::new(reg);
+        state.app.registry = Arc::new(reg);
 
         let opid = state
+            .app
             .operations
             .try_insert("default", None, async {
                 Ok::<Value, RpcError>(serde_json::json!({ "txid": "ab" }))
             })
             .expect("insert");
 
-        let call = |state: AppState, uri: &'static str, params: String| async move {
+        let call = |state: HttpState, uri: &'static str, params: String| async move {
             let body = format!(r#"{{"method":"z_waitforoperation","params":{params},"id":1}}"#);
             let r = router(state)
                 .oneshot(req_to(uri, &body, Some(("u", "p"))))
@@ -939,9 +984,9 @@ mod tests {
     /// `safelist`, returning `(http_status, envelope_error_code)`.
     async fn call_with_safelist(safelist: Vec<String>, body: &str) -> (StatusCode, Option<i64>) {
         let mut state = test_state();
-        let mut cfg = (*state.config).clone();
+        let mut cfg = (*state.app.config).clone();
         cfg.rpc.allowed_methods = safelist;
-        state.config = Arc::new(cfg);
+        state.app.config = Arc::new(cfg);
         let r = router(state)
             .oneshot(req(body, Some(("u", "p"))))
             .await

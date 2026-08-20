@@ -47,6 +47,7 @@ pub fn generate_rpcauth(username: &str, password: Option<&str>) -> (String, Opti
 
 /// `zecd rpcauth <user> [password]`: print a salted credential line for `[rpc] auth`, plus the
 /// password to keep when one is generated. No daemon, config, or external script needed.
+#[cfg(feature = "cli")]
 pub fn run_rpcauth(args: &crate::config::RpcauthArgs) -> anyhow::Result<()> {
     let (line, generated) = generate_rpcauth(&args.username, args.password.as_deref());
 

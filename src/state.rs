@@ -8,13 +8,15 @@ use std::time::Instant;
 use tokio::sync::{watch, Semaphore};
 
 use crate::config::AppConfig;
-use crate::server::auth::Authenticator;
 use crate::wallet::WalletRegistry;
 
+/// Transport-independent node state: everything RPC dispatch and the handlers need. HTTP-only
+/// concerns (the auth gate) live in [`crate::server::HttpState`] instead, so an embedded node
+/// (`crate::node::Node`) never constructs an `Authenticator` - whose config path writes a
+/// cookie file as a side effect.
 #[derive(Clone)]
 pub struct AppState {
     pub config: Arc<AppConfig>,
-    pub auth: Authenticator,
     pub registry: Arc<WalletRegistry>,
     pub started_at: Instant,
     /// Broadcasts `stop`/Ctrl-C to every shutdown waiter (RPC server, health server, wallet

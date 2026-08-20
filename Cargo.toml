@@ -12,12 +12,17 @@ homepage = "https://zecd.org"
 [[bin]]
 name = "zecd"
 path = "src/main.rs"
+# The binary is the full product: HTTP servers + CLI. Library consumers can instead build with
+# `default-features = false` (the embeddable node + the CLI cores, no axum/clap).
+required-features = ["server", "cli"]
 
 [dependencies]
-# Async runtime + HTTP server (hyper's client side drives the zebra JSON-RPC backend)
+# Async runtime + HTTP server (hyper's client side drives the zebra JSON-RPC backend).
+# axum serves only the HTTP layers (`server::run`, `health::run`), so it is optional behind the
+# `server` feature; it is also a dev-dependency (below) because `chain/zebra.rs`'s offline tests
+# run a fake zebrad on it under every feature combination.
 tokio = { version = "1.21", features = ["rt-multi-thread", "macros", "fs", "signal", "sync", "time", "io-util"] }
-axum = { version = "0.7", features = ["json"] }
-tower = { version = "0.5", features = ["util"] }
+axum = { version = "0.7", features = ["json"], optional = true }
 hyper = { version = "1", features = ["client", "http1"] }
 http-body-util = "0.1"
 bytes = "1"
@@ -28,12 +33,14 @@ futures-util = "0.3"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = { version = "1.0", features = ["arbitrary_precision"] }
 
-# CLI / config / logging
-clap = { version = "4.5", features = ["derive", "string", "env"] }
+# CLI / config / logging. clap and tracing-subscriber serve only the CLI surface (the flag
+# parsing and the binary's tracing init), so both ride the `cli` feature; the `tracing` facade
+# stays unconditional.
+clap = { version = "4.5", features = ["derive", "string", "env"], optional = true }
 toml = "0.8"
 anyhow = "1"
 tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json"], optional = true }
 
 # Auth. hmac+sha2 implement Bitcoin Core's salted `rpcauth` scheme (HMAC-SHA256).
 base64 = "0.22"
@@ -127,6 +134,18 @@ fmutex = "0.3"
 mimalloc = { version = "0.1", optional = true }
 
 [features]
+# The binary's full surface, on by default so `cargo build`/`cargo test` and the release
+# images are unchanged. A library consumer builds with `default-features = false` for the
+# embeddable node (`crate::node`) plus the CLI cores, without axum or clap in the tree.
+default = ["server", "cli"]
+# The HTTP transports: the axum JSON-RPC server (`server::run`) and the health server.
+server = ["dep:axum"]
+# The clap CLI surface (`config::Cli`, the subcommand shells) and `daemon::init_tracing`.
+cli = ["dep:clap", "dep:tracing-subscriber"]
+# NB tonic/lightwalletd is deliberately NOT feature-gated (a zebra-only consumer still compiles
+# the gRPC stack): the TLS value types on `BackendConfig` and the `Lwd` variants in
+# `chain::AnySource` and its stream enums couple it into config/chain, so carving it out is its
+# own project.
 # Use mimalloc as the global allocator. Off by default; the musl release images opt in.
 mimalloc = ["dep:mimalloc"]
 # Hardened mimalloc (MI_SECURE): guard pages, encrypted/canary free-lists, randomized
@@ -150,6 +169,12 @@ mimalloc-secure = ["mimalloc", "mimalloc/secure"]
 tempfile = "3"
 # Frontier bookkeeping for the fabricated-chain reorg test (matches librustzcash's version).
 incrementalmerkletree = "0.8"
+# The fake in-process zebrad in `chain/zebra.rs`'s tests is an axum server, and the HTTP
+# integration tests drive `server::router` with `tower::ServiceExt::oneshot`. Dev-dependencies
+# so both compile under every feature combination (axum is otherwise `server`-only, and tower
+# is test-only).
+axum = { version = "0.7", features = ["json"] }
+tower = { version = "0.5", features = ["util"] }
 
 # Dependency notes.
 #

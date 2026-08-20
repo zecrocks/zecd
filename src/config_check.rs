@@ -27,9 +27,12 @@
 //! Output follows the `nginx -t`/`-T` convention: **stdout is the effective configuration,
 //! stderr is the verdict** (see [`run`]).
 
+#[cfg(feature = "cli")]
 use std::io::Write;
 
-use crate::config::{AppConfig, Cli, ConfigCheckArgs};
+use crate::config::AppConfig;
+#[cfg(feature = "cli")]
+use crate::config::{Cli, ConfigCheckArgs};
 
 /// How bad a finding is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -43,7 +46,8 @@ pub enum Level {
 }
 
 impl Level {
-    fn label(self) -> &'static str {
+    /// The lowercase tag the CLI prints in front of a finding (`error: ...` / `warning: ...`).
+    pub fn label(self) -> &'static str {
         match self {
             Level::Error => "error",
             Level::Warning => "warning",
@@ -91,6 +95,41 @@ pub fn inspect(config: &AppConfig) -> Vec<Finding> {
     check_paths(config, &mut findings);
 
     findings
+}
+
+/// The verdict `zecd config check` derives from a set of findings. The pass/fail and
+/// `--strict` semantics live here so a library caller and the CLI cannot disagree on them.
+#[derive(Debug, Clone)]
+pub struct CheckOutcome {
+    pub findings: Vec<Finding>,
+}
+
+impl CheckOutcome {
+    /// Findings the daemon would refuse to start on (or would start and never sync past).
+    pub fn errors(&self) -> usize {
+        self.findings
+            .iter()
+            .filter(|f| f.level == Level::Error)
+            .count()
+    }
+
+    /// Legal-but-risky findings; they fail the check only under `strict`.
+    pub fn warnings(&self) -> usize {
+        self.findings.len() - self.errors()
+    }
+
+    /// Whether the check passes: no errors, and - under `strict` - no warnings either.
+    pub fn passes(&self, strict: bool) -> bool {
+        self.errors() == 0 && !(strict && self.warnings() > 0)
+    }
+}
+
+/// [`inspect`] with the verdict attached - the library core of `zecd config check`, which
+/// adds only the file lookup, the stdout/stderr stream split, and the exit code on top.
+pub fn check(config: &AppConfig) -> CheckOutcome {
+    CheckOutcome {
+        findings: inspect(config),
+    }
 }
 
 /// The upstream endpoint: the token must resolve, and the connect-time checks that need no
@@ -243,6 +282,7 @@ fn check_paths(config: &AppConfig, findings: &mut Vec<Finding>) {
 /// show` prints. One renderer rather than two: a check that described the configuration in its
 /// own vocabulary would invent labels that map to no config key, and would drift from `show` the
 /// first time a knob was added. What `check` adds is the verdict, on stderr.
+#[cfg(feature = "cli")]
 fn summary(config: &AppConfig) -> String {
     crate::config_show::render(config)
 }
@@ -256,6 +296,7 @@ fn summary(config: &AppConfig) -> String {
 /// binaries' output is diffing configuration and nothing else, while the findings and the pass/
 /// fail line stay where diagnostics belong. With `-q` stdout is empty, so a CI gate is silent on
 /// success and still loud on stderr when it isn't.
+#[cfg(feature = "cli")]
 pub fn run(cli: &Cli, args: &ConfigCheckArgs) -> anyhow::Result<()> {
     let conf_path = AppConfig::conf_path(cli);
     emit_err(&format!(
@@ -289,21 +330,21 @@ pub fn run(cli: &Cli, args: &ConfigCheckArgs) -> anyhow::Result<()> {
         }
     };
 
-    let findings = inspect(&config);
+    let outcome = check(&config);
     if !args.quiet {
         emit(&summary(&config));
     }
     let mut report = String::new();
-    if !findings.is_empty() {
+    if !outcome.findings.is_empty() {
         report.push('\n');
-        for f in &findings {
+        for f in &outcome.findings {
             report.push_str(&format!("{}: {}\n", f.level.label(), f.message));
         }
     }
 
-    let errors = findings.iter().filter(|f| f.level == Level::Error).count();
-    let warnings = findings.len() - errors;
-    if errors == 0 && !(args.strict && warnings > 0) && !args.quiet {
+    let errors = outcome.errors();
+    let warnings = outcome.warnings();
+    if outcome.passes(args.strict) && !args.quiet {
         report.push_str(&format!(
             "\nOK: {} is valid for zecd {}{}\n",
             conf_path.display(),
@@ -331,6 +372,7 @@ pub fn run(cli: &Cli, args: &ConfigCheckArgs) -> anyhow::Result<()> {
 }
 
 /// `" ({} warning{})"` filled in for `n`, or empty when there is nothing to report.
+#[cfg(feature = "cli")]
 fn plural_suffix(n: usize, template: &str) -> String {
     if n == 0 {
         return String::new();
@@ -343,6 +385,7 @@ fn plural_suffix(n: usize, template: &str) -> String {
 /// Write the effective configuration to stdout, treating a closed pipe as a clean exit
 /// (`zecd config check | head` would otherwise *panic* through `print!`, since the macros panic
 /// on EPIPE).
+#[cfg(feature = "cli")]
 fn emit(text: &str) {
     let mut out = std::io::stdout().lock();
     let _ = out.write_all(text.as_bytes()).and_then(|()| out.flush());
@@ -350,12 +393,13 @@ fn emit(text: &str) {
 
 /// Write a diagnostic - the header, the findings, the verdict - to stderr. Flushed as it goes, so
 /// it interleaves with [`emit`] in the order written when both are a terminal.
+#[cfg(feature = "cli")]
 fn emit_err(text: &str) {
     let mut err = std::io::stderr().lock();
     let _ = err.write_all(text.as_bytes()).and_then(|()| err.flush());
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "cli"))]
 mod tests {
     use super::*;
     use clap::Parser;

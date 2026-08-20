@@ -71,6 +71,33 @@ jobs:
       - name: Clippy
         run: cargo clippy --all-targets -- -D warnings
 
+  # Library feature combinations: the crate is consumable with `default-features = false`
+  # (the embeddable node + CLI cores, no axum/clap), so every combination the gates create
+  # must stay warning-free and the library-only tests green. The default-features path is
+  # already covered by the `test` job above.
+  features:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install protobuf compiler
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Clippy across feature combinations
+        run: |
+          cargo clippy --all-targets --no-default-features -- -D warnings
+          cargo clippy --all-targets --no-default-features --features server -- -D warnings
+          cargo clippy --all-targets --no-default-features --features cli -- -D warnings
+
+      - name: Test library-only (no default features)
+        run: cargo test --no-default-features
+
   # Dependency policy: RustSec advisories (vulnerabilities AND unmaintained crates),
   # license allowlist, wildcard-version ban, and registry/git source pinning. Exceptions
   # (with rationale) live in deny.toml; .cargo/audit.toml mirrors the advisory exceptions
