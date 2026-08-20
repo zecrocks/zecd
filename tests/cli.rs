@@ -838,6 +838,27 @@ fn config_check_rejects_an_unknown_key_and_names_it() {
     assert!(out.stdout.is_empty(), "stdout: {}", stdout_of(&out));
 }
 
+/// `[log] format` is validated at resolve: `init_tracing` treats anything that isn't "json"
+/// as text, so an unvalidated typo like "jsonl" would silently produce text logs on a
+/// deployment that asked for structured ones.
+#[test]
+fn config_check_rejects_an_unknown_log_format() {
+    let dir = tempfile::tempdir().unwrap();
+    let conf = dir.path().join("zecd.toml");
+    std::fs::write(&conf, "[log]\nformat = \"jsonl\"\n").unwrap();
+
+    let out = config_check(&conf, &[]);
+    assert_eq!(out.status.code(), Some(1), "stderr: {}", stderr_of(&out));
+    let stderr = stderr_of(&out);
+    assert!(stderr.contains("jsonl"), "{stderr}");
+    assert!(stderr.contains("format"), "{stderr}");
+
+    // The two accepted values (case-insensitive) still resolve.
+    std::fs::write(&conf, "[log]\nformat = \"JSON\"\n").unwrap();
+    let out = config_check(&conf, &[]);
+    assert_eq!(out.status.code(), Some(0), "stderr: {}", stderr_of(&out));
+}
+
 /// Checking a file that isn't there is a typo'd path, not a request to validate the built-in
 /// defaults - so it fails, and says which path it looked at.
 #[test]

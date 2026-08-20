@@ -46,6 +46,13 @@ impl Backoff {
     pub fn reset(&mut self) {
         self.attempt = 0;
     }
+
+    /// How many delays have been taken since the last reset - i.e. how many consecutive
+    /// failures this outage has seen so far. Lets the caller log the first failure loudly and
+    /// the paced retries quietly.
+    pub fn attempt(&self) -> u32 {
+        self.attempt
+    }
 }
 
 #[cfg(test)]

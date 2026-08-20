@@ -31,7 +31,12 @@ pub const ALLOW_CORE_DUMPS_ENV: &str = "ZECD_ALLOW_CORE_DUMPS";
 /// call from every subcommand; best-effort, so failures are logged and never fatal.
 pub fn harden_process() {
     if core_dumps_allowed() {
-        warn!("{ALLOW_CORE_DUMPS_ENV}=1 set; leaving core dumps and ptrace enabled");
+        // The operator explicitly asked for this (a documented debugging escape hatch), so it
+        // is not alert material - but it is audit material, hence the dedicated target.
+        tracing::info!(
+            target: "zecd::audit",
+            "{ALLOW_CORE_DUMPS_ENV}=1 set; leaving core dumps and ptrace enabled"
+        );
         return;
     }
     disable_core_dumps();
@@ -56,6 +61,7 @@ fn disable_core_dumps() {
     let rc = unsafe { libc::setrlimit(libc::RLIMIT_CORE, &limit) };
     if rc != 0 {
         warn!(
+            target: "zecd::audit",
             "could not disable core dumps: {}",
             std::io::Error::last_os_error()
         );
@@ -70,6 +76,7 @@ fn set_non_dumpable() {
     let rc = unsafe { libc::prctl(libc::PR_SET_DUMPABLE, 0, 0, 0, 0) };
     if rc != 0 {
         warn!(
+            target: "zecd::audit",
             "could not mark process non-dumpable: {}",
             std::io::Error::last_os_error()
         );
@@ -83,7 +90,8 @@ fn set_non_dumpable() {
 
 #[cfg(not(unix))]
 fn disable_core_dumps() {
-    warn!("core-dump hardening is not implemented on this platform");
+    warn!(
+        target: "zecd::audit","core-dump hardening is not implemented on this platform");
 }
 
 #[cfg(not(unix))]
@@ -106,6 +114,7 @@ pub fn lock_secret(bytes: &[u8]) -> bool {
         true
     } else {
         warn!(
+            target: "zecd::audit",
             "could not mlock the wallet seed (it may be swappable): {}; \
              raise RLIMIT_MEMLOCK to fix",
             std::io::Error::last_os_error()

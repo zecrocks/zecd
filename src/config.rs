@@ -1495,6 +1495,18 @@ impl AppConfig {
             level: log_file.level.unwrap_or_else(|| "info".to_string()),
             format: log_file.format.unwrap_or_else(|| "text".to_string()),
         };
+        // `init_tracing` treats anything that is not "json" as text, so a typo like "jsonl"
+        // would silently produce text logs; refuse it here instead (and `config check`
+        // reports the same refusal without starting anything).
+        if !["text", "json"]
+            .iter()
+            .any(|v| log.format.eq_ignore_ascii_case(v))
+        {
+            anyhow::bail!(
+                "[log] format must be \"text\" or \"json\", got {:?}",
+                log.format
+            );
+        }
 
         Ok(AppConfig {
             network,

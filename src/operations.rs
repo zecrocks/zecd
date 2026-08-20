@@ -456,6 +456,21 @@ impl OperationRegistry {
         statuses
     }
 
+    /// `(wallet, opid)` for every unfinished (queued or executing) operation across all
+    /// wallets, sorted for a deterministic log line. These are the operations that own a
+    /// pending send whose status object is in-memory only, so they are what the shutdown
+    /// warning names (see `AppState::trigger_shutdown`).
+    pub fn unfinished(&self) -> Vec<(String, String)> {
+        let map = self.inner.lock().expect("operation registry poisoned");
+        let mut out: Vec<(String, String)> = map
+            .values()
+            .filter(|e| !e.op.state().is_finished())
+            .map(|e| (e.wallet.clone(), e.op.operation_id().0.clone()))
+            .collect();
+        out.sort();
+        out
+    }
+
     /// All opid strings for this wallet, optionally filtered by state string. An unrecognized
     /// filter yields an empty list - it never equals any state string, matching zcashd's
     /// `z_listoperationids`. Sorted by creation time ascending.

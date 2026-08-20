@@ -361,19 +361,6 @@ const ENHANCE_BATCH: usize = 16;
 /// The heartbeat makes forward progress visible in the log regardless of how the count moves.
 const ENHANCE_LOG_INTERVAL: Duration = Duration::from_secs(30);
 
-/// Progress of the current enhancement drain, for the time-throttled heartbeat. Transient and
-/// per-drain: reset whenever the drain completes or a sync batch does work (which clears
-/// `enhance_satisfied`, the serviced-count baseline).
-struct EnhanceProgress {
-    /// When this drain began.
-    started: Instant,
-    /// Last heartbeat time (throttle clock).
-    last_log: Instant,
-    /// Requests serviced (`enhance_satisfied.len()`) at the last heartbeat, so the logged rate
-    /// is a short rolling window rather than a drifting cumulative average.
-    last_log_count: usize,
-}
-
 /// Whether a [`TransactionDataRequest`] is one zecd can actually service (and therefore one that
 /// counts toward the enhancement backlog). All three variants drain: `GetStatus`/`Enhancement` via
 /// `fetch_full_tx`, and `TransactionsInvolvingAddress` via the transparent address-index query
@@ -487,13 +474,8 @@ struct PreexposeProgress {
     done: u32,
     /// Target depth (= `transparent_initial_scan`).
     total: u32,
-    /// When this run began (for the completion-time and ETA lines).
-    started: Instant,
-    /// Last heartbeat time (throttle clock).
-    last_log: Instant,
-    /// `done` at the last heartbeat, so the rate is a short rolling window (not a drifting
-    /// cumulative average).
-    last_log_count: u32,
+    /// Heartbeat throttle (rolling-window rate; also the completion-time clock).
+    throttle: crate::progress::ProgressThrottle,
 }
 
 /// Pure progress math for the transparent initial-sync heartbeat: given the running count
@@ -797,9 +779,11 @@ struct WalletActor {
     /// sync batch does work (new blocks may add or re-satisfy requests). Entries removed from the
     /// DB by librustzcash on success simply never reappear.
     enhance_satisfied: std::collections::BTreeSet<TransactionDataRequest>,
-    /// Heartbeat state for the current enhancement drain (see [`ENHANCE_LOG_INTERVAL`]).
-    /// `None` when no drain is in progress.
-    enhance_progress: Option<EnhanceProgress>,
+    /// Heartbeat throttle for the current enhancement drain (see [`ENHANCE_LOG_INTERVAL`]).
+    /// `None` when no drain is in progress; transient and per-drain, reset whenever the drain
+    /// completes or a sync batch does work (which clears `enhance_satisfied`, the
+    /// serviced-count baseline).
+    enhance_progress: Option<crate::progress::ProgressThrottle>,
     /// Graceful-shutdown signal (see [`ActorConfig::shutdown`]).
     shutdown: watch::Receiver<bool>,
 }
@@ -807,7 +791,21 @@ struct WalletActor {
 /// Open the wallet, derive its account info, optionally unlock the seed, build the prover,
 /// and spawn the actor task. Returns a clonable handle plus the task's join handle (awaited
 /// at shutdown so the wallet DB closes cleanly before the runtime is torn down).
+///
+/// The whole setup - and the actor task it spawns - runs inside a `wallet` span carrying the
+/// wallet name, so every event emitted on the actor (including the sync engine and the chain
+/// clients it drives) is attributable to its wallet without a hand-written message prefix.
+/// Work that leaves the task (`spawn_blocking` for the pipelined prove) re-enters the span
+/// explicitly.
 pub async fn spawn(
+    cfg: ActorConfig,
+) -> anyhow::Result<(WalletHandle, tokio::task::JoinHandle<()>)> {
+    use tracing::Instrument as _;
+    let span = tracing::info_span!("wallet", name = %cfg.name);
+    spawn_inner(cfg).instrument(span).await
+}
+
+async fn spawn_inner(
     cfg: ActorConfig,
 ) -> anyhow::Result<(WalletHandle, tokio::task::JoinHandle<()>)> {
     if !store::WalletStore::exists(&cfg.keys_path) {
@@ -844,25 +842,23 @@ pub async fn spawn(
         // stalled restore, so it logs at error level - the 0.5.1-rc2 field stall ran 71000.
         if cfg.transparent_gap_limit > crate::config::TRANSPARENT_GAP_LIMIT_SEVERE {
             error!(
-                "[{}] transparent_gap_limit = {} will effectively STALL restores and slow every \
+                "transparent_gap_limit = {} will effectively STALL restores and slow every \
                  incoming transparent payment: recording one transparent receive re-derives the \
                  entire gap window (roughly {}s of address derivation per received UTXO, \
                  repeated per output of a multi-output transaction - a restore that discovers \
                  dozens of UTXOs grinds for hours on one core with no log output). Use a small \
                  gap limit plus [pools] transparent_initial_scan (a one-time pre-exposure with \
                  no per-receive cost) for deep restore coverage instead. Starting anyway.",
-                cfg.name,
                 cfg.transparent_gap_limit,
                 cfg.transparent_gap_limit / 1200
             );
         } else if cfg.transparent_gap_limit > crate::config::TRANSPARENT_GAP_LIMIT_COSTLY {
             warn!(
-                "[{}] transparent_gap_limit = {} is unusually large: every transparent receive \
+                "transparent_gap_limit = {} is unusually large: every transparent receive \
                  recorded by the scan re-derives the entire gap window (roughly {}s of address \
                  derivation per received UTXO, repeated per output of a multi-output \
                  transaction). Prefer a small gap limit plus [pools] transparent_initial_scan \
                  for deep restore coverage.",
-                cfg.name,
                 cfg.transparent_gap_limit,
                 cfg.transparent_gap_limit / 1200
             );
@@ -899,9 +895,8 @@ pub async fn spawn(
                     ));
                 }
                 info!(
-                    "[{}] empty data directory with keys.toml present: rebuilding the account \
+                    "empty data directory with keys.toml present: rebuilding the account \
                      from keys.toml (birthday {}) once the seed is available{}",
-                    cfg.name,
                     u32::from(st.birthday),
                     if encrypted {
                         " (call walletpassphrase to unlock)"
@@ -934,9 +929,8 @@ pub async fn spawn(
         // a stateless rebuild rediscovers transparent funds only below the recovery horizon
         // (or chained past it by funding).
         info!(
-            "[{}] transparent receiving enabled (default_address={}, external_gap_limit={}, \
+            "transparent receiving enabled (default_address={}, external_gap_limit={}, \
              initial_scan={}, recovery_horizon={})",
-            cfg.name,
             cfg.transparent_default,
             cfg.transparent_gap_limit,
             cfg.transparent_initial_scan,
@@ -957,15 +951,12 @@ pub async fn spawn(
     let mut seed = SeedKeeper::locked();
     if watch_only {
         info!(
-            "[{}] watch-only wallet (imported UFVK): balances, history, and addresses are \
-             available; spending and wallet-encryption RPCs are disabled",
-            cfg.name
+            "watch-only wallet (imported UFVK): balances, history, and addresses are \
+             available; spending and wallet-encryption RPCs are disabled"
         );
     } else if encrypted {
         info!(
-            "[{}] wallet is passphrase-encrypted; it starts locked - call walletpassphrase to unlock for sending",
-            cfg.name
-        );
+            "wallet is passphrase-encrypted; it starts locked - call walletpassphrase to unlock for sending");
     } else if cfg.auto_unlock {
         if let Some(identity) = &cfg.age_identity {
             if st.has_seed() {
@@ -994,21 +985,18 @@ pub async fn spawn(
                         }
                         seed.set(s);
                         warn!(
-                            "[{}] auto-unlocked an unencrypted seed at startup: spend authority is \
+                            target: "zecd::audit",
+                            "auto-unlocked an unencrypted seed at startup: spend authority is \
                              resident in memory without a passphrase. Use `zecd init --encrypt` for \
-                             the passphrase model if unattended spend authority is not intended",
-                            cfg.name
-                        );
+                             the passphrase model if unattended spend authority is not intended");
                     }
                     Ok(None) => {}
-                    Err(e) => warn!("[{}] could not decrypt seed at startup: {e}", cfg.name),
+                    Err(e) => warn!("could not decrypt seed at startup: {e}"),
                 }
             }
         } else {
             warn!(
-                "[{}] auto_unlock is set but no age identity configured; sending will require walletpassphrase",
-                cfg.name
-            );
+                "auto_unlock is set but no age identity configured; sending will require walletpassphrase");
         }
     } else {
         // An identity-encrypted wallet with auto_unlock=false is a dead end for sending:
@@ -1016,10 +1004,9 @@ pub async fn spawn(
         // bitcoind's unencrypted wallets) - there is no RPC that can unlock it. Reads still
         // work, so don't refuse to start; warn loudly instead.
         warn!(
-            "[{}] auto_unlock=false on an identity-encrypted wallet: sends will fail (-13) and \
+            "auto_unlock=false on an identity-encrypted wallet: sends will fail (-13) and \
              walletpassphrase cannot unlock it (-15). Enable auto_unlock, or re-create the wallet \
-             passphrase-encrypted with `zecd init --encrypt` (then walletpassphrase unlocks).",
-            cfg.name
+             passphrase-encrypted with `zecd init --encrypt` (then walletpassphrase unlocks)."
         );
     }
 
@@ -1136,7 +1123,12 @@ pub async fn spawn(
         shutdown: cfg.shutdown,
     };
 
-    let task = tokio::spawn(actor.run());
+    // `tokio::spawn` does not inherit the caller's span, so re-attach the wallet span the
+    // setup is running under - it is what keeps every actor-lifetime event wallet-attributed.
+    let task = {
+        use tracing::Instrument as _;
+        tokio::spawn(actor.run().instrument(tracing::Span::current()))
+    };
 
     Ok((
         make_handle(
@@ -1707,8 +1699,8 @@ fn spend_policy_for_source(source: SendSource) -> SpendPolicy {
 /// the client gets `client_msg`, a fixed generic string. The blanket `From<anyhow::Error>` impl
 /// already scrubs errors that flow through `?`, but these `RpcError::misc(format!(... {e}))`
 /// sites format the error directly, bypassing that funnel, so they scrub here.
-fn upstream_error(name: &str, detail: impl std::fmt::Display, client_msg: &str) -> RpcError {
-    warn!("[{name}] {client_msg}: {detail}");
+fn upstream_error(detail: impl std::fmt::Display, client_msg: &str) -> RpcError {
+    warn!("{client_msg}: {detail}");
     RpcError::misc(client_msg)
 }
 
@@ -1835,11 +1827,11 @@ fn describe_frontier(hex_final_state: &str) -> String {
 impl WalletActor {
     async fn run(mut self) {
         if let Err(e) = self.connect().await {
-            warn!("[{}] initial upstream connect failed: {e}", self.name);
+            warn!("initial upstream connect failed: {e}");
         }
         if self.client.is_some() {
             if let Err(e) = self.refresh_tip().await {
-                warn!("[{}] initial tip refresh failed: {e}", self.name);
+                warn!("initial tip refresh failed: {e}");
                 self.client = None;
             }
         }
@@ -1850,7 +1842,7 @@ impl WalletActor {
             // Exit between sync batches once shutdown is signalled, so Ctrl-C/`stop` doesn't
             // wait out a long catch-up scan and the DB connection is dropped cleanly.
             if *self.shutdown.borrow() {
-                info!("[{}] wallet actor shutting down", self.name);
+                info!("wallet actor shutting down");
                 return;
             }
             // Relock an encrypted wallet whose passphrase timeout has elapsed. Checked every
@@ -1937,7 +1929,7 @@ impl WalletActor {
                         if !self.sync_halted && sync_failure_is_terminal(&e) {
                             self.sync_halted = true;
                             error!(
-                                "[{name}] {e}; sync is HALTED for this wallet - retrying cannot \
+                                "{e}; sync is HALTED for this wallet - retrying cannot \
                                  remove the conflicting block. Stop the daemon and run `zecd \
                                  rescan --wallet {name}` to rebuild the wallet database from the \
                                  seed (keys.toml is kept) and resync from the wallet birthday. \
@@ -1998,7 +1990,7 @@ impl WalletActor {
                     // `changed()` would otherwise resolve Err on every iteration (a busy loop).
                     IdleEvent::Shutdown(res) => {
                         if res.is_err() {
-                            info!("[{}] wallet actor shutting down", self.name);
+                            info!("wallet actor shutting down");
                             return;
                         }
                     }
@@ -2017,12 +2009,27 @@ impl WalletActor {
                         if self.client.is_none() {
                             if let Err(e) = self.connect().await {
                                 // Schedule the next attempt with exponential backoff + jitter.
+                                // One WARN per outage (the first failed attempt; the disconnect
+                                // itself already warned when the outage began that way), then
+                                // the paced retries drop to DEBUG so a long outage doesn't
+                                // stream WARNs - recovery logs its own "connected to" INFO.
+                                let attempt = self.backoff.attempt();
                                 let delay = self.backoff.next_delay();
                                 self.reconnect_at = Instant::now() + delay;
-                                warn!(
-                                    "[{}] reconnect failed: {e}; retrying in {delay:?}",
-                                    self.name
-                                );
+                                if attempt == 0 {
+                                    warn!(
+                                        delay_ms = delay.as_millis() as u64,
+                                        "reconnect failed: {e}; retrying with backoff \
+                                         (further attempts log at debug until the connection \
+                                         recovers)"
+                                    );
+                                } else {
+                                    tracing::debug!(
+                                        attempt = attempt + 1,
+                                        delay_ms = delay.as_millis() as u64,
+                                        "reconnect failed: {e}"
+                                    );
+                                }
                                 self.update_status();
                             }
                         }
@@ -2045,10 +2052,7 @@ impl WalletActor {
                         }))
                         .is_err()
                         {
-                            error!(
-                                "[{}] mempool tx handler panicked; the actor continues",
-                                self.name
-                            );
+                            error!("mempool tx handler panicked; the actor continues");
                         }
                     }
                     IdleEvent::Mempool(Ok(None)) => {
@@ -2067,7 +2071,7 @@ impl WalletActor {
                     IdleEvent::Mempool(Err(e)) => {
                         // Best-effort subscription: drop it and let the regular liveness
                         // checks decide whether the connection itself is unhealthy.
-                        tracing::debug!("[{}] mempool stream error: {e}", self.name);
+                        tracing::debug!("mempool stream error: {e}");
                         self.mempool = None;
                     }
                 }
@@ -2091,9 +2095,8 @@ impl WalletActor {
             Ok(stop) => stop,
             Err(_) => {
                 error!(
-                    "[{}] wallet command handler panicked; the actor continues and the command \
-                     failed (this is a bug - please report it)",
-                    self.name
+                    "wallet command handler panicked; the actor continues and the command \
+                     failed (this is a bug - please report it)"
                 );
                 false
             }
@@ -2116,9 +2119,8 @@ impl WalletActor {
             Ok(res) => res,
             Err(_) => {
                 error!(
-                    "[{}] wallet sync batch panicked; the actor continues (this is a bug - \
-                     please report it)",
-                    self.name
+                    "wallet sync batch panicked; the actor continues (this is a bug - \
+                     please report it)"
                 );
                 Err(anyhow!("sync batch panicked"))
             }
@@ -2140,10 +2142,7 @@ impl WalletActor {
         {
             Ok(more) => more,
             Err(_) => {
-                error!(
-                    "[{}] transaction enhancement panicked; the actor continues",
-                    self.name
-                );
+                error!("transaction enhancement panicked; the actor continues");
                 false
             }
         }
@@ -2166,11 +2165,7 @@ impl WalletActor {
         self.client = None;
         self.reconnect_at = reconnect_after_backoff(Instant::now(), &mut self.backoff);
         if std::mem::take(&mut self.connected_logged) {
-            warn!(
-                "[{}] disconnected from {}: {reason}",
-                self.name,
-                self.server.describe()
-            );
+            warn!("disconnected from {}: {reason}", self.server.describe());
         }
     }
 
@@ -2188,18 +2183,18 @@ impl WalletActor {
                 .unwrap_or_else(|| "unknown".to_string());
             if u.active {
                 error!(
-                    "[{}] the upstream chain has activated network upgrade '{name}' (consensus \
+                    "the upstream chain has activated network upgrade '{name}' (consensus \
                      branch 0x{:08x}, activation height {height}) which this zecd build does \
                      not support: block scanning cannot proceed past the activation. \
                      {UPGRADE_GUIDANCE}",
-                    self.name, u.branch_id
+                    u.branch_id
                 );
             } else {
                 warn!(
-                    "[{}] the upstream reports network upgrade '{name}' (consensus branch \
+                    "the upstream reports network upgrade '{name}' (consensus branch \
                      0x{:08x}) activating at height {height}, which this zecd build does not \
                      support: syncing will stop there. {UPGRADE_GUIDANCE}",
-                    self.name, u.branch_id
+                    u.branch_id
                 );
             }
         }
@@ -2244,7 +2239,7 @@ impl WalletActor {
         // pin the old connection alive. It is reopened on the next caught-up sync pass.
         self.mempool = None;
         let describe = self.server.describe();
-        info!("[{}] connecting to {}", self.name, describe);
+        info!("connecting to {}", describe);
         let client = self.server.connect_timeout(self.connect_timeout).await?;
         self.client = Some(client);
         let client = self.client.as_mut().expect("just set");
@@ -2260,7 +2255,7 @@ impl WalletActor {
         .await
         {
             Err(e) => {
-                warn!("[{}] health check failed on {}: {e}", self.name, describe);
+                warn!("health check failed on {}: {e}", describe);
                 self.client = None;
                 return Err(e);
             }
@@ -2294,16 +2289,15 @@ impl WalletActor {
         // stream body is consumed incrementally from the idle loop.
         match tokio::time::timeout(UNARY_RPC_TIMEOUT, client.subscribe_mempool()).await {
             Ok(Ok(stream)) => {
-                tracing::debug!("[{}] subscribed to the mempool stream", self.name);
+                tracing::debug!("subscribed to the mempool stream");
                 self.mempool = Some(stream);
             }
             Ok(Err(e)) => {
-                tracing::debug!("[{}] mempool stream unavailable: {e}", self.name);
+                tracing::debug!("mempool stream unavailable: {e}");
             }
             Err(_) => {
                 tracing::debug!(
-                    "[{}] mempool stream subscription timed out after {UNARY_RPC_TIMEOUT:?}",
-                    self.name
+                    "mempool stream subscription timed out after {UNARY_RPC_TIMEOUT:?}"
                 );
             }
         }
@@ -2323,7 +2317,7 @@ impl WalletActor {
                 .filter(|r| is_serviceable_request(r) && !self.enhance_satisfied.contains(r))
                 .count() as u64,
             Err(e) => {
-                tracing::debug!("[{}] counting pending enhancements: {e}", self.name);
+                tracing::debug!("counting pending enhancements: {e}");
                 0
             }
         }
@@ -2336,35 +2330,24 @@ impl WalletActor {
     /// up front (servicing a request can enqueue successors), so a flat reading between polls does
     /// not distinguish steady progress from a stall - the heartbeat does.
     fn maybe_log_enhance_progress(&mut self, pending: usize) {
-        let now = Instant::now();
+        let done = self.enhance_satisfied.len();
         let Some(progress) = self.enhance_progress.as_mut() else {
             // Drain just started: arm the throttle without logging, so short drains stay quiet.
-            self.enhance_progress = Some(EnhanceProgress {
-                started: now,
-                last_log: now,
-                last_log_count: self.enhance_satisfied.len(),
-            });
+            self.enhance_progress = Some(crate::progress::ProgressThrottle::new(
+                ENHANCE_LOG_INTERVAL,
+                done as u64,
+            ));
             return;
         };
-        let window = now.duration_since(progress.last_log);
-        if window < ENHANCE_LOG_INTERVAL {
-            return;
+        if let Some(w) = progress.tick(done as u64) {
+            info!(
+                serviced = done,
+                pending,
+                elapsed_secs = w.elapsed_secs as u64,
+                rate_per_sec = (w.rate * 10.0).round() / 10.0,
+                "enhancement drain in progress"
+            );
         }
-        let done = self.enhance_satisfied.len();
-        let did = done.saturating_sub(progress.last_log_count);
-        let rate = if window.as_secs_f64() > 0.0 {
-            did as f64 / window.as_secs_f64()
-        } else {
-            0.0
-        };
-        info!(
-            "[{}] enhancement drain in progress: {done} request(s) serviced in {:.0}s \
-             ({rate:.1}/s), {pending} pending",
-            self.name,
-            progress.started.elapsed().as_secs_f64(),
-        );
-        progress.last_log = now;
-        progress.last_log_count = done;
     }
 
     /// Service one bounded batch of the wallet's pending transaction-data requests - the
@@ -2404,7 +2387,7 @@ impl WalletActor {
         let requests = match self.db_data.transaction_data_requests() {
             Ok(r) => r,
             Err(e) => {
-                warn!("[{}] reading transaction data requests: {e}", self.name);
+                warn!("reading transaction data requests: {e}");
                 return false;
             }
         };
@@ -2428,11 +2411,14 @@ impl WalletActor {
             if *self.shutdown.borrow() {
                 return false;
             }
+            // Per-request visibility for a long drain, below DEBUG (a from-birthday restore
+            // services tens of thousands of these).
+            tracing::trace!(request = ?req, "servicing transaction data request");
             if let Err(e) = self.service_data_request(req, chain_tip).await {
                 // A transport failure has already dropped the client (a DB-write error just ends
                 // the batch); either way stop here and retry the remainder on the next pass rather
                 // than spinning on a persistent failure.
-                tracing::debug!("[{}] transaction enhancement aborted: {e}", self.name);
+                tracing::debug!("transaction enhancement aborted: {e}");
                 self.update_status();
                 return false;
             }
@@ -2508,8 +2494,7 @@ impl WalletActor {
                     // request was never emitted" when reading a failing restore's logs.
                     use zcash_keys::encoding::AddressCodec as _;
                     tracing::debug!(
-                        "[{}] TIA: skipping address={} - range starts at {}, past the tip {}",
-                        self.name,
+                        "TIA: skipping address={} - range starts at {}, past the tip {}",
                         addr_req.address().encode(&self.network),
                         u32::from(addr_req.block_range_start()),
                         u32::from(chain_tip),
@@ -2517,17 +2502,13 @@ impl WalletActor {
                     return Ok(());
                 };
                 let address = addr_req.address().encode(&self.network);
-                tracing::debug!(
-                    "[{}] TIA: address-txid query addr={address} range={start}..={as_of}",
-                    self.name
-                );
+                tracing::debug!("TIA: address-txid query addr={address} range={start}..={as_of}");
                 let evidence = self
                     .fetch_transparent_tx_evidence(vec![address], start, as_of)
                     .await
                     .map_err(|e| anyhow!("{e}"))?;
                 tracing::debug!(
-                    "[{}] TIA: address-txid query returned {} item(s)",
-                    self.name,
+                    "TIA: address-txid query returned {} item(s)",
                     evidence.len()
                 );
                 self.store_tx_evidence(evidence, chain_tip).await?;
@@ -2664,18 +2645,14 @@ impl WalletActor {
             if let Some(index) = lookahead {
                 if let Err(e) = engine::record_lookahead_address(&mut self.db_data, account, index)
                 {
-                    warn!(
-                        "[{}] recording lookahead transparent address at index {index} failed: {e}",
-                        self.name
-                    );
+                    warn!("recording lookahead transparent address at index {index} failed: {e}");
                     continue;
                 }
             }
             match self.db_data.put_received_transparent_utxo(&output) {
                 Ok(_) => recorded += 1,
                 Err(e) => warn!(
-                    "[{}] recording transparent receive {}:{} failed: {e}",
-                    self.name,
+                    "recording transparent receive {}:{} failed: {e}",
                     output.outpoint().txid(),
                     output.outpoint().n(),
                 ),
@@ -2714,32 +2691,23 @@ impl WalletActor {
         if start >= depth {
             // Already covered before we derived anything (e.g. a restart whose DB was complete).
             if self.transparent_preexpose.is_none() {
-                info!(
-                    "[{}] transparent initial sync already complete ({depth} addresses)",
-                    self.name
-                );
+                info!("transparent initial sync already complete ({depth} addresses)");
             }
             return false;
         }
         if self.transparent_preexpose.is_none() {
-            let now = Instant::now();
             self.transparent_preexpose = Some(PreexposeProgress {
                 done: start,
                 total: depth,
-                started: now,
-                last_log: now,
-                last_log_count: start,
+                throttle: crate::progress::ProgressThrottle::new(
+                    PREEXPOSE_LOG_INTERVAL,
+                    u64::from(start),
+                ),
             });
             if start > 0 {
-                info!(
-                    "[{}] resuming transparent initial sync at {start}/{depth} addresses",
-                    self.name
-                );
+                info!("resuming transparent initial sync at {start}/{depth} addresses");
             } else {
-                info!(
-                    "[{}] starting transparent initial sync: {depth} addresses to scan",
-                    self.name
-                );
+                info!("starting transparent initial sync: {depth} addresses to scan");
             }
         }
         let end = depth.min(start.saturating_add(TRANSPARENT_PREEXPOSE_CHUNK));
@@ -2768,10 +2736,7 @@ impl WalletActor {
                 })
         });
         if let Err(e) = derived {
-            warn!(
-                "[{}] transparent initial sync failed in [{start}, {end}): {e}",
-                self.name
-            );
+            warn!("transparent initial sync failed in [{start}, {end}): {e}");
             // Stop attempting this process so we don't spin re-hitting the same chunk every pass;
             // the transaction rolled back, so the window stays exposed up to `start` and a later
             // restart resumes there via `next_unexposed_external_index`.
@@ -2784,11 +2749,12 @@ impl WalletActor {
             let elapsed = self
                 .transparent_preexpose
                 .as_ref()
-                .map(|p| p.started.elapsed().as_secs_f64())
+                .map(|p| p.throttle.elapsed_secs())
                 .unwrap_or(0.0);
             info!(
-                "[{}] transparent initial sync complete: {depth} addresses in {elapsed:.0}s",
-                self.name
+                addresses = depth,
+                elapsed_secs = elapsed as u64,
+                "transparent initial sync complete"
             );
             return false;
         }
@@ -2820,24 +2786,23 @@ impl WalletActor {
     /// is derived from that rate and flagged approximate. Monotonic `Instant` throughout, and the
     /// rate divide is guarded so a zero-length interval can't produce `inf`/NaN.
     fn maybe_log_preexpose_progress(&mut self) {
-        let name = self.name.clone();
         let Some(p) = self.transparent_preexpose.as_mut() else {
             return;
         };
-        let now = Instant::now();
-        let window = now.saturating_duration_since(p.last_log).as_secs_f64();
-        if window < PREEXPOSE_LOG_INTERVAL.as_secs_f64() {
-            return;
-        }
         let done = p.done;
         let total = p.total;
-        let did = done.saturating_sub(p.last_log_count);
-        let (pct, rate, eta) = preexpose_progress_stats(done, total, did, window);
+        let Some(w) = p.throttle.tick(u64::from(done)) else {
+            return;
+        };
+        let (pct, rate, eta) = preexpose_progress_stats(done, total, w.did as u32, w.window_secs);
         info!(
-            "[{name}] transparent initial sync: {done}/{total} ({pct:.1}%), {rate:.0} addr/s, ETA {eta}"
+            exposed = done,
+            total,
+            percent = (pct * 10.0).round() / 10.0,
+            rate_per_sec = rate.round(),
+            eta = %eta,
+            "transparent initial sync in progress"
         );
-        p.last_log = now;
-        p.last_log_count = done;
     }
 
     /// Fetch a full transaction from the upstream and parse it for enhancement, returning the
@@ -2884,7 +2849,7 @@ impl WalletActor {
         ) {
             Ok(tx) => tx,
             Err(e) => {
-                tracing::debug!("[{}] skipping unparseable mempool tx: {e}", self.name);
+                tracing::debug!("skipping unparseable mempool tx: {e}");
                 return;
             }
         };
@@ -2903,8 +2868,7 @@ impl WalletActor {
                 let txid_hex = txid.to_string();
                 let ours = t_recorded > 0 || super::read::tx_exists(&self.wallet_dir, &txid_hex);
                 tracing::debug!(
-                    "[{}] processed mempool tx {txid} (ours={ours}, transparent_receives={t_recorded})",
-                    self.name
+                    "processed mempool tx {txid} (ours={ours}, transparent_receives={t_recorded})"
                 );
                 // If the tx is ours and still unmined, stamp when we first saw it so
                 // `gettransaction`/`listtransactions` can report `time`/`timereceived` (Bitcoin
@@ -2921,7 +2885,7 @@ impl WalletActor {
                     }
                 }
             }
-            Err(e) => warn!("[{}] failed to store mempool tx {txid}: {e}", self.name),
+            Err(e) => warn!("failed to store mempool tx {txid}: {e}"),
         }
     }
 
@@ -2940,7 +2904,7 @@ impl WalletActor {
                 let unmined: std::collections::HashSet<String> = unmined.into_iter().collect();
                 map.retain(|txid, _| unmined.contains(txid));
             }
-            Err(e) => tracing::debug!("[{}] pruning first-seen map: {e}", self.name),
+            Err(e) => tracing::debug!("pruning first-seen map: {e}"),
         }
     }
 
@@ -2979,15 +2943,13 @@ impl WalletActor {
         if !self.connected_logged {
             self.connected_logged = true;
             info!(
-                "[{}] connected to {}; chain tip {}",
-                self.name,
-                self.server.describe(),
-                u32::from(tip)
+                server = %self.server.describe(),
+                tip = u32::from(tip),
+                "connected to the upstream"
             );
         }
         tracing::debug!(
-            "[{}] tip refreshed: {:?} -> {} (suggest_scan_ranges drives the rescan/rewind)",
-            self.name,
+            "tip refreshed: {:?} -> {} (suggest_scan_ranges drives the rescan/rewind)",
             prev,
             u32::from(tip)
         );
@@ -3060,7 +3022,6 @@ impl WalletActor {
                 .as_mut()
                 .ok_or_else(|| anyhow!("not connected"))?;
             engine::sync_one_batch(
-                &self.name,
                 client,
                 &self.network,
                 &self.wallet_dir,
@@ -3103,7 +3064,7 @@ impl WalletActor {
         {
             Ok(r) => r,
             Err(e) => {
-                warn!("[{}] rebuilding transparent address set: {e}", self.name);
+                warn!("rebuilding transparent address set: {e}");
                 return;
             }
         };
@@ -3121,7 +3082,7 @@ impl WalletActor {
         {
             Ok(r) => r,
             Err(e) => {
-                warn!("[{}] rebuilding transparent address set: {e}", self.name);
+                warn!("rebuilding transparent address set: {e}");
                 return;
             }
         };
@@ -3165,9 +3126,8 @@ impl WalletActor {
         // *funding*, and is what bounds a from-seed restore. Log both so the difference is
         // visible when a wallet has issued past its recovery horizon.
         tracing::debug!(
-            "[{}] transparent address set rebuilt: {} receiver(s) ({} gap-lookahead from index \
+            "transparent address set rebuilt: {} receiver(s) ({} gap-lookahead from index \
              {frontier}, live coverage through {}; recovery horizon {})",
-            self.name,
             all.len(),
             lookahead.len(),
             frontier.saturating_add(self.transparent_gap_limit),
@@ -3190,8 +3150,7 @@ impl WalletActor {
         match crate::wallet::read::unspent_transparent_outpoints(&self.wallet_dir) {
             Ok(set) => {
                 tracing::debug!(
-                    "[{}] watching {} unspent transparent outpoint(s) for spends",
-                    self.name,
+                    "watching {} unspent transparent outpoint(s) for spends",
                     set.len()
                 );
                 self.transparent_unspent = Some(set);
@@ -3199,10 +3158,7 @@ impl WalletActor {
             }
             // Leave the previous set in place: a stale set still catches most spends, and the
             // next pass retries. Never fatal - this is discovery, not consensus.
-            Err(e) => warn!(
-                "[{}] rebuilding the unspent transparent outpoint set: {e}",
-                self.name
-            ),
+            Err(e) => warn!("rebuilding the unspent transparent outpoint set: {e}"),
         }
     }
 
@@ -3252,18 +3208,12 @@ impl WalletActor {
             {
                 Ok(Ok(ts)) => ts,
                 Ok(Err(e)) => {
-                    warn!(
-                        "[{}] bootstrap: fetching birthday tree state failed: {e}",
-                        self.name
-                    );
+                    warn!("bootstrap: fetching birthday tree state failed: {e}");
                     self.client = None;
                     return;
                 }
                 Err(_) => {
-                    warn!(
-                        "[{}] bootstrap: birthday tree-state fetch timed out",
-                        self.name
-                    );
+                    warn!("bootstrap: birthday tree-state fetch timed out");
                     self.client = None;
                     return;
                 }
@@ -3278,19 +3228,15 @@ impl WalletActor {
         let orchard_frontier = describe_frontier(&treestate.orchard_tree);
         if prior != treestate_returned {
             warn!(
-                "[{}] bootstrap: treestate height mismatch - requested {prior}, upstream \
-                 returned {treestate_returned}",
-                self.name
+                "bootstrap: treestate height mismatch - requested {prior}, upstream \
+                 returned {treestate_returned}"
             );
         }
         let birthday =
             match AccountBirthday::from_treestate(treestate, Some(BlockHeight::from_u32(tip))) {
                 Ok(b) => b,
                 Err(_) => {
-                    warn!(
-                        "[{}] bootstrap: could not derive account birthday from tree state",
-                        self.name
-                    );
+                    warn!("bootstrap: could not derive account birthday from tree state");
                     return;
                 }
             };
@@ -3298,10 +3244,7 @@ impl WalletActor {
             .db_data
             .create_account("primary", &seed, &birthday, None)
         {
-            warn!(
-                "[{}] bootstrap: creating the account failed: {e}",
-                self.name
-            );
+            warn!("bootstrap: creating the account failed: {e}");
             return;
         }
         match try_select_account(&self.db_data) {
@@ -3336,9 +3279,8 @@ impl WalletActor {
                     Ok(()) => {}
                     Err(e) => {
                         error!(
-                            "[{}] bootstrap: {e}. The rebuilt account is left unadopted; \
-                             restarting the daemon will surface this as a startup failure.",
-                            self.name
+                            "bootstrap: {e}. The rebuilt account is left unadopted; \
+                             restarting the daemon will surface this as a startup failure."
                         );
                         self.pending_bootstrap = None;
                         return;
@@ -3359,10 +3301,7 @@ impl WalletActor {
                 // `wallet_birthday`, so the rescan floors at the birthday instead of an
                 // in-progress subtree boundary far below it.
                 if let Err(e) = self.db_data.update_chain_tip(BlockHeight::from_u32(tip)) {
-                    warn!(
-                        "[{}] bootstrap: update_chain_tip after account creation failed: {e}",
-                        self.name
-                    );
+                    warn!("bootstrap: update_chain_tip after account creation failed: {e}");
                 }
                 // The scan floor: the lowest height the queue will scan, derived from the now
                 // birthday-anchored scan ranges (a local sqlite read zecd runs every sync - no
@@ -3374,10 +3313,7 @@ impl WalletActor {
                         .map(|r| u32::from(r.block_range().start))
                         .min(),
                     Err(e) => {
-                        tracing::debug!(
-                            "[{}] bootstrap: suggest_scan_ranges for log failed: {e}",
-                            self.name
-                        );
+                        tracing::debug!("bootstrap: suggest_scan_ranges for log failed: {e}");
                         None
                     }
                 };
@@ -3402,10 +3338,9 @@ impl WalletActor {
                 if let Some(gap) = blocks_below_birthday {
                     if gap > BOOTSTRAP_SCAN_FLOOR_WARN_GAP {
                         warn!(
-                            "[{}] bootstrap: scan floor {} is {} blocks below birthday {} - far \
+                            "bootstrap: scan floor {} is {} blocks below birthday {} - far \
                              below the wallet birthday; the rescan will scan history it need not \
                              (check shard alignment / wallet_birthday)",
-                            self.name,
                             scan_floor.unwrap_or(0),
                             gap,
                             birthday
@@ -3414,14 +3349,8 @@ impl WalletActor {
                 }
                 self.update_status();
             }
-            Ok(None) => warn!(
-                "[{}] bootstrap: account missing immediately after creation",
-                self.name
-            ),
-            Err(e) => warn!(
-                "[{}] bootstrap: re-reading the new account failed: {e}",
-                self.name
-            ),
+            Ok(None) => warn!("bootstrap: account missing immediately after creation"),
+            Err(e) => warn!("bootstrap: re-reading the new account failed: {e}"),
         }
     }
 
@@ -3535,7 +3464,7 @@ impl WalletActor {
         let txs = match read::unmined_raw_txs(&self.wallet_dir, tip) {
             Ok(txs) => txs,
             Err(e) => {
-                warn!("[{}] querying unmined txs for rebroadcast: {e}", self.name);
+                warn!("querying unmined txs for rebroadcast: {e}");
                 return;
             }
         };
@@ -3550,11 +3479,10 @@ impl WalletActor {
             match sent {
                 Ok(outcome) => {
                     if outcome.is_accepted() {
-                        info!("[{}] re-broadcast unmined tx {txid}", self.name);
+                        info!("re-broadcast unmined tx {txid}");
                     } else {
                         tracing::debug!(
-                            "[{}] rebroadcast of {txid} rejected (code {}): {}",
-                            self.name,
+                            "rebroadcast of {txid} rejected (code {}): {}",
                             outcome.error_code,
                             outcome.error_message
                         );
@@ -3673,10 +3601,7 @@ impl WalletActor {
         if self.unlock_until.is_some_and(|t| Instant::now() >= t) {
             seed_guard(&self.seed).lock();
             self.unlock_until = None;
-            info!(
-                "[{}] wallet auto-locked (walletpassphrase timeout elapsed)",
-                self.name
-            );
+            info!(target: "zecd::audit", "wallet auto-locked (walletpassphrase timeout elapsed)");
             self.update_status();
         }
     }
@@ -3845,30 +3770,28 @@ impl WalletActor {
         let taddr = transparent_receiver(&ua)?;
         if index < horizon {
             info!(
-                "[{}] issued transparent address at external index {index}, past the \
+                "issued transparent address at external index {index}, past the \
                  funded-anchored gap window but within the recovery horizon ({horizon}) - \
-                 recoverable from seed.",
-                self.name
+                 recoverable from seed."
             );
             let remaining = horizon_slots_remaining(horizon, index);
             if remaining <= self.transparent_gap_warn_threshold {
                 warn!(
-                    "[{}] transparent recovery horizon nearly exhausted: {remaining} recoverable \
+                    "transparent recovery horizon nearly exhausted: {remaining} recoverable \
                      address slot(s) remain (recovery horizon = {horizon}). Raise [pools] \
                      transparent_initial_scan to your issuance high-water mark before handing \
-                     out more addresses.",
-                    self.name
+                     out more addresses."
                 );
             }
         } else {
             warn!(
-                "[{}] issued transparent address at external index {index}, OUTSIDE the \
+                target: "zecd::audit",
+                "issued transparent address at external index {index}, OUTSIDE the \
                  stateless-restore recovery horizon ({horizon}). Funds received here may be \
                  UNRECOVERABLE from seed unless you raise [pools] transparent_initial_scan \
                  past this index (preferred - a large transparent_gap_limit makes every \
                  recorded transparent receive re-derive the whole window). (permitted by \
-                 transparent_allow_beyond_recovery_window = true)",
-                self.name
+                 transparent_allow_beyond_recovery_window = true)"
             );
         }
         use zcash_keys::encoding::AddressCodec as _;
@@ -3965,13 +3888,12 @@ impl WalletActor {
             let remaining = in_window.max(under_horizon);
             if remaining <= self.transparent_gap_warn_threshold {
                 warn!(
-                    "[{}] transparent recovery window nearly exhausted: {remaining} recoverable \
+                    "transparent recovery window nearly exhausted: {remaining} recoverable \
                      address slot(s) remain (gap_limit={gap_limit}, recovery horizon={horizon}) \
                      before getnewaddress can no longer issue an address recoverable from seed. \
                      Raise [pools] transparent_initial_scan past your issuance high-water mark \
                      (preferred - a large transparent_gap_limit makes every recorded transparent \
-                     receive re-derive the whole window), or fund a lower-index address.",
-                    self.name
+                     receive re-derive the whole window), or fund a lower-index address."
                 );
             }
         }
@@ -4121,9 +4043,8 @@ impl WalletActor {
         if self.client.is_none() {
             if let Err(e) = self.connect().await {
                 warn!(
-                    "[{}] could not reach upstream to sync before sending ({e}); building \
-                     against the last-scanned height",
-                    self.name
+                    "could not reach upstream to sync before sending ({e}); building \
+                     against the last-scanned height"
                 );
                 return;
             }
@@ -4421,15 +4342,7 @@ impl WalletActor {
         let b0 = Instant::now();
         self.broadcast_committed(txid, raw).await?;
         self.update_status();
-        log_send_latency(
-            &self.name,
-            "inline",
-            shape,
-            build,
-            prove,
-            store,
-            b0.elapsed(),
-        );
+        log_send_latency("inline", shape, build, prove, store, b0.elapsed());
         Ok(txid)
     }
 
@@ -4522,15 +4435,7 @@ impl WalletActor {
         let b0 = Instant::now();
         self.broadcast_committed(txid, raw).await?;
         self.update_status();
-        log_send_latency(
-            &self.name,
-            "fused",
-            shape,
-            build,
-            prove,
-            Duration::ZERO,
-            b0.elapsed(),
-        );
+        log_send_latency("fused", shape, build, prove, Duration::ZERO, b0.elapsed());
         Ok(txid)
     }
 
@@ -4654,9 +4559,12 @@ impl WalletActor {
             }
         };
         let done_tx = self.send_done_tx.clone();
-        let name = self.name.clone();
+        // The prove runs off the actor task, so the wallet span does not follow it; carry it
+        // into the closure so the panic/failure logs keep their wallet attribution.
+        let span = tracing::Span::current();
         self.send_in_flight = true;
         tokio::task::spawn_blocking(move || {
+            let _entered = span.enter();
             let p0 = Instant::now();
             // Isolate a proving panic: a completion MUST always be sent, or the pipeline would
             // wedge with `send_in_flight` stuck true.
@@ -4664,7 +4572,7 @@ impl WalletActor {
                 prove_sign_pczt(pczt, &usk, &prover, &keys)
             }))
             .unwrap_or_else(|_| {
-                error!("[{name}] send proof panicked off-actor; the actor continues");
+                error!("send proof panicked off-actor; the actor continues");
                 Err(RpcError::wallet("proving panicked"))
             });
             let _ = done_tx.blocking_send(SendCompletion {
@@ -4737,15 +4645,7 @@ impl WalletActor {
         let b0 = Instant::now();
         self.broadcast_committed(txid, raw).await?;
         self.update_status();
-        log_send_latency(
-            &self.name,
-            "pipelined",
-            shape,
-            build,
-            prove,
-            store,
-            b0.elapsed(),
-        );
+        log_send_latency("pipelined", shape, build, prove, store, b0.elapsed());
         Ok(txid)
     }
 
@@ -4761,9 +4661,8 @@ impl WalletActor {
             .is_err()
         {
             error!(
-                "[{}] pipelined send commit panicked; the actor continues (this is a bug - \
-                 please report it)",
-                self.name
+                "pipelined send commit panicked; the actor continues (this is a bug - \
+                 please report it)"
             );
             self.send_in_flight = false;
         }
@@ -5165,7 +5064,7 @@ impl WalletActor {
 
         self.broadcast_committed(txid, raw).await?;
         self.update_status();
-        info!("[{}] z_shieldcoinbase broadcast {txid}", self.name);
+        info!("z_shieldcoinbase broadcast {txid}");
         Ok(txid)
     }
 
@@ -5740,7 +5639,7 @@ impl WalletActor {
         self.transparent_unspent_dirty = true;
         self.broadcast_committed(txid, raw).await?;
         self.update_status();
-        info!("[{}] z_mergetoaddress broadcast {txid}", self.name);
+        info!("z_mergetoaddress broadcast {txid}");
         Ok(txid)
     }
 
@@ -5758,9 +5657,8 @@ impl WalletActor {
         if self.client.is_none() {
             if let Err(e) = self.connect().await {
                 warn!(
-                    "[{}] created {txid} but no upstream is reachable ({e}); it will be \
-                     re-broadcast once a connection recovers",
-                    self.name
+                    "created {txid} but no upstream is reachable ({e}); it will be \
+                     re-broadcast once a connection recovers"
                 );
                 return Ok(());
             }
@@ -5791,10 +5689,7 @@ impl WalletActor {
             // delivery, or it even mined already) means the committed send IS delivered -
             // success, not a rejection.
             if upstream_already_has_tx(&outcome.error_message) != AlreadyKnown::No {
-                info!(
-                    "[{}] upstream already has {txid}; treating broadcast as delivered",
-                    self.name
-                );
+                info!("upstream already has {txid}; treating broadcast as delivered");
                 return Ok(());
             }
             // An explicit upstream rejection (the node examined the tx and refused it) is a
@@ -5803,8 +5698,8 @@ impl WalletActor {
             // again - an immediate retry fails with -6 rather than double-paying.
             let reason = sanitize_upstream_msg(&outcome.error_message);
             warn!(
-                "[{}] upstream rejected {txid} (code {}): {reason}",
-                self.name, outcome.error_code
+                "upstream rejected {txid} (code {}): {reason}",
+                outcome.error_code
             );
             return Err(RpcError::new(
                 codes::RPC_VERIFY_REJECTED,
@@ -5839,9 +5734,9 @@ impl WalletActor {
     /// `TxFilter` hash is the txid's internal bytes (per zcash-devtool's enhance).
     async fn fetch_tx_from_upstream(&mut self, txid: TxId) -> Result<Option<RawTx>, RpcError> {
         if self.client.is_none() {
-            self.connect().await.map_err(|e| {
-                upstream_error(&self.name, e, "could not connect to the upstream node")
-            })?;
+            self.connect()
+                .await
+                .map_err(|e| upstream_error(e, "could not connect to the upstream node"))?;
         }
         let fetched = {
             let client = self
@@ -5882,9 +5777,9 @@ impl WalletActor {
         end: u32,
     ) -> Result<Vec<TxEvidence>, RpcError> {
         if self.client.is_none() {
-            self.connect().await.map_err(|e| {
-                upstream_error(&self.name, e, "could not connect to the upstream node")
-            })?;
+            self.connect()
+                .await
+                .map_err(|e| upstream_error(e, "could not connect to the upstream node"))?;
         }
         let result = {
             let client = self
@@ -5919,9 +5814,9 @@ impl WalletActor {
     /// caller knows the network never accepted the tx.
     async fn do_broadcast(&mut self, data: Vec<u8>) -> Result<(), RpcError> {
         if self.client.is_none() {
-            self.connect().await.map_err(|e| {
-                upstream_error(&self.name, e, "could not connect to the upstream node")
-            })?;
+            self.connect()
+                .await
+                .map_err(|e| upstream_error(e, "could not connect to the upstream node"))?;
         }
         let response = {
             let client = self
@@ -5949,13 +5844,12 @@ impl WalletActor {
         let result = classify_broadcast_outcome(&outcome);
         match &result {
             // Accepted-but-not-fresh is the idempotent already-in-mempool case (worth a note).
-            Ok(()) if !outcome.is_accepted() => info!(
-                "[{}] upstream already has tx in mempool; sendrawtransaction succeeds",
-                self.name
-            ),
+            Ok(()) if !outcome.is_accepted() => {
+                info!("upstream already has tx in mempool; sendrawtransaction succeeds")
+            }
             Err(e) if e.code == codes::RPC_VERIFY_REJECTED => warn!(
-                "[{}] upstream rejected tx (code {}): {}",
-                self.name, outcome.error_code, e.message
+                "upstream rejected tx (code {}): {}",
+                outcome.error_code, e.message
             ),
             _ => {}
         }
@@ -6009,6 +5903,13 @@ impl WalletActor {
             }
         }
         seed_guard(&self.seed).set(seed);
+        // Seed exposure is audit material, like the auto-unlock and relock events. The
+        // passphrase itself never appears anywhere near a log.
+        info!(
+            target: "zecd::audit",
+            timeout_secs,
+            "wallet unlocked via walletpassphrase"
+        );
         // Re-running walletpassphrase overwrites the deadline (resets the timer). A timeout of 0
         // relocks ~immediately, which `relock_if_expired` then enforces.
         self.unlock_until = Some(Instant::now() + Duration::from_secs(timeout_secs.max(0) as u64));
@@ -6459,9 +6360,7 @@ fn read_raw_tx(db: &WriteDb, txid: TxId) -> Result<Vec<u8>, RpcError> {
 /// its shape, and the wall time of each phase. `path` is `inline` / `fused` / `pipelined`. On a
 /// large wallet this line is the primary stress-test artifact - it shows whether the minutes land
 /// in selection (`select+build`) or proving (`prove`).
-#[allow(clippy::too_many_arguments)]
 fn log_send_latency(
-    name: &str,
     path: &str,
     shape: SendShape,
     build: Duration,
@@ -6469,15 +6368,17 @@ fn log_send_latency(
     store: Duration,
     broadcast: Duration,
 ) {
+    // Fields, not prose: this is the line an operator graphs, so each phase duration and the
+    // proposal shape must be queryable without a log parser.
     info!(
-        "[{name}] send complete ({path}): {} inputs, {} orchard actions; \
-         select+build {} ms, prove+sign {} ms, store {} ms, broadcast {} ms",
-        shape.inputs,
-        shape.orchard_actions,
-        build.as_millis(),
-        prove.as_millis(),
-        store.as_millis(),
-        broadcast.as_millis(),
+        path,
+        inputs = shape.inputs,
+        orchard_actions = shape.orchard_actions,
+        build_ms = build.as_millis() as u64,
+        prove_ms = prove.as_millis() as u64,
+        store_ms = store.as_millis() as u64,
+        broadcast_ms = broadcast.as_millis() as u64,
+        "send complete"
     );
 }
 

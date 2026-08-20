@@ -172,8 +172,11 @@ impl PreparedNode {
                 && (entry.transparent_initial_scan >= LIGHT_TRANSPARENT_ADDR_WARN
                     || entry.transparent_gap_limit >= LIGHT_TRANSPARENT_ADDR_WARN)
             {
+                // This runs before the wallet's actor (and its `wallet` span) exists, so the
+                // wallet identity is a field here rather than span context.
                 tracing::warn!(
-                    "[{name}] transparent_initial_scan = {} / transparent_gap_limit = {} on a \
+                    wallet = %name,
+                    "transparent_initial_scan = {} / transparent_gap_limit = {} on a \
                      lightwalletd backend: spend detection queries each funded address separately, \
                      one remote round trip apiece. Running your own zebra (server = \"zebra\") is \
                      recommended at this scale",
@@ -328,7 +331,19 @@ impl Node {
         let req = crate::server::jsonrpc::RpcRequest::positional(method, params);
         // Register with the in-flight tracker so `getrpcinfo` sees embedded calls too.
         let _active = self.state.active.begin(&req.method);
-        crate::rpc::dispatch(&self.state, wallet, &req).await
+        // Same `rpc` span the HTTP transport enters, so an embedded call's downstream events
+        // are attributable exactly as an HTTP one's are - and so an embedder's own span
+        // wrapping this call nests zecd's events underneath it (the correlation id they can
+        // attach, which zecd deliberately has no field for).
+        use tracing::Instrument as _;
+        let span = tracing::info_span!(
+            "rpc",
+            method = %req.method,
+            wallet = wallet.unwrap_or("default")
+        );
+        crate::rpc::dispatch(&self.state, wallet, &req)
+            .instrument(span)
+            .await
     }
 
     /// Request graceful shutdown (what `stop` and the daemon's SIGINT/SIGTERM handling do):

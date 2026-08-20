@@ -27,6 +27,15 @@
 //! policy: tracing subscribers, panic behavior beyond an idempotent hook, and
 //! [`hardening::harden_process`] (core-dump/ptrace lockdown) stay the binary's business.
 //!
+//! Logging follows from that: the embedder's own subscriber receives every event, including
+//! the `rpc` and `wallet` spans and the `zecd::audit` target (see the README's "Logging when
+//! embedded"). Two things belong to `daemon::init_tracing` rather than to the library, so a
+//! `default-features = false` build has neither - `[log] level`/`[log] format`/`RUST_LOG`
+//! (which still parse, and still appear in [`config_show::render`], but are read only there),
+//! and the `log` -> `tracing` bridge that carries `zcash_client_sqlite`'s `schemerz` migration
+//! records (an embedder wanting them installs `tracing_log::LogTracer` and filters `schemerz`
+//! themselves).
+//!
 //! Every other public item exists because the binary and its tests are built from this crate;
 //! treat it as internal API with no stability promise across commits.
 
@@ -51,6 +60,7 @@ pub mod network;
 pub mod node;
 pub mod operations;
 pub mod pools;
+pub mod progress;
 pub mod rpc;
 pub mod server;
 pub mod state;

@@ -54,15 +54,15 @@ impl LwdSource {
         let advertised = !info.lightwallet_protocol_version.is_empty();
         let pool_types_capable = advertised || assume_capable;
         tracing::info!(
-            "lightwalletd: {} {} chain={} protocol_version={:?} \
-             (transparent-in-compact-blocks: {}{})",
-            info.vendor,
-            info.version,
-            info.chain_name,
-            info.lightwallet_protocol_version,
-            pool_types_capable,
+            vendor = %info.vendor,
+            version = %info.version,
+            chain = %info.chain_name,
+            protocol_version = %info.lightwallet_protocol_version,
+            transparent_in_compact_blocks = pool_types_capable,
+            "lightwalletd server info{}",
             match (advertised, assume_capable) {
-                (false, true) => " - assumed via [backend] assume_transparent_in_compact_blocks",
+                (false, true) =>
+                    " (capability assumed via [backend] assume_transparent_in_compact_blocks)",
                 _ => "",
             },
         );

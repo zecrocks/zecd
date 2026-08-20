@@ -155,6 +155,7 @@ async fn handle(
         // Bitcoin Core inserts a small delay on auth failure to deter brute-forcing.
         tokio::time::sleep(std::time::Duration::from_millis(250)).await;
         warn!(
+            target: "zecd::audit",
             user = auth::basic_auth_username(auth_header)
                 .as_deref()
                 .unwrap_or("<none>"),
@@ -165,7 +166,10 @@ async fn handle(
         );
         return unauthorized();
     }
-    info!(
+    // Success is the overwhelmingly common case - one line per authenticated request - so it
+    // sits at DEBUG (still under the audit target for a sink that wants it); failures warn.
+    tracing::debug!(
+        target: "zecd::audit",
         user = auth::basic_auth_username(auth_header)
             .as_deref()
             .unwrap_or("<none>"),
@@ -212,7 +216,16 @@ async fn process_single(state: &AppState, wallet: Option<&str>, v: Value) -> (Va
         Ok(req) => {
             let _active = state.active.begin(&req.method);
             let start = std::time::Instant::now();
-            let result = rpc::dispatch(state, wallet, &req).await;
+            // Dispatch under a span so every event emitted while handling this call - down to
+            // the sanitized-error detail lines in `error.rs` - carries the method and wallet,
+            // and a JSON log consumer can join them to the `rpc ok`/`rpc error` event below.
+            // The client-supplied request `id` is deliberately not a span field: it is
+            // untrusted display data.
+            let span = tracing::info_span!("rpc", method = %req.method, wallet = wallet.unwrap_or("default"));
+            let result = {
+                use tracing::Instrument as _;
+                rpc::dispatch(state, wallet, &req).instrument(span).await
+            };
             let elapsed_ms = start.elapsed().as_millis() as u64;
             match result {
                 Ok(value) => {

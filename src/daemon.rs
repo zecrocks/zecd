@@ -46,6 +46,19 @@ pub fn init_tracing(log: &config::LogConfig) {
 
 #[cfg(feature = "server")]
 pub async fn run(config: AppConfig) -> anyhow::Result<()> {
+    // One identifying line before anything can fail or connect - ahead of even the datadir
+    // lock, so a refusal to start is still attributable to a build and a datadir. Both
+    // documented stuck-sync incidents came down to "which zecd build, on which network,
+    // against which upstream", and the connect path logs the *upstream's* version while
+    // nothing logged zecd's own. This is the binary's banner: an embedded node
+    // (`crate::node`) is started by a host that owns its own startup logging.
+    info!(
+        version = env!("CARGO_PKG_VERSION"),
+        network = config.network.name(),
+        datadir = %config.datadir.display(),
+        backend = %config.backend.server,
+        "starting zecd"
+    );
     // Fail-fast phase first (datadir lock, placeholder-password refusal, panic hook), then the
     // HTTP-only startup work, then the wallet spawns - the order the daemon has always had. The
     // auth construction sits between the two node phases on purpose: a bad rpcauth entry must
@@ -162,12 +175,13 @@ where
 #[cfg(feature = "server")]
 fn log_auth_mode(rpc: &config::RpcConfig, password_on_cli: bool) {
     if !rpc.auth.is_empty() {
-        info!("RPC auth: {} salted rpcauth credential(s)", rpc.auth.len());
+        info!(target: "zecd::audit", "RPC auth: {} salted rpcauth credential(s)", rpc.auth.len());
     }
     if rpc.user.is_some() && rpc.password.is_some() {
-        info!("RPC auth: rpcuser/rpcpassword (bare password)");
+        info!(target: "zecd::audit", "RPC auth: rpcuser/rpcpassword (bare password)");
         if !rpc.bind.is_loopback() {
             warn!(
+                target: "zecd::audit",
                 "RPC is bound to non-loopback {} with a bare rpcpassword; credentials cross the \
                  network in plaintext (zecd serves plaintext HTTP). Bind to localhost, or place \
                  zecd behind a TLS-terminating proxy.",
@@ -175,10 +189,11 @@ fn log_auth_mode(rpc: &config::RpcConfig, password_on_cli: bool) {
             );
         }
     } else if let Some(cookie) = &rpc.cookiefile {
-        info!("RPC auth: cookie file {}", cookie.display());
+        info!(target: "zecd::audit", "RPC auth: cookie file {}", cookie.display());
     }
     if password_on_cli {
         warn!(
+            target: "zecd::audit",
             "RPC password was passed via --rpcpassword on the command line; it is exposed to \
              any local user through `ps` and /proc/<pid>/cmdline. Prefer the ZECD_RPC_PASSWORD \
              environment variable or `[rpc] password_file` (a mounted Secret) instead."

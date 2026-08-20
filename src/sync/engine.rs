@@ -306,7 +306,6 @@ pub fn owned_transparent_output(
 }
 
 async fn download_blocks<C: ChainSource>(
-    name: &str,
     client: &mut C,
     wallet_dir: &Path,
     db_cache: &mut FsBlockDb,
@@ -318,7 +317,7 @@ async fn download_blocks<C: ChainSource>(
     Vec<MatchedTransparentReceive>,
     Vec<MatchedTransparentSpend>,
 )> {
-    info!("[{name}] Fetching {scan_range}");
+    info!(range = %scan_range, "fetching compact blocks");
     let mut stream = client
         .compact_block_range(
             scan_range.block_range().start,
@@ -340,6 +339,15 @@ async fn download_blocks<C: ChainSource>(
     // batch.
     let mut watch = unspent.cloned();
     while let Some((block, t_outs, t_ins)) = stream.next().await? {
+        // The per-block level for diagnosing "stuck at height N" in the field without a
+        // custom build; costs one disabled-level check per block when filtered out.
+        tracing::trace!(
+            height = u32::from(block.height()),
+            txs = block.vtx.len(),
+            transparent_outputs = t_outs.len(),
+            transparent_inputs = t_ins.len(),
+            "downloaded block"
+        );
         let (sapling_outputs_count, orchard_actions_count) = block
             .vtx
             .iter()
@@ -435,22 +443,17 @@ async fn download_chain_state<C: ChainSource>(
 /// in-place reorg recovery never completed. Because sync processes one batch per call
 /// (download -> scan -> delete before the next), truncating to just below the batch's lowest
 /// height removes exactly this batch's rows, so the table never accumulates.
-fn delete_cached_blocks(
-    name: &str,
-    wallet_dir: &Path,
-    db_cache: &mut FsBlockDb,
-    block_meta: Vec<BlockMeta>,
-) {
+fn delete_cached_blocks(wallet_dir: &Path, db_cache: &mut FsBlockDb, block_meta: Vec<BlockMeta>) {
     let lowest = block_meta.iter().map(|m| m.height).min();
     for meta in &block_meta {
         if let Err(e) = std::fs::remove_file(block_path(wallet_dir, meta)) {
-            warn!("[{name}] Failed to remove cached block {:?}: {}", meta, e);
+            warn!("Failed to remove cached block {:?}: {}", meta, e);
         }
     }
     if let Some(lowest) = lowest {
         let truncate_to = BlockHeight::from(u32::from(lowest).saturating_sub(1));
         if let Err(e) = db_cache.truncate_to_height(truncate_to) {
-            warn!("[{name}] Failed to truncate block cache metadata to {truncate_to}: {e:?}");
+            warn!("Failed to truncate block cache metadata to {truncate_to}: {e:?}");
         }
     }
 }
@@ -486,7 +489,6 @@ fn delete_cached_blocks(
 /// (PostgreSQL), propose upstream a trait-level error (or a `truncate_to_height` variant
 /// that reports "no valid target at or below" portably) and switch this match to it.
 fn perform_rewind(
-    name: &str,
     db_data: &mut WriteDb,
     at_height: BlockHeight,
     requested: BlockHeight,
@@ -512,7 +514,7 @@ fn perform_rewind(
     for target in candidates.into_iter().flatten() {
         match db_data.truncate_to_height(target) {
             Ok(h) => {
-                info!("[{name}] Shallow rewind to {h} (no valid target at or below {requested})");
+                info!("Shallow rewind to {h} (no valid target at or below {requested})");
                 return Ok(h);
             }
             Err(SqliteClientError::RequestedRewindInvalid { .. }) => continue,
@@ -543,7 +545,6 @@ pub struct ScanOutcome {
 
 /// Scan a downloaded range; handle continuity (reorg) errors by rewinding. See [`ScanOutcome`].
 fn scan_blocks(
-    name: &str,
     params: &ZNetwork,
     wallet_dir: &Path,
     db_cache: &mut FsBlockDb,
@@ -551,7 +552,7 @@ fn scan_blocks(
     initial_chain_state: &ChainState,
     scan_range: &ScanRange,
 ) -> anyhow::Result<ScanOutcome> {
-    info!("[{name}] Scanning {scan_range}");
+    info!(range = %scan_range, "scanning blocks");
     let scan_result = scan_cached_blocks(
         params,
         db_cache,
@@ -565,7 +566,7 @@ fn scan_blocks(
         Err(ChainError::Scan(err)) if err.is_continuity_error() => {
             let requested = err.at_height().saturating_sub(10);
             info!(
-                "[{name}] Chain reorg detected at {}, rewinding to {}",
+                "Chain reorg detected at {}, rewinding to {}",
                 err.at_height(),
                 requested
             );
@@ -574,7 +575,7 @@ fn scan_blocks(
             // (virtually all real blocks). `perform_rewind` falls back to the nearest
             // valid checkpoint when the requested height has none; the cache is then
             // truncated to the height actually rewound to.
-            let rewind_height = perform_rewind(name, db_data, err.at_height(), requested)?;
+            let rewind_height = perform_rewind(db_data, err.at_height(), requested)?;
             // Delete the now-stale cached block files above the rewind height. A metadata row
             // whose backing file is already gone (rows left behind by an older zecd that removed
             // files but not their `compactblocks_meta` rows) must not abort this: `with_blocks`
@@ -613,7 +614,7 @@ fn scan_blocks(
                     if e.kind() == std::io::ErrorKind::NotFound =>
                 {
                     warn!(
-                        "[{name}] Stale block-cache metadata row had no backing file during \
+                        "Stale block-cache metadata row had no backing file during \
                          reorg cleanup; truncating it"
                     );
                 }
@@ -666,7 +667,6 @@ pub struct BatchOutcome {
 /// gap-lookahead address records its `addresses` row first ([`record_lookahead_address`]).
 #[allow(clippy::too_many_arguments)]
 pub async fn sync_one_batch<C: ChainSource>(
-    name: &str,
     client: &mut C,
     params: &ZNetwork,
     wallet_dir: &Path,
@@ -677,7 +677,7 @@ pub async fn sync_one_batch<C: ChainSource>(
 ) -> anyhow::Result<BatchOutcome> {
     let scan_ranges = db_data.suggest_scan_ranges()?;
     tracing::debug!(
-        "[{name}] suggest_scan_ranges -> {} range(s): {:?}",
+        "suggest_scan_ranges -> {} range(s): {:?}",
         scan_ranges.len(),
         scan_ranges
             .iter()
@@ -710,7 +710,6 @@ pub async fn sync_one_batch<C: ChainSource>(
     };
 
     let (block_meta, received, spent) = download_blocks(
-        name,
         client,
         wallet_dir,
         db_cache,
@@ -733,7 +732,6 @@ pub async fn sync_one_batch<C: ChainSource>(
         // `scan_cached_blocks` is CPU-bound; keep the async runtime healthy.
         let outcome = tokio::task::block_in_place(|| {
             scan_blocks(
-                name,
                 params,
                 wallet_dir,
                 db_cache,
@@ -749,7 +747,7 @@ pub async fn sync_one_batch<C: ChainSource>(
     // Remove the downloaded compact blocks (files and their metadata rows) whether the scan
     // succeeded or failed, so a transient error (or a reorg-shifted range) cannot strand cache
     // files on disk or leave stale `compactblocks_meta` rows behind.
-    delete_cached_blocks(name, wallet_dir, db_cache, block_meta);
+    delete_cached_blocks(wallet_dir, db_cache, block_meta);
     let outcome = result?;
 
     // Record the transparent receives matched during download - but only when the range was
@@ -761,8 +759,8 @@ pub async fn sync_one_batch<C: ChainSource>(
     let mut transparent_spends_recorded = 0;
     if !outcome.reorged {
         let mut coinbase_stored: HashSet<TxId> = HashSet::new();
-        let record_started = std::time::Instant::now();
-        let mut record_last_log = record_started;
+        let mut record_throttle =
+            crate::progress::ProgressThrottle::new(TRANSPARENT_RECORD_LOG_INTERVAL, 0);
         for matched in &received {
             let output = &matched.output;
             // A gap-lookahead match has no `addresses` row yet; record (and thereby expose) it
@@ -771,7 +769,7 @@ pub async fn sync_one_batch<C: ChainSource>(
                 if let Some(index) = matcher.lookahead_index(output.recipient_address()) {
                     if let Err(e) = record_lookahead_address(db_data, matcher.account, index) {
                         warn!(
-                            "[{name}] recording lookahead transparent address at index {index} \
+                            "recording lookahead transparent address at index {index} \
                              failed: {e}"
                         );
                         continue;
@@ -792,24 +790,22 @@ pub async fn sync_one_batch<C: ChainSource>(
                 Ok(_) => transparent_recorded += 1,
                 Err(e) => {
                     warn!(
-                        "[{name}] recording transparent receive {}:{} failed: {e}",
+                        "recording transparent receive {}:{} failed: {e}",
                         output.outpoint().txid(),
                         output.outpoint().n(),
                     );
                     continue;
                 }
             }
-            if record_last_log.elapsed() >= TRANSPARENT_RECORD_LOG_INTERVAL {
+            if let Some(w) = record_throttle.tick(transparent_recorded as u64) {
                 info!(
-                    "[{name}] recording transparent receives from block scan: {}/{} in {:.0}s \
-                     (each receive re-derives the transparent gap window; keep [pools] \
-                     transparent_gap_limit small and use transparent_initial_scan for restore \
-                     depth)",
-                    transparent_recorded,
-                    received.len(),
-                    record_started.elapsed().as_secs_f64(),
+                    recorded = transparent_recorded,
+                    total = received.len(),
+                    elapsed_secs = w.elapsed_secs as u64,
+                    "recording transparent receives from block scan (each receive re-derives \
+                     the transparent gap window; keep [pools] transparent_gap_limit small and \
+                     use transparent_initial_scan for restore depth)"
                 );
-                record_last_log = std::time::Instant::now();
             }
             // A coinbase receive also stores its full transaction, so the wallet DB learns
             // `tx_index = 0` (`put_tx_data` derives it from `Bundle::is_coinbase`). This is what
@@ -822,7 +818,7 @@ pub async fn sync_one_batch<C: ChainSource>(
                         decrypt_and_store_transaction(params, db_data, tx, output.mined_height())
                     {
                         warn!(
-                            "[{name}] storing coinbase tx {} for a matched receive failed: {e}",
+                            "storing coinbase tx {} for a matched receive failed: {e}",
                             tx.txid()
                         );
                     }
@@ -830,9 +826,7 @@ pub async fn sync_one_batch<C: ChainSource>(
             }
         }
         if transparent_recorded > 0 {
-            info!(
-                "[{name}] recorded {transparent_recorded} transparent receive(s) from block scan"
-            );
+            info!("recorded {transparent_recorded} transparent receive(s) from block scan");
         }
 
         // Record the matched spends. Storing the spending transaction is what marks the wallet's
@@ -846,7 +840,7 @@ pub async fn sync_one_batch<C: ChainSource>(
                 Ok(Some(tx)) => tx,
                 Ok(None) => {
                     warn!(
-                        "[{name}] upstream does not know transparent-spending tx {}; the spend \
+                        "upstream does not know transparent-spending tx {}; the spend \
                          will be retried when the block is rescanned",
                         matched.spending_txid
                     );
@@ -854,7 +848,7 @@ pub async fn sync_one_batch<C: ChainSource>(
                 }
                 Err(e) => {
                     warn!(
-                        "[{name}] fetching transparent-spending tx {} failed: {e}",
+                        "fetching transparent-spending tx {} failed: {e}",
                         matched.spending_txid
                     );
                     continue;
@@ -867,12 +861,12 @@ pub async fn sync_one_batch<C: ChainSource>(
                 Ok(()) => {
                     transparent_spends_recorded += 1;
                     info!(
-                        "[{name}] recorded transparent spend {} at height {} from block scan",
+                        "recorded transparent spend {} at height {} from block scan",
                         matched.spending_txid, matched.height
                     );
                 }
                 Err(e) => warn!(
-                    "[{name}] storing transparent-spending tx {} failed: {e}",
+                    "storing transparent-spending tx {} failed: {e}",
                     matched.spending_txid
                 ),
             }
@@ -1165,7 +1159,6 @@ mod tests {
             let cmx = cmx_bytes(0x0A, h);
             metas_a.push(write_block(wd, &mut db_cache, h, hash, prev, cmx, h));
             scan_blocks(
-                "test",
                 &net,
                 wd,
                 &mut db_cache,
@@ -1197,7 +1190,6 @@ mod tests {
             11,
         );
         let outcome = scan_blocks(
-            "test",
             &net,
             wd,
             &mut db_cache,
@@ -1249,7 +1241,6 @@ mod tests {
             .update_chain_tip(BlockHeight::from_u32(12))
             .expect("advance tip");
         scan_blocks(
-            "test",
             &net,
             wd,
             &mut db_cache,
@@ -1293,7 +1284,6 @@ mod tests {
             let cmx = cmx_bytes(0x0A, h);
             write_block(wd, &mut db_cache, h, hash, prev, cmx, h);
             scan_blocks(
-                "test",
                 &net,
                 wd,
                 &mut db_cache,
@@ -1324,7 +1314,6 @@ mod tests {
         let mut db_data = short_chain_wallet(wd, 5);
 
         let rewound = perform_rewind(
-            "test",
             &mut db_data,
             BlockHeight::from_u32(6),
             BlockHeight::from_u32(0),
@@ -1352,7 +1341,6 @@ mod tests {
         let mut db_data = short_chain_wallet(wd, 1);
 
         let err = perform_rewind(
-            "test",
             &mut db_data,
             BlockHeight::from_u32(2),
             BlockHeight::from_u32(0),
@@ -1436,7 +1424,7 @@ mod tests {
             "batch metadata present before cleanup"
         );
 
-        delete_cached_blocks("test", wd, &mut db_cache, metas.clone());
+        delete_cached_blocks(wd, &mut db_cache, metas.clone());
 
         assert_eq!(
             db_cache.get_max_cached_height().expect("max cached"),
@@ -1490,7 +1478,6 @@ mod tests {
             let cmx = cmx_bytes(0x0A, h);
             let meta = write_block(wd, &mut db_cache, h, hash, prev, cmx, h);
             scan_blocks(
-                "test",
                 &net,
                 wd,
                 &mut db_cache,
@@ -1499,7 +1486,7 @@ mod tests {
                 &range(h, h + 1),
             )
             .expect("scan chain A block");
-            delete_cached_blocks("test", wd, &mut db_cache, vec![meta]);
+            delete_cached_blocks(wd, &mut db_cache, vec![meta]);
             assert!(frontier.append(MerkleHashOrchard::from_cmx(
                 &ExtractedNoteCommitment::from_bytes(&cmx).unwrap()
             )));
@@ -1527,7 +1514,6 @@ mod tests {
             11,
         );
         let worked = scan_blocks(
-            "test",
             &net,
             wd,
             &mut db_cache,
@@ -1540,7 +1526,7 @@ mod tests {
             worked.ranges_changed,
             "a rewind reports that the scan ranges changed"
         );
-        delete_cached_blocks("test", wd, &mut db_cache, vec![meta_11]);
+        delete_cached_blocks(wd, &mut db_cache, vec![meta_11]);
 
         // Rewound to 11 - 10 = 1, and the cache metadata was truncated to match (empty, since
         // block 1's file+row were already removed by its own batch).
@@ -1566,7 +1552,6 @@ mod tests {
             .update_chain_tip(BlockHeight::from_u32(12))
             .expect("advance tip");
         scan_blocks(
-            "test",
             &net,
             wd,
             &mut db_cache,
@@ -1618,7 +1603,6 @@ mod tests {
             let cmx = cmx_bytes(0x0A, h);
             metas.push(write_block(wd, &mut db_cache, h, hash, prev, cmx, h));
             scan_blocks(
-                "test",
                 &net,
                 wd,
                 &mut db_cache,
@@ -1654,7 +1638,6 @@ mod tests {
             11,
         );
         scan_blocks(
-            "test",
             &net,
             wd,
             &mut db_cache,

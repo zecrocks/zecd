@@ -115,7 +115,8 @@ pub fn verify_or_pin_account(
         None => {
             WalletStore::pin_ufvk(keys_path, account_ufvk)?;
             info!(
-                "[{name}] pinned the wallet account's unified full viewing key into keys.toml \
+                target: "zecd::audit",
+                "pinned the wallet account's unified full viewing key into keys.toml \
                  (pre-existing wallet upgraded); future startups verify the wallet database \
                  against this pin"
             );

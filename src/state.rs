@@ -38,7 +38,22 @@ pub struct AppState {
 impl AppState {
     /// Request graceful shutdown: flag first (so in-flight new requests get 503), then wake
     /// every waiter.
+    ///
+    /// Async operations (`z_sendmany`/`z_shieldcoinbase`/`z_mergetoaddress`) are the one class
+    /// of work shutdown can lose silently: a command still queued for the actor is dropped, and
+    /// every status object is in-memory only. Name them once here so the loss is diagnosable -
+    /// this is a log line, not a drain (a send already stored still rebroadcasts on restart).
     pub fn trigger_shutdown(&self) {
+        let unfinished = self.operations.unfinished();
+        if !unfinished.is_empty() {
+            tracing::warn!(
+                count = unfinished.len(),
+                operations = ?unfinished,
+                "async operations still in flight at shutdown; their status objects are \
+                 in-memory only and will not survive restart (a transaction that was already \
+                 stored is still rebroadcast on the next start)"
+            );
+        }
         self.shutting_down.store(true, Ordering::Relaxed);
         self.shutdown_tx.send_replace(true);
     }
