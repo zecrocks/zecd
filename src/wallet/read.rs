@@ -128,8 +128,8 @@ pub fn balance(
         // immature coinbase rides in `value_pending_spendability` - so drain the
         // immature-coinbase total from `pending` first and touch `transparent_spendable` only
         // as a clamped fallback (it holds no immature coinbase on the current upstream; the
-        // fallback guards against the bucketing shifting again across RCs, which it already
-        // did once between rc.1 and rc.4).
+        // fallback guards against the bucketing shifting again across upstream releases, which
+        // it already did once between 0.24.0-rc.1 and 0.24.0-rc.4).
         let immature_coinbase = immature_coinbase_zats(wallet_dir, target_height)?;
         let from_pending = immature_coinbase.min(info.pending);
         let from_spendable = (immature_coinbase - from_pending).min(info.transparent_spendable);

@@ -92,8 +92,8 @@ zcash_encoding = "0.4"
 # and the received-by-address read paths; zecd's own wallets never expose transparent receivers.
 # `pczt` exposes `create_pczt_from_proposal` / `extract_and_store_transaction_from_pczt`, the
 # build/prove/store seam that lets the proving step take a cached Orchard proving key.
-zcash_client_backend = { version = "0.24.0-rc.7", features = ["lightwalletd-tonic-tls-webpki-roots", "orchard", "transparent-inputs", "pczt"] }
-zcash_client_sqlite = { version = "0.22.0-rc.8", features = ["unstable", "orchard", "serde", "transparent-inputs"] }
+zcash_client_backend = { version = "0.24.0", features = ["lightwalletd-tonic-tls-webpki-roots", "orchard", "transparent-inputs", "pczt"] }
+zcash_client_sqlite = { version = "0.22.0", features = ["unstable", "orchard", "serde", "transparent-inputs"] }
 zcash_keys = { version = "0.16", features = ["unstable", "orchard"] }
 zcash_primitives = "0.30"
 zcash_proofs = { version = "0.30", features = ["bundled-prover"] }
@@ -107,7 +107,7 @@ sapling = { package = "sapling-crypto", version = "0.7" }
 # zcash_client_backend `pczt` feature's own pin (0.9.3).
 pczt = { version = "0.9.3", default-features = false, features = ["prover", "signer", "orchard", "sapling"] }
 zip32 = "0.2"
-zip321 = "0.9.0-rc.1"
+zip321 = "0.9"
 libc = "0.2.186"
 # Single-instance guard: an advisory exclusive lock on `<datadir>/.lock` so two zecd processes
 # can't operate on the same data directory at once (mirrors zallet / zcashd). Linux only needs
@@ -138,9 +138,9 @@ mimalloc-secure = ["mimalloc", "mimalloc/secure"]
 # opt-in on regtest via the `ZECD_REGTEST_NU63_HEIGHT` env var (the ironwood harness sets it to 8;
 # the standard harness leaves it unset, so that chain stays pre-NU6.3). So ironwood is "always
 # built, live on both public networks" with no build flag - a mainnet send past 3_428_143 is an
-# ironwood send. The
-# wallet crates are pinned to crates.io **release candidates** (see the version reqs above); move to
-# the finals when they publish.
+# ironwood send. Every
+# librustzcash crate is now a crates.io **stable release** (see the version reqs above) - there are
+# no release-candidate pins left.
 
 [dev-dependencies]
 tempfile = "3"
@@ -149,18 +149,18 @@ incrementalmerkletree = "0.8"
 
 # Dependency notes.
 #
-# The ironwood / NU6.3 librustzcash line is now consumed **straight from crates.io** - the leaf
-# crates as finals (`zcash_primitives`/`zcash_proofs 0.30.0`, `orchard 0.15.0`, `zcash_protocol
-# 0.10`, `zcash_keys 0.16`, `zcash_address 0.13.0`, `zcash_transparent 0.10.0`) and the wallet
-# crates as release candidates (`zcash_client_backend 0.24.0-rc.7`, `zcash_client_sqlite
-# 0.22.0-rc.8`, `pczt 0.9.3`, `zip321 0.9.0-rc.1`). This replaced the
+# The ironwood / NU6.3 librustzcash line is consumed **straight from crates.io, entirely as stable
+# releases**: the leaf crates (`zcash_primitives`/`zcash_proofs 0.30`, `orchard 0.15`,
+# `zcash_protocol 0.10`, `zcash_keys 0.16`, `zcash_address 0.13.0`, `zcash_transparent 0.10.0`) and
+# the wallet crates (`zcash_client_backend 0.24.0`, `zcash_client_sqlite 0.22.0`, `pczt 0.9.3`,
+# `zip321 0.9.0`). The wallet crates rode release candidates until upstream published the finals on
+# 2026-08-18; nothing here is a prerelease any more. That whole arrangement replaced the
 # previous all-or-nothing `[patch.crates-io]` git pin of the whole librustzcash workspace to the
 # `dw/ironwood-scan-model` rev `1105d8203` (zcash/librustzcash#2539), which existed only because the
 # wallet crates had no ironwood release yet. The shardtree/incrementalmerkletree git pins went with
 # it: this line depends on published `shardtree 0.7` / `incrementalmerkletree 0.8.2`, which carry the
 # explicit-checkpoint-retention APIs and the `clear_flags` checkpoint-pruning panic fix the old pins
-# existed for. Zecd carries **no librustzcash fork and no git pins** - move the RC reqs to the finals
-# when they publish.
+# existed for. Zecd carries **no librustzcash fork, no git pins, and no prerelease requirements**.
 #
 # Still-relevant notes inherited from the git-pin era (they describe the published line too):
 #
@@ -169,32 +169,43 @@ incrementalmerkletree = "0.8"
 #   re-decryption pass. The gap is narrow and self-healing (the live mempool path fills the memo on
 #   the authoring node; a from-seed restore recovers it via enhancement) - it only bites the
 #   authoring node when the mempool missed its own self-send, and a rescan fixes it. Re-check when
-#   bumping to the next RC/final.
-# - **Ironwood sends route through the cached-key PCZT path.** The published RC BUILDS Ironwood
+#   bumping to the next release.
+# - **Ironwood sends route through the cached-key PCZT path.** The published line BUILDS Ironwood
 #   PCZTs (librustzcash#2543 landed - the old git rev rejected them), so the `ironwood_forces_fused`
 #   gate in `actor.rs` is gone and post-NU6.3 sends no longer pay the fused path's ~4.5 s/send
 #   keygen. `ProvingKeyCache` caches both circuit keys (`FixedPostNu6_2` for the V2 Orchard bundle,
 #   `PostNu6_3` for the V3 Ironwood bundle); see the send-proving-path notes in the project docs.
-# - **rc.7 closes the extractor's Ironwood-output gap.** Through rc.6,
-#   `extract_and_store_transaction_from_pczt` built its `SentTransaction` outputs from the Sapling
-#   and Orchard bundles only, so a post-NU6.3 send's Ironwood payment/change outputs reached the DB
-#   with no `sent_notes` row and no memo; rc.7 records them (and tags every shielded sent output
-#   with its note commitment tree). `actor::backfill_ironwood_memos` - the workaround that
-#   re-decrypted the just-stored transaction - is deleted with this bump. If a future bump ever
-#   regresses the extractor, the symptom is a missing memo on an ironwood send's own outputs on the
-#   authoring node, and only the regtest ironwood tier can see it.
-# - **rc.8 is almost entirely pool-migration work, which zecd does not use.** It adds the migration
-#   history/cancel/finalize APIs, a `MigrationUuid` identity, two migration views, and schema
-#   migrations that rework those tables (txid to BLOB, uuid + committed_height columns) - all over
-#   tables zecd never writes, so they run empty. Two changes do touch paths zecd is on.
+# - **The extractor records Ironwood outputs** (since `zcash_client_backend 0.24.0-rc.7`). Through
+#   rc.6, `extract_and_store_transaction_from_pczt` built its `SentTransaction` outputs from the
+#   Sapling and Orchard bundles only, so a post-NU6.3 send's Ironwood payment/change outputs reached
+#   the DB with no `sent_notes` row and no memo; it now records them (and tags every shielded sent
+#   output with its note commitment tree). `actor::backfill_ironwood_memos` - the workaround that
+#   re-decrypted the just-stored transaction - is gone. If a future bump ever regresses the
+#   extractor, the symptom is a missing memo on an ironwood send's own outputs on the authoring
+#   node, and only the regtest ironwood tier can see it.
+# - **Pool migration is most of what the 0.22.0 sqlite line added, and zecd does not use it.** The
+#   migration history/cancel/finalize APIs, a `MigrationUuid` identity, two migration views, and
+#   schema migrations reworking those tables (txid to BLOB, uuid + committed_height columns) - all
+#   over tables zecd never writes, so they run empty. Two changes do touch paths zecd is on.
 #   `WalletWrite::store_transactions_to_be_sent` - the fully-transparent t-to-t send path's store
-#   call - now upserts each transaction's sent-output records rather than failing on a transaction
-#   the wallet already recorded, and classifies each stored transaction against ZIP 318 at store
-#   time instead of waiting for it to mine; both are strictly more forgiving. Separately, a schema
-#   migration relaxes the `addresses` table constraint to admit upstream's new watch-only
-#   transparent address import (`transparent-key-import` feature, which zecd does not enable).
-#   `zcash_client_backend` stays at rc.7 - no rc.8 of that crate is published, and rc.8 of the
-#   sqlite crate requires `^0.24.0-rc.7`.
+#   call - upserts each transaction's sent-output records rather than failing on a transaction the
+#   wallet already recorded, and classifies each stored transaction against ZIP 318 at store time
+#   instead of waiting for it to mine; both are strictly more forgiving.
+# - **What the finals added over the last RCs**, none of it requiring a zecd source change.
+#   `Proposal::check_transaction_size` estimates a step's serialized size from its inputs, outputs
+#   and change and rejects a proposal that could not fit in a block (`MAX_BLOCK_BYTES`), as a new
+#   `ProposalError` variant; every `propose_*` call and every build entry point
+#   (`create_proposed_transactions`, `create_pczt_from_proposal`) runs it, so an over-large
+#   selection now fails at proposal time with a specific error instead of at build time - which
+#   matters most to the callers that deliberately select as many inputs as they can,
+#   `z_shieldcoinbase` and an `ANY_TADDR` shield. The size constants behind the estimate are what
+#   `zcash_primitives 0.30.1` publishes.
+#   A new `standalone_address` schema migration relaxes the `addresses` constraint to admit
+#   upstream's new bare-address import (`transparent-key-import`, which zecd does not enable);
+#   it rebuilds the `addresses` table, so an existing wallet database is migrated in place.
+#   Transparent P2SH inputs whose size the wallet has not been told now estimate as
+#   `InputSize::Unknown` (the consensus maximum) rather than being guessed at P2PKH size; zecd
+#   spends only P2PKH, so this is inert here.
 # - **`orchard` 0.15.4 speeds up batched trial decryption**, which is how the compact-block scan
 #   decrypts every block's outputs: GLV endomorphism setup is now shared across a whole batch
 #   instead of recomputed per output. Shared secrets are byte-identical to the per-item path, so it
