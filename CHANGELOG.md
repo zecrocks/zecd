@@ -5,6 +5,30 @@ All notable changes to zecd are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com), and this
 project adheres to [Semantic Versioning](https://semver.org).
 
+## [0.7.0-rc1] - 2026-08-20
+
+Three things a 0.6.3 wallet could not do: sweep its own fragmented balance back
+together, be driven from Rust without a socket in between, and emit logs a
+machine can query. This candidate adds all three. A running daemon behaves as it
+did otherwise, with no configuration keys, response shapes or error codes moved,
+and the binary and release images are built exactly as before.
+
+It is a candidate because the library surface is new and has been exercised only
+by this repository's own tests. The RPC surface is not affected by that caveat.
+
+### Added
+- **`z_mergetoaddress`, the amountless consolidation sweep.** A wallet that has received many small payments accumulates a long tail of UTXOs and notes, and nothing here could gather them up. This is zcashd's answer, with its signature and response shape: merge many transparent UTXOs or shielded notes into one output at any address, paying inputs minus fee. There is no amount argument and no change in any pool. The selection counts return synchronously and the proving and broadcast run under an opid, as `z_shieldcoinbase` does.
+- Sources are one class per call: `ANY_TADDR` or explicit wallet t-addresses (non-coinbase), `ANY_SAPLING`, `ANY_ORCHARD` (the Orchard and Ironwood family here), or an own shielded address, meaning the account's notes. Mixing transparent and shielded sources is refused, the one documented divergence from zcashd. The per-call limits are real (50 transparent, 200 shielded, `0` for as many as fit), so a large wallet consolidates by calling repeatedly. Privacy is the existing `[spend] privacy_policy` ladder unchanged: a transparent source still needs `AllowRevealedSenders`, a fully transparent merge still needs `AllowFullyTransparent`, and transparent coinbase remains `z_shieldcoinbase`'s alone.
+- **zecd is usable as a library.** `node::NodeBuilder` brings up wallet actors, sync and async operations in a host process without the HTTP servers, and `node::Node::call` dispatches any RPC in-process with wire-identical semantics: the same method table, the same `[rpc] allowed_methods` safelist, the same arity checks and Bitcoin Core error codes an HTTP client gets. Each CLI subcommand is now a data-returning function behind its printing shell, so an embedder creates or rescans a wallet, checks a configuration or derives an address by calling the same code the command line runs.
+- **A typed Rust client**, one method per RPC across all 51 of them, borrowed from a node as a wallet-bound `Client`. Every wrapper sends the same positional parameters a JSON caller would and decodes what dispatch returned, so it cannot drift away from the wire contract, and a lockstep test fails the build if a method ever lacks a wrapper. Amounts are exact zatoshis rather than floats.
+- Two Cargo features, `server` and `cli`, gate the HTTP servers and the clap surface. Both are on by default, so the binary, the Docker images and the release artifacts are unchanged; a library consumer builds with `default-features = false` and gets neither axum nor clap in its dependency tree.
+
+### Changed
+- **Logs carry their context on spans instead of in prose.** Everything emitted while an RPC is handled, including the sanitized error detail lines, is now attributed to that call's method and wallet, and every event from a wallet's actor carries the wallet name as a real field rather than a `[name]` prefix pasted onto the message text. Text output looks much as it did; JSON output is queryable without parsing message strings. Numbers that were baked into sentences (durations, counts, rates on the send profile, the scan batches and the periodic heartbeats) are now fields.
+- **A stable `zecd::audit` target** on the security-relevant events: the RPC auth mode and per-request outcomes, the account-to-keys binding pin, seed unlock and relock, transparent issuance past the recovery horizon, and every process-hardening no-op or opt-out. An operator routes those to a separate sink with a one-line filter instead of matching on message text.
+- Two log levels move. Per-request authentication *success* drops from INFO to DEBUG, which removes one line per authenticated request; failures stay at WARN. Reconnect attempts during an upstream outage no longer stream WARNs: the first failure warns and names the demotion, and the paced retries after it log at DEBUG with their attempt number and delay. There are also new TRACE events, one per downloaded block and one per serviced transaction-data request, off unless asked for.
+- `[log] format` is validated when the configuration resolves. Anything other than `json` was silently treated as text, so a typo like `jsonl` produced text logs with no complaint; it is now refused, and `zecd config check` reports the same refusal. One identifying line is logged at startup (version, network, datadir and upstream), which nothing did before, and shutdown warns when async operations are still unfinished.
+
 ## [0.6.3] - 2026-08-20
 
 Every librustzcash crate zecd depends on is now a published stable release. The wallet crates
@@ -433,6 +457,7 @@ Zcash, backed entirely by librustzcash and running as a light client.
 ### Security
 - Pre-release audit hardening; refuse to start on mainnet with the placeholder RPC password; enforce a 12-character passphrase minimum.
 
+[0.7.0-rc1]: https://github.com/zecrocks/zecd/compare/v0.6.3...v0.7.0-rc1
 [0.6.3]: https://github.com/zecrocks/zecd/compare/v0.6.2...v0.6.3
 [0.6.2]: https://github.com/zecrocks/zecd/compare/v0.6.1...v0.6.2
 [0.6.1]: https://github.com/zecrocks/zecd/compare/v0.6.0...v0.6.1
