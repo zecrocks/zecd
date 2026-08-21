@@ -123,6 +123,9 @@ pub(crate) fn resolve_wallet_entry(config: &AppConfig, wallet: &str) -> WalletEn
         .unwrap_or_else(|| WalletEntry {
             dir: config.datadir.join(wallet),
             keys_file: None,
+            coin: crate::coin::Coin::Zcash,
+            chain: crate::coin::Coin::Zcash.chain(config.network),
+            backend: Default::default(),
             pools: config.pools.enabled.clone(),
             default_receivers: config.pools.default_receivers.clone(),
             transparent_enabled: config.pools.transparent_enabled,
@@ -293,8 +296,8 @@ pub async fn init_wallet(config: &AppConfig, opts: InitOptions) -> anyhow::Resul
     let init_gap_limit = entry
         .transparent_enabled
         .then_some(entry.transparent_gap_limit);
+    let network = entry.zcash_network();
     let wallet_dir = entry.dir;
-    let network = config.network;
 
     if WalletStore::exists(&keys_path) {
         return Err(anyhow!(
@@ -331,9 +334,10 @@ pub async fn init_wallet(config: &AppConfig, opts: InitOptions) -> anyhow::Resul
         if let Some(existing) = existing_spending_wallet(network, &config.wallets, &wallet) {
             return Err(anyhow!(
                 "cannot create spending wallet '{}': wallet '{}' already holds spending keys, \
-                 and zecd allows at most one spending wallet (any number of watch-only UFVK \
-                 wallets may be added alongside it). Create this wallet watch-only with `--ufvk` \
-                 (see `zecd export-ufvk`), or remove/convert the existing spending wallet.",
+                 and zecd allows at most one spending wallet (any number of watch-only \
+                 UFVK wallets may be added alongside it). Create this wallet watch-only with \
+                 `--ufvk` (see `zecd export-ufvk`), or remove/convert the existing spending \
+                 wallet.",
                 wallet,
                 existing
             ));
@@ -569,6 +573,7 @@ pub fn export_ufvk(config: &AppConfig, args: &ExportUfvkArgs) -> anyhow::Result<
 pub fn export_ufvk_string(config: &AppConfig, wallet: &str) -> anyhow::Result<String> {
     let entry = resolve_wallet_entry(config, wallet);
     let keys_path = entry.keys_path();
+    let network = entry.zcash_network();
     let wallet_dir = entry.dir;
 
     if !WalletStore::exists(&keys_path) {
@@ -581,16 +586,9 @@ pub fn export_ufvk_string(config: &AppConfig, wallet: &str) -> anyhow::Result<St
     // The UFVK encoding is network-scoped; refuse a network flag that contradicts the wallet
     // on disk rather than emit a key the watch-only side would reject.
     let st = WalletStore::read(&keys_path)?;
-    if st.network != config.network {
-        return Err(anyhow!(
-            "wallet '{}' is a {} wallet, but the configuration selects {}",
-            wallet,
-            st.network.name(),
-            config.network.name()
-        ));
-    }
+    ensure_store_matches(&st, wallet, network)?;
 
-    let db = open::open_read(config.network, &wallet_dir)?;
+    let db = open::open_read(network, &wallet_dir)?;
     let account_id = *db
         .get_account_ids()?
         .first()
@@ -601,7 +599,7 @@ pub fn export_ufvk_string(config: &AppConfig, wallet: &str) -> anyhow::Result<St
     let ufvk = account
         .ufvk()
         .ok_or_else(|| anyhow!("account has no unified full viewing key"))?;
-    Ok(ufvk.encode(&config.network))
+    Ok(ufvk.encode(&network))
 }
 
 /// `zecd rescan`: the recovery path for a broken wallet database - e.g. a persistent
@@ -620,7 +618,7 @@ pub fn rescan(config: &AppConfig, args: &RescanArgs) -> anyhow::Result<()> {
 
     let entry = resolve_wallet_entry(config, &args.wallet);
     let removed = rescan_wallet(
-        config.network,
+        entry.zcash_network(),
         &args.wallet,
         &entry.keys_path(),
         &entry.dir,
@@ -700,14 +698,7 @@ pub fn rescan_wallet(
         ));
     }
     let st = WalletStore::read(keys_path)?;
-    if st.network != network {
-        return Err(anyhow!(
-            "wallet '{}' is a {} wallet, but the configuration selects {}",
-            wallet,
-            st.network.name(),
-            network.name()
-        ));
-    }
+    ensure_store_matches(&st, wallet, network)?;
     if !st.has_seed() {
         return Err(anyhow!(
             "wallet '{}' is watch-only (keys.toml holds no seed), so the daemon cannot rebuild \
@@ -774,6 +765,24 @@ fn ensure_no_preexisting_account(
         open::data_db_path(wallet_dir).display(),
         accounts
     ))
+}
+
+/// Refuse a `keys.toml` that belongs to a different network than the configuration selects,
+/// rather than acting on it.
+fn ensure_store_matches(
+    store: &WalletStore,
+    wallet: &str,
+    network: ZNetwork,
+) -> anyhow::Result<()> {
+    if store.network != network {
+        return Err(anyhow!(
+            "wallet '{}' is a {} wallet, but the configuration selects {}",
+            wallet,
+            store.network.name(),
+            network.name()
+        ));
+    }
+    Ok(())
 }
 
 /// Scan the configured `wallets` (other than `exclude`) for one that is already initialized and
@@ -1071,6 +1080,9 @@ mod tests {
             WalletEntry {
                 dir: default_dir.path().to_path_buf(),
                 keys_file: None,
+                coin: crate::coin::Coin::Zcash,
+                chain: crate::coin::Coin::Zcash.chain(net),
+                backend: Default::default(),
                 pools: orchard_pools(),
                 default_receivers: orchard_pools(),
                 transparent_enabled: false,
@@ -1086,6 +1098,9 @@ mod tests {
             WalletEntry {
                 dir: w2_dir.path().to_path_buf(),
                 keys_file: None,
+                coin: crate::coin::Coin::Zcash,
+                chain: crate::coin::Coin::Zcash.chain(net),
+                backend: Default::default(),
                 pools: orchard_pools(),
                 default_receivers: orchard_pools(),
                 transparent_enabled: false,
@@ -1131,6 +1146,9 @@ mod tests {
                 WalletEntry {
                     dir: dir.path().to_path_buf(),
                     keys_file: None,
+                    coin: crate::coin::Coin::Zcash,
+                    chain: crate::coin::Coin::Zcash.chain(net),
+                    backend: Default::default(),
                     pools: orchard_pools(),
                     default_receivers: orchard_pools(),
                     transparent_enabled: false,

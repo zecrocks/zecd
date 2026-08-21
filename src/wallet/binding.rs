@@ -96,6 +96,12 @@ pub fn seed_ufvk_encoded(
 /// - no pin (a `keys.toml` from before this field existed): pin the current account,
 ///   trust-on-first-use. The next seed exposure (auto-unlock or `walletpassphrase`) verifies
 ///   the pinned account against the seed, so a wrong TOFU pin cannot survive an unlock.
+///
+/// The pin is a UFVK because that is what identifies a Zcash account. The *concept* is
+/// independent of the key format - "which keys does this database serve, and do they derive from our
+/// seed?" - so a UTXO engine generalizes it by pinning its descriptors instead, with the same
+/// threat model (a swapped database silently diverting deposits) and the same
+/// fatal-on-mismatch policy. Nothing else about this module changes for that.
 pub fn verify_or_pin_account(
     name: &str,
     keys_path: &Path,

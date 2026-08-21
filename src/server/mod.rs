@@ -544,10 +544,10 @@ mod tests {
     #[tokio::test]
     async fn getblockcount_honors_wallet_routing() {
         use crate::network::ZNetwork;
-        use crate::wallet::{SyncStatus, WalletHandle};
+        use crate::wallet::{CoinWallet, SyncStatus, WalletHandle};
 
         let mut reg = WalletRegistry::new("default".into());
-        reg.insert(WalletHandle::for_test(
+        reg.insert(CoinWallet::Zcash(WalletHandle::for_test(
             "default",
             ZNetwork::Test,
             SyncStatus {
@@ -555,8 +555,8 @@ mod tests {
                 scanning: false,
                 ..Default::default()
             },
-        ));
-        reg.insert(WalletHandle::for_test(
+        )));
+        reg.insert(CoinWallet::Zcash(WalletHandle::for_test(
             "w2",
             ZNetwork::Test,
             SyncStatus {
@@ -564,7 +564,7 @@ mod tests {
                 scanning: true,
                 ..Default::default()
             },
-        ));
+        )));
         let mut state = test_state();
         state.app.registry = Arc::new(reg);
 
@@ -601,11 +601,11 @@ mod tests {
         tokio::sync::watch::Sender<crate::wallet::SyncStatus>,
     ) {
         use crate::network::ZNetwork;
-        use crate::wallet::WalletHandle;
+        use crate::wallet::{CoinWallet, WalletHandle};
 
         let (handle, tx) = WalletHandle::for_test_publishing("default", ZNetwork::Test, status);
         let mut reg = WalletRegistry::new("default".into());
-        reg.insert(handle);
+        reg.insert(CoinWallet::Zcash(handle));
         let mut state = test_state();
         state.app.registry = Arc::new(reg);
         (state, tx)
@@ -798,19 +798,19 @@ mod tests {
     async fn z_waitforoperation_blocks_until_the_operation_finishes() {
         use crate::error::RpcError;
         use crate::network::ZNetwork;
-        use crate::wallet::{SyncStatus, WalletHandle};
+        use crate::wallet::{CoinWallet, SyncStatus, WalletHandle};
 
         let mut reg = WalletRegistry::new("default".into());
-        reg.insert(WalletHandle::for_test(
+        reg.insert(CoinWallet::Zcash(WalletHandle::for_test(
             "default",
             ZNetwork::Test,
             SyncStatus::default(),
-        ));
-        reg.insert(WalletHandle::for_test(
+        )));
+        reg.insert(CoinWallet::Zcash(WalletHandle::for_test(
             "w2",
             ZNetwork::Test,
             SyncStatus::default(),
-        ));
+        )));
         let mut state = test_state();
         state.app.registry = Arc::new(reg);
 
@@ -893,14 +893,14 @@ mod tests {
     async fn z_waitforoperation_reports_a_failed_operation_as_finished() {
         use crate::error::RpcError;
         use crate::network::ZNetwork;
-        use crate::wallet::{SyncStatus, WalletHandle};
+        use crate::wallet::{CoinWallet, SyncStatus, WalletHandle};
 
         let mut reg = WalletRegistry::new("default".into());
-        reg.insert(WalletHandle::for_test(
+        reg.insert(CoinWallet::Zcash(WalletHandle::for_test(
             "default",
             ZNetwork::Test,
             SyncStatus::default(),
-        ));
+        )));
         let mut state = test_state();
         state.app.registry = Arc::new(reg);
 
@@ -939,15 +939,15 @@ mod tests {
     async fn z_waitforoperation_is_wallet_scoped_and_rejects_unknown_ids() {
         use crate::error::RpcError;
         use crate::network::ZNetwork;
-        use crate::wallet::{SyncStatus, WalletHandle};
+        use crate::wallet::{CoinWallet, SyncStatus, WalletHandle};
 
         let mut reg = WalletRegistry::new("default".into());
         for name in ["default", "w2"] {
-            reg.insert(WalletHandle::for_test(
+            reg.insert(CoinWallet::Zcash(WalletHandle::for_test(
                 name,
                 ZNetwork::Test,
                 SyncStatus::default(),
-            ));
+            )));
         }
         let mut state = test_state();
         state.app.registry = Arc::new(reg);

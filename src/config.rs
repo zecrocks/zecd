@@ -14,6 +14,7 @@ use clap::Parser;
 use serde::Deserialize;
 use zcash_client_backend::data_api::wallet::ConfirmationsPolicy;
 
+use crate::coin::{Coin, CoinNetwork};
 use crate::network::ZNetwork;
 use crate::pools::{Receiver, ReceiverSet};
 
@@ -261,6 +262,14 @@ pub struct WalletEntry {
     /// `[keys] keys_file` / `ZECD_KEYS_FILE` for the default wallet) lets the encrypted seed
     /// be mounted as a Kubernetes Secret separately from the (disposable) data directory.
     pub keys_file: Option<PathBuf>,
+    /// The coin this wallet serves.
+    pub coin: Coin,
+    /// This wallet's chain, derived from (its coin, the daemon's network environment). Not a
+    /// config key: `--testnet`/`--regtest` set the environment for the whole daemon and every
+    /// wallet's chain follows from it, so a wallet on the wrong network is unrepresentable.
+    pub chain: CoinNetwork,
+    /// This wallet's overrides of the global `[backend]` endpoint settings.
+    pub backend: WalletBackendOverride,
     /// Shielded pools this wallet receives into and spends from (resolved per wallet).
     pub pools: ReceiverSet,
     /// Receivers included by default in this wallet's Unified Addresses (a subset of `pools`).
@@ -282,12 +291,103 @@ pub struct WalletEntry {
 }
 
 impl WalletEntry {
+    /// This wallet's Zcash network.
+    ///
+    /// Unwrapped at the call site rather than stored bare, so the daemon-global
+    /// `config.network` and a wallet's own chain stay distinguishable: the reads that mean
+    /// "this deployment" keep using the former, and the per-wallet ones go through here.
+    pub fn zcash_network(&self) -> ZNetwork {
+        match self.chain {
+            CoinNetwork::Zcash(network) => network,
+        }
+    }
+
     /// The effective path to this wallet's `keys.toml` (the explicit `keys_file` override, or
     /// `<dir>/keys.toml` by default).
     pub fn keys_path(&self) -> PathBuf {
         self.keys_file
             .clone()
             .unwrap_or_else(|| self.dir.join("keys.toml"))
+    }
+}
+
+/// A wallet's per-endpoint overrides of the global `[backend]` section.
+///
+/// Only the settings that describe *which upstream this wallet dials* are overridable:
+/// the server token and the TLS trust that authenticates it. Daemon policy - timeouts,
+/// reconnect backoff, the cleartext-locality rules - and the `[zebra]` credentials stay
+/// global, because they are properties of the deployment rather than of one endpoint.
+///
+/// Every field is `None` when the wallet does not override it, which is also what
+/// `config show` renders by: a wallet with no overrides emits no backend keys at all, and
+/// falls back to `[backend]`.
+#[derive(Debug, Clone, Default)]
+pub struct WalletBackendOverride {
+    /// See [`BackendConfig::server`].
+    pub server: Option<String>,
+    /// See [`BackendConfig::tls`]. The outer `Option` is "did the wallet override it"; the
+    /// inner one is the tri-state TLS mode (`None` = auto).
+    pub tls: Option<Option<bool>>,
+    /// See [`BackendConfig::tls_roots`].
+    pub tls_roots: Option<crate::backend::TlsRoots>,
+    /// See [`BackendConfig::tls_insecure_skip_verify`].
+    pub tls_insecure_skip_verify: Option<bool>,
+    /// See [`BackendConfig::tls_ca_pem`]. Read at config load, like the global key.
+    pub tls_ca_pem: Option<Vec<u8>>,
+    /// See [`BackendConfig::tls_ca_file`] - kept so the setting can be reported by its key.
+    pub tls_ca_file: Option<PathBuf>,
+    /// See [`BackendConfig::tls_pins`].
+    pub tls_pins: Option<Vec<crate::backend::CertFingerprint>>,
+    /// See [`BackendConfig::assume_transparent_in_compact_blocks`].
+    pub assume_transparent_in_compact_blocks: Option<bool>,
+}
+
+impl WalletBackendOverride {
+    /// Whether this wallet overrides anything at all (used to skip duplicate reporting of an
+    /// endpoint that is just the global one).
+    pub fn is_empty(&self) -> bool {
+        self.server.is_none()
+            && self.tls.is_none()
+            && self.tls_roots.is_none()
+            && self.tls_insecure_skip_verify.is_none()
+            && self.tls_ca_pem.is_none()
+            && self.tls_pins.is_none()
+            && self.assume_transparent_in_compact_blocks.is_none()
+    }
+
+    /// The effective backend settings for this wallet: the global `[backend]` with this
+    /// wallet's overrides applied. Field-by-field, so a wallet that overrides only `server`
+    /// keeps every global TLS setting.
+    pub fn effective(&self, global: &BackendConfig) -> BackendConfig {
+        BackendConfig {
+            server: self.server.clone().unwrap_or_else(|| global.server.clone()),
+            tls: self.tls.unwrap_or(global.tls),
+            tls_roots: self.tls_roots.unwrap_or(global.tls_roots),
+            tls_insecure_skip_verify: self
+                .tls_insecure_skip_verify
+                .unwrap_or(global.tls_insecure_skip_verify),
+            tls_ca_pem: self
+                .tls_ca_pem
+                .clone()
+                .or_else(|| global.tls_ca_pem.clone()),
+            tls_ca_file: self
+                .tls_ca_file
+                .clone()
+                .or_else(|| global.tls_ca_file.clone()),
+            tls_pins: self
+                .tls_pins
+                .clone()
+                .unwrap_or_else(|| global.tls_pins.clone()),
+            assume_transparent_in_compact_blocks: self
+                .assume_transparent_in_compact_blocks
+                .unwrap_or(global.assume_transparent_in_compact_blocks),
+            // Daemon policy, never per-wallet.
+            connect_timeout_secs: global.connect_timeout_secs,
+            reconnect_base_secs: global.reconnect_base_secs,
+            reconnect_max_secs: global.reconnect_max_secs,
+            rfc1918_is_local: global.rfc1918_is_local,
+            allow_remote_cleartext: global.allow_remote_cleartext,
+        }
     }
 }
 
@@ -650,6 +750,20 @@ struct WalletFile {
     dir: Option<PathBuf>,
     /// Path to this wallet's `keys.toml`, independent of `dir` (mount it as a Secret).
     keys_file: Option<PathBuf>,
+    /// Override the global `[backend] server` for this wallet.
+    server: Option<String>,
+    /// Override the global `[backend] tls` for this wallet.
+    tls: Option<String>,
+    /// Override the global `[backend] tls_roots` for this wallet.
+    tls_roots: Option<String>,
+    /// Override the global `[backend] tls_insecure_skip_verify` for this wallet.
+    tls_insecure_skip_verify: Option<bool>,
+    /// Override the global `[backend] tls_ca_file` for this wallet.
+    tls_ca_file: Option<PathBuf>,
+    /// Override the global `[backend] tls_pinned_sha256` for this wallet.
+    tls_pinned_sha256: Option<Vec<String>>,
+    /// Override the global `[backend] assume_transparent_in_compact_blocks` for this wallet.
+    assume_transparent_in_compact_blocks: Option<bool>,
     /// Override the global `[pools] enabled` for this wallet.
     pools: Option<Vec<String>>,
     /// Override the global `[pools] default_receivers` for this wallet.
@@ -1223,6 +1337,8 @@ impl AppConfig {
                     None
                 }
             });
+            let coin = Coin::Zcash;
+            let backend_override = resolve_wallet_backend(name, w)?;
             let (
                 enabled,
                 default_receivers,
@@ -1249,6 +1365,9 @@ impl AppConfig {
                 WalletEntry {
                     dir,
                     keys_file,
+                    coin,
+                    chain: coin.chain(network),
+                    backend: backend_override,
                     pools: enabled,
                     default_receivers,
                     transparent_enabled,
@@ -1265,6 +1384,9 @@ impl AppConfig {
             .or_insert_with(|| WalletEntry {
                 dir: datadir.join(&default_wallet),
                 keys_file: keys_file_global.clone(),
+                coin: Coin::Zcash,
+                chain: Coin::Zcash.chain(network),
+                backend: WalletBackendOverride::default(),
                 pools: pools.enabled.clone(),
                 default_receivers: pools.default_receivers.clone(),
                 transparent_enabled: pools.transparent_enabled,
@@ -1335,6 +1457,15 @@ impl AppConfig {
                 .unwrap_or(false),
         };
         validate_backend_tls(&backend)?;
+        // Same contradiction checks for every wallet that overrides the endpoint, against its
+        // effective settings - a never-consulted pin is exactly as silent per wallet as it is
+        // globally.
+        for (name, entry) in &wallets {
+            if !entry.backend.is_empty() {
+                validate_backend_tls(&entry.backend.effective(&backend))
+                    .with_context(|| format!("[wallets.{name}]"))?;
+            }
+        }
 
         let zebra_file = file.zebra.unwrap_or_default();
         let zebra = ZebraConfig {
@@ -1583,6 +1714,49 @@ fn validate_backend_tls(backend: &BackendConfig) -> anyhow::Result<()> {
         );
     }
     Ok(())
+}
+
+/// Parse a wallet's `[wallets.<name>]` backend override keys. Each key is parsed by the same
+/// helper the global `[backend]` section uses, so the two cannot drift; errors name the exact
+/// TOML key that is wrong.
+fn resolve_wallet_backend(name: &str, w: &WalletFile) -> anyhow::Result<WalletBackendOverride> {
+    Ok(WalletBackendOverride {
+        server: w.server.clone(),
+        tls: match w.tls.as_deref() {
+            Some(mode) => Some(
+                crate::backend::parse_tls_mode(mode)
+                    .with_context(|| format!("[wallets.{name}] tls"))?,
+            ),
+            None => None,
+        },
+        tls_roots: match w.tls_roots.as_deref() {
+            Some(roots) => Some(
+                crate::backend::TlsRoots::parse(roots)
+                    .with_context(|| format!("[wallets.{name}] tls_roots"))?,
+            ),
+            None => None,
+        },
+        tls_insecure_skip_verify: w.tls_insecure_skip_verify,
+        // Read now, not at connect time, exactly as the global key is: an unreadable CA file
+        // must fail startup rather than leave this wallet silently on the public roots.
+        tls_ca_pem: match w.tls_ca_file.as_deref() {
+            Some(path) => Some(std::fs::read(path).with_context(|| {
+                format!("reading [wallets.{name}] tls_ca_file {}", path.display())
+            })?),
+            None => None,
+        },
+        tls_ca_file: w.tls_ca_file.clone(),
+        tls_pins: match &w.tls_pinned_sha256 {
+            Some(pins) => Some(
+                pins.iter()
+                    .map(|s| crate::backend::CertFingerprint::parse(s))
+                    .collect::<anyhow::Result<Vec<_>>>()
+                    .with_context(|| format!("[wallets.{name}] tls_pinned_sha256"))?,
+            ),
+            None => None,
+        },
+        assume_transparent_in_compact_blocks: w.assume_transparent_in_compact_blocks,
+    })
 }
 
 fn resolve_global_pools(file: Option<&PoolsFile>) -> anyhow::Result<PoolsConfig> {
@@ -2561,6 +2735,125 @@ mod tests {
             cfg.wallets["default"].keys_path(),
             PathBuf::from("/cli/keys.toml")
         );
+    }
+
+    #[test]
+    #[cfg(feature = "cli")]
+    fn every_resolved_wallet_is_a_zcash_wallet() {
+        // The implicit default wallet and any named wallet alike. Nothing in the config file
+        // selects this - it is a property of the build, resolved once so the rest of the tree
+        // reads it from the entry rather than assuming it.
+        use clap::Parser as _;
+        let dir = tempfile::tempdir().unwrap();
+        let conf = dir.path().join("zecd.toml");
+        std::fs::write(
+            &conf,
+            "network = \"test\"\ndatadir = \"/d\"\n[wallets.other]\n",
+        )
+        .unwrap();
+        let cli = Cli::parse_from(["zecd", "--conf", conf.to_str().unwrap()]);
+        let cfg = AppConfig::resolve(&cli).unwrap();
+        assert_eq!(cfg.wallets["default"].coin, Coin::Zcash);
+        assert_eq!(cfg.wallets["other"].coin, Coin::Zcash);
+    }
+
+    #[test]
+    #[cfg(feature = "cli")]
+    fn wallet_chain_is_derived_from_the_daemon_environment() {
+        // One environment per daemon: a wallet's chain follows from it rather than being
+        // configured on its own, so there is no way to express a mainnet wallet in a testnet
+        // daemon.
+        use clap::Parser as _;
+        let dir = tempfile::tempdir().unwrap();
+        let conf = dir.path().join("zecd.toml");
+        std::fs::write(&conf, "datadir = \"/d\"\n[wallets.other]\n").unwrap();
+
+        for (flag, env) in [("test", ZNetwork::Test), ("main", ZNetwork::Main)] {
+            let cli = Cli::parse_from([
+                "zecd",
+                "--conf",
+                conf.to_str().unwrap(),
+                "--network",
+                flag,
+                "--rpcpassword",
+                "not-the-placeholder",
+            ]);
+            let cfg = AppConfig::resolve(&cli).unwrap();
+            for name in ["default", "other"] {
+                let entry = &cfg.wallets[name];
+                assert_eq!(entry.chain, CoinNetwork::Zcash(env));
+                assert_eq!(entry.zcash_network(), env);
+                assert_eq!(entry.zcash_network(), cfg.network);
+            }
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "cli")]
+    fn per_wallet_backend_overrides_fall_back_to_the_global_section() {
+        // One daemon, two upstreams: a zebra-backed wallet alongside a lightwalletd-backed one.
+        // A wallet that overrides nothing must resolve exactly as it did before the keys existed.
+        use clap::Parser as _;
+        let dir = tempfile::tempdir().unwrap();
+        let conf = dir.path().join("zecd.toml");
+        std::fs::write(
+            &conf,
+            "network = \"test\"\ndatadir = \"/d\"\n\
+             [backend]\nserver = \"zebra://127.0.0.1:18234\"\ntls_roots = \"webpki\"\n\
+             [wallets.default]\n\
+             [wallets.replica]\nserver = \"https://lwd.example:9067\"\n",
+        )
+        .unwrap();
+        let cli = Cli::parse_from(["zecd", "--conf", conf.to_str().unwrap()]);
+        let cfg = AppConfig::resolve(&cli).unwrap();
+
+        // No overrides: the global endpoint, unchanged.
+        let default = &cfg.wallets["default"];
+        assert!(default.backend.is_empty());
+        let resolved = crate::backend::resolve_for_wallet(&cfg, default).unwrap();
+        assert_eq!(
+            resolved.describe(),
+            crate::backend::resolve_configured(&cfg).unwrap().describe()
+        );
+
+        // Overridden server, but the global TLS settings still apply field by field.
+        let replica = &cfg.wallets["replica"];
+        assert!(!replica.backend.is_empty());
+        let resolved = crate::backend::resolve_for_wallet(&cfg, replica).unwrap();
+        assert_eq!(resolved.kind(), crate::backend::ServerKind::Lightwalletd);
+        assert_eq!(
+            replica.backend.effective(&cfg.backend).tls_roots,
+            crate::backend::TlsRoots::Webpki
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "cli")]
+    fn per_wallet_backend_keys_are_parsed_and_validated_by_their_own_key() {
+        use clap::Parser as _;
+        let dir = tempfile::tempdir().unwrap();
+        let conf = dir.path().join("zecd.toml");
+
+        // A bad value names the wallet's own key, not `[backend]`.
+        std::fs::write(
+            &conf,
+            "network = \"test\"\ndatadir = \"/d\"\n[wallets.a]\ntls_roots = \"bogus\"\n",
+        )
+        .unwrap();
+        let cli = Cli::parse_from(["zecd", "--conf", conf.to_str().unwrap()]);
+        let err = format!("{:#}", AppConfig::resolve(&cli).unwrap_err());
+        assert!(err.contains("[wallets.a] tls_roots"), "{err}");
+
+        // The TLS contradiction checks apply per wallet, against its effective settings.
+        std::fs::write(
+            &conf,
+            "network = \"test\"\ndatadir = \"/d\"\n\
+             [wallets.a]\nserver = \"https://lwd.example\"\ntls = \"no\"\n\
+             tls_pinned_sha256 = [\"AA:BB\"]\n",
+        )
+        .unwrap();
+        let cli = Cli::parse_from(["zecd", "--conf", conf.to_str().unwrap()]);
+        assert!(AppConfig::resolve(&cli).is_err());
     }
 
     #[test]

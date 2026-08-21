@@ -146,6 +146,12 @@ cli = ["dep:clap", "dep:tracing-subscriber"]
 # the gRPC stack): the TLS value types on `BackendConfig` and the `Lwd` variants in
 # `chain::AnySource` and its stream enums couple it into config/chain, so carving it out is its
 # own project.
+#
+# The general rule that NB is the cautionary precedent for: a dependency stays gateable only
+# while its types stay out of the shared layer. Keeping the wallet-side crates out of the
+# config structs, the RPC handler signatures, and the registry enum is what makes the existing
+# `server`/`cli` gates cheap, and it is why `librustzcash` types are confined to `wallet/`,
+# `sync/` and `chain/` rather than threaded through `config.rs` and `rpc/`.
 # Use mimalloc as the global allocator. Off by default; the musl release images opt in.
 mimalloc = ["dep:mimalloc"]
 # Hardened mimalloc (MI_SECURE): guard pages, encrypted/canary free-lists, randomized

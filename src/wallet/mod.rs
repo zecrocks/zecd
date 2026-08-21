@@ -28,6 +28,7 @@ use zcash_transparent::address::TransparentAddress;
 use zip32::DiversifierIndex;
 use zip321::TransactionRequest;
 
+use crate::coin::Coin;
 use crate::config::SendPrivacy;
 use crate::error::RpcError;
 use crate::network::ZNetwork;
@@ -448,6 +449,13 @@ impl WalletHandle {
         self.status_rx.borrow().clone()
     }
 
+    /// The coin this handle serves. Constant by construction - a `WalletHandle` is the Zcash
+    /// engine's handle - but written as a method so the codec call sites that need a [`Coin`]
+    /// read as "this wallet's coin" rather than hard-coding the answer.
+    pub fn coin(&self) -> Coin {
+        Coin::Zcash
+    }
+
     /// A private receiver on the actor's published [`SyncStatus`], for RPC handlers that must
     /// *wait* for the wallet's view of the chain to move rather than poll it (the `waitfor*`
     /// blockchain RPCs). The clone inherits this handle's seen-version, which is the channel's
@@ -701,9 +709,35 @@ impl WalletHandle {
     }
 }
 
+/// A loaded wallet, tagged with the kind of wallet it is.
+///
+/// The tag keeps the registry's storage independent of the handle type, so the librustzcash
+/// half of the tree stays confined to `wallet/` instead of appearing in the registry's own
+/// signatures. Built the way `chain::AnySource` is: an enum, not a trait object.
+pub enum CoinWallet {
+    /// A Zcash wallet, served by the librustzcash-backed actor.
+    Zcash(WalletHandle),
+}
+
+impl CoinWallet {
+    /// The coin this wallet serves.
+    pub fn coin(&self) -> Coin {
+        match self {
+            CoinWallet::Zcash(_) => Coin::Zcash,
+        }
+    }
+
+    /// The wallet's name, as `/wallet/<name>` addresses it.
+    pub fn name(&self) -> &str {
+        match self {
+            CoinWallet::Zcash(handle) => &handle.name,
+        }
+    }
+}
+
 /// The set of loaded wallets, addressable by name with a configured default.
 pub struct WalletRegistry {
-    wallets: HashMap<String, WalletHandle>,
+    wallets: HashMap<String, CoinWallet>,
     default: String,
 }
 
@@ -715,8 +749,8 @@ impl WalletRegistry {
         }
     }
 
-    pub fn insert(&mut self, handle: WalletHandle) {
-        self.wallets.insert(handle.name.clone(), handle);
+    pub fn insert(&mut self, wallet: CoinWallet) {
+        self.wallets.insert(wallet.name().to_string(), wallet);
     }
 
     pub fn is_empty(&self) -> bool {
@@ -724,7 +758,22 @@ impl WalletRegistry {
     }
 
     /// Look up a wallet by name, or the default when `name` is `None`.
+    ///
+    /// Returns the handle directly, so all ~38 handler call sites read the same as before the
+    /// registry grew its tag. The exhaustive match is deliberate: it resolves at one
+    /// chokepoint, where an accessor returning an `Option` would conflate "no such wallet"
+    /// with "a wallet that exists but is not the kind you asked for" - and the `-18` contract
+    /// depends on telling those apart.
     pub fn get(&self, name: Option<&str>) -> Result<&WalletHandle, RpcError> {
+        match self.get_coin(name)? {
+            CoinWallet::Zcash(handle) => Ok(handle),
+        }
+    }
+
+    /// Look up a wallet without resolving its engine - what the dispatch-time coin gate needs,
+    /// since it must decide whether a method serves this wallet's coin before any handler runs.
+    /// Same `-18` contract as [`WalletRegistry::get`].
+    pub fn get_coin(&self, name: Option<&str>) -> Result<&CoinWallet, RpcError> {
         let name = name.unwrap_or(&self.default);
         self.wallets.get(name).ok_or_else(|| {
             RpcError::wallet_not_found(format!(

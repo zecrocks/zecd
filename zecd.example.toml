@@ -36,6 +36,13 @@ dir = "./data/default"
 # The global [keys] keys_file below sets this for the default wallet; ZECD_KEYS_FILE /
 # --keys-file override it. data.sqlite and blocks/ still live under `dir`.
 # keys_file = "/secrets/keys.toml"
+# This wallet's own upstream, overriding [backend] below. Every [backend] endpoint key
+# (server, tls, tls_roots, tls_insecure_skip_verify, tls_ca_file, tls_pinned_sha256,
+# assume_transparent_in_compact_blocks) can be set per wallet and falls back to the global
+# value when omitted - so one daemon can serve, say, a zebra-backed spending wallet next to a
+# lightwalletd-backed watch-only replica. Deployment-wide settings (timeouts, reconnect
+# backoff, the cleartext-locality rules) and the [zebra] credentials stay global.
+# server = "zebra://127.0.0.1:8234"
 
 [backend]
 # The chain upstream: a LOCAL zebrad's JSON-RPC ("full mode", the default and the

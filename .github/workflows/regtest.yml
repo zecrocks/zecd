@@ -165,7 +165,10 @@ jobs:
           # back to the full HARNESS_TESTS list (env above).
           - suite: zecd-lwd
             backend: lwd
-            tests: --test regtest_lwd --test regtest_funded --test regtest_transparent --test regtest_transparent_t2t --test regtest_transparent_sendmany_t2t --test regtest_transparent_gap --test regtest_transparent_offline_restore --test regtest_shielding --test regtest_mergetoaddress
+            # regtest_multibackend is extended-tier (it skips in seconds otherwise) and lives
+            # only here: it is the one binary needing a lightwalletd AND a zebra endpoint in the
+            # same daemon, and lightwalletd is provisioned only on this leg.
+            tests: --test regtest_lwd --test regtest_funded --test regtest_transparent --test regtest_transparent_t2t --test regtest_transparent_sendmany_t2t --test regtest_transparent_gap --test regtest_transparent_offline_restore --test regtest_shielding --test regtest_mergetoaddress --test regtest_multibackend
             # Heavier per-slot than the zebra suite (an extra lightwalletd per stack), and only
             # a handful of binaries to get through - see REGTEST_JOBS below.
             jobs: 4

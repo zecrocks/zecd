@@ -163,6 +163,34 @@ fn check_backend(config: &AppConfig, findings: &mut Vec<Finding>) {
     }
 
     for (name, wallet) in &config.wallets {
+        // A wallet that overrides the endpoint dials its own, so it gets its own resolve and
+        // preflight - and the per-wallet warnings below key off *its* backend kind, not the
+        // global one. A wallet with no overrides is the global endpoint already checked above.
+        let (lightwalletd, assume_transparent) = if wallet.backend.is_empty() {
+            (
+                lightwalletd,
+                config.backend.assume_transparent_in_compact_blocks,
+            )
+        } else {
+            match crate::backend::resolve_for_wallet(config, wallet) {
+                Ok(wallet_server) => {
+                    if let Err(e) = wallet_server.preflight() {
+                        findings.push(Finding::error(format!("[wallets.{name}] server: {e:#}")));
+                    }
+                    (
+                        wallet_server.kind() == crate::backend::ServerKind::Lightwalletd,
+                        wallet
+                            .backend
+                            .effective(&config.backend)
+                            .assume_transparent_in_compact_blocks,
+                    )
+                }
+                Err(e) => {
+                    findings.push(Finding::error(format!("[wallets.{name}] server: {e:#}")));
+                    continue;
+                }
+            }
+        };
         if !wallet.transparent_enabled {
             continue;
         }
@@ -171,7 +199,7 @@ fn check_backend(config: &AppConfig, findings: &mut Vec<Finding>) {
         // populates the advertisement, so in practice the assertion knob is required. Only a
         // warning: whether a given server advertises it is a fact about the server, not the
         // config, and this check never dials.
-        if lightwalletd && !config.backend.assume_transparent_in_compact_blocks {
+        if lightwalletd && !assume_transparent {
             findings.push(Finding::warning(format!(
                 "wallet '{name}' has [pools] transparent = true against a lightwalletd upstream: \
                  the wallet refuses to run unless the server advertises that it serves \

@@ -89,6 +89,8 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
+      # Every combination the gates in Cargo.toml create is built here, so a `use` or helper
+      # that only one combination needs fails the job rather than review.
       - name: Clippy across feature combinations
         run: |
           cargo clippy --all-targets --no-default-features -- -D warnings

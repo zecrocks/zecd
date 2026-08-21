@@ -270,9 +270,11 @@ pub fn derive(config: &AppConfig, opts: DeriveOptions<'_>) -> anyhow::Result<Der
     if opts.count == 0 {
         bail!("--count must be at least 1");
     }
-    let network = config.network;
     let wallet = opts.wallet.unwrap_or(DEFAULT_WALLET);
     let entry = crate::init::resolve_wallet_entry(config, wallet);
+    // Derivation follows the wallet's own chain, so an index here is the index the daemon
+    // serving that wallet exposes.
+    let network = entry.zcash_network();
     let keys_path = entry.keys_path();
     let mut notes = Vec::new();
 
@@ -702,6 +704,9 @@ mod tests {
         let mut entry = WalletEntry {
             dir: std::path::PathBuf::from("/nonexistent"),
             keys_file: None,
+            coin: crate::coin::Coin::Zcash,
+            chain: crate::coin::Coin::Zcash.chain(crate::network::ZNetwork::Test),
+            backend: Default::default(),
             pools: ReceiverSet::single(Receiver::Orchard),
             default_receivers: ReceiverSet::single(Receiver::Orchard),
             transparent_enabled: false,

@@ -10,6 +10,7 @@ pub mod wallet_methods;
 
 use serde_json::Value;
 
+use crate::coin::Coin;
 use crate::error::RpcError;
 use crate::server::jsonrpc::RpcRequest;
 use crate::state::AppState;
@@ -157,6 +158,100 @@ const MAX_POSITIONAL_ARGS: &[(&str, usize)] = &[
     ("z_getaddressforaccount", 3),
 ];
 
+/// Which coins a method serves.
+///
+/// A method a wallet cannot serve is indistinguishable from one that does not exist, so the
+/// gate answers `-32601` - the precedent the removed label methods set.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MethodCoins {
+    /// Served by every wallet: the shared shell, the chain reads, and the Bitcoin-dialect
+    /// wallet surface.
+    All,
+    /// Served only by the listed coins.
+    Only(&'static [Coin]),
+}
+
+/// The coins that serve each dispatched method.
+///
+/// The nine `z_*` methods are Zcash-only (shielded sends, the shielding/merge sweeps, the
+/// async-operation trio, and zcashd's account address derivation); the other 42 are the
+/// Bitcoin-Core dialect zecd implements for any coin. Today every loaded wallet is Zcash, so
+/// the gate this table drives can never fire - it lands as machinery with live tests, so the
+/// PR that adds an engine changes data rather than dispatch.
+///
+/// Kept in lockstep with [`ALL_METHODS`] by the `method_coins_table_matches_all_methods` test.
+const ZCASH_ONLY: &[Coin] = &[Coin::Zcash];
+const METHOD_COINS: &[(&str, MethodCoins)] = &[
+    // Control
+    ("stop", MethodCoins::All),
+    ("uptime", MethodCoins::All),
+    ("help", MethodCoins::All),
+    ("getrpcinfo", MethodCoins::All),
+    // Network
+    ("getnetworkinfo", MethodCoins::All),
+    ("getconnectioncount", MethodCoins::All),
+    ("getpeerinfo", MethodCoins::All),
+    ("ping", MethodCoins::All),
+    // Blockchain
+    ("getblockchaininfo", MethodCoins::All),
+    ("getblockcount", MethodCoins::All),
+    ("getbestblockhash", MethodCoins::All),
+    ("getblockhash", MethodCoins::All),
+    ("getblockheader", MethodCoins::All),
+    ("waitfornewblock", MethodCoins::All),
+    ("waitforblock", MethodCoins::All),
+    ("waitforblockheight", MethodCoins::All),
+    // Utility
+    ("validateaddress", MethodCoins::All),
+    ("estimatesmartfee", MethodCoins::All),
+    ("estimatefee", MethodCoins::All),
+    ("getmempoolinfo", MethodCoins::All),
+    ("signmessage", MethodCoins::All),
+    ("verifymessage", MethodCoins::All),
+    ("settxfee", MethodCoins::All),
+    // Raw transactions
+    ("sendrawtransaction", MethodCoins::All),
+    ("getrawtransaction", MethodCoins::All),
+    // Wallet - reads
+    ("getbalance", MethodCoins::All),
+    ("getbalances", MethodCoins::All),
+    ("getunconfirmedbalance", MethodCoins::All),
+    ("getwalletinfo", MethodCoins::All),
+    ("listwallets", MethodCoins::All),
+    ("listtransactions", MethodCoins::All),
+    ("listsinceblock", MethodCoins::All),
+    ("gettransaction", MethodCoins::All),
+    ("listunspent", MethodCoins::All),
+    ("getreceivedbyaddress", MethodCoins::All),
+    ("listreceivedbyaddress", MethodCoins::All),
+    ("getaddressinfo", MethodCoins::All),
+    ("z_listtransactions", MethodCoins::Only(ZCASH_ONLY)),
+    // Wallet - writes
+    ("getnewaddress", MethodCoins::All),
+    ("sendtoaddress", MethodCoins::All),
+    ("sendmany", MethodCoins::All),
+    ("walletpassphrase", MethodCoins::All),
+    ("walletlock", MethodCoins::All),
+    // Wallet - async operations
+    ("z_sendmany", MethodCoins::Only(ZCASH_ONLY)),
+    ("z_shieldcoinbase", MethodCoins::Only(ZCASH_ONLY)),
+    ("z_mergetoaddress", MethodCoins::Only(ZCASH_ONLY)),
+    ("z_getoperationstatus", MethodCoins::Only(ZCASH_ONLY)),
+    ("z_getoperationresult", MethodCoins::Only(ZCASH_ONLY)),
+    ("z_listoperationids", MethodCoins::Only(ZCASH_ONLY)),
+    ("z_waitforoperation", MethodCoins::Only(ZCASH_ONLY)),
+    // Wallet - address derivation (zcashd-style)
+    ("z_getaddressforaccount", MethodCoins::Only(ZCASH_ONLY)),
+];
+
+/// The coins serving `method`, or `None` when the method is unknown.
+fn method_coins(method: &str) -> Option<MethodCoins> {
+    METHOD_COINS
+        .iter()
+        .find(|(m, _)| *m == method)
+        .map(|(_, c)| *c)
+}
+
 /// The positional-argument cap for `method`, or `None` when the method is unknown (the
 /// method-not-found path handles those).
 fn max_positional_args(method: &str) -> Option<usize> {
@@ -203,6 +298,19 @@ pub(crate) async fn dispatch(
     // after the safelist so a disabled method still reads as method-not-found, not a bad-arity
     // hint about a surface the operator hid.
     check_arity(req)?;
+    // Coin gate: a method its wallet's engine cannot serve reads as method-not-found, exactly
+    // like a safelisted-out one. Deliberately non-erroring on an unresolvable wallet: dispatch
+    // only knows the wallet *name* (handlers resolve the handle themselves), so failing here
+    // would reorder every coin-restricted handler's own errors - an unknown wallet must keep
+    // answering -18, and a bad parameter must keep answering its own code. Today every loaded
+    // wallet is Zcash, so this can never fire.
+    if let Some(MethodCoins::Only(coins)) = method_coins(&req.method) {
+        if let Ok(wallet) = state.registry.get_coin(wallet) {
+            if !coins.contains(&wallet.coin()) {
+                return Err(RpcError::method_not_found(&req.method));
+            }
+        }
+    }
     dispatch_zecd(state, wallet, req).await
 }
 
@@ -333,6 +441,52 @@ mod tests {
     /// The arity table must name exactly the methods in `ALL_METHODS` - no gaps (an unlisted
     /// method would silently keep accepting extra positional junk) and no strays (a typo'd key
     /// never fires). This keeps [`super::check_arity`] total over the dispatch surface.
+    #[test]
+    fn method_coins_table_matches_all_methods() {
+        let declared: BTreeSet<String> = super::ALL_METHODS.iter().map(|s| s.to_string()).collect();
+        let coins: BTreeSet<String> = super::METHOD_COINS
+            .iter()
+            .map(|(m, _)| m.to_string())
+            .collect();
+        assert_eq!(
+            coins, declared,
+            "METHOD_COINS is out of sync with ALL_METHODS"
+        );
+        assert_eq!(
+            super::METHOD_COINS.len(),
+            coins.len(),
+            "METHOD_COINS contains duplicate method names"
+        );
+    }
+
+    /// The data itself: the `z_*` surface is Zcash-only and everything else is the shared
+    /// Bitcoin-Core dialect. Keyed off the name, so a new `z_*` method that forgets its
+    /// restriction fails here rather than passing unnoticed.
+    #[test]
+    fn z_methods_are_zcash_only_and_every_other_method_is_universal() {
+        use crate::coin::Coin;
+        for (method, coins) in super::METHOD_COINS {
+            if method.starts_with("z_") {
+                assert_eq!(
+                    *coins,
+                    super::MethodCoins::Only(&[Coin::Zcash]),
+                    "{method} is a Zcash extension and must be gated to Zcash"
+                );
+            } else {
+                assert_eq!(
+                    *coins,
+                    super::MethodCoins::All,
+                    "{method} is part of the shared dialect and must not be coin-gated"
+                );
+            }
+        }
+        let zcash_only = super::METHOD_COINS
+            .iter()
+            .filter(|(_, c)| *c != super::MethodCoins::All)
+            .count();
+        assert_eq!(zcash_only, 9, "the Zcash-only surface is nine methods");
+    }
+
     #[test]
     fn arity_table_matches_all_methods() {
         let declared: BTreeSet<String> = super::ALL_METHODS.iter().map(|s| s.to_string()).collect();

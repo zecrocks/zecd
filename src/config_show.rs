@@ -204,6 +204,54 @@ pub fn render(config: &AppConfig) -> String {
         if let Some(keys_file) = &w.keys_file {
             kv(&mut s, "keys_file", path_val(keys_file));
         }
+        // Endpoint overrides are rendered only when this wallet actually sets them: an absent
+        // key means "falls back to [backend]", which is what the omission says.
+        let bo = &w.backend;
+        if let Some(server) = &bo.server {
+            match crate::backend::resolve_for_wallet(config, w) {
+                Ok(resolved) => kv_note(&mut s, "server", str_val(server), &resolved.describe()),
+                Err(e) => kv_note(
+                    &mut s,
+                    "server",
+                    str_val(server),
+                    &format!("UNRESOLVED: {e}"),
+                ),
+            }
+        }
+        if let Some(tls) = bo.tls {
+            kv(
+                &mut s,
+                "tls",
+                str_val(match tls {
+                    None => "auto",
+                    Some(true) => "yes",
+                    Some(false) => "no",
+                }),
+            );
+        }
+        if let Some(roots) = bo.tls_roots {
+            kv(
+                &mut s,
+                "tls_roots",
+                str_val(match roots {
+                    crate::backend::TlsRoots::Native => "native",
+                    crate::backend::TlsRoots::Webpki => "webpki",
+                }),
+            );
+        }
+        if let Some(skip) = bo.tls_insecure_skip_verify {
+            kv(&mut s, "tls_insecure_skip_verify", skip);
+        }
+        if let Some(ca) = &bo.tls_ca_file {
+            kv(&mut s, "tls_ca_file", path_val(ca));
+        }
+        if let Some(pins) = &bo.tls_pins {
+            let pins: Vec<String> = pins.iter().map(|p| p.to_string()).collect();
+            kv(&mut s, "tls_pinned_sha256", list_val(&pins));
+        }
+        if let Some(assume) = bo.assume_transparent_in_compact_blocks {
+            kv(&mut s, "assume_transparent_in_compact_blocks", assume);
+        }
         kv(&mut s, "pools", list_val(&w.pools.names()));
         kv(
             &mut s,
@@ -456,6 +504,53 @@ mod tests {
 
     /// A wallet entry stands on its own: every pool setting appears resolved under the wallet,
     /// so reading it never means mentally applying the global `[pools]` defaults.
+
+    #[test]
+    fn per_wallet_backend_overrides_render_and_re_resolve() {
+        // The renderer's schema contract on the per-wallet endpoint keys: what it emits must be
+        // a config `resolve` accepts, and rendering it again must reproduce it byte for byte.
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = resolve_from(
+            &format!(
+                "network = \"test\"\ndatadir = {:?}\n\
+                 [backend]\nserver = \"zebra\"\n\
+                 [wallets.default]\n\
+                 [wallets.replica]\nserver = \"https://lwd.example:9067\"\n\
+                 tls = \"yes\"\ntls_roots = \"webpki\"\n\
+                 assume_transparent_in_compact_blocks = true\n",
+                dir.path()
+            ),
+            dir.path(),
+        );
+        let out = render(&cfg);
+
+        let replica = out
+            .split("[wallets.replica]")
+            .nth(1)
+            .expect("the wallet table");
+        assert!(
+            replica.contains("server = \"https://lwd.example:9067\""),
+            "{replica}"
+        );
+        assert!(replica.contains("tls = \"yes\""), "{replica}");
+        assert!(replica.contains("tls_roots = \"webpki\""), "{replica}");
+        assert!(
+            replica.contains("assume_transparent_in_compact_blocks = true"),
+            "{replica}"
+        );
+
+        // A wallet with no overrides emits no endpoint keys - it falls back to [backend].
+        let default = out
+            .split("[wallets.default]")
+            .nth(1)
+            .and_then(|rest| rest.split("[wallets.replica]").next())
+            .expect("the default wallet table");
+        assert!(!default.contains("server ="), "{default}");
+        assert!(!default.contains("tls ="), "{default}");
+
+        assert_eq!(out, render(&resolve_from(&out, dir.path())));
+    }
+
     #[test]
     fn wallet_entries_carry_their_resolved_pool_settings() {
         let dir = tempfile::tempdir().unwrap();

@@ -12,7 +12,9 @@
 //! literal on that line, and each method name appears in exactly one wrapper.
 //!
 //! Amounts are [`crate::amount::Amount`]/[`crate::amount::SignedAmount`] - exact zatoshi
-//! values that never round-trip through `f64`. Txids and block hashes are display-order hex
+//! values that never round-trip through `f64`. Both carry base units and every coin zecd can
+//! serve uses the same 10^8 scale, so the zatoshi-flavoured accessors have coin-neutral
+//! aliases (`from_base_units`/`base_units`). Txids and block hashes are display-order hex
 //! `String`s (a `Txid` newtype is future work). Heights are `u32`.
 
 pub mod blockchain;

@@ -11,6 +11,7 @@ use zip32::DiversifierIndex;
 use zip321::{Payment, TransactionRequest};
 
 use crate::amount::{signed_zats_to_value, value_to_zats, zats_to_value};
+use crate::coin::Coin;
 use crate::config::SendPrivacy;
 use crate::error::RpcError;
 use crate::operations::{ContextInfo, OperationId};
@@ -1548,6 +1549,7 @@ fn param_engaged(v: &Value) -> bool {
 }
 
 fn build_payment(
+    coin: Coin,
     network: &crate::network::ZNetwork,
     privacy: SendPrivacy,
     addr: &str,
@@ -1555,7 +1557,7 @@ fn build_payment(
     memo_hex: Option<&str>,
     allow_zero: bool,
 ) -> Result<Payment, RpcError> {
-    let zaddr = crate::address::parse_recipient_on_network(network, addr)?;
+    let zaddr = crate::address::parse_recipient_on_network(coin, network, addr)?;
     // A recipient with no shielded receiver (a transparent-only address) forces a transparent
     // output, revealing both the amount and the recipient on-chain - so every policy short of
     // `AllowRevealedRecipients` rejects it up front. Notably `AllowRevealedAmounts` opts into
@@ -1581,9 +1583,15 @@ fn build_payment(
     // over-MAX_MONEY amounts are already "Amount out of range" in value_to_zats). zcashd's
     // `z_sendmany`, however, permits a zero-valued output - its standard memo-only-send pattern
     // (a shielded recipient, `amount: 0`, and a memo) - so that path passes `allow_zero`.
-    if !allow_zero && zats.into_u64() == 0 {
+    if !allow_zero && zats == 0 {
         return Err(RpcError::type_error("Invalid amount"));
     }
+    // The Zcash boundary: `value_to_zats` is coin-neutral base units, and this is where they
+    // become the engine's own amount type. The cap was already enforced there, so the error
+    // arm is unreachable - kept rather than unwrapped so a future change to either range can
+    // only produce the same wire error, never a panic.
+    let zats = zcash_protocol::value::Zatoshis::from_u64(zats)
+        .map_err(|_| RpcError::type_error("Amount out of range"))?;
     // Hex-encoded shielded memo, zcashd's z_sendmany convention (and error messages).
     let memo = match memo_hex {
         None => None,
@@ -1669,6 +1677,7 @@ pub(crate) async fn sendtoaddress(
     };
     let handle = state.registry.get(wallet)?.clone();
     let payment = build_payment(
+        handle.coin(),
         &handle.network,
         state.config.spend.privacy,
         addr,
@@ -1727,6 +1736,7 @@ pub(crate) async fn sendmany(
     let mut payments = Vec::new();
     for (addr, amount) in recipients {
         payments.push(build_payment(
+            handle.coin(),
             &handle.network,
             state.config.spend.privacy,
             addr,
@@ -1927,6 +1937,7 @@ pub(crate) fn z_sendmany(
         has_transparent_recipient |= crate::address::decode_on_network(&handle.network, addr)
             .is_some_and(|a| !crate::address::has_shielded_receiver(&a));
         payments.push(build_payment(
+            handle.coin(),
             &handle.network,
             privacy,
             addr,
@@ -2023,11 +2034,12 @@ pub(crate) async fn z_shieldcoinbase(
     // which is -5), matching its z_shieldcoinbase exactly.
     let toaddress = req.require_str(1, "z_shieldcoinbase requires a toaddress")?;
     let to_addr =
-        crate::address::parse_recipient_on_network(&handle.network, toaddress).map_err(|_| {
-            RpcError::invalid_parameter(format!(
-                "Invalid parameter, unknown address format: {toaddress}"
-            ))
-        })?;
+        crate::address::parse_recipient_on_network(handle.coin(), &handle.network, toaddress)
+            .map_err(|_| {
+                RpcError::invalid_parameter(format!(
+                    "Invalid parameter, unknown address format: {toaddress}"
+                ))
+            })?;
     let receives_shielded = crate::address::decode_on_network(&handle.network, toaddress)
         .is_some_and(|a| crate::address::has_shielded_receiver(&a));
     if !receives_shielded {
@@ -2304,11 +2316,12 @@ pub(crate) async fn z_mergetoaddress(
     // multi-transaction proposals everywhere.
     let toaddress = req.require_str(1, "z_mergetoaddress requires a toaddress")?;
     let to_addr =
-        crate::address::parse_recipient_on_network(&handle.network, toaddress).map_err(|_| {
-            RpcError::invalid_parameter(format!(
-                "Invalid parameter, unknown address format: {toaddress}"
-            ))
-        })?;
+        crate::address::parse_recipient_on_network(handle.coin(), &handle.network, toaddress)
+            .map_err(|_| {
+                RpcError::invalid_parameter(format!(
+                    "Invalid parameter, unknown address format: {toaddress}"
+                ))
+            })?;
     let decoded_to = crate::address::decode_on_network(&handle.network, toaddress);
     if matches!(decoded_to, Some(zcash_keys::address::Address::Tex(_))) {
         return Err(RpcError::invalid_parameter(
@@ -3216,13 +3229,22 @@ mod tests {
         let ua = "utest12r53eljnr7kev8ychw3ahzjgm6fwxm7fd8vfay7hn9uylj05x0pxxhze800h9dcgyr8hkc7kz3s2crnrhjcy2p90yfce2vl8mq667zw0";
         // Zero amounts are a -3 "Invalid amount" for the Bitcoin-Core-dialect sends (allow_zero
         // = false); positive ones build.
-        let e = build_payment(&net, revealed, ua, &json!(0), None, false).unwrap_err();
+        let e = build_payment(Coin::Zcash, &net, revealed, ua, &json!(0), None, false).unwrap_err();
         assert_eq!(e.code, crate::error::codes::RPC_TYPE_ERROR);
         assert!(e.message.contains("Invalid amount"), "{}", e.message);
-        assert!(build_payment(&net, revealed, ua, &json!(0.1), None, false).is_ok());
+        assert!(build_payment(Coin::Zcash, &net, revealed, ua, &json!(0.1), None, false).is_ok());
         // z_sendmany permits a zero-valued output (memo-only send): allow_zero = true accepts it.
-        assert!(build_payment(&net, revealed, ua, &json!(0), Some("f00f"), true).is_ok());
-        assert!(build_payment(&net, revealed, ua, &json!(0), None, true).is_ok());
+        assert!(build_payment(
+            Coin::Zcash,
+            &net,
+            revealed,
+            ua,
+            &json!(0),
+            Some("f00f"),
+            true
+        )
+        .is_ok());
+        assert!(build_payment(Coin::Zcash, &net, revealed, ua, &json!(0), None, true).is_ok());
 
         // verbose: bare txid by default, {txid, fee_reason} object when set, -3 on junk.
         assert!(!verbose_param(None).unwrap());
@@ -3268,19 +3290,37 @@ mod tests {
         let p = SendPrivacy::AllowRevealedRecipients;
         let ua = "utest12r53eljnr7kev8ychw3ahzjgm6fwxm7fd8vfay7hn9uylj05x0pxxhze800h9dcgyr8hkc7kz3s2crnrhjcy2p90yfce2vl8mq667zw0";
         // A hex memo to a shielded recipient builds.
-        assert!(build_payment(&net, p, ua, &json!(0.1), Some("f00f"), false).is_ok());
+        assert!(build_payment(Coin::Zcash, &net, p, ua, &json!(0.1), Some("f00f"), false).is_ok());
         // Bad hex and oversized memos are -8 with zcashd's messages.
-        let e = build_payment(&net, p, ua, &json!(0.1), Some("xyz"), false).unwrap_err();
+        let e =
+            build_payment(Coin::Zcash, &net, p, ua, &json!(0.1), Some("xyz"), false).unwrap_err();
         assert_eq!(e.code, crate::error::codes::RPC_INVALID_PARAMETER);
         assert!(e.message.contains("hexadecimal"), "{}", e.message);
-        let e =
-            build_payment(&net, p, ua, &json!(0.1), Some(&"ab".repeat(513)), false).unwrap_err();
+        let e = build_payment(
+            Coin::Zcash,
+            &net,
+            p,
+            ua,
+            &json!(0.1),
+            Some(&"ab".repeat(513)),
+            false,
+        )
+        .unwrap_err();
         assert!(e.message.contains("512"), "{}", e.message);
         // A memo to a transparent recipient is rejected.
         use zcash_keys::encoding::AddressCodec as _;
         let taddr =
             zcash_transparent::address::TransparentAddress::PublicKeyHash([0u8; 20]).encode(&net);
-        let e = build_payment(&net, p, &taddr, &json!(0.1), Some("f00f"), false).unwrap_err();
+        let e = build_payment(
+            Coin::Zcash,
+            &net,
+            p,
+            &taddr,
+            &json!(0.1),
+            Some("f00f"),
+            false,
+        )
+        .unwrap_err();
         assert_eq!(e.code, crate::error::codes::RPC_INVALID_PARAMETER);
         assert!(e.message.contains("transparent"), "{}", e.message);
     }
@@ -3299,10 +3339,18 @@ mod tests {
 
         // FullPrivacy: any shielded recipient passes build_payment; a transparent recipient is
         // -8 with a self-diagnosing message; the default policy allows all of them.
-        assert!(
-            build_payment(&net, SendPrivacy::FullPrivacy, ua, &json!(0.1), None, false).is_ok()
-        );
         assert!(build_payment(
+            Coin::Zcash,
+            &net,
+            SendPrivacy::FullPrivacy,
+            ua,
+            &json!(0.1),
+            None,
+            false
+        )
+        .is_ok());
+        assert!(build_payment(
+            Coin::Zcash,
             &net,
             SendPrivacy::FullPrivacy,
             sapling,
@@ -3312,6 +3360,7 @@ mod tests {
         )
         .is_ok());
         let e = build_payment(
+            Coin::Zcash,
             &net,
             SendPrivacy::FullPrivacy,
             &taddr,
@@ -3328,14 +3377,25 @@ mod tests {
         // *recipients*: shielded recipients pass, but a transparent recipient is still -8 (the
         // bug was that it collapsed onto AllowRevealedRecipients and silently paid transparent).
         let amounts = SendPrivacy::AllowRevealedAmounts;
-        assert!(build_payment(&net, amounts, ua, &json!(0.1), None, false).is_ok());
-        assert!(build_payment(&net, amounts, sapling, &json!(0.1), None, false).is_ok());
-        let e = build_payment(&net, amounts, &taddr, &json!(0.1), None, false).unwrap_err();
+        assert!(build_payment(Coin::Zcash, &net, amounts, ua, &json!(0.1), None, false).is_ok());
+        assert!(build_payment(
+            Coin::Zcash,
+            &net,
+            amounts,
+            sapling,
+            &json!(0.1),
+            None,
+            false
+        )
+        .is_ok());
+        let e = build_payment(Coin::Zcash, &net, amounts, &taddr, &json!(0.1), None, false)
+            .unwrap_err();
         assert_eq!(e.code, crate::error::codes::RPC_INVALID_PARAMETER);
         assert!(e.message.contains("AllowRevealedAmounts"), "{}", e.message);
 
         // AllowRevealedRecipients allows the transparent recipient.
         assert!(build_payment(
+            Coin::Zcash,
             &net,
             SendPrivacy::AllowRevealedRecipients,
             &taddr,
@@ -3351,6 +3411,7 @@ mod tests {
         // guard: the edge-fixes merge left `allows_transparent_recipient` without this rung, which
         // broke the regtest_transparent_t2t / _sendmany_t2t e2e.)
         assert!(build_payment(
+            Coin::Zcash,
             &net,
             SendPrivacy::AllowFullyTransparent,
             &taddr,

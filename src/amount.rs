@@ -1,16 +1,27 @@
-//! Conversion between Zcash zatoshis and the decimal ZEC amounts Bitcoin Core's RPC
-//! uses on the wire.
+//! Conversion between base units and the decimal amounts Bitcoin Core's RPC uses on the wire.
 //!
 //! Bitcoin Core serializes amounts as JSON numbers with exactly 8 decimal places
 //! (`ValueFromAmount`) and parses incoming amounts with `ParseFixedPoint` via
 //! `AmountFromValue`. Zcash uses the same 1 ZEC = 100,000,000 zatoshi scale, so the
 //! mapping is 1:1. We rely on `serde_json`'s `arbitrary_precision` feature so amounts
 //! round-trip as exact decimal literals rather than through `f64`.
+//!
+//! The module deals in `u64` base units and the constants below rather than in
+//! `zcash_protocol`'s `Zatoshis`, so the wire-format arithmetic - which is Bitcoin Core's, not
+//! Zcash's - stays testable on its own and the conversion to the wallet crates' newtype happens
+//! at the one call site that needs it.
 
 use serde_json::Value;
-use zcash_protocol::value::{Zatoshis, COIN};
 
 use crate::error::RpcError;
+
+/// Base units in one ZEC: 1 ZEC = 10^8 zatoshis.
+pub const COIN: u64 = 100_000_000;
+
+/// The supply cap in base units (21,000,000 ZEC). Bitcoin Core range-checks every parsed
+/// amount against its own cap in `AmountFromValue`, and the value matches; an amount above it
+/// cannot exist, so it is rejected at the RPC boundary rather than deeper in the wallet.
+const MAX_MONEY: u64 = 21_000_000 * COIN;
 
 /// Render an unsigned zatoshi amount as a JSON number with 8 decimal places.
 pub fn zats_to_value(zats: u64) -> Value {
@@ -34,10 +45,10 @@ pub fn signed_zats_to_value(zats: i64) -> Value {
     serde_json::from_str(&s).expect("formatted amount is valid JSON number")
 }
 
-/// Parse a Bitcoin-Core-style decimal ZEC amount into `Zatoshis`, mirroring
-/// `AmountFromValue`: accept a JSON number or string, parse with [`parse_fixed_point`],
-/// then range-check (negative or above `MAX_MONEY` → "Amount out of range").
-pub fn value_to_zats(v: &Value) -> Result<Zatoshis, RpcError> {
+/// Parse a Bitcoin-Core-style decimal amount into base units, mirroring `AmountFromValue`:
+/// accept a JSON number or string, parse with [`parse_fixed_point`], then range-check
+/// (negative or above [`MAX_MONEY`] -> "Amount out of range").
+pub fn value_to_zats(v: &Value) -> Result<u64, RpcError> {
     let literal = match v {
         // With `arbitrary_precision`, `Number`'s Display preserves the original literal.
         Value::Number(n) => n.to_string(),
@@ -47,7 +58,11 @@ pub fn value_to_zats(v: &Value) -> Result<Zatoshis, RpcError> {
     };
     let zats =
         parse_fixed_point(&literal, 8).ok_or_else(|| RpcError::type_error("Invalid amount"))?;
-    Zatoshis::from_nonnegative_i64(zats).map_err(|_| RpcError::type_error("Amount out of range"))
+    let zats = u64::try_from(zats).map_err(|_| RpcError::type_error("Amount out of range"))?;
+    if zats > MAX_MONEY {
+        return Err(RpcError::type_error("Amount out of range"));
+    }
+    Ok(zats)
 }
 
 /// An exact, unsigned zatoshi amount for the typed client (`crate::typed`). On the wire it is
@@ -62,7 +77,19 @@ impl Amount {
         Amount(zats)
     }
 
+    /// [`Amount::from_zatoshis`] under a coin-neutral name. The type carries base units, and
+    /// every coin zecd can serve uses the same 10^8 scale, so the zatoshi-flavoured spelling
+    /// is a Zcash label on a general value rather than a Zcash-only constructor.
+    pub const fn from_base_units(units: u64) -> Amount {
+        Amount(units)
+    }
+
     pub const fn zatoshis(self) -> u64 {
+        self.0
+    }
+
+    /// [`Amount::zatoshis`] under a coin-neutral name.
+    pub const fn base_units(self) -> u64 {
         self.0
     }
 }
@@ -87,7 +114,7 @@ impl<'de> serde::Deserialize<'de> for Amount {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Amount, D::Error> {
         let v = Value::deserialize(deserializer)?;
         value_to_zats(&v)
-            .map(|z| Amount(z.into_u64()))
+            .map(Amount)
             .map_err(|e| serde::de::Error::custom(e.message))
     }
 }
@@ -373,9 +400,9 @@ mod tests {
     #[test]
     fn parse_number_and_string() {
         let n: Value = serde_json::from_str("1.5").unwrap();
-        assert_eq!(value_to_zats(&n).unwrap().into_u64(), 150_000_000);
+        assert_eq!(value_to_zats(&n).unwrap(), 150_000_000);
         let s = Value::String("0.00000001".to_string());
-        assert_eq!(value_to_zats(&s).unwrap().into_u64(), 1);
+        assert_eq!(value_to_zats(&s).unwrap(), 1);
     }
 
     /// `AmountFromValue` vectors from zcashd `src/test/rpc_tests.cpp`
@@ -393,7 +420,7 @@ mod tests {
                 from_num.is_ok(),
                 "string and number forms disagree for {s}"
             );
-            from_num.ok().map(|z| z.into_u64())
+            from_num.ok()
         };
         let zat = |v: u64| Some(v);
 
@@ -567,6 +594,18 @@ mod tests {
         assert!(value_to_zats(&n).is_err());
     }
 
+    /// The local constants are coin-neutral, but they must still be numerically identical to
+    /// the Zcash ones - the whole decoupling rests on the two chains sharing this scale and cap.
+    /// Cross-checked here, in test code, so production stays free of the engine's types.
+    #[test]
+    fn local_constants_match_zcash_protocol() {
+        assert_eq!(COIN, zcash_protocol::value::COIN);
+        assert_eq!(
+            MAX_MONEY,
+            u64::try_from(zcash_protocol::value::MAX_BALANCE).unwrap()
+        );
+    }
+
     #[test]
     fn reject_over_max_money() {
         let n: Value = serde_json::from_str("21000001").unwrap(); // > 21M ZEC
@@ -578,14 +617,14 @@ mod tests {
         // Bitcoin Core's ParseFixedPoint accepts exponent form; these exercise
         // parse_fixed_point's exponent handling end to end.
         let n: Value = serde_json::from_str("1e-5").unwrap(); // 0.00001 ZEC = 1000 zats
-        assert_eq!(value_to_zats(&n).unwrap().into_u64(), 1_000);
+        assert_eq!(value_to_zats(&n).unwrap(), 1_000);
         let n: Value = serde_json::from_str("1E-8").unwrap(); // 1 zatoshi
-        assert_eq!(value_to_zats(&n).unwrap().into_u64(), 1);
+        assert_eq!(value_to_zats(&n).unwrap(), 1);
         let n: Value = serde_json::from_str("1.5e2").unwrap(); // 150 ZEC
-        assert_eq!(value_to_zats(&n).unwrap().into_u64(), 150 * COIN);
+        assert_eq!(value_to_zats(&n).unwrap(), 150 * COIN);
         // As a string, too.
         let s = Value::String("2e-3".to_string()); // 0.002 ZEC = 200_000 zats
-        assert_eq!(value_to_zats(&s).unwrap().into_u64(), 200_000);
+        assert_eq!(value_to_zats(&s).unwrap(), 200_000);
     }
 
     #[test]

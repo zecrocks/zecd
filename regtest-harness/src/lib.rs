@@ -1519,6 +1519,10 @@ pub struct ZecdConfig {
     /// (`zecd init --encrypt`, passphrase supplied via `ZECD_WALLET_PASSPHRASE`): it starts
     /// locked and needs `walletpassphrase` before sending. `None` = unencrypted (identity model).
     pub encrypt_passphrase: Option<String>,
+    /// Per-wallet `[wallets.<name>] server` overrides, for stacks where one daemon serves
+    /// wallets on different upstreams (a zebra-backed wallet beside a lightwalletd-backed one).
+    /// A wallet not named here falls back to the global `[backend] server`.
+    pub wallet_servers: Vec<(String, String)>,
 }
 
 impl ZecdConfig {
@@ -1549,6 +1553,7 @@ impl ZecdConfig {
             transparent_allow_beyond_recovery_window: None,
             transparent_gap_warn_threshold: None,
             encrypt_passphrase: None,
+            wallet_servers: Vec::new(),
         }
     }
 
@@ -1950,19 +1955,44 @@ impl Zecd {
     /// The server-side wait is capped per call so a hung daemon still surfaces as this
     /// function's own timeout rather than an indefinite block.
     pub async fn wait_until_synced(&self, target: u64, timeout: Duration) -> Result<()> {
+        self.wait_until_synced_inner(None, target, timeout).await
+    }
+
+    /// [`Zecd::wait_until_synced`] for a named wallet (`/wallet/<name>`). Each wallet scans on
+    /// its own actor - and, when it overrides `[backend] server`, over its own upstream - so a
+    /// multi-wallet stack has to wait for each one it is about to read.
+    pub async fn wait_until_wallet_synced(
+        &self,
+        wallet: &str,
+        target: u64,
+        timeout: Duration,
+    ) -> Result<()> {
+        self.wait_until_synced_inner(Some(wallet), target, timeout)
+            .await
+    }
+
+    async fn wait_until_synced_inner(
+        &self,
+        wallet: Option<&str>,
+        target: u64,
+        timeout: Duration,
+    ) -> Result<()> {
         const MAX_SERVER_WAIT: Duration = Duration::from_secs(5);
         let deadline = Instant::now() + timeout;
         loop {
             let remaining = deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
-                bail!("zecd did not sync to height {target} within {timeout:?}");
+                let which = wallet.unwrap_or("default");
+                bail!("zecd wallet '{which}' did not sync to height {target} within {timeout:?}");
             }
             // Never 0: that is `waitforblockheight`'s "wait indefinitely".
             let wait_ms = remaining.min(MAX_SERVER_WAIT).as_millis().max(1) as u64;
-            match self
-                .call("waitforblockheight", json!([target, wait_ms]))
-                .await
-            {
+            let params = json!([target, wait_ms]);
+            let call = match wallet {
+                Some(name) => self.call_wallet(name, "waitforblockheight", params).await,
+                None => self.call("waitforblockheight", params).await,
+            };
+            match call {
                 Ok(v) => {
                     if v.get("height").and_then(|h| h.as_u64()).unwrap_or(0) >= target {
                         return Ok(());
@@ -2455,9 +2485,16 @@ fn write_zecd_toml(datadir: &Path, cfg: &ZecdConfig) -> Result<()> {
         }
     };
     // The default wallet plus any extra `[wallets.<name>]` entries (multiwallet tests).
+    // A per-wallet `server` override, when this stack gives the wallet its own upstream.
+    let wallet_server =
+        |name: &str| match cfg.wallet_servers.iter().find(|(wallet, _)| wallet == name) {
+            Some((_, server)) => format!("server = \"{server}\"\n"),
+            None => String::new(),
+        };
     let mut wallets = format!(
-        "[wallets.default]\ndir = \"{}/default\"\n",
-        datadir.display()
+        "[wallets.default]\ndir = \"{}/default\"\n{}",
+        datadir.display(),
+        wallet_server("default")
     );
     for name in cfg
         .extra_wallets
@@ -2465,8 +2502,9 @@ fn write_zecd_toml(datadir: &Path, cfg: &ZecdConfig) -> Result<()> {
         .chain(&cfg.extra_watch_only_wallets)
     {
         wallets.push_str(&format!(
-            "\n[wallets.{name}]\ndir = \"{}/{name}\"\n",
-            datadir.display()
+            "\n[wallets.{name}]\ndir = \"{}/{name}\"\n{}",
+            datadir.display(),
+            wallet_server(name)
         ));
     }
     // Optional [pools] section (multi-pool / Sapling e2e, and/or transparent receiving); omitted

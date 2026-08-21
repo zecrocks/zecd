@@ -227,7 +227,7 @@ mod tests {
     use super::ensure_single_spending_wallet;
     #[cfg(feature = "server")]
     use super::rpcpassword_on_cli;
-
+    /// Fixture helper: name/watch-only pairs in the shape the guard consumes.
     fn wallets(entries: &[(&str, bool)]) -> Vec<(String, bool)> {
         entries
             .iter()

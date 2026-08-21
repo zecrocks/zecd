@@ -29,7 +29,7 @@ use crate::state::AppState;
 use crate::wallet::actor::{self, ActorConfig};
 use crate::wallet::binding;
 use crate::wallet::store::WalletStore;
-use crate::wallet::WalletRegistry;
+use crate::wallet::{CoinWallet, WalletRegistry};
 
 /// Builder for an embedded zecd node. `new(config).start().await` is the normal entry point;
 /// the two-phase `prepare()` / [`PreparedNode::start`] split exists so the binary can run its
@@ -153,7 +153,7 @@ impl PreparedNode {
                 );
                 continue;
             }
-            let server = match backend::resolve_configured(&config) {
+            let server = match backend::resolve_for_wallet(&config, entry) {
                 Ok(server) => server,
                 Err(e) => {
                     stop_actors(&shutdown_tx, actor_tasks).await;
@@ -194,7 +194,10 @@ impl PreparedNode {
             };
             let actor_cfg = ActorConfig {
                 name: name.clone(),
-                network: config.network,
+                // The wallet's own chain rather than the daemon-global network: the actor is
+                // configured entirely from its entry, so nothing below this point reads
+                // `config` again.
+                network: entry.zcash_network(),
                 wallet_dir: entry.dir.clone(),
                 keys_path: keys_path.clone(),
                 server,
@@ -230,7 +233,7 @@ impl PreparedNode {
                         if watch_only { " (watch-only)" } else { "" }
                     );
                     loaded.push((name.clone(), watch_only));
-                    registry.insert(handle);
+                    registry.insert(CoinWallet::Zcash(handle));
                     actor_tasks.push((name.clone(), task));
                 }
                 // A failed account-to-keys binding check is evidence the wallet database (or

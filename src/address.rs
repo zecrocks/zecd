@@ -11,13 +11,24 @@ use zcash_protocol::consensus::Parameters;
 use zcash_protocol::PoolType;
 use zcash_transparent::address::TransparentAddress;
 
+use crate::coin::Coin;
 use crate::error::RpcError;
 
 /// Parse an address string into a network-agnostic [`ZcashAddress`] (for use as a payment
 /// recipient). Returns a Bitcoin-Core `RPC_INVALID_ADDRESS_OR_KEY` (-5) on failure.
-pub fn parse_recipient(s: &str) -> Result<ZcashAddress, RpcError> {
-    ZcashAddress::try_from_encoded(s)
-        .map_err(|_| RpcError::invalid_address_or_key(format!("Invalid Zcash address: {s}")))
+///
+/// `coin` selects the codec and names the currency in the error, so the message is a property
+/// of the wallet being paid rather than of this function. Every RPC-boundary caller passes the
+/// target wallet's own value rather than hard-coding it.
+pub fn parse_recipient(coin: Coin, s: &str) -> Result<ZcashAddress, RpcError> {
+    match coin {
+        Coin::Zcash => ZcashAddress::try_from_encoded(s).map_err(|_| {
+            RpcError::invalid_address_or_key(format!(
+                "Invalid {} address: {s}",
+                coin.display_name()
+            ))
+        }),
+    }
 }
 
 /// Decode an address and verify it belongs to `params`' network. Returns `None` if the
@@ -155,10 +166,11 @@ pub fn validate<P: Parameters>(params: &P, s: &str) -> Validation {
 /// Verify a recipient parses and is on the configured network, returning the
 /// [`ZcashAddress`] for inclusion in a payment.
 pub fn parse_recipient_on_network<P: Parameters>(
+    coin: Coin,
     params: &P,
     s: &str,
 ) -> Result<ZcashAddress, RpcError> {
-    let zaddr = parse_recipient(s)?;
+    let zaddr = parse_recipient(coin, s)?;
     if decode_on_network(params, s).is_none() {
         return Err(RpcError::invalid_address_or_key(format!(
             "Address is not valid for the configured network: {s}"
@@ -180,6 +192,14 @@ mod tests {
     const TESTNET_P2SH: &str = "t3b1jtLvxCstdo1pJs9Tjzc5dmWyvGQSZj8"; // wrong network: this is mainnet-encoded
     const MAINNET_SAPLING: &str =
         "zs1z7rejlpsa98s2rrrfkwmaxu53e4ue0ulcrw0h4x5g8jl04tak0d3mm47vdtahatqrlkngh9slya";
+
+    #[test]
+    fn the_invalid_address_error_names_the_coin() {
+        // The message is templated on the coin rather than hardcoded, and for Zcash it renders
+        // byte-identically to the string it replaced - the wire contract is unchanged.
+        let err = parse_recipient(Coin::Zcash, "not-an-address").unwrap_err();
+        assert_eq!(err.message, "Invalid Zcash address: not-an-address");
+    }
 
     #[test]
     fn valid_p2pkh_mainnet_has_p2pkh_script() {

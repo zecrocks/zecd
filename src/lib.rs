@@ -44,6 +44,7 @@ pub mod amount;
 pub mod backend;
 pub mod backoff;
 pub mod chain;
+pub mod coin;
 pub mod config;
 pub mod config_check;
 pub mod config_show;

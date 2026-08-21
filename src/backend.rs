@@ -648,6 +648,41 @@ pub fn resolve_configured(config: &crate::config::AppConfig) -> anyhow::Result<S
     Ok(server)
 }
 
+/// Resolve the upstream endpoint for one wallet: its own `[wallets.<name>]` `server`/TLS
+/// overrides, falling back field-by-field to the global `[backend]`. The `[zebra]`
+/// credentials and the cleartext-locality policy stay global - they are properties of the
+/// deployment, not of one endpoint.
+///
+/// This is what lets a single daemon serve, say, a zebra-backed spending wallet alongside a
+/// lightwalletd-backed watch-only replica. Every per-endpoint capability check (the
+/// lightwalletd transparent-capability probe, the cleartext gate) is already per-actor, so it
+/// follows the wallet's own server without further plumbing.
+pub fn resolve_for_wallet(
+    config: &crate::config::AppConfig,
+    entry: &crate::config::WalletEntry,
+) -> anyhow::Result<Server> {
+    let backend = entry.backend.effective(&config.backend);
+    // The token grammar is resolved from the wallet's own entry, so the upstream a wallet
+    // dials is decided here and nothing above this function reads the global config again.
+    let mut server = match entry.coin {
+        crate::coin::Coin::Zcash => resolve(&backend.server, entry.zcash_network())?,
+    };
+    apply_zebra_auth(&mut server, &config.zebra.auth());
+    apply_cleartext_policy(
+        &mut server,
+        CleartextPolicy {
+            rfc1918_is_local: backend.rfc1918_is_local,
+            allow_remote_cleartext: backend.allow_remote_cleartext,
+        },
+    );
+    apply_tls(&mut server, backend.tls_options());
+    apply_transparent_capability_override(
+        &mut server,
+        backend.assume_transparent_in_compact_blocks,
+    );
+    Ok(server)
+}
+
 /// Attach zebrad RPC credentials (the `[zebra]` config section) to the resolved endpoint.
 /// A no-op for a lightwalletd endpoint: lightwalletd has no client auth, and the zebra
 /// credentials must never ride to a foreign host.
