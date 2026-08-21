@@ -2,7 +2,10 @@ name: Release
 
 # Tag-driven release tier: pushing a `v*` tag builds the release artifacts for both Linux
 # targets and attaches them to a *draft* GitHub release (a human reviews and publishes),
-# and pushes Docker images to GHCR tagged with the semver version.
+# pushes Docker images to GHCR tagged with the semver version, and publishes the crate to
+# crates.io. Note the asymmetry: the GitHub release waits for a human, but the GHCR images and
+# the crates.io version go out on the tag push and cannot be recalled (only overwritten and
+# yanked respectively), so the tag is the point of no return, not the publish button.
 #
 # Binaries are extracted from the `export` stage of the project Dockerfiles rather than a
 # fresh `cargo build`, so the published binaries inherit the exact *reproducible* build
@@ -162,6 +165,57 @@ jobs:
             dist/zecd-*.tar.gz
             dist/zecd_*.deb
             dist/SHA256SUMS
+
+  # Publish the crate to crates.io. Tag pushes only: a manual dispatch is a packaging dry-run
+  # and must never upload, since a crates.io version can be yanked but never deleted or
+  # replaced. Ordered after `release` so a packaging or artifact failure surfaces first, while
+  # everything upstream of it is still reversible. Release candidates are published too;
+  # `cargo install` and a caret requirement both skip a prerelease unless asked for by version.
+  crates-io:
+    needs: [setup, release]
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install protobuf compiler
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      # The tag names the version everywhere else in this workflow, so a manifest that
+      # disagrees would publish under a number nothing else refers to.
+      - name: Check the manifest version matches the tag
+        run: |
+          MANIFEST=$(cargo metadata --no-deps --format-version 1 \
+            | jq -r '.packages[] | select(.name == "zecd") | .version')
+          echo "manifest=${MANIFEST} tag=${{ needs.setup.outputs.version }}"
+          if [ "${MANIFEST}" != "${{ needs.setup.outputs.version }}" ]; then
+            echo "::error::Cargo.toml says ${MANIFEST}, the tag says ${{ needs.setup.outputs.version }}"
+            exit 1
+          fi
+
+      # A missing token FAILS the job rather than skipping quietly. Publishing was a manual
+      # step before this job existed, and it was simply forgotten for two releases while every
+      # other artifact shipped normally; a silent skip here would reproduce that exactly.
+      # Re-running the workflow on an already-published version is a no-op, not an error.
+      - name: Publish to crates.io
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+          VERSION: ${{ needs.setup.outputs.version }}
+        run: |
+          if [ -z "${CARGO_REGISTRY_TOKEN}" ]; then
+            echo "::error::CARGO_REGISTRY_TOKEN is not set, so ${VERSION} cannot be published"
+            exit 1
+          fi
+          if curl -sf -H 'User-Agent: zecd-release-workflow' https://index.crates.io/ze/cd/zecd \
+             | jq -e --arg v "${VERSION}" 'select(.vers == $v)' > /dev/null; then
+            echo "zecd ${VERSION} is already on crates.io; nothing to do"
+            exit 0
+          fi
+          cargo publish --locked
 
   # amd64: the reproducible StageX image, pushed *by digest* (no tags of its own). The
   # `manifest` job stitches amd64 + arm64 into one multi-arch tag, so consumers pull a single
