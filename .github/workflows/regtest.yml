@@ -70,6 +70,12 @@ on:
       # Only the Python harness scripts (conformance.py + the smoke scripts) feed the
       # regtest run; packaging/shell scripts under scripts/ don't, so scope to *.py.
       - "scripts/*.py"
+      # This workflow runs `tests/embedded_regtest.rs` itself (the embedded-library e2e step
+      # below), so a change to it must trigger this workflow - otherwise the one job that
+      # executes that file never runs on the PR editing it, and it merges having never run.
+      # Scoped to the file rather than `tests/**` because the rest of `tests/` is offline and
+      # has no business starting a node; add any other file this workflow runs.
+      - "tests/embedded_regtest.rs"
       - ".github/workflows/regtest.yml"
   pull_request:
     paths:
@@ -78,6 +84,7 @@ on:
       - "Cargo.toml"
       - "Cargo.lock"
       - "scripts/*.py"
+      - "tests/embedded_regtest.rs"
       - ".github/workflows/regtest.yml"
 
 # The pinned node images used by PR/push runs; the schedule runs each project's `latest` instead,
