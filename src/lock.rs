@@ -87,21 +87,43 @@ pub fn lock_datadir(datadir: &Path) -> anyhow::Result<fmutex::Guard<'static>> {
 }
 
 /// Best-effort local hostname for the lockfile diagnostic stamp; `"unknown"` if it can't be read.
+///
+/// Split per platform because `libc` declares `gethostname` only on Unix - calling it ungated
+/// fails to *compile* for a Windows target rather than failing at runtime. Nothing in zecd's
+/// supported deployments is non-Unix, but this crate is consumable as a library, and a consumer
+/// building for Windows should get an error about a feature they cannot use, not a build break
+/// in a diagnostic breadcrumb. The stamp is advisory either way (see the caller): it identifies
+/// the host that holds the datadir, and it enforces nothing.
 fn hostname() -> String {
-    let mut buf = [0u8; 256];
-    // SAFETY: `gethostname` writes at most `buf.len()` bytes into `buf` and NUL-terminates when
-    // there is room. We pass the real buffer length and read back only up to the first NUL.
-    let rc = unsafe { libc::gethostname(buf.as_mut_ptr() as *mut libc::c_char, buf.len()) };
-    if rc != 0 {
-        return "unknown".to_string();
-    }
-    let end = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
-    let name = String::from_utf8_lossy(&buf[..end]).into_owned();
+    let name = hostname_raw();
     if name.is_empty() {
         "unknown".to_string()
     } else {
         name
     }
+}
+
+#[cfg(unix)]
+fn hostname_raw() -> String {
+    let mut buf = [0u8; 256];
+    // SAFETY: `gethostname` writes at most `buf.len()` bytes into `buf` and NUL-terminates when
+    // there is room. We pass the real buffer length and read back only up to the first NUL.
+    let rc = unsafe { libc::gethostname(buf.as_mut_ptr() as *mut libc::c_char, buf.len()) };
+    if rc != 0 {
+        return String::new();
+    }
+    let end = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
+    String::from_utf8_lossy(&buf[..end]).into_owned()
+}
+
+/// Non-Unix fallback: the environment's machine name (`COMPUTERNAME` on Windows), which needs no
+/// platform API. An absent variable yields the empty string, which the caller renders as
+/// `"unknown"` - the same outcome a failed `gethostname` produces.
+#[cfg(not(unix))]
+fn hostname_raw() -> String {
+    std::env::var("COMPUTERNAME")
+        .or_else(|_| std::env::var("HOSTNAME"))
+        .unwrap_or_default()
 }
 
 #[cfg(test)]
