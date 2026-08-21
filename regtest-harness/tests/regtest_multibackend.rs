@@ -75,8 +75,8 @@ async fn regtest_multibackend_wallets_share_one_daemon() {
         .expect("listwallets");
     assert_eq!(wallets, json!(["default", "replica"]), "{wallets}");
 
-    // 3. Fund the shared account and confirm it. The replica watches the same keys, so the
-    //    payment must land on both sides.
+    // 3. Fund the shared account and confirm it past the untrusted depth. The replica watches
+    //    the same keys, so the payment must land on both sides.
     let addr = zecd
         .call("getnewaddress", json!([]))
         .await
@@ -88,8 +88,12 @@ async fn regtest_multibackend_wallets_share_one_daemon() {
         .send_many(&[(addr, FUND_ZATOSHIS)])
         .await
         .expect("fund the wallet under test");
+    // `getbalance` applies the default confirmations policy, under which an externally
+    // received (untrusted) note needs 10 confirmations before it counts, and the funder pays
+    // this wallet's own external address. Mine past that depth, plus a couple for tip skew, as
+    // every other funded binary here does; 2 blocks leaves both wallets correctly reporting 0.
     zebrad
-        .generate_blocks(2)
+        .generate_blocks(12)
         .await
         .expect("confirm the funding");
 
