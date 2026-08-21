@@ -5,6 +5,28 @@ All notable changes to zecd are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com), and this
 project adheres to [Semantic Versioning](https://semver.org).
 
+## [0.7.0-rc2] - 2026-08-21
+
+Two operator-visible changes on top of `0.7.0-rc1`: wallet data moves into a
+per-coin subdirectory, migrating itself on first start, and each wallet can now
+point at its own chain upstream. The rest is the embedding surface, which is
+what this line is a candidate for.
+
+### Added
+- **Per-wallet backends.** `[backend]` was daemon-global, so every wallet in a process dialled the same upstream. Each `[wallets.<name>]` section can now override the endpoint keys (`server`, the TLS settings, `assume_transparent_in_compact_blocks`), falling back field by field to the global section, so a wallet overriding only `server` keeps every global TLS setting. One daemon can serve a zebra-backed spending wallet beside a lightwalletd-backed watch-only replica of the same seed. Deployment-wide settings stay global: timeouts, reconnect backoff, the cleartext-locality rules and the `[zebra]` credentials. Existing configurations resolve exactly as before.
+- `getwalletinfo` reports `pending_enhancements` and a top-level `enhanced_through` height. Together they separate "scanned to the tip" from "serving complete history": a scanned but un-enhanced output still has a null memo, and the backlog count was previously only on the health server, which a library consumer does not run. `gettransaction.details` entries now carry `pool`, so `(txid, pool, vout)` identifies an output there as it already did on history entries.
+- `[rpc] allow_duplicate_shielded_recipients`, off by default. zcashd refuses any repeated recipient in one `z_sendmany`; this permits a repeated *shielded* address, for callers deliberately paying one address from several outputs in a single transaction. Repeated transparent recipients stay refused.
+- For embedders: a memo-native `Node::send`, `zip321` and `TxId` re-exported so requests are built against the versions zecd links, and the query and status types marked `#[non_exhaustive]`, which the crate root already assumed.
+
+### Changed
+- **Wallet data is nested as `<wallet>/<coin>/<engine>`.** `data.sqlite`, `blockmeta.sqlite` and `blocks/` move two levels down, to `<dir>/zec/lrz/`; `keys.toml` stays at the wallet root, because the seed is the one thing no chain can rebuild. Existing wallets migrate automatically on first start, under the datadir lock, before anything opens a wallet, and also at `init` and `rescan`. Artifacts are renamed rather than copied, so no free space is needed and nothing is deleted, the `-wal` sidecars travel with their databases, and an interrupted run resumes. A failure is fatal by design rather than a silent rebuild of an empty database. No configuration changes, including for a wallet with an explicit `dir`. `zecd config check` reports a pending move as a warning and the both-places refusal as an error.
+- Releases are published to crates.io by the release workflow rather than by hand. 0.6.2 and 0.6.3 were absent from the registry until this cycle; both are now published, along with 0.7.0-rc1.
+
+### Fixed
+- **A memo whose bytes are not valid UTF-8 no longer disappears.** A memo declared as text with a non-UTF-8 body came back with no `memo`, no `memoStr` and no error, which is silent loss indistinguishable from an output carrying no memo. The hex is now always emitted from the stored bytes and only `memoStr` depends on parsing. An absent `memo` field again means "no memo" rather than "unparseable".
+- **Paging through history could repeat or skip a transaction.** Results were ordered by height alone, which is not injective, so a `LIMIT`/`OFFSET` boundary landing inside a same-height tie was resolved arbitrarily. The order is now height, txid, pool and output index, which is stable across calls.
+- The crate compiles for Windows again. `lock::hostname` called a Unix-only libc function ungated, so a library consumer building for Windows failed on code it never runs. CI now cross-compiles for that target on every run.
+
 ## [0.7.0-rc1] - 2026-08-20
 
 Three things a 0.6.3 wallet could not do: sweep its own fragmented balance back
@@ -457,6 +479,7 @@ Zcash, backed entirely by librustzcash and running as a light client.
 ### Security
 - Pre-release audit hardening; refuse to start on mainnet with the placeholder RPC password; enforce a 12-character passphrase minimum.
 
+[0.7.0-rc2]: https://github.com/zecrocks/zecd/compare/v0.7.0-rc1...v0.7.0-rc2
 [0.7.0-rc1]: https://github.com/zecrocks/zecd/compare/v0.6.3...v0.7.0-rc1
 [0.6.3]: https://github.com/zecrocks/zecd/compare/v0.6.2...v0.6.3
 [0.6.2]: https://github.com/zecrocks/zecd/compare/v0.6.1...v0.6.2
