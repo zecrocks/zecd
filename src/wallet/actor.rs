@@ -39,6 +39,7 @@ use zcash_client_backend::wallet::{
 use zcash_client_sqlite::error::SqliteClientError;
 use zcash_client_sqlite::{AccountUuid, FsBlockDb};
 use zcash_keys::address::Address;
+use zcash_keys::keys::UnifiedFullViewingKey;
 use zcash_primitives::transaction::builder::{BuildConfig, Builder, BundlePadding};
 use zcash_primitives::transaction::components::orchard::bundle_version_for_branch;
 use zcash_primitives::transaction::fees::zip317::FeeRule as Zip317FeeRule;
@@ -376,6 +377,42 @@ const ENHANCE_BATCH: usize = 16;
 /// The heartbeat makes forward progress visible in the log regardless of how the count moves.
 const ENHANCE_LOG_INTERVAL: Duration = Duration::from_secs(30);
 
+/// The largest pending enhancement backlog for which [`SyncStatus::enhanced_through`] is
+/// computed exactly. Resolving an `Enhancement`/`GetStatus` request to a height is one point
+/// query, and a post-restore drain holds tens of thousands of requests, so past this bound the
+/// watermark reports "nothing known to be enhanced" instead of running a five-figure query
+/// count on every status update. A consumer waiting on a backlog that size is waiting for it to
+/// drain regardless.
+const ENHANCED_THROUGH_MAX_PROBE: usize = 2048;
+
+/// What rebuilds a wallet's account on the bootstrap path (an empty data directory beside a
+/// populated `keys.toml`). Both sources are recorded in `keys.toml` itself and neither is
+/// recoverable from anywhere else on disk, which is why the bootstrap decision is made once at
+/// spawn and carried, rather than re-read per attempt.
+enum BootstrapKey {
+    /// A spending wallet: `create_account` from the decrypted seed. Waits for the seed to be
+    /// available (immediately for an identity/auto-unlock wallet, at the first
+    /// `walletpassphrase` for an encrypted one).
+    Seed,
+    /// A watch-only wallet: `import_account_ufvk` from the key pinned in `keys.toml`. Needs no
+    /// secret, so it runs as soon as the upstream can serve the birthday tree state.
+    Ufvk(Box<UnifiedFullViewingKey>),
+}
+
+/// The enhancement watermark: the height through which every transaction has had its full data
+/// fetched, given the scanned frontier and the lowest height any pending request still refers to.
+///
+/// Nothing above `fully_scanned` has been scanned at all, so the watermark can never exceed it.
+/// A pending request at height `h` means `h` itself is not yet complete, so the watermark stops
+/// at `h - 1`. An empty backlog (`lowest_pending` of `None`) means the whole scanned range is
+/// enhanced. Pure so the boundary cases are unit-testable without an actor.
+fn enhanced_through(fully_scanned: u32, lowest_pending: Option<u32>) -> u32 {
+    match lowest_pending {
+        Some(h) => fully_scanned.min(h.saturating_sub(1)),
+        None => fully_scanned,
+    }
+}
+
 /// Whether a [`TransactionDataRequest`] is one zecd can actually service (and therefore one that
 /// counts toward the enhancement backlog). All three variants drain: `GetStatus`/`Enhancement` via
 /// `fetch_full_tx`, and `TransactionsInvolvingAddress` via the transparent address-index query
@@ -703,7 +740,7 @@ struct WalletActor {
     account_index: Option<zip32::AccountId>,
     /// When `Some`, the account must be (re)created from `keys.toml` at this birthday height once
     /// the seed is available and an upstream is connected. `None` once an account exists.
-    pending_bootstrap: Option<BlockHeight>,
+    pending_bootstrap: Option<(BlockHeight, BootstrapKey)>,
     db_data: WriteDb,
     db_cache: FsBlockDb,
     client: Option<AnySource>,
@@ -787,6 +824,11 @@ struct WalletActor {
     /// upstream connection each time (280 attempts over ten minutes, observed in CI), which looks
     /// like a flaky upstream rather than a wallet that needs rebuilding.
     sync_halted: bool,
+    /// Set by [`WalletCommand::SyncNow`]: run a sync pass on the next loop iteration instead of
+    /// waiting out `sync_interval`. Consumed (and cleared) at the top of the loop. A plain flag
+    /// rather than a wake channel because delivering the command already wakes the idle
+    /// `select!` - all this adds is "and treat the next iteration as having work to do".
+    force_sync: bool,
     /// Serviceable transaction-data requests already attempted in the current enhancement drain.
     /// Mirrors zcash-devtool/zkv's per-pass `satisfied` set, but carried across `enhance_step`
     /// batches so a request the upstream can't satisfy (left in the DB after servicing) is
@@ -891,16 +933,41 @@ async fn spawn_inner(
         match try_select_account(&db_data)? {
             Some((id, index, wo)) => (Some(id), index, wo, None),
             None => {
-                if !st.has_seed() {
-                    // Watch-only wallet (no seed, and the UFVK isn't cached in keys.toml):
-                    // nothing on disk can rebuild a viewable account.
+                // What can rebuild the account from `keys.toml` alone: the seed for a spending
+                // wallet, or the pinned UFVK for a watch-only one. The pin is the same key
+                // `init --ufvk` imported and the same one every startup verifies the account
+                // against, and the birthday sits beside it, so a view-only rebuild needs
+                // nothing the file does not already hold. Only a `keys.toml` written before the
+                // pin existed (and never backfilled by a daemon start) is genuinely
+                // unrebuildable.
+                let bootstrap_key = if st.has_seed() {
+                    Some(BootstrapKey::Seed)
+                } else {
+                    match st.pinned_ufvk() {
+                        Some(pin) => Some(BootstrapKey::Ufvk(Box::new(
+                            UnifiedFullViewingKey::decode(&cfg.network, pin).map_err(|e| {
+                                anyhow!(
+                                    "wallet '{}' has an empty data directory and the UFVK \
+                                     pinned in keys.toml does not decode on {}: {e}. Recreate \
+                                     it with `zecd init --ufvk`.",
+                                    cfg.name,
+                                    cfg.network.name()
+                                )
+                            })?,
+                        ))),
+                        None => None,
+                    }
+                };
+                let Some(bootstrap_key) = bootstrap_key else {
+                    // No seed and no pin: nothing on disk can rebuild a viewable account.
                     return Err(anyhow!(
-                        "wallet '{}' has an empty data directory and no spending seed in \
-                         keys.toml (watch-only): it cannot be rebuilt. Recreate it with \
+                        "wallet '{}' has an empty data directory, and keys.toml holds neither a \
+                         spending seed nor a pinned viewing key (a watch-only keys.toml written \
+                         before the pin existed): it cannot be rebuilt. Recreate it with \
                          `zecd init --ufvk`.",
                         cfg.name
                     ));
-                }
+                };
                 if !cfg.bootstrap {
                     return Err(anyhow!(
                         "wallet '{}' has no account in {}; run `zecd init`, or enable \
@@ -909,18 +976,26 @@ async fn spawn_inner(
                         open::data_db_path(&cfg.engine_dir).display()
                     ));
                 }
+                let watch_only = matches!(bootstrap_key, BootstrapKey::Ufvk(_));
                 info!(
-                    "empty data directory with keys.toml present: rebuilding the account \
-                     from keys.toml (birthday {}) once the seed is available{}",
-                    u32::from(st.birthday),
-                    if encrypted {
-                        " (call walletpassphrase to unlock)"
+                    "empty data directory with keys.toml present: rebuilding the {} account \
+                     from keys.toml (birthday {}){}",
+                    if watch_only {
+                        "watch-only (pinned UFVK)"
                     } else {
-                        ""
+                        "spending (seed)"
+                    },
+                    u32::from(st.birthday),
+                    match (watch_only, encrypted) {
+                        // A view-only rebuild needs no secret, so it proceeds as soon as the
+                        // upstream is reachable.
+                        (true, _) => "",
+                        (false, true) =>
+                            " once the seed is available (call walletpassphrase to unlock)",
+                        (false, false) => " once the seed is available",
                     }
                 );
-                // A seed wallet is never watch-only; the rebuilt account is a spending account.
-                (None, None, false, Some(st.birthday))
+                (None, None, watch_only, Some((st.birthday, bootstrap_key)))
             }
         };
 
@@ -1133,6 +1208,7 @@ async fn spawn_inner(
         last_sync_error: None,
         sync_error_streak: 0,
         sync_halted: false,
+        force_sync: false,
         enhance_satisfied: std::collections::BTreeSet::new(),
         enhance_progress: None,
         shutdown: cfg.shutdown,
@@ -1864,6 +1940,12 @@ impl WalletActor {
             // iteration (between sync batches) so the seed doesn't linger long past expiry; the
             // `select!` branch below handles the idle case, and `do_send` has a hard backstop.
             self.relock_if_expired();
+            // An explicit `waitforsync` nudge counts as work to do, so the pass runs now rather
+            // than after up to a full `sync_interval` of idling. Consumed here so one nudge
+            // buys exactly one pass.
+            if std::mem::take(&mut self.force_sync) {
+                more_work = true;
+            }
             // A halted wallet serves commands and reads but never re-attempts the scan: the
             // failure that halted it cannot succeed on retry (see `sync_halted`). Clearing
             // `more_work` every pass keeps the loop parked in the `select!` below rather than
@@ -2318,23 +2400,80 @@ impl WalletActor {
         }
     }
 
-    /// Count the serviceable transaction-data requests still pending in this enhancement drain -
-    /// the "enhancement backlog" surfaced on `SyncStatus.pending_enhancements`. This is the work
-    /// that remains *after* the block scan reaches the tip: compact blocks carry no memos, so each
-    /// pending request is one full-transaction fetch + decrypt/store away from being served.
-    /// Requests already attempted this drain (`enhance_satisfied`) and unsupported ones
-    /// ([`is_serviceable_request`]) are excluded, so a clean drain converges to zero. A DB read
-    /// error reports zero (best-effort; the count is observability, not a correctness gate).
-    fn count_pending_enhancements(&self) -> u64 {
-        match self.db_data.transaction_data_requests() {
-            Ok(reqs) => reqs
-                .iter()
-                .filter(|r| is_serviceable_request(r) && !self.enhance_satisfied.contains(r))
-                .count() as u64,
+    /// The enhancement backlog as `(count, lowest referenced height)`.
+    ///
+    /// The count is the serviceable transaction-data requests still pending in this drain - the
+    /// backlog surfaced on `SyncStatus.pending_enhancements`. This is the work that remains
+    /// *after* the block scan reaches the tip: compact blocks carry no memos, so each pending
+    /// request is one full-transaction fetch + decrypt/store away from being served. Requests
+    /// already attempted this drain (`enhance_satisfied`) and unsupported ones
+    /// ([`is_serviceable_request`]) are excluded, so a clean drain converges to zero.
+    ///
+    /// The second element is what [`SyncStatus::enhanced_through`] is derived from: the lowest
+    /// block height any still-pending request refers to, so every height strictly below it is
+    /// known to be fully enhanced. A request refers to a height by way of
+    /// [`enhancement_request_height`]; `None` means nothing pending refers to any height, and
+    /// the whole scanned range is enhanced.
+    ///
+    /// Cost is bounded by [`ENHANCED_THROUGH_MAX_PROBE`]: resolving an `Enhancement`/`GetStatus`
+    /// request to a height is a point query per request, and a post-restore drain can hold tens
+    /// of thousands of them. Past that bound the height is reported as unknown (`Some(0)`,
+    /// which floors the watermark) rather than paying a five-figure query count on every status
+    /// update - a consumer waits for the backlog to come down instead, which is the same thing
+    /// it would do anyway. The count itself is always exact; only the watermark degrades.
+    fn enhancement_backlog(&self) -> (u64, Option<u32>) {
+        let reqs = match self.db_data.transaction_data_requests() {
+            Ok(reqs) => reqs,
             Err(e) => {
-                tracing::debug!("counting pending enhancements: {e}");
-                0
+                // Best-effort for the count (observability), but the watermark must fail
+                // closed: reporting "everything below X is enhanced" off a failed read could
+                // let a consumer advance past a memo it never saw.
+                tracing::debug!("reading transaction data requests: {e}");
+                return (0, Some(0));
             }
+        };
+        let pending: Vec<_> = reqs
+            .iter()
+            .filter(|r| is_serviceable_request(r) && !self.enhance_satisfied.contains(r))
+            .collect();
+        let count = pending.len() as u64;
+        if pending.is_empty() {
+            return (0, None);
+        }
+        if pending.len() > ENHANCED_THROUGH_MAX_PROBE {
+            return (count, Some(0));
+        }
+        // Requests referring to no mined height are skipped rather than treated as a zero
+        // bound: an unmined transaction is above every mined height by construction (it can
+        // only mine at a future one), so it cannot make an already-scanned height un-enhanced.
+        // `min` over `Option` would get this backwards, since `None` sorts below `Some`.
+        let lowest = pending
+            .iter()
+            .filter_map(|r| self.enhancement_request_height(r))
+            .min();
+        (count, lowest)
+    }
+
+    /// The block height a pending [`TransactionDataRequest`] refers to, or `None` when it refers
+    /// to no mined height (an unmined transaction, which no height watermark can be below).
+    ///
+    /// `Enhancement`/`GetStatus` name a transaction, so the height is that transaction's;
+    /// `TransactionsInvolvingAddress` names a range, so it is the range's start.
+    fn enhancement_request_height(&self, req: &TransactionDataRequest) -> Option<u32> {
+        match req {
+            TransactionDataRequest::GetStatus(txid) | TransactionDataRequest::Enhancement(txid) => {
+                self.db_data
+                    .get_tx_height(*txid)
+                    .ok()
+                    .flatten()
+                    .map(u32::from)
+            }
+            TransactionDataRequest::TransactionsInvolvingAddress(addr_req) => {
+                Some(u32::from(addr_req.block_range_start()))
+            } // Deliberately no catch-all arm: a new upstream request variant must stop this
+              // compiling, so its height contribution is decided here rather than defaulting to
+              // "bounds nothing" - which would silently let the watermark run past work the new
+              // variant represents. Match `is_serviceable_request`, which faces the same choice.
         }
     }
 
@@ -3193,16 +3332,23 @@ impl WalletActor {
     /// missing it returns and is retried on the next pass. The birthday's tree state is fetched
     /// fresh from the upstream (never cached on disk), reusing the exact path `zecd init` takes.
     async fn maybe_bootstrap_account(&mut self) {
-        let Some(birthday_height) = self.pending_bootstrap else {
+        let Some((birthday_height, bootstrap_key)) = self.pending_bootstrap.as_ref() else {
             return;
         };
+        let birthday_height = *birthday_height;
         if self.account_id.is_some() {
             self.pending_bootstrap = None;
             return;
         }
-        // A copy of the seed (zeroized on drop); absent means the wallet is still locked.
-        let Some(seed) = seed_guard(&self.seed).clone_seed() else {
-            return;
+        // A seed rebuild needs the seed (a copy, zeroized on drop); absent means the wallet is
+        // still locked, and the bootstrap is retried on a later pass. A view-only rebuild needs
+        // no secret at all - the pinned key is already in hand.
+        let seed = match bootstrap_key {
+            BootstrapKey::Seed => match seed_guard(&self.seed).clone_seed() {
+                Some(seed) => Some(seed),
+                None => return,
+            },
+            BootstrapKey::Ufvk(_) => None,
         };
         let Some(tip) = self.tip_height else {
             return;
@@ -3255,10 +3401,28 @@ impl WalletActor {
                     return;
                 }
             };
-        if let Err(e) = self
-            .db_data
-            .create_account("primary", &seed, &birthday, None)
-        {
+        // Same account label and same creation calls `zecd init` makes, so a rebuilt account is
+        // indistinguishable from a freshly initialized one - which is what lets the binding
+        // verification below hold it to the same pin.
+        let created = match (&self.pending_bootstrap, &seed) {
+            (Some((_, BootstrapKey::Seed)), Some(seed)) => self
+                .db_data
+                .create_account("primary", seed, &birthday, None)
+                .map(|_| ()),
+            (Some((_, BootstrapKey::Ufvk(ufvk))), _) => self
+                .db_data
+                .import_account_ufvk(
+                    "primary",
+                    ufvk,
+                    &birthday,
+                    zcash_client_backend::data_api::AccountPurpose::ViewOnly,
+                    None,
+                )
+                .map(|_| ()),
+            // `pending_bootstrap` was checked at entry and nothing clears it in between.
+            _ => return,
+        };
+        if let Err(e) = created {
             warn!("bootstrap: creating the account failed: {e}");
             return;
         }
@@ -3410,10 +3574,21 @@ impl WalletActor {
         // running it dominates readiness via the height gap, so don't pay the extra DB read; once
         // caught up, this count is what stands between "scanned to tip" and "ready to serve full
         // history", so measure it fresh. `0` while scanning means "not yet measured", not "drained".
-        let pending_enhancements = if scanning {
-            0
+        //
+        // `enhanced_through` rides the same measurement: the lowest height any pending request
+        // still refers to, minus one, clamped to the scanned frontier (nothing above it has
+        // been scanned, let alone enhanced). An empty backlog means the whole scanned range is
+        // enhanced. While scanning it is `None` - unmeasured, and a consumer must not advance a
+        // memo cursor on an unknown, so this deliberately reads as "don't know" rather than
+        // falling back to `fully_scanned`.
+        let (pending_enhancements, enhanced_through) = if scanning {
+            (0, None)
         } else {
-            self.count_pending_enhancements()
+            let (count, lowest) = self.enhancement_backlog();
+            (
+                count,
+                fully_scanned.map(|scanned| enhanced_through(scanned, lowest)),
+            )
         };
 
         // `Ready` must mean "ready to serve full history", so a non-empty enhancement backlog keeps
@@ -3444,6 +3619,7 @@ impl WalletActor {
             scan_progress,
             scanning,
             pending_enhancements,
+            enhanced_through,
             encrypted: self.encrypted,
             watch_only: self.watch_only,
             unlocked_until,
@@ -3551,6 +3727,21 @@ impl WalletActor {
                 reply,
             } => {
                 let res = self.do_unlock(passphrase, timeout_secs).await;
+                let _ = reply.send(res);
+            }
+            WalletCommand::SyncNow { reply } => {
+                // Record the nudge and acknowledge immediately: the pass itself runs on the
+                // next loop iteration, and the caller waits on `SyncStatus` for its result.
+                // A halted wallet is the one case a nudge cannot help - say so rather than
+                // acknowledging a pass that will never run.
+                let res = if self.sync_halted {
+                    Err(RpcError::misc(
+                        "sync is halted for this wallet; run `zecd rescan` to rebuild it",
+                    ))
+                } else {
+                    self.force_sync = true;
+                    Ok(())
+                };
                 let _ = reply.send(res);
             }
             WalletCommand::Lock { reply } => {
@@ -6818,6 +7009,37 @@ mod tests {
         assert_eq!(horizon_slots_remaining(20, 19), 0);
         // Overflow-safe at the top of the index space.
         assert_eq!(horizon_slots_remaining(u32::MAX, u32::MAX), 0);
+    }
+
+    /// The enhancement watermark stops one below the lowest pending request, never above the
+    /// scanned frontier, and covers the whole scanned range when the backlog is empty.
+    ///
+    /// The load-bearing case is the middle one: a consumer replaying memos as a log advances a
+    /// cursor over what it reads, and an output whose memo has not been backfilled yet is
+    /// invisible to a `memo IS NOT NULL` filter. If the watermark ever reached the height of a
+    /// still-pending request, that output would be behind the cursor by the time enhancement
+    /// filled it in - skipped permanently, with nothing to detect it.
+    #[test]
+    fn enhancement_watermark_stops_below_the_lowest_pending_request() {
+        use super::enhanced_through;
+        // Empty backlog: the whole scanned range is enhanced.
+        assert_eq!(enhanced_through(240, None), 240);
+        // A pending request at height 100 leaves 0..=99 enhanced.
+        assert_eq!(enhanced_through(240, Some(100)), 99);
+        // The scanned frontier still caps it: nothing above it has been scanned at all.
+        assert_eq!(enhanced_through(50, Some(100)), 50);
+        assert_eq!(enhanced_through(50, None), 50);
+        // A request against the genesis-adjacent floor cannot underflow, and reports that
+        // nothing is known to be enhanced.
+        assert_eq!(enhanced_through(240, Some(0)), 0);
+        assert_eq!(enhanced_through(0, Some(0)), 0);
+        // The boundary: a request at height h never leaves h itself claimed as enhanced.
+        for h in [1u32, 2, 1_000, 3_428_143] {
+            assert!(
+                enhanced_through(u32::MAX, Some(h)) < h,
+                "watermark must stay strictly below a pending request at {h}"
+            );
+        }
     }
 
     /// The recovery horizon is anchored at the restore floor - the larger of the configured

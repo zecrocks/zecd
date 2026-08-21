@@ -216,6 +216,14 @@ password = "change-me"
 #   "walletpassphrasechange",  # ⚠ rotate the passphrase
 #   "encryptwallet",           # ⚠ re-wraps the seed at rest; can lock the owner out
 # ]
+#
+# Accept a repeated *shielded* recipient address within one `z_sendmany` call. Off by default,
+# matching zcashd, which refuses any duplicate recipient. Turn it on only if you run a protocol
+# that deliberately pays one shielded address from several outputs in a single transaction -
+# batching memo-carrying payments, for instance, where the point is one ZIP-317 fee for the
+# batch. Neither consensus nor the wallet forbids that shape; the refusal is dialect parity.
+# Repeated *transparent* recipients stay refused either way.
+# allow_duplicate_shielded_recipients = false
 
 [keys]
 # age identity file used to decrypt the wallet seed for unattended sending.

@@ -38,6 +38,7 @@ pub const ALL_METHODS: &[&str] = &[
     "waitfornewblock",
     "waitforblock",
     "waitforblockheight",
+    "waitforsync",
     // Utility
     "validateaddress",
     "signmessage",
@@ -115,6 +116,7 @@ const MAX_POSITIONAL_ARGS: &[(&str, usize)] = &[
     ("waitfornewblock", 1),
     ("waitforblock", 2),
     ("waitforblockheight", 2),
+    ("waitforsync", 1),
     // Utility
     ("validateaddress", 1),
     ("settxfee", 1),
@@ -131,7 +133,7 @@ const MAX_POSITIONAL_ARGS: &[(&str, usize)] = &[
     ("getwalletinfo", 0),
     ("getaddressinfo", 1),
     ("listtransactions", 4),
-    ("z_listtransactions", 3),
+    ("z_listtransactions", 5),
     ("listsinceblock", 4),
     ("gettransaction", 3),
     ("listunspent", 5),
@@ -201,6 +203,7 @@ const METHOD_COINS: &[(&str, MethodCoins)] = &[
     ("waitfornewblock", MethodCoins::All),
     ("waitforblock", MethodCoins::All),
     ("waitforblockheight", MethodCoins::All),
+    ("waitforsync", MethodCoins::All),
     // Utility
     ("validateaddress", MethodCoins::All),
     ("estimatesmartfee", MethodCoins::All),
@@ -342,6 +345,7 @@ async fn dispatch_zecd(
         "waitfornewblock" => blockchain::waitfornewblock(state, wallet, req).await,
         "waitforblock" => blockchain::waitforblock(state, wallet, req).await,
         "waitforblockheight" => blockchain::waitforblockheight(state, wallet, req).await,
+        "waitforsync" => blockchain::waitforsync(state, wallet, req).await,
 
         // Utility
         "validateaddress" => util::validateaddress(state, wallet, req),

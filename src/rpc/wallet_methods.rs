@@ -314,6 +314,19 @@ fn parse_diversifier_index_arg(v: Option<&Value>) -> Result<Option<DiversifierIn
         .map_err(|_| RpcError::invalid_parameter("diversifier index is too large."))
 }
 
+/// A confirmations policy bounding both trusted and untrusted depth at `minconf`, clamped to
+/// at least 1 (shielded notes can never be spent at 0 confirmations). Shared by the RPC
+/// `minconf` arguments ([`minconf_policy`]) and the embedded [`crate::node::Node::send`], so an
+/// in-process caller's depth override cannot drift from the wire one's.
+pub(crate) fn symmetrical_confirmations(minconf: u32) -> ConfirmationsPolicy {
+    ConfirmationsPolicy::new_symmetrical(
+        NonZeroU32::new(minconf.max(1)).expect("clamped to >= 1"),
+        // cfg(transparent-inputs) arg: an explicit minconf must not loosen transparent spends
+        // to 0-conf.
+        false,
+    )
+}
+
 /// Map `getbalance`'s optional `minconf` argument onto a [`ConfirmationsPolicy`]. Omitted
 /// (or null) keeps the wallet's configured policy (`[spend]`; ZIP-315 trusted-3/untrusted-10
 /// by default) - so the no-argument balance always equals what a send can actually spend.
@@ -329,15 +342,9 @@ fn minconf_policy(
         Some(v) => match v.as_i64() {
             // Bitcoin Core accepts any integer here; depths below 1 behave like its
             // default of 0, which for shielded notes means the 1-confirmation minimum.
-            Some(n) => {
-                let min = u32::try_from(n.max(1)).unwrap_or(u32::MAX);
-                Ok(ConfirmationsPolicy::new_symmetrical(
-                    NonZeroU32::new(min).expect("clamped to >= 1"),
-                    // cfg(transparent-inputs) arg: an explicit minconf must not loosen
-                    // transparent spends to 0-conf.
-                    false,
-                ))
-            }
+            Some(n) => Ok(symmetrical_confirmations(
+                u32::try_from(n.max(1)).unwrap_or(u32::MAX),
+            )),
             None => Err(RpcError::type_error("minconf must be a number")),
         },
     }
@@ -428,8 +435,18 @@ pub(crate) fn getwalletinfo(state: &AppState, wallet: Option<&str>) -> Result<Va
     // holds at 1.0 through the enhancement drain, whose backlog is an open-ended count surfaced on
     // `/status` and factored into readiness rather than squeezed into this [0,1] field. Matches
     // Bitcoin Core's shape (an object while scanning, `false` when idle).
+    // `pending_enhancements` is a zecd extension inside Core's object: the enhancement backlog
+    // is open-ended work that `progress` (a [0,1] block-scan ratio) cannot express, and until
+    // now the count existed only on the health server's `/status` - unreachable for a
+    // `default-features = false` embedder, and for anyone driving zecd purely over JSON-RPC. It
+    // is the difference between "scanned to the tip" and "serving complete history", since a
+    // scanned-but-unenhanced output still has a NULL memo.
     let scanning = if st.scanning || st.pending_enhancements > 0 {
-        json!({ "duration": 0, "progress": st.scan_progress })
+        json!({
+            "duration": 0,
+            "progress": st.scan_progress,
+            "pending_enhancements": st.pending_enhancements,
+        })
     } else {
         Value::Bool(false)
     };
@@ -449,6 +466,14 @@ pub(crate) fn getwalletinfo(state: &AppState, wallet: Option<&str>) -> Result<Va
         "private_keys_enabled": !st.watch_only,
         "avoid_reuse": false,
         "scanning": scanning,
+        // zecd extension, and deliberately **top-level rather than inside `scanning`**: that
+        // object is Core's, and it is the literal `false` once the wallet is idle - which is
+        // exactly the moment a consumer following wallet history as a log is ready to advance
+        // its cursor, and therefore exactly when it needs this. Nesting it there made the
+        // field unreachable at the only time it matters. Null when not currently determinable
+        // (see `SyncStatus::enhanced_through`), which a consumer must read as "hold the
+        // cursor", never as "everything is enhanced".
+        "enhanced_through": st.enhanced_through,
         "descriptors": false
     });
     // Only present for passphrase-encrypted wallets (matches Bitcoin Core): the unix time the
@@ -696,22 +721,35 @@ fn push_wallet_tx_fields(entry: &mut Value, tx: &read::TxRecord, time: i64) {
 }
 
 /// Append an output's shielded memo as extension fields beyond Bitcoin Core's set, using
-/// zcashd's `z_viewtransaction` names: `memo` is the raw ZIP-302 bytes in hex, `memoStr`
-/// the decoded text for text memos. Empty/absent memos add nothing.
+/// zcashd's `z_viewtransaction` names: `memo` is the raw stored bytes in hex, `memoStr` the
+/// decoded text for ZIP-302 text memos.
+///
+/// **`memo` is emitted from the raw bytes and is never gated on the ZIP-302 parse succeeding**,
+/// only `memoStr` is. The two are different questions: a memo whose lead byte is at or below
+/// `0xF4` is *declared* to be UTF-8 text, but nothing on the consensus side enforces that, so a
+/// protocol embedding arbitrary bytes in that lead-byte space produces a memo that fails
+/// `Memo::try_from` while still being perfectly good data the wallet stored. Gating the hex
+/// field on the parse dropped those memos from the response entirely - no `memo`, no `memoStr`,
+/// and no error - which is silent data loss for the caller and indistinguishable from an output
+/// that carried no memo at all.
+///
+/// The one memo still dropped is the canonical **empty** memo (`0xF6` followed by zeros), which
+/// every shielded output without a memo carries: emitting 1024 hex characters of padding on
+/// every such entry is noise, and its absence is unambiguous. NB that makes an absent `memo`
+/// field mean "empty memo", never "unparseable memo".
 fn push_memo_fields(entry: &mut Value, memo: Option<&[u8]>) {
     let Some(bytes) = memo else { return };
-    let Some(parsed) = MemoBytes::from_bytes(bytes)
+    // Parse for two purposes only: recognizing the empty memo, and decoding `memoStr`. A parse
+    // failure leaves `parsed` as `None` and the raw bytes are still reported below.
+    let parsed = MemoBytes::from_bytes(bytes)
         .ok()
-        .and_then(|mb| Memo::try_from(&mb).ok())
-    else {
-        return;
-    };
-    if matches!(parsed, Memo::Empty) {
+        .and_then(|mb| Memo::try_from(&mb).ok());
+    if matches!(parsed, Some(Memo::Empty)) {
         return;
     }
     let obj = entry.as_object_mut().expect("entry is a JSON object");
     obj.insert("memo".into(), json!(hex::encode(bytes)));
-    if let Memo::Text(text) = &parsed {
+    if let Some(Memo::Text(text)) = &parsed {
         obj.insert("memoStr".into(), json!(&**text));
     }
 }
@@ -772,6 +810,12 @@ fn tx_entries(
                 "amount": signed_zats_to_value(amount),
                 "label": "",
                 "vout": out.output_index,
+                // zecd extension. `vout` is the output index *within its pool's bundle*, not a
+                // transparent outpoint index, so on a transaction with outputs in more than one
+                // pool `(txid, vout)` does not identify an output - which is exactly the key a
+                // consumer following `listsinceblock` as an incremental cursor would reach for.
+                // `(txid, pool, vout)` does. Additive, like `listunspent.pool`.
+                "pool": pool_name(out.pool),
                 "confirmations": confirmations,
                 "txid": tx.txid_hex,
                 "bip125-replaceable": "no",
@@ -814,6 +858,21 @@ fn gettransaction_amount(account_balance_delta: i64, fee_paid: Option<u64>) -> i
     }
 }
 
+/// One page of history: the pagination window plus the optional mined-height range restricting
+/// which transactions are eligible for it.
+///
+/// The range bounds are `read::TxQuery`'s, so they carry its semantics: `start_height` is
+/// inclusive, `end_height` exclusive, and unmined transactions are included only while
+/// `end_height` is `None` (zcashd's predicate - an open-ended range keeps them, an upper bound
+/// drops them, since an unmined transaction has no height to compare).
+#[derive(Debug, Clone, Copy, Default)]
+struct HistoryPage {
+    from: usize,
+    count: usize,
+    start_height: Option<u32>,
+    end_height: Option<u32>,
+}
+
 /// The most recent `count` history entries after skipping `from`, in oldest-to-newest order,
 /// shared by `listtransactions` and `z_listtransactions`. Rather than expanding the whole
 /// wallet then slicing the tail, fetch transactions newest-first in growing pages and expand
@@ -826,10 +885,15 @@ fn gettransaction_amount(account_balance_delta: i64, fee_paid: Option<u64>) -> i
 /// slice output exactly.
 fn paginate_history(
     wallet_dir: &std::path::Path,
-    from: usize,
-    count: usize,
+    page: HistoryPage,
     expand: impl Fn(&read::TxRecord) -> Vec<Value>,
 ) -> Result<Vec<Value>, RpcError> {
+    let HistoryPage {
+        from,
+        count,
+        start_height,
+        end_height,
+    } = page;
     let want = from.saturating_add(count);
     // Grow the transaction page until the window is covered or the wallet is exhausted. Once a
     // page returns fewer txs than requested there are no more, so the doubling is bounded by
@@ -838,8 +902,8 @@ fn paginate_history(
     let mut limit: u32 = (want.max(1)).min(u32::MAX as usize) as u32;
     loop {
         let query = read::TxQuery {
-            start_height: None,
-            end_height: None,
+            start_height,
+            end_height,
             offset: 0,
             limit: Some(limit),
             newest_first: true,
@@ -895,6 +959,23 @@ fn window_history_from_txs(
     window
 }
 
+/// Parse an optional block-height positional argument, with Bitcoin Core's argument taxonomy: a
+/// non-integer is a type error (-3) and a value outside the representable height range - which
+/// includes every negative number - is `-8`. Omitted or null means "no bound".
+fn height_param(req: &RpcRequest, i: usize, name: &str) -> Result<Option<u32>, RpcError> {
+    match req.param(i).filter(|v| !v.is_null()) {
+        None => Ok(None),
+        Some(v) => {
+            let n = v
+                .as_i64()
+                .ok_or_else(|| RpcError::type_error(format!("{name} must be a number")))?;
+            u32::try_from(n)
+                .map(Some)
+                .map_err(|_| RpcError::invalid_parameter(format!("{name} out of range")))
+        }
+    }
+}
+
 /// Parse `listtransactions`/`z_listtransactions`'s `count` and `from` positional args with
 /// Bitcoin Core's strictness: a negative value is `-8`, a non-integer is `-3`.
 fn count_from_params(
@@ -941,7 +1022,12 @@ pub(crate) fn listtransactions(
     let st = handle.status();
     let first_seen = handle.first_seen();
 
-    let entries = paginate_history(&handle.engine_dir, skip, count, |tx| {
+    let page = HistoryPage {
+        from: skip,
+        count,
+        ..HistoryPage::default()
+    };
+    let entries = paginate_history(&handle.engine_dir, page, |tx| {
         let confirmations = tx_confirmations(&st, tx);
         let time = tx_time(tx, first_seen.get(&tx.txid_hex).copied());
         tx_entries(&network, tx, confirmations, time, label_filter.as_deref())
@@ -1043,31 +1129,58 @@ fn z_tx_entries(
     entries
 }
 
-/// `z_listtransactions [count=10] [from=0] [includeWatchonly=false]` - a zecd extension (no
-/// such method exists in zcashd) listing per-output history in zcashd's `z_*` vocabulary:
-/// `pool`/`category`/`amount`/`amountZat`/`address`/`outindex`/`outgoing`/`status`, plus
-/// `memo`/`memoStr` for shielded outputs and `fee`/`feeZat` on sends. Pagination is identical
-/// to `listtransactions` (newest-first cursor, oldest-first output). `includeWatchonly` is
-/// accepted and ignored (no watch-only support); there is no account filter.
+/// `z_listtransactions [count=10] [from=0] [includeWatchonly=false] [start_height] [end_height]`,
+/// a zecd extension (no such method exists in zcashd) listing per-output history in zcashd's
+/// `z_*` vocabulary: `pool`/`category`/`amount`/`amountZat`/`address`/`outindex`/`outgoing`/
+/// `status`, plus `memo`/`memoStr` for shielded outputs and `fee`/`feeZat` on sends.
+/// `includeWatchonly` is accepted and ignored (no watch-only support); there is no account
+/// filter.
+///
+/// Pagination is `listtransactions`' (newest-first cursor, oldest-first output). The optional
+/// height range is zecd's own addition, because `count`/`from` alone cannot express an
+/// *incremental* read: this is the only method carrying `memo`, `pool` and `outindex` on one
+/// entry, so a consumer following the wallet as a log has to use it - and with an offset-only
+/// cursor, every poll re-reads from the newest end and walks back over history it already has.
+/// A height range turns that into "what happened since height N". `start_height` is inclusive
+/// and `end_height` exclusive; see [`HistoryPage`] for how unmined transactions interact with
+/// the bounds.
 pub(crate) fn z_listtransactions(
     state: &AppState,
     wallet: Option<&str>,
     req: &RpcRequest,
 ) -> Result<Value, RpcError> {
-    // Positional args: count, from, includeWatchonly. count/from use zcashd's strictness
-    // (negative -> -8, wrong type -> -3).
+    // Positional args: count, from, includeWatchonly, start_height, end_height. count/from use
+    // zcashd's strictness (negative -> -8, wrong type -> -3).
     let (count, from) = count_from_params(req, 0, 1)?;
     // includeWatchonly: accepted (bool or omitted) and ignored.
     match req.param(2) {
         None | Some(Value::Null) | Some(Value::Bool(_)) => {}
         Some(_) => return Err(RpcError::type_error("includeWatchonly must be a boolean")),
     }
+    let start_height = height_param(req, 3, "start_height")?;
+    let end_height = height_param(req, 4, "end_height")?;
+    // An inverted range can only ever be empty, which almost always means the caller swapped the
+    // arguments. Say so rather than returning a confidently empty list.
+    if let (Some(start), Some(end)) = (start_height, end_height) {
+        if start >= end {
+            return Err(RpcError::invalid_parameter(format!(
+                "start_height ({start}) must be below end_height ({end}); the range is \
+                 [start_height, end_height)"
+            )));
+        }
+    }
     let handle = state.registry.get(wallet)?;
     let network = handle.network;
     let st = handle.status();
     let first_seen = handle.first_seen();
 
-    let entries = paginate_history(&handle.engine_dir, from, count, |tx| {
+    let page = HistoryPage {
+        from,
+        count,
+        start_height,
+        end_height,
+    };
+    let entries = paginate_history(&handle.engine_dir, page, |tx| {
         let confirmations = tx_confirmations(&st, tx);
         let time = tx_time(tx, first_seen.get(&tx.txid_hex).copied());
         z_tx_entries(&network, tx, confirmations, time)
@@ -1379,6 +1492,12 @@ fn gettransaction_details(network: &crate::network::ZNetwork, rec: &read::TxReco
                 "category": category,
                 "amount": signed_zats_to_value(amount),
                 "vout": out.output_index,
+                // Same zecd extension `tx_entries` carries, for the same reason: `vout` is the
+                // index within this output's own pool bundle, so `(txid, vout)` does not
+                // identify an output on a transaction paying more than one pool. These details
+                // are built independently of `tx_entries`, which is why the field has to be
+                // added in both places rather than inherited.
+                "pool": pool_name(out.pool),
                 // zecd is stateless and keeps no address labels; retained empty for Core shape.
                 "label": "",
             });
@@ -1928,14 +2047,33 @@ pub(crate) fn z_sendmany(
             Some(Value::String(s)) => Some(s.as_str()),
             Some(_) => return Err(RpcError::type_error("memo must be a hex string")),
         };
-        if !seen.insert(addr.to_string()) {
+        let decoded = crate::address::decode_on_network(&handle.network, addr);
+        let shielded_recipient = decoded
+            .as_ref()
+            .is_some_and(crate::address::has_shielded_receiver);
+        // z_sendmany permits a zero-valued output (zcashd's memo-only-send pattern).
+        has_transparent_recipient |= decoded.is_some() && !shielded_recipient;
+        // Duplicate recipients: refused by default, as zcashd refuses them. A repeated
+        // *shielded* recipient is a legitimate shape - two shielded outputs paying one address
+        // is how a batch of memo-carrying payments rides in a single transaction, for a single
+        // ZIP-317 fee, and neither consensus nor the wallet objects - so an operator running
+        // such a protocol can allow it with `[rpc] allow_duplicate_shielded_recipients`. A
+        // repeated *transparent* recipient stays refused regardless: that half is Bitcoin
+        // Core's own dedup, and relaxing it was never the ask.
+        let duplicate = !seen.insert(addr.to_string());
+        let duplicate_permitted =
+            shielded_recipient && state.config.rpc.allow_duplicate_shielded_recipients;
+        if duplicate && !duplicate_permitted {
+            let hint = if shielded_recipient {
+                " (set [rpc] allow_duplicate_shielded_recipients to permit repeated shielded \
+                 recipients)"
+            } else {
+                ""
+            };
             return Err(RpcError::invalid_parameter(format!(
-                "Invalid parameter, duplicated recipient address: {addr}"
+                "Invalid parameter, duplicated recipient address: {addr}{hint}"
             )));
         }
-        // z_sendmany permits a zero-valued output (zcashd's memo-only-send pattern).
-        has_transparent_recipient |= crate::address::decode_on_network(&handle.network, addr)
-            .is_some_and(|a| !crate::address::has_shielded_receiver(&a));
         payments.push(build_payment(
             handle.coin(),
             &handle.network,
@@ -3610,6 +3748,126 @@ mod tests {
         assert!(e[1].get("abandoned").is_none());
         assert_eq!(e[0]["address"], e[1]["address"]);
         assert_eq!(e[0]["vout"], e[1]["vout"]);
+    }
+
+    /// `z_listtransactions`'s height bounds follow Core's argument taxonomy: absent/null means
+    /// unbounded, a non-integer is `-3`, and anything outside the height range - negatives
+    /// included - is `-8`.
+    #[test]
+    fn height_params_follow_the_core_argument_taxonomy() {
+        let req = |v: Value| RpcRequest::positional("z_listtransactions", vec![v]);
+
+        assert_eq!(
+            height_param(&RpcRequest::positional("x", vec![]), 0, "start_height").unwrap(),
+            None
+        );
+        assert_eq!(
+            height_param(&req(Value::Null), 0, "start_height").unwrap(),
+            None
+        );
+        assert_eq!(
+            height_param(&req(json!(42)), 0, "start_height").unwrap(),
+            Some(42)
+        );
+
+        let e = height_param(&req(json!("100")), 0, "start_height").unwrap_err();
+        assert_eq!(e.code, crate::error::codes::RPC_TYPE_ERROR);
+        assert!(e.message.contains("start_height"), "{}", e.message);
+
+        for bad in [json!(-1), json!(i64::from(u32::MAX) + 1)] {
+            let e = height_param(&req(bad.clone()), 0, "end_height").unwrap_err();
+            assert_eq!(
+                e.code,
+                crate::error::codes::RPC_INVALID_PARAMETER,
+                "for {bad}"
+            );
+            assert!(e.message.contains("end_height"), "{}", e.message);
+        }
+    }
+
+    /// Every history entry names the pool its output lives in, so `(txid, pool, vout)`
+    /// identifies an output. `vout` alone does not: it is the index within the output's own
+    /// pool bundle, so a transaction paying two pools emits two entries that agree on `vout`
+    /// and differ only in `pool` - the ambiguity that makes a bare `(txid, vout)` cursor over
+    /// `listsinceblock` unsound.
+    #[test]
+    fn history_entries_name_their_pool() {
+        let sapling = TxOutputRecord {
+            pool: 2,
+            output_index: 0,
+            ..out(false, true, 100, Some("zs1recipient"), false)
+        };
+        let ironwood = TxOutputRecord {
+            pool: 4,
+            output_index: 0,
+            ..out(false, true, 200, Some("uironwood"), false)
+        };
+        let t = tx(Some(50), false, None, vec![sapling, ironwood]);
+
+        let entries = tx_entries(&crate::network::ZNetwork::Test, &t, 3, 0, None);
+        assert_eq!(
+            entries.len(),
+            2,
+            "one entry per received output: {entries:?}"
+        );
+        assert_eq!(entries[0]["pool"], "sapling");
+        assert_eq!(entries[1]["pool"], "ironwood");
+        // The point of the field: without it these two entries are indistinguishable.
+        assert_eq!(entries[0]["vout"], entries[1]["vout"]);
+        assert_eq!(entries[0]["txid"], entries[1]["txid"]);
+    }
+
+    /// The `memo` hex field reports the stored bytes whether or not they parse as ZIP-302; only
+    /// `memoStr` depends on the parse. The regression this guards is a binary memo whose lead
+    /// byte falls in the text range (<= 0xF4) but whose body is not valid UTF-8: it parses as
+    /// nothing, and gating the hex on the parse dropped it from the response silently.
+    #[test]
+    fn memo_hex_is_reported_even_when_the_zip302_parse_fails() {
+        let fields = |bytes: Option<Vec<u8>>| {
+            let mut entry = json!({});
+            push_memo_fields(&mut entry, bytes.as_deref());
+            entry
+        };
+
+        // Text memo: both fields.
+        let text = fields(Some(text_memo_bytes("gm")));
+        assert_eq!(text["memoStr"], "gm");
+        assert_eq!(text["memo"], hex::encode(text_memo_bytes("gm")));
+
+        // Declared text (lead byte <= 0xF4) but not valid UTF-8: a lone 0x80 continuation byte
+        // cannot start a UTF-8 sequence, so `Memo::try_from` rejects it. The bytes are still
+        // real stored data and must come back.
+        let mut binary = vec![0u8; 512];
+        binary[0] = 0x01;
+        binary[1] = 0x80;
+        let bin = fields(Some(binary.clone()));
+        assert_eq!(
+            bin["memo"],
+            hex::encode(&binary),
+            "unparseable memo bytes must still be reported as hex"
+        );
+        assert!(
+            bin.get("memoStr").is_none(),
+            "memoStr is reserved for memos that decode as text"
+        );
+
+        // Arbitrary-format memo (lead byte 0xFF): hex only, no text.
+        let mut arbitrary = vec![0u8; 512];
+        arbitrary[0] = 0xFF;
+        let arb = fields(Some(arbitrary.clone()));
+        assert_eq!(arb["memo"], hex::encode(&arbitrary));
+        assert!(arb.get("memoStr").is_none());
+
+        // The canonical empty memo stays dropped - every memoless shielded output carries one,
+        // and its absence is what callers already read as "no memo".
+        let mut empty = vec![0u8; 512];
+        empty[0] = 0xF6;
+        let e = fields(Some(empty));
+        assert!(e.get("memo").is_none() && e.get("memoStr").is_none());
+
+        // No stored memo at all: nothing, as before.
+        let none = fields(None);
+        assert!(none.get("memo").is_none() && none.get("memoStr").is_none());
     }
 
     #[test]

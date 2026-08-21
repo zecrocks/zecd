@@ -1366,27 +1366,48 @@ async fn regtest_funded_orchard_receive() {
         .expect("the watch-only wallet scans from birthday to the tip");
 
     // The received memo is recovered, but only after enhancement runs - which happens on a
-    // caught-up pass, a beat after the block scan reaches the tip. Poll for it.
-    let deadline = Instant::now() + FUND_TIMEOUT;
-    loop {
-        let txs = watch_only
-            .call("listtransactions", json!(["*", 100]))
-            .await
-            .expect("listtransactions on the watch-only wallet");
-        let recovered = txs
-            .as_array()
+    // caught-up pass, a beat after the block scan reaches the tip. `waitforsync` is exactly that
+    // barrier: it resolves only once the scan has reached the tip *and* the enhancement backlog
+    // has drained, so the memo must be readable the moment it returns. Asserting without a poll
+    // is the point - it makes this a test of the RPC's contract as much as of enhancement. A
+    // `waitforsync` that returned while the backlog was still draining (or that only waited on
+    // the block scan, the mistake it exists to prevent) fails here rather than being papered
+    // over by a retry loop.
+    let sync = watch_only
+        .call("waitforsync", json!([FUND_TIMEOUT.as_millis() as u64]))
+        .await
+        .expect("waitforsync on the watch-only wallet");
+    assert_eq!(
+        sync["synced"], true,
+        "waitforsync did not reach a fully-synced state within the timeout: {sync}"
+    );
+    assert_eq!(
+        sync["pending_enhancements"], 0,
+        "a synced wallet reports a drained enhancement backlog: {sync}"
+    );
+    // The watermark must be a real height once synced, and must cover the block the funding
+    // transaction mined in - that is precisely the claim a memo-log consumer relies on when it
+    // advances a cursor.
+    let enhanced_through = sync["enhanced_through"]
+        .as_u64()
+        .expect("a synced wallet reports a known enhancement watermark");
+    assert!(
+        enhanced_through >= tip,
+        "the enhancement watermark ({enhanced_through}) must cover the scanned tip ({tip}): {sync}"
+    );
+
+    let txs = watch_only
+        .call("listtransactions", json!(["*", 100]))
+        .await
+        .expect("listtransactions on the watch-only wallet");
+    assert!(
+        txs.as_array()
             .expect("array")
             .iter()
-            .any(|t| t["category"] == "receive" && t["memoStr"].as_str() == Some(RECEIVE_MEMO));
-        if recovered {
-            break;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "the watch-only wallet never recovered the received memo via enhancement: {txs}"
-        );
-        tokio::time::sleep(Duration::from_millis(500)).await;
-    }
+            .any(|t| t["category"] == "receive" && t["memoStr"].as_str() == Some(RECEIVE_MEMO)),
+        "the watch-only wallet must have recovered the received memo via enhancement by the \
+         time waitforsync reports synced: {txs}"
+    );
 
     // What was just rediscovered from nothing but a viewing key + the chain is an IRONWOOD note.
     // This is the from-scratch recovery path for the pool mainnet/testnet are on: the scan had to

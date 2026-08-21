@@ -37,6 +37,14 @@ on:
       - ".github/workflows/release.yml"
       - ".github/workflows/docker.yml"
       - ".github/workflows/regtest.yml"
+  # The Windows *target* check (`windows-cross`) runs automatically on every PR. This dispatch
+  # input adds the heavier MSVC-toolchain job on a Windows runner - see `windows-msvc` below.
+  workflow_dispatch:
+    inputs:
+      windows_msvc:
+        description: "Also run the MSVC-toolchain check on a Windows runner (see `windows-msvc`)"
+        type: boolean
+        default: true
 
 concurrency:
   group: ci-${{ github.ref }}
@@ -137,3 +145,71 @@ jobs:
 
   # (The former dedicated `ironwood` clippy job is gone: ironwood is now compiled unconditionally,
   # so the `test` job's `cargo clippy --all-targets -- -D warnings` above already covers it.)
+
+  # Windows *target* check, cross-compiled from Ubuntu - runs on every PR.
+  #
+  # Windows is not a supported deployment target: zecd ships as a static-musl Linux binary, its
+  # hardening and file-permission paths are Unix-specific, and the regtest tier drives Unix node
+  # binaries. What this protects is the *library* consumer, since zecd is embeddable
+  # (`default-features = false`): a host application that happens to build for Windows should
+  # fail on a feature it cannot use, not on a stray ungated `libc` call in code it never runs.
+  # That is the exact regression it was added for - `lock::hostname` called `libc::gethostname`,
+  # which libc declares only on Unix, so the whole crate failed to compile for Windows while
+  # every other platform-specific site in the tree was correctly `cfg(unix)`-gated.
+  #
+  # It cross-compiles to `x86_64-pc-windows-gnu` on an Ubuntu runner rather than running on
+  # `windows-latest`, which is what makes it cheap enough to run automatically: no Windows
+  # runner minutes, and `cargo check` needs no linking. mingw-w64 is required because the C
+  # build scripts in the tree (ring, secp256k1-sys, libsqlite3-sys) must compile for the target.
+  #
+  # This is deliberately automatic rather than opt-in. An occasional manual check means the next
+  # ungated `libc` call reaches a release unnoticed, and the first thing to break is a library
+  # consumer's build - the failure mode this job exists to prevent. The `windows-msvc` job below
+  # remains manual for the rarer case where the MSVC toolchain itself is in question.
+  windows-cross:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install protobuf compiler and the mingw-w64 cross toolchain
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler mingw-w64
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-gnu
+
+      - uses: Swatinem/rust-cache@v2
+
+      # `check`, not `test`: the point is that the crate compiles for the target. Both feature
+      # combinations matter - the embeddable library (what a Windows consumer would actually
+      # depend on) and the full binary surface, since the gating bug lived in code reachable
+      # from both.
+      - name: Check the embeddable library for Windows
+        run: cargo check --lib --no-default-features --target x86_64-pc-windows-gnu
+
+      - name: Check with default features for Windows
+        run: cargo check --all-targets --target x86_64-pc-windows-gnu
+
+  # The same check against the real MSVC toolchain on a Windows runner. Manual
+  # (Run workflow -> `windows_msvc` ticked), because `windows-cross` above already catches the
+  # regression class this exists for, on a Linux runner, for a fraction of the cost. Reach for
+  # this when the MSVC toolchain specifically is in question - a `cc`/`build.rs` change, or a
+  # dependency whose Windows support differs between the gnu and msvc targets.
+  windows-msvc:
+    if: github.event_name == 'workflow_dispatch' && inputs.windows_msvc
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install protobuf compiler
+        run: choco install protoc --no-progress -y
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Check the embeddable library
+        run: cargo check --lib --no-default-features
+
+      - name: Check with default features
+        run: cargo check --all-targets

@@ -136,6 +136,11 @@ pub fn render(config: &AppConfig) -> String {
         "allowed_methods",
         list_val(&config.rpc.allowed_methods),
     );
+    kv(
+        &mut s,
+        "allow_duplicate_shielded_recipients",
+        config.rpc.allow_duplicate_shielded_recipients,
+    );
 
     table(&mut s, "keys");
     if let Some(id) = &config.keys.age_identity {

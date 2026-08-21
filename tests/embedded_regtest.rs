@@ -293,6 +293,49 @@ async fn embedded_node_serves_typed_calls_end_to_end() {
         waited.error
     );
 
+    // `Node::send`, the memo-native seam - the same unfunded send as above, but through the
+    // typed-request entry point rather than `z_sendmany`'s JSON. Two things are being checked
+    // live that no offline test can reach.
+    //
+    // First, that the seam actually rides the whole send path: the request reaches the
+    // single-writer actor, a proposal is attempted against the real chain, and the failure
+    // comes back as the same Bitcoin Core `-6` the RPC returns. The walletless unit test only
+    // covers wallet *resolution*; nothing below the handle runs there.
+    //
+    // Second, and the reason this seam exists: the request pays **one address twice**, which
+    // `z_sendmany` refuses outright with `-8` (zcashd parity, relaxable only by config). Paying
+    // a single shielded address from several memo-carrying outputs in one transaction, for one
+    // ZIP-317 fee, is the shape a memo-log consumer writes. Asserting `-6` rather than `-8`
+    // proves the duplicate survived all the way to fund selection - i.e. that it failed for
+    // want of money, not for being a duplicate.
+    let memo_payment = |i: u8| {
+        let addr = zcash_address::ZcashAddress::try_from_encoded(&address).expect("own address");
+        // Via the crate's own re-export, which is the point of having it: an embedder builds
+        // requests with the exact `zip321` zecd links, not a separately-pinned copy whose
+        // mismatch would surface as a type error naming two identical-looking paths.
+        zecd::zip321::Payment::new(
+            addr,
+            Some(zcash_protocol::value::Zatoshis::ZERO),
+            Some(zcash_protocol::memo::MemoBytes::from_bytes(&[b'a' + i]).expect("memo")),
+            None,
+            None,
+            vec![],
+        )
+        .expect("a zero-valued memo payment to a shielded address")
+    };
+    let duplicated = zecd::zip321::TransactionRequest::new(vec![memo_payment(0), memo_payment(1)])
+        .expect("a request paying one address twice is representable");
+    let err = node
+        .send(None, duplicated, zecd::node::SendOptions::default())
+        .await
+        .expect_err("an unfunded wallet cannot pay the fee");
+    assert_eq!(
+        err.code,
+        zecd::error::codes::RPC_WALLET_INSUFFICIENT_FUNDS,
+        "duplicate shielded recipients must reach fund selection, not be rejected as \
+         duplicates: {err:?}"
+    );
+
     node.trigger_shutdown();
     node.shutdown().await;
 }

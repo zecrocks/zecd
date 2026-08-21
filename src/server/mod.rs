@@ -290,6 +290,7 @@ mod tests {
             cookiefile: None,
             work_queue: 16,
             allowed_methods: vec![],
+            allow_duplicate_shielded_recipients: false,
         };
         test_state_with_rpc(rpc)
     }
@@ -425,6 +426,7 @@ mod tests {
                 ),
                 work_queue: 16,
                 allowed_methods: vec![],
+                allow_duplicate_shielded_recipients: false,
             };
 
             // Correct credential → 200 through the real dispatch path.

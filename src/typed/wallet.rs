@@ -41,11 +41,25 @@ pub struct Balances {
 
 /// `getwalletinfo.scanning`: an object while scanning (or draining the enhancement backlog),
 /// the literal `false` when idle - Bitcoin Core's shape, kept faithfully typed.
+#[non_exhaustive]
 #[derive(Debug, Clone, serde::Deserialize)]
 #[serde(untagged)]
 pub enum Scanning {
-    /// The in-progress form: `{ duration, progress }`.
-    Active { duration: u64, progress: f64 },
+    /// The in-progress form: `{ duration, progress }`, plus zecd's `pending_enhancements`.
+    /// `#[non_exhaustive]` on the variant too: it gains fields as the scan status does, and a
+    /// pattern listing them exhaustively would break on each one.
+    #[non_exhaustive]
+    Active {
+        duration: u64,
+        progress: f64,
+        /// zecd extension: outstanding transaction-enhancement requests. `progress` covers the
+        /// block scan only, so this is what distinguishes "scanned to the tip" from "serving
+        /// complete history" - memos are NULL on a scanned-but-unenhanced output. Defaulted so
+        /// a response from a zecd predating the field still decodes as the `Active` variant
+        /// rather than falling through to `Idle`.
+        #[serde(default)]
+        pending_enhancements: u64,
+    },
     /// The idle form (always `false`).
     Idle(bool),
 }
@@ -54,6 +68,17 @@ impl Scanning {
     /// Whether a scan (or enhancement drain) is in progress.
     pub fn is_scanning(&self) -> bool {
         matches!(self, Scanning::Active { .. })
+    }
+
+    /// Outstanding transaction-enhancement requests; `0` when idle.
+    pub fn pending_enhancements(&self) -> u64 {
+        match self {
+            Scanning::Active {
+                pending_enhancements,
+                ..
+            } => *pending_enhancements,
+            Scanning::Idle(_) => 0,
+        }
     }
 }
 
@@ -106,6 +131,13 @@ pub struct WalletInfo {
     pub private_keys_enabled: bool,
     pub avoid_reuse: bool,
     pub scanning: Scanning,
+    /// zecd extension: the height through which transaction enhancement has completed, so
+    /// memos are known present at or below it. Top-level rather than inside [`Scanning`]
+    /// because that object is `false` on an idle wallet - the moment a cursor consumer is
+    /// ready to advance. `None` means "not currently determinable", never "everything is
+    /// enhanced": hold the cursor rather than advancing it. Optional so a response from a
+    /// zecd predating the field still decodes.
+    pub enhanced_through: Option<u32>,
     pub descriptors: bool,
     /// Present only for passphrase-encrypted wallets: unix relock time, or 0 while locked.
     pub unlocked_until: Option<i64>,
@@ -156,6 +188,11 @@ pub struct TransactionEntry {
     /// Always empty (zecd keeps no labels).
     pub label: String,
     pub vout: u32,
+    /// zecd extension: the pool this output lives in (`"transparent"` / `"sapling"` /
+    /// `"orchard"` / `"ironwood"`). `vout` is the index within this pool's bundle, so
+    /// `(txid, pool, vout)` - not `(txid, vout)` - identifies an output. Optional so an entry
+    /// from a zecd predating the field still decodes.
+    pub pool: Option<String>,
     /// -1 for an expired unmined transaction (it can never confirm).
     pub confirmations: i64,
     pub txid: String,
@@ -540,14 +577,30 @@ impl Client<'_> {
         self.call_typed("listtransactions", params).await
     }
 
-    /// `z_listtransactions ( count from )`: per-output history in zcashd's vocabulary
-    /// (zecd extension method).
+    /// `z_listtransactions ( count from includeWatchonly start_height end_height )`: per-output
+    /// history in zcashd's vocabulary (zecd extension method).
+    ///
+    /// The height range is the incremental cursor: `start_height` is inclusive, `end_height`
+    /// exclusive, and an upper bound excludes unmined transactions (they have no height to
+    /// compare). This is the only method carrying memo, pool and output index on one entry, so
+    /// it is what a consumer following the wallet as a log reads - and the range is what spares
+    /// it re-walking history from the newest end on every poll.
     pub async fn z_list_transactions(
         &self,
         count: Option<u32>,
         from: Option<u32>,
+        start_height: Option<u32>,
+        end_height: Option<u32>,
     ) -> Result<Vec<ZTransactionEntry>, ClientError> {
-        let params = Self::positional(vec![count.map(|c| json!(c)), from.map(|f| json!(f))]);
+        let params = Self::positional(vec![
+            count.map(|c| json!(c)),
+            from.map(|f| json!(f)),
+            // includeWatchonly: accepted and ignored, but it occupies the slot before the
+            // height bounds, so it must be filled in when either bound is given.
+            (start_height.is_some() || end_height.is_some()).then_some(json!(false)),
+            start_height.map(|h| json!(h)),
+            end_height.map(|h| json!(h)),
+        ]);
         self.call_typed("z_listtransactions", params).await
     }
 
@@ -826,7 +879,8 @@ mod tests {
             "paytxfee": 0.00000000,
             "private_keys_enabled": true,
             "avoid_reuse": false,
-            "scanning": { "duration": 0, "progress": 0.25 },
+            "scanning": { "duration": 0, "progress": 0.25, "pending_enhancements": 42 },
+            "enhanced_through": 118,
             "descriptors": false,
             "unlocked_until": 0,
             "transparent": {
@@ -842,6 +896,8 @@ mod tests {
         });
         let w: WalletInfo = serde_json::from_value(scanning).unwrap();
         assert!(w.scanning.is_scanning());
+        assert_eq!(w.scanning.pending_enhancements(), 42);
+        assert_eq!(w.enhanced_through, Some(118));
         let t = w.transparent.unwrap();
         assert!(t.restorable.unwrap());
         assert!(!t.is_default);

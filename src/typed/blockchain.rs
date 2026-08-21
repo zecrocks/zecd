@@ -40,6 +40,26 @@ pub struct BlockRef {
     pub height: u32,
 }
 
+/// The `waitforsync` result (`rpc/blockchain.rs::waitforsync`): the wallet's best scanned block
+/// plus the two enhancement fields. Returned both when the wait was satisfied and when it timed
+/// out, so `synced` is the field to branch on - a timeout is not an error.
+#[non_exhaustive]
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct SyncState {
+    /// Empty in the brief window before anything is scanned.
+    pub hash: String,
+    pub height: u32,
+    /// True only when the block scan has reached the tip *and* the enhancement backlog is
+    /// empty - i.e. history and memos are complete as of `height`.
+    pub synced: bool,
+    /// Outstanding transaction-enhancement requests; `0` when fully synced.
+    pub pending_enhancements: u64,
+    /// The height through which memos are known to be present (see
+    /// `wallet::SyncStatus::enhanced_through`). `None` means "not currently known", never
+    /// "everything is enhanced" - a consumer advancing a memo cursor must hold it still.
+    pub enhanced_through: Option<u32>,
+}
+
 /// `getblockheader` verbose result (`rpc/blockchain.rs::getblockheader`). Served from the
 /// wallet's scanned-blocks table, so only the fields a compact block carries are present -
 /// no version/merkleroot/nonce/bits/difficulty.
@@ -118,11 +138,50 @@ impl Client<'_> {
         let params = Self::positional(vec![Some(json!(height)), timeout_ms.map(|t| json!(t))]);
         self.call_typed("waitforblockheight", params).await
     }
+
+    /// `waitforsync ( timeout_ms )`: start a sync pass now, then block until the wallet is fully
+    /// caught up - block scan at the tip *and* the enhancement backlog drained, which is what
+    /// makes memos readable. `timeout_ms` of `None`/`0` waits indefinitely; a timeout is not an
+    /// error, so branch on [`SyncState::synced`].
+    pub async fn wait_for_sync(&self, timeout_ms: Option<u64>) -> Result<SyncState, ClientError> {
+        let params = Self::positional(vec![timeout_ms.map(|t| json!(t))]);
+        self.call_typed("waitforsync", params).await
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Fixtures for `waitforsync`: the satisfied case (drained backlog, a known watermark) and
+    /// the timed-out case, where `synced` is false and the watermark can be absent - the shape a
+    /// caller must not read as "everything is enhanced".
+    #[test]
+    fn sync_state_decodes_both_outcomes() {
+        let synced: SyncState = serde_json::from_value(serde_json::json!({
+            "hash": "0000000000000000000000000000000000000000000000000000000000abc123",
+            "height": 240,
+            "synced": true,
+            "pending_enhancements": 0,
+            "enhanced_through": 240,
+        }))
+        .unwrap();
+        assert!(synced.synced);
+        assert_eq!(synced.pending_enhancements, 0);
+        assert_eq!(synced.enhanced_through, Some(240));
+
+        let timed_out: SyncState = serde_json::from_value(serde_json::json!({
+            "hash": "",
+            "height": 100,
+            "synced": false,
+            "pending_enhancements": 4096,
+            "enhanced_through": serde_json::Value::Null,
+        }))
+        .unwrap();
+        assert!(!timed_out.synced);
+        assert_eq!(timed_out.pending_enhancements, 4096);
+        assert_eq!(timed_out.enhanced_through, None);
+    }
 
     /// Fixture captured from a synced regtest wallet's `getblockchaininfo`.
     #[test]

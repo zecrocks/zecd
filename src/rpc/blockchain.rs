@@ -340,6 +340,86 @@ pub(crate) async fn waitforblockheight(
     wait_for_best_block(state, wallet, timeout, move |height, _| height >= target).await
 }
 
+/// `waitforsync ( timeout )` - zecd extension: start a sync pass immediately, then block until
+/// the wallet is fully caught up, meaning **both** the block scan has reached the chain tip and
+/// the transaction-enhancement backlog has drained.
+///
+/// This exists because "caught up" has two halves and only the first is a height. A consumer
+/// that waits on `waitforblockheight` and then reads memos gets nothing for transactions whose
+/// full data has not been fetched yet - compact blocks carry no memos, so a scanned output's
+/// memo is NULL until enhancement backfills it. Answering that question previously meant
+/// combining `waitforblockheight` with a poll of `getwalletinfo.scanning`, and the backlog count
+/// itself was reachable only on the health server, which an embedded node does not run.
+///
+/// The immediate nudge matters as much as the wait: without it the first pass waits out
+/// `[sync] interval_secs`, so a caller asking "sync now, then read" pays that latency on every
+/// call. The nudge is best-effort - a wallet whose actor is gone, or whose sync has halted,
+/// still gets the wait (and the answer that it is not synced) rather than an error, since the
+/// point of the call is to report the state.
+///
+/// `timeout` is in **milliseconds** (Core's `waitfor*` convention, not `z_waitforoperation`'s
+/// seconds), and `0`/omitted waits indefinitely. **A timeout is not an error**: it returns the
+/// current state with `synced: false`, so a caller branches on the field rather than catching.
+/// That boolean is load-bearing - without it "the wait gave up" and "the wallet is ready" would
+/// be told apart only by re-deriving the predicate from the other fields.
+pub(crate) async fn waitforsync(
+    state: &AppState,
+    wallet: Option<&str>,
+    req: &RpcRequest,
+) -> Result<Value, RpcError> {
+    let timeout = wait_timeout(req, 0)?;
+    let handle = state.registry.get(wallet)?;
+    // Nudge first, so the wait below is measuring a pass that is already starting.
+    let _ = handle.sync_now().await;
+
+    let mut status = handle.subscribe_status();
+    let deadline = timeout.map(|t| Instant::now() + t);
+    let shutdown = state.shutdown_signal();
+    tokio::pin!(shutdown);
+    loop {
+        // Mark the current status seen before reading it, so an update landing mid-read wakes
+        // the wait below instead of being missed (as in `wait_for_best_block`).
+        drop(status.borrow_and_update());
+        let st = handle.status();
+        let synced = !st.scanning && st.pending_enhancements == 0;
+        let answer = || {
+            let (height, hash, _) = best_block(state, wallet)?;
+            Ok(json!({
+                "hash": hash.unwrap_or_default(),
+                "height": height,
+                "synced": synced,
+                "pending_enhancements": st.pending_enhancements,
+                "enhanced_through": st.enhanced_through,
+            }))
+        };
+        if synced {
+            return answer();
+        }
+        let now = Instant::now();
+        let remaining = match deadline {
+            Some(d) if d <= now => return answer(),
+            Some(d) => Some(d - now),
+            None => None,
+        };
+        let nap = remaining
+            .unwrap_or(WAIT_RECHECK_INTERVAL)
+            .min(WAIT_RECHECK_INTERVAL);
+        tokio::select! {
+            // Returning on shutdown keeps a no-timeout call from pinning a work-queue permit
+            // through a graceful stop.
+            _ = &mut shutdown => return answer(),
+            _ = tokio::time::sleep(nap) => {}
+            res = status.changed() => {
+                // The actor is gone: nothing will advance, so answer with what the wallet has
+                // rather than waiting out the timeout.
+                if res.is_err() {
+                    return answer();
+                }
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

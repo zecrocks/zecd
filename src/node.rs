@@ -312,6 +312,26 @@ async fn stop_actors(
     }
 }
 
+/// The per-call knobs of [`Node::send`], defaulting to what the Bitcoin-dialect sends do: the
+/// wallet's configured confirmations policy, its configured `[spend] privacy_policy`, and no
+/// named funding source. `SendOptions::default()` is therefore the plain "pay this request"
+/// call, and each field is the in-process spelling of one `z_sendmany` argument.
+#[non_exhaustive]
+#[derive(Debug, Clone, Default)]
+pub struct SendOptions {
+    /// Minimum confirmations for note selection (`z_sendmany`'s `minconf`), applied as a
+    /// symmetric override of the wallet's policy. `None` uses the configured policy. Values
+    /// below 1 are served as 1: a shielded note is never spendable at 0 confirmations.
+    pub minconf: Option<u32>,
+    /// The privacy policy for this send (`z_sendmany`'s `privacyPolicy`). `None` uses the
+    /// wallet's configured `[spend] privacy_policy`. The ladder is enforced identically to the
+    /// RPC path, including the authoritative re-check on the built proposal.
+    pub privacy: Option<crate::config::SendPrivacy>,
+    /// The funding source (`z_sendmany`'s `fromaddress`). Defaults to
+    /// [`crate::wallet::SendSource::Unspecified`] - shielded notes, no coin control.
+    pub source: crate::wallet::SendSource,
+}
+
 /// A running embedded zecd node: the wallet actors, registry, and async-operation registry,
 /// behind the same dispatch table the HTTP server uses. Owns the datadir lock for its
 /// lifetime; call [`Node::shutdown`] to stop the actors and release it cleanly.
@@ -353,6 +373,63 @@ impl Node {
             wallet = wallet.unwrap_or("default")
         );
         crate::rpc::dispatch(&self.state, wallet, &req)
+            .instrument(span)
+            .await
+    }
+
+    /// Build, prove, and broadcast a send from a caller-constructed ZIP-321 transaction
+    /// request - the memo-native send seam for embedders, and part of the supported library
+    /// surface (see the crate root).
+    ///
+    /// [`Node::call`] can reach every send RPC, but only through their zcashd/Bitcoin-dialect
+    /// argument shapes: a JSON array of `{address, amount, memo}` objects that zecd parses back
+    /// into exactly this type. A consumer that already holds a [`TransactionRequest`] - anything
+    /// building payments programmatically, memo-carrying protocols above all - would otherwise
+    /// have to render one to JSON for zecd to re-parse. Everything below this method is the RPC
+    /// path unchanged: the same single-writer actor, so sends still serialize and cannot
+    /// double-spend; the same privacy ladder; the same `SendSource` one-source-per-send rule.
+    ///
+    /// Two differences from `z_sendmany` are worth knowing:
+    ///
+    /// - **Duplicate recipients are accepted.** A [`TransactionRequest`] may pay one address
+    ///   from several payments, and nothing in consensus or the wallet forbids two shielded
+    ///   outputs to one address - it is how a batch of memos to a single address is written in
+    ///   one transaction, for one fee. `z_sendmany` refuses it for zcashd parity (relaxable with
+    ///   `[rpc] allow_duplicate_shielded_recipients`); this seam never had that check to relax.
+    /// - **It is synchronous.** `z_sendmany` returns an opid and proves on a detached task;
+    ///   this awaits the send and returns the txid, so there is no operation to poll and
+    ///   nothing lost if the process restarts (the async-operation registry is in-memory).
+    ///
+    /// Errors are the RPC errors, unchanged - `-18` for an unknown wallet, `-6` for
+    /// insufficient funds, `-4` for a policy refusal - so an embedder branching on
+    /// [`RpcError::code`] reads the same codes an HTTP caller does.
+    pub async fn send(
+        &self,
+        wallet: Option<&str>,
+        request: zip321::TransactionRequest,
+        opts: SendOptions,
+    ) -> Result<zcash_protocol::TxId, RpcError> {
+        // Resolve exactly as dispatch does, so an unknown wallet is the same `-18` here as over
+        // the wire, and a non-Zcash wallet (when a second engine lands) fails at the same
+        // single-arm match rather than in the send path.
+        let handle = self.state.registry.get(wallet)?;
+        // Visible to `getrpcinfo` like any dispatched call. Named for the seam rather than for
+        // an RPC method, since no wire method is being served.
+        let _active = self.state.active.begin("node::send");
+        let span = tracing::info_span!(
+            "rpc",
+            method = "node::send",
+            wallet = wallet.unwrap_or("default")
+        );
+        use tracing::Instrument as _;
+        handle
+            .send(
+                request,
+                opts.minconf
+                    .map(crate::rpc::wallet_methods::symmetrical_confirmations),
+                opts.privacy.unwrap_or(self.state.config.spend.privacy),
+                opts.source,
+            )
             .instrument(span)
             .await
     }
@@ -425,6 +502,7 @@ pub(crate) mod testutil {
             cookiefile: None,
             work_queue: 16,
             allowed_methods,
+            allow_duplicate_shielded_recipients: false,
         };
         let config = AppConfig {
             network: crate::network::ZNetwork::Test,
@@ -543,6 +621,33 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(err.code, crate::error::codes::RPC_WALLET_NOT_FOUND);
+    }
+
+    /// `send` resolves its wallet through the same registry lookup dispatch uses, so an unknown
+    /// or absent wallet is the identical `-18` a `z_sendmany` over the wire would return -
+    /// rather than a panic, or a different error taxonomy for the in-process seam.
+    #[tokio::test]
+    async fn send_resolves_wallets_exactly_as_dispatch_does() {
+        let node = test_node();
+        let request = zip321::TransactionRequest::empty();
+
+        for wallet in [None, Some("nope")] {
+            let err = node
+                .send(wallet, request.clone(), super::SendOptions::default())
+                .await
+                .unwrap_err();
+            assert_eq!(
+                err.code,
+                crate::error::codes::RPC_WALLET_NOT_FOUND,
+                "wallet {wallet:?} must fail resolution the way dispatch does"
+            );
+            // Same message shape as the wire path, so an embedder's logs read identically.
+            let dispatched = node
+                .call(wallet, "getwalletinfo", vec![])
+                .await
+                .unwrap_err();
+            assert_eq!(err.message, dispatched.message);
+        }
     }
 
     /// Plain control methods answer without any wallet or upstream.

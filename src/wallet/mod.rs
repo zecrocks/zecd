@@ -78,6 +78,7 @@ impl ConnState {
 
 /// A snapshot of sync state, published by the actor and read by blockchain/wallet RPCs.
 #[derive(Clone, Debug, Default)]
+#[non_exhaustive]
 pub struct SyncStatus {
     pub connected: bool,
     /// The zebra endpoint, e.g. `"zebra-rpc 127.0.0.1:18234"`.
@@ -108,6 +109,25 @@ pub struct SyncStatus {
     /// fully ready to serve history once this reaches `0`. Surfaced on `/status`, factored into
     /// `synced` readiness, and reflected in `getwalletinfo.scanning`.
     pub pending_enhancements: u64,
+    /// The height through which the wallet is **fully enhanced**: every transaction mined at or
+    /// below it has had its full data fetched, so its memos are readable. `None` means "not
+    /// currently known" - never "everything is enhanced".
+    ///
+    /// This exists because zecd scans and enhances separately, which makes `fully_scanned` the
+    /// wrong bound for anything reading memos. A scanned-but-unenhanced output is *present*
+    /// with a NULL memo, so a consumer that treats "scanned" as "memos available" - or filters
+    /// on `memo IS NOT NULL` and advances a cursor past what it saw - silently and permanently
+    /// skips those outputs: they are already behind the cursor by the time enhancement fills
+    /// them in. Clamping such a cursor to `enhanced_through` instead of `fully_scanned` makes
+    /// that unrepresentable.
+    ///
+    /// It is a floor, not a promise about anything above it: heights above may be enhanced too.
+    /// It is `None` while the block scan is running (the backlog is unmeasured there, see
+    /// `pending_enhancements`), when the backlog is too large to resolve cheaply
+    /// (`actor::ENHANCED_THROUGH_MAX_PROBE`), and on a database read error - all cases where a
+    /// consumer should hold its cursor still rather than advance it. Surfaced on `/status`,
+    /// `getwalletinfo.scanning`, and `waitforsync`.
+    pub enhanced_through: Option<u32>,
     /// True when the wallet is passphrase-encrypted (Bitcoin Core's `HasEncryptionKeys()`).
     /// Drives whether `getwalletinfo` reports `unlocked_until` and how the passphrase RPCs behave.
     pub encrypted: bool,
@@ -198,12 +218,15 @@ pub struct DerivedAddress {
 /// `fromaddress`. One source per send: transparent UTXOs and shielded notes are never mixed in
 /// one transaction, so a shortfall on the named source is `-6` rather than a silent top-up from
 /// the other pool.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum SendSource {
     /// No source named (`sendtoaddress`/`sendmany`, which have no `fromaddress`): shielded notes
     /// fund the send. One legacy exception: under `AllowFullyTransparent` with all-transparent
     /// recipients, the fully-transparent t->t branch still engages (the pre-`SendSource`
     /// behaviour of the Bitcoin-dialect sends, pinned by the t2t regtests).
+    ///
+    /// The default: naming no source is what every send that has no `fromaddress` does.
+    #[default]
     Unspecified,
     /// An explicitly shielded source (`z_sendmany` from a UA / shielded address): the account's
     /// shielded notes only - never transparent UTXOs, whatever the policy. Per-address shielded
@@ -346,6 +369,13 @@ pub enum WalletCommand {
     Unlock {
         passphrase: Passphrase,
         timeout_secs: i64,
+        reply: oneshot::Sender<Result<(), RpcError>>,
+    },
+    /// Ask the actor to run a sync pass now rather than waiting out `[sync] interval_secs`
+    /// (`waitforsync`). The reply is sent as soon as the request is recorded - it acknowledges
+    /// the nudge, not the pass, which runs on the actor's next loop iteration. Waiting for the
+    /// *result* is the caller's job, by watching `SyncStatus`.
+    SyncNow {
         reply: oneshot::Sender<Result<(), RpcError>>,
     },
     /// Zeroize the in-memory seed and cancel any pending relock (`walletlock`).
@@ -543,6 +573,13 @@ impl WalletHandle {
             .map_err(|_| RpcError::misc("wallet actor is not running"))?;
         rx.await
             .map_err(|_| RpcError::misc("wallet actor dropped the reply"))?
+    }
+
+    /// Ask the actor to start a sync pass immediately (see [`WalletCommand::SyncNow`]).
+    /// Returns once the nudge is recorded, not once the pass completes.
+    pub async fn sync_now(&self) -> Result<(), RpcError> {
+        self.dispatch(|reply| WalletCommand::SyncNow { reply })
+            .await
     }
 
     pub async fn get_new_address(&self, request: ReceiverRequest) -> Result<String, RpcError> {

@@ -4,12 +4,39 @@
 //!
 //! # Using zecd as a library
 //!
+//! Releases are published to crates.io as [`zecd`](https://crates.io/crates/zecd); depend on
+//! the released crate rather than on a git revision.
+//!
 //! The supported embedding surface:
 //!
 //! - [`node::NodeBuilder`] / [`node::Node`] - build a running node (wallet actors, sync,
 //!   async operations) without the HTTP servers, and dispatch any RPC in-process via
 //!   [`node::Node::call`] with wire-identical semantics (same method table, same error
 //!   codes). See `examples/embedded.rs`.
+//! - [`node::Node::send`] + [`node::SendOptions`] - build, prove, and broadcast a send from a
+//!   `zip321::TransactionRequest` the caller already holds, instead of rendering one to
+//!   `z_sendmany`'s JSON for zecd to parse back. It accepts duplicate recipients (paying one
+//!   address from several memo-carrying payments in one transaction), which the RPC refuses by
+//!   default for zcashd parity. Everything below it is the RPC send path unchanged.
+//! - [`wallet::read`] - the read-side query API over the wallet database: [`wallet::read::TxQuery`]
+//!   / [`wallet::read::query_transactions`] and the [`wallet::read::TxRecord`] /
+//!   [`wallet::read::TxOutputRecord`] shapes the RPC handlers themselves are built from, for an
+//!   embedder with its own data model. [`wallet::read::query_transactions`] documents the total
+//!   order its results are in - `(mined_height, txid)`, with outputs in `(pool, output_index)`
+//!   order - which is what a consumer replaying wallet history as a log needs in order to
+//!   paginate and resume deterministically.
+//! - [`config::engine_dir`] and [`config::WalletEntry::engine_dir`] - the only supported way to
+//!   compute the `engine_dir` path that [`wallet::read`] takes. A wallet's librustzcash files
+//!   live in a per-coin engine subdirectory of its wallet directory, and nothing outside these
+//!   helpers should join those path components itself; they are named here so a supported API
+//!   is not left taking a path that only internal API can produce.
+//! - [`wallet::keys::seed_with_identity`] and [`wallet::keys::pinned_ufvk`] - the seed
+//!   and viewing key of an on-disk wallet, for protocol-layer key derivation (an application
+//!   signing its own payloads with a BIP 44 child key). Deliberately *not* an RPC: zecd exports
+//!   no key material over the wire, and signing a caller-supplied digest with a wallet key would
+//!   be a spend oracle (that digest can be a transaction sighash). In-process is different -
+//!   the caller already holds the datadir and the age identity file, so these add no reach they
+//!   did not have, only a supported spelling for it.
 //! - [`config::AppConfig::resolve_overrides`] + [`config::ConfigOverrides`] - resolve the
 //!   effective configuration without clap.
 //! - [`error::RpcError`] and [`error::codes`] - the Bitcoin Core error taxonomy `call`
@@ -44,7 +71,41 @@
 //! on a data directory this build created.
 //!
 //! Every other public item exists because the binary and its tests are built from this crate;
-//! treat it as internal API with no stability promise across commits.
+//! treat it as internal API with no stability promise across commits. Worth naming explicitly,
+//! because they look inviting and are the ones embedders have asked about: [`chain`] (the
+//! `ChainSource` trait and its zebra/lightwalletd implementations) is the multi-backend seam
+//! and is reshaped as backends and coins are added; [`wallet::actor`] is the single-writer
+//! actor's command protocol, which every wallet feature extends; and [`wallet::open`] /
+//! [`wallet::store`] are the on-disk layout, whose invariants [`node::NodeBuilder`] exists to
+//! uphold (datadir lock, binding verification, the single-spending-wallet rule) and which a
+//! direct caller would have to re-uphold by hand.
+//!
+//! Supported items keep their names and semantics; they may gain fields and variants, so match
+//! non-exhaustively and construct option structs with `..Default::default()`. One caveat
+//! inherent to this surface: [`node::Node::send`] takes a `zip321::TransactionRequest` and
+//! [`node::SendOptions`] carries a [`config::SendPrivacy`], so a semver bump of `zip321` is
+//! visible here. That coupling is deliberate - it is the same type `z_sendmany` parses into,
+//! and hiding it behind a zecd-owned mirror would mean a second type to keep in lockstep with
+//! librustzcash for no gain.
+//!
+//! # Running several writable wallets
+//!
+//! At most one loaded wallet may hold spending keys (per coin), enforced at `init` and again at
+//! startup. It is a custody line, not a technical limit: with several spenders in one node,
+//! "which key can this RPC credential spend?" stops having a one-word answer, and one datadir's
+//! compromise reaches every seed in it. An application managing several independent writable
+//! stores runs **one node per store** - separate datadirs (each with its own lock, so a
+//! collision fails loudly at startup rather than corrupting a wallet database), separate ports
+//! if the HTTP servers are in play. That is the shape zecd's own regtest harness runs, with the
+//! funder and the wallet under test as sibling daemons. Watch-only replicas are unrestricted
+//! and can be loaded anywhere, including alongside the spender they mirror.
+
+// Re-exports of the third-party types that appear on the supported surface, so an embedder
+// depends on the same versions zecd does rather than pinning them independently - where a
+// mismatch surfaces as a type error naming two identical-looking paths. `zip321` and `TxId`
+// are `node::Node::send`'s parameter and return types.
+pub use zcash_protocol::TxId;
+pub use zip321;
 
 pub mod address;
 pub mod amount;

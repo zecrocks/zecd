@@ -122,6 +122,31 @@ def main() -> int:
     # waitforblock watches the tip for one hash: either it is still the tip, or the chain moved on.
     w = rpc.call("waitforblock", best, 250)
     ck("waitforblock(tip) returns that block", w["hash"] == best or w["height"] > count, f"{w} vs {best}@{count}")
+    # waitforsync is zecd's extension: it answers the *other* half of "caught up" - whether the
+    # transaction-enhancement backlog has drained, which is what makes memos readable. The
+    # daemon under test is synced, so this returns promptly with synced=True.
+    w = rpc.call("waitforsync", 30_000)
+    ck("waitforsync returns the sync-state shape",
+       isinstance(w, dict)
+       and set(w) == {"hash", "height", "synced", "pending_enhancements", "enhanced_through"}, w)
+    ck("waitforsync reports synced on a caught-up wallet", w["synced"] is True, w)
+    ck("waitforsync drained backlog is 0", w["pending_enhancements"] == 0, w)
+    # Once synced, the watermark must be a real height - `null` means "unknown", and a caller
+    # advancing a memo cursor relies on this being present exactly when it is safe to advance.
+    ck("waitforsync enhanced_through is a height when synced",
+       isinstance(w["enhanced_through"], int) and w["enhanced_through"] >= 0, w)
+    ck("waitforsync enhanced_through does not exceed the scanned height",
+       w["enhanced_through"] <= w["height"], w)
+    try:
+        rpc.call("waitforsync", -1)
+        ck("waitforsync negative timeout raises", False)
+    except JSONRPCException as e:
+        ck("waitforsync negative timeout -> code -1", e.code == -1, e.code)
+    try:
+        rpc.call("waitforsync", "soon")
+        ck("waitforsync non-integer timeout raises", False)
+    except JSONRPCException as e:
+        ck("waitforsync non-integer timeout -> code -3", e.code == -3, e.code)
     try:
         rpc.call("waitforblockheight")
         ck("waitforblockheight without a height raises", False)
@@ -199,6 +224,32 @@ def main() -> int:
     # daemon is shielded-only, so it must be absent (the default response shape is unchanged). The
     # present-and-populated case is asserted by the regtest_transparent e2e.
     ck("getwalletinfo omits transparent block when disabled", "transparent" not in wi)
+    # `scanning` is Core's union: an object while scanning or draining the enhancement backlog,
+    # literal False when idle. When it is an object it carries zecd's `pending_enhancements`
+    # extension - the only route to the backlog count for a caller with no health server (an
+    # embedded node, or any pure JSON-RPC client). This suite usually runs against a caught-up
+    # daemon, so accept either shape and only constrain the object form.
+    scanning = wi.get("scanning")
+    ck("getwalletinfo scanning is an object or False",
+       scanning is False or isinstance(scanning, dict), repr(scanning))
+    # `enhanced_through` is top-level, NOT inside `scanning` - that object is False once the
+    # wallet is idle, which is precisely when a consumer following history as a log is ready to
+    # advance its cursor and therefore needs the watermark. The field must be present (possibly
+    # null) in both states, which is the property this asserts.
+    ck("getwalletinfo carries a top-level enhanced_through", "enhanced_through" in wi, wi.keys())
+    ck("enhanced_through is a height or null",
+       wi["enhanced_through"] is None
+       or (isinstance(wi["enhanced_through"], int) and wi["enhanced_through"] >= 0),
+       repr(wi.get("enhanced_through")))
+    ck("enhanced_through is not nested inside scanning",
+       not (isinstance(scanning, dict) and "enhanced_through" in scanning), repr(scanning))
+    if isinstance(scanning, dict):
+        ck("scanning carries pending_enhancements", "pending_enhancements" in scanning,
+           repr(scanning))
+        ck("pending_enhancements is a non-negative integer",
+           isinstance(scanning.get("pending_enhancements"), int)
+           and scanning["pending_enhancements"] >= 0,
+           repr(scanning.get("pending_enhancements")))
 
     print("== amounts are exact decimals ==")
     bal = rpc.call("getbalance")
@@ -635,10 +686,44 @@ def main() -> int:
     except JSONRPCException as e:
         ck("z_listtransactions negative count -> -8", e.code == -8, e.code)
 
+    # The height range is zecd's incremental cursor: [start_height, end_height). An unreachable
+    # window is empty rather than an error, and an inverted one is rejected outright (it can only
+    # ever be empty, so it almost certainly means the arguments were swapped).
+    tip = rpc.call("getblockcount")
+    windowed = rpc.call("z_listtransactions", 100, 0, False, 0, tip + 1)
+    ck("z_listtransactions accepts a height range", isinstance(windowed, list))
+    ck("z_listtransactions full range covers the unbounded read",
+       len(windowed) >= len([z for z in ztx if z["status"] == "mined"]), len(windowed))
+    future = rpc.call("z_listtransactions", 100, 0, False, tip + 1_000_000, tip + 1_000_001)
+    ck("z_listtransactions future-only range is empty", future == [], future)
+    try:
+        rpc.call("z_listtransactions", 100, 0, False, 50, 10)
+        ck("z_listtransactions inverted range raises", False)
+    except JSONRPCException as e:
+        ck("z_listtransactions inverted range -> -8", e.code == -8, e.code)
+    try:
+        rpc.call("z_listtransactions", 100, 0, False, -1)
+        ck("z_listtransactions negative start_height raises", False)
+    except JSONRPCException as e:
+        ck("z_listtransactions negative start_height -> -8", e.code == -8, e.code)
+    try:
+        rpc.call("z_listtransactions", 100, 0, False, "soon")
+        ck("z_listtransactions non-integer start_height raises", False)
+    except JSONRPCException as e:
+        ck("z_listtransactions non-integer start_height -> -3", e.code == -3, e.code)
+
     print("== listsinceblock (restart-safe poller) ==")
     lsb = rpc.call("listsinceblock")
     ck("has transactions list", isinstance(lsb.get("transactions"), list))
     ck("has removed list", isinstance(lsb.get("removed"), list))
+    # Every history entry names its pool: `vout` is the index within that pool's bundle, so
+    # (txid, vout) is ambiguous for a transaction with outputs in more than one pool - and this
+    # is the natural incremental cursor, where that ambiguity would bite.
+    for t in lsb["transactions"]:
+        ck("listsinceblock entry has pool", "pool" in t, t)
+        ck("listsinceblock pool valid",
+           t["pool"] in ("transparent", "sapling", "orchard", "ironwood"), t.get("pool"))
+        break
     ck("lastblock 64-hex", isinstance(lsb.get("lastblock"), str) and len(lsb["lastblock"]) == 64)
     # The daemon may still be scanning a just-mined block when this suite starts (the
     # harness proceeds as soon as a tx hits 1 confirmation), so the `best` captured at the
@@ -779,6 +864,18 @@ def main() -> int:
         ck("z_sendmany unknown privacyPolicy raises", False)
     except JSONRPCException as e:
         ck("z_sendmany unknown privacyPolicy -> code -8", e.code == -8, e.code)
+    try:
+        # A repeated recipient is -8, as in zcashd. zecd can be configured to permit repeated
+        # *shielded* recipients ([rpc] allow_duplicate_shielded_recipients, for protocols that
+        # batch memo-carrying payments to one address); this daemon runs the default, so the
+        # refusal must still stand - the opt-in must not have become the behaviour.
+        rpc.call("z_sendmany", addr,
+                 [{"address": addr, "amount": "0.1"}, {"address": addr, "amount": "0.2"}])
+        ck("z_sendmany duplicate recipient raises", False)
+    except JSONRPCException as e:
+        ck("z_sendmany duplicate recipient -> code -8", e.code == -8, e.code)
+        ck("z_sendmany duplicate recipient names the address",
+           "duplicated recipient address" in str(e), str(e))
     try:
         # An unparseable fromaddress is -5 before any send logic.
         rpc.call("z_sendmany", "not-an-address", [{"address": addr, "amount": "0.1"}])

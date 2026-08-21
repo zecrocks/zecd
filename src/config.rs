@@ -532,6 +532,7 @@ impl ZebraConfig {
 }
 
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct RpcConfig {
     pub bind: IpAddr,
     pub port: u16,
@@ -549,6 +550,20 @@ pub struct RpcConfig {
     /// these methods, with anything else rejected as method-not-found (`-32601`). Names are
     /// validated at startup against [`crate::rpc::ALL_METHODS`], so a typo fails fast.
     pub allowed_methods: Vec<String>,
+    /// Accept a repeated *shielded* recipient in one `z_sendmany` call (default false).
+    ///
+    /// zcashd rejects any duplicate recipient address, and zecd matches that by default: this
+    /// is a zcashd-dialect method, and quietly accepting input a client was written against a
+    /// refusal for is how bugs get baked in. But nothing in consensus or the wallet forbids two
+    /// shielded outputs paying one address - it is how a batch of memo-carrying payments to a
+    /// single address rides in one transaction, for one ZIP-317 fee - so an operator running
+    /// such a protocol can opt in here. Transparent duplicates stay refused whatever this is
+    /// set to: Bitcoin Core dedupes them for reasons of its own in history accounting, and
+    /// nothing asked for that to change.
+    ///
+    /// Embedded callers need no knob: [`crate::node::Node::send`] takes a
+    /// `zip321::TransactionRequest`, which expresses repeated recipients natively.
+    pub allow_duplicate_shielded_recipients: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -875,6 +890,7 @@ struct RpcFile {
     cookiefile: Option<PathBuf>,
     work_queue: Option<usize>,
     allowed_methods: Option<Vec<String>>,
+    allow_duplicate_shielded_recipients: Option<bool>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1527,6 +1543,7 @@ impl AppConfig {
             cookiefile: None,
             work_queue: None,
             allowed_methods: None,
+            allow_duplicate_shielded_recipients: None,
         });
         // RPC password precedence: `--rpcpassword` / `ZECD_RPC_PASSWORD` (clap) > `[rpc]
         // password_file` > inline `[rpc] password`. A configured `password_file` that can't be
@@ -1582,6 +1599,9 @@ impl AppConfig {
                 .or_else(|| Some(datadir.join(".cookie"))),
             work_queue: rpc_file.work_queue.unwrap_or(100).max(1),
             allowed_methods,
+            allow_duplicate_shielded_recipients: rpc_file
+                .allow_duplicate_shielded_recipients
+                .unwrap_or(false),
         };
 
         let keys_file = file.keys.unwrap_or(KeysFile {
@@ -2625,6 +2645,33 @@ mod tests {
         let cli = Cli::parse_from(["zecd", "--conf", conf.to_str().unwrap()]);
         let cfg = AppConfig::resolve(&cli).unwrap();
         assert_eq!(cfg.sync.interval_secs, 20);
+    }
+
+    /// The duplicate-shielded-recipient opt-in defaults off (zcashd parity is the default
+    /// behaviour, not something an operator has to ask for) and parses both ways.
+    #[cfg(feature = "cli")]
+    #[test]
+    fn allow_duplicate_shielded_recipients_defaults_off_and_parses() {
+        use clap::Parser as _;
+        let dir = tempfile::tempdir().unwrap();
+        let conf = dir.path().join("zecd.toml");
+
+        for (body, want) in [
+            ("network = \"test\"\n", false),
+            (
+                "[rpc]\nallow_duplicate_shielded_recipients = false\n",
+                false,
+            ),
+            ("[rpc]\nallow_duplicate_shielded_recipients = true\n", true),
+        ] {
+            std::fs::write(&conf, body).unwrap();
+            let cli = Cli::parse_from(["zecd", "--conf", conf.to_str().unwrap()]);
+            let cfg = AppConfig::resolve(&cli).unwrap();
+            assert_eq!(
+                cfg.rpc.allow_duplicate_shielded_recipients, want,
+                "for config: {body}"
+            );
+        }
     }
 
     #[cfg(feature = "cli")]

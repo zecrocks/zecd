@@ -379,6 +379,7 @@ mod tests {
             cookiefile: Some(cookie.clone()),
             work_queue: 16,
             allowed_methods: vec![],
+            allow_duplicate_shielded_recipients: false,
         };
         let auth = Authenticator::from_config(&rpc).unwrap();
 

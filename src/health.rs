@@ -170,6 +170,7 @@ fn snapshot(state: &AppState) -> Snapshot {
                     "scan_progress": st.scan_progress,
                     "scanning": st.scanning,
                     "pending_enhancements": st.pending_enhancements,
+                    "enhanced_through": st.enhanced_through,
                     "encrypted": st.encrypted,
                     "locked": locked,
                     "ready": w_ready,

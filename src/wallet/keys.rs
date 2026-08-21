@@ -165,6 +165,44 @@ pub fn decrypt_seed_with_identity(
     store.decrypt_seed(identities.iter().map(|i| i.as_ref() as _))
 }
 
+/// The seed of the wallet whose `keys.toml` is at `keys_path`, decrypted with the age identity
+/// file at `identity_path`. `Ok(None)` means the wallet holds no seed (a watch-only import).
+///
+/// This and [`pinned_ufvk`] are the supported key seams for an embedder doing protocol-layer
+/// derivation of its own - signing application payloads with a BIP 44 child key, say. They are
+/// path-based rather than taking a `WalletStore` so that type stays internal.
+///
+/// Deliberately in-process only: zecd exports no key material over RPC, and a
+/// sign-this-digest RPC would be a spend oracle, since a caller-chosen 32-byte digest can be
+/// the sighash of a transaction spending the wallet's UTXOs. An in-process caller already
+/// holds the datadir and the identity file, so this grants no reach it did not have - it only
+/// spares it a reimplementation of the `keys.toml` format. The returned seed zeroizes on drop;
+/// the caller owns that discipline for anything derived from it.
+///
+/// A passphrase-encrypted wallet is not readable this way (there is no identity file to read):
+/// its seed is only ever decrypted by the running actor, via `walletpassphrase`.
+pub fn seed_with_identity(
+    keys_path: &Path,
+    identity_path: &Path,
+) -> anyhow::Result<Option<SecretVec<u8>>> {
+    let store = WalletStore::read(keys_path)?;
+    decrypt_seed_with_identity(&store, identity_path)
+}
+
+/// The Unified Full Viewing Key pinned in the wallet's `keys.toml`, as its encoded string.
+///
+/// This is the pin `init` records and every startup verifies the wallet database's account
+/// against (see `crate::wallet::binding`), so it names the account the daemon actually serves.
+/// `Ok(None)` means the file predates the pin and the daemon has not yet backfilled it.
+/// Available for every custody model - watch-only, identity-file, and passphrase-encrypted
+/// alike - because a viewing key is not a secret in the way a seed is: it reads the wallet, it
+/// cannot spend from it.
+pub fn pinned_ufvk(keys_path: &Path) -> anyhow::Result<Option<String>> {
+    Ok(WalletStore::read(keys_path)?
+        .pinned_ufvk()
+        .map(str::to_string))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -292,6 +330,50 @@ mod tests {
                 Ok(_) => panic!("a group/other-readable identity must be refused"),
             }
         }
+    }
+
+    /// The path-based key seams an embedder is pointed at: they must agree with what the
+    /// daemon's own `WalletStore` path produces, since the whole point is to spare a consumer
+    /// from reimplementing the `keys.toml` format (and from drifting when it changes).
+    #[test]
+    fn path_based_key_seams_agree_with_the_store() {
+        let dir = tempfile::tempdir().unwrap();
+        let kp = crate::wallet::store::keys_path(dir.path());
+        let identity = age::x25519::Identity::generate();
+        let recipient = identity.to_public();
+        let mnemonic = <Mnemonic<English>>::from_phrase(PHRASE).unwrap();
+        const PIN: &str = "uviewtest1keystestplaceholder";
+        WalletStore::init_with_mnemonic(
+            &kp,
+            std::iter::once(&recipient as &dyn age::Recipient),
+            &mnemonic,
+            BlockHeight::from_u32(1),
+            ZNetwork::Test,
+            PIN,
+        )
+        .unwrap();
+        let id_path = dir.path().join("identity.txt");
+        {
+            use age::secrecy::ExposeSecret as _;
+            std::fs::write(&id_path, identity.to_string().expose_secret()).unwrap();
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(&id_path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+
+        // The seed is the mnemonic's, byte for byte.
+        let seed = seed_with_identity(&kp, &id_path)
+            .unwrap()
+            .expect("the wallet has a stored mnemonic");
+        let expected = <Mnemonic<English>>::from_phrase(PHRASE)
+            .unwrap()
+            .to_seed("");
+        assert_eq!(seed.expose_secret().as_slice(), &expected[..]);
+
+        // The pin is the one `init` recorded - the account the daemon verifies against.
+        assert_eq!(pinned_ufvk(&kp).unwrap().as_deref(), Some(PIN));
     }
 
     /// The permission gate: owner-only modes load, any group/other access bit refuses.
