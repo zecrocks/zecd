@@ -143,6 +143,22 @@ async fn regtest_data_directory_layout_migration() {
     zecd.wait_until_synced(target, FUND_TIMEOUT)
         .await
         .expect("zecd scans the funding payment");
+    // "Caught up" has two halves and the wait above is only the first of them. Compact blocks
+    // carry no memos, so the received output's memo stays NULL until either the mempool stream
+    // stored the full transaction at 0-conf or the enhancement backlog drained. This test mines
+    // immediately after the funder's send, which can beat the 2s mempool poller - leaving the
+    // memo assertion below racing enhancement rather than reading a settled wallet. It lost that
+    // race on a faster node, and reported it as a migration failure even though the migration
+    // had not run yet. `waitforsync` is the half that waits for the backlog.
+    let sync = zecd
+        .call("waitforsync", json!([FUND_TIMEOUT.as_millis() as u64]))
+        .await
+        .expect("waitforsync");
+    assert_eq!(
+        sync["synced"], true,
+        "the wallet must be fully synced - scan at the tip and enhancement drained - before the \
+         migration's preconditions are read: {sync}"
+    );
 
     // Everything the migration has to carry across, recorded from the running daemon.
     let txid = zecd
