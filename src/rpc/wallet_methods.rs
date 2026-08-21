@@ -695,22 +695,35 @@ fn push_wallet_tx_fields(entry: &mut Value, tx: &read::TxRecord, time: i64) {
 }
 
 /// Append an output's shielded memo as extension fields beyond Bitcoin Core's set, using
-/// zcashd's `z_viewtransaction` names: `memo` is the raw ZIP-302 bytes in hex, `memoStr`
-/// the decoded text for text memos. Empty/absent memos add nothing.
+/// zcashd's `z_viewtransaction` names: `memo` is the raw stored bytes in hex, `memoStr` the
+/// decoded text for ZIP-302 text memos.
+///
+/// **`memo` is emitted from the raw bytes and is never gated on the ZIP-302 parse succeeding**,
+/// only `memoStr` is. The two are different questions: a memo whose lead byte is at or below
+/// `0xF4` is *declared* to be UTF-8 text, but nothing on the consensus side enforces that, so a
+/// protocol embedding arbitrary bytes in that lead-byte space produces a memo that fails
+/// `Memo::try_from` while still being perfectly good data the wallet stored. Gating the hex
+/// field on the parse dropped those memos from the response entirely - no `memo`, no `memoStr`,
+/// and no error - which is silent data loss for the caller and indistinguishable from an output
+/// that carried no memo at all.
+///
+/// The one memo still dropped is the canonical **empty** memo (`0xF6` followed by zeros), which
+/// every shielded output without a memo carries: emitting 1024 hex characters of padding on
+/// every such entry is noise, and its absence is unambiguous. NB that makes an absent `memo`
+/// field mean "empty memo", never "unparseable memo".
 fn push_memo_fields(entry: &mut Value, memo: Option<&[u8]>) {
     let Some(bytes) = memo else { return };
-    let Some(parsed) = MemoBytes::from_bytes(bytes)
+    // Parse for two purposes only: recognizing the empty memo, and decoding `memoStr`. A parse
+    // failure leaves `parsed` as `None` and the raw bytes are still reported below.
+    let parsed = MemoBytes::from_bytes(bytes)
         .ok()
-        .and_then(|mb| Memo::try_from(&mb).ok())
-    else {
-        return;
-    };
-    if matches!(parsed, Memo::Empty) {
+        .and_then(|mb| Memo::try_from(&mb).ok());
+    if matches!(parsed, Some(Memo::Empty)) {
         return;
     }
     let obj = entry.as_object_mut().expect("entry is a JSON object");
     obj.insert("memo".into(), json!(hex::encode(bytes)));
-    if let Memo::Text(text) = &parsed {
+    if let Some(Memo::Text(text)) = &parsed {
         obj.insert("memoStr".into(), json!(&**text));
     }
 }
@@ -3248,6 +3261,59 @@ mod tests {
         assert!(e[1].get("abandoned").is_none());
         assert_eq!(e[0]["address"], e[1]["address"]);
         assert_eq!(e[0]["vout"], e[1]["vout"]);
+    }
+
+    /// The `memo` hex field reports the stored bytes whether or not they parse as ZIP-302; only
+    /// `memoStr` depends on the parse. The regression this guards is a binary memo whose lead
+    /// byte falls in the text range (<= 0xF4) but whose body is not valid UTF-8: it parses as
+    /// nothing, and gating the hex on the parse dropped it from the response silently.
+    #[test]
+    fn memo_hex_is_reported_even_when_the_zip302_parse_fails() {
+        let fields = |bytes: Option<Vec<u8>>| {
+            let mut entry = json!({});
+            push_memo_fields(&mut entry, bytes.as_deref());
+            entry
+        };
+
+        // Text memo: both fields.
+        let text = fields(Some(text_memo_bytes("gm")));
+        assert_eq!(text["memoStr"], "gm");
+        assert_eq!(text["memo"], hex::encode(text_memo_bytes("gm")));
+
+        // Declared text (lead byte <= 0xF4) but not valid UTF-8: a lone 0x80 continuation byte
+        // cannot start a UTF-8 sequence, so `Memo::try_from` rejects it. The bytes are still
+        // real stored data and must come back.
+        let mut binary = vec![0u8; 512];
+        binary[0] = 0x01;
+        binary[1] = 0x80;
+        let bin = fields(Some(binary.clone()));
+        assert_eq!(
+            bin["memo"],
+            hex::encode(&binary),
+            "unparseable memo bytes must still be reported as hex"
+        );
+        assert!(
+            bin.get("memoStr").is_none(),
+            "memoStr is reserved for memos that decode as text"
+        );
+
+        // Arbitrary-format memo (lead byte 0xFF): hex only, no text.
+        let mut arbitrary = vec![0u8; 512];
+        arbitrary[0] = 0xFF;
+        let arb = fields(Some(arbitrary.clone()));
+        assert_eq!(arb["memo"], hex::encode(&arbitrary));
+        assert!(arb.get("memoStr").is_none());
+
+        // The canonical empty memo stays dropped - every memoless shielded output carries one,
+        // and its absence is what callers already read as "no memo".
+        let mut empty = vec![0u8; 512];
+        empty[0] = 0xF6;
+        let e = fields(Some(empty));
+        assert!(e.get("memo").is_none() && e.get("memoStr").is_none());
+
+        // No stored memo at all: nothing, as before.
+        let none = fields(None);
+        assert!(none.get("memo").is_none() && none.get("memoStr").is_none());
     }
 
     #[test]

@@ -363,13 +363,20 @@ fn tx_unexpired_sql(alias: &str) -> String {
 /// and prefers the recipient recorded at construction time for outputs the wallet created. So
 /// `to_address` is already the address observably paid on chain, and zecd does no rewriting of
 /// its own (it used to map the unified encoding back to the t-address here).
-fn load_outputs(conn: &Connection, txid: &[u8]) -> anyhow::Result<Vec<TxOutputRecord>> {
-    let mut stmt = conn.prepare(
-        "SELECT output_pool, output_index, from_account_uuid, to_account_uuid,
-                to_address, value, is_change, recipient_key_scope, memo
+/// The statement [`load_outputs`] runs. Ordered by `(output_pool, output_index)`, the
+/// within-transaction half of the total order documented on [`query_transactions`]: a
+/// transaction can hold outputs in more than one pool, and `output_index` is the index within
+/// that pool's bundle, so the pool must lead for the pair to be a well-defined key. Named so
+/// the ordering tests exercise this exact text rather than a transcription of it.
+const LOAD_OUTPUTS_SQL: &str = "SELECT output_pool, output_index, from_account_uuid,
+                to_account_uuid, to_address, value, is_change, recipient_key_scope, memo
          FROM v_tx_outputs
-         WHERE txid = :txid",
-    )?;
+         WHERE txid = :txid
+         ORDER BY output_pool ASC, output_index ASC";
+
+/// Outputs come back ordered by `(output_pool, output_index)` - see [`LOAD_OUTPUTS_SQL`].
+fn load_outputs(conn: &Connection, txid: &[u8]) -> anyhow::Result<Vec<TxOutputRecord>> {
+    let mut stmt = conn.prepare(LOAD_OUTPUTS_SQL)?;
     let rows = stmt.query_map(named_params! {":txid": txid}, |row| {
         Ok(TxOutputRecord {
             pool: row.get("output_pool")?,
@@ -448,19 +455,20 @@ pub struct TxQuery {
     pub newest_first: bool,
 }
 
-/// Transactions matching `q`, each with its outputs. The WHERE clause mirrors zcashd's
-/// height predicate (`rpcwallet.cpp` `listsinceblock`/`listreceivedbyaddress` range), and the
-/// `sort_height` ordering (mined height, else a non-zero expiry height) matches what
-/// [`list_transactions`] used before pagination moved into SQL. [`load_outputs`] stays per-tx
-/// but is now bounded by `limit`, not the whole wallet.
-pub fn query_transactions(wallet_dir: &Path, q: &TxQuery) -> anyhow::Result<Vec<TxRecord>> {
-    let conn = open_conn(wallet_dir)?;
-    let order = if q.newest_first {
-        "ORDER BY sort_height DESC NULLS FIRST"
+/// The statement [`query_transactions`] runs, for the requested direction. Extracted (with
+/// [`LOAD_OUTPUTS_SQL`]) so the ordering tests run this exact text against a fixture schema;
+/// the ordering contract is documented on [`query_transactions`].
+///
+/// The `txid` tiebreak follows `sort_height`'s direction, so reversing the query reverses the
+/// whole transaction-level order rather than interleaving a descending height with an ascending
+/// txid.
+fn tx_query_sql(newest_first: bool) -> String {
+    let order = if newest_first {
+        "ORDER BY sort_height DESC NULLS FIRST, v.txid DESC"
     } else {
-        "ORDER BY sort_height ASC NULLS LAST"
+        "ORDER BY sort_height ASC NULLS LAST, v.txid ASC"
     };
-    let mut stmt = conn.prepare(&format!(
+    format!(
         "SELECT {TX_COLS},
             COALESCE(
                 v.mined_height,
@@ -471,8 +479,34 @@ pub fn query_transactions(wallet_dir: &Path, q: &TxQuery) -> anyhow::Result<Vec<
                 OR (v.mined_height IS NULL AND :end_height IS NULL))
            AND (:end_height IS NULL OR v.mined_height < :end_height)
          {order}
-         LIMIT :limit OFFSET :offset",
-    ))?;
+         LIMIT :limit OFFSET :offset"
+    )
+}
+
+/// Transactions matching `q`, each with its outputs. The WHERE clause mirrors zcashd's
+/// height predicate (`rpcwallet.cpp` `listsinceblock`/`listreceivedbyaddress` range), and the
+/// `sort_height` ordering (mined height, else a non-zero expiry height) matches what
+/// [`list_transactions`] used before pagination moved into SQL. [`load_outputs`] stays per-tx
+/// but is now bounded by `limit`, not the whole wallet.
+///
+/// # Ordering
+///
+/// Rows come back in a **total** order: `sort_height`, then `txid`, with each transaction's
+/// outputs ordered by `(output_pool, output_index)` ([`load_outputs`]). Both tiebreaks are part
+/// of the contract, not incidental: `sort_height` alone is not injective (blocks hold many
+/// wallet transactions), so without the `txid` key two transactions at one height came back in
+/// whatever order SQLite happened to produce, and a `LIMIT`/`OFFSET` page boundary landing
+/// inside such a tie could repeat or skip a transaction between adjacent pages. The `txid`
+/// comparison is over the stored internal (little-endian) bytes - an arbitrary but stable
+/// permutation of display order, which is all a tiebreak needs to be.
+///
+/// Consumers replaying wallet history as a log therefore get a stable
+/// `(mined_height, txid, pool, output_index)` sequence, and can resume from the last
+/// `(height, txid, output_index)` they processed. `newest_first` reverses the transaction-level
+/// keys together; the within-transaction output order is unaffected.
+pub fn query_transactions(wallet_dir: &Path, q: &TxQuery) -> anyhow::Result<Vec<TxRecord>> {
+    let conn = open_conn(wallet_dir)?;
+    let mut stmt = conn.prepare(&tx_query_sql(q.newest_first))?;
     let rows = stmt.query_map(
         named_params! {
             ":start_height": q.start_height,
@@ -521,7 +555,10 @@ pub fn received_tx_records(
     let conn = open_conn(wallet_dir)?;
     // Order by the same `sort_height` (oldest-first) as `list_transactions`, so the per-address
     // `txids` list `listreceivedbyaddress` emits is in the identical order it was before this
-    // flat path replaced the full N+1 load.
+    // flat path replaced the full N+1 load - including the `txid` and `(pool, output_index)`
+    // tiebreaks (see [`query_transactions`]'s ordering contract). The grouping below preserves
+    // first-seen txid order, so a fully ordered query is what makes the emitted `txids` list
+    // deterministic across calls rather than merely height-sorted.
     let mut stmt = conn.prepare(
         "SELECT v.txid, v.mined_height, v.expired_unmined,
                 o.to_address, o.value, o.is_change, o.to_account_uuid, o.output_pool,
@@ -532,7 +569,8 @@ pub fn received_tx_records(
          ORDER BY COALESCE(
                 v.mined_height,
                 CASE WHEN v.expiry_height == 0 THEN NULL ELSE v.expiry_height END
-            ) ASC NULLS LAST",
+            ) ASC NULLS LAST,
+            v.txid ASC, o.output_pool ASC, o.output_index ASC",
     )?;
     let rows = stmt.query_map(named_params! { ":addr": address_filter }, |row| {
         Ok((
@@ -1479,6 +1517,150 @@ fn transparent_scope_index(scope: TransparentKeyScope) -> Option<u32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A stand-in for the columns [`tx_query_sql`] and [`LOAD_OUTPUTS_SQL`] read. The real
+    /// `v_transactions`/`v_tx_outputs` are librustzcash views over a dozen tables, and
+    /// materializing a wallet whose *views* yield a same-height txid tie means minting real
+    /// notes; the ordering under test is a property of the query text alone, so the fixture
+    /// supplies the view columns directly and the tests run the production SQL over it.
+    fn ordering_fixture() -> rusqlite::Connection {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE v_transactions (
+                 mined_height INTEGER, txid BLOB, expiry_height INTEGER,
+                 account_balance_delta INTEGER, fee_paid INTEGER, block_time INTEGER,
+                 expired_unmined BOOLEAN, tx_index INTEGER
+             );
+             CREATE TABLE v_tx_outputs (
+                 txid BLOB, output_pool INTEGER, output_index INTEGER,
+                 from_account_uuid BLOB, to_account_uuid BLOB, to_address TEXT,
+                 value INTEGER, is_change BOOLEAN, recipient_key_scope INTEGER, memo BLOB
+             );
+             CREATE TABLE blocks (height INTEGER, hash BLOB);
+             CREATE TABLE transactions (txid BLOB, created TEXT);",
+        )
+        .unwrap();
+        conn
+    }
+
+    /// Insert a transaction whose txid is `byte` repeated, at `mined_height`.
+    fn put_tx(conn: &rusqlite::Connection, byte: u8, mined_height: Option<u32>) {
+        conn.execute(
+            "INSERT INTO v_transactions
+                 (mined_height, txid, expiry_height, account_balance_delta, fee_paid,
+                  block_time, expired_unmined, tx_index)
+             VALUES (?1, ?2, 0, 0, NULL, NULL, 0, NULL)",
+            rusqlite::params![mined_height, vec![byte; 32]],
+        )
+        .unwrap();
+    }
+
+    fn query_order(conn: &rusqlite::Connection, newest_first: bool) -> Vec<u8> {
+        let mut stmt = conn.prepare(&tx_query_sql(newest_first)).unwrap();
+        stmt.query_map(
+            named_params! {
+                ":start_height": None::<u32>,
+                ":end_height": None::<u32>,
+                ":limit": -1i64,
+                ":offset": 0u32,
+            },
+            |row| Ok(row.get::<_, Vec<u8>>("txid")?[0]),
+        )
+        .unwrap()
+        .map(|r| r.unwrap())
+        .collect()
+    }
+
+    /// Transactions sharing a `sort_height` must come back in a deterministic txid order, in
+    /// both directions - the tie is what an incidental-order query leaves unpinned, and what
+    /// makes a `LIMIT`/`OFFSET` page boundary inside the tie unstable.
+    #[test]
+    fn same_height_transactions_are_ordered_by_txid() {
+        let conn = ordering_fixture();
+        // Inserted in an order that matches neither ascending nor descending txid, so passing
+        // cannot be an artifact of the fixture's insertion order.
+        put_tx(&conn, 0x02, Some(100));
+        put_tx(&conn, 0x03, Some(100));
+        put_tx(&conn, 0x01, Some(100));
+
+        assert_eq!(query_order(&conn, false), vec![0x01, 0x02, 0x03]);
+        // `newest_first` reverses the height and txid keys together.
+        assert_eq!(query_order(&conn, true), vec![0x03, 0x02, 0x01]);
+    }
+
+    /// The txid key is strictly *secondary*: height still decides, and unmined transactions
+    /// keep their NULLS LAST / NULLS FIRST placement rather than sorting among mined ones.
+    #[test]
+    fn txid_tiebreak_does_not_disturb_height_ordering() {
+        let conn = ordering_fixture();
+        put_tx(&conn, 0xFF, Some(100));
+        put_tx(&conn, 0x01, Some(200));
+        put_tx(&conn, 0x05, None);
+
+        assert_eq!(query_order(&conn, false), vec![0xFF, 0x01, 0x05]);
+        assert_eq!(query_order(&conn, true), vec![0x05, 0x01, 0xFF]);
+    }
+
+    /// Pagination across a height tie must compose: consecutive `LIMIT 1` pages walking a
+    /// three-way tie visit each transaction exactly once. Without the txid key each page is
+    /// independently free to reorder the tie, so a row can repeat on one page and be skipped
+    /// on the next - silent duplication/loss for a paginating consumer.
+    #[test]
+    fn pagination_across_a_height_tie_visits_each_transaction_once() {
+        let conn = ordering_fixture();
+        put_tx(&conn, 0x02, Some(100));
+        put_tx(&conn, 0x03, Some(100));
+        put_tx(&conn, 0x01, Some(100));
+
+        let mut stmt = conn.prepare(&tx_query_sql(false)).unwrap();
+        let mut seen = Vec::new();
+        for offset in 0..3u32 {
+            let page: Vec<u8> = stmt
+                .query_map(
+                    named_params! {
+                        ":start_height": None::<u32>,
+                        ":end_height": None::<u32>,
+                        ":limit": 1i64,
+                        ":offset": offset,
+                    },
+                    |row| Ok(row.get::<_, Vec<u8>>("txid")?[0]),
+                )
+                .unwrap()
+                .map(|r| r.unwrap())
+                .collect();
+            seen.extend(page);
+        }
+        assert_eq!(seen, vec![0x01, 0x02, 0x03]);
+    }
+
+    /// A transaction with outputs in more than one pool must come back ordered by
+    /// `(output_pool, output_index)`. `output_index` is the index within the pool's bundle, so
+    /// it is not unique across pools and cannot order the set on its own.
+    #[test]
+    fn outputs_are_ordered_by_pool_then_index() {
+        let conn = ordering_fixture();
+        let txid: Vec<u8> = vec![0x07; 32];
+        for (pool, index) in [(4i64, 1u32), (2, 1), (4, 0), (2, 0)] {
+            conn.execute(
+                "INSERT INTO v_tx_outputs
+                     (txid, output_pool, output_index, from_account_uuid, to_account_uuid,
+                      to_address, value, is_change, recipient_key_scope, memo)
+                 VALUES (?1, ?2, ?3, NULL, NULL, NULL, 0, 0, NULL, NULL)",
+                rusqlite::params![txid, pool, index],
+            )
+            .unwrap();
+        }
+
+        let mut stmt = conn.prepare(LOAD_OUTPUTS_SQL).unwrap();
+        let got: Vec<(i64, u32)> = stmt
+            .query_map(named_params! {":txid": txid}, |row| {
+                Ok((row.get("output_pool")?, row.get("output_index")?))
+            })
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+        assert_eq!(got, vec![(2, 0), (2, 1), (4, 0), (4, 1)]);
+    }
 
     /// The `created_time` expression in [`super::TX_COLS`] must parse rusqlite's
     /// `OffsetDateTime` encoding (`yyyy-MM-dd HH:mm:ss.fffffffzzz`, what librustzcash stores
