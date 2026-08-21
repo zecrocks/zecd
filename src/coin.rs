@@ -38,6 +38,42 @@ impl Coin {
         }
     }
 
+    /// The subdirectory of a **wallet** directory holding this coin's state: `zec` for Zcash,
+    /// so a wallet's Zcash data lives under `<datadir>/<wallet>/zec/`
+    /// ([`crate::config::coin_dir`]).
+    ///
+    /// It sits inside the wallet rather than above it because `keys.toml` - the one file in a
+    /// wallet directory that is zecd's own - is derived from a BIP-39 seed that serves every
+    /// coin at once. One wallet, one seed, one directory per coin underneath it.
+    ///
+    /// The token is short and coin-specific rather than [`Coin::name`], because it is a path
+    /// component operators type and complete - and it is **frozen** once a release ships it:
+    /// changing a coin's directory name is a data migration ([`crate::migrate`]), not a rename.
+    pub fn data_dir(self) -> &'static str {
+        match self {
+            Coin::Zcash => "zec",
+        }
+    }
+
+    /// The subdirectory of [`Coin::data_dir`] holding the wallet-storage **engine**'s own files:
+    /// `lrz` (librustzcash) for Zcash, so a Zcash wallet's databases live under
+    /// `<datadir>/<wallet>/zec/lrz/` ([`crate::config::engine_dir`]).
+    ///
+    /// A coin is an engine here, so today this is one directory per coin either way. It is a
+    /// level of its own so that everything a *particular* library owns is separable from the
+    /// coin's own state: replacing librustzcash - or running a migration between two of its
+    /// incompatible schema generations - is then a sibling directory and a rescan, not an
+    /// archaeology exercise over a shared one. Nothing zecd owns goes in here; `keys.toml`,
+    /// which the seed and the chain cannot rebuild, stays at the wallet root where no engine
+    /// swap can reach it.
+    ///
+    /// Frozen once shipped, exactly like [`Coin::data_dir`].
+    pub fn engine_dir(self) -> &'static str {
+        match self {
+            Coin::Zcash => "lrz",
+        }
+    }
+
     /// Parse a token produced by [`Coin::name`]. `None` for anything zecd does not serve.
     pub fn parse(s: &str) -> Option<Coin> {
         Coin::SUPPORTED.iter().copied().find(|c| c.name() == s)
@@ -99,6 +135,29 @@ mod tests {
             let chain = Coin::Zcash.chain(env);
             assert_eq!(chain, CoinNetwork::Zcash(env));
             assert_eq!(chain.coin(), Coin::Zcash);
+        }
+    }
+
+    /// These names are path components every deployment of a release has on disk, so they are
+    /// frozen: a change is a migration, not a rename. Pinning them here makes that explicit
+    /// rather than leaving it to whoever edits the match arms.
+    #[test]
+    fn directory_names_are_frozen_and_distinct() {
+        assert_eq!(Coin::Zcash.data_dir(), "zec");
+        assert_eq!(Coin::Zcash.engine_dir(), "lrz");
+        let mut seen = std::collections::BTreeSet::new();
+        for coin in Coin::SUPPORTED {
+            for dir in [coin.data_dir(), coin.engine_dir()] {
+                assert!(
+                    !dir.is_empty() && !dir.contains('/') && !dir.starts_with('.'),
+                    "{dir:?} must be a plain path component"
+                );
+            }
+            assert!(
+                seen.insert(coin.data_dir()),
+                "two coins share the data directory {:?}",
+                coin.data_dir()
+            );
         }
     }
 

@@ -59,19 +59,41 @@ can recreate everything via `zecd init --restore`.
 
 ### Minimal runtime file set (what's a secret, what's a cache)
 
-A running wallet's data directory holds, per wallet `<dir>`:
+A running wallet's data directory holds the daemon-level files (`zecd.toml`, `.lock`,
+`.cookie`, `identity.txt`) plus one directory per wallet. `<dir>` below is
+`<datadir>/<wallet>` unless a `[wallets.<name>] dir` override says otherwise; inside it,
+`keys.toml` sits at the root and the databases one coin and one engine deeper:
+
+```
+<datadir>/
+  zecd.toml  .lock  .cookie  identity.txt
+  default/
+    keys.toml
+    zec/lrz/    data.sqlite  blockmeta.sqlite  blocks/
+```
 
 | Path | Role | Ship it? |
 |---|---|---|
-| `<dir>/keys.toml` | **Secret** - encrypted seed + birthday/network. | Yes - mount as a Secret (relocate with `keys_file` / `ZECD_KEYS_FILE`). |
+| `<dir>/keys.toml` | **Secret** - encrypted seed + birthday/network. Shared by every coin the wallet serves, which is why it sits above the per-coin directories. | Yes - mount as a Secret (relocate with `keys_file` / `ZECD_KEYS_FILE`). |
 | `identity.txt` | **Secret** - decrypts the seed (spend authority). | Yes, if auto-unlocking - mount as a Secret (`ZECD_AGE_IDENTITY`). |
-| `<dir>/data.sqlite` (+ `-wal`/`-shm`) | Wallet state: the account plus scan progress, balances, and tx history. A **cache** - rebuilt from `keys.toml` + a rescan when absent (see bootstrap below). | No (disposable). |
-| `<dir>/blocks/` | **Cache** - downloaded compact blocks. **Never ship this** - it can grow large and is fully re-derivable. | No. |
+| `<dir>/zec/lrz/data.sqlite` (+ `-wal`/`-shm`) | Wallet state: the account plus scan progress, balances, and tx history. A **cache** - rebuilt from `keys.toml` + a rescan when absent (see bootstrap below). | No (disposable). |
+| `<dir>/zec/lrz/blocks/` | **Cache** - downloaded compact blocks. **Never ship this** - it can grow large and is fully re-derivable. | No. |
 | `<datadir>/.cookie` | Ephemeral RPC cookie, minted at startup and removed on clean shutdown. | No. |
 
 For a cloud deployment: put `keys.toml` (and `identity.txt`, if used) in a read-only Secret
 and point `ZECD_KEYS_FILE` / `ZECD_AGE_IDENTITY` at the mount. `blocks/` is always disposable -
 excluding it from any image/volume snapshot is the single biggest space win.
+
+> **Upgrading from a data directory without `zec/lrz/`.** Older zecd kept the databases at the
+> wallet root (`<datadir>/default/data.sqlite`). The first `zecd run` (or `zecd init` / `zecd
+> rescan`) of a version that ships this layout moves them into `<wallet>/zec/lrz/`, under the
+> datadir lock; `keys.toml` is already where it belongs and is not touched. Each file is renamed,
+> not copied: no extra disk space, nothing deleted, and an interrupted move finishes on the next
+> start. `zecd config check` reports a wallet still waiting for the move (and `--strict` fails on
+> it), so an upgrade pipeline can see it coming. The one case refused rather than guessed at is
+> the same file present in *both* places, and there both copies are left alone. A
+> `[wallets.<name>] dir` override is migrated like any other wallet: the move happens inside
+> whatever directory you named.
 
 > **The data directory must be host-local.** zecd's single-instance lock on `<datadir>/.lock` is
 > an OS advisory lock enforced by the *local* kernel, so it only prevents a second zecd on the

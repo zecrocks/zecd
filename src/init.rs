@@ -113,7 +113,7 @@ pub(crate) fn read_mnemonic_phrase(
 }
 
 /// Resolve the [`WalletEntry`] for `wallet`: the configured `[wallets.<name>]` entry, or the
-/// default layout (`<datadir>/<name>`, global pool settings) for a wallet the config doesn't
+/// default layout (`<datadir>/zec/<name>`, global pool settings) for a wallet the config doesn't
 /// name - exactly the entry the daemon would build for it.
 pub(crate) fn resolve_wallet_entry(config: &AppConfig, wallet: &str) -> WalletEntry {
     config
@@ -121,7 +121,7 @@ pub(crate) fn resolve_wallet_entry(config: &AppConfig, wallet: &str) -> WalletEn
         .get(wallet)
         .cloned()
         .unwrap_or_else(|| WalletEntry {
-            dir: config.datadir.join(wallet),
+            dir: crate::config::wallet_dir(&config.datadir, wallet),
             keys_file: None,
             coin: crate::coin::Coin::Zcash,
             chain: crate::coin::Coin::Zcash.chain(config.network),
@@ -287,6 +287,11 @@ pub async fn init_wallet(config: &AppConfig, opts: InitOptions) -> anyhow::Resul
     // until `init` returns. This refuses an `init` against a datadir a running daemon (or another
     // `init`) already owns, rather than racing it. See `crate::lock`.
     let _datadir_lock = crate::lock::lock_datadir(&config.datadir)?;
+    // Under the same lock, move any wallet still in the pre-`zec/` layout into the per-coin
+    // subdirectory - so an `init` run against an un-migrated data directory sees the wallets
+    // that are already there (and refuses to create one over the top of an existing wallet)
+    // rather than starting a second one beside them. See `crate::migrate`.
+    crate::migrate::migrate(config)?;
 
     let entry = resolve_wallet_entry(config, &wallet);
     let keys_path = entry.keys_path();
@@ -297,6 +302,9 @@ pub async fn init_wallet(config: &AppConfig, opts: InitOptions) -> anyhow::Resul
         .transparent_enabled
         .then_some(entry.transparent_gap_limit);
     let network = entry.zcash_network();
+    // `keys.toml` lives at the wallet root; everything librustzcash owns lives one coin and one
+    // engine deeper (see `crate::migrate`).
+    let engine_dir = entry.engine_dir();
     let wallet_dir = entry.dir;
 
     if WalletStore::exists(&keys_path) {
@@ -352,8 +360,8 @@ pub async fn init_wallet(config: &AppConfig, opts: InitOptions) -> anyhow::Resul
     // account, so receive addresses could derive from a key that is not the operator's. Done
     // before any interactive or network I/O so a refusal is fast and leaves no keys.toml
     // behind.
-    let mut db = open::init_dbs_with_gap_limit(network, &wallet_dir, init_gap_limit)?;
-    ensure_no_preexisting_account(&db, &wallet, &wallet_dir)?;
+    let mut db = open::init_dbs_with_gap_limit(network, &engine_dir, init_gap_limit)?;
+    ensure_no_preexisting_account(&db, &wallet, &engine_dir)?;
 
     let identity_path = config
         .keys
@@ -574,7 +582,9 @@ pub fn export_ufvk_string(config: &AppConfig, wallet: &str) -> anyhow::Result<St
     let entry = resolve_wallet_entry(config, wallet);
     let keys_path = entry.keys_path();
     let network = entry.zcash_network();
-    let wallet_dir = entry.dir;
+    // Read-only and lock-free (it must run beside a live daemon), so it cannot migrate the
+    // layout - but it still reads a wallet database the daemon has not migrated yet.
+    let engine_dir = crate::migrate::engine_dir_for_reading(&entry);
 
     if !WalletStore::exists(&keys_path) {
         return Err(anyhow!(
@@ -588,7 +598,7 @@ pub fn export_ufvk_string(config: &AppConfig, wallet: &str) -> anyhow::Result<St
     let st = WalletStore::read(&keys_path)?;
     ensure_store_matches(&st, wallet, network)?;
 
-    let db = open::open_read(network, &wallet_dir)?;
+    let db = open::open_read(network, &engine_dir)?;
     let account_id = *db
         .get_account_ids()?
         .first()
@@ -615,13 +625,16 @@ pub fn rescan(config: &AppConfig, args: &RescanArgs) -> anyhow::Result<()> {
     // Same single-instance guard as `init`: refuses while the daemon (or another writer) owns
     // the datadir, so the database can't be deleted out from under a live wallet.
     let _datadir_lock = crate::lock::lock_datadir(&config.datadir)?;
+    // As in `init`: migrate the layout under the lock, so a rescan run before the first daemon
+    // start of this build deletes the database that is actually in use. See `crate::migrate`.
+    crate::migrate::migrate(config)?;
 
     let entry = resolve_wallet_entry(config, &args.wallet);
     let removed = rescan_wallet(
         entry.zcash_network(),
         &args.wallet,
         &entry.keys_path(),
-        &entry.dir,
+        &entry.engine_dir(),
         |st| {
             if args.yes {
                 return Ok(true);
@@ -686,7 +699,7 @@ pub fn rescan_wallet(
     network: ZNetwork,
     wallet: &str,
     keys_path: &Path,
-    wallet_dir: &Path,
+    engine_dir: &Path,
     confirm: impl FnOnce(&WalletStore) -> anyhow::Result<bool>,
 ) -> anyhow::Result<Vec<String>> {
     if !WalletStore::exists(keys_path) {
@@ -713,30 +726,25 @@ pub fn rescan_wallet(
         return Err(anyhow!("rescan aborted (expected 'yes')"));
     }
 
-    // The wallet database and the compact-block cache (`open::init_dbs` recreates all of these
-    // on the next start). `keys.toml` - which may live outside the wallet dir via `keys_file` -
-    // and the datadir-level `identity.txt` are deliberately untouched.
+    // Everything in the engine directory - the wallet database and the compact-block cache,
+    // which `open::init_dbs` recreates on the next start. The list is
+    // [`crate::migrate::ENGINE_ARTIFACTS`] rather than a second copy of it, so "what
+    // librustzcash owns" cannot mean one thing to the migration and another to a rescan.
+    // `keys.toml` sits at the wallet root, above this directory (and may be outside it
+    // entirely via `keys_file`), so neither it nor the datadir-level `identity.txt` is touched.
     let mut removed = Vec::new();
-    for file in [
-        "data.sqlite",
-        "data.sqlite-wal",
-        "data.sqlite-shm",
-        "blockmeta.sqlite",
-        "blockmeta.sqlite-wal",
-        "blockmeta.sqlite-shm",
-    ] {
-        let path = wallet_dir.join(file);
-        match std::fs::remove_file(&path) {
-            Ok(()) => removed.push(file.to_string()),
+    for artifact in crate::migrate::ENGINE_ARTIFACTS {
+        let path = engine_dir.join(artifact);
+        let result = if path.is_dir() {
+            std::fs::remove_dir_all(&path).map(|()| format!("{artifact}/"))
+        } else {
+            std::fs::remove_file(&path).map(|()| artifact.to_string())
+        };
+        match result {
+            Ok(name) => removed.push(name),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
             Err(e) => return Err(anyhow!("removing {}: {e}", path.display())),
         }
-    }
-    let blocks = wallet_dir.join("blocks");
-    match std::fs::remove_dir_all(&blocks) {
-        Ok(()) => removed.push("blocks/".to_string()),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-        Err(e) => return Err(anyhow!("removing {}: {e}", blocks.display())),
     }
     Ok(removed)
 }
@@ -749,7 +757,7 @@ pub fn rescan_wallet(
 fn ensure_no_preexisting_account(
     db: &open::WriteDb,
     wallet: &str,
-    wallet_dir: &Path,
+    engine_dir: &Path,
 ) -> anyhow::Result<()> {
     let accounts = db.get_account_ids()?.len();
     if accounts == 0 {
@@ -762,7 +770,7 @@ fn ensure_no_preexisting_account(
          existing data directory aside (or delete it, if it is not yours) and re-run `zecd \
          init`.",
         wallet,
-        open::data_db_path(wallet_dir).display(),
+        open::data_db_path(engine_dir).display(),
         accounts
     ))
 }
@@ -798,17 +806,17 @@ fn existing_spending_wallet(
         .iter()
         .filter(|(name, _)| name.as_str() != exclude)
         .filter(|(_, entry)| WalletStore::exists(&entry.keys_path()))
-        .find(|(_, entry)| wallet_has_spending_keys(network, &entry.dir))
+        .find(|(_, entry)| wallet_has_spending_keys(network, &entry.engine_dir()))
         .map(|(name, _)| name.clone())
 }
 
-/// Whether an initialized wallet at `wallet_dir` holds spending keys (i.e. its account is not a
+/// Whether an initialized wallet at `engine_dir` holds spending keys (i.e. its account is not a
 /// watch-only UFVK import - the same `AccountSource::Imported { ViewOnly }` test the actor uses
 /// for `watch_only`). Best-effort: a wallet whose DB can't be read or has no account is treated
 /// as non-spending, so a single unreadable sibling never blocks `init` - the daemon's startup
 /// guard is the backstop.
-fn wallet_has_spending_keys(network: crate::network::ZNetwork, wallet_dir: &Path) -> bool {
-    let Ok(db) = open::open_read(network, wallet_dir) else {
+fn wallet_has_spending_keys(network: crate::network::ZNetwork, engine_dir: &Path) -> bool {
+    let Ok(db) = open::open_read(network, engine_dir) else {
         return false;
     };
     let Ok(ids) = db.get_account_ids() else {
@@ -980,9 +988,15 @@ mod tests {
             &test_ufvk_encoded(net),
         )
         .expect("write spending keys.toml");
-        let mut db = open::init_dbs(net, dir).expect("init spending dbs");
+        let mut db = open::init_dbs(net, &engine_of(dir)).expect("init spending dbs");
         db.create_account("primary", &test_seed(), &genesis_birthday(), None)
             .expect("create spending account");
+    }
+
+    /// The engine directory inside a wallet directory - where the databases the helpers below
+    /// build actually live (`keys.toml` stays at `dir` itself).
+    fn engine_of(dir: &Path) -> PathBuf {
+        crate::config::engine_dir(dir, crate::coin::Coin::Zcash)
     }
 
     /// Build a fully-initialized watch-only wallet (seedless keys.toml + a ViewOnly UFVK
@@ -1007,7 +1021,7 @@ mod tests {
             .expect("derive USK")
             .to_unified_full_viewing_key()
         };
-        let mut db = open::init_dbs(net, dir).expect("init watch-only dbs");
+        let mut db = open::init_dbs(net, &engine_of(dir)).expect("init watch-only dbs");
         db.import_account_ufvk(
             "watch",
             &ufvk,
@@ -1052,17 +1066,17 @@ mod tests {
         make_watch_only_wallet(watch.path());
 
         assert!(
-            wallet_has_spending_keys(net, spend.path()),
+            wallet_has_spending_keys(net, &engine_of(spend.path())),
             "a seed-derived wallet holds spending keys"
         );
         assert!(
-            !wallet_has_spending_keys(net, watch.path()),
+            !wallet_has_spending_keys(net, &engine_of(watch.path())),
             "a view-only UFVK import does not hold spending keys"
         );
         // An uninitialized directory has no account, so it is treated as non-spending (the guard
         // is best-effort and never blocks on an unreadable sibling).
         assert!(
-            !wallet_has_spending_keys(net, empty.path()),
+            !wallet_has_spending_keys(net, &engine_of(empty.path())),
             "an empty wallet dir is not a spending wallet"
         );
     }
@@ -1179,13 +1193,14 @@ mod tests {
         let net = network::regtest();
         let dir = tempfile::tempdir().unwrap();
         make_spending_wallet(dir.path());
+        let engine = engine_of(dir.path());
         // The compact-block cache dir, as a running daemon would have left it.
-        std::fs::create_dir_all(dir.path().join("blocks")).unwrap();
-        std::fs::write(dir.path().join("blocks").join("100-aa-bb.compact"), b"x").unwrap();
+        std::fs::create_dir_all(engine.join("blocks")).unwrap();
+        std::fs::write(engine.join("blocks").join("100-aa-bb.compact"), b"x").unwrap();
         let keys_path = crate::wallet::store::keys_path(dir.path());
-        assert!(open::data_db_path(dir.path()).exists());
+        assert!(open::data_db_path(&engine).exists());
 
-        let removed = rescan_wallet(net, "default", &keys_path, dir.path(), |st| {
+        let removed = rescan_wallet(net, "default", &keys_path, &engine, |st| {
             // The confirmation sees the parsed store (the prompt shows its birthday).
             assert_eq!(u32::from(st.birthday), 1);
             Ok(true)
@@ -1193,20 +1208,20 @@ mod tests {
         .expect("rescan an initialized spending wallet");
         assert!(removed.contains(&"data.sqlite".to_string()), "{removed:?}");
         assert!(removed.contains(&"blocks/".to_string()), "{removed:?}");
-        assert!(!open::data_db_path(dir.path()).exists(), "database deleted");
-        assert!(!dir.path().join("blocks").exists(), "block cache deleted");
+        assert!(!open::data_db_path(&engine).exists(), "database deleted");
+        assert!(!engine.join("blocks").exists(), "block cache deleted");
         assert!(
             WalletStore::exists(&keys_path),
-            "keys.toml (the rebuild source) must survive"
+            "keys.toml (the rebuild source) sits above the engine directory and must survive"
         );
         // Idempotent: nothing left to delete, still succeeds (recovery can be retried).
-        let removed = rescan_wallet(net, "default", &keys_path, dir.path(), |_| Ok(true))
+        let removed = rescan_wallet(net, "default", &keys_path, &engine, |_| Ok(true))
             .expect("re-running rescan is not an error");
         assert!(removed.is_empty(), "{removed:?}");
 
         // The daemon's bootstrap gate: an account-less database with keys.toml present is the
         // exact state `wallet::actor::spawn` rebuilds from.
-        let db = open::init_dbs(net, dir.path()).expect("fresh dbs re-initialize");
+        let db = open::init_dbs(net, &engine).expect("fresh dbs re-initialize");
         assert!(
             db.get_account_ids().expect("account ids").is_empty(),
             "the rebuilt database starts account-less (bootstrap recreates it from the seed)"
@@ -1226,7 +1241,7 @@ mod tests {
             net,
             "default",
             &crate::wallet::store::keys_path(empty.path()),
-            empty.path(),
+            &engine_of(empty.path()),
             |_| Ok(true),
         )
         .expect_err("no keys.toml, nothing to rebuild from");
@@ -1236,12 +1251,14 @@ mod tests {
         let watch = tempfile::tempdir().unwrap();
         make_watch_only_wallet(watch.path());
         let watch_keys = crate::wallet::store::keys_path(watch.path());
-        let err = rescan_wallet(net, "w", &watch_keys, watch.path(), |_| Ok(true))
-            .expect_err("a watch-only wallet cannot be rebuilt from keys.toml");
+        let err = rescan_wallet(net, "w", &watch_keys, &engine_of(watch.path()), |_| {
+            Ok(true)
+        })
+        .expect_err("a watch-only wallet cannot be rebuilt from keys.toml");
         assert!(err.to_string().contains("watch-only"), "{err}");
         assert!(err.to_string().contains("--ufvk"), "{err}");
         assert!(
-            open::data_db_path(watch.path()).exists(),
+            open::data_db_path(&engine_of(watch.path())).exists(),
             "refusal must not delete anything"
         );
 
@@ -1250,18 +1267,28 @@ mod tests {
         let spend = tempfile::tempdir().unwrap();
         make_spending_wallet(spend.path());
         let spend_keys = crate::wallet::store::keys_path(spend.path());
-        let err = rescan_wallet(ZNetwork::Main, "default", &spend_keys, spend.path(), |_| {
-            Ok(true)
-        })
+        let err = rescan_wallet(
+            ZNetwork::Main,
+            "default",
+            &spend_keys,
+            &engine_of(spend.path()),
+            |_| Ok(true),
+        )
         .expect_err("network mismatch is refused");
         assert!(err.to_string().contains("configuration selects"), "{err}");
 
         // Declined confirmation aborts before deletion.
-        let err = rescan_wallet(net, "default", &spend_keys, spend.path(), |_| Ok(false))
-            .expect_err("a declined confirmation aborts");
+        let err = rescan_wallet(
+            net,
+            "default",
+            &spend_keys,
+            &engine_of(spend.path()),
+            |_| Ok(false),
+        )
+        .expect_err("a declined confirmation aborts");
         assert!(err.to_string().contains("aborted"), "{err}");
         assert!(
-            open::data_db_path(spend.path()).exists(),
+            open::data_db_path(&engine_of(spend.path())).exists(),
             "nothing deleted on abort"
         );
     }

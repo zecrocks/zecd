@@ -82,8 +82,9 @@ impl PreparedNode {
         &self.config
     }
 
-    /// Phase 2: kick off the background proving-key builds, spawn one actor per initialized
-    /// wallet, enforce the single-spending-wallet invariant, and assemble the shared state.
+    /// Phase 2: migrate the data-directory layout if needed, kick off the background
+    /// proving-key builds, spawn one actor per initialized wallet, enforce the
+    /// single-spending-wallet invariant, and assemble the shared state.
     ///
     /// A failed account-to-keys binding check ([`binding::BindingMismatch`]) is fatal for the
     /// whole node - evidence the wallet database or `keys.toml` was replaced - while any other
@@ -97,6 +98,13 @@ impl PreparedNode {
     pub async fn start(self) -> anyhow::Result<Node> {
         let prog = "zecd";
         let config = self.config;
+
+        // Move any librustzcash file still sitting at a wallet directory's root into that
+        // wallet's per-coin engine subdirectory, before anything opens a wallet. Runs under the
+        // datadir lock taken in `prepare()`, is a no-op on an already-migrated (or brand new)
+        // data directory, and is fatal when it cannot complete: the data is still there, and
+        // starting without it would rebuild an empty database beside it. See `crate::migrate`.
+        crate::migrate::migrate(&config)?;
 
         // Shutdown broadcast: `true` is sent on shutdown. Created before the actors so each one
         // carries a receiver and can stop its sync loop between batches.
@@ -198,7 +206,7 @@ impl PreparedNode {
                 // configured entirely from its entry, so nothing below this point reads
                 // `config` again.
                 network: entry.zcash_network(),
-                wallet_dir: entry.dir.clone(),
+                engine_dir: entry.engine_dir(),
                 keys_path: keys_path.clone(),
                 server,
                 sync_interval: Duration::from_secs(config.sync.interval_secs),

@@ -134,10 +134,10 @@ fn bootstrap_rebuild_reproduces_the_same_account() {
 fn regtest_wallet_lifecycle() {
     let net = network::regtest();
     let dir = tempfile::tempdir().unwrap();
-    let wallet_dir = dir.path();
+    let engine_dir = dir.path();
 
     // 1. Initialise the wallet DB on regtest and create an account from the seed.
-    let mut db = open::init_dbs(net, wallet_dir).expect("init regtest dbs");
+    let mut db = open::init_dbs(net, engine_dir).expect("init regtest dbs");
     let (account_id, _usk) = db
         .create_account("primary", &test_seed(), &genesis_birthday(), None)
         .expect("create regtest account");
@@ -182,27 +182,27 @@ fn regtest_wallet_lifecycle() {
 
     // The handed-out transparent address is recognised as the wallet's own.
     assert!(
-        read::is_mine(net, wallet_dir, &taddr),
+        read::is_mine(net, engine_dir, &taddr),
         "a handed-out transparent receiver should be is_mine, got {taddr}"
     );
 
     // 3. Read helpers operate on a regtest wallet: empty-but-valid balances and note set.
-    let bal = read::balance(net, wallet_dir, Default::default()).expect("balance");
+    let bal = read::balance(net, engine_dir, Default::default()).expect("balance");
     assert_eq!(bal.total_spendable, 0);
     assert_eq!(bal.pending, 0);
-    assert!(read::list_unspent(net, wallet_dir)
+    assert!(read::list_unspent(net, engine_dir)
         .expect("listunspent")
         .is_empty());
     // The transaction queries (v_transactions joined with blocks + raw transactions for
     // blockhash / blockindex / created_time) run against the real librustzcash schema.
-    assert!(read::list_transactions(wallet_dir)
+    assert!(read::list_transactions(engine_dir)
         .expect("listtransactions")
         .is_empty());
-    assert!(read::get_transaction(net, wallet_dir, &"ab".repeat(32))
+    assert!(read::get_transaction(net, engine_dir, &"ab".repeat(32))
         .expect("gettransaction")
         .is_none());
-    assert!(!read::tx_exists(wallet_dir, &"ab".repeat(32)));
-    assert!(read::first_scanned_block(wallet_dir)
+    assert!(!read::tx_exists(engine_dir, &"ab".repeat(32)));
+    assert!(read::first_scanned_block(engine_dir)
         .expect("first_scanned_block")
         .is_none());
 
@@ -212,36 +212,36 @@ fn regtest_wallet_lifecycle() {
     // `zcash_client_sqlite` bump that renames a column we depend on fails loudly here (offline)
     // instead of silently at runtime. Together with the `list_unspent`/`list_transactions`/
     // `get_transaction` calls above, this covers every internal column zecd reads.
-    assert_eq!(read::tx_count(wallet_dir).expect("tx_count"), 0);
-    assert!(read::unmined_raw_txs(wallet_dir, 1)
+    assert_eq!(read::tx_count(engine_dir).expect("tx_count"), 0);
+    assert!(read::unmined_raw_txs(engine_dir, 1)
         .expect("unmined_raw_txs")
         .is_empty());
     // received_tx_records runs in both the unfiltered and address-filtered shapes.
-    assert!(read::received_tx_records(wallet_dir, None)
+    assert!(read::received_tx_records(engine_dir, None)
         .expect("received_tx_records")
         .is_empty());
-    assert!(read::received_tx_records(wallet_dir, Some(addr.as_str()))
+    assert!(read::received_tx_records(engine_dir, Some(addr.as_str()))
         .expect("received_tx_records filtered")
         .is_empty());
     // The `blocks`-table queries (no public API exposes block time / a reverse hash lookup).
-    assert!(read::block_info_at(wallet_dir, 1)
+    assert!(read::block_info_at(engine_dir, 1)
         .expect("block_info_at")
         .is_none());
-    assert!(read::median_time_past(wallet_dir, 1)
+    assert!(read::median_time_past(engine_dir, 1)
         .expect("median_time_past")
         .is_none());
-    assert!(read::block_height_by_hash(wallet_dir, &"ab".repeat(32))
+    assert!(read::block_height_by_hash(engine_dir, &"ab".repeat(32))
         .expect("block_height_by_hash")
         .is_none());
 
     // 4. is_mine is network-scoped: true for our own regtest address, false for a testnet UA.
     assert!(
-        read::is_mine(net, wallet_dir, &addr),
+        read::is_mine(net, engine_dir, &addr),
         "the wallet's own regtest address is mine"
     );
     let testnet_ua = "utest12r53eljnr7kev8ychw3ahzjgm6fwxm7fd8vfay7hn9uylj05x0pxxhze800h9dcgyr8hkc7kz3s2crnrhjcy2p90yfce2vl8mq667zw0";
     assert!(
-        !read::is_mine(net, wallet_dir, testnet_ua),
+        !read::is_mine(net, engine_dir, testnet_ua),
         "a testnet address is not valid on regtest"
     );
 
@@ -266,9 +266,9 @@ fn is_mine_attributes_unrecorded_addresses_via_viewing_key() {
 
     let net = network::regtest();
     let dir = tempfile::tempdir().unwrap();
-    let wallet_dir = dir.path();
+    let engine_dir = dir.path();
 
-    let mut db = open::init_dbs(net, wallet_dir).expect("init dbs");
+    let mut db = open::init_dbs(net, engine_dir).expect("init dbs");
     let (account_id, _usk) = db
         .create_account("primary", &test_seed(), &genesis_birthday(), None)
         .expect("create account");
@@ -299,11 +299,11 @@ fn is_mine_attributes_unrecorded_addresses_via_viewing_key() {
         .expect("derive Orchard UA")
         .encode(&net);
     assert!(
-        !read::all_addresses(net, wallet_dir).contains(&orchard_addr),
+        !read::all_addresses(net, engine_dir).contains(&orchard_addr),
         "the far-index address must not be pre-recorded, so only the crypto path can match"
     );
     assert!(
-        read::is_mine(net, wallet_dir, &orchard_addr),
+        read::is_mine(net, engine_dir, &orchard_addr),
         "own Orchard UA must be ismine via viewing-key attribution"
     );
 
@@ -315,13 +315,13 @@ fn is_mine_attributes_unrecorded_addresses_via_viewing_key() {
     let sapling_addr =
         Address::Sapling(*all_ua.sapling().expect("UFVK has a Sapling receiver")).encode(&net);
     assert!(
-        read::is_mine(net, wallet_dir, &sapling_addr),
+        read::is_mine(net, engine_dir, &sapling_addr),
         "own bare Sapling address must be ismine via viewing-key attribution"
     );
 
     // --- Recorded-address fast path still resolves ---
     assert!(
-        read::is_mine(net, wallet_dir, &recorded),
+        read::is_mine(net, engine_dir, &recorded),
         "a recorded address stays ismine"
     );
 
@@ -340,7 +340,7 @@ fn is_mine_attributes_unrecorded_addresses_via_viewing_key() {
         .unwrap()
         .encode(&net);
     assert!(
-        !read::is_mine(net, wallet_dir, &foreign_orchard),
+        !read::is_mine(net, engine_dir, &foreign_orchard),
         "a foreign Orchard UA must not be ismine"
     );
     let foreign_all = fuivk
@@ -348,7 +348,7 @@ fn is_mine_attributes_unrecorded_addresses_via_viewing_key() {
         .unwrap();
     let foreign_sapling = Address::Sapling(*foreign_all.sapling().unwrap()).encode(&net);
     assert!(
-        !read::is_mine(net, wallet_dir, &foreign_sapling),
+        !read::is_mine(net, engine_dir, &foreign_sapling),
         "a foreign bare Sapling address must not be ismine"
     );
 }
@@ -376,8 +376,8 @@ fn is_mine_rejects_spliced_unified_address_with_foreign_receiver() {
 
     // Victim wallet.
     let dir = tempfile::tempdir().unwrap();
-    let wallet_dir = dir.path();
-    let mut db = open::init_dbs(net, wallet_dir).expect("init dbs");
+    let engine_dir = dir.path();
+    let mut db = open::init_dbs(net, engine_dir).expect("init dbs");
     let (account_id, _usk) = db
         .create_account("primary", &test_seed(), &genesis_birthday(), None)
         .expect("create account");
@@ -412,7 +412,7 @@ fn is_mine_rejects_spliced_unified_address_with_foreign_receiver() {
     // Sanity: a genuinely own shielded UA (every receiver ours at one index) is still ismine under
     // the consistency-aware rule.
     assert!(
-        read::is_mine(net, wallet_dir, &mine_shielded.encode(&net)),
+        read::is_mine(net, engine_dir, &mine_shielded.encode(&net)),
         "the wallet's own shielded UA must stay ismine"
     );
 
@@ -430,13 +430,13 @@ fn is_mine_rejects_spliced_unified_address_with_foreign_receiver() {
     assert!(
         read::is_mine(
             net,
-            wallet_dir,
+            engine_dir,
             &Address::Sapling(*mine_shielded.sapling().unwrap()).encode(&net)
         ),
         "precondition: the victim's bare Sapling receiver is genuinely theirs"
     );
     assert!(
-        !read::is_mine(net, wallet_dir, &splice_a),
+        !read::is_mine(net, engine_dir, &splice_a),
         "a UA pairing the attacker's Orchard receiver with the victim's Sapling receiver must NOT \
          be ismine (a sender prefers Orchard and pays the attacker)"
     );
@@ -451,7 +451,7 @@ fn is_mine_rejects_spliced_unified_address_with_foreign_receiver() {
     .expect("build spliced UA")
     .encode(&net);
     assert!(
-        !read::is_mine(net, wallet_dir, &splice_b),
+        !read::is_mine(net, engine_dir, &splice_b),
         "a UA pairing the victim's Orchard receiver with the attacker's Sapling receiver must NOT \
          be ismine (a Sapling-only sender pays the attacker)"
     );
@@ -478,7 +478,7 @@ fn is_mine_rejects_spliced_unified_address_with_foreign_receiver() {
     assert!(
         read::is_mine(
             net,
-            wallet_dir,
+            engine_dir,
             &UnifiedAddress::from_receivers(mine_shielded.orchard().cloned(), None, None)
                 .unwrap()
                 .encode(&net)
@@ -486,18 +486,18 @@ fn is_mine_rejects_spliced_unified_address_with_foreign_receiver() {
         "precondition: the victim's Orchard-only UA is genuinely theirs"
     );
     assert!(
-        !read::is_mine(net, wallet_dir, &splice_c),
+        !read::is_mine(net, engine_dir, &splice_c),
         "a UA stapling the wallet's Orchard receiver to a transparent receiver must NOT be ismine \
          (zecd never issues transparent receivers; a transparent-only sender pays the attacker)"
     );
 
     // The classifier agrees: both splices are Inconsistent (a foreign receiver mixed in).
     assert!(matches!(
-        read::classify_unified_receivers(net, wallet_dir, &splice_a),
+        read::classify_unified_receivers(net, engine_dir, &splice_a),
         read::UaReceivers::Inconsistent(_)
     ));
     assert!(matches!(
-        read::classify_unified_receivers(net, wallet_dir, &splice_b),
+        read::classify_unified_receivers(net, engine_dir, &splice_b),
         read::UaReceivers::Inconsistent(_)
     ));
 }
@@ -659,15 +659,15 @@ fn test_pinned_ufvk(net: crate::network::ZNetwork) -> String {
 /// itself a shutdown signal).
 fn offline_actor_cfg(
     name: &str,
-    wallet_dir: std::path::PathBuf,
+    engine_dir: std::path::PathBuf,
 ) -> (ActorConfig, tokio::sync::watch::Sender<bool>) {
     let (shutdown_tx, shutdown) = tokio::sync::watch::channel(false);
     let net = network::regtest();
-    let keys_path = crate::wallet::store::keys_path(&wallet_dir);
+    let keys_path = crate::wallet::store::keys_path(&engine_dir);
     let cfg = ActorConfig {
         name: name.to_string(),
         network: net,
-        wallet_dir,
+        engine_dir,
         keys_path,
         // Explicitly a zebra endpoint: since light mode returned, a bare host:port resolves
         // to lightwalletd. Port 1 never answers - these actors are offline by construction.

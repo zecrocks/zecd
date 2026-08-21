@@ -46,9 +46,12 @@ pub(crate) fn validateaddress(
     // UA (the index is the owner's secret) or a single-receiver address. Best-effort: if the
     // wallet can't be resolved, the field is simply absent.
     if let Ok(handle) = state.registry.get(wallet) {
-        if let Some(consistent) =
-            crate::wallet::read::classify_unified_receivers(handle.network, &handle.dir, addr)
-                .consistent_flag()
+        if let Some(consistent) = crate::wallet::read::classify_unified_receivers(
+            handle.network,
+            &handle.engine_dir,
+            addr,
+        )
+        .consistent_flag()
         {
             out["receivers_consistent"] = json!(consistent);
         }

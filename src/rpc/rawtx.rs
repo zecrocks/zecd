@@ -80,7 +80,7 @@ pub(crate) async fn getrawtransaction(
     let st = handle.status();
     // Wallet-known txs carry their mined height/time locally; anything else comes from
     // lightwalletd, which reports the mined height alongside the raw bytes.
-    let rec = read::get_transaction(handle.network, &handle.dir, txid_str)
+    let rec = read::get_transaction(handle.network, &handle.engine_dir, txid_str)
         .ok()
         .flatten();
     let rec_height = rec.as_ref().and_then(|r| r.mined_height);
@@ -123,7 +123,7 @@ pub(crate) async fn getrawtransaction(
         obj.insert("confirmations".into(), json!(st.confirmations(Some(h))));
         // Block hash/time come from the wallet's scanned-blocks table; omitted (like
         // Zallet omits them) when the block isn't in the wallet's scan range.
-        if let Ok(Some((hash, time))) = read::block_info_at(&handle.dir, h) {
+        if let Ok(Some((hash, time))) = read::block_info_at(&handle.engine_dir, h) {
             let time = rec.as_ref().and_then(|r| r.block_time).unwrap_or(time);
             obj.insert("blockhash".into(), json!(hash));
             obj.insert("time".into(), json!(time));

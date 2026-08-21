@@ -927,6 +927,42 @@ fn config_check_writes_nothing_to_the_datadir() {
     );
 }
 
+/// A wallet still keeping librustzcash's databases at its directory root is reported by
+/// `config check`, which is where an operator looks before an upgrade: it is a warning (the next
+/// start moves them, so the config itself is fine) and it moves nothing - `config check` never
+/// writes.
+#[test]
+fn config_check_reports_a_wallet_awaiting_the_layout_migration() {
+    let dir = tempfile::tempdir().unwrap();
+    let datadir = dir.path().join("data");
+    let wallet = datadir.join("default");
+    std::fs::create_dir_all(&wallet).unwrap();
+    std::fs::write(wallet.join("keys.toml"), "network = \"test\"\n").unwrap();
+    std::fs::write(wallet.join("data.sqlite"), b"db").unwrap();
+    let conf = dir.path().join("zecd.toml");
+    std::fs::write(
+        &conf,
+        format!("network = \"test\"\ndatadir = {datadir:?}\n"),
+    )
+    .unwrap();
+
+    let out = config_check(&conf, &[]);
+    assert!(out.status.success(), "a pending migration is not an error");
+    let err = stderr_of(&out);
+    assert!(err.contains("older layout"), "{err}");
+    assert!(
+        !wallet.join("zec").exists(),
+        "config check must not perform the migration"
+    );
+    assert!(
+        wallet.join("data.sqlite").is_file(),
+        "config check must not move anything"
+    );
+
+    // ...and --strict fails on it, so an upgrade pipeline can gate on a clean data directory.
+    assert!(!config_check(&conf, &["--strict"]).status.success());
+}
+
 /// `config check` is read-only, so - unlike `init`/`rescan` and like `export-ufvk` - it must
 /// stay usable while a daemon holds the datadir lock. Checking the config of a running
 /// deployment is the main thing an operator does before an upgrade.

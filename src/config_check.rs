@@ -92,6 +92,7 @@ pub fn inspect(config: &AppConfig) -> Vec<Finding> {
 
     check_backend(config, &mut findings);
     check_rpc(config, &mut findings);
+    check_layout(config, &mut findings);
     check_paths(config, &mut findings);
 
     findings
@@ -243,6 +244,31 @@ fn check_rpc(config: &AppConfig, findings: &mut Vec<Finding>) {
     }
 }
 
+/// The data-directory layout: whether any wallet still keeps librustzcash's files at its root
+/// rather than in the per-coin engine subdirectory the next start would move them to, and
+/// whether that migration would refuse.
+///
+/// The plan comes from [`crate::migrate::plan`] itself rather than a second reading of the
+/// filesystem, so what this reports and what the daemon would do cannot drift. A refusal there
+/// is an error here for the same reason the daemon treats it as fatal: it stops startup.
+fn check_layout(config: &AppConfig, findings: &mut Vec<Finding>) {
+    match crate::migrate::plan(config) {
+        Err(e) => findings.push(Finding::error(format!("{e:#}"))),
+        Ok(moves) => {
+            for m in moves {
+                findings.push(Finding::warning(format!(
+                    "wallet '{}' still keeps its databases in the older layout, at the root of \
+                     {}; the next `zecd run`, `zecd init` or `zecd rescan` moves {} into {}",
+                    m.wallet,
+                    m.from.display(),
+                    m.artifacts.join(", "),
+                    m.to.display()
+                )));
+            }
+        }
+    }
+}
+
 /// Paths and per-wallet settings. Everything here is environment-dependent, so it warns rather
 /// than errors: the same config is legitimately checked on a machine that is not the target.
 fn check_paths(config: &AppConfig, findings: &mut Vec<Finding>) {
@@ -262,6 +288,9 @@ fn check_paths(config: &AppConfig, findings: &mut Vec<Finding>) {
 
     let mut initialized = 0usize;
     for (name, wallet) in &config.wallets {
+        // `keys.toml` sits at the wallet root, above the per-coin directories, so a pending
+        // layout migration (reported separately by `check_layout`) never moves it and this
+        // check is unaffected by one.
         let keys_path = wallet.keys_path();
         if crate::wallet::store::WalletStore::exists(&keys_path) {
             initialized += 1;
@@ -483,6 +512,65 @@ mod tests {
                 "{args:?}"
             );
         }
+    }
+
+    /// Build a config whose `default` wallet still keeps its database at the wallet root.
+    /// `keys.toml` is there too, where it always is and always stays.
+    fn pre_migration_config(dir: &Path) -> AppConfig {
+        std::fs::create_dir_all(dir.join("default")).unwrap();
+        std::fs::write(
+            dir.join("default").join("keys.toml"),
+            "network = \"test\"\n",
+        )
+        .unwrap();
+        std::fs::write(dir.join("default").join("data.sqlite"), b"db").unwrap();
+        resolve(
+            &format!(
+                "network = \"test\"\ndatadir = {dir:?}\n[rpc]\nuser = \"u\"\npassword = \"p\"\n"
+            ),
+            dir,
+        )
+    }
+
+    /// A wallet whose databases are still at its directory root is reported - and it is *not*
+    /// also reported uninitialized, since `keys.toml` never moves.
+    #[test]
+    fn a_pre_migration_wallet_is_reported_as_such() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = pre_migration_config(dir.path());
+        let findings = inspect(&config);
+        assert!(errors(&findings).is_empty(), "{findings:?}");
+        assert!(
+            warnings(&findings)
+                .iter()
+                .any(|w| w.contains("older layout") && w.contains("data.sqlite")),
+            "{findings:?}"
+        );
+        assert!(
+            !warnings(&findings)
+                .iter()
+                .any(|w| w.contains("not initialized")),
+            "keys.toml does not move, so the wallet is initialized either way: {findings:?}"
+        );
+    }
+
+    /// The same database in both places stops the daemon, so it is an error here too - and
+    /// `check` is the command an operator runs to find out why.
+    #[test]
+    fn the_same_database_in_both_layouts_is_an_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = pre_migration_config(dir.path());
+        let engine = dir.path().join("default").join("zec").join("lrz");
+        std::fs::create_dir_all(&engine).unwrap();
+        std::fs::write(engine.join("data.sqlite"), b"other").unwrap();
+
+        assert!(
+            errors(&inspect(&config))
+                .iter()
+                .any(|e| e.contains("data.sqlite both at")),
+            "{:?}",
+            inspect(&config)
+        );
     }
 
     /// A config with no upstream/wallet problems produces no *errors*; the wallet-not-initialized

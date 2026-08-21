@@ -34,7 +34,7 @@ fn best_block(
     let w = state.registry.get(wallet)?;
     let st = w.status();
     if let Some(h) = st.fully_scanned {
-        if let Some((hash, time)) = read::block_info_at(&w.dir, h)? {
+        if let Some((hash, time)) = read::block_info_at(&w.engine_dir, h)? {
             return Ok((h, Some(hash), Some(time)));
         }
     }
@@ -48,7 +48,7 @@ pub(crate) fn getblockchaininfo(state: &AppState, wallet: Option<&str>) -> Resul
     let st = w.status();
     let (blocks, best_hash, best_time) = best_block(state, wallet)?;
     let headers = st.chain_tip.unwrap_or(blocks);
-    let mediantime = read::median_time_past(&w.dir, blocks).ok().flatten();
+    let mediantime = read::median_time_past(&w.engine_dir, blocks).ok().flatten();
     Ok(json!({
         "chain": w.network.name(),
         "blocks": blocks,
@@ -109,7 +109,7 @@ pub(crate) fn getblockhash(
     // Any block the wallet has scanned can be answered from the wallet DB; the not-yet-scanned
     // chain tip is answered from the sync status. Anything else (below the wallet birthday,
     // beyond the tip) is out of range for a light wallet.
-    if let Some((hash, _)) = read::block_info_at(&w.dir, height)? {
+    if let Some((hash, _)) = read::block_info_at(&w.engine_dir, height)? {
         return Ok(Value::String(hash));
     }
     let st = w.status();
@@ -164,12 +164,12 @@ pub(crate) fn getblockheader(
     }
 
     let w = state.registry.get(wallet)?;
-    let height = read::block_height_by_hash(&w.dir, hash)?
+    let height = read::block_height_by_hash(&w.engine_dir, hash)?
         .ok_or_else(|| RpcError::invalid_address_or_key("Block not found"))?;
-    let (_, time) = read::block_info_at(&w.dir, height)?
+    let (_, time) = read::block_info_at(&w.engine_dir, height)?
         .ok_or_else(|| RpcError::invalid_address_or_key("Block not found"))?;
     let st = w.status();
-    let mediantime = read::median_time_past(&w.dir, height).ok().flatten();
+    let mediantime = read::median_time_past(&w.engine_dir, height).ok().flatten();
 
     let mut obj = json!({
         "hash": hash,
@@ -181,11 +181,11 @@ pub(crate) fn getblockheader(
     // Chain links, where the neighbors are in the wallet's scan range (Bitcoin Core also
     // omits previousblockhash on genesis and nextblockhash on the tip).
     if let Some(h) = height.checked_sub(1) {
-        if let Some((prev, _)) = read::block_info_at(&w.dir, h)? {
+        if let Some((prev, _)) = read::block_info_at(&w.engine_dir, h)? {
             obj["previousblockhash"] = json!(prev);
         }
     }
-    if let Some((next, _)) = read::block_info_at(&w.dir, height + 1)? {
+    if let Some((next, _)) = read::block_info_at(&w.engine_dir, height + 1)? {
         obj["nextblockhash"] = json!(next);
     }
     Ok(obj)

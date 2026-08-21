@@ -65,10 +65,10 @@ pub const COINBASE_MATURITY: u32 = 100;
 /// `getbalance` maps an explicit `minconf` onto a symmetric override.
 pub fn balance(
     network: ZNetwork,
-    wallet_dir: &Path,
+    engine_dir: &Path,
     policy: ConfirmationsPolicy,
 ) -> anyhow::Result<BalanceInfo> {
-    let db = open_read(network, wallet_dir)?;
+    let db = open_read(network, engine_dir)?;
     let mut info = BalanceInfo::default();
     if let Some(summary) = db.get_wallet_summary(policy)? {
         let target_height = u32::from(summary.chain_tip_height()) + 1;
@@ -130,7 +130,7 @@ pub fn balance(
         // as a clamped fallback (it holds no immature coinbase on the current upstream; the
         // fallback guards against the bucketing shifting again across upstream releases, which
         // it already did once between 0.24.0-rc.1 and 0.24.0-rc.4).
-        let immature_coinbase = immature_coinbase_zats(wallet_dir, target_height)?;
+        let immature_coinbase = immature_coinbase_zats(engine_dir, target_height)?;
         let from_pending = immature_coinbase.min(info.pending);
         let from_spendable = (immature_coinbase - from_pending).min(info.transparent_spendable);
         info.pending -= from_pending;
@@ -139,7 +139,7 @@ pub fn balance(
         // The mature-coinbase breakout (see the field docs). Clamped to the transparent bucket
         // so it is a subset of `trusted` by construction even if the upstream bucketing shifts.
         info.mature_coinbase =
-            mature_coinbase_zats(wallet_dir, target_height)?.min(info.transparent_spendable);
+            mature_coinbase_zats(engine_dir, target_height)?.min(info.transparent_spendable);
         info.total_spendable = info.orchard_spendable
             + info.sapling_spendable
             + info.transparent_spendable
@@ -152,16 +152,16 @@ pub fn balance(
 /// [`COINBASE_MATURITY`] confirmations at `target_height`). Mirrors the coinbase-maturity
 /// clause of `zcash_client_sqlite`'s `get_spendable_transparent_outputs` (which the balance
 /// queries lack) so `balance` can reclassify the immature value.
-fn immature_coinbase_zats(wallet_dir: &Path, target_height: u32) -> anyhow::Result<u64> {
-    coinbase_zats(wallet_dir, target_height, false)
+fn immature_coinbase_zats(engine_dir: &Path, target_height: u32) -> anyhow::Result<u64> {
+    coinbase_zats(engine_dir, target_height, false)
 }
 
 /// Unspent, mined, **mature** coinbase value - the other side of the maturity split. Backs
 /// [`BalanceInfo::mature_coinbase`] and the actor's `-6` enrichment (the "spendable only via
 /// z_shieldcoinbase" hint), so the number a failed send reports is the same one `getbalances`
 /// shows.
-pub fn mature_coinbase_zats(wallet_dir: &Path, target_height: u32) -> anyhow::Result<u64> {
-    coinbase_zats(wallet_dir, target_height, true)
+pub fn mature_coinbase_zats(engine_dir: &Path, target_height: u32) -> anyhow::Result<u64> {
+    coinbase_zats(engine_dir, target_height, true)
 }
 
 /// Sum unspent, mined coinbase value on the requested side of the [`COINBASE_MATURITY`]
@@ -169,8 +169,8 @@ pub fn mature_coinbase_zats(wallet_dir: &Path, target_height: u32) -> anyhow::Re
 /// 1)` - unknown defaults to *non*-coinbase, so a bare UTXO row can't masquerade as coinbase),
 /// and it is suppressed by a spend only while the spending tx is still live (mined or
 /// unexpired), mirroring the `listunspent` query below.
-fn coinbase_zats(wallet_dir: &Path, target_height: u32, mature: bool) -> anyhow::Result<u64> {
-    let conn = open_conn(wallet_dir)?;
+fn coinbase_zats(engine_dir: &Path, target_height: u32, mature: bool) -> anyhow::Result<u64> {
+    let conn = open_conn(engine_dir)?;
     let unexpired_stx = tx_unexpired_sql("stx");
     let maturity_cmp = if mature { ">=" } else { "<" };
     let sql = format!(
@@ -196,8 +196,8 @@ fn coinbase_zats(wallet_dir: &Path, target_height: u32, mature: bool) -> anyhow:
 }
 
 /// Number of transactions in the wallet (for `getwalletinfo.txcount`).
-pub fn tx_count(wallet_dir: &Path) -> anyhow::Result<u64> {
-    let conn = open_conn(wallet_dir)?;
+pub fn tx_count(engine_dir: &Path) -> anyhow::Result<u64> {
+    let conn = open_conn(engine_dir)?;
     let n: i64 = conn.query_row("SELECT COUNT(*) FROM v_transactions", [], |r| r.get(0))?;
     Ok(n as u64)
 }
@@ -312,8 +312,8 @@ pub struct UnspentNote {
     pub generated: bool,
 }
 
-fn open_conn(wallet_dir: &Path) -> anyhow::Result<Connection> {
-    let conn = Connection::open(data_db_path(wallet_dir))?;
+fn open_conn(engine_dir: &Path) -> anyhow::Result<Connection> {
+    let conn = Connection::open(data_db_path(engine_dir))?;
     conn.busy_timeout(std::time::Duration::from_secs(5))?;
     Ok(conn)
 }
@@ -453,8 +453,8 @@ pub struct TxQuery {
 /// `sort_height` ordering (mined height, else a non-zero expiry height) matches what
 /// [`list_transactions`] used before pagination moved into SQL. [`load_outputs`] stays per-tx
 /// but is now bounded by `limit`, not the whole wallet.
-pub fn query_transactions(wallet_dir: &Path, q: &TxQuery) -> anyhow::Result<Vec<TxRecord>> {
-    let conn = open_conn(wallet_dir)?;
+pub fn query_transactions(engine_dir: &Path, q: &TxQuery) -> anyhow::Result<Vec<TxRecord>> {
+    let conn = open_conn(engine_dir)?;
     let order = if q.newest_first {
         "ORDER BY sort_height DESC NULLS FIRST"
     } else {
@@ -498,8 +498,8 @@ pub fn query_transactions(wallet_dir: &Path, q: &TxQuery) -> anyhow::Result<Vec<
 /// All transactions, oldest first (callers apply skip/count). Mirrors `list_tx.rs`. A thin
 /// wrapper over [`query_transactions`] with no filtering, kept for callers that genuinely
 /// want the whole history (`gettransaction.details` aggregation, tests).
-pub fn list_transactions(wallet_dir: &Path) -> anyhow::Result<Vec<TxRecord>> {
-    query_transactions(wallet_dir, &TxQuery::default())
+pub fn list_transactions(engine_dir: &Path) -> anyhow::Result<Vec<TxRecord>> {
+    query_transactions(engine_dir, &TxQuery::default())
 }
 
 /// A lightweight data source for the received-by aggregations
@@ -515,10 +515,10 @@ pub fn list_transactions(wallet_dir: &Path) -> anyhow::Result<Vec<TxRecord>> {
 /// `v_tx_outputs.to_address` as given - a received transparent output is stored under its bare
 /// t-address (see [`load_outputs`]), so a t-address filter matches the stored rows directly.
 pub fn received_tx_records(
-    wallet_dir: &Path,
+    engine_dir: &Path,
     address_filter: Option<&str>,
 ) -> anyhow::Result<Vec<TxRecord>> {
-    let conn = open_conn(wallet_dir)?;
+    let conn = open_conn(engine_dir)?;
     // Order by the same `sort_height` (oldest-first) as `list_transactions`, so the per-address
     // `txids` list `listreceivedbyaddress` emits is in the identical order it was before this
     // flat path replaced the full N+1 load.
@@ -590,13 +590,13 @@ pub fn received_tx_records(
 /// A single transaction by its display-hex txid.
 pub fn get_transaction(
     network: ZNetwork,
-    wallet_dir: &Path,
+    engine_dir: &Path,
     txid_hex: &str,
 ) -> anyhow::Result<Option<TxRecord>> {
     let Some(internal) = txid_internal(txid_hex) else {
         return Ok(None);
     };
-    let conn = open_conn(wallet_dir)?;
+    let conn = open_conn(engine_dir)?;
     let mut stmt = conn.prepare(&format!("SELECT {TX_COLS} {TX_FROM} WHERE v.txid = :txid"))?;
     let mut rows = stmt.query(named_params! {":txid": internal})?;
     let Some(row) = rows.next()? else {
@@ -612,14 +612,14 @@ pub fn get_transaction(
     // exactly the contract of the column read it replaces.
     rec.raw = <[u8; 32]>::try_from(internal)
         .ok()
-        .and_then(|bytes| raw_tx_bytes(network, wallet_dir, TxId::from_bytes(bytes)));
+        .and_then(|bytes| raw_tx_bytes(network, engine_dir, TxId::from_bytes(bytes)));
     Ok(Some(rec))
 }
 
 /// Serialized bytes of a wallet-known transaction, via the public `WalletRead::get_transaction`.
 /// `None` if the txid is unknown to the wallet or its raw data hasn't been stored yet.
-fn raw_tx_bytes(network: ZNetwork, wallet_dir: &Path, txid: TxId) -> Option<Vec<u8>> {
-    let db = open_read(network, wallet_dir).ok()?;
+fn raw_tx_bytes(network: ZNetwork, engine_dir: &Path, txid: TxId) -> Option<Vec<u8>> {
+    let db = open_read(network, engine_dir).ok()?;
     let tx = db.get_transaction(txid).ok()??;
     let mut buf = Vec::new();
     tx.write(&mut buf).ok()?;
@@ -628,11 +628,11 @@ fn raw_tx_bytes(network: ZNetwork, wallet_dir: &Path, txid: TxId) -> Option<Vec<
 
 /// Whether the wallet database has a row for this transaction (display-hex txid). The actor
 /// uses this to record first-seen times only for transactions that concern the wallet.
-pub fn tx_exists(wallet_dir: &Path, txid_hex: &str) -> bool {
+pub fn tx_exists(engine_dir: &Path, txid_hex: &str) -> bool {
     let Some(internal) = txid_internal(txid_hex) else {
         return false;
     };
-    let Ok(conn) = open_conn(wallet_dir) else {
+    let Ok(conn) = open_conn(engine_dir) else {
         return false;
     };
     conn.query_row(
@@ -684,8 +684,8 @@ fn unmined_raw_txs_sql() -> String {
 /// shielded funds *are* ironwood notes, so the omission meant no send could ever be retried - a
 /// send whose broadcast failed (upstream briefly down) was simply never retransmitted, and sat
 /// unmined until it expired. Pre-NU6.3 the tables are empty, so this reads as a no-op there.
-pub fn unmined_raw_txs(wallet_dir: &Path, tip: u32) -> anyhow::Result<Vec<(String, Vec<u8>)>> {
-    let conn = open_conn(wallet_dir)?;
+pub fn unmined_raw_txs(engine_dir: &Path, tip: u32) -> anyhow::Result<Vec<(String, Vec<u8>)>> {
+    let conn = open_conn(engine_dir)?;
     let mut stmt = conn.prepare(&unmined_raw_txs_sql())?;
     let rows = stmt.query_map(named_params! { ":target_height": tip + 1 }, |row| {
         Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, Vec<u8>>(1)?))
@@ -708,9 +708,9 @@ pub fn unmined_raw_txs(wallet_dir: &Path, tip: u32) -> anyhow::Result<Vec<(Strin
 /// spend of it is still a spend the wallet must record. An output is dropped as soon as any
 /// spend of it is recorded, which is what keeps the set shrinking as spends are found.
 pub fn unspent_transparent_outpoints(
-    wallet_dir: &Path,
+    engine_dir: &Path,
 ) -> anyhow::Result<std::collections::HashSet<(TxId, u32)>> {
-    let conn = Connection::open(data_db_path(wallet_dir))?;
+    let conn = Connection::open(data_db_path(engine_dir))?;
     let mut stmt = conn.prepare(
         "SELECT t.txid, txo.output_index
          FROM transparent_received_outputs txo
@@ -735,8 +735,8 @@ pub fn unspent_transparent_outpoints(
 /// Display-hex txids of every wallet transaction that is still unmined (`mined_height` NULL),
 /// including foreign incoming txs the mempool stream stored. Used to prune the actor's transient
 /// in-memory first-seen map (which only ever matters for unmined txs).
-pub fn unmined_txids(wallet_dir: &Path) -> anyhow::Result<Vec<String>> {
-    let conn = open_conn(wallet_dir)?;
+pub fn unmined_txids(engine_dir: &Path) -> anyhow::Result<Vec<String>> {
+    let conn = open_conn(engine_dir)?;
     let mut stmt = conn.prepare("SELECT txid FROM transactions WHERE mined_height IS NULL")?;
     let rows = stmt.query_map([], |row| row.get::<_, Vec<u8>>(0))?;
     let mut out = Vec::new();
@@ -748,8 +748,8 @@ pub fn unmined_txids(wallet_dir: &Path) -> anyhow::Result<Vec<String>> {
 
 /// The `(display-hex hash, unix time)` of a block the wallet has scanned, from the wallet's
 /// `blocks` table. Hashes are stored in internal byte order and displayed reversed, like txids.
-pub fn block_info_at(wallet_dir: &Path, height: u32) -> anyhow::Result<Option<(String, i64)>> {
-    let conn = open_conn(wallet_dir)?;
+pub fn block_info_at(engine_dir: &Path, height: u32) -> anyhow::Result<Option<(String, i64)>> {
+    let conn = open_conn(engine_dir)?;
     let row = conn
         .query_row(
             "SELECT hash, time FROM blocks WHERE height = :height",
@@ -762,8 +762,8 @@ pub fn block_info_at(wallet_dir: &Path, height: u32) -> anyhow::Result<Option<(S
 
 /// The earliest block the wallet has scanned, as `(height, display-hex hash)` - the lowest
 /// cursor `listsinceblock` can hand out when the requested depth predates the wallet.
-pub fn first_scanned_block(wallet_dir: &Path) -> anyhow::Result<Option<(u32, String)>> {
-    let conn = open_conn(wallet_dir)?;
+pub fn first_scanned_block(engine_dir: &Path) -> anyhow::Result<Option<(u32, String)>> {
+    let conn = open_conn(engine_dir)?;
     let row = conn
         .query_row(
             "SELECT height, hash FROM blocks ORDER BY height ASC LIMIT 1",
@@ -784,11 +784,11 @@ pub fn is_block_hash_wellformed(display_hash: &str) -> bool {
 
 /// The height of a wallet-scanned block, looked up by its display-hex hash (for
 /// `listsinceblock`). Hashes are stored in internal byte order, displayed reversed.
-pub fn block_height_by_hash(wallet_dir: &Path, display_hash: &str) -> anyhow::Result<Option<u32>> {
+pub fn block_height_by_hash(engine_dir: &Path, display_hash: &str) -> anyhow::Result<Option<u32>> {
     let Some(internal) = txid_internal(display_hash) else {
         return Ok(None);
     };
-    let conn = open_conn(wallet_dir)?;
+    let conn = open_conn(engine_dir)?;
     let h = conn
         .query_row(
             "SELECT height FROM blocks WHERE hash = :hash",
@@ -801,8 +801,8 @@ pub fn block_height_by_hash(wallet_dir: &Path, display_hash: &str) -> anyhow::Re
 
 /// The median-time-past at `height`: the median of the (up to) 11 scanned block times ending
 /// at `height` inclusive - the consensus MTP rule, for `getblockchaininfo.mediantime`.
-pub fn median_time_past(wallet_dir: &Path, height: u32) -> anyhow::Result<Option<i64>> {
-    let conn = open_conn(wallet_dir)?;
+pub fn median_time_past(engine_dir: &Path, height: u32) -> anyhow::Result<Option<i64>> {
+    let conn = open_conn(engine_dir)?;
     let mut stmt = conn
         .prepare("SELECT time FROM blocks WHERE height <= :height ORDER BY height DESC LIMIT 11")?;
     let rows = stmt.query_map(named_params! {":height": height}, |r| r.get::<_, i64>(0))?;
@@ -815,8 +815,8 @@ pub fn median_time_past(wallet_dir: &Path, height: u32) -> anyhow::Result<Option
 }
 
 /// List unspent Orchard notes for `listunspent` (with mined height for confirmations).
-pub fn list_unspent(network: ZNetwork, wallet_dir: &Path) -> anyhow::Result<Vec<UnspentNote>> {
-    let db = open_read(network, wallet_dir)?;
+pub fn list_unspent(network: ZNetwork, engine_dir: &Path) -> anyhow::Result<Vec<UnspentNote>> {
+    let db = open_read(network, engine_dir)?;
     let Some(chain_height) = db.chain_height()? else {
         return Ok(vec![]);
     };
@@ -834,7 +834,7 @@ pub fn list_unspent(network: ZNetwork, wallet_dir: &Path) -> anyhow::Result<Vec<
     let mut out_addr: HashMap<(String, u32), String> = HashMap::new();
     let mut out_pool: HashMap<(String, u32), i64> = HashMap::new();
     {
-        let conn = open_conn(wallet_dir)?;
+        let conn = open_conn(engine_dir)?;
         let mut stmt =
             conn.prepare("SELECT txid, mined_height, account_balance_delta FROM v_transactions")?;
         let rows = stmt.query_map([], |r| {
@@ -964,7 +964,7 @@ pub fn list_unspent(network: ZNetwork, wallet_dir: &Path) -> anyhow::Result<Vec<
     // note while its spending tx is mined or unexpired - mirroring `spent_notes_clause` - so an
     // expired spend releases the note again.
     {
-        let conn = open_conn(wallet_dir)?;
+        let conn = open_conn(engine_dir)?;
         let seen: std::collections::HashSet<(String, u32)> =
             out.iter().map(|u| (u.txid.clone(), u.vout)).collect();
         let target = u32::from(chain_height) + 1;
@@ -1116,8 +1116,8 @@ pub fn list_unspent(network: ZNetwork, wallet_dir: &Path) -> anyhow::Result<Vec<
 /// Every address the wallet has generated, encoded for the network (for
 /// `listreceivedbyaddress` with `include_empty`). Includes the wallet's exposed transparent
 /// receivers as base58 t-addresses (a no-op for zecd wallets, which never expose any).
-pub fn all_addresses(network: ZNetwork, wallet_dir: &Path) -> Vec<String> {
-    let Ok(db) = open_read(network, wallet_dir) else {
+pub fn all_addresses(network: ZNetwork, engine_dir: &Path) -> Vec<String> {
+    let Ok(db) = open_read(network, engine_dir) else {
         return Vec::new();
     };
     let Ok(ids) = db.get_account_ids() else {
@@ -1166,8 +1166,8 @@ pub fn all_addresses(network: ZNetwork, wallet_dir: &Path) -> Vec<String> {
 /// a bare t-address, never mixed into a UA, so a UA that carries one can only be a splice (a
 /// transparent-only sender would pay the attacker), rejected even when a shielded receiver alongside
 /// it genuinely is the wallet's.
-pub fn is_mine(network: ZNetwork, wallet_dir: &Path, addr: &str) -> bool {
-    let Ok(db) = open_read(network, wallet_dir) else {
+pub fn is_mine(network: ZNetwork, engine_dir: &Path, addr: &str) -> bool {
+    let Ok(db) = open_read(network, engine_dir) else {
         return false;
     };
     let Ok(ids) = db.get_account_ids() else {
@@ -1355,7 +1355,7 @@ fn classify_receivers_with_ufvk(ufvk: &UnifiedFullViewingKey, ua: &UnifiedAddres
 /// [`UaReceivers`]. Non-unified addresses and UAs carrying fewer than two shielded receivers are
 /// [`UaReceivers::NotApplicable`]. Best-effort: storage errors degrade to `NotApplicable` rather
 /// than erroring, so callers fall back to their existing (byte-exact) ownership checks.
-pub fn classify_unified_receivers(network: ZNetwork, wallet_dir: &Path, addr: &str) -> UaReceivers {
+pub fn classify_unified_receivers(network: ZNetwork, engine_dir: &Path, addr: &str) -> UaReceivers {
     let Some(Address::Unified(ua)) = Address::decode(&network, addr) else {
         return UaReceivers::NotApplicable;
     };
@@ -1364,7 +1364,7 @@ pub fn classify_unified_receivers(network: ZNetwork, wallet_dir: &Path, addr: &s
     if u8::from(ua.sapling().is_some()) + u8::from(ua.orchard().is_some()) < 2 {
         return UaReceivers::NotApplicable;
     }
-    let Ok(db) = open_read(network, wallet_dir) else {
+    let Ok(db) = open_read(network, engine_dir) else {
         return UaReceivers::NotApplicable;
     };
     let Ok(ids) = db.get_account_ids() else {
@@ -1429,14 +1429,14 @@ impl TransparentDerivation {
 /// the other read helpers - storage errors degrade to `None`.
 pub fn transparent_derivation(
     network: ZNetwork,
-    wallet_dir: &Path,
+    engine_dir: &Path,
     addr: &str,
 ) -> Option<TransparentDerivation> {
     let taddr = match Address::decode(&network, addr)? {
         Address::Transparent(t) => t,
         _ => return None,
     };
-    let db = open_read(network, wallet_dir).ok()?;
+    let db = open_read(network, engine_dir).ok()?;
     for id in db.get_account_ids().ok()? {
         let Ok(Some(meta)) = db.get_transparent_address_metadata(id, &taddr) else {
             continue;

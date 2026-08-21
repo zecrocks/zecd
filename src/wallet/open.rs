@@ -22,12 +22,12 @@ pub type WriteDb = WalletDb<rusqlite::Connection, ZNetwork, SystemClock, OsRng>;
 /// A read-only wallet handle (no clock/RNG needed), as used by devtool's read paths.
 pub type ReadDb = WalletDb<rusqlite::Connection, ZNetwork, (), ()>;
 
-pub fn data_db_path(wallet_dir: &Path) -> PathBuf {
-    wallet_dir.join(DATA_DB)
+pub fn data_db_path(engine_dir: &Path) -> PathBuf {
+    engine_dir.join(DATA_DB)
 }
 
-pub fn block_path(wallet_dir: &Path, meta: &BlockMeta) -> PathBuf {
-    meta.block_file_path(&wallet_dir.join(BLOCKS_FOLDER))
+pub fn block_path(engine_dir: &Path, meta: &BlockMeta) -> PathBuf {
+    meta.block_file_path(&engine_dir.join(BLOCKS_FOLDER))
 }
 
 /// Open the wallet DB for writing (sync, sends, address generation).
@@ -48,8 +48,8 @@ pub fn block_path(wallet_dir: &Path, meta: &BlockMeta) -> PathBuf {
 /// `for_path` (the writer is opened once and lives for the actor's lifetime, so set-once is
 /// enough). Read connections (`open_read`) never commit, so `synchronous` there is a no-op and
 /// is left untouched.
-pub fn open_write(network: ZNetwork, wallet_dir: &Path) -> anyhow::Result<WriteDb> {
-    open_write_with_gap_limit(network, wallet_dir, None)
+pub fn open_write(network: ZNetwork, engine_dir: &Path) -> anyhow::Result<WriteDb> {
+    open_write_with_gap_limit(network, engine_dir, None)
 }
 
 /// Apply the write-path PRAGMAs (and the array vtab module `WalletDb` requires) to a
@@ -78,10 +78,10 @@ const DEFAULT_EPHEMERAL_GAP: u32 = 10;
 /// configured (WAL + `synchronous = NORMAL`) the same way as [`open_write`].
 pub fn open_write_with_gap_limit(
     network: ZNetwork,
-    wallet_dir: &Path,
+    engine_dir: &Path,
     external_gap_limit: Option<u32>,
 ) -> anyhow::Result<WriteDb> {
-    let conn = rusqlite::Connection::open(data_db_path(wallet_dir))?;
+    let conn = rusqlite::Connection::open(data_db_path(engine_dir))?;
     configure_writer_conn(&conn)?;
     let db = WalletDb::from_connection(conn, network, SystemClock, OsRng);
     Ok(match external_gap_limit {
@@ -95,9 +95,9 @@ pub fn open_write_with_gap_limit(
 }
 
 /// Open the wallet DB read-only (balances, history); short-lived per request.
-pub fn open_read(network: ZNetwork, wallet_dir: &Path) -> anyhow::Result<ReadDb> {
+pub fn open_read(network: ZNetwork, engine_dir: &Path) -> anyhow::Result<ReadDb> {
     Ok(WalletDb::for_path(
-        data_db_path(wallet_dir),
+        data_db_path(engine_dir),
         network,
         (),
         (),
@@ -105,13 +105,13 @@ pub fn open_read(network: ZNetwork, wallet_dir: &Path) -> anyhow::Result<ReadDb>
 }
 
 /// Open the compact-block cache.
-pub fn open_fsblockdb(wallet_dir: &Path) -> anyhow::Result<FsBlockDb> {
-    FsBlockDb::for_path(wallet_dir).map_err(|e| anyhow::anyhow!("opening block-cache db: {e}"))
+pub fn open_fsblockdb(engine_dir: &Path) -> anyhow::Result<FsBlockDb> {
+    FsBlockDb::for_path(engine_dir).map_err(|e| anyhow::anyhow!("opening block-cache db: {e}"))
 }
 
 /// Initialize both the wallet DB and the block-cache DB (idempotent migrations).
-pub fn init_dbs(network: ZNetwork, wallet_dir: &Path) -> anyhow::Result<WriteDb> {
-    init_dbs_with_gap_limit(network, wallet_dir, None)
+pub fn init_dbs(network: ZNetwork, engine_dir: &Path) -> anyhow::Result<WriteDb> {
+    init_dbs_with_gap_limit(network, engine_dir, None)
 }
 
 /// As [`init_dbs`], but with an explicit **external** transparent gap limit (`None` = crate
@@ -120,13 +120,13 @@ pub fn init_dbs(network: ZNetwork, wallet_dir: &Path) -> anyhow::Result<WriteDb>
 /// (wider) window.
 pub fn init_dbs_with_gap_limit(
     network: ZNetwork,
-    wallet_dir: &Path,
+    engine_dir: &Path,
     external_gap_limit: Option<u32>,
 ) -> anyhow::Result<WriteDb> {
-    std::fs::create_dir_all(wallet_dir)?;
-    enable_wal(wallet_dir)?;
-    let mut db_cache = open_fsblockdb(wallet_dir)?;
-    let mut db_data = open_write_with_gap_limit(network, wallet_dir, external_gap_limit)?;
+    std::fs::create_dir_all(engine_dir)?;
+    enable_wal(engine_dir)?;
+    let mut db_cache = open_fsblockdb(engine_dir)?;
+    let mut db_data = open_write_with_gap_limit(network, engine_dir, external_gap_limit)?;
     init_blockmeta_db(&mut db_cache)
         .map_err(|e| anyhow::anyhow!("initializing block-cache db: {e}"))?;
     init_wallet_db(&mut db_data, None)?;
@@ -135,8 +135,8 @@ pub fn init_dbs_with_gap_limit(
 
 /// Put the wallet DB into WAL journal mode (a persistent, per-database setting) so RPC read
 /// connections get consistent snapshots without blocking on the sync writer.
-fn enable_wal(wallet_dir: &Path) -> anyhow::Result<()> {
-    let conn = rusqlite::Connection::open(data_db_path(wallet_dir))?;
+fn enable_wal(engine_dir: &Path) -> anyhow::Result<()> {
+    let conn = rusqlite::Connection::open(data_db_path(engine_dir))?;
     conn.busy_timeout(std::time::Duration::from_secs(5))?;
     // `PRAGMA journal_mode=WAL` returns the resulting mode as a row; ignore it.
     conn.query_row("PRAGMA journal_mode=WAL;", [], |_| Ok(()))?;

@@ -37,7 +37,7 @@ async fn regtest_end_to_end() {
 
     // 2. zecd against zebra's JSON-RPC.
     let cfg = ZecdConfig::new(zebrad.rpc_port, pick_port().expect("pick zecd rpc port"));
-    let zecd = Zecd::start(&cfg)
+    let mut zecd = Zecd::start(&cfg)
         .await
         .expect("start zecd against regtest zebra");
     zecd.wait_until_synced(INITIAL_BLOCKS as u64, SYNC_TIMEOUT)
@@ -132,5 +132,49 @@ async fn regtest_end_to_end() {
     assert_eq!(
         zecd.block_count().await.expect("getblockcount"),
         height0 + 5
+    );
+
+    // ---- data directory layout migration ----
+    // A data directory written by an older zecd keeps librustzcash's databases at the root of
+    // each wallet directory; this build keeps them under `<wallet>/zec/lrz/`, with `keys.toml`
+    // still at the wallet root. Recreate the older layout on a real, scanned wallet and
+    // restart: the daemon must move the databases and come back up on that same wallet.
+    let addr = addr.to_string();
+    let wallet = zecd.wallet_dir("default");
+    let engine = zecd.engine_dir("default");
+    zecd.stop_keeping_datadir().await.expect("stop zecd");
+    for artifact in std::fs::read_dir(&engine).expect("read the engine dir") {
+        let path = artifact.expect("engine dir entry").path();
+        let name = path.file_name().expect("artifact name").to_owned();
+        std::fs::rename(&path, wallet.join(&name)).expect("put the databases back at the root");
+    }
+    std::fs::remove_dir_all(wallet.join("zec")).expect("remove the now-empty coin dir");
+
+    zecd.respawn()
+        .await
+        .expect("zecd starts on a data directory in the older layout");
+    zecd.wait_until_synced(height0 + 5, SYNC_TIMEOUT)
+        .await
+        .expect("the migrated wallet syncs");
+    assert!(
+        engine.join("data.sqlite").is_file(),
+        "the wallet database moved to {}",
+        engine.display()
+    );
+    assert!(
+        !wallet.join("data.sqlite").exists(),
+        "the database is moved, not copied"
+    );
+    assert!(
+        wallet.join("keys.toml").is_file(),
+        "keys.toml stays at the wallet root, above the per-coin directories"
+    );
+    let info = zecd
+        .call("getaddressinfo", json!([addr]))
+        .await
+        .expect("getaddressinfo after the layout migration");
+    assert_eq!(
+        info["ismine"], true,
+        "the migrated wallet is the same wallet - it still owns {addr}"
     );
 }

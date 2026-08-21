@@ -36,6 +36,13 @@
 //! records (an embedder wanting them installs `tracing_log::LogTracer` and filters `schemerz`
 //! themselves).
 //!
+//! One startup side effect an embedder should know about: like the daemon,
+//! [`node::NodeBuilder::start`] takes the exclusive datadir lock and, under it, migrates a data
+//! directory laid out by an older zecd - librustzcash's databases move from a wallet
+//! directory's root into `<wallet>/zec/lrz/`, leaving `keys.toml` where it is (see
+//! [`migrate`]). Each file is renamed, it runs before any wallet is opened, and it is a no-op
+//! on a data directory this build created.
+//!
 //! Every other public item exists because the binary and its tests are built from this crate;
 //! treat it as internal API with no stability promise across commits.
 
@@ -57,6 +64,7 @@ pub mod hardening;
 pub mod health;
 pub mod init;
 pub mod lock;
+pub mod migrate;
 pub mod network;
 pub mod node;
 pub mod operations;

@@ -415,7 +415,9 @@ pub enum WalletCommand {
 #[derive(Clone)]
 pub struct WalletHandle {
     pub name: String,
-    pub dir: PathBuf,
+    /// This wallet's **engine** directory (`<wallet dir>/<coin>/<engine>`) - what the read
+    /// paths open, not the wallet directory `keys.toml` sits in. See [`crate::config::engine_dir`].
+    pub engine_dir: PathBuf,
     pub network: ZNetwork,
     /// The wallet-wide confirmations policy (`[spend]` config; ZIP-315 3/10 by default),
     /// used wherever an RPC doesn't override depth with an explicit `minconf`.
@@ -468,7 +470,7 @@ impl WalletHandle {
 
     /// Build a handle wired to a fixed [`SyncStatus`] for unit tests - no actor, no DB behind it.
     /// The command channel is inert (its receiver is dropped, so any `dispatch` would fail), and
-    /// `dir` is empty; only `status()`/`name`/`network` reads are meaningful. Used to exercise
+    /// `engine_dir` is empty; only `status()`/`name`/`network` reads are meaningful. Used to exercise
     /// `/wallet/<name>` routing in RPC handlers that read solely from the published sync status.
     #[cfg(test)]
     pub(crate) fn for_test(name: &str, network: ZNetwork, status: SyncStatus) -> Self {
@@ -490,7 +492,7 @@ impl WalletHandle {
         let (status_tx, status_rx) = watch::channel(status);
         let handle = WalletHandle {
             name: name.to_string(),
-            dir: PathBuf::new(),
+            engine_dir: PathBuf::new(),
             network,
             confirmations: ConfirmationsPolicy::default(),
             enabled_pools: ReceiverSet::single(Receiver::Orchard),
@@ -793,7 +795,7 @@ impl WalletRegistry {
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn make_handle(
     name: String,
-    dir: PathBuf,
+    engine_dir: PathBuf,
     network: ZNetwork,
     confirmations: ConfirmationsPolicy,
     enabled_pools: ReceiverSet,
@@ -808,7 +810,7 @@ pub(crate) fn make_handle(
 ) -> WalletHandle {
     WalletHandle {
         name,
-        dir,
+        engine_dir,
         network,
         confirmations,
         enabled_pools,

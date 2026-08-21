@@ -120,7 +120,7 @@ env:
   # The harness --test targets for the standard (zecd) suite, as run on the zebra leg. The zakura
   # and zecd-lwd legs each override it with their own list (see the matrix `include` below).
   # Extended/stress tests skip in seconds unless their gate is set.
-  HARNESS_TESTS: "--test regtest_e2e --test regtest_binding --test regtest_funded --test regtest_ironwood --test regtest_proving_cache --test regtest_sapling --test regtest_transparent --test regtest_transparent_t2t --test regtest_transparent_sendmany_t2t --test regtest_transparent_gap --test regtest_transparent_offline_restore --test regtest_transparent_preexpose_responsive --test regtest_transparent_recovery_window --test regtest_shielding --test regtest_mergetoaddress --test regtest_coinbase --test regtest_hang --test regtest_reorg --test regtest_multiwallet --test regtest_restore --test regtest_watchonly --test regtest_stress_notes"
+  HARNESS_TESTS: "--test regtest_e2e --test regtest_binding --test regtest_migration --test regtest_funded --test regtest_ironwood --test regtest_proving_cache --test regtest_sapling --test regtest_transparent --test regtest_transparent_t2t --test regtest_transparent_sendmany_t2t --test regtest_transparent_gap --test regtest_transparent_offline_restore --test regtest_transparent_preexpose_responsive --test regtest_transparent_recovery_window --test regtest_shielding --test regtest_mergetoaddress --test regtest_coinbase --test regtest_hang --test regtest_reorg --test regtest_multiwallet --test regtest_restore --test regtest_watchonly --test regtest_stress_notes"
 
 concurrency:
   group: regtest-${{ github.event_name }}-${{ github.ref }}

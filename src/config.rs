@@ -6,7 +6,7 @@
 use std::collections::BTreeMap;
 use std::net::IpAddr;
 use std::num::NonZeroU32;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::Context;
 #[cfg(feature = "cli")]
@@ -31,6 +31,39 @@ pub const DEFAULT_SERVER: &str = "zebra";
 /// (`backend::tests::default_server_resolves_to_local_zebrad_per_network` pins that.)
 pub fn default_server(_network: ZNetwork) -> &'static str {
     DEFAULT_SERVER
+}
+
+/// The default directory for wallet `name`: `<datadir>/<name>`.
+///
+/// A wallet directory holds `keys.toml` - the one file in it that is zecd's own, and the only
+/// one a from-seed restore cannot rebuild - plus one subdirectory per coin ([`coin_dir`]).
+/// The data directory itself holds only daemon-level files (`zecd.toml`, `.lock`, `.cookie`,
+/// `identity.txt`).
+///
+/// A `[wallets.<name>] dir` override replaces this outright; everything below is still laid
+/// out inside whatever path the operator names.
+pub fn wallet_dir(datadir: &Path, name: &str) -> PathBuf {
+    datadir.join(name)
+}
+
+/// Where `coin`'s state lives inside a wallet directory: `<wallet dir>/zec` for Zcash
+/// ([`Coin::data_dir`]).
+///
+/// The seed in `keys.toml` serves every coin, so the coin sits *inside* the wallet rather than
+/// above it: one wallet, one seed, one subdirectory per coin underneath.
+pub fn coin_dir(wallet_dir: &Path, coin: Coin) -> PathBuf {
+    wallet_dir.join(coin.data_dir())
+}
+
+/// Where the wallet-storage engine's own files live: `<wallet dir>/zec/lrz` for Zcash, holding
+/// everything librustzcash owns - `data.sqlite`, `blockmeta.sqlite`, `blocks/`
+/// ([`Coin::engine_dir`]).
+///
+/// Nothing outside these three functions and [`crate::migrate`] should join a coin or engine
+/// directory name onto a path: callers take a wallet directory from [`WalletEntry::dir`] and an
+/// engine directory from [`WalletEntry::engine_dir`].
+pub fn engine_dir(wallet_dir: &Path, coin: Coin) -> PathBuf {
+    coin_dir(wallet_dir, coin).join(coin.engine_dir())
 }
 
 /// Binary configuration defaults (config file, datadir, ports).
@@ -302,8 +335,18 @@ impl WalletEntry {
         }
     }
 
+    /// This wallet's engine directory: everything librustzcash owns, at
+    /// `<dir>/<coin>/<engine>` (see [`engine_dir`]). This - not [`WalletEntry::dir`] - is what
+    /// the wallet database, the block cache, and every read path are opened against.
+    pub fn engine_dir(&self) -> PathBuf {
+        engine_dir(&self.dir, self.coin)
+    }
+
     /// The effective path to this wallet's `keys.toml` (the explicit `keys_file` override, or
     /// `<dir>/keys.toml` by default).
+    ///
+    /// It sits at the wallet root, above the per-coin directories: the BIP-39 seed it wraps
+    /// serves every coin, and it is the one file here that no engine swap or rescan may touch.
     pub fn keys_path(&self) -> PathBuf {
         self.keys_file
             .clone()
@@ -1329,7 +1372,6 @@ impl AppConfig {
         // subset validation applied per wallet.
         let mut wallets = BTreeMap::new();
         for (name, w) in &file.wallets {
-            let dir = w.dir.clone().unwrap_or_else(|| datadir.join(name));
             let keys_file = w.keys_file.clone().or_else(|| {
                 if name == &default_wallet {
                     keys_file_global.clone()
@@ -1338,6 +1380,7 @@ impl AppConfig {
                 }
             });
             let coin = Coin::Zcash;
+            let dir = w.dir.clone().unwrap_or_else(|| wallet_dir(&datadir, name));
             let backend_override = resolve_wallet_backend(name, w)?;
             let (
                 enabled,
@@ -1382,7 +1425,7 @@ impl AppConfig {
         wallets
             .entry(default_wallet.clone())
             .or_insert_with(|| WalletEntry {
-                dir: datadir.join(&default_wallet),
+                dir: wallet_dir(&datadir, &default_wallet),
                 keys_file: keys_file_global.clone(),
                 coin: Coin::Zcash,
                 chain: Coin::Zcash.chain(network),
@@ -2693,7 +2736,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let conf = dir.path().join("zecd.toml");
 
-        // Default: keys.toml lives under the wallet's dir.
+        // Default: keys.toml lives at the root of the wallet's dir, above the per-coin
+        // subdirectories (see `Coin::data_dir`) - the seed it wraps serves every coin.
         std::fs::write(&conf, "network = \"test\"\ndatadir = \"/d\"\n").unwrap();
         let cli = Cli::parse_from(["zecd", "--conf", conf.to_str().unwrap()]);
         let cfg = AppConfig::resolve(&cli).unwrap();

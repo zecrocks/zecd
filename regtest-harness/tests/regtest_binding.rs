@@ -71,7 +71,7 @@ async fn regtest_account_binding() {
         .await
         .expect("zecd scans to the regtest tip");
 
-    let keys_toml = zecd.datadir().join("default").join("keys.toml");
+    let keys_toml = zecd.wallet_dir("default").join("keys.toml");
     let pin = pinned_ufvk(&keys_toml).expect("zecd init must pin the account UFVK");
     assert!(
         pin.starts_with("uviewregtest1"),
@@ -109,14 +109,14 @@ async fn regtest_account_binding() {
         .stop_keeping_datadir()
         .await
         .expect("stop the foreign zecd");
-    let foreign_db = foreign.datadir().join("default").join("data.sqlite");
+    let foreign_db = foreign.engine_dir("default").join("data.sqlite");
 
     zecd.stop_keeping_datadir().await.expect("stop zecd again");
-    let wallet_dir = zecd.datadir().join("default");
+    let engine_dir = zecd.engine_dir("default");
     for suffix in ["-wal", "-shm"] {
-        let _ = std::fs::remove_file(wallet_dir.join(format!("data.sqlite{suffix}")));
+        let _ = std::fs::remove_file(engine_dir.join(format!("data.sqlite{suffix}")));
     }
-    std::fs::copy(&foreign_db, wallet_dir.join("data.sqlite")).expect("swap in the foreign db");
+    std::fs::copy(&foreign_db, engine_dir.join("data.sqlite")).expect("swap in the foreign db");
 
     let stderr = zecd
         .respawn_expect_startup_failure()
@@ -132,7 +132,7 @@ async fn regtest_account_binding() {
     // The foreign wallet's datadir, with keys.toml removed: exactly the audit's scenario of a
     // pre-existing account-bearing database in a directory about to be initialized. The guard
     // runs before any interactive or network I/O, so the refusal is immediate.
-    std::fs::remove_file(foreign.datadir().join("default").join("keys.toml"))
+    std::fs::remove_file(foreign.wallet_dir("default").join("keys.toml"))
         .expect("remove the foreign wallet's keys.toml");
     let out = Command::new(zecd_bin())
         .args([

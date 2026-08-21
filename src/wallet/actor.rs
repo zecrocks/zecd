@@ -552,8 +552,8 @@ pub fn install_panic_hook() {
 pub struct ActorConfig {
     pub name: String,
     pub network: ZNetwork,
-    pub wallet_dir: PathBuf,
-    /// Path to this wallet's `keys.toml` (may live outside `wallet_dir`, e.g. a mounted Secret).
+    pub engine_dir: PathBuf,
+    /// Path to this wallet's `keys.toml` (may live outside `engine_dir`, e.g. a mounted Secret).
     pub keys_path: PathBuf,
     /// The upstream zebrad endpoint.
     pub server: Server,
@@ -615,8 +615,8 @@ pub struct ActorConfig {
 struct WalletActor {
     name: String,
     network: ZNetwork,
-    wallet_dir: PathBuf,
-    /// Path to this wallet's `keys.toml` (may live outside `wallet_dir`).
+    engine_dir: PathBuf,
+    /// Path to this wallet's `keys.toml` (may live outside `engine_dir`).
     keys_path: PathBuf,
     /// The upstream zebrad endpoint.
     server: Server,
@@ -836,14 +836,14 @@ async fn spawn_inner(
     // there. Probe it up front so a read-only mount fails with a clear error now,
     // not later at an awkward moment - e.g. when a `walletpassphrase` arrives and the bootstrap
     // tries to create the account.
-    ensure_dir_writable(&cfg.wallet_dir)
+    ensure_dir_writable(&cfg.engine_dir)
         .with_context(|| format!("wallet '{}' data directory is not usable", cfg.name))?;
 
     // Apply the configured external transparent gap limit only for transparent-enabled wallets, so
     // shielded-only wallets keep librustzcash's default and are completely unaffected.
     let db_data = open::init_dbs_with_gap_limit(
         cfg.network,
-        &cfg.wallet_dir,
+        &cfg.engine_dir,
         cfg.transparent_enabled.then_some(cfg.transparent_gap_limit),
     )?;
     if cfg.transparent_enabled {
@@ -879,7 +879,7 @@ async fn spawn_inner(
             );
         }
     }
-    let db_cache = open::open_fsblockdb(&cfg.wallet_dir)?;
+    let db_cache = open::open_fsblockdb(&cfg.engine_dir)?;
     let st = store::WalletStore::read(&cfg.keys_path)?;
     let encrypted = st.is_encrypted();
 
@@ -906,7 +906,7 @@ async fn spawn_inner(
                         "wallet '{}' has no account in {}; run `zecd init`, or enable \
                          [keys] bootstrap_from_keys to rebuild the data directory from keys.toml.",
                         cfg.name,
-                        open::data_db_path(&cfg.wallet_dir).display()
+                        open::data_db_path(&cfg.engine_dir).display()
                     ));
                 }
                 info!(
@@ -1076,7 +1076,7 @@ async fn spawn_inner(
     let actor = WalletActor {
         name: cfg.name.clone(),
         network: cfg.network,
-        wallet_dir: cfg.wallet_dir.clone(),
+        engine_dir: cfg.engine_dir.clone(),
         keys_path: cfg.keys_path.clone(),
         server: cfg.server,
         connect_timeout: cfg.connect_timeout,
@@ -1148,7 +1148,7 @@ async fn spawn_inner(
     Ok((
         make_handle(
             cfg.name,
-            cfg.wallet_dir,
+            cfg.engine_dir,
             cfg.network,
             cfg.confirmations_policy,
             cfg.enabled_pools,
@@ -2881,7 +2881,7 @@ impl WalletActor {
                 // The tx is ours iff it now exists in the wallet DB - either the shielded
                 // decrypt stored it or we just recorded a transparent receive from it.
                 let txid_hex = txid.to_string();
-                let ours = t_recorded > 0 || super::read::tx_exists(&self.wallet_dir, &txid_hex);
+                let ours = t_recorded > 0 || super::read::tx_exists(&self.engine_dir, &txid_hex);
                 tracing::debug!(
                     "processed mempool tx {txid} (ours={ours}, transparent_receives={t_recorded})"
                 );
@@ -2914,7 +2914,7 @@ impl WalletActor {
         if map.is_empty() {
             return;
         }
-        match super::read::unmined_txids(&self.wallet_dir) {
+        match super::read::unmined_txids(&self.engine_dir) {
             Ok(unmined) => {
                 let unmined: std::collections::HashSet<String> = unmined.into_iter().collect();
                 map.retain(|txid, _| unmined.contains(txid));
@@ -3039,7 +3039,7 @@ impl WalletActor {
             engine::sync_one_batch(
                 client,
                 &self.network,
-                &self.wallet_dir,
+                &self.engine_dir,
                 &mut self.db_cache,
                 &mut self.db_data,
                 transparent,
@@ -3162,7 +3162,7 @@ impl WalletActor {
     /// indexed query bounded by the outputs the wallet actually holds - not by how many addresses
     /// it has issued - so it stays cheap for a wallet tracking a large address set.
     fn rebuild_transparent_unspent(&mut self) {
-        match crate::wallet::read::unspent_transparent_outpoints(&self.wallet_dir) {
+        match crate::wallet::read::unspent_transparent_outpoints(&self.engine_dir) {
             Ok(set) => {
                 tracing::debug!(
                     "watching {} unspent transparent outpoint(s) for spends",
@@ -3476,7 +3476,7 @@ impl WalletActor {
         self.last_rebroadcast = Some(Instant::now());
         // Same caught-up cadence: drop first-seen entries for txs that have since mined.
         self.prune_first_seen();
-        let txs = match read::unmined_raw_txs(&self.wallet_dir, tip) {
+        let txs = match read::unmined_raw_txs(&self.engine_dir, tip) {
             Ok(txs) => txs,
             Err(e) => {
                 warn!("querying unmined txs for rebroadcast: {e}");
@@ -4121,7 +4121,7 @@ impl WalletActor {
         let net = self.network;
         let change_pool = self.enabled_pools.change_pool();
         let orchard_action_limit = self.orchard_action_limit;
-        let wallet_dir = self.wallet_dir.clone();
+        let engine_dir = self.engine_dir.clone();
         let db = &mut self.db_data;
         tokio::task::block_in_place(move || -> Result<_, RpcError> {
             let start = Instant::now();
@@ -4157,7 +4157,7 @@ impl WalletActor {
                 // `None` builds at the transaction version implied by the target height.
                 None,
             )
-            .map_err(|e| enrich_insufficient_funds(db, &wallet_dir, policy, classify_err(e)))?;
+            .map_err(|e| enrich_insufficient_funds(db, &engine_dir, policy, classify_err(e)))?;
             if privacy == SendPrivacy::FullPrivacy {
                 enforce_full_privacy(&proposal)?;
             }
@@ -4178,7 +4178,7 @@ impl WalletActor {
                 BundlePadding::DEFAULT,
             )
             .map_err(|e| {
-                enrich_insufficient_funds(db, &wallet_dir, policy, classify_pczt_err(e))
+                enrich_insufficient_funds(db, &engine_dir, policy, classify_pczt_err(e))
             })?;
             Ok((pczt, shape, start.elapsed()))
         })
@@ -4381,7 +4381,7 @@ impl WalletActor {
         let orchard_action_limit = self.orchard_action_limit;
         let account_id = self.require_account()?;
         let prover: &LocalTxProver = &self.prover;
-        let wallet_dir = self.wallet_dir.clone();
+        let engine_dir = self.engine_dir.clone();
         let db = &mut self.db_data;
         let (txid, raw, shape, build, prove): (TxId, Vec<u8>, SendShape, Duration, Duration) =
             tokio::task::block_in_place(move || -> Result<_, RpcError> {
@@ -4416,7 +4416,7 @@ impl WalletActor {
                     // `None` builds at the transaction version implied by the target height.
                     None,
                 )
-                .map_err(|e| enrich_insufficient_funds(db, &wallet_dir, policy, classify_err(e)))?;
+                .map_err(|e| enrich_insufficient_funds(db, &engine_dir, policy, classify_err(e)))?;
                 if privacy == SendPrivacy::FullPrivacy {
                     enforce_full_privacy(&proposal)?;
                 }
@@ -4436,7 +4436,7 @@ impl WalletActor {
                     // height, matching the PCZT path.
                     None,
                 )
-                .map_err(|e| enrich_insufficient_funds(db, &wallet_dir, policy, classify_err(e)))?;
+                .map_err(|e| enrich_insufficient_funds(db, &engine_dir, policy, classify_err(e)))?;
                 if txids.len() > 1 {
                     return Err(RpcError::wallet(
                         "multi-transaction proposals are not supported",
@@ -4713,7 +4713,7 @@ impl WalletActor {
         // `self.prover` is an `Arc<LocalTxProver>` (shared for the pipeline); the transaction
         // builder wants `&LocalTxProver`, so deref-coerce through the Arc.
         let prover: &LocalTxProver = &self.prover;
-        let wallet_dir = self.wallet_dir.clone();
+        let engine_dir = self.engine_dir.clone();
         let db = &mut self.db_data;
 
         let (txid, raw): (TxId, Vec<u8>) =
@@ -4766,7 +4766,7 @@ impl WalletActor {
                     // spendable, so a bare "0 spendable" here would contradict what the caller
                     // just read. Same query as `getbalances.mine.coinbase`.
                     let coinbase =
-                        super::read::mature_coinbase_zats(&wallet_dir, u32::from(target_height))
+                        super::read::mature_coinbase_zats(&engine_dir, u32::from(target_height))
                             .unwrap_or(0);
                     return Err(RpcError::insufficient_funds(if coinbase > 0 {
                         format!(
@@ -4804,7 +4804,7 @@ impl WalletActor {
                         // As above: excluded mature coinbase may be exactly what the caller
                         // expected to cover the shortfall, so name it.
                         let coinbase = super::read::mature_coinbase_zats(
-                            &wallet_dir,
+                            &engine_dir,
                             u32::from(target_height),
                         )
                         .unwrap_or(0);
@@ -6575,7 +6575,7 @@ fn classify_err(e: ProposalError) -> RpcError {
 /// can't fire), and a failed lookup just leaves the message unenriched.
 fn enrich_insufficient_funds(
     db: &WriteDb,
-    wallet_dir: &Path,
+    engine_dir: &Path,
     policy: ConfirmationsPolicy,
     err: RpcError,
 ) -> RpcError {
@@ -6609,7 +6609,7 @@ fn enrich_insufficient_funds(
     // caller can't diagnose. Same number as `getbalances.mine.coinbase` (both read
     // `mature_coinbase_zats`); best-effort - a failed lookup just leaves the hint off.
     let target_height = u32::from(summary.chain_tip_height()) + 1;
-    let coinbase = super::read::mature_coinbase_zats(wallet_dir, target_height).unwrap_or(0);
+    let coinbase = super::read::mature_coinbase_zats(engine_dir, target_height).unwrap_or(0);
     if incoming == 0 && change == 0 && coinbase == 0 {
         return err;
     }

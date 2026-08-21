@@ -307,7 +307,7 @@ pub fn owned_transparent_output(
 
 async fn download_blocks<C: ChainSource>(
     client: &mut C,
-    wallet_dir: &Path,
+    engine_dir: &Path,
     db_cache: &mut FsBlockDb,
     scan_range: &ScanRange,
     transparent: Option<&HashSet<TransparentAddress>>,
@@ -414,7 +414,7 @@ async fn download_blocks<C: ChainSource>(
         }
 
         let encoded = block.encode_to_vec();
-        let mut block_file = File::create(block_path(wallet_dir, &meta)).await?;
+        let mut block_file = File::create(block_path(engine_dir, &meta)).await?;
         block_file.write_all(&encoded).await?;
         block_meta.push(meta);
     }
@@ -443,10 +443,10 @@ async fn download_chain_state<C: ChainSource>(
 /// in-place reorg recovery never completed. Because sync processes one batch per call
 /// (download -> scan -> delete before the next), truncating to just below the batch's lowest
 /// height removes exactly this batch's rows, so the table never accumulates.
-fn delete_cached_blocks(wallet_dir: &Path, db_cache: &mut FsBlockDb, block_meta: Vec<BlockMeta>) {
+fn delete_cached_blocks(engine_dir: &Path, db_cache: &mut FsBlockDb, block_meta: Vec<BlockMeta>) {
     let lowest = block_meta.iter().map(|m| m.height).min();
     for meta in &block_meta {
-        if let Err(e) = std::fs::remove_file(block_path(wallet_dir, meta)) {
+        if let Err(e) = std::fs::remove_file(block_path(engine_dir, meta)) {
             warn!("Failed to remove cached block {:?}: {}", meta, e);
         }
     }
@@ -546,7 +546,7 @@ pub struct ScanOutcome {
 /// Scan a downloaded range; handle continuity (reorg) errors by rewinding. See [`ScanOutcome`].
 fn scan_blocks(
     params: &ZNetwork,
-    wallet_dir: &Path,
+    engine_dir: &Path,
     db_cache: &mut FsBlockDb,
     db_data: &mut WriteDb,
     initial_chain_state: &ChainState,
@@ -593,7 +593,7 @@ fn scan_blocks(
                     sapling_outputs_count: 0,
                     orchard_actions_count: 0,
                 };
-                match std::fs::remove_file(block_path(wallet_dir, &meta)) {
+                match std::fs::remove_file(block_path(engine_dir, &meta)) {
                     Ok(()) => Ok(()),
                     Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
                     Err(e) => Err(ChainError::<(), _>::BlockSource(FsBlockDbError::Fs(e))),
@@ -669,7 +669,7 @@ pub struct BatchOutcome {
 pub async fn sync_one_batch<C: ChainSource>(
     client: &mut C,
     params: &ZNetwork,
-    wallet_dir: &Path,
+    engine_dir: &Path,
     db_cache: &mut FsBlockDb,
     db_data: &mut WriteDb,
     transparent: Option<&TransparentMatcher>,
@@ -711,7 +711,7 @@ pub async fn sync_one_batch<C: ChainSource>(
 
     let (block_meta, received, spent) = download_blocks(
         client,
-        wallet_dir,
+        engine_dir,
         db_cache,
         &scan_range,
         transparent.map(|m| &m.all),
@@ -733,7 +733,7 @@ pub async fn sync_one_batch<C: ChainSource>(
         let outcome = tokio::task::block_in_place(|| {
             scan_blocks(
                 params,
-                wallet_dir,
+                engine_dir,
                 db_cache,
                 db_data,
                 &chain_state,
@@ -747,7 +747,7 @@ pub async fn sync_one_batch<C: ChainSource>(
     // Remove the downloaded compact blocks (files and their metadata rows) whether the scan
     // succeeded or failed, so a transient error (or a reorg-shifted range) cannot strand cache
     // files on disk or leave stale `compactblocks_meta` rows behind.
-    delete_cached_blocks(wallet_dir, db_cache, block_meta);
+    delete_cached_blocks(engine_dir, db_cache, block_meta);
     let outcome = result?;
 
     // Record the transparent receives matched during download - but only when the range was
@@ -1042,7 +1042,7 @@ mod tests {
     /// to), write its file into the cache directory, and record its metadata in the cache
     /// DB - exactly what `download_blocks` does with a lightwalletd stream.
     fn write_block(
-        wallet_dir: &Path,
+        engine_dir: &Path,
         db_cache: &mut FsBlockDb,
         height: u32,
         hash: [u8; 32],
@@ -1084,7 +1084,7 @@ mod tests {
             sapling_outputs_count: 0,
             orchard_actions_count: 1,
         };
-        std::fs::write(block_path(wallet_dir, &meta), cb.encode_to_vec())
+        std::fs::write(block_path(engine_dir, &meta), cb.encode_to_vec())
             .expect("write compact block file");
         db_cache
             .write_block_metadata(&[meta])

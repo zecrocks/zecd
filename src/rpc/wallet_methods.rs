@@ -367,7 +367,7 @@ pub(crate) fn getbalance(
     check_balance_dummy(req.param(0))?;
     let handle = state.registry.get(wallet)?;
     let policy = minconf_policy(req.param(1), handle.confirmations)?;
-    let info = read::balance(handle.network, &handle.dir, policy)?;
+    let info = read::balance(handle.network, &handle.engine_dir, policy)?;
     Ok(zats_to_value(info.total_spendable))
 }
 
@@ -378,7 +378,7 @@ pub(crate) fn getunconfirmedbalance(
     wallet: Option<&str>,
 ) -> Result<Value, RpcError> {
     let handle = state.registry.get(wallet)?;
-    let info = read::balance(handle.network, &handle.dir, handle.confirmations)?;
+    let info = read::balance(handle.network, &handle.engine_dir, handle.confirmations)?;
     Ok(zats_to_value(info.pending))
 }
 
@@ -394,7 +394,7 @@ pub(crate) fn getunconfirmedbalance(
 /// the wallet exactly as Bitcoin Core clients expect.
 pub(crate) fn getbalances(state: &AppState, wallet: Option<&str>) -> Result<Value, RpcError> {
     let handle = state.registry.get(wallet)?;
-    let info = read::balance(handle.network, &handle.dir, handle.confirmations)?;
+    let info = read::balance(handle.network, &handle.engine_dir, handle.confirmations)?;
     let mut obj = json!({
         "mine": {
             "trusted": zats_to_value(info.total_spendable),
@@ -406,7 +406,7 @@ pub(crate) fn getbalances(state: &AppState, wallet: Option<&str>) -> Result<Valu
     // `lastprocessedblock` (Bitcoin Core 26+): the block the balances are anchored to -
     // for zecd that is the fully-scanned height, the same anchor as `getblockcount`.
     if let Some(h) = handle.status().fully_scanned {
-        if let Ok(Some((hash, _))) = read::block_info_at(&handle.dir, h) {
+        if let Ok(Some((hash, _))) = read::block_info_at(&handle.engine_dir, h) {
             obj["lastprocessedblock"] = json!({ "hash": hash, "height": h });
         }
     }
@@ -417,8 +417,8 @@ pub(crate) fn getbalances(state: &AppState, wallet: Option<&str>) -> Result<Valu
 /// `unlocked_until` appears only for passphrase-encrypted wallets, like Bitcoin Core.
 pub(crate) fn getwalletinfo(state: &AppState, wallet: Option<&str>) -> Result<Value, RpcError> {
     let handle = state.registry.get(wallet)?;
-    let info = read::balance(handle.network, &handle.dir, handle.confirmations)?;
-    let txcount = read::tx_count(&handle.dir).unwrap_or(0);
+    let info = read::balance(handle.network, &handle.engine_dir, handle.confirmations)?;
+    let txcount = read::tx_count(&handle.engine_dir).unwrap_or(0);
     let st = handle.status();
     // `scanning` stays truthy while a transaction-enhancement backlog drains, not just during the
     // block scan: the wallet has reached the tip but is still backfilling memos/full tx data, so it
@@ -544,17 +544,17 @@ pub(crate) fn getaddressinfo(
     // this wallet issued. `None` (foreign or single-receiver) omits the field. This is informational
     // here; the consuming RPCs (getreceivedbyaddress/z_sendmany) reject the spliced case outright.
     let receivers_consistent = if v.is_valid {
-        read::classify_unified_receivers(handle.network, &handle.dir, addr).consistent_flag()
+        read::classify_unified_receivers(handle.network, &handle.engine_dir, addr).consistent_flag()
     } else {
         None
     };
-    let ismine = v.is_valid && read::is_mine(handle.network, &handle.dir, addr);
+    let ismine = v.is_valid && read::is_mine(handle.network, &handle.engine_dir, addr);
     // For a transparent address the wallet derived, surface where it sits in the BIP 44 chain.
     // `getnewaddress "" "transparent"` returns a bare string (Bitcoin Core's contract) and zecd
     // keeps no off-chain issuance log, so this is how a caller learns which index it was handed -
     // and how an operator reconciles an issued range against `z_getaddressforaccount`.
     let derivation = if ismine {
-        read::transparent_derivation(handle.network, &handle.dir, addr)
+        read::transparent_derivation(handle.network, &handle.engine_dir, addr)
     } else {
         None
     };
@@ -941,7 +941,7 @@ pub(crate) fn listtransactions(
     let st = handle.status();
     let first_seen = handle.first_seen();
 
-    let entries = paginate_history(&handle.dir, skip, count, |tx| {
+    let entries = paginate_history(&handle.engine_dir, skip, count, |tx| {
         let confirmations = tx_confirmations(&st, tx);
         let time = tx_time(tx, first_seen.get(&tx.txid_hex).copied());
         tx_entries(&network, tx, confirmations, time, label_filter.as_deref())
@@ -1067,7 +1067,7 @@ pub(crate) fn z_listtransactions(
     let st = handle.status();
     let first_seen = handle.first_seen();
 
-    let entries = paginate_history(&handle.dir, from, count, |tx| {
+    let entries = paginate_history(&handle.engine_dir, from, count, |tx| {
         let confirmations = tx_confirmations(&st, tx);
         let time = tx_time(tx, first_seen.get(&tx.txid_hex).copied());
         z_tx_entries(&network, tx, confirmations, time)
@@ -1155,17 +1155,17 @@ pub(crate) fn getreceivedbyaddress(
         )));
     }
     if let read::UaReceivers::Inconsistent(why) =
-        read::classify_unified_receivers(handle.network, &handle.dir, addr)
+        read::classify_unified_receivers(handle.network, &handle.engine_dir, addr)
     {
         return Err(RpcError::invalid_address_or_key(why));
     }
-    if !read::is_mine(handle.network, &handle.dir, addr) {
+    if !read::is_mine(handle.network, &handle.engine_dir, addr) {
         return Err(RpcError::wallet("Address not found in wallet"));
     }
     let st = handle.status();
     // Push the single-address filter into SQL (sublinear) rather than scanning the whole
     // history; the aggregation then sees only this address's outputs.
-    let txs = read::received_tx_records(&handle.dir, Some(addr))?;
+    let txs = read::received_tx_records(&handle.engine_dir, Some(addr))?;
     let total = received_by_address(&txs, &st, minconf, include_immature_coinbase)
         .remove(addr)
         .map(|(amt, _, _)| amt)
@@ -1195,14 +1195,14 @@ pub(crate) fn listreceivedbyaddress(
     let include_immature_coinbase = req.param(4).and_then(|v| v.as_bool()).unwrap_or(false);
     let handle = state.registry.get(wallet)?;
     let st = handle.status();
-    let txs = read::received_tx_records(&handle.dir, address_filter.as_deref())?;
+    let txs = read::received_tx_records(&handle.engine_dir, address_filter.as_deref())?;
     let mut received = received_by_address(&txs, &st, minconf, include_immature_coinbase);
 
     // The address universe: everything that received (already restricted by the pushed-down
     // filter), plus (with include_empty) every address the wallet has ever generated.
     let mut addrs: BTreeSet<String> = received.keys().cloned().collect();
     if include_empty {
-        addrs.extend(read::all_addresses(handle.network, &handle.dir));
+        addrs.extend(read::all_addresses(handle.network, &handle.engine_dir));
     }
 
     let mut out = Vec::new();
@@ -1256,7 +1256,7 @@ pub(crate) fn listsinceblock(
         .and_then(|v| v.as_str())
         .filter(|s| !s.is_empty())
     {
-        Some(hash) => match read::block_height_by_hash(&handle.dir, hash)? {
+        Some(hash) => match read::block_height_by_hash(&handle.engine_dir, hash)? {
             Some(height) => Some(height),
             None if read::is_block_hash_wellformed(hash) => None,
             None => return Err(RpcError::invalid_address_or_key("Block not found")),
@@ -1282,7 +1282,7 @@ pub(crate) fn listsinceblock(
         limit: None,
         newest_first: false,
     };
-    let txs = read::query_transactions(&handle.dir, &query)?;
+    let txs = read::query_transactions(&handle.engine_dir, &query)?;
     let network = handle.network;
     let first_seen = handle.first_seen();
     let mut transactions: Vec<Value> = Vec::new();
@@ -1301,10 +1301,10 @@ pub(crate) fn listsinceblock(
     let lastblock = st
         .fully_scanned
         .and_then(|scanned| scanned.checked_sub(target_conf - 1))
-        .and_then(|h| read::block_info_at(&handle.dir, h).ok().flatten())
+        .and_then(|h| read::block_info_at(&handle.engine_dir, h).ok().flatten())
         .map(|(hash, _)| hash)
         .or_else(|| {
-            read::first_scanned_block(&handle.dir)
+            read::first_scanned_block(&handle.engine_dir)
                 .ok()
                 .flatten()
                 .map(|(_, hash)| hash)
@@ -1329,7 +1329,7 @@ pub(crate) async fn gettransaction(
     let txid = req.require_str(0, "gettransaction requires a txid")?;
     let handle = state.registry.get(wallet)?.clone();
     let st = handle.status();
-    let rec = read::get_transaction(handle.network, &handle.dir, txid)?
+    let rec = read::get_transaction(handle.network, &handle.engine_dir, txid)?
         .ok_or_else(|| RpcError::invalid_address_or_key("Invalid or non-wallet transaction id"))?;
 
     let details = gettransaction_details(&handle.network, &rec);
@@ -1525,7 +1525,7 @@ pub(crate) fn listunspent(
         Some(_) => return Err(RpcError::type_error("include_unsafe must be a boolean")),
     };
     let st = handle.status();
-    let notes = read::list_unspent(handle.network, &handle.dir)?;
+    let notes = read::list_unspent(handle.network, &handle.engine_dir)?;
     Ok(Value::Array(unspent_json(
         &notes,
         &st,
@@ -1848,11 +1848,11 @@ pub(crate) fn z_sendmany(
             ));
         };
         if let read::UaReceivers::Inconsistent(why) =
-            read::classify_unified_receivers(handle.network, &handle.dir, fromaddress)
+            read::classify_unified_receivers(handle.network, &handle.engine_dir, fromaddress)
         {
             return Err(RpcError::invalid_address_or_key(why));
         }
-        if !read::is_mine(handle.network, &handle.dir, fromaddress) {
+        if !read::is_mine(handle.network, &handle.engine_dir, fromaddress) {
             return Err(RpcError::invalid_address_or_key(
                 "Invalid from address, no payment source found for address.",
             ));
@@ -2246,11 +2246,11 @@ pub(crate) async fn z_mergetoaddress(
                     ));
                 };
                 if let read::UaReceivers::Inconsistent(why) =
-                    read::classify_unified_receivers(handle.network, &handle.dir, addr)
+                    read::classify_unified_receivers(handle.network, &handle.engine_dir, addr)
                 {
                     return Err(RpcError::invalid_address_or_key(why));
                 }
-                if !read::is_mine(handle.network, &handle.dir, addr) {
+                if !read::is_mine(handle.network, &handle.engine_dir, addr) {
                     return Err(RpcError::invalid_address_or_key(
                         "Invalid from address, no payment source found for address.",
                     ));

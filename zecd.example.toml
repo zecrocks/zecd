@@ -27,14 +27,16 @@ datadir = "./data"
 # Wallet selected when a request hits "/" rather than "/wallet/<name>".
 default_wallet = "default"
 
-# One section per wallet. The directory holds data.sqlite, keys.toml, blocks/. zecd is stateless:
-# it keeps no off-chain data the seed can't rebuild, so there is no label store on disk.
+# One section per wallet. The directory holds keys.toml plus one subdirectory per coin, so a
+# Zcash wallet's databases live at <dir>/zec/lrz/ (zec = the coin, lrz = librustzcash, the
+# library that owns them). zecd is stateless: it keeps no off-chain data the seed can't
+# rebuild, so there is no label store on disk.
 [wallets.default]
 dir = "./data/default"
 # Optional: put this wallet's keys.toml somewhere other than <dir>/keys.toml - e.g. a
 # Kubernetes Secret mounted read-only, separate from the (disposable, cache-only) data dir.
 # The global [keys] keys_file below sets this for the default wallet; ZECD_KEYS_FILE /
-# --keys-file override it. data.sqlite and blocks/ still live under `dir`.
+# --keys-file override it. The databases still live under <dir>/zec/lrz/.
 # keys_file = "/secrets/keys.toml"
 # This wallet's own upstream, overriding [backend] below. Every [backend] endpoint key
 # (server, tls, tls_roots, tls_insecure_skip_verify, tls_ca_file, tls_pinned_sha256,

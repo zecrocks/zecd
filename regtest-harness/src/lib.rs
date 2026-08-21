@@ -1702,6 +1702,19 @@ impl Zecd {
         self._datadir.path()
     }
 
+    /// Wallet `name`'s directory: `<datadir>/<name>`, holding `keys.toml` and one subdirectory
+    /// per coin. Ask for it here rather than joining the name onto [`Zecd::datadir`].
+    pub fn wallet_dir(&self, name: &str) -> PathBuf {
+        self._datadir.path().join(name)
+    }
+
+    /// Wallet `name`'s Zcash **engine** directory: `<datadir>/<name>/zec/lrz`, holding
+    /// everything librustzcash owns - `data.sqlite`, `blockmeta.sqlite`, `blocks/`. This, not
+    /// [`Zecd::wallet_dir`], is where a test tampering with the wallet database looks.
+    pub fn engine_dir(&self, name: &str) -> PathBuf {
+        self.wallet_dir(name).join("zec").join("lrz")
+    }
+
     /// Gracefully stop the daemon (the `stop` RPC, falling back to kill), keeping the data
     /// directory intact so a test can modify on-disk state and relaunch against it with
     /// [`Zecd::respawn`] or [`Zecd::respawn_expect_startup_failure`].
@@ -1798,13 +1811,16 @@ impl Zecd {
         let _ = self.child.kill();
         let _ = self.child.wait();
 
-        // Remove each wallet subdirectory's derived state, keeping its keys.toml.
+        // Remove each wallet's derived state, keeping its keys.toml. The databases live in the
+        // wallet's per-coin engine directory (`<wallet>/zec/lrz/`); `keys.toml` sits above it at
+        // the wallet root, which is exactly what makes this wipe possible.
         for entry in std::fs::read_dir(self._datadir.path()).context("read datadir for wipe")? {
             let path = entry.context("datadir entry")?.path();
             if path.is_dir() {
-                let _ = std::fs::remove_dir_all(path.join("blocks"));
+                let engine = path.join("zec").join("lrz");
+                let _ = std::fs::remove_dir_all(engine.join("blocks"));
                 for name in ["data.sqlite", "data.sqlite-wal", "data.sqlite-shm"] {
-                    let _ = std::fs::remove_file(path.join(name));
+                    let _ = std::fs::remove_file(engine.join(name));
                 }
             }
         }
@@ -2484,28 +2500,25 @@ fn write_zecd_toml(datadir: &Path, cfg: &ZecdConfig) -> Result<()> {
             format!("\n[spend]\n{lines}")
         }
     };
-    // The default wallet plus any extra `[wallets.<name>]` entries (multiwallet tests).
+    // The default wallet plus any extra `[wallets.<name>]` entries (multiwallet tests). No
+    // explicit `dir`: the wallets land wherever zecd puts them by default (`<datadir>/<name>`,
+    // with the databases under `<name>/zec/lrz/`), so the harness exercises the same path
+    // resolution an operator gets. Tests that need a path ask [`Zecd::wallet_dir`] or
+    // [`Zecd::engine_dir`] rather than assuming one.
+    //
     // A per-wallet `server` override, when this stack gives the wallet its own upstream.
     let wallet_server =
         |name: &str| match cfg.wallet_servers.iter().find(|(wallet, _)| wallet == name) {
             Some((_, server)) => format!("server = \"{server}\"\n"),
             None => String::new(),
         };
-    let mut wallets = format!(
-        "[wallets.default]\ndir = \"{}/default\"\n{}",
-        datadir.display(),
-        wallet_server("default")
-    );
+    let mut wallets = format!("[wallets.default]\n{}", wallet_server("default"));
     for name in cfg
         .extra_wallets
         .iter()
         .chain(&cfg.extra_watch_only_wallets)
     {
-        wallets.push_str(&format!(
-            "\n[wallets.{name}]\ndir = \"{}/{name}\"\n{}",
-            datadir.display(),
-            wallet_server(name)
-        ));
+        wallets.push_str(&format!("\n[wallets.{name}]\n{}", wallet_server(name)));
     }
     // Optional [pools] section (multi-pool / Sapling e2e, and/or transparent receiving); omitted
     // entirely → Orchard-only, no transparent.
