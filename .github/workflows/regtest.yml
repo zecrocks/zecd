@@ -33,11 +33,11 @@ on:
   workflow_dispatch:
     inputs:
       zebra-image:
-        description: "zfnd/zebra image tag to test against (e.g. 6.2.2, latest)"
+        description: "zfnd/zebra image tag to test against (e.g. 6.3.0, latest)"
         required: false
         default: ""
       zakura-image:
-        description: "zakuracore/zakura image tag to test against (e.g. 1.0.5, latest)"
+        description: "zakuracore/zakura image tag to test against (e.g. 1.2.0, latest)"
         required: false
         default: ""
       stress:
@@ -90,8 +90,8 @@ on:
 # second line of defence.) NB `ZEBRAD_*`/`ZAKURAD_*` (with the trailing D) are safe - the prefix
 # match requires the underscore right after `ZEBRA`/`ZAKURA`.
 env:
-  ZEBRAD_IMAGE_PINNED: "6.2.2"
-  ZAKURAD_IMAGE_PINNED: "1.0.5"
+  ZEBRAD_IMAGE_PINNED: "6.3.0"
+  ZAKURAD_IMAGE_PINNED: "1.2.0"
   # The funding wallet is a *released* zecd, from its own digest-pinned GHCR image. Running a
   # release rather than the build under test keeps the two sides of every funded test independent -
   # a regression on this branch cannot mask itself by being present in both the wallet under test
@@ -109,14 +109,14 @@ env:
   #   curl -sI -H "Authorization: Bearer $TOKEN" \
   #     -H "Accept: application/vnd.oci.image.index.v1+json" \
   #     https://ghcr.io/v2/zecrocks/zecd/manifests/<tag> | grep -i docker-content-digest
-  ZECD_FUNDER_IMAGE: ${{ inputs.funder-image || 'ghcr.io/zecrocks/zecd@sha256:b5352653659b18dc1c0ebee916dc5841519dd1cf3b524ff1d3b8877a45ef0dd1' }}  # 0.6.1
+  ZECD_FUNDER_IMAGE: ${{ inputs.funder-image || 'ghcr.io/zecrocks/zecd@sha256:05676366531195f58a6e882ae5b190a53a70560fce89a92b3e798af3a8acdbe3' }}  # 0.6.3
   # lightwalletd, built from source at this release tag. Needed only where the *zecd under test* is
   # a light client - the `zecd-lwd` suite and the dedicated regtest_lwd e2e - since the funder now
   # talks straight to the node. 0.5.0 is the first release serving the versioned lightwallet
   # protocol, which is what carries transparent and Ironwood data in compact blocks; the chain is
   # NU6.3-active throughout, so it also has to parse a V6 transaction, which the old v0.4.19 image
   # cannot.
-  LIGHTWALLETD_VERSION: "v0.5.2"
+  LIGHTWALLETD_VERSION: "v0.5.3"
   # The harness --test targets for the standard (zecd) suite, as run on the zebra leg. The zakura
   # and zecd-lwd legs each override it with their own list (see the matrix `include` below).
   # Extended/stress tests skip in seconds unless their gate is set.
@@ -278,12 +278,23 @@ jobs:
           extract "$ZECD_FUNDER_IMAGE" zecd
           echo "ZECD_FUNDER_BIN=$RUNNER_TEMP/bin/zecd" >> "$GITHUB_ENV"
           "$RUNNER_TEMP/bin/zecd" --version
-          # lightwalletd is built from source below (LIGHTWALLETD_VERSION) rather than extracted:
-          # the chain is NU6.3-active, and the old released image cannot parse a V6 transaction.
+          # lightwalletd is built from source below (LIGHTWALLETD_VERSION) rather than extracted -
+          # see the note on that step for why it is the odd one out here.
 
-      # Build lightwalletd at LIGHTWALLETD_VERSION from source (no published image carries it
-      # yet). It is the upstream for the zecd under test on the light-mode leg - the NU6.3-active
-      # chain needs a lightwalletd that parses V6.
+      # Build lightwalletd at LIGHTWALLETD_VERSION from source. It is the upstream for the zecd
+      # under test on the light-mode leg - the NU6.3-active chain needs a lightwalletd that parses
+      # V6.
+      #
+      # This is the one binary the tier does not extract from an image, and it is a deliberate
+      # choice rather than a missing image: `electriccoinco/lightwalletd` does publish every 0.5.x
+      # tag (it stopped at v0.4.19, which cannot parse V6, only until 2026-07-26). But that image
+      # is single-stage - it ships the Go toolchain and the source tree it built from, ~445 MB of
+      # layers, to deliver one 25 MB binary - and the harness runs lightwalletd as a host process,
+      # not a container, so an image buys nothing structurally: we would extract a binary from it
+      # either way. Building costs 22-34s on a cache miss (measured), and the cache is keyed on
+      # LIGHTWALLETD_VERSION, so every run that does not bump the pin restores a 25 MB binary
+      # instead. Extracting would trade that for a ~445 MB pull on every light-mode run. Revisit if
+      # upstream ships a slim runtime image.
       - name: Cache the release-built lightwalletd
         id: lwd-master-bin
         uses: actions/cache@v4
@@ -348,7 +359,7 @@ jobs:
           ZECD_STRESS_NOTE_COUNT: ${{ inputs.stress-note-count }}
           # The shielded-coinbase e2e needs a zebrad whose block template builds valid shielded
           # coinbase (zebra >= 6.0.0; 5.0.0's Orchard coinbase proof fails its own validation),
-          # and self-skips otherwise. The pinned image (6.2.2) and `latest` both have the
+          # and self-skips otherwise. The pinned image (6.3.0) and `latest` both have the
           # capability, so a skip is a failure everywhere except a manual dispatch that names a
           # custom (possibly older) image - guards against the test silently never running.
           # (Only the zebra leg ever runs the coinbase suite - it is zebra-only in CI, so on the
