@@ -73,6 +73,21 @@ use crate::wallet::{
     RawTx, ReceiverRequest, SendSource, SharedSeed, SyncStatus, WalletCommand, WalletHandle,
 };
 
+/// The concrete error type returned by `propose_transfer` / `create_proposed_transactions`
+/// for our `WalletDb`. Naming it pins the otherwise-unconstrained commitment-tree error
+/// parameter so `map_err` closures can infer their argument type (mirrors zcash-devtool's
+/// `WalletErrorT`). It sits here rather than in `error.rs` because it is typed against the
+/// wallet crates, which stay confined to `wallet/`; the shared error module carries only the
+/// Bitcoin Core code taxonomy and its string-typed constructors.
+type ProposalError = zcash_client_backend::data_api::error::Error<
+    zcash_client_sqlite::error::SqliteClientError,
+    zcash_client_sqlite::wallet::commitment_tree::Error,
+    zcash_client_backend::data_api::wallet::input_selection::GreedyInputSelectorError,
+    zcash_primitives::transaction::fees::zip317::FeeError,
+    zcash_primitives::transaction::fees::zip317::FeeError,
+    zcash_client_sqlite::ReceivedNoteId,
+>;
+
 /// Note-management defaults for change splitting (match zcash-devtool's send defaults).
 const TARGET_NOTE_COUNT: usize = 4;
 const MIN_SPLIT_OUTPUT_VALUE: u64 = 10_000_000; // 0.1 ZEC
@@ -6295,7 +6310,7 @@ fn prove_sign_pczt(
 /// Note this is about Sapling *outputs*, not spends: zecd never spends Sapling notes on this path,
 /// but a send can still *pay* a Sapling recipient. `N` (the note-ref type) is otherwise
 /// unconstrained here - it only appears in the error type - so pin it to our `WalletDb`'s note ref,
-/// as `error::ProposalError` does for the fused path.
+/// as `ProposalError` does for the fused path.
 ///
 /// Orchard verifying key: **always `None`**. The extractor verifies *both* the Orchard and the
 /// Ironwood bundles through that one argument, but they use different circuit versions
@@ -6527,7 +6542,7 @@ fn orchard_action_overflow(
 /// Classify a librustzcash spend/proposal error into a Bitcoin-Core RPC code. Insufficient
 /// funds maps to -6; everything else to the generic wallet error -4. Client-facing messages
 /// use `Display` (not `Debug`) so internal note/proposal structure isn't leaked.
-fn classify_err(e: crate::error::ProposalError) -> RpcError {
+fn classify_err(e: ProposalError) -> RpcError {
     use zcash_client_backend::data_api::error::Error;
     match &e {
         Error::InsufficientFunds {

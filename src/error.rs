@@ -57,19 +57,6 @@ pub fn http_status_for_code(code: i32) -> u16 {
     }
 }
 
-/// The concrete error type returned by `propose_transfer` / `create_proposed_transactions`
-/// for our `WalletDb`. Naming it pins the otherwise-unconstrained commitment-tree error
-/// parameter so `map_err` closures can infer their argument type (mirrors zcash-devtool's
-/// `WalletErrorT`).
-pub type ProposalError = zcash_client_backend::data_api::error::Error<
-    zcash_client_sqlite::error::SqliteClientError,
-    zcash_client_sqlite::wallet::commitment_tree::Error,
-    zcash_client_backend::data_api::wallet::input_selection::GreedyInputSelectorError,
-    zcash_primitives::transaction::fees::zip317::FeeError,
-    zcash_primitives::transaction::fees::zip317::FeeError,
-    zcash_client_sqlite::ReceivedNoteId,
->;
-
 /// A Bitcoin-Core-style RPC error carrying a numeric `code` and human `message`.
 #[derive(Debug, Clone)]
 pub struct RpcError {
