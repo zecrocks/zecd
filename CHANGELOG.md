@@ -5,6 +5,22 @@ All notable changes to zecd are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com), and this
 project adheres to [Semantic Versioning](https://semver.org).
 
+## [0.6.4] - 2026-08-22
+
+The 0.6.4 line, released as `0.6.4-rc1`. Nothing changed between the candidate and
+this release; the candidate's section below is kept for history and everything in
+it applies here.
+
+Five fixes a running 0.6.3 daemon can hit, plus one opt-in readiness mode. No
+configuration key, response shape or error code moves and every default is
+unchanged, so upgrading from 0.6.3 is a drop-in.
+
+The two that matter most to a busy deployment are both about reused transparent
+addresses: a spend-search that re-downloaded an address's whole history on every
+pass, and an enhancement backlog that counted the same request thousands of times
+over. Together they made an ordinary send take a wallet out of rotation while it
+was answering correctly.
+
 ## [0.6.4-rc1] - 2026-08-22
 
 Six fixes, five of which a running 0.6.3 daemon can hit, and one new opt-in
@@ -454,6 +470,7 @@ Zcash, backed entirely by librustzcash and running as a light client.
 ### Security
 - Pre-release audit hardening; refuse to start on mainnet with the placeholder RPC password; enforce a 12-character passphrase minimum.
 
+[0.6.4]: https://github.com/zecrocks/zecd/compare/v0.6.3...v0.6.4
 [0.6.4-rc1]: https://github.com/zecrocks/zecd/compare/v0.6.3...v0.6.4-rc1
 [0.6.3]: https://github.com/zecrocks/zecd/compare/v0.6.2...v0.6.3
 [0.6.2]: https://github.com/zecrocks/zecd/compare/v0.6.1...v0.6.2
