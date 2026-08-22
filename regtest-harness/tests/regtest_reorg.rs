@@ -132,6 +132,24 @@ async fn regtest_reorg_rewinds_and_follows() {
             .await
             .expect("invalidate the old tip block (zebra restored it from its backup)");
     }
+
+    // Pin the mechanism, not just its effect. Everything below asserts on a chain that has
+    // already been rebuilt, so if the divergence never happens the failure surfaces 130 blocks
+    // later as a hash comparing equal to itself - which is how the backup race read for weeks.
+    // Assert here, where the cause is, that the chain really is shorter than the tip zecd
+    // scanned.
+    let diverged_height = zebrad
+        .rpc("getblockcount", json!([]))
+        .await
+        .expect("zebra getblockcount after the invalidation")
+        .as_u64()
+        .expect("a height");
+    assert!(
+        diverged_height < old_tip,
+        "the chain must diverge below the old tip {old_tip} before the replacement tail is \
+         mined, but zebra is still at {diverged_height}"
+    );
+
     zebrad
         .generate_blocks(REPLACEMENT_TAIL)
         .await
