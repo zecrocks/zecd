@@ -3,15 +3,21 @@
 //! only offline tests. This is the riskiest sync path in the daemon - a mishandled rewind
 //! wedges the wallet - so the extended tier exercises it against real processes.
 //!
-//! The reorg is produced with zebra's own persistence semantics (the same mechanism the
-//! funded e2e exploits for coinbase maturity): only blocks deeper than
-//! `MAX_BLOCK_REORG_HEIGHT` (99) below the tip are finalized to disk, and a restart resets
-//! the tip to the finalized height. So: mine 120 blocks and let zecd scan them, restart
-//! zebra (the tip drops to ~21) mining to a *different* coinbase address, and mine a
-//! 130-block replacement tail - every block above the finalized height changes (different
-//! coinbase output → different hashes; the different address makes that guaranteed rather
-//! than timestamp-luck) and the new tip ends higher than the old one. zecd must rewind off the
-//! orphaned blocks and follow the replacement chain.
+//! The reorg is produced deterministically: mine 120 blocks and let zecd scan them, restart
+//! zebra onto a *different* coinbase address, invalidate the old tip block, and mine a
+//! 130-block replacement tail. The different miner address is what makes the replacement
+//! blocks guaranteed to differ rather than timestamp-luck; `invalidateblock` is what makes
+//! the divergence happen at all. zecd must rewind off the orphaned block and follow the
+//! replacement chain, which ends far above the old tip.
+//!
+//! The reorg is deliberately SHALLOW (one block). A rewind target has to be a checkpoint with
+//! a real `blocks` row, which is why the test seeds recent checkpoints below; a reorg deeper
+//! than those exercises `perform_rewind`'s two-blocks-per-pass retry walk instead, which is a
+//! different and much slower path.
+//!
+//! NB an earlier version relied on the restart alone dropping the non-finalized tail. Zebra
+//! backs those blocks up and restores them, so that only ever worked when the backup task had
+//! not yet flushed the tip block: the test passed or failed on that race.
 //!
 //! Extended tier: set `ZECD_REGTEST_EXTENDED=1` (plus ZEBRAD_BIN). Skips cleanly otherwise.
 
@@ -100,13 +106,32 @@ async fn regtest_reorg_rewinds_and_follows() {
         .expect("hash is a string")
         .to_string();
 
-    // 3. Replace the chain above zebra's finalized height: restart zebra onto a different
-    //    miner address so it drops the non-finalized tail and mines a divergent one. zecd
-    //    talks straight to zebra, so there is no indexer cache to invalidate.
+    // 3. Replace the chain above the old tip: restart zebra onto a different miner address so
+    //    the replacement blocks are guaranteed to differ (different coinbase output), then
+    //    force the divergence explicitly. zecd talks straight to zebra, so there is no indexer
+    //    cache to invalidate.
     zebrad
         .restart_with_miner(replacement_miner)
         .await
-        .expect("restart zebra (drops the non-finalized tail)");
+        .expect("restart zebra onto the replacement miner address");
+
+    // The restart alone does NOT reliably drop the tail. Zebra backs its non-finalized blocks
+    // up and restores them on startup, so whether the tip block survives depends on whether the
+    // backup task had flushed it before shutdown - a race this test used to rely on losing.
+    // When the backup wins, the chain comes back whole, no reorg happens, and the assertion
+    // below fails on a chain that was never reorganized. Invalidate the old tip explicitly
+    // instead, which drops exactly one block whatever the backup did.
+    let restored_tip_hash = zebrad
+        .rpc("getblockhash", json!([old_tip]))
+        .await
+        .ok()
+        .and_then(|v| v.as_str().map(str::to_string));
+    if restored_tip_hash.as_deref() == Some(old_hash_at_tip.as_str()) {
+        zebrad
+            .rpc("invalidateblock", json!([old_hash_at_tip]))
+            .await
+            .expect("invalidate the old tip block (zebra restored it from its backup)");
+    }
     zebrad
         .generate_blocks(REPLACEMENT_TAIL)
         .await
