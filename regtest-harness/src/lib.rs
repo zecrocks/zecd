@@ -1877,6 +1877,11 @@ pub struct ZecdConfig {
     /// `[pools] transparent_gap_warn_threshold` - warn when fewer than this many in-window slots
     /// remain. `None` omits it (zecd defaults to 5). Only meaningful with `transparent = true`.
     pub transparent_gap_warn_threshold: Option<u32>,
+    /// `[health] readiness` - `Some("scanned")` etc. writes the mode explicitly, `None` omits it
+    /// (zecd defaults to `"synced"`). The transparent e2e runs under `"scanned"` to pin the
+    /// no-flap contract: `/readyz` must stay 200 through a send while the recurring transparent
+    /// spend-search backlog transiently rises.
+    pub readiness: Option<String>,
     /// When `Some`, the spending `default` wallet is created passphrase-encrypted
     /// (`zecd init --encrypt`, passphrase supplied via `ZECD_WALLET_PASSPHRASE`): it starts
     /// locked and needs `walletpassphrase` before sending. `None` = unencrypted (identity model).
@@ -1914,6 +1919,7 @@ impl ZecdConfig {
             transparent_initial_scan: None,
             transparent_allow_beyond_recovery_window: None,
             transparent_gap_warn_threshold: None,
+            readiness: None,
             encrypt_passphrase: None,
             wallet_servers: Vec::new(),
         }
@@ -2949,7 +2955,7 @@ rebroadcast_secs = {rebroadcast}
 enabled = true
 bind = "127.0.0.1"
 port = {health_port}
-{spend_section}"#,
+{readiness}{spend_section}"#,
         datadir = datadir.display(),
         wallets = wallets,
         server = server,
@@ -2958,6 +2964,11 @@ port = {health_port}
         password = cfg.rpc_password,
         rebroadcast = cfg.rebroadcast_secs,
         health_port = cfg.health_port(),
+        readiness = cfg
+            .readiness
+            .as_ref()
+            .map(|m| format!("readiness = \"{m}\"\n"))
+            .unwrap_or_default(),
         spend_section = spend_section,
     );
     std::fs::write(datadir.join("zecd.toml"), toml)?;

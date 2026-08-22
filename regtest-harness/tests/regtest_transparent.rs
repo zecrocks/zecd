@@ -11,6 +11,14 @@
 //! *beyond* the recovery window must still be discovered, which only holds if issuing the address
 //! refreshes the in-memory set the block-scan / mempool matcher works off of.
 //!
+//! The closing phase runs the daemon under `[health] readiness = "scanned"` and pins the no-flap
+//! contract that mode exists for: on a wallet holding many transparent UTXOs (widened here by a
+//! single funder transaction fanning out to 12 wallet t-addresses), every tip advance regenerates
+//! the recurring transparent spend-search requests, and `/readyz` must stay 200 through the drain
+//! rather than pulling a healthy node out of rotation - plus a tripwire that the reported
+//! `pending_enhancements` is the deduplicated request count, not upstream's quadratically
+//! duplicated one.
+//!
 //! Setup mirrors `regtest_funded.rs`/`regtest_sapling.rs`: mine a transparent coinbase to the
 //! funder, mature it, shield it, then have the funder pay zecd. The difference is that zecd is
 //! configured with `[pools] transparent = true` (Orchard-only enabled, as default), zecd hands out
@@ -47,9 +55,14 @@ async fn regtest_transparent_receive_and_autoshield_spend() {
     // The funder's own bare t-address, used here as an external transparent counterparty.
     let funder_taddr = funder.transparent_address().to_string();
 
-    // 5. zecd with transparent receiving enabled (Orchard-only otherwise).
+    // 5. zecd with transparent receiving enabled (Orchard-only otherwise). Readiness runs in
+    //    "scanned" mode: this wallet accumulates transparent UTXOs, whose recurring spend-search
+    //    requests transiently raise `pending_enhancements` on every tip advance - the fleet
+    //    report's readiness flap under the default "synced" mode. Step 11 pins the no-flap
+    //    contract this mode exists for.
     let mut cfg = ZecdConfig::new(zebrad.rpc_port, pick_port().expect("pick zecd rpc port"));
     cfg.transparent = true;
+    cfg.readiness = Some("scanned".to_string());
     let _zecd_lwd = attach_backend(&mut cfg, zebrad.rpc_port)
         .await
         .expect("attach zecd backend");
@@ -342,6 +355,30 @@ async fn regtest_transparent_receive_and_autoshield_spend() {
         "getbalance counts the transparent UTXO: {getbalance}"
     );
 
+    // Called the way Bitcoin Core clients call them, the balance RPCs agree exactly: with no
+    // explicit minconf they all read the same `read::balance` under the wallet's ZIP-315
+    // confirmations policy. (A monitoring stack passing `getbalance "*" 1` switches that call
+    // alone to a symmetric 1-conf override, which is the documented way the numbers diverge -
+    // a field report chased that divergence as a data inconsistency, so pin the agreement.)
+    let wi = zecd
+        .call("getwalletinfo", json!([]))
+        .await
+        .expect("getwalletinfo");
+    assert_eq!(
+        wi["balance"].as_f64(),
+        getbalance.as_f64(),
+        "getwalletinfo.balance equals default-policy getbalance: {wi}"
+    );
+    let balances = zecd
+        .call("getbalances", json!([]))
+        .await
+        .expect("getbalances");
+    assert_eq!(
+        balances["mine"]["trusted"].as_f64(),
+        getbalance.as_f64(),
+        "getbalances.mine.trusted equals default-policy getbalance: {balances}"
+    );
+
     // listunspent lists the transparent UTXO with a real (txid, vout) outpoint and the t-address.
     let lu = zecd
         .call("listunspent", json!([]))
@@ -540,6 +577,112 @@ async fn regtest_transparent_receive_and_autoshield_spend() {
         );
         tokio::time::sleep(Duration::from_millis(500)).await;
     }
+    // 11. Readiness must not flap while the recurring transparent spend-search backlog drains -
+    //     the field report: on a wallet holding many transparent UTXOs, every tip advance
+    //     regenerates the spend-search request set, and under the default "synced" readiness the
+    //     `pending_enhancements == 0` gate turned each send into ~a minute of NotReady. This
+    //     wallet runs `readiness = "scanned"` (see step 5), whose contract is exactly "scanned
+    //     to tip, memos still landing": /readyz must answer 200 on EVERY sample through the
+    //     window below.
+    //
+    //     First widen the UTXO set the way the field wallet's was shaped: one funder transaction
+    //     paying MANY wallet t-addresses at once. A k-output transaction is what arms upstream's
+    //     quadratic spend-search duplication (its request generation joins each queued output to
+    //     every received output of the same tx - see `actor::outstanding_requests`), so this also
+    //     plants a live tripwire: the raw duplicated set for this tx alone is k^2 = 144 requests,
+    //     and the deduplicated count zecd reports stays far below it.
+    const FAN_OUT: usize = 12;
+    let mut fan_addrs = Vec::with_capacity(FAN_OUT);
+    for _ in 0..FAN_OUT {
+        let addr = zecd
+            .call("getnewaddress", json!(["", "transparent"]))
+            .await
+            .expect("getnewaddress transparent (fan-out)")
+            .as_str()
+            .expect("address string")
+            .to_string();
+        fan_addrs.push((addr, 1_000_000u64)); // 0.01 ZEC each
+    }
+    funder
+        .send_many(&fan_addrs)
+        .await
+        .expect("fund 12 wallet t-addresses in one transaction");
+    zebrad
+        .generate_blocks(2)
+        .await
+        .expect("confirm the fan-out");
+    zecd.wait_until_synced_to_node(&zebrad, FUND_TIMEOUT)
+        .await
+        .expect("zecd scans the fan-out");
+
+    // Sample /readyz and /status continuously while the tip advances a few more times (each
+    // advance regenerates the spend-search set and re-runs the drain). Every /readyz sample must
+    // be 200 - that is the whole "scanned" contract. The pending_enhancements bound is a
+    // probabilistic tripwire on top (the deterministic pin for the dedup is
+    // `actor::tests::upstream_spend_search_duplication_is_collapsed_by_outstanding_requests`):
+    // a sample can miss the drain window, but any sample it does catch must show the
+    // deduplicated count (tens), never the raw duplicated one (144+).
+    let health = format!("http://127.0.0.1:{}", cfg.health_port());
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let samples = std::sync::Arc::new(std::sync::Mutex::new(Vec::<(u16, u64)>::new()));
+    let sampler = {
+        let (stop, samples, health) = (stop.clone(), samples.clone(), health.clone());
+        tokio::spawn(async move {
+            while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                let ready = match reqwest::get(format!("{health}/readyz")).await {
+                    Ok(r) => r.status().as_u16(),
+                    Err(_) => 0, // connection failure - recorded and failed below
+                };
+                let pending = match reqwest::get(format!("{health}/status")).await {
+                    Ok(r) => r
+                        .json::<serde_json::Value>()
+                        .await
+                        .ok()
+                        .and_then(|v| v["wallets"]["default"]["pending_enhancements"].as_u64())
+                        .unwrap_or(0),
+                    Err(_) => 0,
+                };
+                samples.lock().unwrap().push((ready, pending));
+                tokio::time::sleep(Duration::from_millis(200)).await;
+            }
+        })
+    };
+    for _ in 0..3 {
+        zebrad
+            .generate_blocks(1)
+            .await
+            .expect("advance the tip during the readiness window");
+        zecd.wait_until_synced_to_node(&zebrad, FUND_TIMEOUT)
+            .await
+            .expect("zecd follows the tip during the readiness window");
+        // Linger caught-up so the sampler sees the post-scan drain, where the backlog is
+        // measured (it reads 0 while scanning).
+        tokio::time::sleep(Duration::from_secs(2)).await;
+    }
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    sampler.await.expect("join the readiness sampler");
+    let samples = samples.lock().unwrap();
+    assert!(
+        samples.len() >= 10,
+        "the readiness window collected too few samples to mean anything: {}",
+        samples.len()
+    );
+    let not_ready: Vec<_> = samples.iter().filter(|(s, _)| *s != 200).collect();
+    assert!(
+        not_ready.is_empty(),
+        "/readyz must stay 200 under readiness = \"scanned\" while the spend-search backlog \
+         drains; got {} non-200 samples out of {}: {:?}",
+        not_ready.len(),
+        samples.len(),
+        not_ready
+    );
+    let peak_pending = samples.iter().map(|(_, p)| *p).max().unwrap_or(0);
+    assert!(
+        peak_pending < 80,
+        "pending_enhancements reported {peak_pending}, at or above the raw duplicated \
+         request count - the dedup in actor::outstanding_requests has regressed"
+    );
+
     drop(zecd);
     // `zebrad` and `funder` clean up on drop.
 }

@@ -103,10 +103,15 @@ pub struct SyncStatus {
     pub scanning: bool,
     /// Pending transaction-enhancement requests: the per-transaction full-tx fetches that backfill
     /// memos (and full transparent data) for transactions the wallet only ever saw as compact
-    /// blocks. Non-zero only once the block scan is caught up (it's `0` while `scanning`, where it
+    /// blocks. Counted as *distinct* requests (`actor::outstanding_requests` - upstream's
+    /// spend-search generation emits duplicates quadratically on reused transparent addresses).
+    /// Non-zero only once the block scan is caught up (it's `0` while `scanning`, where it
     /// would be unmeasured anyway). On a from-birthday restore this can be a multi-hour backlog
     /// that drains *after* `scan_progress` hits 1.0 and `scanning` goes false - so a wallet is only
-    /// fully ready to serve history once this reaches `0`. Surfaced on `/status`, factored into
+    /// fully ready to serve history once this reaches `0`. It is not restore-only: the recurring
+    /// transparent spend-search requests re-emit on every tip advance for a wallet holding
+    /// unspent transparent UTXOs, so it transiently rises after sends/new blocks in steady state
+    /// (which is what `readiness = "scanned"` exists for). Surfaced on `/status`, factored into
     /// `synced` readiness, and reflected in `getwalletinfo.scanning`.
     pub pending_enhancements: u64,
     /// The height through which the wallet is **fully enhanced**: every transaction mined at or

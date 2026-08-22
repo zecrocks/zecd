@@ -437,6 +437,14 @@ port = 9233
 #       while the wallet is still scanning - keep it for any balance-sensitive deployment. (The
 #       height gap is used rather than librustzcash's note-weighted scan progress, which reaches
 #       100% long before the wallet has actually caught up to the tip.)
+#   "scanned" - like "synced" minus the enhancement-backlog term: connected AND within
+#       `max_scan_lag` of the tip, whether or not transaction-data (enhancement) requests are
+#       still pending. Balances and spendability are current in this state; only history
+#       completeness (memos, full transparent data) lags, bounded precisely by
+#       `getwalletinfo.enhanced_through`. Choose this for deployments that send regularly from
+#       wallets with many transparent UTXOs: the recurring spend-search requests re-emit on every
+#       send/new block, so the strict mode's empty-backlog gate can flap /readyz after routine
+#       sends. Clamp any history consumer to `enhanced_through` when using this mode.
 #   "connected" - ready as soon as the backend is connected and its chain tip is past this
 #       wallet's birthday height (a sanity check that we're on the right, live network). It does
 #       NOT wait for the wallet to finish scanning, so RPC clients can reach zecd while it catches
@@ -444,5 +452,5 @@ port = 9233
 #       is caught up - the per-wallet `scan_lag` in /readyz and /status shows by how much. Choose
 #       this only when reachability matters more than balance freshness.
 readiness = "synced"
-# Only consulted in "synced" mode:
+# Only consulted in "synced" and "scanned" modes:
 max_scan_lag = 4

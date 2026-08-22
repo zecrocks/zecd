@@ -49,13 +49,17 @@ port = 9233
 #       "caught up" signal - librustzcash's note-weighted progress ratio reaches 1.0 while
 #       historical ranges are still being scanned, so it would report ready long before the wallet
 #       has scanned to its own funds.
+#   "scanned" - like "synced" minus the enhancement-backlog term. Balances/spendability are
+#       current once scanned to the tip; only history completeness lags, bounded by
+#       `getwalletinfo.enhanced_through`. For deployments that send regularly from wallets with
+#       many transparent UTXOs, where the recurring spend-search backlog flaps the strict mode.
 #   "connected" - ready as soon as the backend is connected and its chain tip is past this wallet's
 #       birthday height (a sanity check that we're on the right, live network). Does NOT wait for
 #       the wallet to finish scanning, so RPC clients can reach zecd while it catches up, and
 #       readiness doesn't flap during a long sync. Reads may lag the tip until caught up (the
 #       per-wallet `scan_lag` in /readyz and /status shows by how much).
 # readiness = "synced"
-# max_scan_lag only applies in "synced" mode.
+# max_scan_lag only applies in "synced" and "scanned" modes.
 # max_scan_lag = 4
 
 [log]
