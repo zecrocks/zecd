@@ -5,6 +5,15 @@ All notable changes to zecd are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com), and this
 project adheres to [Semantic Versioning](https://semver.org).
 
+## [0.7.0-rc4] - 2026-08-22
+
+Test-tier changes only. No first-party code change, no configuration or response
+shape moves, so upgrading from `0.7.0-rc3` is a drop-in and everything that
+release says still applies.
+
+### Changed
+- The regtest end-to-end tier builds its funded chain once and restores copies, instead of every binary that needs one mining past the 100-block coinbase maturity and shielding the coinbase for a byte-identical result. Restoring verifies the chain tip and the funder's balance rather than trusting them, and falls back to a live bring-up on any mismatch, so a stale archive costs the time it was meant to save rather than quietly changing what the tier runs on. The tier also moves to a larger runner with its concurrency scaled to match. Nothing here reaches a running daemon; a local `cargo test` is unchanged.
+
 ## [0.7.0-rc3] - 2026-08-22
 
 One fix that matters to any wallet with a busy transparent address, plus new
@@ -500,6 +509,7 @@ Zcash, backed entirely by librustzcash and running as a light client.
 ### Security
 - Pre-release audit hardening; refuse to start on mainnet with the placeholder RPC password; enforce a 12-character passphrase minimum.
 
+[0.7.0-rc4]: https://github.com/zecrocks/zecd/compare/v0.7.0-rc3...v0.7.0-rc4
 [0.7.0-rc3]: https://github.com/zecrocks/zecd/compare/v0.7.0-rc2...v0.7.0-rc3
 [0.7.0-rc2]: https://github.com/zecrocks/zecd/compare/v0.7.0-rc1...v0.7.0-rc2
 [0.7.0-rc1]: https://github.com/zecrocks/zecd/compare/v0.6.3...v0.7.0-rc1
