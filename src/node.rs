@@ -268,7 +268,10 @@ impl PreparedNode {
         // wallet is a misconfiguration the operator must resolve (zecd won't silently pick which
         // one is "the" spender), so this is fatal - the actors spawned above are stopped and
         // awaited before the error releases the datadir lock.
-        if let Err(e) = crate::daemon::ensure_single_spending_wallet(&loaded) {
+        if let Err(e) = crate::daemon::ensure_single_spending_wallet(
+            &loaded,
+            config.keys.allow_multiple_spending_wallets,
+        ) {
             stop_actors(&shutdown_tx, actor_tasks).await;
             return Err(e);
         }
@@ -493,6 +496,26 @@ pub(crate) mod testutil {
     }
 
     pub(crate) fn walletless_node_with_safelist(allowed_methods: Vec<String>) -> Node {
+        let config = walletless_config_with_safelist(allowed_methods);
+        Node::for_tests(AppState {
+            config: Arc::new(config),
+            registry: Arc::new(WalletRegistry::new("default".into())),
+            started_at: Instant::now(),
+            shutdown_tx: tokio::sync::watch::channel(false).0,
+            shutting_down: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            work_queue: Arc::new(tokio::sync::Semaphore::new(16)),
+            active: crate::state::ActiveCommands::default(),
+            operations: Arc::new(crate::operations::OperationRegistry::new()),
+        })
+    }
+
+    /// The resolved config behind [`walletless_node`], for tests that check a *policy* over a
+    /// config rather than dispatch behaviour.
+    pub(crate) fn walletless_config() -> AppConfig {
+        walletless_config_with_safelist(vec![])
+    }
+
+    fn walletless_config_with_safelist(allowed_methods: Vec<String>) -> AppConfig {
         let rpc = RpcConfig {
             bind: "127.0.0.1".parse().unwrap(),
             port: 1,
@@ -504,7 +527,7 @@ pub(crate) mod testutil {
             allowed_methods,
             allow_duplicate_shielded_recipients: false,
         };
-        let config = AppConfig {
+        AppConfig {
             network: crate::network::ZNetwork::Test,
             datadir: std::path::PathBuf::from("/tmp"),
             default_wallet: "default".into(),
@@ -530,6 +553,7 @@ pub(crate) mod testutil {
                 age_identity: None,
                 auto_unlock: true,
                 bootstrap_from_keys: true,
+                allow_multiple_spending_wallets: false,
             },
             sync: SyncConfig {
                 interval_secs: 20,
@@ -548,17 +572,7 @@ pub(crate) mod testutil {
                 level: "info".into(),
                 format: "text".into(),
             },
-        };
-        Node::for_tests(AppState {
-            config: Arc::new(config),
-            registry: Arc::new(WalletRegistry::new("default".into())),
-            started_at: Instant::now(),
-            shutdown_tx: tokio::sync::watch::channel(false).0,
-            shutting_down: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            work_queue: Arc::new(tokio::sync::Semaphore::new(16)),
-            active: crate::state::ActiveCommands::default(),
-            operations: Arc::new(crate::operations::OperationRegistry::new()),
-        })
+        }
     }
 }
 

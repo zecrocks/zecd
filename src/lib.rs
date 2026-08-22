@@ -90,15 +90,33 @@
 //!
 //! # Running several writable wallets
 //!
-//! At most one loaded wallet may hold spending keys (per coin), enforced at `init` and again at
-//! startup. It is a custody line, not a technical limit: with several spenders in one node,
-//! "which key can this RPC credential spend?" stops having a one-word answer, and one datadir's
-//! compromise reaches every seed in it. An application managing several independent writable
-//! stores runs **one node per store** - separate datadirs (each with its own lock, so a
-//! collision fails loudly at startup rather than corrupting a wallet database), separate ports
-//! if the HTTP servers are in play. That is the shape zecd's own regtest harness runs, with the
-//! funder and the wallet under test as sibling daemons. Watch-only replicas are unrestricted
-//! and can be loaded anywhere, including alongside the spender they mirror.
+//! By default at most one loaded wallet may hold spending keys (per coin), enforced at `init`
+//! and again at startup. That is a custody line, not a technical limit, and the reason is
+//! specifically about RPC: a credential is spend authority for whichever wallet a request
+//! routes to, so with several spenders loaded "which key can this compromised credential
+//! spend?" stops having a one-word answer, and one datadir's compromise reaches every seed in
+//! it.
+//!
+//! That reasoning does not apply to an embedded node, which has no RPC credentials - the host
+//! application is the authorization boundary and names the wallet explicitly on every
+//! [`node::Node::call`] / [`node::Node::send`]. So an application managing several independent
+//! writable stores in one process can set `[keys] allow_multiple_spending_wallets`, which
+//! [`node::NodeBuilder`] honors and the `zecd` daemon **refuses to start on**
+//! ([`config::reject_multiple_spenders_in_daemon`]); that asymmetry is the whole mechanism by
+//! which the option stays library-only. The additional spenders are logged to the
+//! `zecd::audit` target at startup, so the loosened posture is in the record rather than
+//! silent.
+//!
+//! Leaving it off, the alternative is **one node per store** - separate datadirs (each with
+//! its own lock, so a collision fails loudly at startup rather than corrupting a wallet
+//! database), separate ports if the HTTP servers are in play. That is the shape zecd's own
+//! regtest harness runs, with the funder and the wallet under test as sibling daemons, and it
+//! is the only option under the daemon. Note that `server::run` is public: an embedder that
+//! puts the HTTP server in front of a node with this option set re-creates exactly the
+//! situation the daemon refuses, and owns that decision.
+//!
+//! Watch-only replicas are unrestricted either way and can be loaded anywhere, including
+//! alongside the spender they mirror.
 
 // Re-exports of the third-party types that appear on the supported surface, so an embedder
 // depends on the same versions zecd does rather than pinning them independently - where a

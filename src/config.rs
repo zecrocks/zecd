@@ -579,6 +579,23 @@ pub struct KeysConfig {
     /// data directory be a disposable cache while the seed lives in a mounted Secret. Set false
     /// to instead fail fast on an empty datadir.
     pub bootstrap_from_keys: bool,
+    /// Permit more than one loaded wallet to hold spending keys - **honored only by an embedded
+    /// node, and refused outright by the `zecd` daemon** (see
+    /// [`reject_multiple_spenders_in_daemon`]).
+    ///
+    /// The single-spender rule is a custody line, not a technical limit: over RPC, a credential
+    /// is spend authority for whichever wallet a request routes to, so with two spenders loaded
+    /// "which key can this credential spend?" stops having a one-word answer, and one leaked
+    /// credential reaches every seed in the datadir. An embedded node has no RPC credentials -
+    /// its host application is the authorization boundary and names the wallet explicitly on
+    /// every [`crate::node::Node::call`] / [`crate::node::Node::send`] - so the ambiguity the
+    /// rule prevents does not arise, and an application managing several writable stores in one
+    /// process can opt in here rather than running a node per store.
+    ///
+    /// Caveat worth stating plainly: `server::run` is public, so an embedder *can* put the HTTP
+    /// server in front of its own node. Doing that with this flag set re-creates exactly the
+    /// situation the daemon refuses, and is the embedder's decision to own.
+    pub allow_multiple_spending_wallets: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -904,6 +921,7 @@ struct KeysFile {
     keys_file: Option<PathBuf>,
     /// Rebuild `data.sqlite` from `keys.toml` on an empty datadir (default true).
     bootstrap_from_keys: Option<bool>,
+    allow_multiple_spending_wallets: Option<bool>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1609,6 +1627,7 @@ impl AppConfig {
             auto_unlock: None,
             keys_file: None,
             bootstrap_from_keys: None,
+            allow_multiple_spending_wallets: None,
         });
         let keys = KeysConfig {
             // Default to <datadir>/identity.txt, matching where `zecd init` writes the
@@ -1620,6 +1639,9 @@ impl AppConfig {
                 .or_else(|| Some(datadir.join("identity.txt"))),
             auto_unlock: keys_file.auto_unlock.unwrap_or(true),
             bootstrap_from_keys: keys_file.bootstrap_from_keys.unwrap_or(true),
+            allow_multiple_spending_wallets: keys_file
+                .allow_multiple_spending_wallets
+                .unwrap_or(false),
         };
 
         let sync_file = file.sync.unwrap_or(SyncFile {
@@ -1727,6 +1749,35 @@ impl AppConfig {
 /// Deliberately *not* part of [`AppConfig::resolve`]: it is a startup policy, not a parse rule,
 /// and `resolve` is used by tooling (`config check`) that must be able to describe such a config
 /// rather than fail to build it. Both the daemon and `zecd config check` call this, so the two
+/// Refuse a configuration that opts into multiple spending wallets **when it is the `zecd`
+/// daemon that would run it**.
+///
+/// [`KeysConfig::allow_multiple_spending_wallets`] is honored only by an embedded node, whose
+/// host application is the authorization boundary and names the wallet on every call. The
+/// daemon serves JSON-RPC, where a credential is spend authority for whichever wallet the
+/// request routes to - so with two spenders loaded, one leaked credential reaches both seeds
+/// and "which key can this credential spend?" has no single answer. Rather than let that be
+/// configured by accident, the binary refuses to start.
+///
+/// Called by `daemon::run` and by `zecd config check` (which reports what the daemon would do),
+/// and deliberately *not* by [`crate::node::NodeBuilder`] - that asymmetry is the whole
+/// mechanism by which the option stays library-only.
+pub fn reject_multiple_spenders_in_daemon(config: &AppConfig) -> anyhow::Result<()> {
+    if config.keys.allow_multiple_spending_wallets {
+        anyhow::bail!(
+            "[keys] allow_multiple_spending_wallets is set, which the zecd daemon does not \
+             support: over RPC a credential is spend authority for whichever wallet a request \
+             routes to, so more than one loaded spending wallet leaves no single answer to \
+             \"which key can this credential spend?\". The option exists for applications \
+             embedding zecd as a library, where the host application is the authorization \
+             boundary and names the wallet on every call. To run several writable wallets under \
+             the daemon, run one zecd per wallet (separate datadirs and ports); otherwise unset \
+             the option and keep one spending wallet plus any number of watch-only replicas."
+        );
+    }
+    Ok(())
+}
+
 /// always agree on the verdict.
 pub fn reject_placeholder_password(config: &AppConfig) -> anyhow::Result<()> {
     if matches!(config.network, ZNetwork::Main)
@@ -2645,6 +2696,39 @@ mod tests {
         let cli = Cli::parse_from(["zecd", "--conf", conf.to_str().unwrap()]);
         let cfg = AppConfig::resolve(&cli).unwrap();
         assert_eq!(cfg.sync.interval_secs, 20);
+    }
+
+    /// The multi-spender opt-in defaults off, parses both ways, and - the load-bearing half -
+    /// is refused by the daemon while an embedded node accepts it. That asymmetry is the
+    /// mechanism keeping the option library-only, so it is asserted here rather than left to
+    /// the call sites.
+    #[cfg(feature = "cli")]
+    #[test]
+    fn allow_multiple_spending_wallets_is_off_by_default_and_daemon_only_refused() {
+        use clap::Parser as _;
+        let dir = tempfile::tempdir().unwrap();
+        let conf = dir.path().join("zecd.toml");
+
+        for (body, want) in [
+            ("network = \"test\"\n", false),
+            ("[keys]\nallow_multiple_spending_wallets = false\n", false),
+            ("[keys]\nallow_multiple_spending_wallets = true\n", true),
+        ] {
+            std::fs::write(&conf, body).unwrap();
+            let cli = Cli::parse_from(["zecd", "--conf", conf.to_str().unwrap()]);
+            let cfg = AppConfig::resolve(&cli).unwrap();
+            assert_eq!(
+                cfg.keys.allow_multiple_spending_wallets, want,
+                "for config: {body}"
+            );
+            // The daemon refuses exactly when the option is on; resolution itself never does,
+            // because an embedded node resolves through the same path and must accept it.
+            assert_eq!(
+                reject_multiple_spenders_in_daemon(&cfg).is_err(),
+                want,
+                "daemon refusal must track the option: {body}"
+            );
+        }
     }
 
     /// The duplicate-shielded-recipient opt-in defaults off (zcashd parity is the default

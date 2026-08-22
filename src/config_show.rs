@@ -149,6 +149,11 @@ pub fn render(config: &AppConfig) -> String {
     kv(&mut s, "auto_unlock", config.keys.auto_unlock);
     kv(
         &mut s,
+        "allow_multiple_spending_wallets",
+        config.keys.allow_multiple_spending_wallets,
+    );
+    kv(
+        &mut s,
         "bootstrap_from_keys",
         config.keys.bootstrap_from_keys,
     );

@@ -64,6 +64,11 @@ pub async fn run(config: AppConfig) -> anyhow::Result<()> {
     // auth construction sits between the two node phases on purpose: a bad rpcauth entry must
     // fail before any wallet actor is spawned, and its cookie-file side effect belongs to the
     // binary, never to the embeddable node (see `crate::node`).
+    // Library-only options are refused here rather than in `NodeBuilder`: the binary is the
+    // half that exposes RPC, and that is precisely what makes multiple spending wallets a
+    // custody problem. Refused before the datadir lock so it costs nothing and cannot be
+    // mistaken for a locking failure.
+    config::reject_multiple_spenders_in_daemon(&config)?;
     let prepared = crate::node::NodeBuilder::new(config).prepare()?;
     let auth = server::auth::Authenticator::from_config(&prepared.config().rpc)?;
     log_auth_mode(
@@ -206,17 +211,41 @@ fn log_auth_mode(rpc: &config::RpcConfig, password_on_cli: bool) {
 /// pairs each successfully-opened wallet name with its watch-only flag (`true` = watch-only),
 /// in a stable order so the error names the offending wallets deterministically. Returns an
 /// error naming the two spending wallets when more than one is present.
-pub(crate) fn ensure_single_spending_wallet(loaded: &[(String, bool)]) -> anyhow::Result<()> {
+/// `allow_multiple` opts out of the rule ([`crate::config::KeysConfig::allow_multiple_spending_wallets`]):
+/// the additional spenders are logged to the audit target rather than refused, so the loosened
+/// custody posture is visible in the record instead of being silent. Only an embedded node can
+/// reach that branch - the daemon refuses the option before it ever gets here
+/// ([`crate::config::reject_multiple_spenders_in_daemon`]).
+pub(crate) fn ensure_single_spending_wallet(
+    loaded: &[(String, bool)],
+    allow_multiple: bool,
+) -> anyhow::Result<()> {
     let mut spenders = loaded
         .iter()
         .filter(|(_, watch_only)| !watch_only)
         .map(|(name, _)| name.as_str());
     if let (Some(first), Some(second)) = (spenders.next(), spenders.next()) {
+        if allow_multiple {
+            let all: Vec<&str> = loaded
+                .iter()
+                .filter(|(_, watch_only)| !watch_only)
+                .map(|(name, _)| name.as_str())
+                .collect();
+            tracing::warn!(
+                target: "zecd::audit",
+                spenders = all.len(),
+                wallets = %all.join(", "),
+                "multiple spending wallets loaded under [keys] allow_multiple_spending_wallets; \
+                 each holds independent spending keys in one process and one data directory"
+            );
+            return Ok(());
+        }
         anyhow::bail!(
             "multiple spending wallets configured ('{first}' and '{second}'); zecd allows at \
              most one wallet with spending keys (any number of watch-only UFVK wallets may be \
              loaded alongside it). Convert one to watch-only (`zecd export-ufvk` + \
-             `zecd init --ufvk`) or remove it from the configuration."
+             `zecd init --ufvk`) or remove it from the configuration. An application embedding \
+             zecd as a library can instead set [keys] allow_multiple_spending_wallets."
         );
     }
     Ok(())
@@ -239,39 +268,40 @@ mod tests {
     fn no_wallets_is_allowed() {
         // The empty case is guarded separately (registry.is_empty bail); the invariant check
         // itself must not error on it.
-        assert!(ensure_single_spending_wallet(&[]).is_ok());
+        assert!(ensure_single_spending_wallet(&[], false).is_ok());
     }
 
     #[test]
     fn single_spending_wallet_is_allowed() {
-        assert!(ensure_single_spending_wallet(&wallets(&[("default", false)])).is_ok());
+        assert!(ensure_single_spending_wallet(&wallets(&[("default", false)]), false).is_ok());
     }
 
     #[test]
     fn only_watch_only_wallets_is_allowed() {
         // No spending wallet at all is fine (every wallet is a watch-only UFVK import).
-        assert!(ensure_single_spending_wallet(&wallets(&[
-            ("view-a", true),
-            ("view-b", true),
-            ("view-c", true),
-        ]))
+        assert!(ensure_single_spending_wallet(
+            &wallets(&[("view-a", true), ("view-b", true), ("view-c", true),]),
+            false
+        )
         .is_ok());
     }
 
     #[test]
     fn one_spending_plus_many_watch_only_is_allowed() {
-        assert!(ensure_single_spending_wallet(&wallets(&[
-            ("default", false),
-            ("view-a", true),
-            ("view-b", true),
-        ]))
+        assert!(ensure_single_spending_wallet(
+            &wallets(&[("default", false), ("view-a", true), ("view-b", true),]),
+            false
+        )
         .is_ok());
     }
 
     #[test]
     fn two_spending_wallets_are_rejected() {
-        let err = ensure_single_spending_wallet(&wallets(&[("default", false), ("second", false)]))
-            .expect_err("two spending wallets must be rejected");
+        let err = ensure_single_spending_wallet(
+            &wallets(&[("default", false), ("second", false)]),
+            false,
+        )
+        .expect_err("two spending wallets must be rejected");
         let msg = err.to_string();
         // The error names both offenders so the operator knows which to convert/remove.
         assert!(msg.contains("'default'"), "{msg}");
@@ -279,16 +309,61 @@ mod tests {
         assert!(msg.contains("at most one"), "{msg}");
     }
 
+    /// The library opt-in turns the refusal into an audit record rather than an error. Only an
+    /// embedded node can reach this: `daemon::run` refuses the option outright before any of
+    /// this runs (`config::reject_multiple_spenders_in_daemon`), which is what keeps it
+    /// library-only.
+    #[test]
+    fn the_opt_in_permits_multiple_spending_wallets() {
+        assert!(ensure_single_spending_wallet(
+            &wallets(&[("default", false), ("second", false)]),
+            true
+        )
+        .is_ok());
+        // Watch-only wallets alongside them are unaffected either way.
+        assert!(ensure_single_spending_wallet(
+            &wallets(&[("spend-a", false), ("view", true), ("spend-b", false)]),
+            true
+        )
+        .is_ok());
+        // The same shapes that were already fine stay fine under the opt-in - it only ever
+        // removes a refusal, never adds one.
+        assert!(ensure_single_spending_wallet(&[], true).is_ok());
+        assert!(ensure_single_spending_wallet(&wallets(&[("default", false)]), true).is_ok());
+    }
+
+    /// The daemon refuses the opt-in, which is the entire mechanism by which the option stays
+    /// library-only: `NodeBuilder` never calls this, so an embedded node accepts the same
+    /// config the binary declines.
+    #[test]
+    fn the_daemon_refuses_the_library_only_opt_in() {
+        let mut config = crate::node::testutil::walletless_config();
+        assert!(crate::config::reject_multiple_spenders_in_daemon(&config).is_ok());
+
+        config.keys.allow_multiple_spending_wallets = true;
+        let err = crate::config::reject_multiple_spenders_in_daemon(&config)
+            .expect_err("the daemon must refuse the library-only option");
+        let msg = err.to_string();
+        // The message has to route the reader somewhere: what the option is for, and what to do
+        // instead when they are running the daemon.
+        assert!(msg.contains("allow_multiple_spending_wallets"), "{msg}");
+        assert!(msg.contains("embedding zecd as a library"), "{msg}");
+        assert!(msg.contains("one zecd per wallet"), "{msg}");
+    }
+
     #[test]
     fn two_spending_wallets_mixed_with_watch_only_are_rejected() {
         // Watch-only wallets interleaved with the spenders don't mask the violation; the first
         // two spenders in order are named.
-        let err = ensure_single_spending_wallet(&wallets(&[
-            ("view-a", true),
-            ("spend-a", false),
-            ("view-b", true),
-            ("spend-b", false),
-        ]))
+        let err = ensure_single_spending_wallet(
+            &wallets(&[
+                ("view-a", true),
+                ("spend-a", false),
+                ("view-b", true),
+                ("spend-b", false),
+            ]),
+            false,
+        )
         .expect_err("two spending wallets must be rejected");
         let msg = err.to_string();
         assert!(msg.contains("'spend-a'"), "{msg}");

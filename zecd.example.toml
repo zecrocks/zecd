@@ -241,6 +241,18 @@ auto_unlock = true
 # an empty PVC). Set false to instead fail fast on an empty datadir. (Watch-only wallets have no
 # seed and aren't covered - recreate them with `zecd init --ufvk`.)
 bootstrap_from_keys = true
+#
+# Permit more than one loaded wallet to hold spending keys. LIBRARY CONSUMERS ONLY: the zecd
+# daemon REFUSES TO START with this set, and `zecd config check` reports it as an error.
+#
+# It is a custody line, not a technical limit. Over RPC a credential is spend authority for
+# whichever wallet the request routes to, so with two spenders loaded there is no single answer
+# to "which key can this credential spend?", and one leaked credential reaches every seed in the
+# data directory. An application embedding zecd as a library has no RPC credentials - it is
+# itself the authorization boundary, and names the wallet on every call - so it can opt in here
+# instead of running one node per writable wallet. Under the daemon, run one zecd per wallet
+# (separate datadirs and ports) as before.
+# allow_multiple_spending_wallets = false
 
 [pools]
 # Shielded value pools this wallet uses. zecd is shielded-only; supported pools are "sapling"

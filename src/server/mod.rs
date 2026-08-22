@@ -324,6 +324,7 @@ mod tests {
                 age_identity: None,
                 auto_unlock: true,
                 bootstrap_from_keys: true,
+                allow_multiple_spending_wallets: false,
             },
             sync: SyncConfig {
                 interval_secs: 20,

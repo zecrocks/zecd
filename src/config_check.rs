@@ -13,6 +13,7 @@
 //! * **It reaches the daemon's verdict, not a second opinion.** Every check here is either
 //!   `AppConfig::resolve` itself or a helper the daemon calls at startup/connect
 //!   ([`config::reject_placeholder_password`](crate::config::reject_placeholder_password),
+//!   [`config::reject_multiple_spenders_in_daemon`](crate::config::reject_multiple_spenders_in_daemon),
 //!   [`Server::preflight`](crate::backend::Server::preflight),
 //!   [`auth::check_config`](crate::server::auth::check_config)). Nothing re-implements a rule.
 //! * **It changes nothing.** No datadir lock (so it runs alongside a live daemon), no wallet
@@ -87,6 +88,13 @@ pub fn inspect(config: &AppConfig) -> Vec<Finding> {
 
     // Startup policy, shared verbatim with `daemon::run`.
     if let Err(e) = crate::config::reject_placeholder_password(config) {
+        findings.push(Finding::error(format!("{e:#}")));
+    }
+    // An error, not a warning, and for the same reason as the rest of this command: it reports
+    // what *this binary's daemon* would do with this config, and the daemon refuses to start on
+    // it. An embedded node accepts it, which the message says - so a library consumer reading
+    // this finding learns the config is fine for them and only the daemon declines it.
+    if let Err(e) = crate::config::reject_multiple_spenders_in_daemon(config) {
         findings.push(Finding::error(format!("{e:#}")));
     }
 

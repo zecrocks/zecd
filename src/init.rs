@@ -338,7 +338,10 @@ pub async fn init_wallet(config: &AppConfig, opts: InitOptions) -> anyhow::Resul
     // startup, surfaced here so the operator finds out at `init` time rather than at the next
     // boot. Watch-only inits (`--ufvk`) are exempt: any number are allowed. Done before any
     // directory or network I/O so it fails fast and leaves nothing behind.
-    if ufvk.is_none() {
+    // The opt-in ([keys] allow_multiple_spending_wallets, honored only by an embedded node)
+    // skips the guard: refusing to *create* the second wallet would make the option
+    // unreachable, since there would be no way to get into the shape it permits.
+    if ufvk.is_none() && !config.keys.allow_multiple_spending_wallets {
         if let Some(existing) = existing_spending_wallet(network, &config.wallets, &wallet) {
             return Err(anyhow!(
                 "cannot create spending wallet '{}': wallet '{}' already holds spending keys, \

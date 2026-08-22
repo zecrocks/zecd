@@ -838,6 +838,35 @@ fn config_check_rejects_an_unknown_key_and_names_it() {
     assert!(out.stdout.is_empty(), "stdout: {}", stdout_of(&out));
 }
 
+/// `[keys] allow_multiple_spending_wallets` is the library-only option, so the binary must
+/// report it as an error - `config check` answers "would *this daemon* run this config", and
+/// this daemon refuses. The finding has to explain itself, since a config that is perfectly
+/// valid for an embedded node failing here is otherwise baffling.
+#[test]
+fn config_check_reports_the_library_only_multi_spender_option() {
+    let dir = tempfile::tempdir().unwrap();
+    let conf = dir.path().join("zecd.toml");
+
+    // Off (and absent) resolves cleanly.
+    std::fs::write(&conf, "[keys]\nallow_multiple_spending_wallets = false\n").unwrap();
+    let out = config_check(&conf, &[]);
+    assert_eq!(out.status.code(), Some(0), "stderr: {}", stderr_of(&out));
+
+    std::fs::write(&conf, "[keys]\nallow_multiple_spending_wallets = true\n").unwrap();
+    let out = config_check(&conf, &[]);
+    assert_eq!(out.status.code(), Some(1), "stderr: {}", stderr_of(&out));
+    let stderr = stderr_of(&out);
+    assert!(stderr.contains("error:"), "{stderr}");
+    assert!(
+        stderr.contains("allow_multiple_spending_wallets"),
+        "{stderr}"
+    );
+    // Names who it *is* for, and what to do instead when running the daemon - without both, an
+    // operator has no way to tell a rejected typo from a deliberate library option.
+    assert!(stderr.contains("embedding zecd as a library"), "{stderr}");
+    assert!(stderr.contains("one zecd per wallet"), "{stderr}");
+}
+
 /// `[log] format` is validated at resolve: `init_tracing` treats anything that isn't "json"
 /// as text, so an unvalidated typo like "jsonl" would silently produce text logs on a
 /// deployment that asked for structured ones.
