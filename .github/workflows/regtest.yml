@@ -135,13 +135,15 @@ concurrency:
 
 jobs:
   regtest:
-    # An 8-vCPU/32GiB org runner, because this tier is ~18 independent node+wallet stacks and the
-    # default 2-core runner can only ever run them one at a time (measured: 3-way concurrency on
-    # 2 cores is 22m21s against a 22m34s serial baseline - no gain whatsoever). On 8 cores the same
-    # work is 5m42s. Overridable via the `REGTEST_RUNNER` repo variable (Settings > Secrets and
-    # variables > Actions > Variables) - set it to `ubuntu-latest` to fall back to the stock runner,
-    # and drop `REGTEST_JOBS` to 1 with it.
-    runs-on: ${{ vars.REGTEST_RUNNER || 'ubuntu-latest-8-cores' }}
+    # A 16-vCPU org runner. This tier is ~23 independent node+wallet stacks, and it is bounded by
+    # total CPU work over available cores rather than by slot count (see the REGTEST_JOBS comment
+    # below for the measurement that establishes that) - so cores are the one input that actually
+    # moves it. The stock 2-core runner can only ever run these one at a time: 3-way concurrency
+    # there measured 22m21s against a 22m34s serial baseline, no gain whatsoever.
+    # Overridable via the `REGTEST_RUNNER` repo variable (Settings > Secrets and variables >
+    # Actions > Variables) - set it to `ubuntu-latest` to fall back to the stock runner, and drop
+    # `REGTEST_JOBS` to 1 with it. Keep the two in lockstep in both directions.
+    runs-on: ${{ vars.REGTEST_RUNNER || 'ubuntu-latest-16-cores' }}
     # NB: new harness test files must be added to the HARNESS_TESTS env list above (it enumerates
     # --test targets; nothing runs them implicitly).
     #
@@ -176,9 +178,14 @@ jobs:
             # only here: it is the one binary needing a lightwalletd AND a zebra endpoint in the
             # same daemon, and lightwalletd is provisioned only on this leg.
             tests: --test regtest_lwd --test regtest_funded --test regtest_transparent --test regtest_transparent_t2t --test regtest_transparent_sendmany_t2t --test regtest_transparent_gap --test regtest_transparent_offline_restore --test regtest_shielding --test regtest_mergetoaddress --test regtest_multibackend
-            # Heavier per-slot than the zebra suite (an extra lightwalletd per stack), and only
-            # a handful of binaries to get through - see REGTEST_JOBS below.
-            jobs: 4
+            # Heavier per-slot than the zebra suite (an extra lightwalletd per stack, and
+            # regtest_lwd itself runs two lightwalletds plus a second zebra-backed zecd twin), so
+            # this leg keeps its own slot count rather than the default below. 8 is the 16-core
+            # equivalent of the 4 this was tuned to on the 8-core runner - scaled with the runner,
+            # like everything else here. Its list is only 10 binaries, so a lower ceiling costs
+            # little; drop it back if the per-binary timing table shows binaries starved rather
+            # than slots idle.
+            jobs: 8
           # zakura runs the direct-RPC binaries only - the same set it ran before the funder became
           # a zecd. Nothing technical stops the funded ones now (the funder talks straight to the
           # node, so lightwalletd's refusal to front zakura no longer matters, and they do pass
@@ -443,27 +450,24 @@ jobs:
           # their timeouts and turns into flakes. The per-binary wall-clock table the driver prints
           # at the end of the step is the tuning input.
           #
-          # 6, and raising it does not help - this was re-measured on 2026-08-21 and the
-          # intuition behind a higher number is wrong. The premise above ("spends most of its
-          # wall clock *waiting* on that stack") predates NU6.3 and the zecd funder: a funded
-          # binary now runs TWO proving daemons (the wallet under test and the funder, each
-          # building proving keys and proving its own sends), so the tier burns CPU rather than
-          # idling on it, and at 6 slots an 8-vCPU runner is already saturated.
-          #
-          # Measured back to back on the zebra leg, same commit, 23 binaries:
+          # Scale this WITH the runner's cores, never independently of them. The tier is bounded
+          # by total CPU work over available cores, not by slot count - measured back to back on
+          # the zebra leg, same commit, 23 binaries, on the 8-vCPU runner:
           #   6 jobs -> total work 2946s, longest binary 374s, elapsed 524s
           #   8 jobs -> total work 3755s, longest binary 478s, elapsed 521s
-          # Three seconds. Every binary inflated 22-38% (the short ones too), so the extra slots
-          # divided the same CPU instead of filling idle capacity, and the longest binary - the
-          # thing extra slots were meant to hide behind - grew 28% along with everything else.
+          # Three seconds for a third more slots, because every binary inflated 22-38% (the short
+          # ones too): the extra slots divided the same CPU instead of filling idle capacity, and
+          # the longest binary - the thing extra slots were meant to hide behind - grew 28% along
+          # with the rest. The premise in run-tests.sh's header ("spends most of its wall clock
+          # *waiting* on that stack") predates NU6.3 and the zecd funder; a funded binary now runs
+          # TWO proving daemons, each building proving keys and proving its own sends.
           #
-          # So elapsed is governed by total CPU work over available cores, NOT by slot count, and
-          # per-binary wall clock is not a constant to divide by jobs. Two consequences worth
-          # holding onto: raising this number buys nothing without more cores (raise
-          # REGTEST_RUNNER first, in lockstep), and *splitting* a slow binary is worse than
-          # useless here - it adds a whole extra chain bring-up to the CPU total to shorten a
-          # bound that is not what binds. The only levers that move this tier are less CPU work
-          # (fewer proofs, fewer chain bring-ups, fewer blocks scanned) or a bigger runner.
+          # 12 keeps the ~1.33 cores-per-slot ratio that 6-on-8 established, which is the ratio
+          # the measurement above says matters. Past that the tier is bounded by its longest
+          # binary anyway (regtest_coinbase, ~374s), so extra slots would again be pure
+          # contention. NB at 16 cores the tier flips back to being tail-bound, which is the one
+          # regime where *splitting* a slow binary starts paying again - it does not pay while
+          # work-bound, since a new binary adds a whole extra chain bring-up to the CPU total.
           #
           # Also still live from the earlier tuning: REGTEST_TEST_THREADS=2 was tried and
           # reverted after starving the one-test regtest_sapling into a bad getunconfirmedbalance
@@ -474,7 +478,7 @@ jobs:
           # meaningfully more RAM and processes than the zebra suite the 6 was measured against.
           # Its list is also only 6 binaries, so the ceiling costs little wall clock. Raise it if
           # the per-binary timing table shows slots idling.
-          REGTEST_JOBS: ${{ matrix.jobs || vars.REGTEST_JOBS || 6 }}
+          REGTEST_JOBS: ${{ matrix.jobs || vars.REGTEST_JOBS || 12 }}
           REGTEST_LOG_DIR: ${{ runner.temp }}/regtest-logs
         # run-tests.sh builds the binaries once (--locked, against the committed lock) and then
         # runs them REGTEST_JOBS at a time, each in its own slice of the loopback port range. It
