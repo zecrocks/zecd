@@ -1,8 +1,12 @@
 //! `z_mergetoaddress` consolidation e2e over a deliberately fragmented wallet: more transparent
-//! UTXOs (56) than zcashd's default `transparent_limit` (50), plus enough shielded notes (64)
+//! UTXOs (56) than zcashd's default `transparent_limit` (50), plus enough shielded notes (12)
 //! to exercise both shielded-merge paths - the manual limited selection (via an explicit
 //! `shielded_limit` that binds) and the unlimited `propose_send_max` delegation - through
 //! multi-round convergence down to a single note and a final amountless z→t sweep.
+//!
+//! The transparent set is sized to zcashd's default `transparent_limit` because that default is
+//! itself the assertion, and transparent inputs cost no Orchard actions. The note set is sized
+//! to the binding limit instead - see [`N_FANOUT_OUTPUTS`].
 //!
 //! **The fixture is funder-built on purpose.** Fanning a wallet out with its own self-sends
 //! cannot work: librustzcash selects notes oldest-first (by commitment tree position), so later
@@ -38,16 +42,28 @@ const T_FANOUT_TXS: usize = 2;
 const T_FANOUT_OUTPUTS: usize = 28;
 const T_FANOUT_ZATS: u64 = 2_000_000; // 0.02 ZEC
 
-/// Shielded fan-out: 2 funder sends x 32 UA-outputs x 0.005 ZEC = 64 notes. Kept under the
-/// funder's per-send Orchard action cap (a released zecd's default 50, minus change splits).
-const N_FANOUT_TXS: usize = 2;
-const N_FANOUT_OUTPUTS: usize = 32;
+/// Shielded fan-out: 1 funder send x 12 UA-outputs x 0.005 ZEC = 12 notes.
+///
+/// Sized to the *behaviour* under test rather than to zcashd's default constants: what the note
+/// merges below have to prove is that an explicit `shielded_limit` binds and takes the manual
+/// limited-selection path, that a non-binding call rides `propose_send_max` instead, and that
+/// the two converge to a single note. None of that needs a large note set - only more eligible
+/// notes than the binding limit - and every note here is paid for twice in Orchard actions,
+/// once when the funder mints it and again when a merge spends it. The wallet was fanned out to
+/// 64 notes (2 x 32) merged at a limit of 40 until 2026-08, which put ~131 actions of proving on
+/// the PR tier for assertions that 12 notes make identically. The case that genuinely needs the
+/// big set - zcashd's 200-note default `shielded_limit` binding - is the extended-tier test
+/// below, which is where it was already placed for the same reason.
+const N_FANOUT_TXS: usize = 1;
+const N_FANOUT_OUTPUTS: usize = 12;
 const N_FANOUT_ZATS: u64 = 500_000; // 0.005 ZEC
 
-/// The explicit `shielded_limit` for the first note merge: binds (64 eligible > 40), so it
-/// takes the manual limited-selection path and bounds this binary's biggest proof; the
-/// follow-up defaults call then fits the unlimited `propose_send_max` path.
-const NOTE_MERGE_LIMIT: usize = 40;
+/// The explicit `shielded_limit` for the first note merge: binds (14 eligible > 8), so it takes
+/// the manual limited-selection path and bounds this binary's biggest proof; the follow-up
+/// defaults call then fits the unlimited `propose_send_max` path. Keep it strictly below the
+/// eligible count (`N_FANOUT_TXS * N_FANOUT_OUTPUTS` plus the two t->z merge outputs) or round
+/// 1 stops exercising the limited path at all.
+const NOTE_MERGE_LIMIT: usize = 8;
 
 /// Mine past the untrusted confirmations depth (ZIP-315 default 10) and wait for zecd to scan
 /// it: the fan-out lands on the wallet's own *external* addresses, which the confirmations
@@ -112,7 +128,14 @@ async fn merge_stack(zebrad_bin: &std::path::Path) -> (Zebrad, Funder, Zecd, Opt
         .expect("bring up a funded regtest chain");
     let mut cfg = ZecdConfig::new(zebrad.rpc_port, pick_port().expect("pick zecd rpc port"));
     cfg.transparent = true;
-    cfg.transparent_gap_limit = Some(80);
+    // Only wide enough for one fan-out round's issuance: `funder_fanout_round` mines and syncs
+    // before the next round starts, so the longest run of consecutive *unfunded* exposed
+    // addresses is T_FANOUT_OUTPUTS (28), not the full 56. Width is not free - recording a
+    // transparent receive re-derives the whole gap window per involved address, so the cost of
+    // ingesting one 28-output fan-out tx grows with this limit (zecd says so itself while doing
+    // it: "recording transparent receives from block scan (each receive re-derives the gap
+    // window)"). At 80 that ingest measured ~47s per round against ~78s for the funder's send.
+    cfg.transparent_gap_limit = Some(40);
     cfg.orchard_action_limit = Some(0);
     let zecd_lwd = attach_backend(&mut cfg, zebrad.rpc_port)
         .await
@@ -422,7 +445,7 @@ async fn regtest_mergetoaddress_consolidates_a_fragmented_wallet() {
     );
     phase("t->z merges done (0 UTXOs left)");
 
-    // 5. Note merges. Round 1: an explicit shielded_limit that binds (40 < 66 eligible) takes
+    // 5. Note merges. Round 1: an explicit shielded_limit that binds (8 < 14 eligible) takes
     //    the manual limited-selection path and reports the remainder.
     let resp = zecd
         .call(
@@ -450,7 +473,7 @@ async fn regtest_mergetoaddress_consolidates_a_fragmented_wallet() {
     await_op(&zecd, &opid, "note merge round 1").await;
     confirm_untrusted(&zebrad, &zecd).await;
 
-    // Round 2: defaults (200 no longer binds against ~27 notes) ride librustzcash's
+    // Round 2: defaults (200 does not bind against the handful left) ride librustzcash's
     // `propose_send_max` path wholesale, with a memo on the merged output for coverage - and
     // because round 1's own output is back in the eligible set, this converges the wallet to a
     // single note.
