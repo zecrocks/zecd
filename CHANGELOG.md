@@ -97,6 +97,43 @@ by this repository's own tests. The RPC surface is not affected by that caveat.
 - Two log levels move. Per-request authentication *success* drops from INFO to DEBUG, which removes one line per authenticated request; failures stay at WARN. Reconnect attempts during an upstream outage no longer stream WARNs: the first failure warns and names the demotion, and the paced retries after it log at DEBUG with their attempt number and delay. There are also new TRACE events, one per downloaded block and one per serviced transaction-data request, off unless asked for.
 - `[log] format` is validated when the configuration resolves. Anything other than `json` was silently treated as text, so a typo like `jsonl` produced text logs with no complaint; it is now refused, and `zecd config check` reports the same refusal. One identifying line is logged at startup (version, network, datadir and upstream), which nothing did before, and shutdown warns when async operations are still unfinished.
 
+## [0.6.4] - 2026-08-22
+
+The 0.6.4 line, released as `0.6.4-rc1`. Nothing changed between the candidate and
+this release; the candidate's section below is kept for history and everything in
+it applies here.
+
+Five fixes, four of which a running 0.6.3 daemon can hit, plus one opt-in
+readiness mode. No configuration key, response shape or error code moves and
+every default is unchanged, so upgrading from 0.6.3 is a drop-in.
+
+The two that matter most to a busy deployment are both about reused transparent
+addresses: a spend-search that re-downloaded an address's whole history on every
+pass, and an enhancement backlog that counted the same request thousands of times
+over. Together they made an ordinary send take a wallet out of rotation while it
+was answering correctly.
+
+## [0.6.4-rc1] - 2026-08-22
+
+Five fixes, four of which a running 0.6.3 daemon can hit, and one new opt-in
+readiness mode. Nothing here moves a configuration key, a response shape or an
+error code, and every default is unchanged, so upgrading from 0.6.3 is a
+drop-in.
+
+### Added
+- **`[health] readiness = "scanned"`**, a third readiness mode between `"synced"` and `"connected"`: ready once connected and within `max_scan_lag` of the tip, without the strict mode's requirement that the transaction-enhancement backlog be empty. Balances and note spendability come from the block scan and are current in this state; only history completeness lags, and `/status` reports how much is still landing. It exists because the backlog is not restore-only, as the strict mode's wording assumed: a wallet holding many transparent UTXOs re-emits its recurring spend-search requests on every send and every tip advance, so `/readyz` returned 503 for about a minute after one ordinary send and an orchestrator pulled a healthy node out of rotation while every balance RPC was answering correctly. `"synced"` remains the default, so nothing changes for an existing deployment. `max_scan_lag` now applies to both strict modes.
+
+### Fixed
+- **A wallet holding many UTXOs on a reused transparent address re-downloaded its entire history on every spend-search pass.** The wallet asks the chain for transactions involving an address once per UTXO it still holds, which is how a spend authored elsewhere gets noticed, but the index answers each request with every transaction in the range rather than only unseen ones, and all of them were fetched and re-stored. Because that work runs on the wallet's single writer, it starved whatever was queued behind it: measured against an address paid in every block, a `sendtoaddress` waited 109 seconds to be told it had no spendable funds. Transactions already recorded as mined are now skipped. Anything known only from the mempool is still processed, so a confirmation still lands, and the check reads the wallet database, which a rewind truncates, so it stays correct across a reorg. This affects deposit and payout addresses in normal use, not only tests.
+- **The enhancement backlog counted duplicates, inflating `pending_enhancements` by orders of magnitude.** The upstream query that generates spend-search requests joins the per-UTXO queue to received outputs on transaction id alone, never on output index, so a transaction with k unspent wallet outputs emits k identical requests per queue row and k^2 in total. A wallet holding 842 UTXOs across 50 transactions reported 23,968 pending after a single send. The count now reports distinct outstanding requests, and the drain no longer services the same request several times within one batch, each repeat costing a redundant upstream query. This is what made the strict readiness gate above fire on a healthy node.
+- **A memo whose bytes are not valid UTF-8 no longer disappears.** A memo declared as text with a non-UTF-8 body came back with no `memo`, no `memoStr` and no error, which is silent loss indistinguishable from an output carrying no memo. The hex is now always emitted from the stored bytes and only `memoStr` depends on parsing. An absent `memo` field again means "no memo" rather than "unparseable".
+- **Paging through history could repeat or skip a transaction.** Results were ordered by height alone, which is not injective, so a `LIMIT`/`OFFSET` boundary landing inside a same-height tie was resolved arbitrarily. The order is now height, txid, pool and output index, which is stable across calls.
+- The crate compiles for Windows again. `lock::hostname` called a Unix-only libc function ungated, so a library consumer building for Windows failed on code it never runs. CI now cross-compiles for that target on every run.
+
+### Changed
+- Releases are published to crates.io by the release workflow rather than by hand. 0.6.2 and 0.6.3 were absent from the registry until they were published out of band; the job removes the step that has to be remembered.
+- Regtest coverage only, with no effect on a running daemon: the reorg end-to-end forces its chain divergence explicitly instead of relying on a race in how the node restores blocks across a restart, which had made it fail intermittently, and it now asserts that the divergence happened rather than only its downstream effect. The transparent end-to-end runs under the new readiness mode and holds `/readyz` to 200 across a fan-out send, pinning the no-flap contract.
+
 ## [0.6.3] - 2026-08-20
 
 Every librustzcash crate zecd depends on is now a published stable release. The wallet crates
@@ -530,6 +567,8 @@ Zcash, backed entirely by librustzcash and running as a light client.
 [0.7.0-rc3]: https://github.com/zecrocks/zecd/compare/v0.7.0-rc2...v0.7.0-rc3
 [0.7.0-rc2]: https://github.com/zecrocks/zecd/compare/v0.7.0-rc1...v0.7.0-rc2
 [0.7.0-rc1]: https://github.com/zecrocks/zecd/compare/v0.6.3...v0.7.0-rc1
+[0.6.4]: https://github.com/zecrocks/zecd/compare/v0.6.3...v0.6.4
+[0.6.4-rc1]: https://github.com/zecrocks/zecd/compare/v0.6.3...v0.6.4-rc1
 [0.6.3]: https://github.com/zecrocks/zecd/compare/v0.6.2...v0.6.3
 [0.6.2]: https://github.com/zecrocks/zecd/compare/v0.6.1...v0.6.2
 [0.6.1]: https://github.com/zecrocks/zecd/compare/v0.6.0...v0.6.1
