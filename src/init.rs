@@ -12,7 +12,7 @@ use tokio::io::AsyncWriteExt as _;
 
 use tracing::warn;
 use zcash_client_backend::data_api::{
-    Account as _, AccountBirthday, AccountPurpose, AccountSource, WalletRead, WalletWrite,
+    Account as _, AccountPurpose, AccountSource, WalletRead, WalletWrite,
 };
 use zcash_keys::keys::UnifiedFullViewingKey;
 use zcash_protocol::consensus::{BlockHeight, NetworkUpgrade, Parameters};
@@ -466,20 +466,11 @@ pub async fn init_wallet(config: &AppConfig, opts: InitOptions) -> anyhow::Resul
             fresh_wallet_birthday(chain_tip)
         }
     }));
-    let birthday = {
-        // Fetch the tree state for the block before the birthday (leaks birthday to server).
-        // Never request below height 1: lightwalletd treats a BlockId height of 0 as
-        // "unspecified" and rejects it ("must specify a block height or ID"), and there is no
-        // pre-genesis tree state. This happens on short chains (e.g. a fresh regtest network
-        // where `chain_tip - 100` underflows to 0). `AccountBirthday::from_treestate` then
-        // derives the actual birthday from the returned tree state's height.
-        let prior_height = u32::from(birthday_height).saturating_sub(1).max(1);
-        let treestate = client
-            .tree_state(BlockHeight::from_u32(prior_height))
-            .await?;
-        AccountBirthday::from_treestate(treestate, recover_until)
-            .map_err(|_| anyhow!("failed to derive account birthday from tree state"))?
-    };
+    // Anchors on the tree state of the block before the birthday (which leaks the birthday to
+    // the server). Shared with `chain_probe::account_birthday`, which is how an embedder pins a
+    // birthday before the wallet exists - one code path, so the two cannot diverge.
+    let birthday =
+        crate::chain_probe::account_birthday(&mut client, birthday_height, recover_until).await?;
 
     // Non-view-only models always have a mnemonic (the `AtRest` variant and `ufvk.is_none()`
     // agree by construction); `expect` documents that invariant.
@@ -934,6 +925,7 @@ async fn ensure_identity(path: &Path) -> anyhow::Result<Vec<Box<dyn age::Recipie
 #[cfg(test)]
 mod tests {
     use super::*;
+    use zcash_client_backend::data_api::AccountBirthday;
 
     #[test]
     fn restore_birthday_default_is_pool_aware() {

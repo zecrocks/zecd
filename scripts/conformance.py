@@ -128,9 +128,18 @@ def main() -> int:
     w = rpc.call("waitforsync", 30_000)
     ck("waitforsync returns the sync-state shape",
        isinstance(w, dict)
-       and set(w) == {"hash", "height", "synced", "pending_enhancements", "enhanced_through"}, w)
+       and set(w) == {"hash", "height", "chain_tip", "synced",
+                      "pending_enhancements", "enhanced_through"}, w)
     ck("waitforsync reports synced on a caught-up wallet", w["synced"] is True, w)
     ck("waitforsync drained backlog is 0", w["pending_enhancements"] == 0, w)
+    # `height` is the scanned height and `chain_tip` is what it is measured against, which is
+    # what lets a caller render progress without opening its own connection to the chain.
+    # `synced` is exactly `scanned >= tip` (and is false while the tip is unknown), so on a
+    # caught-up wallet the tip must be a known height that the scan has already reached.
+    ck("waitforsync reports the chain tip as a height when synced",
+       isinstance(w["chain_tip"], int) and w["chain_tip"] >= 0, w)
+    ck("waitforsync scanned height has reached the chain tip when synced",
+       w["chain_tip"] <= w["height"], w)
     # Once synced, the watermark must be a real height - `null` means "unknown", and a caller
     # advancing a memo cursor relies on this being present exactly when it is safe to advance.
     ck("waitforsync enhanced_through is a height when synced",

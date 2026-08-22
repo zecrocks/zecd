@@ -219,6 +219,8 @@ impl PreparedNode {
                 bootstrap: config.keys.bootstrap_from_keys,
                 confirmations_policy,
                 orchard_action_limit: config.spend.orchard_action_limit,
+                target_note_count: config.spend.target_note_count,
+                min_split_output_value: config.spend.min_split_output_value,
                 orchard_keys: orchard_keys.clone(),
                 pipeline_proving: config.spend.pipeline_proving,
                 enabled_pools: entry.pools.clone(),

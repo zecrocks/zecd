@@ -387,6 +387,11 @@ pub(crate) async fn waitforsync(
             Ok(json!({
                 "hash": hash.unwrap_or_default(),
                 "height": height,
+                // The upstream's tip, so a caller can render "scanned H of TIP" without opening
+                // its own connection to ask. `height` alone cannot express progress: it is the
+                // scanned height, and what it is being compared against is exactly this.
+                // `None` until the first tip is known (before the first successful connect).
+                "chain_tip": st.chain_tip,
                 "synced": synced,
                 "pending_enhancements": st.pending_enhancements,
                 "enhanced_through": st.enhanced_through,

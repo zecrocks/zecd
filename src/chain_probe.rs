@@ -14,6 +14,8 @@
 use std::time::{Duration, Instant};
 
 use anyhow::Context;
+use zcash_client_backend::data_api::AccountBirthday;
+use zcash_protocol::consensus::BlockHeight;
 
 use crate::chain::{ChainSource, UnsupportedUpgrade};
 use crate::config::AppConfig;
@@ -54,6 +56,75 @@ impl ChainInfo {
     pub fn is_usable(&self) -> bool {
         self.network_matches != Some(false) && self.unsupported_upgrades.is_empty()
     }
+}
+
+/// A tip reading with its block time, for deciding whether a server's view of the chain is
+/// fresh enough to pin a birthday against.
+#[derive(Debug, Clone)]
+#[non_exhaustive]
+pub struct TipStatus {
+    pub height: BlockHeight,
+    /// Display (big-endian) hex, as `getbestblockhash` renders it.
+    pub hash: String,
+    /// Unix epoch seconds when the tip block was mined.
+    pub time: u32,
+}
+
+/// Read the upstream's tip together with the time it was mined.
+///
+/// The timestamp is deliberately not on [`crate::chain::ChainTip`]: neither backend's tip call
+/// carries one (lightwalletd's `GetLatestBlock` returns a bare block ID, zebra's
+/// `getblockchaininfo` has no tip time), so putting it there would add a round trip to every
+/// tip refresh on the *sync* path, which runs constantly. Paying it here instead costs the
+/// extra call only when someone actually asks - which is at birthday-pinning time, once.
+pub async fn tip_status(source: &mut impl ChainSource) -> anyhow::Result<TipStatus> {
+    let tip = source.latest_block().await.context("fetching chain tip")?;
+    let height = BlockHeight::from_u32(
+        u32::try_from(tip.height)
+            .with_context(|| format!("upstream reported tip height {}", tip.height))?,
+    );
+    // The tree state is the one reply on this API that carries the block's timestamp.
+    let state = source
+        .tree_state(height)
+        .await
+        .context("fetching the tip's tree state for its block time")?;
+    Ok(TipStatus {
+        height,
+        hash: state.hash,
+        time: state.time,
+    })
+}
+
+/// Build the [`AccountBirthday`] that `create_account` / `import_account_ufvk` need for a wallet
+/// whose first transaction is no earlier than `birthday_height`.
+///
+/// This is the chicken-and-egg case: a birthday has to be chosen before the wallet it belongs to
+/// exists, so no [`crate::node::Node`] API can serve it - a node needs that wallet to start.
+/// The anchor is the commitment tree state of the block *below* `birthday_height`, which is what
+/// `AccountBirthday::from_treestate` consumes.
+///
+/// `recover_until` bounds the recovery window: pass the current chain tip for a wallet whose key
+/// may already have history (a restore, or an imported viewing key), and `None` for a freshly
+/// generated wallet that cannot.
+///
+/// Never requests below height 1: lightwalletd reads a `BlockId` height of 0 as "unspecified"
+/// and rejects it, and there is no pre-genesis tree state. A short chain (a fresh regtest
+/// network) is exactly where that clamp matters.
+///
+/// `zecd init` builds its birthday through this same function, so what an embedder pins here and
+/// what `init` would have recorded cannot diverge.
+pub async fn account_birthday(
+    source: &mut impl ChainSource,
+    birthday_height: BlockHeight,
+    recover_until: Option<BlockHeight>,
+) -> anyhow::Result<AccountBirthday> {
+    let prior = u32::from(birthday_height).saturating_sub(1).max(1);
+    let treestate = source
+        .tree_state(BlockHeight::from_u32(prior))
+        .await
+        .with_context(|| format!("fetching the tree state at height {prior}"))?;
+    AccountBirthday::from_treestate(treestate, recover_until)
+        .map_err(|_| anyhow::anyhow!("deriving an account birthday from the tree state at {prior}"))
 }
 
 /// Dial the upstream and report its tip.
@@ -258,6 +329,25 @@ mod tests {
         assert!(
             !info(Some(true), vec![upgrade(true)]).is_usable(),
             "an active upgrade this build cannot follow"
+        );
+    }
+
+    /// The tree state is fetched for the block *below* the birthday, and never below height 1:
+    /// lightwalletd reads a `BlockId` height of 0 as "unspecified" and rejects it, and there is
+    /// no pre-genesis tree state. A fresh regtest chain, where the fresh-wallet birthday clamps
+    /// to 0, is exactly where an unclamped `birthday - 1` would ask for it.
+    #[test]
+    fn the_birthday_anchor_height_is_one_below_and_never_under_one() {
+        fn anchor(birthday: u32) -> u32 {
+            birthday.saturating_sub(1).max(1)
+        }
+        assert_eq!(anchor(1_000), 999);
+        assert_eq!(anchor(2), 1);
+        assert_eq!(anchor(1), 1, "no pre-genesis tree state");
+        assert_eq!(
+            anchor(0),
+            1,
+            "a fresh regtest chain must not request height 0"
         );
     }
 

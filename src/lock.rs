@@ -32,7 +32,7 @@
 //! lock doesn't conflict across hosts, a second host would overwrite the stamp, not be refused.
 
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use anyhow::{anyhow, Context as _};
 
@@ -47,13 +47,65 @@ use anyhow::{anyhow, Context as _};
 ///
 /// NB the lock is **host-local** - see the module docs. It does not protect a datadir shared
 /// read-write across hosts (a network volume); that datadir must be host-local.
+/// The path of the advisory lockfile guarding `datadir`.
+///
+/// Exposed because an embedder can deliberately share this lock with zecd - taking it around
+/// its own datadir work so that it and a node exclude each other - and that interlock is only
+/// load-bearing if both sides agree on the file. An embedder asserting agreement should compare
+/// against this rather than rebuilding `datadir.join(".lock")` and hoping it stays true.
+///
+/// NB the lock is not reentrant: `flock` is per open file description, so a process already
+/// holding this lock will *deadlock or fail* if it starts a node on the same datadir. Release
+/// before handing the datadir to [`crate::node::NodeBuilder`].
+pub fn datadir_lock_path(datadir: &Path) -> PathBuf {
+    datadir.join(LOCKFILE_NAME)
+}
+
+const LOCKFILE_NAME: &str = ".lock";
+
+/// The datadir lock is held by another process - i.e. "another zecd is already running".
+///
+/// Returned inside the `anyhow::Error` from [`lock_datadir`] (and therefore from
+/// [`crate::node::NodeBuilder::prepare`]) so a caller can `downcast_ref` for it, the same way
+/// [`crate::wallet::binding::BindingMismatch`] is distinguished. This case is routinely
+/// actionable - retry, or report "already running" - and telling it apart from an I/O failure
+/// by matching on the message text would make the wording load-bearing, which it is not.
+#[derive(Debug)]
+pub struct DatadirLocked {
+    /// The data directory whose lock is held.
+    pub datadir: PathBuf,
+    message: String,
+}
+
+impl DatadirLocked {
+    /// The lockfile that is held.
+    pub fn lockfile(&self) -> PathBuf {
+        datadir_lock_path(&self.datadir)
+    }
+}
+
+impl std::fmt::Display for DatadirLocked {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for DatadirLocked {}
+
+/// Whether `err` (or anything it wraps) is a [`DatadirLocked`].
+///
+/// The predicate form, for a caller that only wants the yes/no and does not need the payload.
+pub fn is_datadir_locked(err: &anyhow::Error) -> bool {
+    err.chain().any(|e| e.is::<DatadirLocked>())
+}
+
 pub fn lock_datadir(datadir: &Path) -> anyhow::Result<fmutex::Guard<'static>> {
     // `init` may be the first thing ever run against this datadir, so make sure it (and thus the
     // lockfile's parent) exists before creating the lockfile.
     fs::create_dir_all(datadir)
         .with_context(|| format!("creating data directory {}", datadir.display()))?;
 
-    let lockfile = datadir.join(".lock");
+    let lockfile = datadir_lock_path(datadir);
     // Ensure the lockfile exists before we try to lock it (the advisory OS lock on it is what
     // actually enforces single-instance access). Create-if-absent *without* truncating: a failed
     // lock attempt must not clobber the current holder's diagnostic stamp.
@@ -66,13 +118,17 @@ pub fn lock_datadir(datadir: &Path) -> anyhow::Result<fmutex::Guard<'static>> {
     let guard = fmutex::try_lock_exclusive_path(&lockfile)
         .with_context(|| format!("reading lockfile {}", lockfile.display()))?
         .ok_or_else(|| {
-            anyhow!(
-                "Cannot lock data directory {}. Another zecd is already running on this host; \
-                 the lock clears when it exits, so just retry (no lockfile to delete). \
-                 Note the lock is host-local: it does NOT protect a datadir shared across hosts \
-                 (e.g. a network/ReadWriteMany volume) - keep the datadir host-local.",
-                datadir.display()
-            )
+            anyhow!(DatadirLocked {
+                datadir: datadir.to_path_buf(),
+                message: format!(
+                    "Cannot lock data directory {}. Another zecd is already running on this \
+                     host; the lock clears when it exits, so just retry (no lockfile to \
+                     delete). Note the lock is host-local: it does NOT protect a datadir shared \
+                     across hosts (e.g. a network/ReadWriteMany volume) - keep the datadir \
+                     host-local.",
+                    datadir.display()
+                ),
+            })
         })?;
 
     // We own the lock: record a best-effort diagnostic stamp so an operator can see which host/pid
@@ -128,7 +184,7 @@ fn hostname_raw() -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::lock_datadir;
+    use super::{datadir_lock_path, is_datadir_locked, lock_datadir, DatadirLocked};
 
     #[test]
     fn second_lock_on_same_datadir_is_refused() {
@@ -182,5 +238,34 @@ mod tests {
 
         let _guard = lock_datadir(&datadir).expect("lock creates the datadir");
         assert!(datadir.join(".lock").exists(), "the lockfile was created");
+    }
+
+    /// An embedder can share this lock with zecd, so both sides must agree on which file it is.
+    /// Pinning it here means a rename shows up as a failing test rather than as a silently
+    /// broken interlock in someone else's process.
+    #[test]
+    fn the_lock_path_is_dot_lock_inside_the_datadir() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        assert_eq!(datadir_lock_path(dir.path()), dir.path().join(".lock"));
+    }
+
+    /// "Already running" is routinely actionable, so it must be distinguishable from an I/O
+    /// failure without matching on the message text - otherwise the wording becomes load-bearing
+    /// for every consumer that needs to tell the two apart.
+    #[test]
+    fn the_already_running_case_is_typed_not_just_prose() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let _held = lock_datadir(dir.path()).expect("first lock succeeds");
+
+        let err = lock_datadir(dir.path()).expect_err("second lock must be refused");
+        assert!(is_datadir_locked(&err), "should be recognized as locked");
+        let typed = err
+            .downcast_ref::<DatadirLocked>()
+            .expect("carries the typed error");
+        assert_eq!(typed.datadir, dir.path());
+        assert_eq!(typed.lockfile(), datadir_lock_path(dir.path()));
+
+        // An unrelated failure must not answer yes, or the predicate is worthless.
+        assert!(!is_datadir_locked(&anyhow::anyhow!("something else")));
     }
 }

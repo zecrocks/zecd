@@ -53,6 +53,21 @@
 //!   [`config_check::check`] (and [`config_check::inspect`]), [`config_show::render`],
 //!   [`chain_probe::probe`], [`example_config::EXAMPLE_CONFIG`], and
 //!   [`server::auth::generate_rpcauth`].
+//! - [`chain_probe::account_birthday`] and [`chain_probe::tip_status`] - the two chain queries
+//!   that have to happen *before* the wallet they are for exists, so no [`node::Node`] method
+//!   can serve them: a birthday must be chosen before `create_account` runs, and a node needs
+//!   that account to start. `account_birthday` is the same function `init` builds its birthday
+//!   with, so an embedder that pins one records what `init` would have. Both take a
+//!   [`chain::ChainSource`] the caller supplies, which is what makes them usable over a
+//!   transport zecd does not configure (a SOCKS5 proxy, say) via
+//!   [`chain::lwd::LwdSource::connect`].
+//! - A narrow, supported slice of [`chain`]: the read queries
+//!   [`chain::ChainSource::latest_block`], [`chain::ChainSource::tree_state`] and
+//!   [`chain::ChainSource::server_info`], their return types [`chain::ChainTip`] and
+//!   [`chain::ServerInfo`], and [`chain::lwd::LwdSource::connect`], which wraps a
+//!   caller-dialed `tonic::Channel`. These are enough to answer everything above without a
+//!   wallet. The **rest** of the trait - block streaming, the mempool, transparent evidence -
+//!   stays internal and is reshaped as backends and coins are added; do not build on it.
 //! - [`chain_probe::probe`] specifically, because it fills a gap the other two leave: it is the
 //!   only supported way to reach the chain *without* a wallet. [`config_check::check`] is
 //!   deliberately offline, and a node needs a wallet to start, so "is the backend reachable?"

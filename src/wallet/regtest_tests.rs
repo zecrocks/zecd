@@ -682,6 +682,8 @@ fn offline_actor_cfg(
         bootstrap: true,
         confirmations_policy: Default::default(),
         orchard_action_limit: crate::config::DEFAULT_ORCHARD_ACTION_LIMIT,
+        target_note_count: crate::config::DEFAULT_TARGET_NOTE_COUNT,
+        min_split_output_value: crate::config::DEFAULT_MIN_SPLIT_OUTPUT_VALUE,
         // Offline test: the actor never sends, so skip building the (expensive) proving key.
         orchard_keys: None,
         pipeline_proving: false,

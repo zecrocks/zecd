@@ -397,6 +397,19 @@ privacy_policy = "AllowRevealedRecipients"
 # deep builder error when a send has too many recipients. Raise it for large batched payouts;
 # set it to 0 to disable the cap entirely.
 orchard_action_limit = 50
+# Change splitting. A send divides its change into up to target_note_count notes, so that the
+# next send has confirmed inputs to draw on without waiting for the previous one; change is only
+# split while every resulting note would be at least min_split_output_value zatoshis, so a small
+# balance is never shattered into dust.
+#
+# The default floor (0.1 ZEC) is sized for mainnet-scale value, and it applies to the *balance*,
+# not the network: a wallet holding less than target_note_count x min_split_output_value gets a
+# single change note, so consecutive sends must wait [spend] trusted_confirmations apart instead
+# of spending several notes in turn. Lower the floor to roughly your typical payment size if you
+# run small balances or high-frequency low-value sends (a faucet-funded testnet wallet is the
+# usual case).
+target_note_count = 4
+min_split_output_value = 10000000
 # Build the Orchard proving key once at startup and reuse it for every send (via the PCZT
 # prove path), instead of librustzcash's fused path which rebuilds it (~seconds of keygen) on
 # every transaction. On by default. Set false to fall back to the fused path (e.g. to

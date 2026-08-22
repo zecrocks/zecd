@@ -638,6 +638,21 @@ pub struct SpendConfig {
     /// `cache_proving_key` on); a Sapling-spending wallet keeps the inline fused path. **Off by
     /// default** - flip it on once validated by the funded/stress regtest tiers.
     pub pipeline_proving: bool,
+    /// How many notes a send tries to leave the wallet holding, by splitting its change
+    /// (librustzcash's `MultiOutputChangeStrategy` target). More notes means more sends can be
+    /// in flight before the wallet runs out of confirmed inputs. Default 4.
+    pub target_note_count: usize,
+    /// Floor, in zatoshis, on each split change note: change is only divided while every
+    /// resulting note would be at least this large, so a send never shatters a small balance
+    /// into dust. Default 10_000_000 (0.1 ZEC).
+    ///
+    /// The default is sized for mainnet-scale value, and it is the *balance* it applies to, not
+    /// the network - a wallet whose whole balance is below `target_note_count` times this floor
+    /// gets a single change note, so consecutive sends must wait `trusted_confirmations` apart
+    /// rather than spending several notes in turn. A deployment built on small balances (a
+    /// faucet-funded testnet wallet, high-frequency low-value sends) should lower this to
+    /// roughly its own typical payment size.
+    pub min_split_output_value: u64,
 }
 
 impl Default for SpendConfig {
@@ -649,12 +664,43 @@ impl Default for SpendConfig {
             orchard_action_limit: DEFAULT_ORCHARD_ACTION_LIMIT,
             cache_proving_key: true,
             pipeline_proving: false,
+            target_note_count: DEFAULT_TARGET_NOTE_COUNT,
+            min_split_output_value: DEFAULT_MIN_SPLIT_OUTPUT_VALUE,
         }
+    }
+}
+
+impl SpendConfig {
+    /// Reject change-splitting settings the send path could not use.
+    ///
+    /// Both values reach librustzcash through constructors that reject out-of-range input, so
+    /// without this a typo in `zecd.toml` would surface as a panic on the first send rather than
+    /// as a refusal to start.
+    pub fn validate_change_splitting(&self) -> anyhow::Result<()> {
+        if self.target_note_count == 0 {
+            anyhow::bail!(
+                "[spend] target_note_count must be at least 1 (it is the number of notes a send \
+                 aims to leave the wallet holding)"
+            );
+        }
+        if zcash_protocol::value::Zatoshis::from_u64(self.min_split_output_value).is_err() {
+            anyhow::bail!(
+                "[spend] min_split_output_value = {} is not a valid amount of zatoshis",
+                self.min_split_output_value
+            );
+        }
+        Ok(())
     }
 }
 
 /// Default Orchard-action cap, matching Zallet's `orchard_actions` default.
 pub const DEFAULT_ORCHARD_ACTION_LIMIT: usize = 50;
+
+/// Default change-splitting target, matching zcash-devtool's send defaults.
+pub const DEFAULT_TARGET_NOTE_COUNT: usize = 4;
+
+/// Default floor on a split change note (0.1 ZEC), matching zcash-devtool's send defaults.
+pub const DEFAULT_MIN_SPLIT_OUTPUT_VALUE: u64 = 10_000_000;
 
 /// `[spend] privacy_policy` - Zallet/zcashd's privacy-policy idea (zcash/zcash#6240) reduced to
 /// the leaks a zecd send can actually cause: whether a send may cross between shielded pools
@@ -940,6 +986,8 @@ struct SpendFile {
     orchard_action_limit: Option<usize>,
     cache_proving_key: Option<bool>,
     pipeline_proving: Option<bool>,
+    target_note_count: Option<usize>,
+    min_split_output_value: Option<u64>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -1687,9 +1735,16 @@ impl AppConfig {
                 .unwrap_or(DEFAULT_ORCHARD_ACTION_LIMIT),
             cache_proving_key: spend_file.cache_proving_key.unwrap_or(true),
             pipeline_proving: spend_file.pipeline_proving.unwrap_or(false),
+            target_note_count: spend_file
+                .target_note_count
+                .unwrap_or(DEFAULT_TARGET_NOTE_COUNT),
+            min_split_output_value: spend_file
+                .min_split_output_value
+                .unwrap_or(DEFAULT_MIN_SPLIT_OUTPUT_VALUE),
         };
         // Fail at startup, not on the first balance/send call.
         spend.confirmations_policy()?;
+        spend.validate_change_splitting()?;
 
         let health_file = file.health.unwrap_or(HealthFile {
             enabled: None,
@@ -2347,6 +2402,49 @@ mod tests {
         .is_err());
         // Unknown keys in the section are rejected like everywhere else.
         assert!(toml::from_str::<SpendFile>("min_conf = 1").is_err());
+    }
+
+    /// The floor is the reason this is configurable at all: a deployment built on small
+    /// balances needs a lower one, and the default is sized for mainnet-scale value. Both keys
+    /// must also be *rejected* when unusable rather than reaching the send path, where they are
+    /// unwrapped - a `target_note_count = 0` used to be a panic waiting for the first send.
+    #[test]
+    fn change_splitting_defaults_parses_and_rejects_unusable_values() {
+        assert_eq!(SpendConfig::default().target_note_count, 4);
+        assert_eq!(SpendConfig::default().min_split_output_value, 10_000_000);
+        SpendConfig::default()
+            .validate_change_splitting()
+            .expect("the defaults are usable");
+
+        let f: SpendFile =
+            toml::from_str("target_note_count = 8\nmin_split_output_value = 50000").unwrap();
+        assert_eq!(f.target_note_count, Some(8));
+        assert_eq!(f.min_split_output_value, Some(50_000));
+
+        let zero_target = SpendConfig {
+            target_note_count: 0,
+            ..SpendConfig::default()
+        };
+        assert!(
+            zero_target.validate_change_splitting().is_err(),
+            "a zero note target would panic the send path"
+        );
+
+        let absurd_floor = SpendConfig {
+            min_split_output_value: u64::MAX,
+            ..SpendConfig::default()
+        };
+        assert!(
+            absurd_floor.validate_change_splitting().is_err(),
+            "a floor above MAX_MONEY is not a valid amount"
+        );
+
+        // A floor of zero is legal: it means "split without a minimum".
+        let no_floor = SpendConfig {
+            min_split_output_value: 0,
+            ..SpendConfig::default()
+        };
+        assert!(no_floor.validate_change_splitting().is_ok());
     }
 
     #[test]

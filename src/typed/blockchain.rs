@@ -49,6 +49,11 @@ pub struct SyncState {
     /// Empty in the brief window before anything is scanned.
     pub hash: String,
     pub height: u32,
+    /// The upstream's chain tip, against which `height` is the scanned progress - so
+    /// "scanned 3,366,176 of 3,366,250" needs no second connection. `None` until the node has
+    /// learned a tip (before its first successful connect).
+    #[serde(default)]
+    pub chain_tip: Option<u32>,
     /// True only when the block scan has reached the tip *and* the enhancement backlog is
     /// empty - i.e. history and memos are complete as of `height`.
     pub synced: bool,
@@ -161,6 +166,7 @@ mod tests {
         let synced: SyncState = serde_json::from_value(serde_json::json!({
             "hash": "0000000000000000000000000000000000000000000000000000000000abc123",
             "height": 240,
+            "chain_tip": 240,
             "synced": true,
             "pending_enhancements": 0,
             "enhanced_through": 240,
@@ -169,10 +175,14 @@ mod tests {
         assert!(synced.synced);
         assert_eq!(synced.pending_enhancements, 0);
         assert_eq!(synced.enhanced_through, Some(240));
+        assert_eq!(synced.chain_tip, Some(240));
 
+        // Mid-sync is the case `chain_tip` exists for: `height` alone cannot express progress,
+        // since what it is measured against is the tip.
         let timed_out: SyncState = serde_json::from_value(serde_json::json!({
             "hash": "",
             "height": 100,
+            "chain_tip": 400,
             "synced": false,
             "pending_enhancements": 4096,
             "enhanced_through": serde_json::Value::Null,
@@ -181,6 +191,19 @@ mod tests {
         assert!(!timed_out.synced);
         assert_eq!(timed_out.pending_enhancements, 4096);
         assert_eq!(timed_out.enhanced_through, None);
+        assert_eq!(timed_out.chain_tip, Some(400));
+
+        // A tip is not known until the first successful connect, and a node that predates the
+        // field omits it entirely; both decode as "unknown" rather than failing.
+        let no_tip: SyncState = serde_json::from_value(serde_json::json!({
+            "hash": "",
+            "height": 0,
+            "synced": false,
+            "pending_enhancements": 0,
+            "enhanced_through": serde_json::Value::Null,
+        }))
+        .unwrap();
+        assert_eq!(no_tip.chain_tip, None);
     }
 
     /// Fixture captured from a synced regtest wallet's `getblockchaininfo`.

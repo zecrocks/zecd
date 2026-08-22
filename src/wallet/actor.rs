@@ -89,10 +89,6 @@ type ProposalError = zcash_client_backend::data_api::error::Error<
     zcash_client_sqlite::ReceivedNoteId,
 >;
 
-/// Note-management defaults for change splitting (match zcash-devtool's send defaults).
-const TARGET_NOTE_COUNT: usize = 4;
-const MIN_SPLIT_OUTPUT_VALUE: u64 = 10_000_000; // 0.1 ZEC
-
 /// The Orchard (+ Ironwood) proving keys, built once and shared (read-only) across
 /// every wallet actor via `Arc`. These are wallet-independent (they're the circuit's keys), and
 /// `ProvingKey::build()` is a full `keygen_vk`+`keygen_pk` - seconds of work - so the fused
@@ -612,6 +608,11 @@ pub struct ActorConfig {
     pub confirmations_policy: ConfirmationsPolicy,
     /// Cap on Orchard actions per send (`[spend] orchard_action_limit`; 0 disables it).
     pub orchard_action_limit: usize,
+    /// Change-splitting target and floor (`[spend] target_note_count` /
+    /// `[spend] min_split_output_value`), validated at config resolution.
+    pub target_note_count: usize,
+    /// See [`ActorConfig::target_note_count`].
+    pub min_split_output_value: u64,
     /// Shared cached Orchard proving/verifying keys (`[spend] cache_proving_key`). `Some`
     /// selects the PCZT prove path with the cached key; `None` selects the legacy fused path
     /// (`create_proposed_transactions`), which rebuilds the proving key per send. Created once in
@@ -667,6 +668,10 @@ struct WalletActor {
     confirmations_policy: ConfirmationsPolicy,
     /// Cap on Orchard actions per send (`[spend] orchard_action_limit`; 0 disables it).
     orchard_action_limit: usize,
+    /// Change-splitting target and floor (`[spend]`), validated at config resolution.
+    target_note_count: usize,
+    /// See [`WalletActor::target_note_count`].
+    min_split_output_value: u64,
     /// Shielded pools this wallet receives into and spends from.
     enabled_pools: ReceiverSet,
     /// Receivers included by default in this wallet's Unified Addresses.
@@ -1161,6 +1166,8 @@ async fn spawn_inner(
         rebroadcast_interval: cfg.rebroadcast_interval,
         confirmations_policy: cfg.confirmations_policy,
         orchard_action_limit: cfg.orchard_action_limit,
+        target_note_count: cfg.target_note_count,
+        min_split_output_value: cfg.min_split_output_value,
         enabled_pools: cfg.enabled_pools.clone(),
         default_receivers: cfg.default_receivers.clone(),
         transparent_enabled: cfg.transparent_enabled,
@@ -4358,6 +4365,8 @@ impl WalletActor {
         let net = self.network;
         let change_pool = self.enabled_pools.change_pool();
         let orchard_action_limit = self.orchard_action_limit;
+        let (target_note_count, min_split_output_value) =
+            (self.target_note_count, self.min_split_output_value);
         let engine_dir = self.engine_dir.clone();
         let db = &mut self.db_data;
         tokio::task::block_in_place(move || -> Result<_, RpcError> {
@@ -4368,8 +4377,8 @@ impl WalletActor {
                 change_pool,
                 DustOutputPolicy::default(),
                 SplitPolicy::with_min_output_value(
-                    NonZeroUsize::new(TARGET_NOTE_COUNT).expect("nonzero"),
-                    Zatoshis::from_u64(MIN_SPLIT_OUTPUT_VALUE).expect("valid"),
+                    NonZeroUsize::new(target_note_count).expect("validated at config load"),
+                    Zatoshis::from_u64(min_split_output_value).expect("validated at config load"),
                 ),
             );
             let input_selector = GreedyInputSelector::new();
@@ -4616,6 +4625,8 @@ impl WalletActor {
         let net = self.network;
         let change_pool = self.enabled_pools.change_pool();
         let orchard_action_limit = self.orchard_action_limit;
+        let (target_note_count, min_split_output_value) =
+            (self.target_note_count, self.min_split_output_value);
         let account_id = self.require_account()?;
         let prover: &LocalTxProver = &self.prover;
         let engine_dir = self.engine_dir.clone();
@@ -4629,8 +4640,9 @@ impl WalletActor {
                     change_pool,
                     DustOutputPolicy::default(),
                     SplitPolicy::with_min_output_value(
-                        NonZeroUsize::new(TARGET_NOTE_COUNT).expect("nonzero"),
-                        Zatoshis::from_u64(MIN_SPLIT_OUTPUT_VALUE).expect("valid"),
+                        NonZeroUsize::new(target_note_count).expect("validated at config load"),
+                        Zatoshis::from_u64(min_split_output_value)
+                            .expect("validated at config load"),
                     ),
                 );
                 let input_selector = GreedyInputSelector::new();

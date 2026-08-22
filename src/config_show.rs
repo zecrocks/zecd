@@ -187,6 +187,12 @@ pub fn render(config: &AppConfig) -> String {
     );
     kv(&mut s, "cache_proving_key", config.spend.cache_proving_key);
     kv(&mut s, "pipeline_proving", config.spend.pipeline_proving);
+    kv(&mut s, "target_note_count", config.spend.target_note_count);
+    kv(
+        &mut s,
+        "min_split_output_value",
+        config.spend.min_split_output_value,
+    );
 
     table(&mut s, "pools");
     pools_keys(&mut s, &config.pools);
