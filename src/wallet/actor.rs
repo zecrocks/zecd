@@ -2290,6 +2290,7 @@ impl WalletActor {
         evidence: Vec<TxEvidence>,
         chain_tip: BlockHeight,
     ) -> anyhow::Result<()> {
+        let (mut stored, mut known) = (0usize, 0usize);
         for item in evidence {
             // The evidence can cover a whole restore's history for a heavily reused address,
             // so bail between fetches on Ctrl-C/`stop` rather than fetching it out. Callers
@@ -2299,26 +2300,71 @@ impl WalletActor {
                 return Err(anyhow!("shutdown during address check"));
             }
             let (tx, mined) = match item {
-                // zebra: txid only - fetch the full tx before storing.
-                TxEvidence::Txid(txid) => match self.fetch_full_tx(txid, chain_tip).await? {
-                    Some(found) => found,
-                    None => continue,
-                },
+                // zebra: txid only - fetch the full tx before storing. Checking first is what
+                // keeps the fetch off the wire entirely for the common case.
+                TxEvidence::Txid(txid) => {
+                    if self.tx_already_recorded(txid) {
+                        known += 1;
+                        continue;
+                    }
+                    match self.fetch_full_tx(txid, chain_tip).await? {
+                        Some(found) => found,
+                        None => continue,
+                    }
+                }
                 // lightwalletd: `GetTaddressTxids` already streamed the full raw tx - parse and
-                // store it directly, no re-fetch.
+                // store it directly, no re-fetch. Parsing is far cheaper than the store below,
+                // so it is still worth checking afterwards.
                 TxEvidence::Raw(raw) => {
                     let mined = raw.mined_height.map(BlockHeight::from_u32);
                     let tx = Transaction::read(
                         &raw.data[..],
                         BranchId::for_height(&self.network, mined.unwrap_or(chain_tip)),
                     )?;
+                    if self.tx_already_recorded(tx.txid()) {
+                        known += 1;
+                        continue;
+                    }
                     (tx, mined)
                 }
             };
             decrypt_and_store_transaction(&self.network, &mut self.db_data, &tx, mined)?;
             self.record_tx_transparent_receives(&tx, mined);
+            stored += 1;
+        }
+        if known > 0 {
+            tracing::debug!(
+                "TIA: stored {stored} transaction(s), skipped {known} already recorded"
+            );
         }
         Ok(())
+    }
+
+    /// Has the wallet already recorded this transaction **as mined**?
+    ///
+    /// This is the guard that stops a recurring spend-search from re-downloading an address's
+    /// entire history. librustzcash re-emits `TransactionsInvolvingAddress` for every UTXO the
+    /// wallet still holds - correctly, since that is how an externally-authored spend is noticed -
+    /// and the address index answers each one with every transaction in the range, not just the
+    /// new ones. Without this check a wallet holding many UTXOs on a reused transparent address
+    /// re-fetches and re-stores all of them every pass, on the single-writer actor, which starves
+    /// every other command behind it. Measured on the coinbase e2e, whose miner address is paid in
+    /// *every* block: 417 address-index queries returning 1853 txids on a 131-block chain, and a
+    /// `sendtoaddress` that had to wait 109 seconds to be told it had no spendable funds.
+    ///
+    /// Three reasons skipping here is safe rather than merely cheap:
+    ///
+    /// - **Discovery is done.** This arm exists to *discover* transactions involving an address.
+    ///   A transaction the wallet has recorded is discovered; if it still needs its full data
+    ///   (memos, outgoing recipients), librustzcash emits an `Enhancement`/`GetStatus` request
+    ///   naming it, which the same drain services. Skipping it here does not skip enhancing it.
+    /// - **Only *mined* counts.** A transaction known solely as unmined (seen in the mempool) is
+    ///   deliberately not skipped, so the mined height still lands when it confirms.
+    /// - **Reorg-safe by construction.** The predicate reads the wallet database, and a rewind
+    ///   truncates it - so anything above the rewind point stops being recorded and is fetched
+    ///   again, with no separate invalidation to keep in step.
+    fn tx_already_recorded(&self, txid: TxId) -> bool {
+        matches!(self.db_data.get_tx_height(txid), Ok(Some(_)))
     }
 
     /// Match a transaction's transparent outputs against the wallet's exposed transparent address
