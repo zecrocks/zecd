@@ -107,6 +107,15 @@ the wallet reports `getwalletinfo.scanning: true`, `/readyz` returns 503 with
 `reason: "enhancing"` in synced mode, and `/status` shows the number. "Scanned to tip" is not
 "ready to serve full history"; see [operations](../guide/operations.md) for monitoring it.
 
+The count is of *distinct* outstanding requests. The upstream query that generates the
+recurring transparent spend-search requests joins its per-UTXO queue to received outputs on
+transaction id alone, so a transaction with k unspent wallet outputs yields k identical
+requests per queue row; deduplicating is what keeps the published count meaningful and stops
+the drain servicing the same request repeatedly within one batch. Because those requests
+re-emit whenever the tip passes an output's observed height, the backlog also rises in steady
+state on a wallet holding many transparent UTXOs, not only during a restore, which is what
+`readiness = "scanned"` exists for.
+
 ## Mempool poller (0-conf)
 
 Once caught up, the actor subscribes to the upstream mempool stream: a 2-second

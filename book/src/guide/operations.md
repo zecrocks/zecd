@@ -79,8 +79,9 @@ it, the restore scans from the activation height of the wallet's earliest enable
 (Orchard/NU5 for the default Orchard-only config, Sapling activation when Sapling is
 enabled): safe (it can never miss notes) but slow on mainnet. History reappears as the scan
 progresses; do not trust balances until the scan and enhancement backlog finish (`"synced"`
-readiness, or `/status` showing `fully_scanned` at the tip and `pending_enhancements` 0; the
-default `"connected"` readiness reports ready long before that).
+readiness, which is the default, or `/status` showing `fully_scanned` at the tip and
+`pending_enhancements` 0. The looser `"scanned"` and `"connected"` modes report ready before
+that point.)
 
 Non-interactive restore: set `ZECD_MNEMONIC`, or pass `--mnemonic-file <path>`
 (`ZECD_MNEMONIC` takes precedence; stdin is the fallback). For `init --encrypt`, set
@@ -104,15 +105,20 @@ zecd serves unauthenticated probes on a separate port (default 9233) when `[heal
 | `GET /readyz` | Readiness, 200/503, gated by `[health] readiness`. |
 | `GET /status` | JSON snapshot: per-wallet sync state, active upstream endpoint, `conn_state` (`down` \| `syncing` \| `ready`), `pending_enhancements`, `locked`. |
 
-Readiness modes:
+Readiness modes, strictest first:
 
-- `"connected"` (default): ready once Zebra is connected and its tip is past the wallet's
-  birthday. Does not wait for the scan, so readiness never flaps during a long catch-up;
-  reads may lag the tip.
-- `"synced"`: ready only once every wallet is connected, within `[health] max_scan_lag`
-  blocks of the tip (default 4), and with an empty enhancement backlog. A from-birthday
-  restore stays not-ready until it has scanned to its own funds and finished backfilling
-  memos.
+- `"synced"` (default): ready only once every wallet is connected, within `[health]
+  max_scan_lag` blocks of the tip (default 4), and with an empty enhancement backlog. A
+  from-birthday restore stays not-ready until it has scanned to its own funds and finished
+  backfilling memos.
+- `"scanned"` (new in 0.6.4): connected and within `max_scan_lag` of the tip, without the
+  empty-backlog term. Balances and note spendability come from the block scan and are
+  current in this state; only history completeness lags. Choose it for a deployment that
+  sends regularly from a wallet holding many transparent UTXOs, where the strict mode's
+  backlog term flaps readiness after routine sends (see below).
+- `"connected"`: ready once the backend is connected and its tip is past the wallet's
+  birthday. Does not wait for the scan at all, so readiness never flaps during a long
+  catch-up; reads may lag the tip arbitrarily.
 
 A 503 body carries a `reason`. Route alerts on it:
 
@@ -120,7 +126,7 @@ A 503 body carries a `reason`. Route alerts on it:
 |---|---|---|
 | `upstream_down` | Zebra unreachable | Page someone. |
 | `actor_down` | A wallet's writer actor died | Restart the process. |
-| `enhancing` | Scanned to tip, still backfilling memos (`"synced"` mode only) | Wait; watch `pending_enhancements` trend to zero. |
+| `enhancing` | Scanned to tip, still backfilling memos (`"synced"` mode only; `"scanned"` and `"connected"` stay ready) | Wait; watch `pending_enhancements` trend to zero. If it recurs after ordinary sends rather than after a restore, see the note below. |
 | `syncing` | Normal block catch-up | Wait. |
 
 **"Scanned to tip" is not "ready".** Compact blocks carry no memos, so after the block scan
@@ -131,6 +137,27 @@ backlog drains, `conn_state` stays `syncing`, `getwalletinfo.scanning` and
 `getblockchaininfo.initialblockdownload` stay truthy, and `"synced"` readiness holds 503 with
 `reason="enhancing"`. Watch `/status` `pending_enhancements`; if it drains slowly, check that
 Zebra's `getrawtransaction` is fast.
+
+> **The backlog is not restore-only.** A wallet holding many transparent UTXOs re-emits its
+> recurring spend-search requests every time the chain tip advances past an unspent output's
+> observed height, so `pending_enhancements` rises transiently after ordinary sends and new
+> blocks, in steady state, on a wallet that has been synced for weeks. Under the default
+> `"synced"` readiness that is enough to answer 503 with `reason="enhancing"` for as long as
+> the drain takes, which on a busy address is long enough for an orchestrator to pull the
+> node out of its service while every balance RPC is answering correctly.
+>
+> If you see readiness flapping after sends rather than after a restore, that is this, and
+> `readiness = "scanned"` is the answer: it keeps the height gate and drops the backlog term,
+> so a node that is scanned to the tip stays in rotation while memos land behind it. Clamp
+> any consumer that needs complete history to `pending_enhancements` reaching zero rather
+> than to readiness.
+>
+> **Fixed in 0.6.4**, separately from the mode: the backlog count previously included
+> duplicate requests, several thousand of them on a wallet with a reused transparent address,
+> because the upstream query that generates them matched on transaction id alone. A count in
+> the tens of thousands on such a wallet was mostly an artifact. `pending_enhancements` now
+> reports distinct outstanding requests, so figures from 0.6.3 and earlier are not comparable
+> with figures from 0.6.4.
 
 `locked` (top-level on both `/readyz` and `/status`, plus per-wallet) is `true` when a
 passphrase-encrypted wallet needs a `walletpassphrase` before it can spend. It is reported
@@ -220,6 +247,25 @@ balance and all history from the chain. Nothing is lost that a seed restore coul
 which is the same guarantee described in [Stateless & recoverable](../design/statelessness.md);
 the cost is the rescan time. Pass `--yes` to skip the confirmation prompt in automated
 recovery.
+
+## Slow sends on a busy transparent address
+
+A wallet holding many unspent outputs on a *reused* transparent address could see an ordinary
+`sendtoaddress` block for a minute or more before answering, sometimes only to report
+insufficient funds. Through 0.6.3 the cause was the spend-search path: the wallet asks the
+chain for transactions involving an address once per unspent output it holds, which is how a
+spend authored elsewhere gets noticed, but the address index answers each request with every
+transaction in the range rather than only the unseen ones, and all of them were fetched and
+re-stored. That work runs on the wallet's single writer, so it starved every command queued
+behind it. Measured against an address paid in every block, a send waited 109 seconds.
+
+**Fixed in 0.6.4**, which skips transactions already recorded as mined. Nothing about the
+configuration changes and no action is needed beyond upgrading. It matters most to deposit
+and payout addresses, which are exactly the ones that accumulate outputs on a single address.
+
+If sends are still slow after upgrading, the cause is elsewhere: check that the node's
+`getrawtransaction` is fast (the same dependency the enhancement backlog has), and check
+`/status` for a wallet still catching up.
 
 ## Upgrades
 

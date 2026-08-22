@@ -201,14 +201,21 @@ container or behind a probe, set `bind = "0.0.0.0"` (the deploy configs do).
 
 What `/readyz` means is a deployment choice, `[health] readiness`:
 
-- `"connected"` (default): ready as soon as the backend is connected and its chain tip is
-  past the wallet's birthday (a sanity check that zecd is talking to the right, live
-  network). Does not wait for the wallet scan, so RPC clients can reach zecd while it
-  catches up and readiness never flaps during a long sync. Reads may lag the tip.
-- `"synced"`: ready only once every wallet is connected, within `max_scan_lag` blocks of
-  the tip (default 4), and its transaction-enhancement backlog has drained. Strict: a
-  from-birthday restore stays not-ready for hours (`reason` distinguishes `syncing` from
-  `enhancing`). Use it when clients must not see stale balances or incomplete history.
+- `"synced"` (default): ready only once every wallet is connected, within `max_scan_lag`
+  blocks of the tip (default 4), and its transaction-enhancement backlog has drained.
+  Strict: a from-birthday restore stays not-ready for hours (`reason` distinguishes
+  `syncing` from `enhancing`). Use it when clients must not see stale balances or
+  incomplete history.
+- `"scanned"` (new in 0.6.4): connected and within `max_scan_lag` of the tip, without the
+  drained-backlog term. Balances and note spendability are current in this state, since
+  both come from the block scan; only history completeness lags. Use it when a wallet holds
+  many transparent UTXOs and sends regularly, where the backlog term makes `/readyz` flap
+  after routine sends and takes a working node out of rotation. See the
+  [operations runbook](operations.md#monitoring-and-alerting).
+- `"connected"`: ready as soon as the backend is connected and its chain tip is past the
+  wallet's birthday (a sanity check that zecd is talking to the right, live network). Does
+  not wait for the wallet scan at all, so RPC clients can reach zecd while it catches up.
+  Reads may lag the tip arbitrarily.
 
 A locked encrypted wallet is still *ready* (reads work); `/readyz` reports it via the
 `locked` flag so a controller can drive a `walletpassphrase` without misreading it as a
@@ -219,8 +226,8 @@ though reads still answer; that needs a process restart.
 [health]
 bind = "0.0.0.0"
 port = 9233
-readiness = "synced"   # or "connected" (default)
-max_scan_lag = 4       # only applies in "synced" mode
+readiness = "synced"   # the default; or "scanned", or "connected"
+max_scan_lag = 4       # applies in "synced" and "scanned" modes
 ```
 
 Kubernetes example:
@@ -250,8 +257,8 @@ readinessProbe:
 
 Startup-probe headroom is still worth keeping for the *scan*, which is unrelated to keygen:
 after a restore or an upgrade with a long offline gap, prefer `readiness = "connected"` or a
-generous readiness budget, since in `"synced"` mode a catching-up wallet answers 503 until it
-reaches the tip.
+generous readiness budget, since in the default `"synced"` mode a catching-up wallet answers
+503 until it reaches the tip and finishes backfilling memos.
 
 ## Allocator: why the images use mimalloc-secure
 

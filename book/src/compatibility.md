@@ -96,7 +96,9 @@ so zecd exposes them as extensions that dialect-pure clients never trip over:
   with a transparent recipient is `-8`.
 - History entries (`listtransactions`, `gettransaction.details`, `z_listtransactions`) carry
   `memo` (hex) and `memoStr` (decoded text) fields when an output has one; entries without a
-  memo omit the fields entirely.
+  memo omit the fields entirely. `memo` is the stored bytes and does not depend on the memo
+  parsing as ZIP-302 text, so an absent `memo` means "no memo" rather than "unparseable" (see
+  [wallet history](rpc/wallet-history.md); this was not true before 0.6.4).
 - `z_sendmany` permits a zero-valued output, zcashd's memo-only-send pattern (a shielded
   recipient, `amount: 0`, and a `memo`). The Bitcoin-Core-dialect `sendtoaddress`/`sendmany`
   keep rejecting a zero amount with `-3 Invalid amount`, as Core does.
@@ -116,9 +118,13 @@ These signals stay busy until the wallet can serve full history, not just until 
 scan reaches the tip. Compact blocks carry no memos, so after the scan catches up a
 per-transaction enhancement pass fetches each transaction's full data from Zebra to backfill
 memos; on a from-birthday restore that backlog can take hours after `scan_progress` hits 1.0.
-The backlog is surfaced as `pending_enhancements` on `GET /status`, `scanning` and
+The backlog is surfaced as `pending_enhancements` on `GET /status` (a count of *distinct*
+outstanding requests since 0.6.4; earlier releases counted duplicates and reported figures
+several times higher on wallets with reused transparent addresses), `scanning` and
 `initialblockdownload` stay truthy, and `"synced"` readiness holds `/readyz` at 503 with
-`reason="enhancing"` until it drains to zero. See the [operations
+`reason="enhancing"` until it drains to zero. The backlog is not restore-only, so under
+`"synced"` this recurs after ordinary sends on a wallet holding many transparent UTXOs;
+`readiness = "scanned"` (0.6.4) keeps the scan gate without it. See the [operations
 runbook](guide/operations.md).
 
 ### sendmany collapses duplicate recipients

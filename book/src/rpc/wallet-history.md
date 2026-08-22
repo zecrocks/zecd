@@ -23,8 +23,20 @@ These apply to every method on this page.
   transaction reports `0` until the mempool stream re-observes it or it mines. The two fields
   are always equal.
 - **`memo` / `memoStr`** are extension fields beyond Bitcoin Core's set, using zcashd's
-  `z_viewtransaction` names: `memo` is the raw ZIP-302 memo bytes in hex, `memoStr` the
-  decoded text when the memo is valid UTF-8 text. Empty or absent memos add neither field.
+  `z_viewtransaction` names: `memo` is the raw stored memo bytes in hex, `memoStr` the
+  decoded text when the memo is a valid ZIP-302 text memo. An output carrying no memo, or
+  the canonical empty memo every memoless shielded output carries, adds neither field.
+
+  `memo` is emitted from the stored bytes and does **not** depend on the ZIP-302 parse
+  succeeding; only `memoStr` does. The two are different questions: a memo whose lead byte
+  is at or below `0xF4` is *declared* to be UTF-8 text, but nothing on the consensus side
+  enforces that, so a protocol embedding arbitrary bytes in that lead-byte space produces a
+  memo that fails the parse while still being perfectly good data. Through 0.6.3 the hex
+  field was gated on that parse, so such a memo came back with no `memo`, no `memoStr` and
+  no error, which is indistinguishable from an output that carried none. **Fixed in 0.6.4**:
+  an absent `memo` field now means "no memo", never "unparseable memo". If you built a
+  workaround that fetches the raw transaction to recover memos this dropped, you can retire
+  it.
 - **Outgoing `address` is the single receiver actually paid**, not the full Unified Address
   the caller typed. A multi-receiver UA is sender-side metadata that never reaches the chain,
   so history reduces each outgoing output to the paid receiver (a bare `t`/`zs` address, or a
@@ -34,6 +46,20 @@ These apply to every method on this page.
 - **`label` is always `""`** and `walletconflicts` always `[]`: zecd keeps no address labels
   and tracks no conflict set. `bip125-replaceable` is always `"no"` (Zcash has no RBF).
 - Amounts are bare JSON numbers in decimal ZEC, 8 places.
+- **History ordering is total, and is a contract.** For the four history methods
+  (`listtransactions`, `z_listtransactions`, `listsinceblock`, `gettransaction`, but *not*
+  `listunspent`, which builds its list from the note and UTXO sets and promises no order),
+  results are ordered by height, then transaction id, then output pool, then output index.
+  Height alone is not injective, since a block holds many wallet transactions, so through 0.6.3 two transactions mined at the same height came
+  back in whatever order SQLite happened to produce. That was stable enough within one call
+  and *not* stable across calls, which meant a `count`/`from` page boundary landing inside a
+  same-height tie could show a transaction twice or skip it entirely between adjacent pages.
+  **Fixed in 0.6.4.** A consumer replaying history as a log therefore gets a stable
+  `(height, txid, pool, outindex)` sequence and can resume from the last entry it processed.
+  The transaction-id comparison is over the stored internal byte order, which is an arbitrary
+  but stable permutation of display order; do not read it as alphabetical by displayed txid.
+  Reversing the order (newest-first) reverses the height and txid keys together, leaving the
+  within-transaction output order unchanged.
 
 ## listtransactions
 

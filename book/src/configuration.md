@@ -187,8 +187,8 @@ Unauthenticated liveness/readiness probes on a separate port; see the
 | `enabled` | bool | `true` | Serve `/healthz`, `/readyz`, `/status`. |
 | `bind` | string (IP) | `"127.0.0.1"` | Probe listen address (`0.0.0.0` to expose off-host). |
 | `port` | integer | `9233` | Probe listen port (all networks). |
-| `readiness` | string | `"connected"` | What `/readyz` gates on: `"connected"` (backend connected and its tip past the wallet's birthday; does not wait for scanning) or `"synced"` (additionally scanned to within `max_scan_lag` blocks of the tip). |
-| `max_scan_lag` | integer | `4` | Maximum `chain_tip - fully_scanned` gap at which `/readyz` reports ready. Only consulted in `"synced"` mode. |
+| `readiness` | string | `"synced"` | What `/readyz` gates on. `"synced"` (the default): connected, scanned to within `max_scan_lag` blocks of the tip, **and** the transaction-enhancement backlog drained. `"scanned"` (new in 0.6.4): the same without the backlog term. `"connected"`: backend connected and its tip past the wallet's birthday, without waiting for the scan at all. |
+| `max_scan_lag` | integer | `4` | Maximum `chain_tip - fully_scanned` gap at which `/readyz` reports ready. Consulted in `"synced"` and `"scanned"` modes; ignored in `"connected"`. |
 
 ## `[log]`
 
