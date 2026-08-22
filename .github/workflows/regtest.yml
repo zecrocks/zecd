@@ -330,6 +330,57 @@ jobs:
             echo "node=${{ matrix.node }}: skipping lightwalletd (it rejects this node's subversion); nothing on this leg needs it"
           fi
 
+      # Every binary that calls `start_funded_chain` needs the same starting state: a chain whose
+      # funder holds a spendable shielded balance. Building it means mining past the 100-block
+      # coinbase maturity (consensus, so it cannot be shortened), starting the funder, shielding
+      # its coinbase and ageing the note - ~89s, paid identically by 12 binaries on the zebra leg.
+      # Build it once here instead, and let the binaries restore a copy.
+      #
+      # The cache key covers everything that can change what the chain *is*: the node image, the
+      # funder image, and the harness source that shapes it (activation heights, coinbase counts,
+      # the funder's own config). A harness edit therefore rebuilds rather than restoring a
+      # snapshot that no longer matches the code reading it - most pull requests do not touch
+      # that file, so the cache still hits on the runs where it matters.
+      #
+      # Only legs that actually run a funded binary need it. That is a property of the leg's
+      # *test list*, not of the node, so ask the sources rather than hard-coding "not zakura":
+      # zakura runs a subset with no funded binary today, but the moment that list gains one the
+      # snapshot has to follow it, and a node-name guard would silently keep skipping - every
+      # funded binary quietly falling back to its own bring-up with nothing to warn anyone.
+      - name: Decide whether this leg needs the funded chain snapshot
+        id: snapshot-needed
+        env:
+          LEG_TESTS: ${{ matrix.tests || env.HARNESS_TESTS }}
+        run: |
+          needed=false
+          for t in $LEG_TESTS; do
+            [ "$t" = "--test" ] && continue
+            if grep -q 'start_funded_chain' "regtest-harness/tests/$t.rs" 2>/dev/null; then
+              needed=true
+              echo "$t calls start_funded_chain -> this leg needs the snapshot"
+              break
+            fi
+          done
+          [ "$needed" = true ] || echo "no binary on this leg calls start_funded_chain -> no snapshot"
+          echo "needed=$needed" >> "$GITHUB_OUTPUT"
+
+      - name: Cache the funded chain snapshot
+        if: steps.snapshot-needed.outputs.needed == 'true'
+        id: chain-snapshot
+        uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}/chain-snapshot
+          key: chain-snapshot-v1-${{ runner.os }}-${{ matrix.node }}-${{ env.NODE_IMAGE }}-${{ env.ZECD_FUNDER_IMAGE }}-${{ hashFiles('regtest-harness/src/lib.rs') }}
+
+      - name: Build the funded chain snapshot
+        if: steps.snapshot-needed.outputs.needed == 'true' && steps.chain-snapshot.outputs.cache-hit != 'true'
+        env:
+          ZECD_REGTEST_NU63_HEIGHT: "8"
+          ZECD_REGTEST_NODE: ${{ matrix.node }}
+        run: |
+          cargo run --release --locked --manifest-path regtest-harness/Cargo.toml \
+            --bin build-chain-snapshot -- "$RUNNER_TEMP/chain-snapshot"
+
       # The funded test also runs scripts/conformance.py (python3, stdlib-only) against the
       # live daemon, so the full Bitcoin-Core wire-format suite is exercised here in CI.
       - name: Run regtest end-to-end harness
@@ -375,6 +426,12 @@ jobs:
           # Light mode: the zecd-lwd suite reruns the opted-in tests with zecd on a dedicated
           # lightwalletd upstream instead of the node's JSON-RPC (empty = the node, the default).
           ZECD_REGTEST_BACKEND: ${{ matrix.backend || '' }}
+          # A prebuilt funded chain for start_funded_chain to restore (built or cache-restored
+          # above; empty on a leg that runs no funded binary, where there is nothing to restore
+          # it). A snapshot that is stale, truncated or from the wrong node is not fatal - the
+          # harness verifies what it restored and falls back to a live bring-up - so the worst a
+          # bad one costs is the time it was meant to save.
+          ZECD_REGTEST_CHAIN_SNAPSHOT: ${{ steps.snapshot-needed.outputs.needed == 'true' && format('{0}/chain-snapshot', runner.temp) || '' }}
           # The node binary (ZEBRAD_BIN/ZAKURAD_BIN) and LIGHTWALLETD_BIN are exported by the
           # provisioning steps above.
           #
@@ -386,14 +443,31 @@ jobs:
           # their timeouts and turns into flakes. The per-binary wall-clock table the driver prints
           # at the end of the step is the tuning input.
           #
-          # 6 on 8 vCPU was measured, not guessed: 6 -> 5m42s, 8 -> 6m04s, 12 -> 6m07s. Past 6 it
-          # gets *slower*, because the tier is no longer bounded by total work but by its longest
-          # single binary (regtest_coinbase), and extra concurrency only adds contention around it.
-          # Going further means splitting that binary, not raising this number - and note that
-          # REGTEST_TEST_THREADS=2, which does exactly that, was tried and reverted: it reached
-          # 4m18s but failed both attempts, the second time in regtest_sapling
-          # ("getunconfirmedbalance is 0: 3.0"), a one-test binary that was simply starved by the
-          # extra load. A minute is not worth a flaky tier.
+          # 6, and raising it does not help - this was re-measured on 2026-08-21 and the
+          # intuition behind a higher number is wrong. The premise above ("spends most of its
+          # wall clock *waiting* on that stack") predates NU6.3 and the zecd funder: a funded
+          # binary now runs TWO proving daemons (the wallet under test and the funder, each
+          # building proving keys and proving its own sends), so the tier burns CPU rather than
+          # idling on it, and at 6 slots an 8-vCPU runner is already saturated.
+          #
+          # Measured back to back on the zebra leg, same commit, 23 binaries:
+          #   6 jobs -> total work 2946s, longest binary 374s, elapsed 524s
+          #   8 jobs -> total work 3755s, longest binary 478s, elapsed 521s
+          # Three seconds. Every binary inflated 22-38% (the short ones too), so the extra slots
+          # divided the same CPU instead of filling idle capacity, and the longest binary - the
+          # thing extra slots were meant to hide behind - grew 28% along with everything else.
+          #
+          # So elapsed is governed by total CPU work over available cores, NOT by slot count, and
+          # per-binary wall clock is not a constant to divide by jobs. Two consequences worth
+          # holding onto: raising this number buys nothing without more cores (raise
+          # REGTEST_RUNNER first, in lockstep), and *splitting* a slow binary is worse than
+          # useless here - it adds a whole extra chain bring-up to the CPU total to shorten a
+          # bound that is not what binds. The only levers that move this tier are less CPU work
+          # (fewer proofs, fewer chain bring-ups, fewer blocks scanned) or a bigger runner.
+          #
+          # Also still live from the earlier tuning: REGTEST_TEST_THREADS=2 was tried and
+          # reverted after starving the one-test regtest_sapling into a bad getunconfirmedbalance
+          # assertion. Raise slots or threads, never both, and never past what the runner has.
           # The light-mode leg runs a lower concurrency than the tuned-for-zebra default: each of
           # its binaries brings up a lightwalletd *in addition to* the node+zecd stack (regtest_lwd
           # runs two lightwalletds and a second zebra-backed zecd twin), so a slot there costs

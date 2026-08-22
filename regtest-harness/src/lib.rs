@@ -240,6 +240,28 @@ fn spawn_zebrad(bin: &Path, config_path: &Path) -> Result<Child> {
         .with_context(|| format!("spawn zebrad ({})", bin.display()))
 }
 
+/// Recursively copy a directory tree. Used by the chain snapshot to hand each stack its own
+/// copy of a prebuilt zebra state directory and funder datadir, rather than letting concurrent
+/// stacks share (and corrupt) one.
+///
+/// Copies everything it finds, deliberately: a wallet database's `-wal`/`-shm` sidecars are part
+/// of its state, and skipping them silently rolls the wallet back to its last checkpoint.
+fn copy_dir_all(src: &Path, dst: &Path) -> Result<()> {
+    std::fs::create_dir_all(dst).with_context(|| format!("create {}", dst.display()))?;
+    for entry in std::fs::read_dir(src).with_context(|| format!("read {}", src.display()))? {
+        let entry = entry?;
+        let from = entry.path();
+        let to = dst.join(entry.file_name());
+        if entry.file_type()?.is_dir() {
+            copy_dir_all(&from, &to)?;
+        } else {
+            std::fs::copy(&from, &to)
+                .with_context(|| format!("copy {} -> {}", from.display(), to.display()))?;
+        }
+    }
+    Ok(())
+}
+
 impl Zebrad {
     /// Launch `zebrad` in Regtest mode (mining to a throwaway address) and wait until its
     /// JSON-RPC answers.
@@ -289,9 +311,32 @@ impl Zebrad {
     /// Used by the funded e2e to stop minting coinbases to the funder so its existing coinbases
     /// can age past maturity while a throwaway address mines the tail.
     pub async fn restart_with_miner(&mut self, miner_address: &str) -> Result<()> {
-        // Clean shutdown via the regtest `stop` RPC (raises SIGINT) so zebra backs up its
-        // non-finalized state. A SIGKILL would drop the recent, not-yet-finalized blocks and reset
-        // the chain to genesis - losing the funder's coinbases.
+        self.stop_gracefully().await;
+        let cache_dir = self.state_dir();
+        std::fs::write(
+            &self.config_path,
+            zebrad_toml(
+                self.net_port,
+                self.rpc_port,
+                miner_address,
+                &cache_dir.to_string_lossy(),
+                self.nu6_3_height,
+            ),
+        )
+        .context("rewrite zebrad.toml for restart")?;
+        self.child = spawn_zebrad(&self.bin, &self.config_path)?;
+        self.wait_until_rpc_up().await?;
+        Ok(())
+    }
+
+    /// Stop `zebrad` via the regtest `stop` RPC (which raises SIGINT) and wait for the process
+    /// to exit, so zebra backs up its non-finalized state on the way out.
+    ///
+    /// **A SIGKILL here loses blocks.** The non-finalized state is written by an asynchronous
+    /// task, so killing zebrad drops the recent, not-yet-finalized blocks and can reset the chain
+    /// toward genesis - which on a funded chain means losing the funder's coinbases. Falls back to
+    /// a kill only after the process ignores the request for a minute.
+    async fn stop_gracefully(&mut self) {
         let _ = self.rpc("stop", json!([])).await;
         let deadline = Instant::now() + Duration::from_secs(60);
         loop {
@@ -307,21 +352,54 @@ impl Zebrad {
                 }
             }
         }
-        let cache_dir = self._dir.path().join("state");
+    }
+
+    /// The chain-state directory (zebra's `cache_dir`), the half of this instance worth
+    /// snapshotting.
+    pub fn state_dir(&self) -> PathBuf {
+        self._dir.path().join("state")
+    }
+
+    /// Start `zebrad` on a **copy** of an existing chain-state directory rather than from
+    /// genesis: the restore half of [`snapshot`]. The state is copied, never opened in place, so
+    /// one snapshot serves any number of concurrent stacks and no test can corrupt it for the
+    /// others.
+    pub async fn start_from_state(
+        bin: &Path,
+        miner_address: &str,
+        state_src: &Path,
+    ) -> Result<Zebrad> {
+        let dir = tempfile::tempdir().context("create zebrad dir")?;
+        let cache_dir = dir.path().join("state");
+        copy_dir_all(state_src, &cache_dir)
+            .with_context(|| format!("copy chain state from {}", state_src.display()))?;
+        let net_port = pick_port()?;
+        let rpc_port = pick_port()?;
+        let config_path = dir.path().join("zebrad.toml");
+        let nu6_3_height = NU6_3_ACTIVATION_HEIGHT;
         std::fs::write(
-            &self.config_path,
+            &config_path,
             zebrad_toml(
-                self.net_port,
-                self.rpc_port,
+                net_port,
+                rpc_port,
                 miner_address,
                 &cache_dir.to_string_lossy(),
-                self.nu6_3_height,
+                nu6_3_height,
             ),
         )
-        .context("rewrite zebrad.toml for restart")?;
-        self.child = spawn_zebrad(&self.bin, &self.config_path)?;
-        self.wait_until_rpc_up().await?;
-        Ok(())
+        .context("write zebrad.toml")?;
+        let child = spawn_zebrad(bin, &config_path)?;
+        let mut zebrad = Zebrad {
+            child,
+            rpc_port,
+            net_port,
+            bin: bin.to_path_buf(),
+            config_path,
+            nu6_3_height,
+            _dir: dir,
+        };
+        zebrad.wait_until_rpc_up().await?;
+        Ok(zebrad)
     }
 
     fn rpc_url(&self) -> String {
@@ -861,6 +939,101 @@ impl Funder {
         Ok(funder)
     }
 
+    /// Bring up a funder daemon on a **copy** of an existing datadir, skipping `init` and the
+    /// chain work that produced its balance: the restore half of the chain snapshot. The
+    /// addresses are passed in rather than re-issued, because re-issuing would move the wallet's
+    /// state - a fresh `getnewaddress "" "transparent"` would hand out index 2 (index 1 having
+    /// been issued and funded before the snapshot was taken), and shielded diversifiers are
+    /// clock-derived, so they would not reproduce either.
+    pub async fn attach(
+        zebra_rpc_port: u16,
+        datadir_src: &Path,
+        source_ua: String,
+        pay_to_ua: String,
+        taddr: String,
+    ) -> Result<Funder> {
+        let bin = funder_bin();
+        if !bin.exists() {
+            bail!(
+                "funder zecd binary not found at {} - build it first \
+                 (cargo build --release --bin zecd) or set $ZECD_FUNDER_BIN",
+                bin.display()
+            );
+        }
+        let dir = tempfile::tempdir().context("create funder dir")?;
+        copy_dir_all(datadir_src, dir.path())
+            .with_context(|| format!("copy funder datadir from {}", datadir_src.display()))?;
+        let cfg = FunderConfig {
+            zebra_rpc_port,
+            rpc_port: pick_port()?,
+            health_port: pick_port()?,
+            user: "funder",
+            password: "funder",
+        };
+        // Overwrite the snapshot's config: its ports belong to the stack that built it.
+        write_funder_toml(dir.path(), &cfg)?;
+        assert_funder_config_check_passes(&bin, dir.path())?;
+
+        let (out, err) = zecd_daemon_stdio();
+        let mut child = Command::new(&bin)
+            .args([
+                "--datadir",
+                dir.path().to_str().unwrap(),
+                "--regtest",
+                "run",
+            ])
+            .stdout(out)
+            .stderr(err)
+            .spawn()
+            .context("spawn funder zecd daemon")?;
+        forward_daemon_logs(&format!("funder:{}", cfg.rpc_port), &mut child);
+
+        let mut funder = Funder {
+            child,
+            base_url: format!("http://127.0.0.1:{}/", cfg.rpc_port),
+            user: cfg.user.to_string(),
+            password: cfg.password.to_string(),
+            http: reqwest::Client::new(),
+            source_ua,
+            pay_to_ua,
+            taddr,
+            _dir: dir,
+        };
+        funder.wait_until_rpc_up().await?;
+        Ok(funder)
+    }
+
+    /// Stop the funder daemon and wait for it to exit, so SQLite checkpoints its write-ahead log
+    /// before the datadir is archived. Snapshotting a wallet database without its `-wal` would
+    /// silently roll it back to the last checkpoint.
+    async fn stop_gracefully(&mut self) {
+        let _ = self.call("stop", json!([])).await;
+        let deadline = Instant::now() + Duration::from_secs(60);
+        loop {
+            match self.child.try_wait() {
+                Ok(Some(_)) => break,
+                Ok(None) if Instant::now() < deadline => {
+                    tokio::time::sleep(Duration::from_millis(200)).await;
+                }
+                _ => {
+                    let _ = self.child.kill();
+                    let _ = self.child.wait();
+                    break;
+                }
+            }
+        }
+    }
+
+    /// The funder's data directory - the half of this instance worth snapshotting.
+    pub fn datadir(&self) -> &Path {
+        self._dir.path()
+    }
+
+    /// The funder's own Orchard-only unified address (its `z_sendmany` source).
+    pub fn source_address(&self) -> &str {
+        &self.source_ua
+    }
+
     /// The funder's first issued transparent address - a wallet-owned t-address tests pay when
     /// they need an external transparent counterparty. (Not the miner address; that is index 0,
     /// derived offline by [`start_funded_chain`] before this wallet existed.)
@@ -1120,7 +1293,7 @@ impl Drop for Funder {
 /// just-mined blocks. From the first block on **every mined block pays the funder**, which is
 /// harmless - `z_shieldcoinbase` filters immature coinbase itself, so accruing more never breaks
 /// the shield.
-pub async fn start_funded_chain(node_bin: &Path) -> Result<(Zebrad, Funder)> {
+pub async fn start_funded_chain_live(node_bin: &Path) -> Result<(Zebrad, Funder)> {
     // Mine to index 0: exposed at account creation, so the funder's wallet will credit these
     // coinbases without ever issuing the address. (Its first *issued* address is index 1.)
     let miner_taddr = derive_funder_transparent_address(0)
@@ -1179,6 +1352,195 @@ pub async fn start_funded_chain(node_bin: &Path) -> Result<(Zebrad, Funder)> {
         funder.spendable_zats().await? > 0,
         "the funder shielded its coinbase in {shield_txid} but has no spendable balance"
     );
+    Ok((zebrad, funder))
+}
+
+/// How long to let zebra's non-finalized state backup task run before stopping the node for a
+/// snapshot. Its own rate limit is `MIN_DURATION_BETWEEN_BACKUP_UPDATES` (5s); this adds margin.
+const NON_FINALIZED_BACKUP_GRACE: Duration = Duration::from_secs(9);
+
+/// Path to a prebuilt chain snapshot, from `ZECD_REGTEST_CHAIN_SNAPSHOT`. Unset (the default, and
+/// what a local `cargo test` sees) means every funded binary builds its own chain, exactly as
+/// before.
+const CHAIN_SNAPSHOT_ENV: &str = "ZECD_REGTEST_CHAIN_SNAPSHOT";
+
+fn chain_snapshot_path() -> Option<PathBuf> {
+    std::env::var(CHAIN_SNAPSHOT_ENV)
+        .ok()
+        .filter(|v| !v.trim().is_empty())
+        .map(PathBuf::from)
+}
+
+/// Bring up a regtest chain whose funder already holds a spendable shielded balance.
+///
+/// Every funded binary starts here, and building that state live is expensive and identical
+/// every time: mine `FUNDER_COINBASES + MATURITY_TAIL` blocks (the 100-block coinbase maturity is
+/// consensus, so it cannot be shortened), start the funder, shield its coinbase (a proof), and
+/// age the note. Measured at ~89s per binary, paid by 12 of them on the zebra leg.
+///
+/// So if `ZECD_REGTEST_CHAIN_SNAPSHOT` names a snapshot built by the `build-chain-snapshot`
+/// binary, restore from it instead. **Failure to restore is never fatal**: a stale, truncated or
+/// wrong-version snapshot logs a warning and falls back to the live bring-up, so the worst a bad
+/// snapshot costs is the time it was meant to save. That matters more than it looks - a snapshot
+/// that silently changed what the funded tier runs on would be far worse than a slow one.
+pub async fn start_funded_chain(node_bin: &Path) -> Result<(Zebrad, Funder)> {
+    if let Some(src) = chain_snapshot_path() {
+        if src.join("meta.json").is_file() {
+            match restore_chain_snapshot(node_bin, &src).await {
+                Ok(pair) => return Ok(pair),
+                Err(e) => eprintln!(
+                    "WARN chain snapshot at {} is unusable, falling back to a live bring-up: {e:#}",
+                    src.display()
+                ),
+            }
+        } else {
+            eprintln!(
+                "WARN {CHAIN_SNAPSHOT_ENV}={} holds no meta.json; falling back to a live bring-up",
+                src.display()
+            );
+        }
+    }
+    start_funded_chain_live(node_bin).await
+}
+
+/// Archive a funded chain so other stacks can restore it. Stops both daemons first - see
+/// [`Zebrad::stop_gracefully`] and [`Funder::stop_gracefully`] for why a kill would corrupt what
+/// we are about to copy - and consumes them, since neither is usable afterwards.
+pub async fn save_chain_snapshot(
+    node_bin: &Path,
+    mut zebrad: Zebrad,
+    mut funder: Funder,
+    dest: &Path,
+) -> Result<()> {
+    // Deliberately NOT the running node's tip. zebra keeps recent blocks in its non-finalized
+    // state and writes them out asynchronously, so the height on disk trails the height the RPC
+    // reports and a stop can drop the difference - the same hazard `restart_with_miner`
+    // documents. Recording the live tip produced a snapshot claiming 137 whose state came back
+    // at 131, which every restore then correctly rejected: 13 fallbacks, a green run, and a
+    // snapshot that had never once been used. So the tip is left unset here and filled in below
+    // from a real restore of the finished archive.
+    let meta = json!({
+        "tip": 0,
+        "source_ua": funder.source_address(),
+        "pay_to_ua": funder.unified_address(),
+        "taddr": funder.transparent_address(),
+        "miner_taddr": derive_funder_transparent_address(0)
+            .context("re-derive the funder's miner address")?,
+    });
+
+    // Order matters: the funder talks to zebra, so stop it first.
+    funder.stop_gracefully().await;
+
+    // Give zebra's non-finalized state backup task time to run before stopping the node.
+    //
+    // zebra keeps recent blocks in memory and persists them from a *rate-limited* background loop
+    // (`zebra-state/src/service/non_finalized_state/backup.rs`: it joins the state-changed signal
+    // with a `MIN_DURATION_BETWEEN_BACKUP_UPDATES` sleep, 5s at the time of writing). There is no
+    // flush on shutdown - the task simply logs "is Zebra shutting down?" and exits - and no RPC
+    // that forces one. So blocks mined inside that window are lost on the stop, which is what
+    // cost the first snapshot its last 6 blocks (recorded 137, restored 131).
+    //
+    // Waiting out the window is the difference between archiving the chain that was built and
+    // archiving most of it. It is a timing constant in someone else's crate, though, so it is
+    // belt and braces only: the restore verification below records the height that actually
+    // survived, so a changed constant costs a few blocks, never a broken snapshot.
+    tokio::time::sleep(NON_FINALIZED_BACKUP_GRACE).await;
+    zebrad.stop_gracefully().await;
+
+    if dest.exists() {
+        std::fs::remove_dir_all(dest).with_context(|| format!("clear {}", dest.display()))?;
+    }
+    std::fs::create_dir_all(dest).with_context(|| format!("create {}", dest.display()))?;
+    copy_dir_all(&zebrad.state_dir(), &dest.join("zebra-state")).context("archive chain state")?;
+    copy_dir_all(funder.datadir(), &dest.join("funder-datadir")).context("archive funder")?;
+    std::fs::write(dest.join("meta.json"), serde_json::to_vec_pretty(&meta)?)
+        .context("write snapshot meta.json")?;
+
+    // Restore what was just written, exactly as a test binary will, and record the height that
+    // survived. Two things fall out of doing this here rather than trusting the archive:
+    // the recorded tip is by construction one a restore can reach, and a snapshot that cannot be
+    // restored at all fails *this* step loudly instead of turning into a silent fallback in every
+    // funded binary. The funder is re-attached and its balance re-checked too, since a chain that
+    // came back short could leave its wallet ahead of the chain.
+    let (verify_zebrad, verify_funder) = restore_chain_snapshot(node_bin, dest)
+        .await
+        .context("verify the snapshot by restoring it")?;
+    let tip = verify_zebrad
+        .rpc("getblockcount", json!([]))
+        .await
+        .context("read the restored tip")?
+        .as_u64()
+        .ok_or_else(|| anyhow!("getblockcount did not return a height"))?;
+    drop(verify_funder);
+    drop(verify_zebrad);
+
+    let mut meta = meta;
+    meta["tip"] = json!(tip);
+    std::fs::write(dest.join("meta.json"), serde_json::to_vec_pretty(&meta)?)
+        .context("rewrite snapshot meta.json with the verified tip")?;
+    eprintln!(
+        "chain snapshot written to {} and verified by restore (tip {tip})",
+        dest.display()
+    );
+    Ok(())
+}
+
+/// Restore a chain built by [`save_chain_snapshot`]. Verifies what it restored rather than
+/// trusting it: the node must come back at or above the recorded tip, and the funder must report
+/// a spendable balance. Either check failing raises, and the caller falls back to a live
+/// bring-up - which is the whole reason those checks are here rather than in a comment.
+async fn restore_chain_snapshot(node_bin: &Path, src: &Path) -> Result<(Zebrad, Funder)> {
+    let meta: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(src.join("meta.json")).context("read snapshot meta.json")?,
+    )
+    .context("parse snapshot meta.json")?;
+    let field = |k: &str| -> Result<String> {
+        meta.get(k)
+            .and_then(|v| v.as_str())
+            .map(str::to_string)
+            .ok_or_else(|| anyhow!("snapshot meta.json has no string field {k:?}"))
+    };
+    let recorded_tip = meta
+        .get("tip")
+        .and_then(|v| v.as_u64())
+        .ok_or_else(|| anyhow!("snapshot meta.json has no tip"))?;
+
+    let zebrad =
+        Zebrad::start_from_state(node_bin, &field("miner_taddr")?, &src.join("zebra-state"))
+            .await
+            .context("start the node on the snapshot chain state")?;
+    let tip = zebrad
+        .rpc("getblockcount", json!([]))
+        .await
+        .context("read the restored tip")?
+        .as_u64()
+        .unwrap_or(0);
+    anyhow::ensure!(
+        tip >= recorded_tip,
+        "restored chain is at height {tip} but the snapshot recorded {recorded_tip}: the state \
+         was archived from a node that had not flushed, or the copy is truncated"
+    );
+
+    let funder = Funder::attach(
+        zebrad.rpc_port,
+        &src.join("funder-datadir"),
+        field("source_ua")?,
+        field("pay_to_ua")?,
+        field("taddr")?,
+    )
+    .await
+    .context("attach the funder to the snapshot datadir")?;
+    funder
+        .sync(&zebrad)
+        .await
+        .context("funder sync after restore")?;
+    let spendable = funder.spendable_zats().await?;
+    anyhow::ensure!(
+        spendable > 0,
+        "the restored funder has no spendable balance (chain tip {tip}); the snapshot datadir is \
+         stale or was archived before its shielding confirmed"
+    );
+    eprintln!("restored funded chain from {} (tip {tip})", src.display());
     Ok((zebrad, funder))
 }
 
