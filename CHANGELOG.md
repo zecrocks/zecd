@@ -5,6 +5,27 @@ All notable changes to zecd are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com), and this
 project adheres to [Semantic Versioning](https://semver.org).
 
+## [0.7.0-rc3] - 2026-08-22
+
+One fix that matters to any wallet with a busy transparent address, plus new
+configuration for how change is split and a wider surface for callers driving
+zecd as a library or from scripts. Everything in `0.7.0-rc2` still applies,
+including the wallet data move, which migrates on first start.
+
+### Added
+- **`zecd chain-info`.** The chain tip was unreachable without a wallet: `config check` is deliberately offline and the daemon needs a wallet to start, so both "what height is the chain at?" and "can this deployment reach its backend?" meant creating one first. The new subcommand dials the configured upstream and reports its tip, chain name, branch id and any network upgrades this build does not recognize, with `--json` for callers and `--server` to try a candidate endpoint before committing it to a config file. It reports the same birthday `init` would record for a fresh wallet, computed by one shared function so the two cannot drift, and exits non-zero exactly when a wallet there would not sync. Read-only like `config check`: no datadir lock, no wallet database, no cookie file, so it is safe against a live deployment.
+- **`[keys] allow_multiple_spending_wallets`**, off by default and refused by the daemon. The single-spending-wallet rule exists because an RPC credential is spend authority for whichever wallet a request routes to, so two loaded spenders leave no single answer to which key a credential can spend. An embedded node has no RPC credentials, so the host application is the authorization boundary and names the wallet on every call. This option lets such an application manage several writable stores in one process; `zecd config check` reports it as an error for the binary, naming what it is for. When it is on, the loaded spenders are logged to the `zecd::audit` target.
+- **`[spend] min_split_output_value` and `[spend] target_note_count`**, both defaulting to the values that were previously hard-coded. The change-split floor applies to a wallet's balance rather than to a network, so a deployment built on small balances received one change note where it wanted several, and its sends then serialized on the confirmation depth instead of spending several notes in turn. Both are validated when the configuration loads; a `target_note_count` of zero was previously a panic waiting for the first send.
+- `waitforsync` reports the chain tip beside the scanned height, since the scanned height alone cannot express progress when what it is measured against is exactly the tip.
+- For embedders: chain queries that run before a wallet exists, so a birthday can be pinned without standing up a second chain client, over a caller-supplied transport such as a proxy; `init` now derives its own birthday through that same function so the two cannot diverge. The datadir-locked error is also downcastable rather than only recognizable by its message text, with the lock path exposed.
+- Insufficient-funds errors carry the available and required amounts as structured data for in-process callers, instead of only stating the shortfall in prose. The wire response is unchanged and a test pins that: Bitcoin Core's error object has exactly a code and a message, so the amounts never appear there. They are optional, because the change-strategy paths genuinely do not know them and reporting zero would be indistinguishable from a real zero.
+
+### Fixed
+- **A wallet holding many UTXOs on a reused transparent address re-downloaded its entire history on every spend-search pass.** The wallet asks the chain for transactions involving an address once per UTXO it still holds, which is how a spend authored elsewhere gets noticed, but the index answers each request with every transaction in the range rather than only unseen ones, and all of them were fetched and re-stored. Because that work runs on the wallet's single writer, it starved whatever was queued behind it: measured against an address paid in every block, a `sendtoaddress` waited 109 seconds to be told it had no spendable funds. Transactions already recorded as mined are now skipped. Anything known only from the mempool is still processed, so a confirmation still lands, and the check reads the wallet database, which a rewind truncates, so it stays correct across a reorg. This affects deposit and payout addresses in normal use, not only tests.
+
+### Changed
+- Regtest coverage only, with no effect on a running daemon: the merge end-to-end fixture is sized to the limit it exercises rather than several times past it, which cuts the standard tier's longest binary to roughly a fifth of its Orchard actions; the embedded end-to-end now completes a funded send through the library send seam rather than only exercising its failure path; and the reorg end-to-end forces its chain divergence explicitly instead of relying on a race in how the node restores blocks across a restart, which had made it fail intermittently.
+
 ## [0.7.0-rc2] - 2026-08-21
 
 Two operator-visible changes on top of `0.7.0-rc1`: wallet data moves into a
@@ -479,6 +500,7 @@ Zcash, backed entirely by librustzcash and running as a light client.
 ### Security
 - Pre-release audit hardening; refuse to start on mainnet with the placeholder RPC password; enforce a 12-character passphrase minimum.
 
+[0.7.0-rc3]: https://github.com/zecrocks/zecd/compare/v0.7.0-rc2...v0.7.0-rc3
 [0.7.0-rc2]: https://github.com/zecrocks/zecd/compare/v0.7.0-rc1...v0.7.0-rc2
 [0.7.0-rc1]: https://github.com/zecrocks/zecd/compare/v0.6.3...v0.7.0-rc1
 [0.6.3]: https://github.com/zecrocks/zecd/compare/v0.6.2...v0.6.3
