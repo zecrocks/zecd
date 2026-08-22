@@ -1017,6 +1017,31 @@ impl Funder {
             .map(|_| ())
     }
 
+    /// Pay many recipients in ONE `z_sendmany` (each `(address, zatoshis)`; addresses must be
+    /// distinct - z_sendmany rejects duplicate recipients). This is the cheap way to fragment a
+    /// wallet under test: fan-out proofs run on the funder, and the recipient's own notes are
+    /// never spent building the fixture (its selection can't cannibalize the fragments the way
+    /// self-send rounds do). Callers batching multiple rounds must confirm the funder's change
+    /// between rounds (mine + [`Funder::sync`]), and must stay under the funder's per-send
+    /// Orchard action cap (a released zecd's default is 50, so at most ~45 shielded outputs
+    /// per call once change splits are counted).
+    pub async fn send_many(&self, outputs: &[(String, u64)]) -> Result<()> {
+        let amounts: Vec<Value> = outputs
+            .iter()
+            .map(|(addr, zats)| json!({ "address": addr, "amount": zec_str(*zats) }))
+            .collect();
+        let opid = self
+            .call("z_sendmany", json!([self.source_ua, amounts]))
+            .await
+            .with_context(|| format!("funder z_sendmany with {} outputs", outputs.len()))?
+            .as_str()
+            .ok_or_else(|| anyhow!("z_sendmany did not return an opid"))?
+            .to_string();
+        self.await_opid(&opid, Duration::from_secs(600))
+            .await
+            .map(|_| ())
+    }
+
     /// Drive an async operation (`z_sendmany` / `z_shieldcoinbase`) to completion and return its
     /// `result` object, failing with the operation's own error so a funding failure names its cause
     /// rather than surfacing later as an unexplained zero balance. Polls the **destructive**
@@ -1490,6 +1515,11 @@ pub struct ZecdConfig {
     /// `[pools] transparent_gap_warn_threshold` - warn when fewer than this many in-window slots
     /// remain. `None` omits it (zecd defaults to 5). Only meaningful with `transparent = true`.
     pub transparent_gap_warn_threshold: Option<u32>,
+    /// `[health] readiness` - `Some("scanned")` etc. writes the mode explicitly, `None` omits it
+    /// (zecd defaults to `"synced"`). The transparent e2e runs under `"scanned"` to pin the
+    /// no-flap contract: `/readyz` must stay 200 through a send while the recurring transparent
+    /// spend-search backlog transiently rises.
+    pub readiness: Option<String>,
     /// When `Some`, the spending `default` wallet is created passphrase-encrypted
     /// (`zecd init --encrypt`, passphrase supplied via `ZECD_WALLET_PASSPHRASE`): it starts
     /// locked and needs `walletpassphrase` before sending. `None` = unencrypted (identity model).
@@ -1523,6 +1553,7 @@ impl ZecdConfig {
             transparent_initial_scan: None,
             transparent_allow_beyond_recovery_window: None,
             transparent_gap_warn_threshold: None,
+            readiness: None,
             encrypt_passphrase: None,
         }
     }
@@ -2511,7 +2542,7 @@ rebroadcast_secs = {rebroadcast}
 enabled = true
 bind = "127.0.0.1"
 port = {health_port}
-{spend_section}"#,
+{readiness}{spend_section}"#,
         datadir = datadir.display(),
         wallets = wallets,
         server = server,
@@ -2520,6 +2551,11 @@ port = {health_port}
         password = cfg.rpc_password,
         rebroadcast = cfg.rebroadcast_secs,
         health_port = cfg.health_port(),
+        readiness = cfg
+            .readiness
+            .as_ref()
+            .map(|m| format!("readiness = \"{m}\"\n"))
+            .unwrap_or_default(),
         spend_section = spend_section,
     );
     std::fs::write(datadir.join("zecd.toml"), toml)?;

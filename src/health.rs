@@ -45,6 +45,18 @@ fn wallet_ready(st: &SyncStatus, cfg: &HealthConfig) -> bool {
             // Until both heights are known the wallet hasn't demonstrably caught up.
             _ => false,
         },
+        // Synced minus the enhancement term: "scanned to tip, memos still landing". Balances and
+        // spendability come from the block scan and are current in this state; only history
+        // completeness lags, and `/status`'s `pending_enhancements` reports what is left. The
+        // strict mode's `pending_enhancements == 0` gate is right for a from-birthday restore
+        // (hours of backfill) but also fires in steady state: a wallet holding many transparent
+        // UTXOs re-emits its recurring spend-search requests on every send/tip advance, so the
+        // strict gate pulls a healthy node out of rotation after routine sends. This mode is the
+        // opt-out for deployments that can tolerate history trailing the tip briefly.
+        ReadinessMode::Scanned => match (st.chain_tip, st.fully_scanned) {
+            (Some(tip), Some(scanned)) => tip.saturating_sub(scanned) <= cfg.max_scan_lag,
+            _ => false,
+        },
         // Lenient: ready as soon as the backend is connected and its tip is past our birthday - a
         // cheap sanity check that we're talking to the right, live network. Does NOT wait for the
         // scan to finish, so RPC clients can reach zecd while it catches up, and readiness doesn't
@@ -301,6 +313,33 @@ mod tests {
         let mut drained = st(true, Some(100), Some(100));
         drained.pending_enhancements = 0;
         assert!(wallet_ready(&drained, &synced));
+    }
+
+    #[test]
+    fn scanned_mode_requires_the_height_gap_but_ignores_the_enhancement_backlog() {
+        let scanned = cfg(ReadinessMode::Scanned);
+
+        // The fleet report's shape: block scan at the tip, but a send just re-emitted the
+        // recurring transparent spend-search requests (five figures of them). The strict mode
+        // flaps not-ready here; this mode must stay ready - balances/spendability are current,
+        // only history completeness lags, and `/status` reports what is left to land.
+        let mut caught_up_but_enhancing = st(true, Some(4_293_139), Some(4_293_139));
+        caught_up_but_enhancing.pending_enhancements = 23_968;
+        assert!(wallet_ready(&caught_up_but_enhancing, &scanned));
+
+        // But it is NOT the lenient mode: the height gap still gates, so a from-birthday
+        // restore mid-scan stays not-ready exactly as in `synced`.
+        assert!(!wallet_ready(
+            &st(true, Some(4_080_983), Some(3_724_064)),
+            &scanned
+        ));
+        assert!(wallet_ready(&st(true, Some(100), Some(96)), &scanned));
+        assert!(!wallet_ready(&st(true, Some(100), Some(95)), &scanned));
+
+        // Disconnected, or heights unknown: never ready.
+        assert!(!wallet_ready(&st(false, Some(100), Some(100)), &scanned));
+        assert!(!wallet_ready(&st(true, None, Some(100)), &scanned));
+        assert!(!wallet_ready(&st(true, Some(100), None), &scanned));
     }
 
     #[test]

@@ -381,6 +381,34 @@ fn is_serviceable_request(req: &TransactionDataRequest) -> bool {
     )
 }
 
+/// Filter one `transaction_data_requests()` read down to the requests actually outstanding in
+/// this drain: serviceable ([`is_serviceable_request`]), not yet attempted (`satisfied`), and
+/// **deduplicated**, preserving first-occurrence order.
+///
+/// The dedup is load-bearing, not cosmetic. `zcash_client_sqlite`'s spend-search generation (the
+/// non-`spend-index` arm of `wallet/transparent.rs::transaction_data_requests`) joins the
+/// per-UTXO `transparent_spend_search_queue` to `transparent_received_outputs` on transaction id
+/// alone - unlike its `spend-index` arm, it never matches `output_index` - so a transaction with
+/// k unspent wallet outputs emits k identical requests per queue row, k^2 in total. On a reused
+/// address funded by fan-out transactions that turns tens of distinct requests into tens of
+/// thousands (field report: 842 UTXOs across 50 transactions -> a 23,968-request spike after one
+/// send, re-emitted on every tip advance). Undeduplicated, that both inflated
+/// `pending_enhancements` (flapping `/readyz` under `readiness = "synced"`) and made
+/// [`WalletActor::enhance_step`] service the same request repeatedly within one batch - the
+/// `enhance_satisfied` filter runs before the batch loop, so in-batch duplicates each cost a
+/// redundant upstream query. TODO(upstream): add the missing
+/// `tro.output_index = ssq.output_index` join predicate in librustzcash.
+fn outstanding_requests(
+    requests: Vec<TransactionDataRequest>,
+    satisfied: &std::collections::BTreeSet<TransactionDataRequest>,
+) -> Vec<TransactionDataRequest> {
+    let mut seen = std::collections::BTreeSet::new();
+    requests
+        .into_iter()
+        .filter(|r| is_serviceable_request(r) && !satisfied.contains(r) && seen.insert(r.clone()))
+        .collect()
+}
+
 /// The inclusive block range `(start, end)` to actually check when servicing a
 /// `TransactionsInvolvingAddress` request, given the request's `block_range_start` and the
 /// current chain tip - or `None` when there is nothing checkable yet.
@@ -2038,10 +2066,9 @@ impl WalletActor {
     /// error reports zero (best-effort; the count is observability, not a correctness gate).
     fn count_pending_enhancements(&self) -> u64 {
         match self.db_data.transaction_data_requests() {
-            Ok(reqs) => reqs
-                .iter()
-                .filter(|r| is_serviceable_request(r) && !self.enhance_satisfied.contains(r))
-                .count() as u64,
+            // Deduplicated (see `outstanding_requests`): the count is *distinct* outstanding
+            // requests, so upstream's duplicate spend-search rows can't inflate it five-fold.
+            Ok(reqs) => outstanding_requests(reqs, &self.enhance_satisfied).len() as u64,
             Err(e) => {
                 tracing::debug!("[{}] counting pending enhancements: {e}", self.name);
                 0
@@ -2128,15 +2155,14 @@ impl WalletActor {
                 return false;
             }
         };
-        // Serviceable requests not yet attempted in this drain. Inserting each into
+        // Serviceable requests not yet attempted in this drain, deduplicated (see
+        // `outstanding_requests` - without the dedup, upstream's duplicate spend-search rows are
+        // each serviced, one redundant upstream query apiece). Inserting each into
         // `enhance_satisfied` (whether it was removed from the DB on success or left in place
         // because the upstream couldn't satisfy it) guarantees forward progress: the unattempted
         // set strictly shrinks every call, so the drain terminates instead of re-fetching the same
         // front-of-queue requests forever.
-        let pending: Vec<TransactionDataRequest> = requests
-            .into_iter()
-            .filter(|r| is_serviceable_request(r) && !self.enhance_satisfied.contains(r))
-            .collect();
+        let pending = outstanding_requests(requests, &self.enhance_satisfied);
         if pending.is_empty() {
             self.enhance_progress = None;
         } else {
@@ -6763,6 +6789,167 @@ mod tests {
                 OutputStatusFilter::All,
             )),
             "the transparent address-index query drains, so it counts toward the backlog"
+        );
+    }
+
+    /// `outstanding_requests` deduplicates the raw `transaction_data_requests()` read and drops
+    /// already-attempted requests. Upstream's spend-search generation emits k identical
+    /// `TransactionsInvolvingAddress` requests for a transaction with k unspent wallet outputs
+    /// (its queue-to-outputs join never matches `output_index`), so without the dedup a reused
+    /// address inflates `pending_enhancements` quadratically - the "23,968 pending after one
+    /// send, `/readyz` flaps" field report - and `enhance_step` services the same request
+    /// repeatedly within one batch.
+    #[test]
+    fn outstanding_requests_dedup_and_satisfied_filter() {
+        use super::outstanding_requests;
+        use zcash_client_backend::data_api::TransactionDataRequest;
+        use zcash_protocol::TxId;
+
+        let a = TransactionDataRequest::Enhancement(TxId::from_bytes([1u8; 32]));
+        let b = TransactionDataRequest::GetStatus(TxId::from_bytes([2u8; 32]));
+        let c = TransactionDataRequest::Enhancement(TxId::from_bytes([3u8; 32]));
+
+        // The upstream shape: the same request repeated many times, interleaved with others.
+        let raw = vec![
+            a.clone(),
+            a.clone(),
+            b.clone(),
+            a.clone(),
+            c.clone(),
+            b.clone(),
+            a.clone(),
+        ];
+
+        // No satisfied set: duplicates collapse, first-occurrence order is preserved.
+        let out = outstanding_requests(raw.clone(), &std::collections::BTreeSet::new());
+        assert_eq!(out, vec![a.clone(), b.clone(), c.clone()]);
+
+        // Already-attempted requests are dropped entirely, duplicates included.
+        let satisfied = std::collections::BTreeSet::from([a.clone()]);
+        let out = outstanding_requests(raw, &satisfied);
+        assert_eq!(out, vec![b, c]);
+    }
+
+    /// Pin the upstream duplication that makes `outstanding_requests`' dedup load-bearing,
+    /// against a real wallet DB rather than a hand-built request list: storing one transaction
+    /// with k transparent outputs received by the wallet enqueues k spend-search rows, and
+    /// `zcash_client_sqlite`'s `transaction_data_requests` (its non-`spend-index` arm) joins
+    /// each row to every received output of the same transaction - it never matches
+    /// `output_index` - so the read returns k^2 `TransactionsInvolvingAddress` requests, k
+    /// identical ones per address. That is the request-set shape behind the field report's
+    /// 23,968-pending spike from 842 UTXOs (readiness flapping after every send).
+    ///
+    /// If the k^2 assertion starts failing with a *linear* count after a librustzcash bump, the
+    /// upstream join was fixed: update `outstanding_requests`' docs (the dedup itself stays
+    /// correct and cheap either way).
+    #[test]
+    fn upstream_spend_search_duplication_is_collapsed_by_outstanding_requests() {
+        use super::outstanding_requests;
+        use bip0039::{English, Mnemonic};
+        use secrecy::SecretVec;
+        use zcash_client_backend::data_api::chain::ChainState;
+        use zcash_client_backend::data_api::wallet::decrypt_and_store_transaction;
+        use zcash_client_backend::data_api::{
+            AccountBirthday, TransactionDataRequest, WalletRead, WalletWrite,
+        };
+        use zcash_primitives::block::BlockHash;
+        use zcash_primitives::transaction::{TransactionData, TxVersion};
+        use zcash_protocol::consensus::{BlockHeight, BranchId};
+        use zcash_protocol::value::Zatoshis;
+        use zcash_transparent::address::Script;
+        use zcash_transparent::bundle::{Authorized, Bundle, OutPoint, TxIn, TxOut};
+
+        const K: usize = 3;
+        const PHRASE: &str = "mechanic vehicle helmet decide plug gorilla frost dial october \
+             midnight culture idea mountain fame park social drip bid doctor scatter glance defy \
+             moment stage";
+
+        let dir = tempfile::tempdir().unwrap();
+        let net = crate::network::regtest();
+        let mut db = crate::wallet::open::init_dbs_with_gap_limit(net, dir.path(), Some(10))
+            .expect("init dbs");
+        let seed = SecretVec::new(
+            <Mnemonic<English>>::from_phrase(PHRASE)
+                .unwrap()
+                .to_seed("")
+                .to_vec(),
+        );
+        let birthday = AccountBirthday::from_parts(
+            ChainState::empty(BlockHeight::from_u32(0), BlockHash([0u8; 32])),
+            None,
+        );
+        let account = db
+            .create_account("primary", &seed, &birthday, None)
+            .expect("create account")
+            .0;
+        db.update_chain_tip(BlockHeight::from_u32(120))
+            .expect("set chain tip");
+
+        // K distinct wallet external t-addresses (the gap window pre-materializes their rows).
+        let receivers = db
+            .get_transparent_receivers(account, false, false)
+            .expect("external receivers");
+        let addrs: Vec<_> = receivers.keys().copied().take(K).collect();
+        assert_eq!(addrs.len(), K, "gap window must hold at least K addresses");
+
+        // One transaction paying all K addresses, stored the way the mempool/TIA/enhancement
+        // paths store full transactions - which is what enqueues spend detection per output.
+        let vout = addrs
+            .iter()
+            .map(|a| TxOut::new(Zatoshis::const_from_u64(10_000), a.script().into()))
+            .collect();
+        let vin = vec![TxIn::<Authorized>::from_parts(
+            OutPoint::new([9u8; 32], 0),
+            Script(zcash_script::script::Code(vec![])),
+            0xffff_ffff,
+        )];
+        let tx = TransactionData::from_parts(
+            TxVersion::V5,
+            BranchId::Nu5,
+            0,
+            BlockHeight::from_u32(0),
+            Some(Bundle {
+                vin,
+                vout,
+                authorization: Authorized,
+            }),
+            None,
+            None,
+            None,
+        )
+        .freeze()
+        .expect("freeze transparent-only tx");
+        decrypt_and_store_transaction(&net, &mut db, &tx, Some(BlockHeight::from_u32(100)))
+            .expect("store the funding tx");
+
+        // Advance the tip past whatever `max_observed_unspent_height` the store recorded - the
+        // same condition that regenerates the spend-search set on every live tip advance.
+        db.update_chain_tip(BlockHeight::from_u32(130))
+            .expect("advance chain tip");
+
+        // Count only the spend-search requests for the K paid addresses: the read also holds
+        // TransactionsInvolvingAddress rows for the ZIP-320 *ephemeral* address checks (one per
+        // ephemeral gap address), which are a different, non-duplicated population.
+        let reqs = db.transaction_data_requests().expect("read requests");
+        let ours: std::collections::BTreeSet<_> = addrs.iter().copied().collect();
+        let is_our_spend_search = |r: &TransactionDataRequest| match r {
+            TransactionDataRequest::TransactionsInvolvingAddress(a) => ours.contains(&a.address()),
+            _ => false,
+        };
+        let raw = reqs.iter().filter(|r| is_our_spend_search(r)).count();
+        assert_eq!(
+            raw,
+            K * K,
+            "upstream emits k^2 spend-search requests for a k-output tx (k identical per \
+             address); a linear count here means the upstream join was fixed - update \
+             outstanding_requests' docs"
+        );
+
+        let deduped = outstanding_requests(reqs, &std::collections::BTreeSet::new());
+        let distinct = deduped.iter().filter(|r| is_our_spend_search(r)).count();
+        assert_eq!(
+            distinct, K,
+            "outstanding_requests collapses the duplicates to one request per address"
         );
     }
 

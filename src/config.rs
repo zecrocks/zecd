@@ -195,10 +195,23 @@ impl Default for PoolsConfig {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReadinessMode {
     /// Ready only once the wallet has actually scanned to (near) the chain tip: connected and
-    /// within `max_scan_lag` blocks of the tip. Strict - a from-birthday restore stays "not
+    /// within `max_scan_lag` blocks of the tip, AND the transaction-enhancement backlog has
+    /// drained. Strict - a from-birthday restore stays "not
     /// ready" until it catches up. **This is the default**: a client must not see an empty or
     /// stale balance/history as authoritative while the wallet is still scanning.
     Synced,
+    /// Like [`ReadinessMode::Synced`] minus the enhancement-backlog term: connected and within
+    /// `max_scan_lag` blocks of the tip, whether or not transaction-data requests are still
+    /// pending. This is the "scanned to tip, memos still landing" state: balances and note
+    /// spendability are current (they come from the block scan), but history RPCs may still be
+    /// missing memos/full transaction data, with `/status`'s `pending_enhancements` reporting
+    /// how much is left to land. Exists because the backlog is not restore-only: on a wallet holding many
+    /// transparent UTXOs, every send (and tip advance) re-emits the recurring spend-search
+    /// requests, so gating on an empty backlog makes `/readyz` flap after routine sends -
+    /// pulling a healthy node out of rotation while every balance RPC was answering correctly.
+    /// Opt in (`readiness = "scanned"`) for deployments that route balance/send traffic and
+    /// can tolerate history trailing the tip briefly.
+    Scanned,
     /// Ready as soon as the backend is connected and its chain tip is past the wallet's birthday
     /// (a cheap sanity check that we're talking to the right, live network). Does NOT wait for
     /// the wallet to finish scanning, so RPC clients can reach zecd while it catches up - at the
@@ -211,6 +224,7 @@ impl ReadinessMode {
     pub fn as_str(self) -> &'static str {
         match self {
             ReadinessMode::Synced => "synced",
+            ReadinessMode::Scanned => "scanned",
             ReadinessMode::Connected => "connected",
         }
     }
@@ -218,9 +232,11 @@ impl ReadinessMode {
     fn parse(s: &str) -> anyhow::Result<Self> {
         match s {
             "synced" => Ok(ReadinessMode::Synced),
+            "scanned" => Ok(ReadinessMode::Scanned),
             "connected" => Ok(ReadinessMode::Connected),
             other => Err(anyhow::anyhow!(
-                "invalid [health] readiness {other:?}: expected \"synced\" or \"connected\""
+                "invalid [health] readiness {other:?}: expected \"synced\", \"scanned\" or \
+                 \"connected\""
             )),
         }
     }
@@ -2256,11 +2272,26 @@ mod tests {
         let cfg = AppConfig::resolve(&cli).unwrap();
         assert_eq!(cfg.health.readiness, ReadinessMode::Synced);
 
-        // ...and the lenient mode is still opt-in from the file.
+        // ...and the lenient modes are still opt-in from the file.
         std::fs::write(&conf, "[health]\nreadiness = \"connected\"\n").unwrap();
         let cli = Cli::parse_from(["zecd", "--conf", conf.to_str().unwrap()]);
         let cfg = AppConfig::resolve(&cli).unwrap();
         assert_eq!(cfg.health.readiness, ReadinessMode::Connected);
+
+        // The middle mode: scanned to tip without waiting on the enhancement backlog.
+        std::fs::write(&conf, "[health]\nreadiness = \"scanned\"\n").unwrap();
+        let cli = Cli::parse_from(["zecd", "--conf", conf.to_str().unwrap()]);
+        let cfg = AppConfig::resolve(&cli).unwrap();
+        assert_eq!(cfg.health.readiness, ReadinessMode::Scanned);
+
+        // An unknown mode is a config error naming the accepted values.
+        std::fs::write(&conf, "[health]\nreadiness = \"caught-up\"\n").unwrap();
+        let cli = Cli::parse_from(["zecd", "--conf", conf.to_str().unwrap()]);
+        let err = AppConfig::resolve(&cli).unwrap_err().to_string();
+        assert!(
+            err.contains("scanned"),
+            "error should list the modes: {err}"
+        );
     }
 
     #[test]
