@@ -11,9 +11,9 @@ The 0.6.4 line, released as `0.6.4-rc1`. Nothing changed between the candidate a
 this release; the candidate's section below is kept for history and everything in
 it applies here.
 
-Five fixes a running 0.6.3 daemon can hit, plus one opt-in readiness mode. No
-configuration key, response shape or error code moves and every default is
-unchanged, so upgrading from 0.6.3 is a drop-in.
+Five fixes, four of which a running 0.6.3 daemon can hit, plus one opt-in
+readiness mode. No configuration key, response shape or error code moves and
+every default is unchanged, so upgrading from 0.6.3 is a drop-in.
 
 The two that matter most to a busy deployment are both about reused transparent
 addresses: a spend-search that re-downloaded an address's whole history on every
@@ -23,7 +23,7 @@ was answering correctly.
 
 ## [0.6.4-rc1] - 2026-08-22
 
-Six fixes, five of which a running 0.6.3 daemon can hit, and one new opt-in
+Five fixes, four of which a running 0.6.3 daemon can hit, and one new opt-in
 readiness mode. Nothing here moves a configuration key, a response shape or an
 error code, and every default is unchanged, so upgrading from 0.6.3 is a
 drop-in.
