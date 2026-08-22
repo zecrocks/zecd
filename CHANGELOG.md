@@ -5,6 +5,22 @@ All notable changes to zecd are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com), and this
 project adheres to [Semantic Versioning](https://semver.org).
 
+## [0.7.0-rc5] - 2026-08-22
+
+One fix and one opt-in readiness mode, both for the same failure: a healthy node
+being pulled out of rotation after an ordinary send. Everything in `0.7.0-rc4`
+still applies, and every default is unchanged, so upgrading from it is a
+drop-in.
+
+### Added
+- **`[health] readiness = "scanned"`**, a third readiness mode between `"synced"` and `"connected"`: ready once connected and within `max_scan_lag` of the tip, without the strict mode's requirement that the transaction-enhancement backlog also be empty. Balances and note spendability come from the block scan and are current in this state; only history completeness lags, and `getwalletinfo.enhanced_through` bounds that precisely for a history consumer. It exists because the backlog is not restore-only, which is what the strict mode's design assumed: a wallet holding many transparent UTXOs re-emits its recurring spend-search requests on every send and every tip advance, so `/readyz` returned 503 for about a minute after one ordinary `sendtoaddress` and an orchestrator took a healthy node out of its service while every balance RPC was answering correctly. `"synced"` remains the default, so nothing changes for an existing deployment; `max_scan_lag` now applies to both strict modes.
+
+### Fixed
+- **The enhancement backlog counted duplicates, inflating `pending_enhancements` by orders of magnitude.** The upstream query that generates transparent spend-search requests joins the per-UTXO queue to received outputs on transaction id alone and never on output index, so a transaction with k unspent wallet outputs emits k identical requests per queue row, k^2 in total. A wallet holding 842 UTXOs across 50 transactions reported 23,968 requests pending after a single send. The count now reports distinct outstanding requests, and the drain no longer services the same request several times within one batch, where each repeat cost a redundant upstream query. This is what made the strict readiness gate above fire on a node that was working correctly, and it is pinned by a test that stores a k-output transaction and asserts both the upstream duplication and its collapse, so a future dependency bump that fixes the join upstream reports itself here.
+
+### Changed
+- Regtest coverage only, with no effect on a running daemon: the transparent end-to-end runs under the new readiness mode, fans out one transaction paying twelve wallet t-addresses to arm the quadratic request set, and holds `/readyz` to 200 on every sample while the tip advances.
+
 ## [0.7.0-rc4] - 2026-08-22
 
 Test-tier changes only. No first-party code change, no configuration or response
@@ -509,6 +525,7 @@ Zcash, backed entirely by librustzcash and running as a light client.
 ### Security
 - Pre-release audit hardening; refuse to start on mainnet with the placeholder RPC password; enforce a 12-character passphrase minimum.
 
+[0.7.0-rc5]: https://github.com/zecrocks/zecd/compare/v0.7.0-rc4...v0.7.0-rc5
 [0.7.0-rc4]: https://github.com/zecrocks/zecd/compare/v0.7.0-rc3...v0.7.0-rc4
 [0.7.0-rc3]: https://github.com/zecrocks/zecd/compare/v0.7.0-rc2...v0.7.0-rc3
 [0.7.0-rc2]: https://github.com/zecrocks/zecd/compare/v0.7.0-rc1...v0.7.0-rc2
