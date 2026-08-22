@@ -70,6 +70,11 @@ const BIRTHDAY: u32 = SEED_BLOCKS + 1;
 
 /// Coinbases mined to zecd before the maturity/aging phase (the deterministic assertion set).
 const ZECD_COINBASES: u64 = 8;
+/// How long the mature-coinbase `-6` refusal may take (step 8). It selects nothing and proves
+/// nothing, so anything beyond a few seconds means the request queued behind the actor rather
+/// than being served; 109s was the measured symptom of the spend-search re-fetch loop that
+/// `tx_already_recorded` closes. Generous on purpose - a starvation guard, not a latency SLO.
+const REFUSAL_MAX_LATENCY: Duration = Duration::from_secs(45);
 const SYNC_TIMEOUT: Duration = Duration::from_secs(240);
 const OP_TIMEOUT: Duration = Duration::from_secs(240);
 const SPEND_TIMEOUT: Duration = Duration::from_secs(240);
@@ -451,11 +456,26 @@ async fn regtest_transparent_coinbase_shield_and_spend() {
     // 8. Mature but still coinbase: the regular transparent spend path must refuse it -
     //    spending a transparent coinbase output with transparent outputs (recipient + change)
     //    is consensus-invalid on mainnet, so zecd's t→t selection excludes coinbase outright.
+    //    It must also refuse *promptly*. This send does no proving and selects nothing, so the
+    //    only thing that can make it slow is waiting for the single-writer actor - and that is a
+    //    real regression surface, not a hypothetical: servicing a recurring spend-search used to
+    //    re-download this address's entire history (it is paid in every block) on every pass,
+    //    and this exact call was measured taking 109 seconds to answer. The bound is deliberately
+    //    generous against a contended CI runner; it is here to catch an actor starved for
+    //    minutes, not to police seconds.
+    let refusal_started = Instant::now();
     let err = zecd
         .call("sendtoaddress", json!([SEED_MINER_ADDRESS, 0.5]))
         .await
         .expect_err("t->t send must never select coinbase UTXOs");
+    let refusal_took = refusal_started.elapsed();
     assert_eq!(err.code(), Some(-6), "expected -6, got {err}");
+    assert!(
+        refusal_took < REFUSAL_MAX_LATENCY,
+        "a send that selects nothing and proves nothing must fail fast, but the -6 took {:?} \
+         (limit {REFUSAL_MAX_LATENCY:?}); the actor is being starved - see tx_already_recorded",
+        refusal_took
+    );
     // The -6 is self-diagnosing: the wallet's whole spendable balance is mature coinbase, so
     // the error must say so and name the one path that can move it.
     assert!(
