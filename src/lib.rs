@@ -40,11 +40,26 @@
 //! - [`config::AppConfig::resolve_overrides`] + [`config::ConfigOverrides`] - resolve the
 //!   effective configuration without clap.
 //! - [`error::RpcError`] and [`error::codes`] - the Bitcoin Core error taxonomy `call`
-//!   returns.
+//!   returns. [`error::RpcError::details`] carries structured amounts for the errors that have
+//!   them - today [`error::InsufficientFunds`] on a `-6`, so a caller reads the shortfall and
+//!   the value awaiting confirmations as numbers instead of parsing the message. It is
+//!   in-process only: the wire error object stays exactly Bitcoin Core's `code` + `message`.
+//! - [`typed`] - one Rust method per RPC, on a wallet-bound [`typed::Client`] obtained from
+//!   [`node::Node::wallet`]. Every wrapper builds the same positional params a JSON caller
+//!   sends and rides through [`node::Node::call`], so the typed surface cannot drift from the
+//!   wire contract; response structs are `#[non_exhaustive]` and use exact-zatoshi amounts.
 //! - The CLI cores, one data-returning function per subcommand: [`init::init_wallet`],
 //!   [`init::rescan_wallet`], [`init::export_ufvk_string`], [`derive_address::derive`],
 //!   [`config_check::check`] (and [`config_check::inspect`]), [`config_show::render`],
-//!   [`example_config::EXAMPLE_CONFIG`], and [`server::auth::generate_rpcauth`].
+//!   [`chain_probe::probe`], [`example_config::EXAMPLE_CONFIG`], and
+//!   [`server::auth::generate_rpcauth`].
+//! - [`chain_probe::probe`] specifically, because it fills a gap the other two leave: it is the
+//!   only supported way to reach the chain *without* a wallet. [`config_check::check`] is
+//!   deliberately offline, and a node needs a wallet to start, so "is the backend reachable?"
+//!   and "what height is the chain at right now?" were unanswerable before
+//!   [`init::init_wallet`] had run. It reports [`init::fresh_wallet_birthday`] for the tip it
+//!   saw, so a caller pinning a birthday alongside a seed it generated itself records the same
+//!   height `init` would.
 //!
 //! Cargo features: `server` (the axum JSON-RPC + health servers) and `cli` (the clap
 //! surface, the printing subcommand shells, and `daemon::init_tracing`); both are default so
@@ -68,7 +83,12 @@
 //! directory laid out by an older zecd - librustzcash's databases move from a wallet
 //! directory's root into `<wallet>/zec/lrz/`, leaving `keys.toml` where it is (see
 //! [`migrate`]). Each file is renamed, it runs before any wallet is opened, and it is a no-op
-//! on a data directory this build created.
+//! on a data directory this build created. Two helpers there are supported for embedders that
+//! need to reason about the layout without starting a node: [`migrate::awaits_migration`]
+//! (whether a wallet directory still holds an old-layout database, so a host can warn or
+//! schedule the lock-taking start itself) and [`migrate::engine_dir_for_reading`] (the engine
+//! directory to read *without* migrating, which is how `export-ufvk` reads an un-migrated
+//! wallet in place).
 //!
 //! Every other public item exists because the binary and its tests are built from this crate;
 //! treat it as internal API with no stability promise across commits. Worth naming explicitly,
@@ -130,6 +150,7 @@ pub mod amount;
 pub mod backend;
 pub mod backoff;
 pub mod chain;
+pub mod chain_probe;
 pub mod coin;
 pub mod config;
 pub mod config_check;

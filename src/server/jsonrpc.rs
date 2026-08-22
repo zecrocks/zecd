@@ -209,6 +209,25 @@ mod tests {
         assert_eq!(built.id, Value::Null);
     }
 
+    /// `RpcError::details` is in-process only. Bitcoin Core's error object has exactly `code`
+    /// and `message`, so an error carrying details must serialize identically to one without -
+    /// otherwise the structured-amounts affordance would silently become a conformance break.
+    #[test]
+    fn error_details_never_reach_the_wire() {
+        use crate::error::{ErrorDetails, InsufficientFunds};
+
+        let plain = RpcError::insufficient_funds("Insufficient funds");
+        let detailed = RpcError::insufficient_funds("Insufficient funds").with_details(
+            ErrorDetails::InsufficientFunds(InsufficientFunds {
+                available: Some(1),
+                required: Some(2),
+                ..Default::default()
+            }),
+        );
+        let id = serde_json::json!(1);
+        assert_eq!(error(id.clone(), &plain), error(id, &detailed));
+    }
+
     #[test]
     fn envelopes_match_bitcoind_shape() {
         let ok = success(serde_json::json!(1), serde_json::json!("done"));

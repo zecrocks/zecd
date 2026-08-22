@@ -61,7 +61,7 @@ use crate::chain::{
     UnsupportedUpgrade,
 };
 use crate::config::SendPrivacy;
-use crate::error::{codes, RpcError};
+use crate::error::{codes, ErrorDetails, InsufficientFunds, RpcError};
 use crate::network::ZNetwork;
 use crate::pools::{Receiver, ReceiverSet};
 use crate::sync::engine;
@@ -4966,7 +4966,12 @@ impl WalletActor {
                         )
                     } else {
                         "Insufficient funds: 0 spendable transparent UTXOs".to_string()
-                    }));
+                    })
+                    .with_details(ErrorDetails::InsufficientFunds(InsufficientFunds {
+                        available: Some(0),
+                        mature_coinbase: coinbase,
+                        ..Default::default()
+                    })));
                 }
                 // Greedy: spend the largest UTXOs first to minimize the input count (and the fee).
                 utxos.sort_by_key(|u| std::cmp::Reverse(u.value()));
@@ -5005,7 +5010,16 @@ impl WalletActor {
                         if coinbase > 0 {
                             msg = format!("{msg}; {}", coinbase_hint(coinbase));
                         }
-                        RpcError::insufficient_funds(msg)
+                        // `required` stays unset: the selection that would have priced the fee
+                        // is the one that just failed, so only the recipient total is known and
+                        // reporting it as "required" would understate the real figure.
+                        RpcError::insufficient_funds(msg).with_details(
+                            ErrorDetails::InsufficientFunds(InsufficientFunds {
+                                available: Some(values.iter().sum()),
+                                mature_coinbase: coinbase,
+                                ..Default::default()
+                            }),
+                        )
                     })?;
                 utxos.truncate(n_selected);
                 let selected = utxos;
@@ -5186,6 +5200,13 @@ impl WalletActor {
                      (including fee)",
                     u64::from(*available),
                     u64::from(*required),
+                ))
+                .with_details(ErrorDetails::InsufficientFunds(
+                    InsufficientFunds {
+                        available: Some(u64::from(*available)),
+                        required: Some(u64::from(*required)),
+                        ..Default::default()
+                    },
                 )),
                 _ => {
                     let s = e.to_string();
@@ -6216,7 +6237,7 @@ async fn verify_server_network<C: ChainSource>(
 
 /// Classify a lightwalletd `chain_name` as mainnet (`Some(true)`), a test chain
 /// (`Some(false)`), or unrecognized (`None`).
-fn chain_name_is_main(chain_name: &str) -> Option<bool> {
+pub(crate) fn chain_name_is_main(chain_name: &str) -> Option<bool> {
     match chain_name {
         "main" => Some(true),
         "test" | "regtest" => Some(false),
@@ -6743,7 +6764,12 @@ fn classify_err(e: ProposalError) -> RpcError {
             "Insufficient funds: {} zatoshis spendable, {} required (including fee)",
             u64::from(*available),
             u64::from(*required),
-        )),
+        ))
+        .with_details(ErrorDetails::InsufficientFunds(InsufficientFunds {
+            available: Some(u64::from(*available)),
+            required: Some(u64::from(*required)),
+            ..Default::default()
+        })),
         // Insufficient-balance conditions can also surface from the change strategy
         // (e.g. `ChangeError::InsufficientFunds`); catch those by message.
         _ => {
@@ -6804,6 +6830,13 @@ fn enrich_insufficient_funds(
     if incoming == 0 && change == 0 && coinbase == 0 {
         return err;
     }
+    // Carry forward whatever the selector already reported, so enriching the message never
+    // costs a caller the shortfall numbers (`classify_err` attaches them; the message-sniffing
+    // and change-strategy paths have none to attach).
+    let (available, required) = match err.insufficient_funds_details() {
+        Some(d) => (d.available, d.required),
+        None => (None, None),
+    };
     let mut msg = err.message;
     if incoming > 0 || change > 0 {
         msg = format!(
@@ -6814,7 +6847,15 @@ fn enrich_insufficient_funds(
     if coinbase > 0 {
         msg = format!("{msg}; {}", coinbase_hint(coinbase));
     }
-    RpcError::insufficient_funds(msg)
+    RpcError::insufficient_funds(msg).with_details(ErrorDetails::InsufficientFunds(
+        InsufficientFunds {
+            available,
+            required,
+            pending_incoming: incoming,
+            pending_change: change,
+            mature_coinbase: coinbase,
+        },
+    ))
 }
 
 /// The mature-coinbase `-6` hint, worded identically everywhere it appears (the proposal-path
@@ -7895,6 +7936,27 @@ mod tests {
             out.message, bare.message,
             "no pending balance and no mature coinbase, so no enrichment"
         );
+    }
+
+    /// Enrichment rebuilds the error to append its hints, so the shortfall numbers the selector
+    /// reported have to be carried across that rebuild - a caller that reads `required` from the
+    /// details must not lose it just because the wallet also had pending value to mention.
+    #[test]
+    fn enrichment_preserves_the_selector_reported_amounts() {
+        use crate::error::{ErrorDetails, InsufficientFunds, RpcError};
+
+        let with_amounts = RpcError::insufficient_funds("Insufficient funds").with_details(
+            ErrorDetails::InsufficientFunds(InsufficientFunds {
+                available: Some(10),
+                required: Some(25),
+                ..Default::default()
+            }),
+        );
+        let carried = match with_amounts.insufficient_funds_details() {
+            Some(d) => (d.available, d.required),
+            None => panic!("details were attached"),
+        };
+        assert_eq!(carried, (Some(10), Some(25)));
     }
 
     /// The mature-coinbase hint must name the value and the one actionable next step - the

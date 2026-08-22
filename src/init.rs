@@ -28,6 +28,22 @@ use crate::wallet::keys;
 use crate::wallet::open;
 use crate::wallet::store::{Passphrase, WalletStore};
 
+/// How far below the chain tip a *freshly generated* wallet's birthday is placed.
+///
+/// A new wallet has no history, so the tip itself would do - the margin absorbs a short reorg
+/// between reading the tip and recording the birthday, which would otherwise strand the wallet
+/// anchored to a block that no longer exists.
+pub const FRESH_WALLET_BIRTHDAY_MARGIN: u32 = 100;
+
+/// The birthday `init` records for a freshly generated wallet at a given chain tip.
+///
+/// Exposed so a caller that needs the height *before* creating the wallet - pinning a birthday
+/// alongside a seed it generated itself, say - gets the number `init` would actually use rather
+/// than re-deriving the policy. [`crate::chain_probe`] reports it for exactly that reason.
+pub fn fresh_wallet_birthday(chain_tip: u32) -> u32 {
+    chain_tip.saturating_sub(FRESH_WALLET_BIRTHDAY_MARGIN)
+}
+
 /// The default account birthday when `--birthday` is omitted for a restore/import: the
 /// activation height of the earliest *enabled* shielded pool, with a human label. An
 /// Orchard-only wallet (the default) can hold no notes before NU5 (Orchard activation), so it
@@ -447,7 +463,7 @@ pub async fn init_wallet(config: &AppConfig, opts: InitOptions) -> anyhow::Resul
             );
             height
         } else {
-            chain_tip.saturating_sub(100)
+            fresh_wallet_birthday(chain_tip)
         }
     }));
     let birthday = {

@@ -1723,3 +1723,75 @@ fn derive_address_follows_the_config_file_and_can_bypass_it() {
         stdout_lines(&from_config)
     );
 }
+
+/// `chain-info` dials the upstream, so an endpoint with nothing behind it must fail fast and
+/// say so - and, like `config check` and `derive-address`, it must leave the data directory
+/// untouched: no lock file, no cookie, no wallet database. That last part is what makes it
+/// safe to run against a live deployment, and what lets a caller ask for the tip *before* any
+/// wallet exists.
+#[test]
+fn chain_info_fails_on_an_unreachable_upstream_and_writes_nothing() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let out = run_with_timeout(
+        {
+            let mut c = zecd();
+            c.arg("--datadir")
+                .arg(dir.path())
+                .arg("--regtest")
+                .arg("chain-info")
+                // Port 9 (discard) is not listening in CI; this never leaves the loopback.
+                .arg("--server")
+                .arg("zebra://127.0.0.1:9")
+                .env("RUST_BACKTRACE", "0");
+            c
+        },
+        Duration::from_secs(30),
+    );
+    assert!(
+        !out.status.success(),
+        "an unreachable upstream must exit non-zero"
+    );
+    let stderr = stderr_of(&out);
+    assert!(
+        stderr.to_lowercase().contains("connect"),
+        "the failure should name the connection, got: {stderr}"
+    );
+
+    let left_behind: Vec<_> = std::fs::read_dir(dir.path())
+        .expect("reading datadir")
+        .map(|e| e.expect("entry").file_name())
+        .collect();
+    assert!(
+        left_behind.is_empty(),
+        "chain-info must not write to the datadir, found: {left_behind:?}"
+    );
+}
+
+/// Global flags parse on either side of the subcommand (every top-level flag is
+/// `global = true`), so a caller can write them in whichever order they think of them.
+#[test]
+fn chain_info_accepts_global_flags_on_either_side() {
+    for args in [
+        vec!["--regtest", "chain-info", "--server", "zebra://127.0.0.1:9"],
+        vec!["chain-info", "--server", "zebra://127.0.0.1:9", "--regtest"],
+    ] {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let out = run_with_timeout(
+            {
+                let mut c = zecd();
+                c.arg("--datadir")
+                    .arg(dir.path())
+                    .args(&args)
+                    .env("RUST_BACKTRACE", "0");
+                c
+            },
+            Duration::from_secs(30),
+        );
+        // Both spellings must reach the dial and fail there - not fail to parse.
+        let stderr = stderr_of(&out);
+        assert!(
+            stderr.to_lowercase().contains("connect"),
+            "args {args:?} should have reached the dial, got: {stderr}"
+        );
+    }
+}

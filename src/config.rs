@@ -1128,8 +1128,25 @@ pub enum Command {
     /// rescans the chain from the wallet birthday, re-deriving all funds and history. Refuses
     /// to run while the daemon holds the data directory.
     Rescan(RescanArgs),
+    /// Dial the configured upstream and report its chain tip, then exit. Needs no wallet, so
+    /// it answers "can this deployment reach its backend?" and "what birthday should a wallet
+    /// created now get?" before `zecd init` has run.
+    ChainInfo(ChainInfoArgs),
     /// Run the JSON-RPC daemon (default).
     Run,
+}
+
+#[cfg(feature = "cli")]
+#[derive(Debug, clap::Args)]
+pub struct ChainInfoArgs {
+    /// Probe this endpoint instead of `[backend] server`, using the same token grammar, to
+    /// test a candidate before committing it to a configuration file.
+    #[arg(long, value_name = "TOKEN")]
+    pub server: Option<String>,
+
+    /// Emit a JSON object instead of the human-readable summary.
+    #[arg(long)]
+    pub json: bool,
 }
 
 #[cfg(feature = "cli")]

@@ -57,11 +57,51 @@ pub fn http_status_for_code(code: i32) -> u16 {
     }
 }
 
-/// A Bitcoin-Core-style RPC error carrying a numeric `code` and human `message`.
+/// The amounts behind an insufficient-funds (`-6`) error, in zatoshis.
+///
+/// `available` and `required` are `None` when the failure did not come from the selector's own
+/// shortfall report - a change-strategy failure, or one recognized only by its message - because
+/// reporting `0` there would be indistinguishable from a genuine zero.
+#[derive(Debug, Clone, Default)]
+#[non_exhaustive]
+pub struct InsufficientFunds {
+    /// Value the input selector could actually spend.
+    pub available: Option<u64>,
+    /// Value the send needed, fee included.
+    pub required: Option<u64>,
+    /// Received value not yet spendable, awaiting confirmations.
+    pub pending_incoming: u64,
+    /// Own change not yet spendable, awaiting confirmations.
+    pub pending_change: u64,
+    /// Mature transparent coinbase: counted by `getbalance`, but spendable only through
+    /// `z_shieldcoinbase`, so it is never available to an ordinary send.
+    pub mature_coinbase: u64,
+}
+
+/// Structured detail attached to selected [`RpcError`]s.
+///
+/// This never reaches the wire. [`crate::server::jsonrpc`] builds the response object from
+/// `code` and `message` alone, because Bitcoin Core's error object has exactly those two keys
+/// and matching it is a hard requirement. The detail exists so an in-process caller can act on
+/// the numbers the message states in prose without parsing English - the same reasoning as the
+/// other library-only affordances on the crate root.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
+pub enum ErrorDetails {
+    /// Accompanies [`codes::RPC_WALLET_INSUFFICIENT_FUNDS`].
+    InsufficientFunds(InsufficientFunds),
+}
+
+/// A Bitcoin-Core-style RPC error carrying a numeric `code` and human `message`.
+///
+/// `details` is in-process only and always `None` for an error that crossed the wire; see
+/// [`ErrorDetails`].
+#[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct RpcError {
     pub code: i32,
     pub message: String,
+    pub details: Option<ErrorDetails>,
 }
 
 impl RpcError {
@@ -69,6 +109,21 @@ impl RpcError {
         RpcError {
             code,
             message: message.into(),
+            details: None,
+        }
+    }
+
+    /// Attach structured [`ErrorDetails`] to this error, replacing any already present.
+    pub fn with_details(mut self, details: ErrorDetails) -> Self {
+        self.details = Some(details);
+        self
+    }
+
+    /// The insufficient-funds amounts, when this is a `-6` carrying them.
+    pub fn insufficient_funds_details(&self) -> Option<&InsufficientFunds> {
+        match &self.details {
+            Some(ErrorDetails::InsufficientFunds(d)) => Some(d),
+            _ => None,
         }
     }
 
