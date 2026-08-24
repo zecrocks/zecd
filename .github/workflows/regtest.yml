@@ -111,12 +111,16 @@ env:
   # check`, which is what makes `assert_funder_config_check_passes` (regtest-harness/src/lib.rs)
   # stop warn-and-skipping and start really asserting that the pinned release accepts the config
   # `write_funder_toml` writes for it - the enforcer behind that function's only-long-stable-keys
-  # rule. Resolve a new digest with:
+  # rule. 0.7.0 is the first release that nests librustzcash's files at <wallet>/zec/lrz/ and
+  # migrates an existing flat wallet directory into it on first start, so a funder datadir this
+  # pin builds is in the new layout; the chain-snapshot cache key below already includes this
+  # image, so bumping the pin rebuilds the archive rather than restoring one the funder would
+  # have to migrate. Resolve a new digest with:
   #   TOKEN=$(curl -sL "https://ghcr.io/token?scope=repository:zecrocks/zecd:pull&service=ghcr.io" | jq -r .token)
   #   curl -sI -H "Authorization: Bearer $TOKEN" \
   #     -H "Accept: application/vnd.oci.image.index.v1+json" \
   #     https://ghcr.io/v2/zecrocks/zecd/manifests/<tag> | grep -i docker-content-digest
-  ZECD_FUNDER_IMAGE: ${{ inputs.funder-image || 'ghcr.io/zecrocks/zecd@sha256:05676366531195f58a6e882ae5b190a53a70560fce89a92b3e798af3a8acdbe3' }}  # 0.6.3
+  ZECD_FUNDER_IMAGE: ${{ inputs.funder-image || 'ghcr.io/zecrocks/zecd@sha256:4d4c854749f1e9ef6f2a5a56f3c67cae12cccf0da0966326679be95d0c36c708' }}  # 0.7.0
   # lightwalletd, built from source at this release tag. Needed only where the *zecd under test* is
   # a light client - the `zecd-lwd` suite and the dedicated regtest_lwd e2e - since the funder now
   # talks straight to the node. 0.5.0 is the first release serving the versioned lightwallet
