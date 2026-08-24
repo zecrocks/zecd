@@ -5,6 +5,37 @@ All notable changes to zecd are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com), and this
 project adheres to [Semantic Versioning](https://semver.org).
 
+## [0.7.0] - 2026-08-23
+
+The 0.7.0 line, released as `0.7.0-rc1` through `0.7.0-rc5`. Everything below is relative to
+0.6.3; the release-candidate sections that follow are kept for history. Two changes land here
+that were in no candidate, marked *New since rc5* below.
+
+A feature release. Three things a 0.6.3 wallet could not do arrive together: sweep its own
+fragmented balance back into one note, be driven from Rust without a socket in between, and
+emit logs a machine can query. Alongside them are per-wallet backends, an offline chain probe,
+new configuration for how change is split, and fixes for history ordering, memo reporting and a
+spend-search path that could stall sends on a busy transparent address.
+
+Two things to read before deploying. **Wallet data moves** into a per-coin subdirectory and
+migrates itself on first start, under the datadir lock; a failure there is fatal by design
+rather than a silent rebuild, so take the usual backup first. And if you run 0.6.4, its five
+fixes and its readiness mode are all here, so this is an upgrade rather than a change of line.
+
+Every configuration key and response shape from 0.6.3 still resolves as it did, and every new
+option defaults to the previous behaviour.
+
+### Added
+- **`zecd licenses`.** zecd links every dependency statically, so those crates' license texts travel inside the shipped binary, and most of the licenses in the tree require the text and copyright notice to be reproduced when they do. A generated `THIRD-PARTY-LICENSES.txt` covering 372 crates now ships in the release tarball, in the Debian package, and in both container images under `/usr/share/doc/zecd/`. The images are built `FROM scratch` and have no shell, so the same text is embedded in the binary and printed by this subcommand, which is the one place the notices are readable wherever zecd runs. *New since rc5.*
+- **`z_mergetoaddress`**, **the library surface** (`node::NodeBuilder` and `Node`, the CLI cores, and the `server`/`cli` default features), **structured logging** with `rpc` and `wallet` spans and a stable `zecd::audit` target, **per-wallet `[backend]` overrides**, **`zecd chain-info`**, **`[spend] min_split_output_value` and `[spend] target_note_count`**, **`[keys] allow_multiple_spending_wallets`** for embedders, **`[rpc] allow_duplicate_shielded_recipients`**, **`[health] readiness = "scanned"`**, `getwalletinfo.pending_enhancements` and `enhanced_through`, `gettransaction.details[].pool`, and a chain tip on `waitforsync`. Each is described in the candidate section that introduced it.
+
+### Changed
+- **Wallet data is nested as `<wallet>/<coin>/<engine>`.** `data.sqlite`, `blockmeta.sqlite` and `blocks/` move to `<dir>/zec/lrz/`, while `keys.toml` stays at the wallet root. Existing wallets migrate on first start with no configuration change; see the `0.7.0-rc2` section for what the migration guarantees.
+- Regtest coverage only, with no effect on a running daemon: both node legs now run the full end-to-end list, including every binary that needs a funded chain and the coinbase suite, which were previously scoped to one of them for reasons that stopped applying when the test funder changed. Measured head to head, the two legs finish within thirteen seconds of each other and run in parallel, so the wider coverage costs no wall-clock. *New since rc5.*
+
+### Fixed
+- **A wallet holding many UTXOs on a reused transparent address re-downloaded its entire history on every spend-search pass**, starving sends queued behind it. Also fixed: history paging that could repeat or skip a transaction across a same-height tie, a non-UTF-8 memo disappearing from `gettransaction` entirely, an enhancement backlog that counted duplicates and could hold `/readyz` at 503 after an ordinary send, and a Windows build failure on an ungated Unix call. All five are also in 0.6.4.
+
 ## [0.7.0-rc5] - 2026-08-22
 
 One fix and one opt-in readiness mode, both for the same failure: a healthy node
@@ -562,6 +593,7 @@ Zcash, backed entirely by librustzcash and running as a light client.
 ### Security
 - Pre-release audit hardening; refuse to start on mainnet with the placeholder RPC password; enforce a 12-character passphrase minimum.
 
+[0.7.0]: https://github.com/zecrocks/zecd/compare/v0.6.3...v0.7.0
 [0.7.0-rc5]: https://github.com/zecrocks/zecd/compare/v0.7.0-rc4...v0.7.0-rc5
 [0.7.0-rc4]: https://github.com/zecrocks/zecd/compare/v0.7.0-rc3...v0.7.0-rc4
 [0.7.0-rc3]: https://github.com/zecrocks/zecd/compare/v0.7.0-rc2...v0.7.0-rc3
