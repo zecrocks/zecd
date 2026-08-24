@@ -1,0 +1,23 @@
+zecd - Third-party licenses
+===========================
+
+zecd is distributed as a statically linked binary. This file reproduces the
+license texts and copyright notices of every third-party crate compiled into it,
+as required by those licenses. The set errs on the side of inclusion: build-time
+and test-only dependencies, which are not part of the shipped binary, are covered
+here too. zecd's own code is dual-licensed under MIT or Apache-2.0 (see
+LICENSE-MIT and LICENSE-APACHE). Generated with cargo-about; see
+scripts/generate-licenses.sh.
+{{#each licenses}}
+
+================================================================================
+{{{name}}}
+================================================================================
+
+Used by:
+{{#each used_by}}
+  - {{{crate.name}}} {{{crate.version}}}
+{{/each}}
+
+{{{text}}}
+{{/each}}

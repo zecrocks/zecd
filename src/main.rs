@@ -33,6 +33,13 @@ async fn main() -> anyhow::Result<()> {
         return zecd::example_config::run(args);
     }
 
+    // `licenses` prints text embedded at compile time. Like the two above it needs no config,
+    // datadir or wallet - and the container images are `FROM scratch`, so this is the only way
+    // to read the notices from inside one.
+    if let Some(Command::Licenses) = &cli.command {
+        return zecd::licenses::run();
+    }
+
     // The `config` subcommands report on the configuration - including one `resolve` rejects,
     // which is the case `check` exists for - so they must run *before* `resolve`, and without
     // tracing (their output is the command's product; log lines would interleave with it).

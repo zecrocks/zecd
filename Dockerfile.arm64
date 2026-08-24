@@ -83,6 +83,8 @@ COPY --from=builder /usr/local/bin/zecd /zecd
 # --- runtime (bare scratch, matching the StageX image) ---
 FROM scratch AS runtime
 COPY --from=export /zecd /usr/local/bin/zecd
+# License texts - zecd is statically linked, so the third-party notices ship with it.
+COPY LICENSE-MIT LICENSE-APACHE THIRD-PARTY-LICENSES.txt /usr/share/doc/zecd/
 # CA bundle so native TLS roots can validate public lightwalletd endpoints (e.g. zec.rocks).
 # Comes from the digest-pinned base image (Alpine ships ca-certificates-bundle in the base),
 # so no extra apk pin is needed and the bundle is as reproducible as the base itself.

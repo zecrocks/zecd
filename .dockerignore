@@ -10,3 +10,10 @@
 !vendor
 # `example-config` embeds this with include_str!, so the build needs it in the context.
 !zecd.example.toml
+# License texts shipped in the runtime image (zecd is statically linked, so the
+# third-party notices must travel with the binary). THIRD-PARTY-LICENSES.txt is also a
+# *build* input: src/licenses.rs embeds it with include_str! for `zecd licenses`, so
+# dropping it from this allowlist breaks the compile, not just the runtime COPY.
+!LICENSE-MIT
+!LICENSE-APACHE
+!THIRD-PARTY-LICENSES.txt

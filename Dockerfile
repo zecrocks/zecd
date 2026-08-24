@@ -85,6 +85,8 @@ COPY --from=builder /usr/local/cargo/bin/zecd /zecd
 # --- Stage 3: Minimal runtime with stagex ---
 FROM scratch AS runtime
 COPY --from=export /zecd /usr/local/bin/zecd
+# License texts - zecd is statically linked, so the third-party notices ship with it.
+COPY LICENSE-MIT LICENSE-APACHE THIRD-PARTY-LICENSES.txt /usr/share/doc/zecd/
 # CA bundle so native TLS roots can validate public lightwalletd endpoints (e.g. zec.rocks).
 COPY --from=ca-certificates /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
 ENV SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt

@@ -1,0 +1,42 @@
+# cargo-about configuration for generating THIRD-PARTY-LICENSES.txt.
+#
+# zecd is a statically linked binary, so every dependency's license text travels
+# in the shipped artifact. `scripts/generate-licenses.sh` runs `cargo about generate`
+# against this config + about.hbs to produce the committed THIRD-PARTY-LICENSES.txt
+# (CI verifies it is current). Keep the `accepted` set in lockstep with deny.toml's
+# `[licenses] allow` list - both describe the same permissive-only dependency tree.
+
+# Only consider the dependencies that actually ship in the binary: the release targets
+# below (cargo-about unions them), with the feature set the release artifacts are built
+# with - the default features (`server` + `cli`) plus `mimalloc-secure`, which the static
+# musl images opt into. `scripts/generate-licenses.sh` passes that feature set on the
+# command line; keep the two in step if the release build ever changes features.
+targets = [
+    "x86_64-unknown-linux-musl",
+    "x86_64-unknown-linux-gnu",
+    "aarch64-unknown-linux-gnu",
+]
+
+# Workspace-internal crates carry no third-party text.
+private = { ignore = true }
+
+# cargo-about's defaults cover build- and dev-dependencies as well as the ones linked into
+# the binary, and that is left alone deliberately: over-attribution is harmless, whereas
+# trimming the graph risks dropping a crate that does ship. about.hbs says as much in the
+# generated file's header.
+
+# Permissive licenses present in the dependency tree (mirrors deny.toml).
+accepted = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "BSL-1.0",
+    "CC0-1.0",
+    "ISC",
+    "Unicode-3.0",
+    "Unlicense",
+    "Zlib",
+    "CDLA-Permissive-2.0",
+]

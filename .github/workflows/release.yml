@@ -105,7 +105,7 @@ jobs:
           VERSION="${{ needs.setup.outputs.version }}"
           STAGE="zecd-${VERSION}-linux-${{ matrix.arch }}"
           install -D -m 0755 out/zecd "$STAGE/zecd"
-          cp README.md CHANGELOG.md LICENSE-MIT LICENSE-APACHE zecd.example.toml "$STAGE/"
+          cp README.md CHANGELOG.md LICENSE-MIT LICENSE-APACHE THIRD-PARTY-LICENSES.txt zecd.example.toml "$STAGE/"
           # Reproducible tar: stable order, fixed mtime, root owner; gzip -n drops the
           # embedded name/timestamp.
           tar --sort=name --owner=0 --group=0 --numeric-owner \

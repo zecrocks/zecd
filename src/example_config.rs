@@ -49,13 +49,15 @@ fn output_path(args: &ExampleConfigArgs) -> Option<&Path> {
     }
 }
 
-/// Write the config to stdout via the locked handle.
+/// Write `text` to stdout via the locked handle.
 ///
-/// Not `print!`: the payload is ~12 KiB, so `zecd example-config | head` closes the pipe
-/// mid-write, and the `println!`/`print!` macros *panic* on `EPIPE` rather than returning it.
-/// A broken pipe here means the reader stopped caring, which is a clean exit, not an error.
+/// Not `print!`: the payload is ~12 KiB (and ~290 KiB for `zecd licenses`, which shares this),
+/// so `zecd example-config | head` closes the pipe mid-write, and the `println!`/`print!`
+/// macros *panic* on `EPIPE` rather than returning it. A broken pipe here means the reader
+/// stopped caring, which is a clean exit, not an error. Shared with `crate::licenses` so that
+/// gotcha has one implementation rather than a copy that can rot.
 #[cfg(feature = "cli")]
-fn write_stdout(text: &str) -> anyhow::Result<()> {
+pub(crate) fn write_stdout(text: &str) -> anyhow::Result<()> {
     let mut out = std::io::stdout().lock();
     match out.write_all(text.as_bytes()).and_then(|()| out.flush()) {
         Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => Ok(()),

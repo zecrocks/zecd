@@ -1,0 +1,4 @@
+# THIRD-PARTY-LICENSES.txt is generated (scripts/generate-licenses.sh) and 6k+ lines of
+# upstream license text, so collapse it in diffs and keep it out of language stats. Every
+# dependency bump regenerates it; the review interest is the crate list, which CI checks.
+THIRD-PARTY-LICENSES.txt linguist-generated=true

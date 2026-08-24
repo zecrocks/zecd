@@ -38,6 +38,8 @@ chmod 0755 "$STAGE"   # mktemp -d is 0700; the package root (./) should be world
 install -D -m 0755 "$BINARY_PATH"                       "$STAGE/usr/bin/zecd"
 install -D -m 0644 "$REPO_ROOT/zecd.example.toml"       "$STAGE/usr/share/doc/zecd/zecd.example.toml"
 install -D -m 0644 "$REPO_ROOT/README.md"               "$STAGE/usr/share/doc/zecd/README.md"
+# Third-party license bundle - zecd is statically linked, so these notices ship with it.
+install -D -m 0644 "$REPO_ROOT/THIRD-PARTY-LICENSES.txt" "$STAGE/usr/share/doc/zecd/THIRD-PARTY-LICENSES.txt"
 
 # systemd unit (installed, not enabled - the admin opts in with `systemctl enable zecd`).
 install -D -m 0644 /dev/stdin "$STAGE/lib/systemd/system/zecd.service" <<'UNIT'
@@ -78,7 +80,9 @@ Copyright: The zecd authors
 License: MIT or Apache-2.0
  zecd is dual-licensed under the MIT and Apache-2.0 licenses. The full texts are
  distributed with the source at https://github.com/zecrocks/zecd
- (LICENSE-MIT and LICENSE-APACHE).
+ (LICENSE-MIT and LICENSE-APACHE). The licenses of the third-party crates compiled
+ into the statically linked binary are reproduced in
+ /usr/share/doc/zecd/THIRD-PARTY-LICENSES.txt.
 COPYRIGHT
 
 # Debian changelog (gzip -n keeps it timestamp/name free for reproducibility).

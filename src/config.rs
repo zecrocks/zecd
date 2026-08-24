@@ -1184,6 +1184,9 @@ pub enum Command {
     /// Print the annotated example configuration file to stdout (or `--output-file`), then
     /// exit. Redirect it to `<datadir>/zecd.toml` and edit to taste.
     ExampleConfig(ExampleConfigArgs),
+    /// Print the license texts of the third-party crates compiled into this binary to
+    /// stdout, then exit. The same text the packaging ships as `THIRD-PARTY-LICENSES.txt`.
+    Licenses,
     /// Inspect the configuration (`zecd config check`), then exit.
     #[command(subcommand)]
     Config(ConfigCommand),

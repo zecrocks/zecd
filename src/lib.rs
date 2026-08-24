@@ -51,8 +51,8 @@
 //! - The CLI cores, one data-returning function per subcommand: [`init::init_wallet`],
 //!   [`init::rescan_wallet`], [`init::export_ufvk_string`], [`derive_address::derive`],
 //!   [`config_check::check`] (and [`config_check::inspect`]), [`config_show::render`],
-//!   [`chain_probe::probe`], [`example_config::EXAMPLE_CONFIG`], and
-//!   [`server::auth::generate_rpcauth`].
+//!   [`chain_probe::probe`], [`example_config::EXAMPLE_CONFIG`],
+//!   [`licenses::THIRD_PARTY_LICENSES`], and [`server::auth::generate_rpcauth`].
 //! - [`chain_probe::account_birthday`] and [`chain_probe::tip_status`] - the two chain queries
 //!   that have to happen *before* the wallet they are for exists, so no [`node::Node`] method
 //!   can serve them: a birthday must be chosen before `create_account` runs, and a node needs
@@ -178,6 +178,7 @@ pub mod hardening;
 #[cfg(feature = "server")]
 pub mod health;
 pub mod init;
+pub mod licenses;
 pub mod lock;
 pub mod migrate;
 pub mod network;

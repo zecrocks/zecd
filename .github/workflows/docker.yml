@@ -16,6 +16,9 @@ on:
       - Dockerfile
       - Dockerfile.arm64
       - .dockerignore
+      # the license texts the runtime stage COPYs into /usr/share/doc/zecd
+      - THIRD-PARTY-LICENSES.txt
+      - LICENSE-*
       - Cargo.toml
       - Cargo.lock
       - rust-toolchain.toml
@@ -28,6 +31,9 @@ on:
       - Dockerfile
       - Dockerfile.arm64
       - .dockerignore
+      # the license texts the runtime stage COPYs into /usr/share/doc/zecd
+      - THIRD-PARTY-LICENSES.txt
+      - LICENSE-*
       - Cargo.toml
       - Cargo.lock
       - rust-toolchain.toml

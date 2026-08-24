@@ -20,6 +20,12 @@ fn zecd() -> Command {
 /// Run to completion, killing the child if it is still alive after `timeout` - a
 /// startup-failure path that regresses into a running daemon should fail the test,
 /// not hang CI.
+///
+/// Both pipes are drained by reader threads *while* the child runs, rather than collected
+/// after it exits: a child writing more than the pipe buffer (~64 KiB) otherwise blocks in
+/// `write` forever, and the deadline above turns that into "did not exit within 10s" - a
+/// timeout that looks like a hung daemon but is really this harness holding the pipe shut.
+/// `zecd licenses` emits ~290 KiB and hit exactly that.
 fn run_with_timeout(mut cmd: Command, timeout: Duration) -> Output {
     let mut child = cmd
         .stdout(Stdio::piped())
@@ -27,17 +33,40 @@ fn run_with_timeout(mut cmd: Command, timeout: Duration) -> Output {
         .stdin(Stdio::null())
         .spawn()
         .expect("spawning zecd");
+    let mut out_pipe = child.stdout.take().expect("piped stdout");
+    let mut err_pipe = child.stderr.take().expect("piped stderr");
+    let readers = (
+        std::thread::spawn(move || {
+            let mut buf = Vec::new();
+            std::io::Read::read_to_end(&mut out_pipe, &mut buf).expect("reading stdout");
+            buf
+        }),
+        std::thread::spawn(move || {
+            let mut buf = Vec::new();
+            std::io::Read::read_to_end(&mut err_pipe, &mut buf).expect("reading stderr");
+            buf
+        }),
+    );
     let deadline = Instant::now() + timeout;
-    loop {
+    let status = loop {
         match child.try_wait().expect("polling zecd") {
-            Some(_) => return child.wait_with_output().expect("collecting output"),
+            Some(status) => break status,
             None if Instant::now() >= deadline => {
+                // Killing the child closes its ends of both pipes, so the readers see EOF and
+                // the joins below cannot hang.
                 child.kill().ok();
                 child.wait().ok();
+                readers.0.join().ok();
+                readers.1.join().ok();
                 panic!("zecd did not exit within {timeout:?}; expected a fast failure");
             }
             None => std::thread::sleep(Duration::from_millis(50)),
         }
+    };
+    Output {
+        status,
+        stdout: readers.0.join().expect("stdout reader"),
+        stderr: readers.1.join().expect("stderr reader"),
     }
 }
 
@@ -718,6 +747,93 @@ fn help_lists_example_config_subcommand() {
     assert!(
         stdout.contains("example-config"),
         "help should list example-config: {stdout}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// licenses
+// ---------------------------------------------------------------------------
+
+/// stdout is byte-for-byte the shipped `THIRD-PARTY-LICENSES.txt`, so the notices a user reads
+/// out of the binary and the file the packaging installs can never disagree. This is the
+/// binary-side half of that guarantee (the file-side half is CI's `licenses` job, which keeps
+/// the bundle current with the dependency tree).
+#[test]
+fn licenses_prints_the_shipped_bundle_to_stdout() {
+    let out = run_with_timeout(
+        {
+            let mut c = zecd();
+            c.arg("licenses");
+            c
+        },
+        Duration::from_secs(10),
+    );
+    let stderr = stderr_of(&out);
+    assert!(out.status.success(), "stderr: {stderr}");
+    let stdout = String::from_utf8(out.stdout).expect("utf-8 licenses");
+    assert_eq!(
+        stdout,
+        zecd::licenses::THIRD_PARTY_LICENSES,
+        "stdout must be exactly the shipped license bundle"
+    );
+    assert!(
+        stderr.is_empty(),
+        "nothing but the notices on stdout, and nothing at all on stderr: {stderr}"
+    );
+}
+
+/// The command exists so the notices are readable wherever the binary is - including a
+/// `FROM scratch` container with no config, no datadir and no shell. This is the regression
+/// guard for dispatching it before `AppConfig::resolve`: a config `resolve` *rejects* must
+/// still not stop it, and the run must leave the datadir untouched.
+#[test]
+fn licenses_works_without_a_usable_config_and_writes_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("zecd.toml"), "[rpc]\nbogus_field = 1\n").unwrap();
+    let out = run_with_timeout(
+        {
+            let mut c = zecd();
+            c.args(["--datadir", dir.path().to_str().unwrap(), "licenses"]);
+            c
+        },
+        Duration::from_secs(10),
+    );
+    assert!(
+        out.status.success(),
+        "a broken config must not block reading the notices; stderr: {}",
+        stderr_of(&out)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        zecd::licenses::THIRD_PARTY_LICENSES
+    );
+
+    let entries: Vec<_> = std::fs::read_dir(dir.path())
+        .unwrap()
+        .map(|e| e.unwrap().file_name())
+        .collect();
+    assert_eq!(
+        entries.len(),
+        1,
+        "only the zecd.toml we wrote: {entries:?} - no lock file, no wallet, no cookie"
+    );
+}
+
+#[test]
+fn help_lists_licenses_subcommand() {
+    let out = run_with_timeout(
+        {
+            let mut c = zecd();
+            c.arg("--help");
+            c
+        },
+        Duration::from_secs(10),
+    );
+    assert!(out.status.success());
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("licenses"),
+        "help should list licenses: {stdout}"
     );
 }
 
