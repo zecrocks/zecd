@@ -285,7 +285,8 @@ and full transaction data), not just during the block scan.
   "paytxfee": 0.00000000,
   "private_keys_enabled": true,
   "avoid_reuse": false,
-  "scanning": { "duration": 0, "progress": 0.9731 },
+  "scanning": { "duration": 0, "progress": 0.9731, "pending_enhancements": 84 },
+  "enhanced_through": 2912916,
   "descriptors": false,
   "unlocked_until": 1751629200
 }
@@ -303,6 +304,23 @@ and full transaction data), not just during the block scan.
   wallet; the wallet-level cannot-sign signal, as with Core's `disable_private_keys` wallets.
 - `scanning`: an object (`duration` always `0`, `progress` the block-scan ratio in [0,1])
   while scanning or while the enhancement backlog is nonzero; `false` when idle.
+- `scanning.pending_enhancements` (extension, 0.7.0): distinct outstanding transaction-data
+  requests. `progress` is a [0,1] block-scan ratio and cannot express this open-ended work, and
+  until 0.7.0 the count existed only on the health server's `/status`, which is unreachable for
+  a `default-features = false` [embedder](../library.md) and for anyone driving zecd purely over
+  JSON-RPC. `progress` holds at `1.0` through the drain.
+- `enhanced_through` (extension, 0.7.0): the height below which history is complete. It is the
+  difference between "scanned to the tip" and "serving complete history", since a scanned but
+  un-enhanced output still has a null memo.
+
+  It is **top-level rather than inside `scanning`** deliberately: that object is Core's, and it
+  is the literal `false` once the wallet is idle, which is exactly the moment a consumer
+  following wallet history as a log is ready to advance its cursor, and therefore exactly when
+  it needs this. Nesting it there would make the field unreachable at the only time it matters.
+
+  `null` means "not currently determinable", which a consumer must read as **hold the cursor**,
+  never as "everything is enhanced". [`waitforsync`](blockchain.md#waitforsync) blocks until the
+  backlog is empty and returns the same fields.
 - `descriptors`: always `false`.
 - `unlocked_until`: present only for passphrase-encrypted wallets; the unix time the wallet
   auto-relocks, or `0` while locked. Absent on unencrypted and watch-only wallets.
@@ -335,8 +353,8 @@ and full transaction data), not just during the block scan.
 Core master has dropped the `balance`/`unconfirmed_balance`/`immature_balance`/`paytxfee`
 fields from this method (balances live on `getbalances`); zecd still emits them, in the
 older Core shape. zecd omits Core's `external_signer`, `blank`, `birthtime`, `flags`, and
-`lastprocessedblock` (the latter appears on zecd's `getbalances`). The `transparent` block
-is an addition.
+`lastprocessedblock` (the latter appears on zecd's `getbalances`). The `transparent` block,
+`enhanced_through`, and `scanning.pending_enhancements` are additions.
 
 **vs zcashd**: zcashd's `getwalletinfo` keeps the old pre-0.19 Core shape plus its own
 split (`balance` is transparent-only, with a separate `shielded_balance`), a real key pool

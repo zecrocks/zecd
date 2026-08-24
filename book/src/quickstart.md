@@ -55,8 +55,23 @@ Always use `--release`: a debug build takes more than 20 seconds to prove a sing
 send. The same applies to `cargo install`, which builds in release mode by default.
 
 **Release candidates are opt-in.** `cargo install zecd` resolves to the newest *stable* release,
-so a pre-release has to be asked for by name (`cargo install zecd --version 0.6.0-rc3`). The
-same holds for a dependency: a `zecd = "0.6"` requirement will not pick up a `-rc`.
+so a pre-release has to be asked for by name (`cargo install zecd --version 0.7.0-rc5`). The
+same holds for a dependency: a `zecd = "0.7"` requirement will not pick up a `-rc`.
+
+## Check the node is reachable
+
+Before creating anything, confirm zecd can reach the node and agrees with it about which chain
+this is:
+
+```sh
+./target/release/zecd --testnet chain-info
+```
+
+It prints the upstream's tip, the chain name, and the birthday a wallet created now would get,
+and **exits non-zero exactly when a wallet created here would not sync**: wrong chain, or a
+consensus upgrade already active that this build does not know. It opens no wallet and writes
+nothing, so it is also the right probe against a live deployment later. See
+[Probing the chain without a wallet](configuration.md#probing-the-chain-without-a-wallet).
 
 ## Initialize a wallet
 
@@ -77,8 +92,10 @@ This generates three things:
   is the only way to recover the wallet: shielded funds are unconditionally recoverable from
   it on any librustzcash wallet; the on-disk data directory is a rebuildable cache
   (see [Stateless & recoverable](design/statelessness.md)).
-- **The wallet account** in `<datadir>/default/data.sqlite`, plus `keys.toml` holding the
-  age-encrypted mnemonic.
+- **The wallet account** in `<datadir>/default/zec/lrz/data.sqlite`, plus `keys.toml` at
+  `<datadir>/default/` holding the age-encrypted mnemonic. (Wallets created before 0.7.0 kept
+  the database flat beside `keys.toml` and are moved into place automatically on first start;
+  see [wallet data layout](guide/operations.md#wallet-data-layout).)
 
 Variants (see [Key custody](security/key-custody.md) for the trade-offs):
 

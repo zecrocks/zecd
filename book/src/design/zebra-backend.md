@@ -195,6 +195,35 @@ The token decides the mode:
 | `http://host:port` | light | Any lightwalletd, no TLS. Refused toward a public host unless `allow_remote_cleartext`. |
 | `host:port` | light | TLS decided by locality: plaintext toward loopback/private, TLS toward public. |
 
+### One upstream per wallet
+
+*New in 0.7.0.* `[backend]` used to be daemon-global, so every wallet in a process dialled the
+same upstream. A wallet's own `[wallets.<name>]` section can now override the keys that describe
+**which upstream it dials** and the TLS trust that authenticates it: `server`, `tls`,
+`tls_roots`, `tls_ca_file`, `tls_pinned_sha256`, `tls_insecure_skip_verify`, and
+`assume_transparent_in_compact_blocks`.
+
+Fallback is field by field, so a wallet overriding only `server` keeps every global TLS setting.
+
+```toml
+[backend]
+server = "zebra"                    # the deployment default
+
+[wallets.hot]                       # spending wallet: local node
+
+[wallets.replica]                   # watch-only replica of the same seed, light upstream
+server = "zecrocks"
+```
+
+Deployment policy stays global on purpose: timeouts, reconnect backoff, the cleartext-locality
+rules, and the `[zebra]` credentials are properties of the deployment rather than of one
+endpoint. Existing configurations resolve exactly as they did before.
+
+Note what this does *not* dilute. A light upstream is still a third party inside your trust
+boundary, and pointing one wallet at it puts that wallet's queries in front of it. The
+recommendation above is unchanged; this only lets one daemon hold wallets that made different
+calls on it.
+
 ### TLS
 
 `tls` forces (`"yes"`) or disables (`"no"`) it; the default `"auto"` uses the locality heuristic

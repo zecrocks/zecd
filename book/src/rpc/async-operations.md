@@ -1,19 +1,19 @@
 # Async operations
 
-Reference for `z_sendmany`, `z_shieldcoinbase`, and the operation-tracking trio
-`z_getoperationstatus` / `z_getoperationresult` / `z_listoperationids`. These five methods
+Reference for `z_sendmany`, `z_shieldcoinbase`, `z_mergetoaddress`, and the operation-tracking
+trio `z_getoperationstatus` / `z_getoperationresult` / `z_listoperationids`. These six methods
 adopt zcashd's asynchronous send model: they match zcashd's syntax, status shapes, and
 state strings, so clients written for zcashd's `z_sendmany` work unchanged. For synchronous
 sends in Bitcoin Core's dialect, see [Sending](sending.md).
 
-A sixth method, [`z_waitforoperation`](#z_waitforoperation), is a **zecd extension** with no
+A seventh method, [`z_waitforoperation`](#z_waitforoperation), is a **zecd extension** with no
 zcashd counterpart: it blocks until one operation finishes, so a client does not have to
 write a poll-sleep loop.
 
 ## The operation model
 
-`z_sendmany` and `z_shieldcoinbase` validate their arguments, then return an operation id
-(`opid-` followed by a UUID, identical to zcashd) immediately. The transaction is selected,
+`z_sendmany`, `z_shieldcoinbase` and `z_mergetoaddress` validate their arguments, then return
+an operation id (`opid-` followed by a UUID, identical to zcashd) immediately. The transaction is selected,
 proved, and broadcast on a background task; its outcome is fetched later through the tracking
 methods.
 The background task still funnels through the wallet's single-writer actor, so an async send
@@ -50,7 +50,7 @@ Properties of the registry:
     themselves already broadcast).
   - At most **16** *unfinished* (queued + executing) operations per wallet. An in-flight
     operation owns a real pending send and cannot be evicted, so past this cap new
-    `z_sendmany` calls are rejected with `-4` back-pressure until some finish. Finished
+    async-send calls are rejected with `-4` back-pressure until some finish. Finished
     operations never count toward this cap, so forgetting to reap never blocks new sends.
 
   zcashd has neither cap. Sends serialize on the wallet actor regardless, so 16 in flight is
@@ -287,6 +287,135 @@ curl -u u:p -d '{
 }' http://127.0.0.1:8232/
 ```
 
+## z_mergetoaddress
+
+```
+z_mergetoaddress ["fromaddress", ...] "toaddress" ( fee ) ( transparent_limit ) ( shielded_limit ) ( "memo" ) ( privacyPolicy )
+```
+
+New in 0.7.0. The consolidation sweep: merge many UTXOs, or many notes, into **one** output at
+`toaddress`, paying `inputs - fee`. There is no amount argument and no change in any pool.
+
+A wallet that has received many small payments accumulates a long tail of UTXOs and notes.
+Nothing else in zecd gathers them up: the ordinary send methods select inputs to cover an
+amount you name, which is the opposite operation. This is zcashd's answer, with its signature
+and its response shape.
+
+The selection counts return **synchronously**, so the `merging*` and `remaining*` numbers are
+fixed before the call returns. Proving and broadcast run under the returned opid, exactly as
+with [`z_sendmany`](#z_sendmany) and [`z_shieldcoinbase`](#z_shieldcoinbase).
+
+**One source class per call.** Sources are either transparent or shielded, never both:
+
+| `fromaddresses` entry | Selects |
+|---|---|
+| `"ANY_TADDR"` | Every non-coinbase transparent UTXO the wallet holds. |
+| an own t-address | That address's non-coinbase UTXOs. Several may be listed. |
+| `"ANY_SAPLING"` | The account's Sapling notes. |
+| `"ANY_ORCHARD"` | The account's Orchard **and Ironwood** notes. A zecd extension: zcashd's wildcard set predates Orchard, and post-NU6.3 an Orchard receiver holds Ironwood notes, so one wildcard spans the family. |
+| an own shielded or unified address | The **account's** notes across every pool it can hold. Notes are account-scoped, so per-address shielded coin control does not exist here, exactly as with `z_sendmany`'s `fromaddress`. |
+
+Mixing a transparent and a shielded source in one call is `-8`. **This is the one documented
+divergence from zcashd**, whose t+z merge predates zecd's one-source-per-send model; two calls
+achieve the same consolidation. `ANY_TADDR` together with individual t-addresses is also `-8`,
+as is a shielded wildcard together with an individual shielded address, and so is a duplicated
+entry. `"ANY_SPROUT"` is `-8`: there is no Sprout support at all.
+
+Transparent **coinbase** is never selected. It cannot be: consensus forbids a transaction
+spending transparent coinbase from having any transparent output, so sweeping it is
+[`z_shieldcoinbase`](#z_shieldcoinbase)'s job alone.
+
+**Privacy is the existing ladder, unchanged.** See [Privacy policy](../design/privacy.md):
+
+- a transparent source needs `AllowRevealedSenders`;
+- a fully transparent merge (transparent inputs paying a transparent destination) needs
+  `AllowFullyTransparent`;
+- paying a transparent destination out of shielded notes needs `AllowRevealedRecipients`.
+
+**Call it repeatedly.** The per-call limits are real, and the `remaining*` fields say what a
+follow-up would pick up. A large wallet consolidates over several calls, waiting for each
+operation to finish before starting the next (sends serialize per wallet regardless).
+
+**Parameters**
+
+| # | Name | Type | Default | Description |
+|---|------|------|---------|-------------|
+| 1 | fromaddresses | array of string | required | Non-empty; see the source table above. A missing argument is `-1`; a non-array is `-8`. |
+| 2 | toaddress | string | required | Any address, own or foreign, transparent or shielded. A [TEX](../guide/addresses.md) destination is `-8`: paying one is a two-transaction ZIP-320 proposal, and zecd rejects multi-transaction proposals everywhere. |
+| 3 | fee | null | null | Must be omitted or `null`. Fees are ZIP-317, computed by the wallet; any explicit value is `-8`. |
+| 4 | transparent_limit | number | 50 | Maximum UTXOs to merge. `0` means as many as fit under the block-space cap. Accepted and ignored for a shielded source, as in zcashd. |
+| 5 | shielded_limit | number | 200 | Maximum notes to merge. `0` means no caller limit by count; Orchard-family selections are additionally clamped by [`[spend] orchard_action_limit`](../configuration.md#spend). Accepted and ignored for a transparent source. |
+| 6 | memo | string (hex) | omitted | ZIP-302 memo on the output. Shielded destinations only; with a transparent `toaddress` it is `-8`. |
+| 7 | privacyPolicy | string | wallet policy | Per-call override of `[spend] privacy_policy`, same names as [`z_sendmany`](#z_sendmany). |
+
+**Result**
+
+```json
+{
+  "remainingUTXOs": 12,
+  "remainingTransparentValue": 3.75000000,
+  "remainingNotes": 0,
+  "remainingShieldedValue": 0.00000000,
+  "mergingUTXOs": 50,
+  "mergingTransparentValue": 15.62500000,
+  "mergingNotes": 0,
+  "mergingShieldedValue": 0.00000000,
+  "opid": "opid-9c2f0d61-1c2b-4f3e-9a3e-2d4b8c7a5e10"
+}
+```
+
+- `merging*`: what this operation is sweeping, fixed at call time.
+- `remaining*`: what the limits or the block-space cap left behind. Non-zero means call again
+  once this operation finishes.
+- `opid`: feed it to `z_getoperationstatus` / `z_getoperationresult`.
+
+The pair that does not match your source class is reported as zero, not omitted.
+
+**Errors** (synchronous)
+
+| Code | When |
+|------|------|
+| -1 | `fromaddresses` or `toaddress` missing |
+| -3 | `memo` is not a string |
+| -4 | The wallet already has 16 unfinished operations |
+| -5 | A `fromaddresses` entry is undecodable, for the wrong network, or not this wallet's |
+| -6 | Nothing to merge, or insufficient value to cover the fee |
+| -8 | Empty or non-array `fromaddresses`; a duplicated entry; mixed source classes; `ANY_TADDR` with explicit t-addresses; a shielded wildcard with an explicit shielded address; `ANY_SPROUT`; an unparseable or TEX `toaddress`; an explicit `fee`; a negative or non-integer limit; a memo with a transparent destination or over 512 bytes; a privacy policy that forbids the shape, or an unknown one |
+| -13 | The wallet is locked |
+
+Note the split: an undecodable `fromaddresses` entry is `-5`, while an undecodable `toaddress`
+is `-8` (`unknown address format`). That asymmetry is zcashd's, and zecd reproduces it.
+
+Only argument validation and the selection fail synchronously; proving and broadcast failures
+surface in the operation's `error` object.
+
+**vs Bitcoin Core**: no equivalent.
+
+**vs zcashd**: same signature, same response shape, same opid model. Three differences. zecd
+refuses to mix transparent and shielded sources in one call (see above). An explicit numeric
+`fee` is `-8` rather than being applied. And `ANY_ORCHARD` is an addition, covering the
+Orchard and Ironwood notes zcashd's wildcard set has no name for.
+
+**Example**
+
+Sweep up to 50 transparent UTXOs into a shielded address, then check what is left:
+
+```sh
+curl -u u:p -d '{
+  "jsonrpc": "1.0", "id": 1, "method": "z_mergetoaddress",
+  "params": [["ANY_TADDR"], "u1abc...", null, 0, null, "", "AllowRevealedSenders"]
+}' http://127.0.0.1:8232/
+```
+
+Consolidate the account's shielded notes into a single note at one of its own addresses:
+
+```sh
+curl -u u:p -d '{
+  "jsonrpc": "1.0", "id": 1, "method": "z_mergetoaddress",
+  "params": [["ANY_ORCHARD"], "u1own..."]
+}' http://127.0.0.1:8232/
+```
+
 ## z_getoperationstatus
 
 ```
@@ -344,8 +473,8 @@ Non-destructive: operations stay in memory.
 **vs Bitcoin Core**: no equivalent.
 
 **vs zcashd**: same shape and sort order. zcashd's view is node-wide and includes its other
-async operation types (`z_mergetoaddress`, the Sapling migration); zecd only ever has
-`z_sendmany` and `z_shieldcoinbase` operations, scoped to the routed wallet. zcashd silently
+async operation types (the Sapling migration among them); zecd only ever has `z_sendmany`,
+`z_shieldcoinbase` and `z_mergetoaddress` operations, scoped to the routed wallet. zcashd silently
 ignores a malformed opid string; zecd rejects it with `-8`. zcashd reports `execution_secs` as
 a fractional number; zecd reports whole seconds.
 

@@ -19,7 +19,8 @@ no dump/import cycle on migration.
 
 ## The wallet database is a cache
 
-The on-disk state is the librustzcash wallet DB (`data.sqlite`). Every row in it is derivable:
+The on-disk state is the librustzcash wallet DB (`data.sqlite`, at `<wallet>/zec/lrz/` since
+0.7.0). Every row in it is derivable:
 
 - **Balances, notes, and transparent UTXOs** are rebuilt by re-scanning the chain: note
   trial-decryption with the account's viewing key for shielded funds, the block-scan

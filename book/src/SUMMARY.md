@@ -30,6 +30,10 @@
 - [Network](rpc/network.md)
 - [Utility & control](rpc/util-control.md)
 
+# Embedding
+
+- [Using zecd as a library](library.md)
+
 # Design
 
 - [Architecture](design/architecture.md)

@@ -1,6 +1,7 @@
 # Method index: zecd vs bitcoind vs zcashd
 
-Every RPC method zecd dispatches (50 methods, the `ALL_METHODS` table in `src/rpc/mod.rs`),
+Every RPC method zecd dispatches (52 methods as of 0.7.0, the `ALL_METHODS` table in
+`src/rpc/mod.rs`),
 compared against Bitcoin Core master and zcashd. Each method name links to its full reference
 entry.
 
@@ -40,6 +41,7 @@ is covered in [Conventions & wire format](index.md).
 | [waitfornewblock](blockchain.md#waitfornewblock-waitforblock-waitforblockheight) | ✓ | ✓ | Blocks until the **fully-scanned** height advances; timeout in ms, `0` = indefinite; timing out is not an error |
 | [waitforblock](blockchain.md#waitfornewblock-waitforblock-waitforblockheight) | ✓ | ✓ | Blocks until the named hash is the scanned tip |
 | [waitforblockheight](blockchain.md#waitfornewblock-waitforblock-waitforblockheight) | ✓ | ✓ | Blocks until the scanned height reaches N; the correct "has the wallet caught up?" primitive |
+| [waitforsync](blockchain.md#waitforsync) | n/a | n/a | **zecd extension** (0.7.0). Blocks until the scan *and* the enhancement backlog are done; reports `chain_tip`, `pending_enhancements` and `enhanced_through`; timing out is not an error |
 | **Utility** | | | |
 | [validateaddress](util-control.md#validateaddress) | ✓ | same name, differs (transparent-only; shielded via `z_validateaddress`) | Validates every Zcash address kind; adds `isvalid_orchard` and `receiver_types` extension fields |
 | [settxfee](util-control.md#settxfee) | *removed* | same name, differs (functional in zcashd) | Always `-8`: fees are ZIP-317, never client-settable |
@@ -74,6 +76,7 @@ is covered in [Conventions & wire format](index.md).
 | **Async operations** | | | |
 | [z_sendmany](async-operations.md#z_sendmany) | n/a | ✓ | Async: returns an opid, proves/broadcasts in the background; `fromaddress` selects the funding source and must be the wallet's own (or `ANY_TADDR`); explicit `fee` answers `-8` |
 | [z_shieldcoinbase](async-operations.md#z_shieldcoinbase) | n/a | ✓ | Async: sweeps mature transparent coinbase into one shielded output, no change in any pool; `toaddress` must have a shielded receiver; explicit `fee` answers `-8`; nothing mature to shield answers `-6` |
+| [z_mergetoaddress](async-operations.md#z_mergetoaddress) | n/a | ✓ | Async (0.7.0): consolidates many UTXOs *or* many notes into one output, no amount argument and no change; one source class per call, so a mixed t+z merge is `-8`; adds an `ANY_ORCHARD` wildcard; explicit `fee` answers `-8` |
 | [z_getoperationstatus](async-operations.md#z_getoperationstatus) | n/a | ✓ | Non-destructive status objects; wallet-scoped |
 | [z_waitforoperation](async-operations.md#z_waitforoperation) | n/a | n/a | **zecd extension.** Blocks until one operation finishes; adds a `finished` flag; timeout in seconds (default 120, clamped to 3600); non-destructive |
 | [z_getoperationresult](async-operations.md#z_getoperationresult) | n/a | ✓ | Finished operations only; destructive one-shot reap, matching zcashd |
@@ -113,4 +116,5 @@ These answer method-not-found (`-32601`), the same as any unknown method.
 `help <method>` ignores its argument and returns a static one-line blurb naming only a few
 methods. bitcoind lists every command and returns per-method usage for `help <method>`, so
 tooling that introspects via `help` gets nothing useful from zecd today. Use this index and
-the per-category reference pages instead.
+the per-category reference pages instead. (The blurb ends by pointing at the README for the
+full list, which is now a stub that points here; treat this index as the list it means.)

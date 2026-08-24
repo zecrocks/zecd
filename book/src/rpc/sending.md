@@ -46,6 +46,20 @@ Insufficient funds: 0 zatoshis spendable, 10001000 required (including fee);
 awaiting confirmations: 0 zatoshis incoming, 49990000 zatoshis change
 ```
 
+**Change is split into several notes.** A send leaves up to `[spend] target_note_count` change
+notes (default 4) rather than one, so the *next* send has several notes to spend in turn instead
+of serializing on one note's confirmation depth. The split only happens above
+`[spend] min_split_output_value` (default 0.1 ZEC), since splitting a small balance into dust
+helps nobody. Both were hard-coded before 0.7.0 and are now configurable; the defaults are the
+old hard-coded values, so nothing changes unless you set them. A deployment built on small
+balances is the case that wants the floor lowered: below it, one change note comes back, and
+back-to-back sends then hit the `-6` above.
+
+**Consolidating the other direction.** Many small notes and UTXOs accumulate on a wallet that
+receives a lot of payments, and no send method gathers them up, because they all select inputs
+to cover an amount you name. [`z_mergetoaddress`](async-operations.md#z_mergetoaddress),
+new in 0.7.0, is the sweep that does.
+
 **Coinbase inputs are never selected here.** Consensus forbids a transaction that spends a
 transparent coinbase output from having any transparent output, change included, so the
 transparent-to-transparent path (which always writes transparent outputs) skips coinbase

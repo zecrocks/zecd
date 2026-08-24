@@ -321,6 +321,7 @@ raw `hex`.
       "category": "send",
       "amount": -0.50000000,
       "vout": 0,
+      "pool": "ironwood",
       "label": "",
       "abandoned": false,
       "fee": -0.00015000
@@ -346,6 +347,12 @@ raw `hex`.
 - `details` has one entry per non-change output and category, with the `listtransactions`
   entry shape minus the per-transaction fields (`confirmations`, `txid`, times), which sit at
   the top level. `memo`/`memoStr` appear per detail entry.
+- `details[].pool` (extension, 0.7.0): `"transparent"`, `"sapling"`, `"orchard"` or
+  `"ironwood"`. `vout` is the output index **within its own pool's bundle**, not a transparent
+  outpoint index, so on a transaction with outputs in more than one pool `(txid, vout)` does not
+  identify an output. `(txid, pool, vout)` does, which is the key a consumer following
+  [`listsinceblock`](#listsinceblock) as an incremental cursor reaches for. History entries
+  already carried `pool`; this brings `details` into line with them.
 - `hex` is the stored raw transaction when the wallet has it (wallet-authored sends, and
   receives stored via the mempool stream or the enhancement pass). For a transaction the
   wallet only ever saw as a compact block, the bytes are fetched on demand from the chain
@@ -360,7 +367,7 @@ raw `hex`.
 
 **vs Bitcoin Core:** same top-level shape; omits `wtxid`, `parent_descs`, `generated`,
 `comment`, and (since `verbose` is ignored) `decoded`. `fee` appears only on wallet-funded
-transactions, as in Core. `details` entries add `memo`/`memoStr`.
+transactions, as in Core. `details` entries add `memo`/`memoStr` and `pool`.
 
 **vs zcashd:** zcashd's `gettransaction` reports the transparent parts and defers shielded
 detail to `z_viewtransaction`. zecd's `details` cover shielded outputs (with memos) directly;

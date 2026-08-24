@@ -18,6 +18,9 @@ It is written for integrators and operators: engineers wiring a payment system, 
 service to Zcash, and the SREs who run it. It is a light client: it syncs compact blocks in
 the background, never speaks P2P, and never indexes the chain itself.
 
+Since 0.7.0 it is also a **Rust library**: a host process can bring up the wallet and dispatch
+any RPC in-process, with no socket in between. See [Using zecd as a library](library.md).
+
 ## Deployment model
 
 zecd sits between your application and a **self-hosted [Zebra](https://github.com/ZcashFoundation/zebra)
@@ -94,8 +97,8 @@ default, private/LAN ranges are allowed).
 
 - **Not zcashd-RPC-compatible.** zecd is intentionally not a zcashd clone: it does not
   implement zcashd's `z_*` surface except a small chosen subset (`z_sendmany` plus the
-  operation-tracking trio, `z_listtransactions`, `z_getaddressforaccount`). Migrating an
-  integration is a concept mapping, not a drop-in; see
+  operation-tracking trio, `z_shieldcoinbase`, `z_mergetoaddress`, `z_listtransactions`,
+  `z_getaddressforaccount`). Migrating an integration is a concept mapping, not a drop-in; see
   [Migrating from zcashd](migrating-from-zcashd.md).
 - **No P2P.** zecd never speaks the Zcash peer-to-peer protocol; Zebra is its only upstream,
   and `getpeerinfo` reports at most that one connection.
@@ -114,6 +117,8 @@ default, private/LAN ranges are allowed).
 - **Building an integration:** [RPC conventions & wire format](rpc/index.md), then the
   [method index](rpc/method-index.md) for the full method-by-method comparison with bitcoind
   and zcashd.
+- **Driving it from Rust:** [Using zecd as a library](library.md), for callers who would
+  rather not put an HTTP socket between their process and the wallet.
 - **Running it in production:** [Deployment](guide/deployment.md) (Docker, `.deb`/systemd,
   release binaries) and the [Operations runbook](guide/operations.md) (backup/restore,
   monitoring, health endpoints).

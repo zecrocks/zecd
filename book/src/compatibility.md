@@ -135,6 +135,13 @@ address` cannot be reproduced. Do not list the same address twice; combine the a
 one entry. `z_sendmany` takes an array of recipient objects instead, so it does detect and
 reject duplicates with `-8`.
 
+Since 0.7.0, `[rpc] allow_duplicate_shielded_recipients` (off by default) permits a repeated
+**shielded** address on `z_sendmany`, for callers deliberately paying one address from several
+memo-carrying outputs in a single transaction. Repeated transparent recipients stay refused
+either way, and `sendmany` is unaffected, since its duplicates are gone before zecd sees them.
+An [embedded](library.md#sending) caller gets the same thing unconditionally through
+`Node::send`.
+
 ### listsinceblock cursors do not survive reorgs
 
 zecd keeps only the current chain's scanned block hashes (a light wallet has no stale-header

@@ -56,7 +56,7 @@ per wallet here.
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
-| `dir` | path | `<datadir>/<name>` | Directory holding this wallet's `data.sqlite`, `keys.toml`, and `blocks/`. |
+| `dir` | path | `<datadir>/<name>` | This wallet's directory. `keys.toml` sits at its root; since 0.7.0 the librustzcash artifacts (`data.sqlite`, `blockmeta.sqlite`, `blocks/`) live in a per-coin, per-engine subdirectory below it, `<dir>/zec/lrz/`. Existing wallets migrate themselves on first start with no configuration change. See [wallet data layout](guide/operations.md#wallet-data-layout). |
 | `keys_file` | path | `<dir>/keys.toml` | Location of this wallet's `keys.toml` (the encrypted seed), independent of `dir` (for example a read-only mounted Kubernetes Secret while `dir` stays a disposable cache). For the default wallet, `[keys] keys_file` / `ZECD_KEYS_FILE` / `--keys-file` set this too, but an explicit per-wallet `keys_file` wins over all of them. |
 | `pools` | array of string | global `[pools] enabled` | Override of the enabled shielded pools for this wallet. |
 | `default_receivers` | array of string | see below | Override of the default UA receivers. A wallet that overrides `pools` but not `default_receivers` receives into everything it enabled; a wallet that overrides neither inherits the global default. Must be a subset of the wallet's enabled pools. |
@@ -66,6 +66,30 @@ per wallet here.
 | `transparent_initial_scan` | integer | global value | Override of `[pools] transparent_initial_scan`. |
 | `transparent_allow_beyond_recovery_window` | bool | global value | Override of `[pools] transparent_allow_beyond_recovery_window`. |
 | `transparent_gap_warn_threshold` | integer | global value | Override of `[pools] transparent_gap_warn_threshold`. |
+
+**Per-wallet backend overrides (0.7.0).** `[backend]` used to be daemon-global, so every wallet
+in a process dialled the same upstream. These keys, written directly in the wallet's own
+section, override it:
+
+| Key | Overrides |
+|---|---|
+| `server` | `[backend] server` |
+| `tls` | `[backend] tls` |
+| `tls_roots` | `[backend] tls_roots` |
+| `tls_ca_file` | `[backend] tls_ca_file` |
+| `tls_pinned_sha256` | `[backend] tls_pinned_sha256` |
+| `tls_insecure_skip_verify` | `[backend] tls_insecure_skip_verify` |
+| `assume_transparent_in_compact_blocks` | `[backend] assume_transparent_in_compact_blocks` |
+
+Only the settings that describe *which upstream this wallet dials*, and the TLS trust that
+authenticates it, are overridable. Fallback is **field by field**, so a wallet overriding only
+`server` keeps every global TLS setting. Deployment policy stays global and is deliberately not
+listed above: timeouts, reconnect backoff, the cleartext-locality rules, and the `[zebra]`
+credentials are properties of the deployment rather than of one endpoint.
+
+One daemon can therefore serve a zebra-backed spending wallet beside a lightwalletd-backed
+watch-only replica of the same seed. Existing configurations resolve exactly as before, and a
+wallet with no overrides emits no backend keys from `config show`.
 
 At most one loaded wallet may hold spending keys; any number of watch-only (UFVK) wallets
 may run alongside it; see [Watch-only wallets](guide/watch-only.md).
@@ -125,6 +149,7 @@ zecd's own JSON-RPC server (the Bitcoin-Core-dialect surface; see
 | `auth` | array of string | `[]` | Bitcoin-Core-style `rpcauth` entries (`<user>:<salt>$<hmac-sha256 hex>`), each an additional accepted credential. Generate with `zecd rpcauth <user> [password]`. Entries from `--rpcauth` flags and this key **accumulate** (all are accepted), matching bitcoind. |
 | `cookiefile` | path | `<datadir>/.cookie` | Where the bitcoind-style cookie is written when no user/password is set: zecd mints a random secret at startup and writes `__cookie__:<random>` (mode 0600). |
 | `work_queue` | integer | `100` | Max concurrent in-flight requests before returning HTTP 503 (Bitcoin Core's `-rpcworkqueue`); clamped to at least 1. |
+| `allow_duplicate_shielded_recipients` | bool | `false` | Permit a repeated **shielded** address across the recipients of one `z_sendmany`, for callers deliberately paying one address from several memo-carrying outputs in a single transaction. zcashd refuses any repeated recipient, which is the default here too. Repeated *transparent* recipients stay refused either way. In-process callers get the same thing unconditionally through `Node::send` (see [embedding](library.md#sending)). |
 | `allowed_methods` | array of string | `[]` | RPC method safelist. Empty means every method is served; non-empty serves *only* the listed methods, anything else returning `-32601` ("Method not found") exactly as if it did not exist. Names are validated against the implemented method set at startup, so a typo fails fast. A coarse server-wide gate, not per-user. |
 
 ## `[keys]`
@@ -137,6 +162,7 @@ at-rest custody models (age identity vs. passphrase).
 | `age_identity` | path | `<datadir>/identity.txt` | age identity file used to decrypt the wallet seed for unattended sending (the identity-file custody model). Overridden by `--age-identity` / `ZECD_AGE_IDENTITY`. |
 | `auto_unlock` | bool | `true` | Decrypt the seed at startup so sends need no `walletpassphrase` (identity-file wallets only; passphrase-encrypted wallets always start locked). |
 | `keys_file` | path | unset | Location of the **default** wallet's `keys.toml`, independent of the datadir (mount it as a Secret). Equivalent to `[wallets.<default>] keys_file`; overridden by `--keys-file` / `ZECD_KEYS_FILE`, and by an explicit per-wallet `keys_file`. |
+| `allow_multiple_spending_wallets` | bool | `false` | Load more than one wallet holding spending keys. **Refused by the daemon**, which reports it as a `config check` error: an RPC credential is spend authority for whichever wallet a request routes to, so two loaded spenders leave no single answer to which keys a credential can spend. It exists for [embedded](library.md#several-spending-wallets-in-one-process) hosts, which have no RPC credentials and name the wallet on every call. When on, the loaded spenders are logged to the `zecd::audit` target. |
 | `bootstrap_from_keys` | bool | `true` | When a wallet's `keys.toml` exists but its `data.sqlite` has no account, recreate the account from the seed on boot and rescan from the wallet's birthday: the setting that lets the data directory be a disposable cache. Set `false` to fail fast on an empty datadir instead. Watch-only wallets have no seed and are not covered. |
 
 ## `[pools]`
@@ -174,6 +200,8 @@ Send policy: confirmations, privacy, and the proving pipeline. See
 | `untrusted_confirmations` | integer | `10` | Confirmations before third-party outputs are spendable (ZIP 315 default). Must be at least `trusted_confirmations` (validated at startup). Anchors balances and spend proposals; `getbalance`'s explicit `minconf` overrides per call. |
 | `privacy_policy` | string | `"AllowRevealedRecipients"` | What sends may reveal on-chain: `"FullPrivacy"`, `"AllowRevealedAmounts"`, `"AllowRevealedRecipients"`, `"AllowRevealedSenders"` (permits funding a send from transparent UTXOs, with shielded change), or `"AllowFullyTransparent"`. `z_sendmany`'s per-call `privacyPolicy` overrides it. Note `"AllowRevealedSenders"` was a synonym for `"AllowRevealedRecipients"` before 0.6.1 and is now a rung of its own. |
 | `orchard_action_limit` | integer | `50` | Cap on Orchard actions (`max(inputs, outputs)`) a single send may build; bounds memory/proving cost and yields a clean `-8` for oversized sends. `0` disables the cap. |
+| `target_note_count` | integer | `4` | How many change notes a send tries to leave behind, so the next send has several notes to spend in turn rather than serializing on one note's confirmation depth. Must be at least 1; `0` was previously a panic waiting for the first send. |
+| `min_split_output_value` | integer (zatoshis) | `10000000` (0.1 ZEC) | Floor below which change is *not* split into `target_note_count` notes. The floor applies to the wallet's balance rather than to a network, so a deployment built on small balances was receiving one change note where it wanted several. Both keys default to what was hard-coded before 0.7.0, and both are validated when the configuration loads. |
 | `cache_proving_key` | bool | `true` | Build the Orchard proving key once (on a background task at startup, so it does not delay the listeners) and prove sends through the PCZT path, instead of rebuilding the key (~seconds of keygen) on every transaction. Both paths produce identical transactions. |
 | `pipeline_proving` | bool | `false` | Run a send's proving step off the single-writer actor so a long proof no longer freezes background sync and status. Sends still serialize. Only engages on the cached-Orchard PCZT path (`cache_proving_key = true`, Orchard-only spends). |
 
@@ -195,7 +223,7 @@ Unauthenticated liveness/readiness probes on a separate port; see the
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
 | `level` | string | `"info"` | Default tracing filter; overridden entirely by `RUST_LOG` when set. |
-| `format` | string | `"text"` | `"text"` (human-readable) or `"json"` (structured, for log aggregation). Logs go to stderr. |
+| `format` | string | `"text"` | `"text"` (human-readable) or `"json"` (structured, for log aggregation). Logs go to stderr. **Validated since 0.7.0**: anything else used to be silently treated as text, so a typo like `jsonl` produced text logs with no complaint. It is now refused at startup, and `zecd config check` reports the same refusal. |
 
 ## CLI flags
 
@@ -227,10 +255,10 @@ so `zecd --conf /etc/zecd.toml config check` and `zecd config check --conf /etc/
 are the same command. (Before 0.6.0 the flags had to precede the subcommand, which made
 `zecd config check --conf FILE` - the way anyone would naturally write it - a usage error.)
 
-`init`, `export-ufvk`, `rescan`, `derive-address` and the `config` group honor the
-datadir/network/keys flags; the RPC flags are inert for them. `rpcauth` and `example-config`
-run before config resolution and ignore all of them, so they work when there is no config
-file yet.
+`init`, `export-ufvk`, `rescan`, `derive-address`, `chain-info` and the `config` group honor
+the datadir/network/keys flags; the RPC flags are inert for them. `rpcauth`, `example-config`
+and `licenses` run before config resolution and ignore all of them, so they work when there is
+no config file yet.
 
 | Subcommand | Flags | Description |
 |------------|-------|-------------|
@@ -240,6 +268,8 @@ file yet.
 | `derive-address` | `--wallet <NAME>`, `--mnemonic`, `--mnemonic-file <FILE>`, `--ufvk <UFVK>`, `--address-type <TYPE>`, `--index <N>`, `--count <N>`, `--json` | Derive addresses **offline**. Touches no network, no wallet database and no daemon, and takes no datadir lock, so it runs beside a live daemon. See [Offline address derivation](#offline-address-derivation) below. |
 | `config check` | `--strict`, `-q, --quiet` | Validate a config against *this* build without starting the daemon; exits non-zero if the daemon would refuse it. Prints the effective settings on stdout and the verdict on stderr. `--strict` also fails on warnings. See [Validating a config](#validating-a-config). |
 | `config show` | | Print the effective configuration as round-trippable TOML, then exit. Secrets are emitted as commented-out key names, never values. |
+| `chain-info` | `--server <TOKEN>`, `--json` | **New in 0.7.0.** Dial the configured upstream and report its tip, then exit. See [Probing the chain without a wallet](#probing-the-chain-without-a-wallet). |
+| `licenses` | | **New in 0.7.0.** Print the license texts of the third-party crates compiled into this binary, then exit. See [Third-party licenses](#third-party-licenses). |
 | `rpcauth <username> [password]` | | Generate a salted `[rpc] auth` credential line. Omitting the password generates a strong random one, printed once. Needs no datadir or config. |
 | `example-config` | `-o, --output-file <FILE>`, `--force` | Print the annotated example config, then exit. Goes to stdout by default (`-o -` is the same), so it can be redirected or piped. With `-o <FILE>` it writes there instead and refuses to overwrite an existing file unless `--force`; the "wrote example config to ..." confirmation goes to stderr, so stdout carries config text and nothing else in every mode. The output is the shipped `zecd.example.toml`, byte for byte. Needs no datadir or config. |
 | `run` | | Run the JSON-RPC daemon (the default when no subcommand is given). |
@@ -306,6 +336,78 @@ fails loudly. The cost is that a secret-bearing config does not round-trip byte 
 
 Unlike `check`, a missing config file is fine for `show`: "what would this binary do with no
 config" is well defined, and is the quickest way to see the built-in defaults.
+
+### Probing the chain without a wallet
+
+New in 0.7.0. `zecd chain-info` dials the configured upstream and reports its tip.
+
+Before it, the chain tip was unreachable without a wallet: `config check` is deliberately
+offline, and the daemon needs a wallet to start, so both "what height is the chain at?" and
+"can this deployment reach its backend?" meant creating a wallet first.
+
+```sh
+$ zecd chain-info --conf /etc/zecd/zecd.toml
+server            zebra://127.0.0.1:8234
+network           main
+chain             main
+tip height        3512847
+tip hash          0000000000d0e1f2a3b4c5d6e7f8091a2b3c4d5e6f708192a3b4c5d6e7f80912
+birthday for new  3512747
+branch id         c8e71055
+round trip        14 ms
+OK: reachable, chain matches, consensus rules understood
+```
+
+The summary goes to stdout and the verdict to stderr, so the two can be separated in a script.
+`--json` emits an object instead, with `network_matches`, `suggested_birthday`, `branch_id` and
+an `unsupported_upgrades` array.
+
+**It exits non-zero exactly when a wallet created there would not sync**, which is what makes
+it usable as a deployment gate:
+
+| Outcome | Exit | Meaning |
+|---|---|---|
+| Reachable, chain matches, upgrades understood | 0 | Good to `init`. |
+| Upstream serves a different chain than `network` | non-zero | Pointing at the wrong node. |
+| Upstream reports an **active** network upgrade this build does not know | non-zero | The build is too old to follow current consensus. Update zecd before syncing a wallet against it. |
+| Upstream reports a *future* upgrade this build does not know | 0, with a warning | Update before it activates. |
+| Chain name unrecognized | 0, with a warning | Cannot confirm the match either way, which is not a pass. |
+
+`birthday for new` is the birthday `zecd init` would record for a wallet created right now, and
+it comes from the same function `init` itself calls, so the two cannot drift apart. Record it
+alongside a mnemonic you generated yourself.
+
+`--server <TOKEN>` probes a candidate endpoint instead of `[backend] server`, using the same
+token grammar, so a new upstream can be tested before it is committed to a config file. The
+override is applied by re-resolving the configuration with the token swapped, which means the
+candidate carries the same `[zebra]` credentials, TLS settings and cleartext policy the daemon
+would give it. What is probed is what a daemon on that token would dial, including the
+no-network refusals: an endpoint this build would never dial fails here for that reason rather
+than as a connection timeout.
+
+Read-only, like `config check`: no datadir lock, no wallet database, no cookie file. It is safe
+to run against a live deployment.
+
+### Third-party licenses
+
+New in 0.7.0. `zecd licenses` prints the license texts of every third-party crate compiled into
+the binary.
+
+zecd links its dependencies statically, so those crates travel inside the shipped binary, and
+most of the licenses in the tree require the text and copyright notice to be reproduced when
+they do. The same text ships as `THIRD-PARTY-LICENSES.txt` in the release tarball, in the
+Debian package, and in both container images under `/usr/share/doc/zecd/`.
+
+```sh
+zecd licenses | less
+zecd licenses > THIRD-PARTY-LICENSES.txt
+```
+
+The container images are built `FROM scratch` and have no shell, so this subcommand is the one
+place the notices are readable wherever zecd runs. It needs no datadir and no config file.
+
+The bundle is generated from the lockfile at release time and covers a few hundred crates, so
+expect a few hundred kilobytes of output. Piping it into a pager that exits early is fine.
 
 ### Offline address derivation
 

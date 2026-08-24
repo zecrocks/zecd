@@ -22,6 +22,10 @@ transparent source on [`z_sendmany`](rpc/async-operations.md#z_sendmany) under t
 - **No auto-shielding.** Nothing sweeps transparent receives into the shielded pool on its own;
   every shield is a call an operator or an integration makes. Wiring librustzcash's
   `propose_shielding` into a caught-up sync pass is the planned path to a background sweep.
+  Since 0.7.0 the *bulk* call exists at least:
+  [`z_mergetoaddress`](rpc/async-operations.md#z_mergetoaddress) with `["ANY_TADDR"]` and a
+  shielded destination sweeps up to 50 non-coinbase UTXOs per call into one note. It is still
+  something you have to call.
   Coinbase keeps its own route, [`z_shieldcoinbase`](rpc/async-operations.md#z_shieldcoinbase),
   because consensus leaves it no other one: a transaction spending transparent coinbase may not
   have any transparent output, change included.

@@ -294,3 +294,81 @@ tip = rpc.getblockcount()
 rpc.waitforblockheight(tip + 6, 120000)      # 6 confirmations, 120s cap
 rpc.listsinceblock()                          # heights are now written
 ```
+
+## waitforsync
+
+```
+waitforsync ( timeout )
+```
+
+New in 0.7.0, and a **zecd extension**: neither Bitcoin Core nor zcashd has it. Block until
+the wallet is *fully* caught up, meaning the block scan has finished **and** the
+transaction-enhancement backlog has drained, then return that state.
+
+It exists because the three `waitfor*` methods above answer "has the wallet scanned to height
+N?", which is not the same question as "is this wallet serving complete history?". Compact
+blocks carry no memos, so after the scan reaches the tip an enhancement pass is still fetching
+full transaction data. A caller that waits on height alone and then reads
+[`gettransaction`](wallet-history.md#gettransaction) can find a memo missing that will appear a
+minute later. See [the operations runbook](../guide/operations.md#monitoring-and-alerting) for
+what that backlog is and why it is not restore-only.
+
+The call nudges a sync pass before it starts waiting, so the wait measures a pass that is
+already beginning rather than one that is up to `[sync] interval_secs` away.
+
+**Parameters**
+
+| # | Name | Type | Default | Description |
+|---|------|------|---------|-------------|
+| 1 | timeout | number | 0 | Milliseconds, following the `waitfor*` convention rather than `z_waitforoperation`'s seconds. `0` or omitted waits indefinitely. |
+
+**Result**
+
+```json
+{
+  "hash": "0000000001a2b3c4d5e6f708192a3b4c5d6e7f8091a2b3c4d5e6f70819aabbcc",
+  "height": 2913000,
+  "chain_tip": 2913004,
+  "synced": true,
+  "pending_enhancements": 0,
+  "enhanced_through": 2913000
+}
+```
+
+- `height` / `hash`: the fully-scanned height, the same value
+  [`getblockcount`](#getblockcount) returns.
+- `chain_tip`: the **upstream's** tip, so a caller can render "scanned H of TIP" without
+  opening its own connection to ask. `height` alone cannot express progress, because what it
+  is being measured against is exactly this. `null` until the first tip is known, before the
+  first successful connect.
+- `synced`: the predicate the call waits on.
+- `pending_enhancements`: distinct outstanding transaction-data requests still to drain.
+- `enhanced_through`: the height below which history is complete. `null` means "not currently
+  determinable", which a consumer must read as **hold the cursor**, never as "everything is
+  enhanced".
+
+**Timing out is not an error.** The current state comes back with `synced: false`, so a caller
+branches on that field rather than catching an exception. That boolean is load-bearing: without
+it, "the wait gave up" and "the wallet is ready" would be distinguishable only by re-deriving
+the predicate from the other fields.
+
+A blocking call occupies an `[rpc] work_queue` permit while it waits, and ends promptly on
+daemon shutdown, exactly as the `waitfor*` family does.
+
+**Errors**
+
+| Code | When |
+|------|------|
+| -1 | `timeout` is negative |
+| -3 | `timeout` is not an integer |
+
+**Example**
+
+```python
+# Restore a wallet, then block until its history is actually complete.
+st = rpc.waitforsync(600000)                  # 10 minute cap
+if not st["synced"]:
+    raise TimeoutError(f'scanned {st["height"]} of {st["chain_tip"]}, '
+                       f'{st["pending_enhancements"]} enhancements pending')
+rpc.listsinceblock()                          # memos are now populated
+```

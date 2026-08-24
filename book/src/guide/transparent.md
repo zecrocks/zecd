@@ -159,6 +159,26 @@ twice: it is recovered on a from-seed restore via the internal gap chain, and th
 recognize the internal key scope as change and hide it, while a deliberate payment to one of
 your own *external* t-addresses stays visible as a send+receive pair, matching Bitcoin Core.
 
+## Sweeping many transparent UTXOs at once
+
+A wallet paid repeatedly at t-addresses accumulates a long tail of small UTXOs.
+[`z_mergetoaddress`](../rpc/async-operations.md#z_mergetoaddress), new in 0.7.0, consolidates
+them into one output:
+
+```sh
+curl -s --user "$RPCUSER:$RPCPASS" --data-binary \
+  '{"jsonrpc":"1.0","id":"doc","method":"z_mergetoaddress",
+    "params":[["ANY_TADDR"],"u1...",null,0,null,"","AllowRevealedSenders"]}' \
+  http://127.0.0.1:8232/
+```
+
+With a shielded destination this is a bulk shield: it needs `AllowRevealedSenders`, because
+spending transparent UTXOs reveals the sender either way. With a transparent destination it is a
+fully transparent transaction and needs `AllowFullyTransparent`. The default per-call limit is
+50 UTXOs and the response's `remainingUTXOs` says whether to call again.
+
+**Coinbase is not included**, and cannot be: see the next section.
+
 ## Coinbase: shielding is the only way to spend it
 
 Transparent coinbase (a block reward or fee paid to one of the wallet's t-addresses) is a

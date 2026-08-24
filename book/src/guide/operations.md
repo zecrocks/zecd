@@ -15,7 +15,9 @@ Funds are recoverable from the mnemonic alone. Everything else is convenience.
 | `keys.toml` | `<wallet dir>/keys.toml`, or wherever `keys_file` points | The age-encrypted mnemonic plus network and birthday. Useless without the identity; pair the two for a full server restore. This is the file you ship as a Secret. |
 | `identity.txt` (age identity) | `[keys] age_identity`, default `<datadir>/identity.txt` | Decrypts `keys.toml`. This is spend authority. Store its backup separately from `keys.toml` backups. |
 
-Do not back up `data.sqlite` or `blocks/`. They are caches derived from the chain: zecd is
+Do not back up `data.sqlite` or `blocks/` (since 0.7.0 both live under
+`<wallet dir>/zec/lrz/`; see [wallet data layout](#wallet-data-layout)). They are caches
+derived from the chain: zecd is
 [stateless](../design/statelessness.md), so with the mnemonic (and birthday) the whole data
 directory can be recreated. Shielded funds are unconditionally recoverable from seed;
 transparent funds only within the gap-limit / initial-scan window (see
@@ -29,8 +31,9 @@ Per wallet directory `<dir>`:
 |---|---|---|
 | `<dir>/keys.toml` | Secret: encrypted seed + birthday/network | Yes. Mount as a Secret; relocate with `keys_file` / `ZECD_KEYS_FILE`. |
 | `identity.txt` | Secret: decrypts the seed (spend authority) | Yes, if auto-unlocking. Mount as a Secret (`ZECD_AGE_IDENTITY`). |
-| `<dir>/data.sqlite` (+ `-wal`/`-shm`) | Cache: account, scan progress, balances, history. Rebuilt from `keys.toml` plus a rescan. | No. |
-| `<dir>/blocks/` | Cache: downloaded compact blocks. Can grow large; fully re-derivable. | No. Exclude from every snapshot. |
+| `<dir>/zec/lrz/data.sqlite` (+ `-wal`/`-shm`) | Cache: account, scan progress, balances, history. Rebuilt from `keys.toml` plus a rescan. | No. |
+| `<dir>/zec/lrz/blockmeta.sqlite` (+ sidecars) | Cache: block metadata. | No. |
+| `<dir>/zec/lrz/blocks/` | Cache: downloaded compact blocks. Can grow large; fully re-derivable. | No. Exclude from every snapshot. |
 | `<datadir>/.cookie` | Ephemeral RPC cookie, minted at startup, removed on clean shutdown | No. |
 
 Keep secrets out of the TOML (which typically lives in a ConfigMap):
@@ -42,6 +45,63 @@ Keep secrets out of the TOML (which typically lives in a ConfigMap):
 - `keys.toml` location: `ZECD_KEYS_FILE` / `--keys-file` / `[keys] keys_file` (per-wallet
   `[wallets.<name>] keys_file`).
 - age identity: `ZECD_AGE_IDENTITY` / `--age-identity` / `[keys] age_identity`.
+
+## Wallet data layout
+
+Since 0.7.0 a wallet directory nests its derived state one coin and one engine deep:
+
+```text
+<datadir>/<wallet>/keys.toml                                    <- the seed. Stays at the root.
+<datadir>/<wallet>/zec/lrz/data.sqlite
+<datadir>/<wallet>/zec/lrz/blockmeta.sqlite
+<datadir>/<wallet>/zec/lrz/blocks/
+```
+
+Before 0.7.0 all of these sat flat in the wallet directory together.
+
+The split follows what can be rebuilt from what. `keys.toml` wraps a BIP-39 seed that serves
+every coin and that nothing on any chain can reconstruct, so it stays at the top. Everything
+below it is derived state, namespaced first by the coin that owns it and then by the library
+that wrote it, so a second coin gets a sibling directory rather than a share of one flat
+namespace, and replacing the storage library becomes a sibling directory plus a rescan.
+
+### The migration
+
+**Existing wallets migrate themselves on first start. No configuration changes**, including for
+a wallet with an explicit `dir`. What it guarantees:
+
+- It runs under the datadir lock, before anything opens a wallet, and also at `zecd init` and
+  `zecd rescan`.
+- Artifacts are **renamed** within the wallet directory, never copied, so no free disk space is
+  needed and nothing is deleted.
+- The SQLite `-wal` and `-shm` sidecars travel with their databases. A `-wal` holds committed
+  transactions not yet checkpointed back, so moving a database without it would silently
+  discard the most recent writes.
+- An interrupted run resumes: the next start moves whatever is left.
+- **A failure is fatal by design.** It is not a silent fallback to rebuilding an empty
+  database, because that would look like a working daemon with a wallet that has lost its
+  history. The one case it cannot resolve on its own is an error leaving copies in both places,
+  which it reports for an operator to settle.
+
+Take the usual datadir backup before the upgrade anyway. The worst case is a from-seed restore,
+not lost funds, but a restore costs a scan.
+
+`zecd config check` reports a pending move as a warning and the both-places state as an error,
+so an upgrade can be dry-run against a live deployment before anything is stopped.
+
+Read-only commands take no datadir lock and therefore cannot migrate. `zecd export-ufvk` reads
+an un-migrated wallet database where it lies; `zecd derive-address` needs no fallback at all,
+since it reads only `keys.toml`, which the migration never moves.
+
+### If you compute these paths yourself
+
+Backup scripts, log shippers, and volume mounts that hard-code `<wallet>/data.sqlite` need
+updating to `<wallet>/zec/lrz/data.sqlite`. The exclusion advice above is unchanged in
+substance: exclude the engine directory, keep `keys.toml`.
+
+Embedders must use `config::engine_dir` or `config::WalletEntry::engine_dir` rather than joining
+the components by hand, since the layout is versioned by coin and engine. See
+[embedding](../library.md#reading-wallet-history).
 
 ## Restore procedures
 
@@ -159,6 +219,22 @@ Zebra's `getrawtransaction` is fast.
 > reports distinct outstanding requests, so figures from 0.6.3 and earlier are not comparable
 > with figures from 0.6.4.
 
+**Bounding history completeness precisely.** Since 0.7.0,
+[`getwalletinfo`](../rpc/wallet-addresses.md#getwalletinfo) reports a top-level
+`enhanced_through` height, and `pending_enhancements` appears inside its `scanning` object. That
+matters for two readers the health server does not serve: a library consumer running with
+`default-features = false` has no health port at all, and anyone driving zecd purely over
+JSON-RPC previously had to run one just for this number.
+
+`enhanced_through` is the height below which history is complete, so a consumer replaying wallet
+history as a log clamps its cursor to it rather than to readiness. It is `null` when not
+currently determinable, which must be read as **hold the cursor**, never as "everything is
+enhanced".
+
+[`waitforsync`](../rpc/blockchain.md#waitforsync) (also 0.7.0) blocks until both the scan and
+the backlog are done and returns all of these in one object, which is usually what a restore
+script wants instead of a poll loop.
+
 `locked` (top-level on both `/readyz` and `/status`, plus per-wallet) is `true` when a
 passphrase-encrypted wallet needs a `walletpassphrase` before it can spend. It is reported
 independently of readiness (a locked wallet can be `ready: true`), so a controller can drive
@@ -182,6 +258,59 @@ Suggested alerts:
 The health server starts after wallets load, so cover prover init at boot with a
 `startupProbe` / `initialDelaySeconds`. The port is unauthenticated by design and exposes
 sync status only; keep it off the public internet anyway.
+
+## Structured logging
+
+Reworked in 0.7.0. Text output looks much as it did; JSON output (`[log] format = "json"`) is
+now queryable without matching on message strings.
+
+**Context lives on spans, not in prose.** Everything emitted while an RPC is handled, the
+sanitized error detail lines included, is attributed to that call's method and wallet through an
+`rpc` span. Every event from a wallet's actor carries the wallet name as a real field on a
+`wallet` span, rather than a `[name]` prefix pasted onto the message text.
+
+**Numbers are fields.** Durations, counts, and the rates on the send profile, the scan batches,
+and the periodic heartbeats used to be baked into sentences. They are now fields you can
+aggregate on.
+
+### The `zecd::audit` target
+
+A stable tracing target carries the security-relevant events, so an operator routes them to a
+separate sink with a one-line filter instead of matching on message text:
+
+- the RPC authentication mode chosen at startup, and per-request outcomes;
+- the account-to-keys binding pin;
+- seed unlock and relock, including the `walletpassphrase` timeout auto-lock;
+- transparent issuance past the recovery horizon;
+- every process-hardening step that was a no-op or was opted out of;
+- the loaded spending wallets, when
+  [`allow_multiple_spending_wallets`](../configuration.md#keys) is on.
+
+Route it with a `RUST_LOG` directive, which overrides `[log] level` entirely when set:
+
+```sh
+RUST_LOG='warn,zecd::audit=info'     # audit trail only, plus real problems
+```
+
+### Two log levels moved
+
+Both changes reduce steady-state volume, and both are worth knowing before you write an alert
+on the old behaviour:
+
+- **Per-request authentication success dropped from INFO to DEBUG**, removing one line per
+  authenticated request. Failures stay at WARN.
+- **Reconnect attempts during an upstream outage no longer stream WARNs.** The first failure
+  warns and names the demotion; the paced retries after it log at DEBUG with their attempt
+  number and delay. An alert that counted reconnect WARNs will now fire once per outage rather
+  than continuously, which is the intent.
+
+New TRACE events exist for one-per-downloaded-block and one-per-serviced-transaction-data
+request. They are off unless asked for, and are verbose enough that you want a narrow filter.
+
+### Startup and shutdown
+
+One identifying line is logged at startup with the version, network, datadir, and upstream,
+which nothing did before. Shutdown warns when async operations are still unfinished.
 
 ## Send semantics under failure
 
@@ -303,6 +432,13 @@ If sends are still slow after upgrading, the cause is elsewhere: check that the 
 5. Start. Wallet DB migrations run automatically at open; the first start after a large
    librustzcash bump can take longer.
 
+**Upgrading onto 0.7.0 specifically**, the first start also moves each wallet's databases into
+a per-coin subdirectory. It is automatic and needs no configuration change, but read
+[wallet data layout](#wallet-data-layout) first: a failure there is deliberately fatal rather
+than a silent rebuild, and any backup script or volume mount that names `<wallet>/data.sqlite`
+by hand needs its path updated. Step 1's `config check` reports a pending move as a warning, so
+the dry run tells you it is coming.
+
 Downgrades across DB migrations are not supported. If you need a rollback path, stop the
 daemon and snapshot the datadir first. The worst case of a lost datadir is a from-seed
 restore, not lost funds.
@@ -320,8 +456,10 @@ an OS advisory lock the kernel releases when the process exits, including a cras
 there is never a stale lockfile to delete: if the error appears and no zecd is running, just
 retry. Several commands are exempt because they never write the datadir: `zecd export-ufvk`
 (read-only DB access, so you can export a UFVK while the daemon runs), `zecd rpcauth`, and,
-since 0.6.0, `zecd derive-address`, `zecd config check` and `zecd config show`. All of them
-are safe to run against a live deployment. `config check` deliberately does not mint a cookie
+since 0.6.0, `zecd derive-address`, `zecd config check` and `zecd config show`. Since 0.7.0
+`zecd chain-info` and `zecd licenses` join them: `chain-info` opens no wallet database and
+writes no cookie file, and `licenses` never reaches a datadir at all. All of them are safe to
+run against a live deployment. `config check` deliberately does not mint a cookie
 file either, which would otherwise invalidate the credential a running daemon already handed
 out.
 
