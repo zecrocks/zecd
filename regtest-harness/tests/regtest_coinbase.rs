@@ -40,14 +40,16 @@
 //! exists are below its birthday and invisible - the coinbase set the assertions key on stays
 //! exactly the blocks mined after startup.
 //!
-//! Neither test needs the funding wallet: zebra's own `generate` mines straight
-//! to zecd. Skips cleanly unless `ZEBRAD_BIN` is set.
+//! Neither test needs the funding wallet: the node's own `generate` mines straight
+//! to zecd. Runs against whichever node `ZECD_REGTEST_NODE` selects; skips cleanly unless that
+//! node's binary variable (`ZEBRAD_BIN` / `ZAKURAD_BIN`) is set.
 
 use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
 use zecd_regtest_harness::{
-    derive_address_offline, pick_port, resolve_bin, Zebrad, Zecd, ZecdConfig, SEED_MINER_ADDRESS,
+    derive_address_offline, pick_port, resolve_node_bin, Zebrad, Zecd, ZecdConfig,
+    SEED_MINER_ADDRESS,
 };
 
 /// The wallet under test is restored from a known phrase so its miner address can be derived
@@ -179,14 +181,12 @@ async fn balance_zec(zecd: &Zecd) -> f64 {
 
 #[tokio::test]
 async fn regtest_transparent_coinbase_shield_and_spend() {
-    // Coinbase tests are zebra-only in CI: the harness leaves ZEBRAD_BIN unset on the zakura leg,
-    // so this skips there. (zecd drives zakura fine and zakura *can* build a shielded coinbase, but
-    // the transparent-coinbase maturity+shield flow was flaky against zakura in local testing, so
-    // the suite is scoped to zebra to keep the zakura leg reliably green - revisit if wanted.)
-    let Some(zebrad_bin) = resolve_bin("ZEBRAD_BIN") else {
+    // Runs against whichever node the leg selected (`ZECD_REGTEST_NODE`), so the whole coinbase
+    // ladder is exercised on zebra and zakura alike; skips only when that node's binary is absent.
+    let Some(zebrad_bin) = resolve_node_bin() else {
         eprintln!(
-            "SKIP regtest_transparent_coinbase_shield_and_spend: set ZEBRAD_BIN to run the \
-             coinbase e2e. The harness still compiled."
+            "SKIP regtest_transparent_coinbase_shield_and_spend: set the node binary variable \
+             (ZEBRAD_BIN / ZAKURAD_BIN) to run the coinbase e2e. The harness still compiled."
         );
         return;
     };
@@ -601,11 +601,11 @@ async fn regtest_transparent_coinbase_shield_and_spend() {
 
 #[tokio::test]
 async fn regtest_shielded_coinbase_receive_and_spend() {
-    // Zebra-only in CI (ZEBRAD_BIN unset on the zakura leg -> skips there); see the sibling test.
-    let Some(zebrad_bin) = resolve_bin("ZEBRAD_BIN") else {
+    // Runs on whichever node the leg selected; see the sibling test.
+    let Some(zebrad_bin) = resolve_node_bin() else {
         eprintln!(
-            "SKIP regtest_shielded_coinbase_receive_and_spend: set ZEBRAD_BIN to run the coinbase \
-             e2e. The harness still compiled."
+            "SKIP regtest_shielded_coinbase_receive_and_spend: set the node binary variable \
+             (ZEBRAD_BIN / ZAKURAD_BIN) to run the coinbase e2e. The harness still compiled."
         );
         return;
     };
