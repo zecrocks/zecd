@@ -49,6 +49,7 @@ pub(crate) fn validateaddress(
         if let Some(consistent) = crate::wallet::read::classify_unified_receivers(
             handle.network,
             &handle.engine_dir,
+            handle.account_scope(),
             addr,
         )
         .consistent_flag()

@@ -136,6 +136,15 @@ pub struct SyncStatus {
     /// True when the wallet is passphrase-encrypted (Bitcoin Core's `HasEncryptionKeys()`).
     /// Drives whether `getwalletinfo` reports `unlocked_until` and how the passphrase RPCs behave.
     pub encrypted: bool,
+    /// The account this wallet name resolves to inside its wallet database.
+    ///
+    /// A database can hold several accounts - that is how a fleet of watch-only wallets is
+    /// scanned once rather than once each - so every read that reports this wallet's own money,
+    /// history or addresses must be scoped to it ([`read::AccountScope`]). `None` while no
+    /// account exists yet: an empty data directory whose account has not been rebuilt from
+    /// `keys.toml`, e.g. an encrypted wallet awaiting its first `walletpassphrase`. Published on
+    /// the status rather than fixed at spawn precisely so it appears when that bootstrap runs.
+    pub account: Option<AccountUuid>,
     /// True for a watch-only wallet (imported UFVK; no spending material anywhere). Drives
     /// `getwalletinfo.private_keys_enabled` - the wallet-level signal, as in Bitcoin Core's
     /// descriptor wallets (per-address `iswatchonly` is deprecated there and stays false).
@@ -491,6 +500,18 @@ impl WalletHandle {
     /// read as "this wallet's coin" rather than hard-coding the answer.
     pub fn coin(&self) -> Coin {
         Coin::Zcash
+    }
+
+    /// Which account in this wallet's database its reads apply to.
+    ///
+    /// [`read::AccountScope::Any`] until the account exists (a pending bootstrap), which is also
+    /// exactly the pre-fleet behaviour - and identical to naming the account whenever the
+    /// database holds only one, which is every non-fleet wallet.
+    pub fn account_scope(&self) -> read::AccountScope {
+        match self.status_rx.borrow().account {
+            Some(account) => read::AccountScope::Only(account),
+            None => read::AccountScope::Any,
+        }
     }
 
     /// A private receiver on the actor's published [`SyncStatus`], for RPC handlers that must

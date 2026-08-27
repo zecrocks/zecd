@@ -2208,6 +2208,15 @@ impl WalletActor {
         }
     }
 
+    /// Which account this actor's own reads apply to. `Any` only while no account exists yet
+    /// (a pending bootstrap), where there is nothing in the database to scope to anyway.
+    fn scope(&self) -> super::read::AccountScope {
+        match self.account_id {
+            Some(account) => super::read::AccountScope::Only(account),
+            None => super::read::AccountScope::Any,
+        }
+    }
+
     /// Run one writer command, catching any panic so a single bad command can't silently take
     /// the whole actor - and thus every wallet *write* - down until process restart (reads
     /// bypass the actor and would keep working, masking the outage). The one *expected* panic
@@ -3702,6 +3711,7 @@ impl WalletActor {
             pending_enhancements,
             enhanced_through,
             encrypted: self.encrypted,
+            account: self.account_id,
             watch_only: self.watch_only,
             unlocked_until,
             transparent_frontier: self.transparent_frontier,
@@ -4396,6 +4406,9 @@ impl WalletActor {
         let (target_note_count, min_split_output_value) =
             (self.target_note_count, self.min_split_output_value);
         let engine_dir = self.engine_dir.clone();
+        // Captured alongside `engine_dir`: the closures below hold `&mut self.db_data`,
+        // so `self` cannot be borrowed again to ask for the scope once they have started.
+        let scope = self.scope();
         let db = &mut self.db_data;
         tokio::task::block_in_place(move || -> Result<_, RpcError> {
             let start = Instant::now();
@@ -4431,7 +4444,9 @@ impl WalletActor {
                 // `None` builds at the transaction version implied by the target height.
                 None,
             )
-            .map_err(|e| enrich_insufficient_funds(db, &engine_dir, policy, classify_err(e)))?;
+            .map_err(|e| {
+                enrich_insufficient_funds(db, &engine_dir, scope, policy, classify_err(e))
+            })?;
             if privacy == SendPrivacy::FullPrivacy {
                 enforce_full_privacy(&proposal)?;
             }
@@ -4452,7 +4467,7 @@ impl WalletActor {
                 BundlePadding::DEFAULT,
             )
             .map_err(|e| {
-                enrich_insufficient_funds(db, &engine_dir, policy, classify_pczt_err(e))
+                enrich_insufficient_funds(db, &engine_dir, scope, policy, classify_pczt_err(e))
             })?;
             Ok((pczt, shape, start.elapsed()))
         })
@@ -4658,6 +4673,9 @@ impl WalletActor {
         let account_id = self.require_account()?;
         let prover: &LocalTxProver = &self.prover;
         let engine_dir = self.engine_dir.clone();
+        // Captured alongside `engine_dir`: the closures below hold `&mut self.db_data`,
+        // so `self` cannot be borrowed again to ask for the scope once they have started.
+        let scope = self.scope();
         let db = &mut self.db_data;
         let (txid, raw, shape, build, prove): (TxId, Vec<u8>, SendShape, Duration, Duration) =
             tokio::task::block_in_place(move || -> Result<_, RpcError> {
@@ -4693,7 +4711,9 @@ impl WalletActor {
                     // `None` builds at the transaction version implied by the target height.
                     None,
                 )
-                .map_err(|e| enrich_insufficient_funds(db, &engine_dir, policy, classify_err(e)))?;
+                .map_err(|e| {
+                    enrich_insufficient_funds(db, &engine_dir, scope, policy, classify_err(e))
+                })?;
                 if privacy == SendPrivacy::FullPrivacy {
                     enforce_full_privacy(&proposal)?;
                 }
@@ -4713,7 +4733,9 @@ impl WalletActor {
                     // height, matching the PCZT path.
                     None,
                 )
-                .map_err(|e| enrich_insufficient_funds(db, &engine_dir, policy, classify_err(e)))?;
+                .map_err(|e| {
+                    enrich_insufficient_funds(db, &engine_dir, scope, policy, classify_err(e))
+                })?;
                 if txids.len() > 1 {
                     return Err(RpcError::wallet(
                         "multi-transaction proposals are not supported",
@@ -4991,6 +5013,9 @@ impl WalletActor {
         // builder wants `&LocalTxProver`, so deref-coerce through the Arc.
         let prover: &LocalTxProver = &self.prover;
         let engine_dir = self.engine_dir.clone();
+        // Captured alongside `engine_dir`: the closures below hold `&mut self.db_data`,
+        // so `self` cannot be borrowed again to ask for the scope once they have started.
+        let scope = self.scope();
         let db = &mut self.db_data;
 
         let (txid, raw): (TxId, Vec<u8>) =
@@ -5042,9 +5067,12 @@ impl WalletActor {
                     // may hold mature coinbase UTXOs that `listunspent`/`getbalance` display as
                     // spendable, so a bare "0 spendable" here would contradict what the caller
                     // just read. Same query as `getbalances.mine.coinbase`.
-                    let coinbase =
-                        super::read::mature_coinbase_zats(&engine_dir, u32::from(target_height))
-                            .unwrap_or(0);
+                    let coinbase = super::read::mature_coinbase_zats(
+                        &engine_dir,
+                        scope,
+                        u32::from(target_height),
+                    )
+                    .unwrap_or(0);
                     return Err(RpcError::insufficient_funds(if coinbase > 0 {
                         format!(
                             "Insufficient funds: 0 spendable non-coinbase transparent UTXOs; {}",
@@ -5087,6 +5115,7 @@ impl WalletActor {
                         // expected to cover the shortfall, so name it.
                         let coinbase = super::read::mature_coinbase_zats(
                             &engine_dir,
+                            scope,
                             u32::from(target_height),
                         )
                         .unwrap_or(0);
@@ -6879,6 +6908,7 @@ fn classify_err(e: ProposalError) -> RpcError {
 fn enrich_insufficient_funds(
     db: &WriteDb,
     engine_dir: &Path,
+    scope: super::read::AccountScope,
     policy: ConfirmationsPolicy,
     err: RpcError,
 ) -> RpcError {
@@ -6912,7 +6942,7 @@ fn enrich_insufficient_funds(
     // caller can't diagnose. Same number as `getbalances.mine.coinbase` (both read
     // `mature_coinbase_zats`); best-effort - a failed lookup just leaves the hint off.
     let target_height = u32::from(summary.chain_tip_height()) + 1;
-    let coinbase = super::read::mature_coinbase_zats(engine_dir, target_height).unwrap_or(0);
+    let coinbase = super::read::mature_coinbase_zats(engine_dir, scope, target_height).unwrap_or(0);
     if incoming == 0 && change == 0 && coinbase == 0 {
         return err;
     }
@@ -8170,14 +8200,25 @@ mod tests {
 
         let other = RpcError::wallet("some other failure");
         assert_eq!(
-            super::enrich_insufficient_funds(&db, dir.path(), Default::default(), other.clone())
-                .message,
+            super::enrich_insufficient_funds(
+                &db,
+                dir.path(),
+                super::read::AccountScope::Any,
+                Default::default(),
+                other.clone()
+            )
+            .message,
             other.message
         );
 
         let bare = RpcError::insufficient_funds("Insufficient funds: 0 zatoshis spendable");
-        let out =
-            super::enrich_insufficient_funds(&db, dir.path(), Default::default(), bare.clone());
+        let out = super::enrich_insufficient_funds(
+            &db,
+            dir.path(),
+            super::read::AccountScope::Any,
+            Default::default(),
+            bare.clone(),
+        );
         assert_eq!(out.code, codes::RPC_WALLET_INSUFFICIENT_FUNDS);
         assert_eq!(
             out.message, bare.message,

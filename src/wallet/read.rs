@@ -18,8 +18,97 @@ use zcash_protocol::{ShieldedPool, TxId};
 use zcash_transparent::keys::TransparentKeyScope;
 use zip32::{DiversifierIndex, Scope};
 
+use zcash_client_sqlite::AccountUuid;
+
 use crate::network::ZNetwork;
 use crate::wallet::open::{data_db_path, open_read};
+
+/// Which account in a wallet database a read applies to.
+///
+/// One `WalletDb` can hold several accounts - that is how a fleet of watch-only wallets is
+/// scanned once instead of once each, so every query that reports a *wallet's own* money,
+/// history or addresses has to name the account it means. The database
+/// already carries the column everywhere it is needed: `v_transactions.account_uuid`,
+/// `v_tx_outputs.from_account_uuid`/`to_account_uuid`, and an `account_id` foreign key on the
+/// received-note and transparent-output tables.
+///
+/// Chain-level reads (`blocks`, block hashes, median time past) are deliberately *not* scoped:
+/// they describe the chain the database has scanned, which every account in it shares. Neither
+/// are the actor's own maintenance reads (the rebroadcast set, the transparent spend-watch set),
+/// which must cover every account the actor scans for.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum AccountScope {
+    /// Every account in the database. The pre-fleet behaviour, and what a wallet whose account
+    /// does not exist yet (an encrypted wallet awaiting its first `walletpassphrase`, so the
+    /// bootstrap has not run) necessarily uses. Identical to [`AccountScope::Only`] whenever the
+    /// database holds exactly one account, which is what makes this scoping a no-op for the
+    /// single-wallet layout.
+    #[default]
+    Any,
+    /// Exactly one account.
+    Only(AccountUuid),
+}
+
+impl AccountScope {
+    /// The value bound to `:scope_account`: the account's UUID, or `NULL` for
+    /// [`AccountScope::Any`].
+    ///
+    /// The predicates below are written so that a `NULL` here matches everything, which is what
+    /// lets the SQL stay a single constant string per query instead of being assembled per
+    /// variant - no conditional fragments, no conditional parameter lists, and no way for the
+    /// two to disagree.
+    fn param(&self) -> Option<Uuid> {
+        match self {
+            AccountScope::Any => None,
+            AccountScope::Only(account) => Some(account.expose_uuid()),
+        }
+    }
+
+    /// True when this scope names an account that `account` is not. For the few reads whose rows
+    /// come from librustzcash's own API rather than SQL written here, so the filter is applied in
+    /// Rust instead.
+    fn excludes(&self, account: AccountUuid) -> bool {
+        matches!(self, AccountScope::Only(only) if *only != account)
+    }
+}
+
+/// A SQL predicate restricting an account **UUID** column to the bound [`AccountScope`].
+/// Unscoped reads bind `NULL`, which the `IS NULL` arm turns into "every account".
+fn scope_by_uuid(column: &str) -> String {
+    format!("(:scope_account IS NULL OR {column} = :scope_account)")
+}
+
+/// The accounts a read applies to: every account the database holds, or just the scoped one.
+/// For the reads whose rows come from librustzcash's own API (balances, spendable notes, address
+/// lists) rather than SQL written here.
+fn scoped_account_ids(
+    db: &crate::wallet::open::ReadDb,
+    scope: AccountScope,
+) -> anyhow::Result<Vec<AccountUuid>> {
+    Ok(db
+        .get_account_ids()?
+        .into_iter()
+        .filter(|account| !scope.excludes(*account))
+        .collect())
+}
+
+/// A SQL predicate matching a `v_tx_outputs` row that belongs to the scoped account on *either*
+/// side: a received output names it in `to_account_uuid`, a sent one in `from_account_uuid`.
+fn scope_by_output_account() -> String {
+    "(:scope_account IS NULL OR to_account_uuid = :scope_account \
+      OR from_account_uuid = :scope_account)"
+        .to_string()
+}
+
+/// As [`scope_by_uuid`], for an account **id** column - the integer foreign key the note and
+/// transparent-output tables carry. Resolved through `accounts` so callers only ever hold the
+/// stable UUID.
+fn scope_by_id(column: &str) -> String {
+    format!(
+        "(:scope_account IS NULL OR {column} = \
+         (SELECT id FROM accounts WHERE uuid = :scope_account))"
+    )
+}
 
 /// Spendable / pending balances aggregated across the wallet's accounts (in zatoshis).
 #[derive(Debug, Default, Clone)]
@@ -66,13 +155,20 @@ pub const COINBASE_MATURITY: u32 = 100;
 pub fn balance(
     network: ZNetwork,
     engine_dir: &Path,
+    scope: AccountScope,
     policy: ConfirmationsPolicy,
 ) -> anyhow::Result<BalanceInfo> {
     let db = open_read(network, engine_dir)?;
     let mut info = BalanceInfo::default();
     if let Some(summary) = db.get_wallet_summary(policy)? {
         let target_height = u32::from(summary.chain_tip_height()) + 1;
-        for bal in summary.account_balances().values() {
+        // `get_wallet_summary` reports every account in the database, so the scope is applied
+        // here rather than pushed down: a fleet shard holds many wallets' accounts, and summing
+        // them all would report each wallet the whole shard's money.
+        for (account, bal) in summary.account_balances() {
+            if scope.excludes(*account) {
+                continue;
+            }
             info.orchard_spendable += bal.orchard_balance().spendable_value().into_u64();
             info.sapling_spendable += bal.sapling_balance().spendable_value().into_u64();
             // Transparent (unshielded) value, spendable as an input (`z_shieldcoinbase` /
@@ -130,7 +226,7 @@ pub fn balance(
         // as a clamped fallback (it holds no immature coinbase on the current upstream; the
         // fallback guards against the bucketing shifting again across upstream releases, which
         // it already did once between 0.24.0-rc.1 and 0.24.0-rc.4).
-        let immature_coinbase = immature_coinbase_zats(engine_dir, target_height)?;
+        let immature_coinbase = immature_coinbase_zats(engine_dir, scope, target_height)?;
         let from_pending = immature_coinbase.min(info.pending);
         let from_spendable = (immature_coinbase - from_pending).min(info.transparent_spendable);
         info.pending -= from_pending;
@@ -139,7 +235,7 @@ pub fn balance(
         // The mature-coinbase breakout (see the field docs). Clamped to the transparent bucket
         // so it is a subset of `trusted` by construction even if the upstream bucketing shifts.
         info.mature_coinbase =
-            mature_coinbase_zats(engine_dir, target_height)?.min(info.transparent_spendable);
+            mature_coinbase_zats(engine_dir, scope, target_height)?.min(info.transparent_spendable);
         info.total_spendable = info.orchard_spendable
             + info.sapling_spendable
             + info.transparent_spendable
@@ -152,16 +248,24 @@ pub fn balance(
 /// [`COINBASE_MATURITY`] confirmations at `target_height`). Mirrors the coinbase-maturity
 /// clause of `zcash_client_sqlite`'s `get_spendable_transparent_outputs` (which the balance
 /// queries lack) so `balance` can reclassify the immature value.
-fn immature_coinbase_zats(engine_dir: &Path, target_height: u32) -> anyhow::Result<u64> {
-    coinbase_zats(engine_dir, target_height, false)
+fn immature_coinbase_zats(
+    engine_dir: &Path,
+    scope: AccountScope,
+    target_height: u32,
+) -> anyhow::Result<u64> {
+    coinbase_zats(engine_dir, scope, target_height, false)
 }
 
 /// Unspent, mined, **mature** coinbase value - the other side of the maturity split. Backs
 /// [`BalanceInfo::mature_coinbase`] and the actor's `-6` enrichment (the "spendable only via
 /// z_shieldcoinbase" hint), so the number a failed send reports is the same one `getbalances`
 /// shows.
-pub fn mature_coinbase_zats(engine_dir: &Path, target_height: u32) -> anyhow::Result<u64> {
-    coinbase_zats(engine_dir, target_height, true)
+pub fn mature_coinbase_zats(
+    engine_dir: &Path,
+    scope: AccountScope,
+    target_height: u32,
+) -> anyhow::Result<u64> {
+    coinbase_zats(engine_dir, scope, target_height, true)
 }
 
 /// Sum unspent, mined coinbase value on the requested side of the [`COINBASE_MATURITY`]
@@ -169,10 +273,16 @@ pub fn mature_coinbase_zats(engine_dir: &Path, target_height: u32) -> anyhow::Re
 /// 1)` - unknown defaults to *non*-coinbase, so a bare UTXO row can't masquerade as coinbase),
 /// and it is suppressed by a spend only while the spending tx is still live (mined or
 /// unexpired), mirroring the `listunspent` query below.
-fn coinbase_zats(engine_dir: &Path, target_height: u32, mature: bool) -> anyhow::Result<u64> {
+fn coinbase_zats(
+    engine_dir: &Path,
+    scope: AccountScope,
+    target_height: u32,
+    mature: bool,
+) -> anyhow::Result<u64> {
     let conn = open_conn(engine_dir)?;
     let unexpired_stx = tx_unexpired_sql("stx");
     let maturity_cmp = if mature { ">=" } else { "<" };
+    let account = scope_by_id("txo.account_id");
     let sql = format!(
         "SELECT IFNULL(SUM(txo.value_zat), 0)
          FROM transparent_received_outputs txo
@@ -180,6 +290,7 @@ fn coinbase_zats(engine_dir: &Path, target_height: u32, mature: bool) -> anyhow:
          WHERE t.mined_height IS NOT NULL
            AND IFNULL(t.tx_index, 1) == 0
            AND :target_height - t.mined_height {maturity_cmp} {COINBASE_MATURITY}
+           AND {account}
            AND txo.id NOT IN (
                SELECT s.transparent_received_output_id
                FROM transparent_received_output_spends s
@@ -189,16 +300,24 @@ fn coinbase_zats(engine_dir: &Path, target_height: u32, mature: bool) -> anyhow:
     );
     let total: i64 = conn.query_row(
         &sql,
-        named_params! { ":target_height": target_height },
+        named_params! {
+            ":target_height": target_height,
+            ":scope_account": scope.param(),
+        },
         |r| r.get(0),
     )?;
     Ok(u64::try_from(total).unwrap_or(0))
 }
 
 /// Number of transactions in the wallet (for `getwalletinfo.txcount`).
-pub fn tx_count(engine_dir: &Path) -> anyhow::Result<u64> {
+pub fn tx_count(engine_dir: &Path, scope: AccountScope) -> anyhow::Result<u64> {
     let conn = open_conn(engine_dir)?;
-    let n: i64 = conn.query_row("SELECT COUNT(*) FROM v_transactions", [], |r| r.get(0))?;
+    let account = scope_by_uuid("account_uuid");
+    let n: i64 = conn.query_row(
+        &format!("SELECT COUNT(*) FROM v_transactions WHERE {account}"),
+        named_params! { ":scope_account": scope.param() },
+        |r| r.get(0),
+    )?;
     Ok(n as u64)
 }
 
@@ -373,28 +492,41 @@ fn tx_unexpired_sql(alias: &str) -> String {
 /// transaction can hold outputs in more than one pool, and `output_index` is the index within
 /// that pool's bundle, so the pool must lead for the pair to be a well-defined key. Named so
 /// the ordering tests exercise this exact text rather than a transcription of it.
+///
+/// The account predicate is written into the constant rather than formatted in, so the ordering
+/// test still runs character-for-character what the caller runs. It is the same predicate
+/// [`scope_by_output_account`] builds for the queries that must assemble their SQL.
 const LOAD_OUTPUTS_SQL: &str = "SELECT output_pool, output_index, from_account_uuid,
                 to_account_uuid, to_address, value, is_change, recipient_key_scope, memo
          FROM v_tx_outputs
          WHERE txid = :txid
+           AND (:scope_account IS NULL OR to_account_uuid = :scope_account
+                OR from_account_uuid = :scope_account)
          ORDER BY output_pool ASC, output_index ASC";
 
 /// Outputs come back ordered by `(output_pool, output_index)` - see [`LOAD_OUTPUTS_SQL`].
-fn load_outputs(conn: &Connection, txid: &[u8]) -> anyhow::Result<Vec<TxOutputRecord>> {
+fn load_outputs(
+    conn: &Connection,
+    scope: AccountScope,
+    txid: &[u8],
+) -> anyhow::Result<Vec<TxOutputRecord>> {
     let mut stmt = conn.prepare(LOAD_OUTPUTS_SQL)?;
-    let rows = stmt.query_map(named_params! {":txid": txid}, |row| {
-        Ok(TxOutputRecord {
-            pool: row.get("output_pool")?,
-            output_index: row.get("output_index")?,
-            from_account: row.get::<_, Option<Uuid>>("from_account_uuid")?,
-            to_account: row.get::<_, Option<Uuid>>("to_account_uuid")?,
-            to_address: row.get("to_address")?,
-            value: row.get("value")?,
-            is_change: row.get("is_change")?,
-            recipient_key_scope: row.get::<_, Option<i64>>("recipient_key_scope")?,
-            memo: row.get("memo")?,
-        })
-    })?;
+    let rows = stmt.query_map(
+        named_params! {":txid": txid, ":scope_account": scope.param()},
+        |row| {
+            Ok(TxOutputRecord {
+                pool: row.get("output_pool")?,
+                output_index: row.get("output_index")?,
+                from_account: row.get::<_, Option<Uuid>>("from_account_uuid")?,
+                to_account: row.get::<_, Option<Uuid>>("to_account_uuid")?,
+                to_address: row.get("to_address")?,
+                value: row.get("value")?,
+                is_change: row.get("is_change")?,
+                recipient_key_scope: row.get::<_, Option<i64>>("recipient_key_scope")?,
+                memo: row.get("memo")?,
+            })
+        },
+    )?;
     let mut out = Vec::new();
     for r in rows {
         out.push(r?);
@@ -472,6 +604,7 @@ pub struct TxQuery {
 /// whole transaction-level order rather than interleaving a descending height with an ascending
 /// txid.
 fn tx_query_sql(newest_first: bool) -> String {
+    let account = scope_by_uuid("v.account_uuid");
     let order = if newest_first {
         "ORDER BY sort_height DESC NULLS FIRST, v.txid DESC"
     } else {
@@ -487,6 +620,7 @@ fn tx_query_sql(newest_first: bool) -> String {
          WHERE (:start_height IS NULL OR v.mined_height >= :start_height
                 OR (v.mined_height IS NULL AND :end_height IS NULL))
            AND (:end_height IS NULL OR v.mined_height < :end_height)
+           AND {account}
          {order}
          LIMIT :limit OFFSET :offset"
     )
@@ -513,13 +647,18 @@ fn tx_query_sql(newest_first: bool) -> String {
 /// `(mined_height, txid, pool, output_index)` sequence, and can resume from the last
 /// `(height, txid, output_index)` they processed. `newest_first` reverses the transaction-level
 /// keys together; the within-transaction output order is unaffected.
-pub fn query_transactions(engine_dir: &Path, q: &TxQuery) -> anyhow::Result<Vec<TxRecord>> {
+pub fn query_transactions(
+    engine_dir: &Path,
+    scope: AccountScope,
+    q: &TxQuery,
+) -> anyhow::Result<Vec<TxRecord>> {
     let conn = open_conn(engine_dir)?;
     let mut stmt = conn.prepare(&tx_query_sql(q.newest_first))?;
     let rows = stmt.query_map(
         named_params! {
             ":start_height": q.start_height,
             ":end_height": q.end_height,
+            ":scope_account": scope.param(),
             // LIMIT -1 means "no limit" in SQLite.
             ":limit": q.limit.map(i64::from).unwrap_or(-1),
             ":offset": q.offset,
@@ -532,7 +671,7 @@ pub fn query_transactions(engine_dir: &Path, q: &TxQuery) -> anyhow::Result<Vec<
     }
     let mut records = Vec::with_capacity(pending.len());
     for (txid, mut rec) in pending {
-        rec.outputs = load_outputs(&conn, &txid)?;
+        rec.outputs = load_outputs(&conn, scope, &txid)?;
         records.push(rec);
     }
     Ok(records)
@@ -541,8 +680,8 @@ pub fn query_transactions(engine_dir: &Path, q: &TxQuery) -> anyhow::Result<Vec<
 /// All transactions, oldest first (callers apply skip/count). Mirrors `list_tx.rs`. A thin
 /// wrapper over [`query_transactions`] with no filtering, kept for callers that genuinely
 /// want the whole history (`gettransaction.details` aggregation, tests).
-pub fn list_transactions(engine_dir: &Path) -> anyhow::Result<Vec<TxRecord>> {
-    query_transactions(engine_dir, &TxQuery::default())
+pub fn list_transactions(engine_dir: &Path, scope: AccountScope) -> anyhow::Result<Vec<TxRecord>> {
+    query_transactions(engine_dir, scope, &TxQuery::default())
 }
 
 /// A lightweight data source for the received-by aggregations
@@ -559,51 +698,54 @@ pub fn list_transactions(engine_dir: &Path) -> anyhow::Result<Vec<TxRecord>> {
 /// t-address (see [`load_outputs`]), so a t-address filter matches the stored rows directly.
 pub fn received_tx_records(
     engine_dir: &Path,
+    scope: AccountScope,
     address_filter: Option<&str>,
 ) -> anyhow::Result<Vec<TxRecord>> {
     let conn = open_conn(engine_dir)?;
+    let account = scope_by_uuid("v.account_uuid");
     // Order by the same `sort_height` (oldest-first) as `list_transactions`, so the per-address
     // `txids` list `listreceivedbyaddress` emits is in the identical order it was before this
-    // flat path replaced the full N+1 load - including the `txid` and `(pool, output_index)`
-    // tiebreaks (see [`query_transactions`]'s ordering contract). The grouping below preserves
-    // first-seen txid order, so a fully ordered query is what makes the emitted `txids` list
-    // deterministic across calls rather than merely height-sorted.
-    let mut stmt = conn.prepare(
+    // flat path replaced the full N+1 load.
+    let mut stmt = conn.prepare(&format!(
         "SELECT v.txid, v.mined_height, v.expired_unmined,
                 o.to_address, o.value, o.is_change, o.to_account_uuid, o.output_pool,
                 o.recipient_key_scope, v.tx_index
          FROM v_transactions v
          JOIN v_tx_outputs o ON o.txid = v.txid
          WHERE (:addr IS NULL OR o.to_address = :addr)
+           AND {account}
          ORDER BY COALESCE(
                 v.mined_height,
                 CASE WHEN v.expiry_height == 0 THEN NULL ELSE v.expiry_height END
             ) ASC NULLS LAST,
-            v.txid ASC, o.output_pool ASC, o.output_index ASC",
+            v.txid ASC, o.output_pool ASC, o.output_index ASC"
+    ))?;
+    let rows = stmt.query_map(
+        named_params! { ":addr": address_filter, ":scope_account": scope.param() },
+        |row| {
+            Ok((
+                row.get::<_, Vec<u8>>(0)?,
+                row.get::<_, Option<u32>>(1)?,
+                row.get::<_, bool>(2)?,
+                // `tx_index` identifies a coinbase tx (block index 0), which the aggregation needs
+                // for the transparent coinbase-maturity exclusion.
+                row.get::<_, Option<u32>>(9)?,
+                TxOutputRecord {
+                    // `output_index`/`from_account`/`memo` are unused by the aggregation; `pool`
+                    // is carried through so the record is the same shape [`load_outputs`] produces.
+                    pool: row.get(7)?,
+                    output_index: 0,
+                    from_account: None,
+                    to_account: row.get::<_, Option<Uuid>>(6)?,
+                    to_address: row.get(3)?,
+                    value: row.get(4)?,
+                    is_change: row.get(5)?,
+                    recipient_key_scope: row.get::<_, Option<i64>>(8)?,
+                    memo: None,
+                },
+            ))
+        },
     )?;
-    let rows = stmt.query_map(named_params! { ":addr": address_filter }, |row| {
-        Ok((
-            row.get::<_, Vec<u8>>(0)?,
-            row.get::<_, Option<u32>>(1)?,
-            row.get::<_, bool>(2)?,
-            // `tx_index` identifies a coinbase tx (block index 0), which the aggregation needs
-            // for the transparent coinbase-maturity exclusion.
-            row.get::<_, Option<u32>>(9)?,
-            TxOutputRecord {
-                // `output_index`/`from_account`/`memo` are unused by the aggregation; `pool`
-                // is carried through so the record is the same shape [`load_outputs`] produces.
-                pool: row.get(7)?,
-                output_index: 0,
-                from_account: None,
-                to_account: row.get::<_, Option<Uuid>>(6)?,
-                to_address: row.get(3)?,
-                value: row.get(4)?,
-                is_change: row.get(5)?,
-                recipient_key_scope: row.get::<_, Option<i64>>(8)?,
-                memo: None,
-            },
-        ))
-    })?;
     // Group outputs back under their transaction, preserving first-seen txid order.
     let mut order: Vec<Vec<u8>> = Vec::new();
     let mut by_txid: HashMap<Vec<u8>, TxRecord> = HashMap::new();
@@ -638,20 +780,25 @@ pub fn received_tx_records(
 pub fn get_transaction(
     network: ZNetwork,
     engine_dir: &Path,
+    scope: AccountScope,
     txid_hex: &str,
 ) -> anyhow::Result<Option<TxRecord>> {
     let Some(internal) = txid_internal(txid_hex) else {
         return Ok(None);
     };
     let conn = open_conn(engine_dir)?;
-    let mut stmt = conn.prepare(&format!("SELECT {TX_COLS} {TX_FROM} WHERE v.txid = :txid"))?;
-    let mut rows = stmt.query(named_params! {":txid": internal})?;
+    let account = scope_by_uuid("v.account_uuid");
+    let mut stmt = conn.prepare(&format!(
+        "SELECT {TX_COLS} {TX_FROM} WHERE v.txid = :txid AND {account}"
+    ))?;
+    let mut rows =
+        stmt.query(named_params! {":txid": internal, ":scope_account": scope.param()})?;
     let Some(row) = rows.next()? else {
         return Ok(None);
     };
     let (txid, mut rec) = tx_from_row(row)?;
     drop(rows);
-    rec.outputs = load_outputs(&conn, &txid)?;
+    rec.outputs = load_outputs(&conn, scope, &txid)?;
     // Fetch the raw transaction bytes for `gettransaction.hex` via the public `WalletRead` API
     // (mirroring the actor's `do_get_raw_tx`) instead of reading librustzcash's internal
     // `transactions.raw` column directly: this yields the canonical consensus serialization off
@@ -862,7 +1009,11 @@ pub fn median_time_past(engine_dir: &Path, height: u32) -> anyhow::Result<Option
 }
 
 /// List unspent Orchard notes for `listunspent` (with mined height for confirmations).
-pub fn list_unspent(network: ZNetwork, engine_dir: &Path) -> anyhow::Result<Vec<UnspentNote>> {
+pub fn list_unspent(
+    network: ZNetwork,
+    engine_dir: &Path,
+    scope: AccountScope,
+) -> anyhow::Result<Vec<UnspentNote>> {
     let db = open_read(network, engine_dir)?;
     let Some(chain_height) = db.chain_height()? else {
         return Ok(vec![]);
@@ -882,9 +1033,12 @@ pub fn list_unspent(network: ZNetwork, engine_dir: &Path) -> anyhow::Result<Vec<
     let mut out_pool: HashMap<(String, u32), i64> = HashMap::new();
     {
         let conn = open_conn(engine_dir)?;
-        let mut stmt =
-            conn.prepare("SELECT txid, mined_height, account_balance_delta FROM v_transactions")?;
-        let rows = stmt.query_map([], |r| {
+        let tx_account = scope_by_uuid("account_uuid");
+        let mut stmt = conn.prepare(&format!(
+            "SELECT txid, mined_height, account_balance_delta FROM v_transactions
+             WHERE {tx_account}"
+        ))?;
+        let rows = stmt.query_map(named_params! { ":scope_account": scope.param() }, |r| {
             Ok((
                 r.get::<_, Vec<u8>>(0)?,
                 r.get::<_, Option<u32>>(1)?,
@@ -895,11 +1049,12 @@ pub fn list_unspent(network: ZNetwork, engine_dir: &Path) -> anyhow::Result<Vec<
             let (txid, mh, delta) = row?;
             tx_meta.insert(txid_display(&txid), (mh, delta < 0));
         }
-        let mut stmt = conn.prepare(
+        let out_account = scope_by_output_account();
+        let mut stmt = conn.prepare(&format!(
             "SELECT txid, output_index, output_pool, to_address FROM v_tx_outputs
-             WHERE output_pool IN (2, 3, 4)",
-        )?;
-        let rows = stmt.query_map([], |r| {
+             WHERE output_pool IN (2, 3, 4) AND {out_account}"
+        ))?;
+        let rows = stmt.query_map(named_params! { ":scope_account": scope.param() }, |r| {
             Ok((
                 r.get::<_, Vec<u8>>(0)?,
                 r.get::<_, u32>(1)?,
@@ -933,7 +1088,7 @@ pub fn list_unspent(network: ZNetwork, engine_dir: &Path) -> anyhow::Result<Vec<
     // `Receiver::SUPPORTED` member (ironwood has no UA receiver - see `pools.rs`), so add it explicitly.
     // Harmless pre-NU6.3: the ironwood note table is simply empty on mainnet / pre-activation testnet.
     protocols.push(ShieldedPool::Ironwood);
-    for account in db.get_account_ids()? {
+    for account in scoped_account_ids(&db, scope)? {
         let notes = db.select_unspent_notes(
             account,
             &protocols,
@@ -1163,11 +1318,11 @@ pub fn list_unspent(network: ZNetwork, engine_dir: &Path) -> anyhow::Result<Vec<
 /// Every address the wallet has generated, encoded for the network (for
 /// `listreceivedbyaddress` with `include_empty`). Includes the wallet's exposed transparent
 /// receivers as base58 t-addresses (a no-op for zecd wallets, which never expose any).
-pub fn all_addresses(network: ZNetwork, engine_dir: &Path) -> Vec<String> {
+pub fn all_addresses(network: ZNetwork, engine_dir: &Path, scope: AccountScope) -> Vec<String> {
     let Ok(db) = open_read(network, engine_dir) else {
         return Vec::new();
     };
-    let Ok(ids) = db.get_account_ids() else {
+    let Ok(ids) = scoped_account_ids(&db, scope) else {
         return Vec::new();
     };
     let mut out = Vec::new();
@@ -1213,11 +1368,11 @@ pub fn all_addresses(network: ZNetwork, engine_dir: &Path) -> Vec<String> {
 /// a bare t-address, never mixed into a UA, so a UA that carries one can only be a splice (a
 /// transparent-only sender would pay the attacker), rejected even when a shielded receiver alongside
 /// it genuinely is the wallet's.
-pub fn is_mine(network: ZNetwork, engine_dir: &Path, addr: &str) -> bool {
+pub fn is_mine(network: ZNetwork, engine_dir: &Path, scope: AccountScope, addr: &str) -> bool {
     let Ok(db) = open_read(network, engine_dir) else {
         return false;
     };
-    let Ok(ids) = db.get_account_ids() else {
+    let Ok(ids) = scoped_account_ids(&db, scope) else {
         return false;
     };
     // Decode once for the crypto path; `None` (unparseable / wrong network) just skips it.
@@ -1402,7 +1557,12 @@ fn classify_receivers_with_ufvk(ufvk: &UnifiedFullViewingKey, ua: &UnifiedAddres
 /// [`UaReceivers`]. Non-unified addresses and UAs carrying fewer than two shielded receivers are
 /// [`UaReceivers::NotApplicable`]. Best-effort: storage errors degrade to `NotApplicable` rather
 /// than erroring, so callers fall back to their existing (byte-exact) ownership checks.
-pub fn classify_unified_receivers(network: ZNetwork, engine_dir: &Path, addr: &str) -> UaReceivers {
+pub fn classify_unified_receivers(
+    network: ZNetwork,
+    engine_dir: &Path,
+    scope: AccountScope,
+    addr: &str,
+) -> UaReceivers {
     let Some(Address::Unified(ua)) = Address::decode(&network, addr) else {
         return UaReceivers::NotApplicable;
     };
@@ -1414,11 +1574,12 @@ pub fn classify_unified_receivers(network: ZNetwork, engine_dir: &Path, addr: &s
     let Ok(db) = open_read(network, engine_dir) else {
         return UaReceivers::NotApplicable;
     };
-    let Ok(ids) = db.get_account_ids() else {
+    let Ok(ids) = scoped_account_ids(&db, scope) else {
         return UaReceivers::NotApplicable;
     };
-    // One account per wallet today, but iterate so a future multi-account wallet still resolves
-    // the receivers against whichever account owns them. The first non-`Foreign` verdict wins.
+    // A shard database holds several wallets' accounts, so the scope decides which key the
+    // receivers are checked against; within one wallet's accounts the first non-`Foreign`
+    // verdict wins.
     for id in ids {
         let Ok(Some(account)) = db.get_account(id) else {
             continue;
@@ -1477,6 +1638,7 @@ impl TransparentDerivation {
 pub fn transparent_derivation(
     network: ZNetwork,
     engine_dir: &Path,
+    scope: AccountScope,
     addr: &str,
 ) -> Option<TransparentDerivation> {
     let taddr = match Address::decode(&network, addr)? {
@@ -1484,7 +1646,7 @@ pub fn transparent_derivation(
         _ => return None,
     };
     let db = open_read(network, engine_dir).ok()?;
-    for id in db.get_account_ids().ok()? {
+    for id in scoped_account_ids(&db, scope).ok()? {
         let Ok(Some(meta)) = db.get_transparent_address_metadata(id, &taddr) else {
             continue;
         };
@@ -1538,7 +1700,10 @@ mod tests {
             "CREATE TABLE v_transactions (
                  mined_height INTEGER, txid BLOB, expiry_height INTEGER,
                  account_balance_delta INTEGER, fee_paid INTEGER, block_time INTEGER,
-                 expired_unmined BOOLEAN, tx_index INTEGER
+                 expired_unmined BOOLEAN, tx_index INTEGER,
+                 -- Read by the [`AccountScope`] predicate the production SQL carries; the
+                 -- ordering tests bind `NULL` for it, which is the unscoped arm.
+                 account_uuid BLOB
              );
              CREATE TABLE v_tx_outputs (
                  txid BLOB, output_pool INTEGER, output_index INTEGER,
@@ -1557,8 +1722,8 @@ mod tests {
         conn.execute(
             "INSERT INTO v_transactions
                  (mined_height, txid, expiry_height, account_balance_delta, fee_paid,
-                  block_time, expired_unmined, tx_index)
-             VALUES (?1, ?2, 0, 0, NULL, NULL, 0, NULL)",
+                  block_time, expired_unmined, tx_index, account_uuid)
+             VALUES (?1, ?2, 0, 0, NULL, NULL, 0, NULL, NULL)",
             rusqlite::params![mined_height, vec![byte; 32]],
         )
         .unwrap();
@@ -1570,6 +1735,7 @@ mod tests {
             named_params! {
                 ":start_height": None::<u32>,
                 ":end_height": None::<u32>,
+                ":scope_account": None::<Uuid>,
                 ":limit": -1i64,
                 ":offset": 0u32,
             },
@@ -1662,9 +1828,10 @@ mod tests {
 
         let mut stmt = conn.prepare(LOAD_OUTPUTS_SQL).unwrap();
         let got: Vec<(i64, u32)> = stmt
-            .query_map(named_params! {":txid": txid}, |row| {
-                Ok((row.get("output_pool")?, row.get("output_index")?))
-            })
+            .query_map(
+                named_params! {":txid": txid, ":scope_account": None::<Uuid>},
+                |row| Ok((row.get("output_pool")?, row.get("output_index")?)),
+            )
             .unwrap()
             .map(|r| r.unwrap())
             .collect();
@@ -1850,10 +2017,12 @@ mod tests {
              CREATE TABLE transparent_received_outputs(
                  id INTEGER PRIMARY KEY,
                  transaction_id INTEGER,
+                 account_id INTEGER,
                  value_zat INTEGER);
              CREATE TABLE transparent_received_output_spends(
                  transparent_received_output_id INTEGER,
-                 transaction_id INTEGER);",
+                 transaction_id INTEGER);
+             CREATE TABLE accounts(id INTEGER PRIMARY KEY, uuid BLOB NOT NULL);",
         )
         .unwrap();
         let target: u32 = 200;
@@ -1878,12 +2047,34 @@ mod tests {
             )
             .unwrap();
             conn.execute(
-                "INSERT INTO transparent_received_outputs(id, transaction_id, value_zat)
-                 VALUES (?1, ?1, ?2)",
+                "INSERT INTO transparent_received_outputs(id, transaction_id, account_id,
+                                                          value_zat)
+                 VALUES (?1, ?1, 1, ?2)",
                 rusqlite::params![id, value],
             )
             .unwrap();
         }
+        // A second account in the same database - a fleet shard's shape - holding its own mature
+        // coinbase. Nothing about it may show up in the first account's totals.
+        conn.execute(
+            "INSERT INTO transactions(id_tx, mined_height, tx_index, expiry_height,
+                                      min_observed_height)
+             VALUES (7, ?1, 0, 0, 1)",
+            rusqlite::params![m],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO transparent_received_outputs(id, transaction_id, account_id, value_zat)
+             VALUES (7, 7, 2, 9_000_000)",
+            [],
+        )
+        .unwrap();
+        let (account_a, account_b) = (uuid::Uuid::from_u128(0xaa), uuid::Uuid::from_u128(0xbb));
+        conn.execute(
+            "INSERT INTO accounts(id, uuid) VALUES (1, ?1), (2, ?2)",
+            rusqlite::params![account_a, account_b],
+        )
+        .unwrap();
         // Spend output 6 with a mined (live) tx, so it is suppressed from both sides.
         conn.execute(
             "INSERT INTO transactions(id_tx, mined_height, tx_index, expiry_height,
@@ -1901,15 +2092,30 @@ mod tests {
         .unwrap();
         drop(conn);
 
+        let only_a = AccountScope::Only(AccountUuid::from_uuid(account_a));
+        let only_b = AccountScope::Only(AccountUuid::from_uuid(account_b));
         assert_eq!(
-            super::mature_coinbase_zats(dir.path(), target).unwrap(),
+            super::mature_coinbase_zats(dir.path(), only_a, target).unwrap(),
             1_000,
             "mature = the boundary coinbase only (spent one suppressed)"
         );
         assert_eq!(
-            super::immature_coinbase_zats(dir.path(), target).unwrap(),
+            super::immature_coinbase_zats(dir.path(), only_a, target).unwrap(),
             200,
             "immature = the one-short coinbase only"
+        );
+        // The scope is what keeps a shard's wallets apart: account B's 9M-zat coinbase must not
+        // reach account A's total, and vice versa.
+        assert_eq!(
+            super::mature_coinbase_zats(dir.path(), only_b, target).unwrap(),
+            9_000_000,
+            "account B sees its own coinbase and none of A's"
+        );
+        // Unscoped is the pre-fleet behaviour: everything the database holds.
+        assert_eq!(
+            super::mature_coinbase_zats(dir.path(), AccountScope::Any, target).unwrap(),
+            9_001_000,
+            "AccountScope::Any sums every account, as it always did"
         );
     }
 

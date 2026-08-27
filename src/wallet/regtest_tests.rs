@@ -182,25 +182,28 @@ fn regtest_wallet_lifecycle() {
 
     // The handed-out transparent address is recognised as the wallet's own.
     assert!(
-        read::is_mine(net, engine_dir, &taddr),
+        read::is_mine(net, engine_dir, read::AccountScope::Any, &taddr),
         "a handed-out transparent receiver should be is_mine, got {taddr}"
     );
 
     // 3. Read helpers operate on a regtest wallet: empty-but-valid balances and note set.
-    let bal = read::balance(net, engine_dir, Default::default()).expect("balance");
+    let bal = read::balance(net, engine_dir, read::AccountScope::Any, Default::default())
+        .expect("balance");
     assert_eq!(bal.total_spendable, 0);
     assert_eq!(bal.pending, 0);
-    assert!(read::list_unspent(net, engine_dir)
+    assert!(read::list_unspent(net, engine_dir, read::AccountScope::Any)
         .expect("listunspent")
         .is_empty());
     // The transaction queries (v_transactions joined with blocks + raw transactions for
     // blockhash / blockindex / created_time) run against the real librustzcash schema.
-    assert!(read::list_transactions(engine_dir)
+    assert!(read::list_transactions(engine_dir, read::AccountScope::Any)
         .expect("listtransactions")
         .is_empty());
-    assert!(read::get_transaction(net, engine_dir, &"ab".repeat(32))
-        .expect("gettransaction")
-        .is_none());
+    assert!(
+        read::get_transaction(net, engine_dir, read::AccountScope::Any, &"ab".repeat(32))
+            .expect("gettransaction")
+            .is_none()
+    );
     assert!(!read::tx_exists(engine_dir, &"ab".repeat(32)));
     assert!(read::first_scanned_block(engine_dir)
         .expect("first_scanned_block")
@@ -212,17 +215,24 @@ fn regtest_wallet_lifecycle() {
     // `zcash_client_sqlite` bump that renames a column we depend on fails loudly here (offline)
     // instead of silently at runtime. Together with the `list_unspent`/`list_transactions`/
     // `get_transaction` calls above, this covers every internal column zecd reads.
-    assert_eq!(read::tx_count(engine_dir).expect("tx_count"), 0);
+    assert_eq!(
+        read::tx_count(engine_dir, read::AccountScope::Any).expect("tx_count"),
+        0
+    );
     assert!(read::unmined_raw_txs(engine_dir, 1)
         .expect("unmined_raw_txs")
         .is_empty());
     // received_tx_records runs in both the unfiltered and address-filtered shapes.
-    assert!(read::received_tx_records(engine_dir, None)
-        .expect("received_tx_records")
-        .is_empty());
-    assert!(read::received_tx_records(engine_dir, Some(addr.as_str()))
-        .expect("received_tx_records filtered")
-        .is_empty());
+    assert!(
+        read::received_tx_records(engine_dir, read::AccountScope::Any, None)
+            .expect("received_tx_records")
+            .is_empty()
+    );
+    assert!(
+        read::received_tx_records(engine_dir, read::AccountScope::Any, Some(addr.as_str()))
+            .expect("received_tx_records filtered")
+            .is_empty()
+    );
     // The `blocks`-table queries (no public API exposes block time / a reverse hash lookup).
     assert!(read::block_info_at(engine_dir, 1)
         .expect("block_info_at")
@@ -236,12 +246,12 @@ fn regtest_wallet_lifecycle() {
 
     // 4. is_mine is network-scoped: true for our own regtest address, false for a testnet UA.
     assert!(
-        read::is_mine(net, engine_dir, &addr),
+        read::is_mine(net, engine_dir, read::AccountScope::Any, &addr),
         "the wallet's own regtest address is mine"
     );
     let testnet_ua = "utest12r53eljnr7kev8ychw3ahzjgm6fwxm7fd8vfay7hn9uylj05x0pxxhze800h9dcgyr8hkc7kz3s2crnrhjcy2p90yfce2vl8mq667zw0";
     assert!(
-        !read::is_mine(net, engine_dir, testnet_ua),
+        !read::is_mine(net, engine_dir, read::AccountScope::Any, testnet_ua),
         "a testnet address is not valid on regtest"
     );
 
@@ -299,11 +309,11 @@ fn is_mine_attributes_unrecorded_addresses_via_viewing_key() {
         .expect("derive Orchard UA")
         .encode(&net);
     assert!(
-        !read::all_addresses(net, engine_dir).contains(&orchard_addr),
+        !read::all_addresses(net, engine_dir, read::AccountScope::Any).contains(&orchard_addr),
         "the far-index address must not be pre-recorded, so only the crypto path can match"
     );
     assert!(
-        read::is_mine(net, engine_dir, &orchard_addr),
+        read::is_mine(net, engine_dir, read::AccountScope::Any, &orchard_addr),
         "own Orchard UA must be ismine via viewing-key attribution"
     );
 
@@ -315,13 +325,13 @@ fn is_mine_attributes_unrecorded_addresses_via_viewing_key() {
     let sapling_addr =
         Address::Sapling(*all_ua.sapling().expect("UFVK has a Sapling receiver")).encode(&net);
     assert!(
-        read::is_mine(net, engine_dir, &sapling_addr),
+        read::is_mine(net, engine_dir, read::AccountScope::Any, &sapling_addr),
         "own bare Sapling address must be ismine via viewing-key attribution"
     );
 
     // --- Recorded-address fast path still resolves ---
     assert!(
-        read::is_mine(net, engine_dir, &recorded),
+        read::is_mine(net, engine_dir, read::AccountScope::Any, &recorded),
         "a recorded address stays ismine"
     );
 
@@ -340,7 +350,7 @@ fn is_mine_attributes_unrecorded_addresses_via_viewing_key() {
         .unwrap()
         .encode(&net);
     assert!(
-        !read::is_mine(net, engine_dir, &foreign_orchard),
+        !read::is_mine(net, engine_dir, read::AccountScope::Any, &foreign_orchard),
         "a foreign Orchard UA must not be ismine"
     );
     let foreign_all = fuivk
@@ -348,7 +358,7 @@ fn is_mine_attributes_unrecorded_addresses_via_viewing_key() {
         .unwrap();
     let foreign_sapling = Address::Sapling(*foreign_all.sapling().unwrap()).encode(&net);
     assert!(
-        !read::is_mine(net, engine_dir, &foreign_sapling),
+        !read::is_mine(net, engine_dir, read::AccountScope::Any, &foreign_sapling),
         "a foreign bare Sapling address must not be ismine"
     );
 }
@@ -412,7 +422,12 @@ fn is_mine_rejects_spliced_unified_address_with_foreign_receiver() {
     // Sanity: a genuinely own shielded UA (every receiver ours at one index) is still ismine under
     // the consistency-aware rule.
     assert!(
-        read::is_mine(net, engine_dir, &mine_shielded.encode(&net)),
+        read::is_mine(
+            net,
+            engine_dir,
+            read::AccountScope::Any,
+            &mine_shielded.encode(&net)
+        ),
         "the wallet's own shielded UA must stay ismine"
     );
 
@@ -431,12 +446,13 @@ fn is_mine_rejects_spliced_unified_address_with_foreign_receiver() {
         read::is_mine(
             net,
             engine_dir,
+            read::AccountScope::Any,
             &Address::Sapling(*mine_shielded.sapling().unwrap()).encode(&net)
         ),
         "precondition: the victim's bare Sapling receiver is genuinely theirs"
     );
     assert!(
-        !read::is_mine(net, engine_dir, &splice_a),
+        !read::is_mine(net, engine_dir, read::AccountScope::Any, &splice_a),
         "a UA pairing the attacker's Orchard receiver with the victim's Sapling receiver must NOT \
          be ismine (a sender prefers Orchard and pays the attacker)"
     );
@@ -451,7 +467,7 @@ fn is_mine_rejects_spliced_unified_address_with_foreign_receiver() {
     .expect("build spliced UA")
     .encode(&net);
     assert!(
-        !read::is_mine(net, engine_dir, &splice_b),
+        !read::is_mine(net, engine_dir, read::AccountScope::Any, &splice_b),
         "a UA pairing the victim's Orchard receiver with the attacker's Sapling receiver must NOT \
          be ismine (a Sapling-only sender pays the attacker)"
     );
@@ -479,6 +495,7 @@ fn is_mine_rejects_spliced_unified_address_with_foreign_receiver() {
         read::is_mine(
             net,
             engine_dir,
+            read::AccountScope::Any,
             &UnifiedAddress::from_receivers(mine_shielded.orchard().cloned(), None, None)
                 .unwrap()
                 .encode(&net)
@@ -486,20 +503,120 @@ fn is_mine_rejects_spliced_unified_address_with_foreign_receiver() {
         "precondition: the victim's Orchard-only UA is genuinely theirs"
     );
     assert!(
-        !read::is_mine(net, engine_dir, &splice_c),
+        !read::is_mine(net, engine_dir, read::AccountScope::Any, &splice_c),
         "a UA stapling the wallet's Orchard receiver to a transparent receiver must NOT be ismine \
          (zecd never issues transparent receivers; a transparent-only sender pays the attacker)"
     );
 
     // The classifier agrees: both splices are Inconsistent (a foreign receiver mixed in).
     assert!(matches!(
-        read::classify_unified_receivers(net, engine_dir, &splice_a),
+        read::classify_unified_receivers(net, engine_dir, read::AccountScope::Any, &splice_a),
         read::UaReceivers::Inconsistent(_)
     ));
     assert!(matches!(
-        read::classify_unified_receivers(net, engine_dir, &splice_b),
+        read::classify_unified_receivers(net, engine_dir, read::AccountScope::Any, &splice_b),
         read::UaReceivers::Inconsistent(_)
     ));
+}
+
+/// Two accounts in **one** wallet database must not see each other through the read helpers.
+///
+/// This is the shape a fleet shard has: many watch-only wallets sharing one `WalletDb` so the
+/// chain is scanned once rather than once per wallet. Every read
+/// that reports a wallet's own money, history or addresses therefore carries an
+/// [`read::AccountScope`], and this is the guard that the scoping actually holds.
+///
+/// `is_mine` is the sharp one. It answers "does this wallet own this address?", and `z_sendmany`
+/// uses it to decide whether a `fromaddress` names funds the caller may spend from - so an
+/// unscoped `is_mine` in a shared database would let one wallet name another wallet's address as
+/// its funding source. The other direction matters too: scoping must not make a wallet stop
+/// recognizing its *own* addresses.
+#[test]
+fn accounts_sharing_one_database_do_not_see_each_others_addresses() {
+    let net = network::regtest();
+    let dir = tempfile::tempdir().unwrap();
+    let engine_dir = dir.path();
+    let mut db = open::init_dbs(net, engine_dir).unwrap();
+
+    // Two accounts from unrelated seeds, in one database.
+    let (account_a, _) = db
+        .create_account("a", &test_seed(), &genesis_birthday(), None)
+        .unwrap();
+    let (account_b, _) = db
+        .create_account("b", &foreign_seed(), &genesis_birthday(), None)
+        .unwrap();
+    assert_ne!(account_a, account_b);
+
+    let mut address_of = |account| {
+        db.get_address_for_index(
+            account,
+            zip32::DiversifierIndex::from(0u32),
+            UnifiedAddressRequest::AllAvailableKeys,
+        )
+        .unwrap()
+        .expect("index 0 derives an address")
+        .encode(&net)
+    };
+    let addr_a = address_of(account_a);
+    let addr_b = address_of(account_b);
+    assert_ne!(addr_a, addr_b, "unrelated seeds derive different addresses");
+    drop(db);
+
+    let scope_a = read::AccountScope::Only(account_a);
+    let scope_b = read::AccountScope::Only(account_b);
+
+    // Each account owns its own address and disowns the other's.
+    assert!(read::is_mine(net, engine_dir, scope_a, &addr_a));
+    assert!(
+        !read::is_mine(net, engine_dir, scope_a, &addr_b),
+        "account A must not claim account B's address"
+    );
+    assert!(read::is_mine(net, engine_dir, scope_b, &addr_b));
+    assert!(
+        !read::is_mine(net, engine_dir, scope_b, &addr_a),
+        "account B must not claim account A's address"
+    );
+    // Unscoped is the pre-fleet behaviour: the database as a whole owns both.
+    assert!(read::is_mine(
+        net,
+        engine_dir,
+        read::AccountScope::Any,
+        &addr_a
+    ));
+    assert!(read::is_mine(
+        net,
+        engine_dir,
+        read::AccountScope::Any,
+        &addr_b
+    ));
+
+    // `all_addresses` backs `getaddressesbyaccount`-style listings, so the same split applies.
+    let listed_a = read::all_addresses(net, engine_dir, scope_a);
+    let listed_b = read::all_addresses(net, engine_dir, scope_b);
+    assert!(listed_a.contains(&addr_a) && !listed_a.contains(&addr_b));
+    assert!(listed_b.contains(&addr_b) && !listed_b.contains(&addr_a));
+    let listed_all = read::all_addresses(net, engine_dir, read::AccountScope::Any);
+    assert!(listed_all.contains(&addr_a) && listed_all.contains(&addr_b));
+    assert_eq!(
+        listed_all.len(),
+        listed_a.len() + listed_b.len(),
+        "every listed address belongs to exactly one of the two accounts"
+    );
+
+    // Balances and history are empty here (nothing is funded), but they must be empty *per
+    // account* rather than by accident - and the scoped queries must run against the real
+    // schema, which is what this fixture adds over the hand-built one in `read.rs`.
+    for scope in [scope_a, scope_b, read::AccountScope::Any] {
+        assert_eq!(read::tx_count(engine_dir, scope).unwrap(), 0);
+        assert!(read::list_transactions(engine_dir, scope)
+            .unwrap()
+            .is_empty());
+        assert!(read::list_unspent(net, engine_dir, scope)
+            .unwrap()
+            .is_empty());
+        let bal = read::balance(net, engine_dir, scope, Default::default()).unwrap();
+        assert_eq!(bal.total_spendable, 0);
+    }
 }
 
 /// The watch-only (UFVK) pairing guarantee, offline on regtest:
@@ -623,10 +740,16 @@ fn watch_only_ufvk_wallet_pairs_with_spending_wallet() {
 
     // The read paths the RPC handlers use work against the watch-only DB.
     assert!(
-        read::is_mine(net, watch_dir.path(), &addr),
+        read::is_mine(net, watch_dir.path(), read::AccountScope::Any, &addr),
         "the watch-only wallet recognises its own address"
     );
-    let bal = read::balance(net, watch_dir.path(), Default::default()).expect("balance");
+    let bal = read::balance(
+        net,
+        watch_dir.path(),
+        read::AccountScope::Any,
+        Default::default(),
+    )
+    .expect("balance");
     assert_eq!((bal.total_spendable, bal.pending), (0, 0));
 }
 
