@@ -598,6 +598,61 @@ def main() -> int:
     ck("listwallets is a non-empty list of strings",
        isinstance(lw, list) and bool(lw) and all(isinstance(w, str) for w in lw), lw)
 
+    # listwalletdir: Bitcoin Core's {"wallets": [{"name": ...}]}. Every loaded wallet is also
+    # available on disk, so listwallets must be a subset of it.
+    lwd = rpc.call("listwalletdir")
+    ck("listwalletdir has a wallets array",
+       isinstance(lwd, dict) and isinstance(lwd.get("wallets"), list), lwd)
+    on_disk = {w.get("name") for w in lwd["wallets"] if isinstance(w, dict)}
+    ck("listwalletdir entries are {name: str} objects",
+       all(isinstance(n, str) for n in on_disk), on_disk)
+    ck("every loaded wallet is available on disk", set(lw) <= on_disk, (lw, on_disk))
+
+    # createwallet onboards a *view* wallet, so it needs a viewing key and a birthday and refuses
+    # every Bitcoin Core flag that would ask for a spending wallet. The parameter rejections are
+    # what a conformance run can assert without provisioning key material.
+    try:
+        rpc.call("createwallet")
+        ck("createwallet with no name raises", False)
+    except JSONRPCException as e:
+        ck("createwallet with no name -> -8", e.code == -8, e.code)
+    try:
+        rpc.call("createwallet", "conformance-tmp")
+        ck("createwallet without a ufvk raises", False)
+    except JSONRPCException as e:
+        ck("createwallet without a ufvk -> -8", e.code == -8, e.code)
+    try:
+        rpc.call("createwallet", "conformance-tmp", True, None, None, None, None, None, None,
+                 {"ufvk": "uview1notarealkey"})
+        ck("createwallet without a birthday raises", False)
+    except JSONRPCException as e:
+        ck("createwallet without a birthday -> -8", e.code == -8, e.code)
+    try:
+        # zecd loads at most one wallet with spending keys, and it is not created over the wire.
+        rpc.call("createwallet", "conformance-tmp", False)
+        ck("createwallet asking for spending keys raises", False)
+    except JSONRPCException as e:
+        ck("createwallet disable_private_keys=false -> -8", e.code == -8, e.code)
+
+    # loadwallet / unloadwallet name a wallet that is not loaded: -18, as for any unknown wallet.
+    for method in ("loadwallet", "unloadwallet"):
+        try:
+            rpc.call(method, "definitely-not-a-wallet")
+            ck(f"{method} on an unknown wallet raises", False)
+        except JSONRPCException as e:
+            ck(f"{method} unknown wallet -> -18 or -4", e.code in (-18, -4), e.code)
+
+    # A configured [wallets.<name>] entry is refused, not unloaded: loadwallet only restores
+    # fleet-manifest wallets, so unloading a configured one (the spending wallet included)
+    # would be irreversible until a restart.
+    try:
+        rpc.call("unloadwallet", "default")
+        ck("unloadwallet on a configured wallet raises", False)
+    except JSONRPCException as e:
+        ck("unloadwallet configured wallet -> -4", e.code == -4, e.code)
+    ck("the configured wallet is still served after the refusal",
+       isinstance(rpc.call("getwalletinfo"), dict))
+
     print("== listunspent ==")
     lu = rpc.call("listunspent")
     ck("listunspent is list", isinstance(lu, list))

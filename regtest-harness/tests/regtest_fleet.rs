@@ -327,6 +327,144 @@ async fn regtest_fleet_many_view_wallets_are_scanned_together_and_stay_isolated(
         );
     }
 
+    // --- Runtime onboarding ------------------------------------------------------------------
+    //
+    // A fleet that can only grow by editing a config file and restarting is not a fleet: every
+    // arrival would cost every wallet in the daemon a stop and a re-sync. `createwallet` places a
+    // new view wallet into a shard - opening one if none has room - and serves it immediately.
+    let newcomer = provision_view_wallets(zebrad.rpc_port, 1, 2)
+        .await
+        .expect("provision a late arrival")
+        .pop()
+        .expect("one wallet");
+    let created = zecd
+        .call(
+            "createwallet",
+            json!([
+                "late-arrival",
+                true,
+                null,
+                null,
+                null,
+                null,
+                null,
+                null,
+                { "ufvk": newcomer.ufvk, "birthday": 2 }
+            ]),
+        )
+        .await
+        .expect("createwallet onboards a view wallet");
+    assert_eq!(created["name"], json!("late-arrival"));
+
+    // It is served straight away, before it has scanned anything.
+    let info = zecd
+        .call_wallet("late-arrival", "getwalletinfo", json!([]))
+        .await
+        .expect("the new wallet answers immediately");
+    assert_eq!(info["private_keys_enabled"], json!(false));
+
+    // Onboarding is idempotent-proof: the same name twice is refused rather than served by two
+    // accounts, which would leave one of them silently unreachable.
+    let again = zecd
+        .call(
+            "createwallet",
+            json!(["late-arrival", true, null, null, null, null, null, null,
+                   { "ufvk": newcomer.ufvk, "birthday": 2 }]),
+        )
+        .await;
+    assert!(
+        again.is_err(),
+        "createwallet must refuse a name that is already loaded, got {again:?}"
+    );
+
+    // And it actually scans: pay it, and the money arrives in it and nowhere else.
+    let late_payment = 4_200_000;
+    funder
+        .send(&newcomer.address, late_payment)
+        .await
+        .expect("funder pays the late arrival");
+    zebrad
+        .generate_blocks(12)
+        .await
+        .expect("mine the late payment past the untrusted depth");
+    funder.sync(&zebrad).await.expect("funder follows the tip");
+    let tip = node_height(&zebrad).await;
+    let late = zecd_regtest_harness::ViewWallet {
+        name: "late-arrival".to_string(),
+        ..newcomer.clone()
+    };
+    wait_for_fleet(&zecd, std::slice::from_ref(&late), tip).await;
+    assert_eq!(
+        zec_to_zats(
+            &zecd
+                .call_wallet("late-arrival", "getbalance", json!([]))
+                .await
+                .expect("getbalance")
+        ),
+        late_payment,
+        "the wallet onboarded at runtime must be credited its payment"
+    );
+    // The wallets that were already there are undisturbed - onboarding must not have rewound a
+    // shard they live in and lost their balances.
+    for (index, wallet) in wallets.iter().enumerate() {
+        assert_eq!(
+            zec_to_zats(
+                &zecd
+                    .call_wallet(&wallet.name, "getbalance", json!([]))
+                    .await
+                    .expect("getbalance")
+            ),
+            payment_for(index),
+            "wallet '{}' lost its balance when a new wallet was onboarded",
+            wallet.name
+        );
+    }
+
+    // `listwalletdir` reports what is provisioned on disk, which is now the whole fleet plus the
+    // newcomer - the answer an operator needs when a name is missing from `listwallets`.
+    let on_disk: BTreeSet<String> = zecd
+        .call("listwalletdir", json!([]))
+        .await
+        .expect("listwalletdir")["wallets"]
+        .as_array()
+        .expect("an array")
+        .iter()
+        .map(|w| w["name"].as_str().expect("a name").to_string())
+        .collect();
+    assert!(on_disk.contains("late-arrival"));
+    for wallet in &wallets {
+        assert!(
+            on_disk.contains(&wallet.name),
+            "{} is provisioned",
+            wallet.name
+        );
+    }
+
+    // Unload stops serving it without deleting anything, and load brings it back - with its
+    // balance, since its account never left its shard.
+    zecd.call("unloadwallet", json!(["late-arrival"]))
+        .await
+        .expect("unloadwallet");
+    assert!(
+        zecd.call_wallet("late-arrival", "getwalletinfo", json!([]))
+            .await
+            .is_err(),
+        "an unloaded wallet must not be served"
+    );
+    zecd.call("loadwallet", json!(["late-arrival"]))
+        .await
+        .expect("loadwallet");
+    assert_eq!(
+        zec_to_zats(
+            &zecd
+                .call_wallet("late-arrival", "getbalance", json!([]))
+                .await
+                .expect("getbalance after reload")
+        ),
+        late_payment,
+        "a reloaded wallet keeps its balance - unloading deletes nothing"
+    );
+
     // A restart must adopt every account from its shard database rather than re-import it: the
     // manifest is idempotent, and re-importing would rewind the shard and rescan the fleet.
     let mut zecd = zecd;
@@ -334,7 +472,12 @@ async fn regtest_fleet_many_view_wallets_are_scanned_together_and_stay_isolated(
         .await
         .expect("stop the daemon cleanly");
     zecd.respawn().await.expect("restart the daemon");
-    wait_for_fleet(&zecd, &wallets, node_height(&zebrad).await).await;
+    let mut after_restart = wallets.clone();
+    after_restart.push(zecd_regtest_harness::ViewWallet {
+        name: "late-arrival".to_string(),
+        ..newcomer.clone()
+    });
+    wait_for_fleet(&zecd, &after_restart, node_height(&zebrad).await).await;
     for (index, wallet) in wallets.iter().enumerate() {
         let balance = zecd
             .call_wallet(&wallet.name, "getbalance", json!([]))
@@ -347,6 +490,18 @@ async fn regtest_fleet_many_view_wallets_are_scanned_together_and_stay_isolated(
             wallet.name
         );
     }
+    // The runtime-onboarded wallet too: `createwallet` wrote its manifest, so a restart must load
+    // it from disk like any other - and adopt its existing account rather than re-import it.
+    assert_eq!(
+        zec_to_zats(
+            &zecd
+                .call_wallet("late-arrival", "getbalance", json!([]))
+                .await
+                .expect("the runtime-onboarded wallet survives a restart")
+        ),
+        late_payment,
+        "the wallet onboarded at runtime was not reloaded from its manifest"
+    );
 }
 
 /// The node's current tip height.

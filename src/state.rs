@@ -33,6 +33,11 @@ pub struct AppState {
     /// wallet. Shared across handlers; populated by `z_sendmany`, read by
     /// `z_getoperationstatus`/`z_getoperationresult`/`z_listoperationids`.
     pub operations: Arc<crate::operations::OperationRegistry>,
+    /// Runtime onboarding for the fleet: what `createwallet` needs to place a view wallet into a
+    /// shard and start serving it without a restart. `None` when this node has no fleet
+    /// configured, which is every pre-fleet deployment - the management RPCs then say so rather
+    /// than pretending to work.
+    pub fleet: Option<Arc<crate::fleet::FleetManager>>,
 }
 
 impl AppState {

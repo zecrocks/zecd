@@ -40,6 +40,205 @@ pub(crate) fn listwallets(state: &AppState) -> Result<Value, RpcError> {
     Ok(json!(state.registry.names()))
 }
 
+/// `listwalletdir` - the wallets available on disk, whether or not they are loaded.
+///
+/// Bitcoin Core's shape (`{"wallets": [{"name": ...}, ...]}`). For zecd this is the fleet's
+/// manifest directory: the wallets an operator has provisioned, which is what they reconcile
+/// against when a name is missing from `listwallets`. Configured `[wallets.<name>]` entries are
+/// listed too - they are equally "on disk available", and omitting them would make the two RPCs
+/// disagree for reasons that have nothing to do with the fleet.
+pub(crate) fn listwalletdir(state: &AppState) -> Result<Value, RpcError> {
+    let mut names: Vec<String> = state.config.wallets.keys().cloned().collect();
+    if let Some(fleet) = &state.fleet {
+        match crate::fleet::load_manifests(fleet.manifest_dir()) {
+            Ok(members) => names.extend(members.into_iter().map(|m| m.name)),
+            // A manifest the daemon cannot read is an operator-visible problem, but it must not
+            // make listing the rest fail - that is exactly when this RPC is being used.
+            Err(e) => tracing::warn!("listwalletdir: reading the fleet manifests: {e:#}"),
+        }
+    }
+    names.sort();
+    names.dedup();
+    let wallets: Vec<Value> = names
+        .into_iter()
+        .map(|name| json!({ "name": name }))
+        .collect();
+    Ok(json!({ "wallets": wallets }))
+}
+
+/// `createwallet "wallet_name" ( disable_private_keys blank passphrase avoid_reuse descriptors
+/// load_on_startup external_signer )` - onboard a **view wallet** into the fleet, without
+/// restarting the daemon.
+///
+/// zecd's divergence from Bitcoin Core is forced by what a Zcash wallet is: Core creates a wallet
+/// that generates its own keys, while a monitored Zcash wallet is defined by a viewing key it is
+/// given. So this RPC requires `ufvk` and `birthday` (in the options object, param 8), and every
+/// Core flag that would ask for a *spending* wallet is refused rather than ignored - zecd loads at
+/// most one wallet with spending keys, and it is not created over the network. `disable_private_keys`
+/// is accepted only as `true`, which is what a fleet wallet is.
+///
+/// The birthday is required for the same reason it is in a manifest: defaulting it would silently
+/// choose between a full-chain rescan and a tip-only scan that misses the wallet's funds.
+///
+/// Returns Core's `{"name": ..., "warning": ...}`.
+pub(crate) async fn createwallet(state: &AppState, params: &[Value]) -> Result<Value, RpcError> {
+    let name = params
+        .first()
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| RpcError::invalid_parameter("createwallet requires a wallet name"))?
+        .to_string();
+
+    // Core's positional flags. Only the ones that describe a watch-only wallet are honoured; the
+    // rest are refused, because silently ignoring a request for a spending wallet would hand back
+    // a wallet that cannot do what the caller asked for.
+    if let Some(v) = params.get(1) {
+        if v.as_bool() == Some(false) {
+            return Err(RpcError::invalid_parameter(
+                "createwallet on zecd creates a watch-only wallet from a viewing key, so \
+                 disable_private_keys must be true (or omitted). zecd loads at most one wallet \
+                 with spending keys, created offline with `zecd init`.",
+            ));
+        }
+    }
+    for (index, flag) in [(3usize, "passphrase"), (7, "external_signer")] {
+        if params.get(index).is_some_and(|v| !v.is_null()) {
+            return Err(RpcError::invalid_parameter(format!(
+                "createwallet does not support {flag}: a fleet wallet holds no spending material"
+            )));
+        }
+    }
+
+    let options = params.get(8).cloned().unwrap_or(Value::Null);
+    let ufvk = options
+        .get("ufvk")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| {
+            RpcError::invalid_parameter(
+                "createwallet requires a \"ufvk\" in its options object (param 8): a monitored \
+                 Zcash wallet is defined by the viewing key it is given",
+            )
+        })?
+        .to_string();
+    let birthday = options
+        .get("birthday")
+        .and_then(|v| v.as_u64())
+        .ok_or_else(|| {
+            RpcError::invalid_parameter(
+                "createwallet requires a \"birthday\" height in its options object (param 8): \
+                 defaulting it would either rescan the whole chain or miss the wallet's funds",
+            )
+        })?;
+    let birthday = u32::try_from(birthday)
+        .map_err(|_| RpcError::invalid_parameter("birthday is not a block height"))?;
+
+    let fleet = state.fleet.as_ref().ok_or_else(|| {
+        RpcError::wallet(
+            "this node has no fleet manager, so view wallets cannot be onboarded here \
+             (an embedded host built without one; the zecd daemon always has it)"
+                .to_string(),
+        )
+    })?;
+    let member = crate::wallet::shard::ShardMember {
+        name: name.clone(),
+        ufvk,
+        birthday: zcash_protocol::consensus::BlockHeight::from_u32(birthday),
+    };
+    fleet
+        .onboard(&state.registry, member, true)
+        .await
+        .map_err(onboard_error)?;
+    Ok(json!({
+        "name": name,
+        // The wallet is served immediately but has not scanned yet, which a caller reading a zero
+        // balance a moment later needs to know.
+        "warning": "the wallet is loaded; its balance and history are empty until the shard \
+                    scans from its birthday",
+    }))
+}
+
+/// `unloadwallet ( "wallet_name" load_on_startup )` - stop serving a wallet.
+///
+/// As in Bitcoin Core, this does not delete anything: the wallet's manifest and its account stay
+/// where they are, so a restart (or `loadwallet`) serves it again. Its shard also keeps scanning
+/// for it - the account is still in that database, and removing it would rewind the shard and
+/// re-scan every other wallet in it, which is a far larger action than "stop answering for this
+/// name".
+pub(crate) fn unloadwallet(
+    state: &AppState,
+    params: &[Value],
+    routed: Option<&str>,
+) -> Result<Value, RpcError> {
+    // Core takes the name positionally *or* from the /wallet/<name> route.
+    let name = params
+        .first()
+        .and_then(|v| v.as_str())
+        .or(routed)
+        .ok_or_else(|| RpcError::invalid_parameter("unloadwallet requires a wallet name"))?;
+    // Only fleet wallets are unloadable: `loadwallet` restores from the fleet manifests, so
+    // unloading a configured `[wallets.<name>]` entry (the spending wallet included) would be
+    // irreversible until a restart - and `listwalletdir` would keep calling it loadable.
+    if state.config.wallets.contains_key(name) {
+        return Err(RpcError::wallet(format!(
+            "wallet '{name}' is a configured [wallets.{name}] entry, which stays loaded for the \
+             daemon's lifetime; only fleet wallets can be unloaded (to retire it, remove the \
+             config entry and restart)"
+        )));
+    }
+    if !state.registry.remove(name) {
+        return Err(RpcError::wallet_not_found(format!(
+            "Requested wallet does not exist or is not loaded: {name}"
+        )));
+    }
+    Ok(json!({ "name": name, "warning": "" }))
+}
+
+/// `loadwallet "filename" ( load_on_startup )` - serve a wallet that is provisioned but not
+/// loaded: one added to the manifest directory while the daemon ran, or one `unloadwallet`
+/// dropped.
+pub(crate) async fn loadwallet(state: &AppState, params: &[Value]) -> Result<Value, RpcError> {
+    let name = params
+        .first()
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| RpcError::invalid_parameter("loadwallet requires a wallet name"))?
+        .to_string();
+    let fleet = state.fleet.as_ref().ok_or_else(|| {
+        RpcError::wallet(
+            "this node has no fleet manager, so wallets cannot be loaded at runtime \
+             (an embedded host built without one; the zecd daemon always has it)"
+                .to_string(),
+        )
+    })?;
+    let member = crate::fleet::load_manifests(fleet.manifest_dir())
+        .map_err(|e| RpcError::wallet(format!("reading the fleet manifests: {e:#}")))?
+        .into_iter()
+        .find(|m| m.name == name)
+        .ok_or_else(|| {
+            RpcError::wallet_not_found(format!(
+                "no wallet '{name}' in the fleet manifest directory ({}); see listwalletdir",
+                fleet.manifest_dir().display()
+            ))
+        })?;
+    // The manifest is already on disk, so this is a load, not a create.
+    fleet
+        .onboard(&state.registry, member, false)
+        .await
+        .map_err(onboard_error)?;
+    Ok(json!({ "name": name, "warning": "" }))
+}
+
+/// Map an onboarding refusal onto Bitcoin Core's error dialect.
+fn onboard_error(e: crate::fleet::OnboardError) -> RpcError {
+    use crate::fleet::OnboardError;
+    match e {
+        // Core's `RPC_WALLET_ALREADY_EXISTS` case.
+        OnboardError::NameTaken(_) => RpcError::wallet(e.to_string()),
+        OnboardError::BadName(_) | OnboardError::BadKey(_) => {
+            RpcError::invalid_parameter(e.to_string())
+        }
+        OnboardError::Failed(_) => RpcError::wallet(e.to_string()),
+    }
+}
+
 /// `getnewaddress [label] [address_type]` - a fresh diversified unified address for the wallet's
 /// account (new diversifier, not a new derivation path).
 ///

@@ -64,6 +64,11 @@ pub const ALL_METHODS: &[&str] = &[
     "getreceivedbyaddress",
     "listreceivedbyaddress",
     "listwallets",
+    "listwalletdir",
+    // Wallet - management (fleet onboarding)
+    "createwallet",
+    "loadwallet",
+    "unloadwallet",
     // Wallet - writes / async
     "getnewaddress",
     "sendtoaddress",
@@ -140,6 +145,14 @@ const MAX_POSITIONAL_ARGS: &[(&str, usize)] = &[
     ("getreceivedbyaddress", 3),
     ("listreceivedbyaddress", 5),
     ("listwallets", 0),
+    ("listwalletdir", 0),
+    // Wallet - management (fleet onboarding). `createwallet` keeps Bitcoin Core's eight
+    // positional parameters so a Core-shaped client's call is accepted (and its
+    // spending-wallet flags explicitly refused); zecd's own arguments ride in the options
+    // object at param 8.
+    ("createwallet", 9),
+    ("loadwallet", 2),
+    ("unloadwallet", 2),
     // Wallet - writes / async
     ("getnewaddress", 2),
     ("sendtoaddress", 12),
@@ -176,7 +189,7 @@ enum MethodCoins {
 /// The coins that serve each dispatched method.
 ///
 /// The nine `z_*` methods are Zcash-only (shielded sends, the shielding/merge sweeps, the
-/// async-operation trio, and zcashd's account address derivation); the other 42 are the
+/// async-operation trio, and zcashd's account address derivation); the other 46 are the
 /// Bitcoin-Core dialect zecd implements for any coin. Today every loaded wallet is Zcash, so
 /// the gate this table drives can never fire - it lands as machinery with live tests, so the
 /// PR that adds an engine changes data rather than dispatch.
@@ -221,6 +234,7 @@ const METHOD_COINS: &[(&str, MethodCoins)] = &[
     ("getunconfirmedbalance", MethodCoins::All),
     ("getwalletinfo", MethodCoins::All),
     ("listwallets", MethodCoins::All),
+    ("listwalletdir", MethodCoins::All),
     ("listtransactions", MethodCoins::All),
     ("listsinceblock", MethodCoins::All),
     ("gettransaction", MethodCoins::All),
@@ -229,6 +243,11 @@ const METHOD_COINS: &[(&str, MethodCoins)] = &[
     ("listreceivedbyaddress", MethodCoins::All),
     ("getaddressinfo", MethodCoins::All),
     ("z_listtransactions", MethodCoins::Only(ZCASH_ONLY)),
+    // Wallet - management (fleet onboarding). Bitcoin-dialect method names, so `All`: what is
+    // engine-specific is the format of `createwallet`'s `ufvk` option, not the method itself.
+    ("createwallet", MethodCoins::All),
+    ("loadwallet", MethodCoins::All),
+    ("unloadwallet", MethodCoins::All),
     // Wallet - writes
     ("getnewaddress", MethodCoins::All),
     ("sendtoaddress", MethodCoins::All),
@@ -374,6 +393,12 @@ async fn dispatch_zecd(
         "getreceivedbyaddress" => wallet_methods::getreceivedbyaddress(state, wallet, req),
         "listreceivedbyaddress" => wallet_methods::listreceivedbyaddress(state, wallet, req),
         "listwallets" => wallet_methods::listwallets(state),
+        "listwalletdir" => wallet_methods::listwalletdir(state),
+
+        // Wallet - management (fleet onboarding)
+        "createwallet" => wallet_methods::createwallet(state, &req.params).await,
+        "loadwallet" => wallet_methods::loadwallet(state, &req.params).await,
+        "unloadwallet" => wallet_methods::unloadwallet(state, &req.params, wallet),
 
         // Wallet - writes / async
         "getnewaddress" => wallet_methods::getnewaddress(state, wallet, req).await,

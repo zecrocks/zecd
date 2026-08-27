@@ -22,6 +22,32 @@ pub struct BalancesMine {
     pub coinbase: Amount,
 }
 
+/// One entry of `listwalletdir` (`rpc/wallet_methods.rs::listwalletdir`).
+#[non_exhaustive]
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct WalletDirEntry {
+    pub name: String,
+}
+
+/// `listwalletdir` (`rpc/wallet_methods.rs::listwalletdir`).
+#[non_exhaustive]
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct WalletDir {
+    pub wallets: Vec<WalletDirEntry>,
+}
+
+/// The reply shape shared by `createwallet`, `loadwallet` and `unloadwallet`
+/// (Bitcoin Core's `{name, warning}`).
+#[non_exhaustive]
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct WalletLoaded {
+    pub name: String,
+    /// Empty unless the daemon has something the caller needs to know - notably, that a
+    /// just-created wallet is served but has not scanned yet.
+    #[serde(default)]
+    pub warning: String,
+}
+
 /// The block a balance snapshot is anchored to (Bitcoin Core 26+'s `lastprocessedblock`).
 #[non_exhaustive]
 #[derive(Debug, Clone, serde::Deserialize)]
@@ -662,6 +688,50 @@ impl Client<'_> {
     /// `listwallets`: the loaded wallet names.
     pub async fn list_wallets(&self) -> Result<Vec<String>, ClientError> {
         self.call_typed("listwallets", vec![]).await
+    }
+
+    /// `listwalletdir`: the wallets available on disk, loaded or not
+    /// (`rpc/wallet_methods.rs::listwalletdir`).
+    pub async fn list_wallet_dir(&self) -> Result<WalletDir, ClientError> {
+        self.call_typed("listwalletdir", vec![]).await
+    }
+
+    /// `createwallet "name" ... {"ufvk": ..., "birthday": ...}`: onboard a view wallet into the
+    /// fleet without restarting the daemon (`rpc/wallet_methods.rs::createwallet`).
+    ///
+    /// zecd's arguments ride in Bitcoin Core's options object (param 8), and Core's leading
+    /// positional flags are left at their defaults - a fleet wallet is watch-only by definition,
+    /// which is the only shape zecd's `createwallet` accepts.
+    pub async fn create_wallet(
+        &self,
+        name: &str,
+        ufvk: &str,
+        birthday: u32,
+    ) -> Result<WalletLoaded, ClientError> {
+        let params = Self::positional(vec![
+            Some(json!(name)),
+            Some(json!(true)), // disable_private_keys: a fleet wallet holds no spending material
+            None,              // blank
+            None,              // passphrase
+            None,              // avoid_reuse
+            None,              // descriptors
+            None,              // load_on_startup
+            None,              // external_signer
+            Some(json!({ "ufvk": ufvk, "birthday": birthday })),
+        ]);
+        self.call_typed("createwallet", params).await
+    }
+
+    /// `loadwallet "name"`: serve a wallet that is provisioned but not loaded
+    /// (`rpc/wallet_methods.rs::loadwallet`).
+    pub async fn load_wallet(&self, name: &str) -> Result<WalletLoaded, ClientError> {
+        self.call_typed("loadwallet", vec![json!(name)]).await
+    }
+
+    /// `unloadwallet "name"`: stop serving a wallet, without deleting anything
+    /// (`rpc/wallet_methods.rs::unloadwallet`).
+    pub async fn unload_wallet(&self, name: &str) -> Result<WalletLoaded, ClientError> {
+        self.call_typed("unloadwallet", vec![json!(name)]).await
     }
 
     /// `sendtoaddress <address> <amount> ...`: pay one recipient; returns the txid. Fees are

@@ -3568,6 +3568,31 @@ impl WalletActor {
         account.uivk().transparent().clone()
     }
 
+    /// Accept a view wallet into this shard, for import on the next connected pass.
+    ///
+    /// Refused for a conventional wallet: its account comes from its own `keys.toml`, and there
+    /// is nowhere for a foreign viewing key to go. Refused for a name the shard already serves,
+    /// which would otherwise queue a second account under it.
+    fn add_shard_member(&mut self, member: shard::ShardMember) -> Result<(), RpcError> {
+        if self.shard_accounts.is_empty() && self.shard_pending.is_empty() {
+            return Err(RpcError::wallet(
+                "this wallet is not a fleet shard; view wallets are onboarded into the fleet"
+                    .to_string(),
+            ));
+        }
+        if self.shard_accounts.contains_key(&member.name)
+            || self.shard_pending.iter().any(|m| m.name == member.name)
+        {
+            return Err(RpcError::wallet(format!(
+                "wallet '{}' is already in this shard",
+                member.name
+            )));
+        }
+        info!(wallet = %member.name, "queued a view wallet for import into this shard");
+        self.shard_pending.push(member);
+        Ok(())
+    }
+
     /// Import each shard member that has no account yet, one per pass.
     ///
     /// This is the fleet's counterpart of [`Self::maybe_bootstrap_account`], and it waits for the
@@ -4050,6 +4075,10 @@ impl WalletActor {
                 reply,
             } => {
                 let res = self.get_address_for_account(account, request, diversifier_index);
+                let _ = reply.send(res);
+            }
+            WalletCommand::AddShardMember { member, reply } => {
+                let res = self.add_shard_member(member);
                 let _ = reply.send(res);
             }
             WalletCommand::Send {

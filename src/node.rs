@@ -114,7 +114,7 @@ impl PreparedNode {
         // carries a receiver and can stop its sync loop between batches.
         let (shutdown_tx, _) = tokio::sync::watch::channel(false);
 
-        let mut registry = WalletRegistry::new(config.default_wallet.clone());
+        let registry = WalletRegistry::new(config.default_wallet.clone());
         let mut actor_tasks = Vec::new();
         // Build the Orchard proving keys once (they're wallet-independent) and share them across
         // every actor, so each send reuses the cached key instead of rebuilding it per transaction.
@@ -307,26 +307,22 @@ impl PreparedNode {
         // The fleet: many watch-only wallets scanned in a handful of shards rather than one
         // actor apiece. Additive - with no manifests present this does nothing, and the
         // `[wallets.<name>]` actors above are untouched.
-        match spawn_fleet(
+        let fleet = match spawn_fleet(
             &config,
             &fleet_hub,
             confirmations_policy,
             &shutdown_tx,
-            &mut registry,
+            &registry,
             &mut actor_tasks,
         )
         .await
         {
-            Ok(count) if count > 0 => info!(
-                "fleet: {count} view wallet(s) across {} shard(s)",
-                actor_tasks.len().saturating_sub(config.wallets.len())
-            ),
-            Ok(_) => {}
+            Ok(fleet) => fleet,
             Err(e) => {
                 stop_actors(&shutdown_tx, actor_tasks).await;
                 return Err(e);
             }
-        }
+        };
 
         if registry.is_empty() {
             anyhow::bail!(
@@ -356,6 +352,7 @@ impl PreparedNode {
             work_queue: Arc::new(tokio::sync::Semaphore::new(config.rpc.work_queue)),
             active: crate::state::ActiveCommands::default(),
             operations: Arc::new(crate::operations::OperationRegistry::new()),
+            fleet: fleet.clone(),
         };
 
         Ok(Node {
@@ -381,13 +378,15 @@ async fn spawn_fleet(
     hub: &Arc<chain::hub::ChainHub>,
     confirmations_policy: zcash_client_backend::data_api::wallet::ConfirmationsPolicy,
     shutdown_tx: &tokio::sync::watch::Sender<bool>,
-    registry: &mut WalletRegistry,
+    registry: &WalletRegistry,
     actor_tasks: &mut Vec<(String, tokio::task::JoinHandle<()>)>,
-) -> anyhow::Result<usize> {
+) -> anyhow::Result<Option<Arc<crate::fleet::FleetManager>>> {
     let members = crate::fleet::load_manifests(&config.fleet.manifest_dir)?;
-    if members.is_empty() {
-        return Ok(0);
-    }
+    // No manifests is an *empty* fleet, not an absent one: the manager is still built (it is
+    // only data - nothing dials or spawns until a wallet exists) so `createwallet` can onboard
+    // the first fleet wallet at runtime. Returning `None` here would leave the RPC that exists
+    // to avoid config-file-and-restart onboarding unable to bootstrap on exactly the daemons
+    // that have not bootstrapped yet.
     // A fleet wallet name must not collide with a configured one: both are addressed as
     // `/wallet/<name>`, and a collision would silently route one of them to the other's actor.
     for member in &members {
@@ -416,6 +415,26 @@ async fn spawn_fleet(
 
     let layout = crate::fleet::plan(members, &placed, &existing, &config.fleet);
     let total = layout.members();
+    // The manager keeps the pieces a shard actor is built from, so `createwallet` can place a
+    // wallet into a running shard - or open a new one - without a restart.
+    let manager = Arc::new(crate::fleet::FleetManager::new(
+        config.fleet.clone(),
+        crate::fleet::ShardTemplate {
+            network: config.network,
+            hub: Arc::clone(hub),
+            sync_interval: Duration::from_secs(config.sync.interval_secs),
+            rebroadcast_interval: Duration::from_secs(config.sync.rebroadcast_secs),
+            reconnect_base: Duration::from_secs(config.backend.reconnect_base_secs),
+            reconnect_max: Duration::from_secs(config.backend.reconnect_max_secs),
+            confirmations_policy,
+            orchard_action_limit: config.spend.orchard_action_limit,
+            target_note_count: config.spend.target_note_count,
+            min_split_output_value: config.spend.min_split_output_value,
+            enabled_pools: config.pools.enabled.clone(),
+            default_receivers: config.pools.default_receivers.clone(),
+            shutdown: shutdown_tx.clone(),
+        },
+    ));
     for (dir, members) in layout.shards {
         std::fs::create_dir_all(&dir)
             .with_context(|| format!("creating shard directory {}", dir.display()))?;
@@ -463,15 +482,41 @@ async fn spawn_fleet(
             shard_members: members,
             shutdown: shutdown_tx.subscribe(),
         };
+        let member_names: Vec<String> = actor_cfg
+            .shard_members
+            .iter()
+            .map(|m| m.name.clone())
+            .collect();
+        let lowest_birthday = actor_cfg
+            .shard_members
+            .iter()
+            .map(|m| u32::from(m.birthday))
+            .min();
         let (handles, task) = actor::spawn_shard(actor_cfg)
             .await
             .with_context(|| format!("starting fleet shard '{name}'"))?;
+        // Any of this shard's handles serves as the prototype for a member onboarded into it
+        // later: they differ only by name.
+        if let Some(prototype) = handles.first().cloned() {
+            manager.register_shard(dir.clone(), prototype, member_names, lowest_birthday);
+        }
         for handle in handles {
             registry.insert(CoinWallet::Zcash(handle));
         }
         actor_tasks.push((name, task));
     }
-    Ok(total)
+    if total > 0 {
+        info!(
+            "fleet: {total} view wallet(s) across {} shard(s)",
+            shard_count(&manager)
+        );
+    }
+    Ok(Some(manager))
+}
+
+/// How many shards the manager currently tracks (for the startup line).
+fn shard_count(manager: &crate::fleet::FleetManager) -> usize {
+    manager.shards()
 }
 
 /// Signal shutdown and wait for the given actor tasks, so no task is still writing the wallet
@@ -633,8 +678,16 @@ impl Node {
     /// than the tasks being killed mid-write at runtime teardown. Consumes the node; the
     /// datadir lock is released on return.
     pub async fn shutdown(self) {
+        // Shard actors started *after* boot (a `createwallet` that opened a new shard) are owned
+        // by the fleet manager, not by this list. They must be awaited too, or the process could
+        // exit with one of them mid-write - the exact thing awaiting the boot-time actors exists
+        // to prevent.
+        let mut tasks = self.actor_tasks;
+        if let Some(fleet) = &self.state.fleet {
+            tasks.extend(fleet.take_tasks());
+        }
         // The send inside covers the case where the embedder never called `trigger_shutdown`.
-        stop_actors(&self.state.shutdown_tx, self.actor_tasks).await;
+        stop_actors(&self.state.shutdown_tx, tasks).await;
     }
 
     /// The shared state, for the binary's HTTP layers (`server::run`, `health::run`).
@@ -685,6 +738,7 @@ pub(crate) mod testutil {
             work_queue: Arc::new(tokio::sync::Semaphore::new(16)),
             active: crate::state::ActiveCommands::default(),
             operations: Arc::new(crate::operations::OperationRegistry::new()),
+            fleet: None,
         })
     }
 

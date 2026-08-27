@@ -35,6 +35,7 @@ use zcash_protocol::consensus::BlockHeight;
 
 use crate::config::FleetConfig;
 use crate::wallet::shard::{self, ShardMember, ShardState};
+use crate::wallet::CoinWallet;
 
 /// A manifest file's contents. `deny_unknown_fields` for the same reason the main config uses it:
 /// a mistyped key is a wallet that would silently not be what the operator meant.
@@ -199,6 +200,23 @@ pub fn plan(
     }
 }
 
+/// The first shard index at or after `from` whose directory does not exist under `fleet_dir`,
+/// with that directory. A fresh shard must never adopt an existing directory: one can be on
+/// disk without being registered with the manager (its manifests were removed, or a previous
+/// spawn failed after creating it), and in the registered case it belongs to a RUNNING actor -
+/// deriving the name from the in-memory shard count would reuse it, in the worst case putting a
+/// second single-writer actor over a live shard's database.
+fn next_free_shard_dir(fleet_dir: &Path, from: usize) -> (usize, PathBuf) {
+    let mut index = from;
+    loop {
+        let dir = fleet_dir.join(shard::shard_dir_name(index));
+        if !dir.exists() {
+            return (index, dir);
+        }
+        index += 1;
+    }
+}
+
 /// Read back what shard `index` at `dir` already holds: its account count, the lowest birthday
 /// among them, and which manifested wallet each account serves (recorded into `placed`).
 ///
@@ -265,6 +283,28 @@ mod tests {
             ufvk: format!("uview1{name}"),
             birthday: BlockHeight::from_u32(birthday),
         }
+    }
+
+    /// A new shard's directory must come from the disk, not the manager's shard count: a
+    /// directory can exist without a manager entry (emptied manifests, a crashed spawn), and in
+    /// the worst case the count-named directory belongs to a shard that is RUNNING.
+    #[test]
+    fn a_new_shard_never_adopts_an_existing_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        // Nothing on disk: the requested index is free.
+        assert_eq!(
+            next_free_shard_dir(dir.path(), 0),
+            (0, dir.path().join(shard::shard_dir_name(0)))
+        );
+        // shard-0000 and shard-0001 exist (say, only shard-0001 is registered, so the manager
+        // holds ONE entry and would have named the new shard shard-0001 - the running one).
+        for index in [0usize, 1] {
+            std::fs::create_dir_all(dir.path().join(shard::shard_dir_name(index))).unwrap();
+        }
+        assert_eq!(
+            next_free_shard_dir(dir.path(), 1),
+            (2, dir.path().join(shard::shard_dir_name(2)))
+        );
     }
 
     /// A daemon with no fleet directory is every existing deployment: it must load cleanly as an
@@ -372,6 +412,92 @@ mod tests {
         assert!(layout.shards[1].0.ends_with("shard-0001"));
     }
 
+    /// A manager over one shard that already holds `member`, with an inert handle standing in for
+    /// its actor. Enough to exercise placement's "already there" branch without a chain.
+    fn manager_holding(member: &str) -> FleetManager {
+        let (shutdown, _) = tokio::sync::watch::channel(false);
+        let template = ShardTemplate {
+            network: crate::network::ZNetwork::Test,
+            hub: crate::chain::hub::ChainHub::new(
+                crate::backend::resolve("zebra://127.0.0.1:18234", crate::network::ZNetwork::Test)
+                    .expect("a loopback zebra endpoint resolves"),
+                std::time::Duration::from_secs(1),
+            ),
+            sync_interval: std::time::Duration::from_secs(60),
+            rebroadcast_interval: std::time::Duration::from_secs(60),
+            reconnect_base: std::time::Duration::from_secs(1),
+            reconnect_max: std::time::Duration::from_secs(2),
+            confirmations_policy: Default::default(),
+            orchard_action_limit: 0,
+            target_note_count: crate::config::DEFAULT_TARGET_NOTE_COUNT,
+            min_split_output_value: crate::config::DEFAULT_MIN_SPLIT_OUTPUT_VALUE,
+            enabled_pools: crate::pools::ReceiverSet::single(crate::pools::Receiver::Orchard),
+            default_receivers: crate::pools::ReceiverSet::single(crate::pools::Receiver::Orchard),
+            shutdown,
+        };
+        let manager = FleetManager::new(FleetConfig::default(), template);
+        manager.register_shard(
+            PathBuf::from("shard-0000"),
+            crate::wallet::WalletHandle::for_test(
+                member,
+                crate::network::ZNetwork::Test,
+                Default::default(),
+            ),
+            vec![member.to_string()],
+            Some(1),
+        );
+        manager
+    }
+
+    /// Loading a wallet whose account is still in its shard must be a **rename, not an import**.
+    ///
+    /// `unloadwallet` deletes nothing - the manifest and the account stay, and the shard never
+    /// stops scanning for it - so a subsequent `loadwallet` has nothing to import. Handing the
+    /// member to the actor again asks for a second account under one name, which the actor
+    /// refuses; the wallet then cannot be reloaded at all without restarting the daemon, which is
+    /// precisely what these RPCs exist to avoid. (Caught by the fleet e2e's unload/load
+    /// round-trip; pinned here because that costs ten minutes of CI to learn.)
+    #[tokio::test]
+    async fn reloading_a_wallet_already_in_a_shard_does_not_re_import_it() {
+        let manager = manager_holding("view-0000");
+        let member = ShardMember {
+            name: "view-0000".to_string(),
+            ufvk: "uview1".to_string(),
+            birthday: BlockHeight::from_u32(1),
+        };
+        // The stand-in handle's command channel is inert, so an import attempt would fail here.
+        // Reaching a handle at all is the assertion.
+        let handle = manager
+            .place(member)
+            .await
+            .expect("a wallet already in a shard is reloaded, not re-imported");
+        assert_eq!(handle.name, "view-0000");
+        assert_eq!(
+            manager.shards(),
+            1,
+            "reloading must not open a second shard"
+        );
+    }
+
+    /// The counterpart: a wallet that is *not* in any shard is a genuine arrival, so placement
+    /// must reach the import path rather than silently serving a handle for an account that does
+    /// not exist.
+    #[tokio::test]
+    async fn placing_an_unknown_wallet_is_not_treated_as_a_reload() {
+        let manager = manager_holding("view-0000");
+        let member = ShardMember {
+            name: "brand-new".to_string(),
+            ufvk: "uview1".to_string(),
+            birthday: BlockHeight::from_u32(1),
+        };
+        // The stand-in handle's command channel is inert, so the import attempt fails - which is
+        // exactly the evidence that this took the import path and not the reload shortcut.
+        assert!(
+            manager.place(member).await.is_err(),
+            "an unknown wallet must be imported, not served as a rename"
+        );
+    }
+
     /// Shard directories are numbered densely; a hand-removed directory truncates the scan rather
     /// than renumbering the shards above it (which would move - and rescan - every wallet in them).
     #[test]
@@ -382,5 +508,378 @@ mod tests {
         }
         let dirs = existing_shard_dirs(dir.path());
         assert_eq!(dirs.len(), 2, "0 and 1; 3 is past the gap at 2");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Runtime onboarding
+// ---------------------------------------------------------------------------
+
+/// Everything needed to onboard a view wallet **while the daemon runs**: place it into a shard,
+/// start scanning for it, and serve it at `/wallet/<name>` - without a restart.
+///
+/// A fleet that can only grow by editing a config file and restarting is not a fleet; every
+/// arrival would cost every wallet in the daemon a stop and a re-sync. So the pieces a shard
+/// actor is built from are kept here, and `createwallet` uses them.
+///
+/// The manager is deliberately thin: it holds the actor template, the live shards, and the tasks
+/// it spawned. Placement, reconciliation and import are the same code the startup path uses.
+pub struct FleetManager {
+    config: crate::config::FleetConfig,
+    /// How to build a shard actor. Everything in it is daemon-wide except the shard's own name,
+    /// directory and members.
+    template: ShardTemplate,
+    /// The live shards, in index order.
+    shards: std::sync::Mutex<Vec<ShardRuntime>>,
+    /// Actors this manager spawned after startup. `Node::shutdown` drains them, so a wallet
+    /// onboarded at runtime gets the same clean stop as one loaded at boot - without this, a
+    /// shard could be killed mid-write when the process exits.
+    tasks: std::sync::Mutex<Vec<(String, tokio::task::JoinHandle<()>)>>,
+    /// Serializes onboarding end to end (`onboard` holds it across `place`'s awaits, which the
+    /// `shards` lock - a std `Mutex` - cannot span). Placement is a read-decide-act over the
+    /// shard set: two concurrent `createwallet`s could otherwise both conclude "no shard has
+    /// room", both derive the same new shard index, and spawn two single-writer actors over one
+    /// database. Onboarding is a rare operator action, so serializing it costs nothing.
+    onboarding: tokio::sync::Mutex<()>,
+}
+
+/// The daemon-wide half of a shard actor's configuration.
+#[derive(Clone)]
+pub struct ShardTemplate {
+    pub network: crate::network::ZNetwork,
+    pub hub: std::sync::Arc<crate::chain::hub::ChainHub>,
+    pub sync_interval: std::time::Duration,
+    pub rebroadcast_interval: std::time::Duration,
+    pub reconnect_base: std::time::Duration,
+    pub reconnect_max: std::time::Duration,
+    pub confirmations_policy: zcash_client_backend::data_api::wallet::ConfirmationsPolicy,
+    pub orchard_action_limit: usize,
+    pub target_note_count: usize,
+    pub min_split_output_value: u64,
+    pub enabled_pools: crate::pools::ReceiverSet,
+    pub default_receivers: crate::pools::ReceiverSet,
+    pub shutdown: tokio::sync::watch::Sender<bool>,
+}
+
+/// One running shard: enough to add a member to it and to mint that member's handle.
+struct ShardRuntime {
+    dir: PathBuf,
+    /// The wallets placed here, whether or not their accounts have been imported yet.
+    ///
+    /// Tracked by the manager rather than read back from the actor's published account map,
+    /// because the two differ exactly when it matters: a member is *placed* the moment the actor
+    /// accepts it and *imported* one connected pass later. Consulting the published map would
+    /// make a reload racy against that window.
+    members: std::collections::BTreeSet<String>,
+    /// Any handle belonging to this shard. A shard's handles differ only in their name - they
+    /// share the actor's command channel and published status - so a new member's handle is this
+    /// one with a different name. That is also why a member is servable the instant it is
+    /// accepted, before its account exists: the account arrives on the published map.
+    prototype: crate::wallet::WalletHandle,
+    accounts: usize,
+    lowest_birthday: Option<u32>,
+}
+
+/// Why an onboarding request was refused.
+#[derive(Debug)]
+pub enum OnboardError {
+    /// The name is already served (a configured wallet, or another fleet wallet).
+    NameTaken(String),
+    /// The name cannot be addressed as `/wallet/<name>`.
+    BadName(String),
+    /// The viewing key does not decode for this network.
+    BadKey(String),
+    /// Something failed while placing or starting the wallet.
+    Failed(anyhow::Error),
+}
+
+impl std::fmt::Display for OnboardError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            OnboardError::NameTaken(name) => {
+                write!(f, "a wallet named '{name}' is already loaded")
+            }
+            OnboardError::BadName(why) => f.write_str(why),
+            OnboardError::BadKey(why) => f.write_str(why),
+            OnboardError::Failed(e) => write!(f, "{e:#}"),
+        }
+    }
+}
+
+impl FleetManager {
+    pub fn new(config: crate::config::FleetConfig, template: ShardTemplate) -> Self {
+        FleetManager {
+            config,
+            template,
+            shards: std::sync::Mutex::new(Vec::new()),
+            tasks: std::sync::Mutex::new(Vec::new()),
+            onboarding: tokio::sync::Mutex::new(()),
+        }
+    }
+
+    /// Record a shard the startup path already started, so runtime onboarding can place wallets
+    /// into it rather than always opening a new one.
+    pub fn register_shard(
+        &self,
+        dir: PathBuf,
+        prototype: crate::wallet::WalletHandle,
+        members: Vec<String>,
+        lowest_birthday: Option<u32>,
+    ) {
+        self.lock_shards().push(ShardRuntime {
+            dir,
+            accounts: members.len(),
+            members: members.into_iter().collect(),
+            prototype,
+            lowest_birthday,
+        });
+    }
+
+    /// See [`next_free_shard_dir`].
+    fn next_shard_dir(&self, from: usize) -> (usize, PathBuf) {
+        next_free_shard_dir(&self.config.dir, from)
+    }
+
+    /// The manifest directory this fleet reads.
+    pub fn manifest_dir(&self) -> &Path {
+        &self.config.manifest_dir
+    }
+
+    /// How many shards this fleet currently has.
+    pub fn shards(&self) -> usize {
+        self.lock_shards().len()
+    }
+
+    /// Take the actors spawned after startup, for the shutdown path to await.
+    pub fn take_tasks(&self) -> Vec<(String, tokio::task::JoinHandle<()>)> {
+        std::mem::take(&mut self.lock_tasks())
+    }
+
+    /// Onboard a view wallet: write its manifest, place it into a shard (starting one if none has
+    /// room), and register it so `/wallet/<name>` serves it immediately.
+    ///
+    /// The wallet is servable before its account exists - balances read zero and its scan begins
+    /// on the shard's next connected pass, exactly as a wallet loaded at boot behaves before it
+    /// catches up. `persist` writes the manifest; a wallet being *re*-loaded skips it.
+    pub async fn onboard(
+        &self,
+        registry: &crate::wallet::WalletRegistry,
+        member: ShardMember,
+        persist: bool,
+    ) -> Result<(), OnboardError> {
+        // One onboarding at a time, held to the end: the name check, the placement decision and
+        // the registry insert are a single read-decide-act, and interleaving two of them can
+        // double-place a name or double-open a shard (see the field doc).
+        let _onboarding = self.onboarding.lock().await;
+        if registry.contains(&member.name) {
+            return Err(OnboardError::NameTaken(member.name));
+        }
+        if let Err(e) = check_wallet_name(&member.name, Path::new(&member.name)) {
+            return Err(OnboardError::BadName(e.to_string()));
+        }
+        // Decode before anything is written: a bad key must not leave a manifest behind that
+        // would then fail every subsequent startup.
+        member
+            .decode_ufvk(self.template.network)
+            .map_err(|e| OnboardError::BadKey(format!("{e:#}")))?;
+
+        if persist {
+            self.write_manifest(&member).map_err(OnboardError::Failed)?;
+        }
+        match self.place(member.clone()).await {
+            Ok(handle) => {
+                registry.insert(CoinWallet::Zcash(handle));
+                Ok(())
+            }
+            Err(e) => {
+                // Don't leave a manifest for a wallet that never started: the next restart would
+                // try to import it again with no explanation of why it is not being served.
+                if persist {
+                    let _ = std::fs::remove_file(self.manifest_path(&member.name));
+                }
+                Err(OnboardError::Failed(e))
+            }
+        }
+    }
+
+    /// Place `member` into a shard with room, opening a new shard when none has any, and return
+    /// its handle.
+    async fn place(&self, member: ShardMember) -> anyhow::Result<crate::wallet::WalletHandle> {
+        // Already in a shard? Then this is a *reload*, not an import: `unloadwallet` removes the
+        // name from the RPC surface and deletes nothing, so the account is still there and the
+        // shard has never stopped scanning for it. Handing it to the actor again would be asking
+        // for a second account under one name, which the actor rightly refuses - so serving it is
+        // a rename of any handle from that shard, exactly as onboarding is.
+        if let Some(prototype) = self.shard_holding(&member.name) {
+            tracing::info!(wallet = %member.name, "reloaded a view wallet already in a shard");
+            return Ok(prototype.sibling(member.name));
+        }
+        let existing: Vec<ShardState> = self
+            .lock_shards()
+            .iter()
+            .map(|s| ShardState {
+                accounts: s.accounts,
+                lowest_birthday: s.lowest_birthday,
+            })
+            .collect();
+        let index = shard::place_members(
+            &existing,
+            std::slice::from_ref(&member),
+            self.config.shard_size,
+            self.config.cohort_depth,
+        )[0];
+
+        let birthday = u32::from(member.birthday);
+        if index < existing.len() {
+            // An existing shard: hand the member to its actor, which imports it on its next
+            // connected pass (an import needs the tree state below the birthday).
+            let (prototype, dir) = {
+                let shards = self.lock_shards();
+                let shard = &shards[index];
+                (shard.prototype.clone(), shard.dir.clone())
+            };
+            prototype.add_shard_member(member.clone()).await?;
+            let mut shards = self.lock_shards();
+            shards[index].accounts += 1;
+            shards[index].members.insert(member.name.clone());
+            shards[index].lowest_birthday = Some(
+                shards[index]
+                    .lowest_birthday
+                    .map_or(birthday, |l| l.min(birthday)),
+            );
+            tracing::info!(
+                wallet = %member.name,
+                shard = %dir.display(),
+                "onboarded a view wallet into a running shard"
+            );
+            return Ok(prototype.sibling(member.name));
+        }
+
+        // No shard has room (or none exists): start one. Its directory is derived from what is
+        // on DISK, not from the in-memory shard count: startup registers only shards that had
+        // manifested members, so a directory can exist (an emptied shard, a crashed spawn's
+        // leftovers) without a manager entry - and naming by count would then reuse it,
+        // in the worst case putting a second single-writer actor over a running shard's
+        // database. The scan is safe against concurrent onboarding because `onboard` serializes
+        // callers.
+        let (index, dir) = self.next_shard_dir(index);
+        std::fs::create_dir_all(&dir)
+            .with_context(|| format!("creating shard directory {}", dir.display()))?;
+        let name = shard::shard_dir_name(index);
+        let cfg = self
+            .template
+            .actor_config(&name, &dir, vec![member.clone()]);
+        let (handles, task) = crate::wallet::actor::spawn_shard(cfg)
+            .await
+            .with_context(|| format!("starting fleet shard '{name}'"))?;
+        let handle = handles
+            .into_iter()
+            .next()
+            .ok_or_else(|| anyhow!("a shard must produce a handle per member"))?;
+        self.lock_tasks().push((name.clone(), task));
+        self.lock_shards().push(ShardRuntime {
+            dir,
+            members: std::iter::once(member.name.clone()).collect(),
+            prototype: handle.clone(),
+            accounts: 1,
+            lowest_birthday: Some(birthday),
+        });
+        tracing::info!(wallet = %member.name, shard = %name, "onboarded a view wallet into a new shard");
+        Ok(handle)
+    }
+
+    /// A handle from the shard `name` is already placed in, if any.
+    fn shard_holding(&self, name: &str) -> Option<crate::wallet::WalletHandle> {
+        self.lock_shards()
+            .iter()
+            .find(|shard| shard.members.contains(name))
+            .map(|shard| shard.prototype.clone())
+    }
+
+    fn manifest_path(&self, name: &str) -> PathBuf {
+        self.config.manifest_dir.join(format!("{name}.toml"))
+    }
+
+    fn write_manifest(&self, member: &ShardMember) -> anyhow::Result<()> {
+        std::fs::create_dir_all(&self.config.manifest_dir).with_context(|| {
+            format!(
+                "creating the fleet manifest directory {}",
+                self.config.manifest_dir.display()
+            )
+        })?;
+        let path = self.manifest_path(&member.name);
+        if path.exists() {
+            return Err(anyhow!(
+                "a manifest for '{}' already exists at {}",
+                member.name,
+                path.display()
+            ));
+        }
+        std::fs::write(
+            &path,
+            format!(
+                "# Written by zecd createwallet.\nufvk = \"{}\"\nbirthday = {}\n",
+                member.ufvk,
+                u32::from(member.birthday)
+            ),
+        )
+        .with_context(|| format!("writing the manifest {}", path.display()))
+    }
+
+    /// The `RwLock`/`Mutex` critical sections here are all short and cannot leave a half-built
+    /// value behind, so recover from a poisoned lock instead of taking the daemon down.
+    fn lock_shards(&self) -> std::sync::MutexGuard<'_, Vec<ShardRuntime>> {
+        self.shards.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn lock_tasks(&self) -> std::sync::MutexGuard<'_, Vec<(String, tokio::task::JoinHandle<()>)>> {
+        self.tasks.lock().unwrap_or_else(|e| e.into_inner())
+    }
+}
+
+impl ShardTemplate {
+    /// A shard actor's configuration: this template plus the shard's own identity and members.
+    fn actor_config(
+        &self,
+        name: &str,
+        dir: &Path,
+        members: Vec<ShardMember>,
+    ) -> crate::wallet::actor::ActorConfig {
+        crate::wallet::actor::ActorConfig {
+            name: name.to_string(),
+            network: self.network,
+            engine_dir: dir.to_path_buf(),
+            // A shard has no keys.toml: its wallets are watch-only accounts imported from the
+            // manifest's viewing keys.
+            keys_path: dir.join("keys.toml"),
+            hub: std::sync::Arc::clone(&self.hub),
+            sync_interval: self.sync_interval,
+            rebroadcast_interval: self.rebroadcast_interval,
+            reconnect_base: self.reconnect_base,
+            reconnect_max: self.reconnect_max,
+            age_identity: None,
+            auto_unlock: false,
+            bootstrap: false,
+            confirmations_policy: self.confirmations_policy,
+            orchard_action_limit: self.orchard_action_limit,
+            // Never consulted - a shard member cannot spend - but carried so a shard actor's
+            // config matches a wallet actor's on every field they share.
+            target_note_count: self.target_note_count,
+            min_split_output_value: self.min_split_output_value,
+            // Shard members never spend, so the proving keys would be dead weight.
+            orchard_keys: None,
+            pipeline_proving: false,
+            enabled_pools: self.enabled_pools.clone(),
+            default_receivers: self.default_receivers.clone(),
+            // Shielded-only - see `crate::wallet::shard`.
+            transparent_enabled: false,
+            transparent_default: false,
+            transparent_gap_limit: crate::config::DEFAULT_TRANSPARENT_GAP_LIMIT,
+            transparent_initial_scan: 0,
+            transparent_allow_beyond_recovery_window: true,
+            transparent_gap_warn_threshold: 5,
+            shard_members: members,
+            shutdown: self.shutdown.subscribe(),
+        }
     }
 }
