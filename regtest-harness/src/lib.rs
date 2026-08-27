@@ -768,6 +768,143 @@ pub fn derive_address_offline(mnemonic: &str, address_type: &str, index: u32) ->
     Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
 }
 
+/// One provisioned view wallet: independent key material the monitoring daemon is given a
+/// *viewing* key for, plus an address to pay it at.
+///
+/// This is the fleet's real deployment shape - the spending wallets live somewhere else (a cold
+/// signer, another daemon) and the monitor only ever holds viewing keys - so the harness mints
+/// them the same way: a throwaway zecd wallet the fleet daemon never sees, of which only the UFVK
+/// crosses over.
+#[derive(Clone, Debug)]
+pub struct ViewWallet {
+    pub name: String,
+    pub ufvk: String,
+    /// A shielded address of this wallet, for the funder to pay.
+    pub address: String,
+    pub mnemonic: String,
+}
+
+/// Mint `count` independent view wallets, concurrently.
+///
+/// Each is a real `zecd init` in its own throwaway datadir (zecd allows one spending wallet per
+/// datadir, so they cannot share one), from which only the mnemonic is kept; the UFVK and a
+/// receiving address are then derived **offline** with `derive-address --json`, which is the same
+/// path an operator provisioning a fleet from a cold seed would take.
+///
+/// The inits need a reachable upstream (an account birthday is anchored on the tree state below
+/// it), hence `zebra_rpc_port`. They are spawned concurrently because the wall clock here is
+/// process startup, not work.
+pub async fn provision_view_wallets(
+    zebra_rpc_port: u16,
+    count: usize,
+    birthday: u32,
+) -> Result<Vec<ViewWallet>> {
+    let mut tasks = Vec::with_capacity(count);
+    for index in 0..count {
+        tasks.push(tokio::task::spawn_blocking(move || {
+            mint_view_wallet(zebra_rpc_port, index, birthday)
+        }));
+    }
+    let mut wallets = Vec::with_capacity(count);
+    for task in tasks {
+        wallets.push(task.await.context("provisioning task panicked")??);
+    }
+    Ok(wallets)
+}
+
+/// Mint one view wallet: `zecd init` in a throwaway datadir for the mnemonic, then offline
+/// derivation for the viewing key and an address.
+fn mint_view_wallet(zebra_rpc_port: u16, index: usize, birthday: u32) -> Result<ViewWallet> {
+    let dir = tempfile::tempdir().context("create provisioning datadir")?;
+    std::fs::write(
+        dir.path().join("zecd.toml"),
+        format!(
+            "network = \"regtest\"\ndatadir = \"{datadir}\"\ndefault_wallet = \"default\"\n\n\
+             [wallets.default]\ndir = \"{datadir}/default\"\n\n\
+             [backend]\nserver = \"zebra://127.0.0.1:{zebra_rpc_port}\"\nconnect_timeout_secs = 5\n",
+            datadir = dir.path().display()
+        ),
+    )
+    .context("write provisioning zecd.toml")?;
+
+    let out = Command::new(zecd_bin())
+        .args([
+            "--datadir",
+            dir.path().to_str().unwrap(),
+            "--regtest",
+            "init",
+            "--wallet",
+            "default",
+            "--birthday",
+            &birthday.to_string(),
+        ])
+        .stdin(Stdio::null())
+        .output()
+        .context("spawn zecd init for a view wallet")?;
+    if !out.status.success() {
+        bail!(
+            "zecd init for view wallet {index} failed ({}):\n{}",
+            out.status,
+            tail(&String::from_utf8_lossy(&out.stderr), 30)
+        );
+    }
+    // `zecd init` prints the generated mnemonic - and nothing else - on stdout.
+    let mnemonic = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if mnemonic.is_empty() {
+        bail!("zecd init printed no mnemonic for view wallet {index}");
+    }
+
+    // Offline from here: the UFVK and an address, straight out of `derive-address --json`.
+    let derived = derive_json_offline(&mnemonic)?;
+    let ufvk = derived["ufvk"]
+        .as_str()
+        .ok_or_else(|| anyhow::anyhow!("derive-address --json printed no ufvk"))?
+        .to_string();
+    let address = derived["addresses"][0]["address"]
+        .as_str()
+        .ok_or_else(|| anyhow::anyhow!("derive-address --json printed no address"))?
+        .to_string();
+    Ok(ViewWallet {
+        name: format!("view-{index:04}"),
+        ufvk,
+        address,
+        mnemonic,
+    })
+}
+
+/// `zecd derive-address --mnemonic --json` for an Orchard receiver at index 0, offline.
+///
+/// Orchard on purpose: every diversifier index has a valid Orchard receiver, while a UA that also
+/// requires Sapling does not - index 0 simply has no address for about half of all seeds (the
+/// default-address gotcha), which would make provisioning fail at random.
+fn derive_json_offline(mnemonic: &str) -> Result<Value> {
+    let out = Command::new(zecd_bin())
+        .args([
+            "--conf",
+            "/dev/null",
+            "--regtest",
+            "derive-address",
+            "--mnemonic",
+            "--address-type",
+            "orchard",
+            "--index",
+            "0",
+            "--json",
+        ])
+        .env("ZECD_MNEMONIC", mnemonic)
+        .stdin(Stdio::null())
+        .output()
+        .context("spawn zecd derive-address --json")?;
+    if !out.status.success() {
+        bail!(
+            "zecd derive-address --json failed ({}):\n{}",
+            out.status,
+            tail(&String::from_utf8_lossy(&out.stderr), 30)
+        );
+    }
+    serde_json::from_slice(&out.stdout).context("parse derive-address --json output")
+}
+
 /// Coinbase blocks the funder gets to actually spend. Every block mined once zebra points at the
 /// funder pays it, so what really matters is how many are *mature* when we shield:
 /// `FUNDER_COINBASES + MATURITY_TAIL - `[`COINBASE_MATURITY`] `= 30`. That has to stay under
@@ -1882,6 +2019,15 @@ pub struct ZecdConfig {
     /// no-flap contract: `/readyz` must stay 200 through a send while the recurring transparent
     /// spend-search backlog transiently rises.
     pub readiness: Option<String>,
+    /// View wallets the daemon monitors as a **fleet**: each becomes a manifest under
+    /// `<datadir>/wallets.d/`, and the daemon groups them into shard databases that scan once for
+    /// all of their accounts. Empty (the default) writes no manifests and no `[fleet]` section,
+    /// so the daemon behaves exactly as it always has.
+    pub fleet: Vec<ViewWallet>,
+    /// `[fleet] shard_size` - view wallets per shard database. `None` omits it (zecd defaults to
+    /// 128). The fleet e2e sets it small so a handful of wallets still spans several shards,
+    /// which is what exercises the placement and per-shard scanning rather than one big database.
+    pub fleet_shard_size: Option<usize>,
     /// When `Some`, the spending `default` wallet is created passphrase-encrypted
     /// (`zecd init --encrypt`, passphrase supplied via `ZECD_WALLET_PASSPHRASE`): it starts
     /// locked and needs `walletpassphrase` before sending. `None` = unencrypted (identity model).
@@ -1920,6 +2066,8 @@ impl ZecdConfig {
             transparent_allow_beyond_recovery_window: None,
             transparent_gap_warn_threshold: None,
             readiness: None,
+            fleet: Vec::new(),
+            fleet_shard_size: None,
             encrypt_passphrase: None,
             wallet_servers: Vec::new(),
         }
@@ -2038,6 +2186,23 @@ impl Zecd {
         // disagreement between the two - on a production-shaped config rather than a fixture,
         // across both backends and every tier. Same for what `config show` renders from it.
         assert_config_commands_agree(&bin, datadir.path())?;
+        // Fleet manifests, before the daemon starts: one small TOML per view wallet, which is
+        // all a monitored wallet is (a name, a viewing key, a birthday).
+        if !cfg.fleet.is_empty() {
+            let manifest_dir = datadir.path().join("wallets.d");
+            std::fs::create_dir_all(&manifest_dir).context("create the fleet manifest dir")?;
+            for wallet in &cfg.fleet {
+                std::fs::write(
+                    manifest_dir.join(format!("{}.toml", wallet.name)),
+                    format!(
+                        "ufvk = \"{}\"\nbirthday = {}\n",
+                        wallet.ufvk,
+                        cfg.birthday.unwrap_or(2)
+                    ),
+                )
+                .with_context(|| format!("write the manifest for '{}'", wallet.name))?;
+            }
+        }
         let mnemonic = init_default_with_retry(&bin, datadir.path(), cfg).await?;
 
         // Watch-only replicas derive from the default wallet's exported UFVK (read straight from
@@ -2925,6 +3090,14 @@ fn write_zecd_toml(datadir: &Path, cfg: &ZecdConfig) -> Result<()> {
         String::new()
     };
     wallets.push_str(&pools);
+    // `[fleet]` only when there is a fleet: an absent section is the pre-fleet default, and every
+    // other regtest must keep exercising exactly that.
+    if !cfg.fleet.is_empty() {
+        wallets.push_str("\n[fleet]\n");
+        if let Some(n) = cfg.fleet_shard_size {
+            wallets.push_str(&format!("shard_size = {n}\n"));
+        }
+    }
     // Fast reconnect backoff (1..2s) so outage-recovery tests converge quickly.
     let toml = format!(
         r#"network = "regtest"
