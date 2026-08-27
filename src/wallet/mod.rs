@@ -6,12 +6,13 @@ pub mod binding;
 pub mod keys;
 pub mod open;
 pub mod read;
+pub mod shard;
 pub mod store;
 
 #[cfg(test)]
 mod regtest_tests;
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
@@ -136,15 +137,19 @@ pub struct SyncStatus {
     /// True when the wallet is passphrase-encrypted (Bitcoin Core's `HasEncryptionKeys()`).
     /// Drives whether `getwalletinfo` reports `unlocked_until` and how the passphrase RPCs behave.
     pub encrypted: bool,
-    /// The account this wallet name resolves to inside its wallet database.
+    /// Which account each wallet this actor serves resolves to, keyed by wallet name.
     ///
-    /// A database can hold several accounts - that is how a fleet of watch-only wallets is
-    /// scanned once rather than once each - so every read that reports this wallet's own money,
-    /// history or addresses must be scoped to it ([`read::AccountScope`]). `None` while no
-    /// account exists yet: an empty data directory whose account has not been rebuilt from
-    /// `keys.toml`, e.g. an encrypted wallet awaiting its first `walletpassphrase`. Published on
-    /// the status rather than fixed at spawn precisely so it appears when that bootstrap runs.
-    pub account: Option<AccountUuid>,
+    /// A database can hold several accounts - that is how a fleet shard scans many view wallets
+    /// in one pass - so every read that reports a wallet's own money, history or addresses must
+    /// be scoped to its account ([`read::AccountScope`]). A conventional actor publishes a single
+    /// entry for its own wallet; a shard publishes one per member.
+    ///
+    /// A wallet is absent from the map until its account exists: an empty data directory whose
+    /// account has not been rebuilt from `keys.toml` (an encrypted wallet awaiting its first
+    /// `walletpassphrase`), or a shard member whose viewing key has not been imported yet.
+    /// Publishing it rather than fixing it at spawn is what lets the scope start reporting an
+    /// account the moment one of those completes.
+    pub accounts: Arc<BTreeMap<String, AccountUuid>>,
     /// True for a watch-only wallet (imported UFVK; no spending material anywhere). Drives
     /// `getwalletinfo.private_keys_enabled` - the wallet-level signal, as in Bitcoin Core's
     /// descriptor wallets (per-address `iswatchonly` is deprecated there and stays false).
@@ -340,6 +345,10 @@ pub struct MergePlan {
 /// Commands sent from RPC handlers to the per-wallet actor (the sole DB writer).
 pub enum WalletCommand {
     GetNewAddress {
+        /// Which account to derive for. A fleet shard's database holds one account per view
+        /// wallet it hosts, so the command names the one the request came in on; `None` means
+        /// the actor's own single account, which is every conventional wallet.
+        account: Option<AccountUuid>,
         /// The kind of address to derive (per-call override resolved against wallet config).
         request: ReceiverRequest,
         reply: oneshot::Sender<Result<String, RpcError>>,
@@ -351,6 +360,8 @@ pub enum WalletCommand {
     /// transparent receiver, or `Default` for the wallet's configured default. Returns the
     /// encoded address, the index used, and the receivers actually derived.
     GetAddressForAccount {
+        /// As [`WalletCommand::GetNewAddress::account`].
+        account: Option<AccountUuid>,
         request: ReceiverRequest,
         diversifier_index: Option<DiversifierIndex>,
         reply: oneshot::Sender<Result<DerivedAddress, RpcError>>,
@@ -508,10 +519,16 @@ impl WalletHandle {
     /// exactly the pre-fleet behaviour - and identical to naming the account whenever the
     /// database holds only one, which is every non-fleet wallet.
     pub fn account_scope(&self) -> read::AccountScope {
-        match self.status_rx.borrow().account {
+        match self.account() {
             Some(account) => read::AccountScope::Only(account),
             None => read::AccountScope::Any,
         }
+    }
+
+    /// This wallet's account, as published by its actor. `None` until the account exists (a
+    /// pending bootstrap, or a shard member awaiting import).
+    pub fn account(&self) -> Option<AccountUuid> {
+        self.status_rx.borrow().accounts.get(&self.name).copied()
     }
 
     /// A private receiver on the actor's published [`SyncStatus`], for RPC handlers that must
@@ -609,8 +626,13 @@ impl WalletHandle {
     }
 
     pub async fn get_new_address(&self, request: ReceiverRequest) -> Result<String, RpcError> {
-        self.dispatch(|reply| WalletCommand::GetNewAddress { request, reply })
-            .await
+        let account = self.account();
+        self.dispatch(|reply| WalletCommand::GetNewAddress {
+            account,
+            request,
+            reply,
+        })
+        .await
     }
 
     /// Derive an address for the wallet's single account (`z_getaddressforaccount`).
@@ -622,7 +644,9 @@ impl WalletHandle {
         request: ReceiverRequest,
         diversifier_index: Option<DiversifierIndex>,
     ) -> Result<DerivedAddress, RpcError> {
+        let account = self.account();
         self.dispatch(|reply| WalletCommand::GetAddressForAccount {
+            account,
             request,
             diversifier_index,
             reply,

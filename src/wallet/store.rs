@@ -108,6 +108,26 @@ impl WalletStore {
         write_keys_atomic(keys_path, &encoding, true)
     }
 
+    /// An in-memory stand-in for a fleet **shard**, which has no `keys.toml` at all.
+    ///
+    /// A shard's wallets are watch-only accounts imported from the manifest's viewing keys, so
+    /// every question a `keys.toml` answers is already decided: there is no seed to unlock, no
+    /// passphrase to hold, and no UFVK to pin (each member's manifest entry is its own pin - see
+    /// [`crate::wallet::shard::reconcile_accounts`]). `birthday` is the earliest member's, so the
+    /// shard's scan covers all of them.
+    ///
+    /// Nothing writes this to disk; it exists so the actor's startup path can stay one path
+    /// rather than forking into a keyless copy of itself.
+    pub fn view_only_placeholder(network: ZNetwork, birthday: BlockHeight) -> Self {
+        WalletStore {
+            network,
+            birthday,
+            seed_ciphertext: None,
+            encrypted: false,
+            pinned_ufvk: None,
+        }
+    }
+
     /// Create a new `keys.toml` for a watch-only wallet (imported UFVK): network, birthday,
     /// and the pinned viewing key, no mnemonic. The UFVK also lives (in the clear, as for
     /// every wallet) in the wallet DB's accounts table; the copy pinned here is what startup

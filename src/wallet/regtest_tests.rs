@@ -519,6 +519,124 @@ fn is_mine_rejects_spliced_unified_address_with_foreign_receiver() {
     ));
 }
 
+/// A **fleet shard** at scale: many view wallets in one database, one actor, one scan.
+///
+/// This is the property the whole fleet design rests on, so it is asserted directly rather than
+/// inferred: `FLEET_SIZE` unrelated viewing keys are imported into a single `WalletDb`, one
+/// `spawn_shard` serves all of them, and every one comes back as its own `/wallet/<name>` handle
+/// routed to its own account. The scan itself is shared by construction - `scan_cached_blocks`
+/// reads every account's key out of the database and trial-decrypts each block once against the
+/// whole set - so what needs guarding is the routing around it: that N wallets do not collapse
+/// into one another, and that N wallets do not cost N actors.
+///
+/// Offline: the accounts are pre-imported at a genesis birthday, so the actor adopts them at spawn
+/// and never needs a chain (a member with no account yet is imported on a connected pass instead,
+/// which the regtest tier covers). The upstream is a dead port, so the actor runs disconnected.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_shard_serves_many_view_wallets_from_one_actor() {
+    use zcash_keys::keys::UnifiedSpendingKey;
+
+    /// Enough wallets that a per-wallet cost would be obvious, and few enough to stay a fast
+    /// offline test. The production bound is `[fleet] shard_size`, not this.
+    const FLEET_SIZE: usize = 64;
+
+    let net = network::regtest();
+    let dir = tempfile::tempdir().unwrap();
+    let shard_dir = dir.path().to_path_buf();
+
+    // Build `FLEET_SIZE` unrelated wallets and import each as a watch-only account, exactly as
+    // the shard's own import path does.
+    let mut db = open::init_dbs(net, &shard_dir).unwrap();
+    let mut members = Vec::new();
+    let mut expected_addresses = Vec::new();
+    for i in 0..FLEET_SIZE {
+        // Distinct seeds, so any cross-wallet leak shows up as a wrong address rather than a
+        // coincidence.
+        let mut raw = [0u8; 32];
+        raw[..8].copy_from_slice(&(i as u64 + 1).to_le_bytes());
+        let usk = UnifiedSpendingKey::from_seed(&net, &raw, 0u32.try_into().unwrap()).unwrap();
+        let ufvk = usk.to_unified_full_viewing_key().encode(&net);
+        let member = crate::wallet::shard::ShardMember {
+            name: format!("view-{i:04}"),
+            ufvk,
+            birthday: BlockHeight::from_u32(1),
+        };
+        let account =
+            crate::wallet::shard::import_member(&mut db, &member, &genesis_birthday()).unwrap();
+        // The account's default address, which import always derives and exposes. Not a fixed
+        // diversifier index: the default index is the seed's first Sapling-valid one, a per-seed
+        // value that is 0 for only about half of seeds, so index 0 simply has no address for
+        // many of these wallets.
+        expected_addresses.push(
+            db.list_addresses(account)
+                .unwrap()
+                .first()
+                .expect("import exposes the account's default address")
+                .address()
+                .encode(&net),
+        );
+        members.push(member);
+    }
+    drop(db);
+
+    // One actor for all of them.
+    let (mut cfg, _shutdown_tx) = offline_actor_cfg("shard-0000", shard_dir.clone());
+    cfg.shard_members = members.clone();
+    let (handles, task) = actor::spawn_shard(cfg).await.expect("shard spawns");
+
+    assert_eq!(
+        handles.len(),
+        FLEET_SIZE,
+        "one handle per view wallet, from one actor"
+    );
+
+    // Every wallet resolves to its *own* account, and no two share one. This is what makes the
+    // scoped reads of the previous commit actually separate the wallets: they all read the same
+    // database file.
+    let mut seen = std::collections::HashSet::new();
+    for (i, handle) in handles.iter().enumerate() {
+        assert_eq!(handle.name, format!("view-{i:04}"));
+        assert_eq!(
+            handle.engine_dir, shard_dir,
+            "one database for the whole shard"
+        );
+        let account = handle
+            .account()
+            .unwrap_or_else(|| panic!("{} must resolve to an account", handle.name));
+        assert!(
+            seen.insert(account),
+            "{} shares an account with another wallet",
+            handle.name
+        );
+        // The scope reaches the read path, and the read path answers with this wallet's own
+        // address - not the shard's first, and not all of them.
+        let listed = read::all_addresses(net, &handle.engine_dir, handle.account_scope());
+        assert!(
+            listed.contains(&expected_addresses[i]),
+            "{} must see its own address",
+            handle.name
+        );
+        for (j, other) in expected_addresses.iter().enumerate() {
+            assert!(
+                i == j || !listed.contains(other),
+                "{} must not see view-{j:04}'s address",
+                handle.name
+            );
+        }
+    }
+
+    // A watch-only shard holds no spending material, so sends are refused - and, because it can
+    // never prove, it also holds none of the bundled Sapling proving parameters (tens of
+    // megabytes that would otherwise be resident per shard).
+    assert!(
+        handles[0].status().watch_only,
+        "shard members are watch-only"
+    );
+
+    drop(handles);
+    task.abort();
+}
+
 /// Two accounts in **one** wallet database must not see each other through the read helpers.
 ///
 /// This is the shape a fleet shard has: many watch-only wallets sharing one `WalletDb` so the
@@ -820,6 +938,8 @@ fn offline_actor_cfg(
         transparent_initial_scan: 0,
         transparent_allow_beyond_recovery_window: true,
         transparent_gap_warn_threshold: 5,
+        // A conventional single-wallet actor, not a fleet shard.
+        shard_members: Vec::new(),
         shutdown,
     };
     (cfg, shutdown_tx)

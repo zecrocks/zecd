@@ -124,6 +124,55 @@ pub struct AppConfig {
     pub pools: PoolsConfig,
     pub health: HealthConfig,
     pub log: LogConfig,
+    /// `[fleet]` - monitoring many watch-only wallets in this one daemon.
+    pub fleet: FleetConfig,
+}
+
+/// Where the fleet's wallet manifests live, relative to the datadir.
+pub const DEFAULT_FLEET_MANIFEST_DIR: &str = "wallets.d";
+/// Where the fleet's shard databases live, relative to the datadir.
+pub const DEFAULT_FLEET_DIR: &str = "fleet";
+/// Accounts per shard database.
+///
+/// Sharding buys nothing in trial-decryption cost - that is the sum over viewing keys however
+/// they are grouped - so this is not a throughput knob. It bounds *blast radius*: onboarding a
+/// wallet rewinds its shard's database to the new account's birthday, one SQLite writer
+/// serializes per shard, `get_wallet_summary` is O(accounts in the database), and a halted shard
+/// stops one group of wallets rather than the fleet.
+pub const DEFAULT_FLEET_SHARD_SIZE: usize = 128;
+/// How far below a shard's earliest birthday an arriving wallet may be and still join it, rather
+/// than starting a shard of its own.
+///
+/// Importing an account rewinds its database to that account's birthday, so a wallet arriving far
+/// below a caught-up shard's floor would drag every wallet in it back through a rescan. Alone in a
+/// fresh shard it re-scans only against its own key, over blocks the daemon is fetching anyway.
+pub const DEFAULT_FLEET_COHORT_DEPTH: u32 = 10_000;
+
+/// `[fleet]` - monitoring many watch-only wallets in one daemon.
+///
+/// The fleet is **additive**: with no manifests present none of this does anything, and
+/// `[wallets.<name>]` entries keep behaving exactly as they always have.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FleetConfig {
+    /// Directory of per-wallet manifests, one small TOML each (absolute after resolution).
+    pub manifest_dir: PathBuf,
+    /// Directory holding the shard databases (absolute after resolution).
+    pub dir: PathBuf,
+    /// Accounts per shard - see [`DEFAULT_FLEET_SHARD_SIZE`].
+    pub shard_size: usize,
+    /// Cohort depth for placement - see [`DEFAULT_FLEET_COHORT_DEPTH`].
+    pub cohort_depth: u32,
+}
+
+impl Default for FleetConfig {
+    fn default() -> Self {
+        FleetConfig {
+            manifest_dir: PathBuf::from(DEFAULT_FLEET_MANIFEST_DIR),
+            dir: PathBuf::from(DEFAULT_FLEET_DIR),
+            shard_size: DEFAULT_FLEET_SHARD_SIZE,
+            cohort_depth: DEFAULT_FLEET_COHORT_DEPTH,
+        }
+    }
 }
 
 /// `[pools]` - the wallet's shielded pool configuration: which pools are enabled and which
@@ -862,6 +911,16 @@ struct ConfigFile {
     pools: Option<PoolsFile>,
     health: Option<HealthFile>,
     log: Option<LogFile>,
+    fleet: Option<FleetFile>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FleetFile {
+    manifest_dir: Option<PathBuf>,
+    dir: Option<PathBuf>,
+    shard_size: Option<usize>,
+    cohort_depth: Option<u32>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1794,6 +1853,31 @@ impl AppConfig {
             max_scan_lag: health_file.max_scan_lag.unwrap_or(4),
         };
 
+        let fleet_file = file.fleet.unwrap_or(FleetFile {
+            manifest_dir: None,
+            dir: None,
+            shard_size: None,
+            cohort_depth: None,
+        });
+        let fleet = FleetConfig {
+            manifest_dir: fleet_file
+                .manifest_dir
+                .map(|p| datadir.join(p))
+                .unwrap_or_else(|| datadir.join(DEFAULT_FLEET_MANIFEST_DIR)),
+            dir: fleet_file
+                .dir
+                .map(|p| datadir.join(p))
+                .unwrap_or_else(|| datadir.join(DEFAULT_FLEET_DIR)),
+            shard_size: fleet_file.shard_size.unwrap_or(DEFAULT_FLEET_SHARD_SIZE),
+            cohort_depth: fleet_file
+                .cohort_depth
+                .unwrap_or(DEFAULT_FLEET_COHORT_DEPTH),
+        };
+        // A shard is a scan domain: zero accounts per shard would mean no wallet is ever placed.
+        if fleet.shard_size == 0 {
+            anyhow::bail!("[fleet] shard_size must be at least 1");
+        }
+
         let log_file = file.log.unwrap_or(LogFile {
             level: None,
             format: None,
@@ -1829,6 +1913,7 @@ impl AppConfig {
             pools,
             health,
             log,
+            fleet,
         })
     }
 }

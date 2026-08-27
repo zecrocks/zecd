@@ -208,6 +208,15 @@ pub fn render(config: &AppConfig) -> String {
     );
     kv(&mut s, "max_scan_lag", config.health.max_scan_lag);
 
+    table(&mut s, "fleet");
+    // Rendered as absolute paths, as resolved: the config accepts either, and an operator
+    // reading "which directory is this daemon actually watching for wallet manifests" wants the
+    // answer, not the datadir-relative form they may have written.
+    kv(&mut s, "manifest_dir", path_val(&config.fleet.manifest_dir));
+    kv(&mut s, "dir", path_val(&config.fleet.dir));
+    kv(&mut s, "shard_size", config.fleet.shard_size);
+    kv(&mut s, "cohort_depth", config.fleet.cohort_depth);
+
     table(&mut s, "log");
     kv(&mut s, "level", str_val(&config.log.level));
     kv(&mut s, "format", str_val(&config.log.format));
