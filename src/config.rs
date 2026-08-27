@@ -495,6 +495,7 @@ impl WalletBackendOverride {
             reconnect_max_secs: global.reconnect_max_secs,
             rfc1918_is_local: global.rfc1918_is_local,
             allow_remote_cleartext: global.allow_remote_cleartext,
+            proxy: global.proxy.clone(),
         }
     }
 }
@@ -561,6 +562,16 @@ pub struct BackendConfig {
     ///
     /// Ignored by `zebra://` endpoints, which always cover transparent data.
     pub assume_transparent_in_compact_blocks: bool,
+    /// Route every outbound connection through this SOCKS5 proxy (`socks5://host:port`), e.g.
+    /// `socks5://127.0.0.1:9050` for Tor. `None` (the default) dials directly.
+    ///
+    /// Daemon policy, not a per-endpoint setting: it covers both upstream kinds - the zebrad
+    /// JSON-RPC client and the lightwalletd gRPC channel - so a configured proxy carries *all*
+    /// of zecd's network traffic. The destination is resolved by the proxy rather than locally
+    /// (so `.onion` upstreams work and no DNS leaks), and lightwalletd TLS is layered over the
+    /// proxied stream unchanged, keeping certificate verification pinned to the destination
+    /// hostname. SOCKS username/password authentication is not supported.
+    pub proxy: Option<crate::socks::SocksProxy>,
 }
 
 impl BackendConfig {
@@ -1002,6 +1013,9 @@ struct BackendFile {
     /// Assert that the upstream lightwalletd serves transparent data in compact blocks - see
     /// [`BackendConfig::assume_transparent_in_compact_blocks`].
     assume_transparent_in_compact_blocks: Option<bool>,
+    /// Route all upstream traffic through a SOCKS5 proxy (`socks5://host:port`) - see
+    /// [`BackendConfig::proxy`].
+    proxy: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -1122,6 +1136,8 @@ pub struct ConfigOverrides {
     pub rpc_auth: Vec<String>,
     /// Chain upstream token (`zebra`, `zebra://host:port`, `zecrocks`, `https://...`, ...).
     pub server: Option<String>,
+    /// SOCKS5 proxy carrying every outbound connection (`socks5://host:port`).
+    pub proxy: Option<String>,
     /// age identity file used to decrypt the wallet seed for sending.
     pub age_identity: Option<PathBuf>,
     /// Path to the default wallet's `keys.toml`, independent of the datadir.
@@ -1143,6 +1159,7 @@ impl From<&Cli> for ConfigOverrides {
             rpc_password: cli.rpc_password.clone(),
             rpc_auth: cli.rpc_auth.clone(),
             server: cli.server.clone(),
+            proxy: cli.proxy.clone(),
             age_identity: cli.age_identity.clone(),
             keys_file: cli.keys_file.clone(),
         }
@@ -1210,6 +1227,11 @@ pub struct Cli {
     /// Chain upstream: `zebra` (local zebrad, the default) or `zebra://host:port`.
     #[arg(long, global = true, value_name = "SERVER")]
     pub server: Option<String>,
+
+    /// Route every outbound connection through a SOCKS5 proxy, e.g. `socks5://127.0.0.1:9050`
+    /// for Tor. Covers both upstream kinds; the proxy resolves the destination.
+    #[arg(long, global = true, value_name = "SOCKS5_URL")]
+    pub proxy: Option<String>,
 
     /// age identity file used to decrypt the wallet seed for sending.
     #[arg(long, global = true, value_name = "FILE", env = "ZECD_AGE_IDENTITY")]
@@ -1631,6 +1653,7 @@ impl AppConfig {
             tls_ca_file: None,
             tls_pinned_sha256: None,
             assume_transparent_in_compact_blocks: None,
+            proxy: None,
         });
         let server = select_server_token(cli.server.clone(), backend_file.server);
         let reconnect_base_secs = backend_file.reconnect_base_secs.unwrap_or(1).max(1);
@@ -1675,6 +1698,15 @@ impl AppConfig {
             assume_transparent_in_compact_blocks: backend_file
                 .assume_transparent_in_compact_blocks
                 .unwrap_or(false),
+            // Parsed now, like the CA file above: a malformed proxy token must fail startup
+            // rather than let the daemon dial directly under a config that says otherwise -
+            // the whole point of the knob is that nothing bypasses it.
+            proxy: match cli.proxy.clone().or(backend_file.proxy) {
+                Some(token) => {
+                    Some(crate::socks::SocksProxy::parse(&token).context("[backend] proxy")?)
+                }
+                None => None,
+            },
         };
         validate_backend_tls(&backend)?;
         // Same contradiction checks for every wallet that overrides the endpoint, against its
@@ -2670,6 +2702,73 @@ mod tests {
     }
 
     #[test]
+    fn backend_file_parses_the_proxy_key() {
+        let f: BackendFile = toml::from_str("server = \"zecrocks\"").unwrap();
+        assert_eq!(f.proxy, None);
+        let f: BackendFile = toml::from_str("proxy = \"socks5://127.0.0.1:9050\"").unwrap();
+        assert_eq!(f.proxy.as_deref(), Some("socks5://127.0.0.1:9050"));
+    }
+
+    /// The library entry point carries the proxy the same way the binary's flag does, and it
+    /// reaches the `Server` a `NodeBuilder` would dial - so an embedded node is proxied on the
+    /// same terms as the daemon.
+    #[test]
+    fn a_library_consumers_override_reaches_the_resolved_server() {
+        let dir = tempfile::tempdir().unwrap();
+        let conf = dir.path().join("zecd.toml");
+        std::fs::write(
+            &conf,
+            format!(
+                "network = \"test\"\ndatadir = {:?}\n[rpc]\nuser = \"u\"\npassword = \"p\"\n",
+                dir.path()
+            ),
+        )
+        .unwrap();
+
+        let config = AppConfig::resolve_overrides(&ConfigOverrides {
+            conf: Some(conf),
+            proxy: Some("socks5://127.0.0.1:9050".into()),
+            ..Default::default()
+        })
+        .expect("resolve with a proxy override");
+        assert_eq!(
+            config.backend.proxy,
+            Some(crate::socks::SocksProxy::parse("socks5://127.0.0.1:9050").unwrap())
+        );
+        // `resolve_configured` is what the daemon dials through; `resolve_for_wallet` is what
+        // `node.rs` calls per wallet. Both must carry it.
+        assert!(crate::backend::resolve_configured(&config)
+            .unwrap()
+            .describe()
+            .contains("via socks5://127.0.0.1:9050"));
+        for entry in config.wallets.values() {
+            assert!(crate::backend::resolve_for_wallet(&config, entry)
+                .unwrap()
+                .describe()
+                .contains("via socks5://127.0.0.1:9050"));
+        }
+    }
+
+    #[test]
+    fn the_proxy_is_daemon_policy_and_never_per_wallet() {
+        // A wallet may override its endpoint and TLS, but not how the daemon reaches the
+        // network: one proxy decision for the whole process.
+        let mut global = backend_cfg();
+        global.proxy = Some(crate::socks::SocksProxy::parse("socks5://127.0.0.1:9050").unwrap());
+        let override_with_own_server = WalletBackendOverride {
+            server: Some("zecrocks".into()),
+            ..Default::default()
+        };
+        assert_eq!(
+            override_with_own_server.effective(&global).proxy,
+            global.proxy,
+            "a wallet override must inherit the daemon's proxy"
+        );
+        // And there is no per-wallet key to set one with.
+        assert!(toml::from_str::<WalletFile>("proxy = \"socks5://127.0.0.1:9050\"").is_err());
+    }
+
+    #[test]
     fn backend_file_parses_transparent_capability_override() {
         // Absent by default - asserting a capability the server does not advertise has to be a
         // deliberate act, since guessing wrong loses transparent receives silently.
@@ -2718,6 +2817,7 @@ mod tests {
             tls_ca_file: None,
             tls_pins: Vec::new(),
             assume_transparent_in_compact_blocks: false,
+            proxy: None,
         }
     }
 

@@ -1046,6 +1046,86 @@ fn config_check_strict_fails_on_warnings_alone() {
     );
 }
 
+/// A valid proxy resolves, is reported as an effective setting, and is named on the endpoint
+/// description - so an operator can confirm at a glance that their traffic is being routed.
+#[test]
+fn config_check_accepts_a_socks_proxy_and_reports_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let conf = dir.path().join("zecd.toml");
+    std::fs::write(
+        &conf,
+        format!(
+            "network = \"test\"\ndatadir = {:?}\n[rpc]\nuser = \"u\"\npassword = \"p\"\n\
+             [backend]\nserver = \"zebra://zebrad.internal:18234\"\n\
+             proxy = \"socks5://127.0.0.1:9050\"\n",
+            dir.path()
+        ),
+    )
+    .unwrap();
+
+    let out = config_check(&conf, &[]);
+    assert!(out.status.success(), "stderr: {}", stderr_of(&out));
+    let stdout = stdout_of(&out);
+    assert!(
+        stdout.contains("proxy = \"socks5://127.0.0.1:9050\""),
+        "the effective settings should carry the proxy: {stdout}"
+    );
+    assert!(
+        stdout.contains("via socks5://127.0.0.1:9050"),
+        "the endpoint description should name the proxy: {stdout}"
+    );
+}
+
+/// A malformed proxy is a startup failure, not a silent direct dial - and the error names the
+/// key so the operator knows which line to fix.
+#[test]
+fn config_check_rejects_a_malformed_proxy_and_names_the_key() {
+    let dir = tempfile::tempdir().unwrap();
+    let conf = dir.path().join("zecd.toml");
+    std::fs::write(
+        &conf,
+        format!(
+            "network = \"test\"\ndatadir = {:?}\n[rpc]\nuser = \"u\"\npassword = \"p\"\n\
+             [backend]\nproxy = \"http://127.0.0.1:8080\"\n",
+            dir.path()
+        ),
+    )
+    .unwrap();
+
+    let out = config_check(&conf, &[]);
+    assert_eq!(out.status.code(), Some(1), "stdout: {}", stdout_of(&out));
+    let stderr = stderr_of(&out);
+    assert!(stderr.contains("[backend] proxy"), "stderr: {stderr}");
+    assert!(stderr.contains("socks5"), "stderr: {stderr}");
+}
+
+/// A proxy pointed at a loopback upstream names the *proxy's* loopback, which is almost never
+/// what was meant - a warning, so `--strict` fails on it while a normal run still starts.
+#[test]
+fn config_check_warns_when_a_proxy_is_pointed_at_a_loopback_upstream() {
+    let dir = tempfile::tempdir().unwrap();
+    let conf = dir.path().join("zecd.toml");
+    // `server = "zebra"` resolves to 127.0.0.1, so this is the defaults-plus-proxy shape.
+    std::fs::write(
+        &conf,
+        format!(
+            "network = \"test\"\ndatadir = {:?}\n[rpc]\nuser = \"u\"\npassword = \"p\"\n\
+             [backend]\nproxy = \"socks5://127.0.0.1:9050\"\n",
+            dir.path()
+        ),
+    )
+    .unwrap();
+
+    let out = config_check(&conf, &[]);
+    assert!(out.status.success(), "stderr: {}", stderr_of(&out));
+    let stderr = stderr_of(&out);
+    assert!(
+        stderr.contains("proxy") && stderr.contains("loopback"),
+        "stderr: {stderr}"
+    );
+    assert_eq!(config_check(&conf, &["--strict"]).status.code(), Some(1));
+}
+
 /// The check must leave the datadir exactly as it found it. The cookie file is the one thing
 /// that would otherwise be written - `Authenticator::from_config` mints one as a side effect -
 /// and doing so against a live deployment would invalidate the credential its daemon handed out.

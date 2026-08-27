@@ -424,6 +424,10 @@ pub async fn init_wallet(config: &AppConfig, opts: InitOptions) -> anyhow::Resul
         &mut server,
         config.backend.assume_transparent_in_compact_blocks,
     );
+    // `init` dials the upstream itself (it anchors on the tree state at birthday - 1), so it
+    // must honour the proxy too: without this the very first connection a new wallet makes
+    // would go out direct, exposing the operator's address before the daemon ever runs.
+    backend::apply_proxy(&mut server, config.backend.proxy.clone());
     let mut client = server
         .connect_timeout(Duration::from_secs(config.backend.connect_timeout_secs))
         .await

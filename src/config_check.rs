@@ -163,6 +163,17 @@ fn check_backend(config: &AppConfig, findings: &mut Vec<Finding>) {
              lightwalletd; it will be ignored (a zebra backend always covers transparent data)",
         ));
     }
+    // A proxy resolves and dials the destination itself, so a loopback destination names the
+    // *proxy's* own loopback - almost never what an operator pointing zecd at a local node
+    // meant. Warn rather than error: a proxy running on this same host is a legitimate setup.
+    if config.backend.proxy.is_some() && crate::chain::zebra::host_is_loopback(server.host()) {
+        findings.push(Finding::warning(format!(
+            "[backend] proxy is set, but the upstream host '{}' is loopback: the proxy will \
+             dial its OWN loopback, not this machine's. Name the host as the proxy sees it, \
+             or drop the proxy for a local upstream",
+            server.host()
+        )));
+    }
     if config.backend.tls_insecure_skip_verify {
         findings.push(Finding::warning(
             "[backend] tls_insecure_skip_verify = true accepts any lightwalletd certificate: \

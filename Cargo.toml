@@ -81,6 +81,13 @@ tonic = { version = "0.14", features = ["gzip", "tls-ring", "tls-native-roots", 
 # auto-selection. `ring` matches tonic's `tls-ring`.
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
 hyper-util = { version = "0.1", features = ["tokio", "client-legacy", "http1"] }
+# SOCKS5 client for `[backend] proxy`. Deliberately a *transport-only* crate (futures-util,
+# thiserror, tokio): it carries no rustls, so it cannot land a second crypto provider and break
+# tonic's auto-selection. `tower-service` is the bare `Service` trait - both tonic's
+# `connect_with_connector` and hyper-util's legacy-client `Connect` bound are expressed over it,
+# so the SOCKS connector needs only this, not all of `tower` (which stays a dev-dependency).
+tokio-socks = "0.5"
+tower-service = "0.3"
 rusqlite = { version = "0.37", features = ["time"] }
 time = "0.3"
 uuid = { version = "1", features = ["v4", "serde"] }

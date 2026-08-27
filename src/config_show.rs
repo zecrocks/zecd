@@ -68,6 +68,12 @@ pub fn render(config: &AppConfig) -> String {
             &format!("UNRESOLVED: {e}"),
         ),
     }
+    // Rendered only when set, like tls_ca_file: an absent proxy has no key to write back.
+    // `SocksProxy`'s Display is the canonical token, so this re-parses to the same value -
+    // which `render_is_idempotent_through_a_resolve` depends on.
+    if let Some(proxy) = &b.proxy {
+        kv(&mut s, "proxy", str_val(&proxy.to_string()));
+    }
     kv(&mut s, "connect_timeout_secs", b.connect_timeout_secs);
     kv(&mut s, "reconnect_base_secs", b.reconnect_base_secs);
     kv(&mut s, "reconnect_max_secs", b.reconnect_max_secs);

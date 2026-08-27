@@ -41,7 +41,7 @@ use anyhow::{anyhow, bail, Context};
 use base64::Engine as _;
 use bytes::Bytes;
 use http_body_util::{BodyExt, Full, Limited};
-use hyper_util::client::legacy::{connect::HttpConnector, Client as HyperClient};
+use hyper_util::client::legacy::Client as HyperClient;
 use hyper_util::rt::TokioExecutor;
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -185,7 +185,7 @@ impl CallError {
 /// A cheaply-clonable zebrad JSON-RPC client (hyper pools the underlying connections).
 #[derive(Clone)]
 pub struct ZebraClient {
-    http: HyperClient<HttpConnector, Full<Bytes>>,
+    http: HyperClient<crate::socks::MaybeSocksConnector, Full<Bytes>>,
     url: hyper::Uri,
     auth_header: Option<String>,
 }
@@ -228,7 +228,7 @@ fn parse_host_ip(host: &str) -> Option<std::net::IpAddr> {
 
 /// Is `host` a loopback address (an IP literal that `is_loopback()`, or the name `localhost`)?
 /// Hostnames other than `localhost` are treated as non-loopback without a DNS lookup.
-fn host_is_loopback(host: &str) -> bool {
+pub(crate) fn host_is_loopback(host: &str) -> bool {
     match parse_host_ip(host) {
         Some(ip) => ip.is_loopback(),
         None => host.eq_ignore_ascii_case("localhost"),
@@ -316,6 +316,7 @@ impl ZebraClient {
         port: u16,
         auth: &ZebraAuth,
         policy: CleartextPolicy,
+        proxy: Option<&crate::socks::SocksProxy>,
     ) -> anyhow::Result<ZebraClient> {
         let url: hyper::Uri = format!("http://{host}:{port}/")
             .parse()
@@ -323,13 +324,24 @@ impl ZebraClient {
         let auth_header = auth.header()?;
         cleartext_gate(host, auth_header.is_some(), policy)?;
         if !host_is_loopback(host) {
-            tracing::warn!(
-                host,
-                "zebra endpoint is non-loopback: JSON-RPC traffic is plaintext HTTP"
-            );
+            match proxy {
+                // SOCKS carries the bytes, it does not encrypt them: the hop from the proxy to
+                // zebra is still cleartext, so the warning stands either way.
+                Some(proxy) => tracing::warn!(
+                    host,
+                    %proxy,
+                    "zebra endpoint is non-loopback: JSON-RPC traffic is plaintext HTTP, \
+                     including the proxy's hop to it"
+                ),
+                None => tracing::warn!(
+                    host,
+                    "zebra endpoint is non-loopback: JSON-RPC traffic is plaintext HTTP"
+                ),
+            }
         }
         Ok(ZebraClient {
-            http: HyperClient::builder(TokioExecutor::new()).build(HttpConnector::new()),
+            http: HyperClient::builder(TokioExecutor::new())
+                .build(crate::socks::MaybeSocksConnector::new(proxy)),
             url,
             auth_header,
         })
@@ -639,8 +651,9 @@ impl ZebraSource {
         auth: &ZebraAuth,
         network: ZNetwork,
         policy: CleartextPolicy,
+        proxy: Option<&crate::socks::SocksProxy>,
     ) -> anyhow::Result<ZebraSource> {
-        let client = ZebraClient::new(host, port, auth, policy)?;
+        let client = ZebraClient::new(host, port, auth, policy, proxy)?;
         let info = client.blockchain_info().await?;
         Ok(ZebraSource {
             client,
@@ -1231,7 +1244,7 @@ mod tests {
 
     #[test]
     fn client_refuses_cleartext_credentials_to_public_host() {
-        let err = match ZebraClient::new("203.0.113.5", 8234, &creds(), default_policy()) {
+        let err = match ZebraClient::new("203.0.113.5", 8234, &creds(), default_policy(), None) {
             Ok(_) => panic!("credentialed public connect must be refused"),
             Err(e) => e.to_string(),
         };
@@ -1256,7 +1269,7 @@ mod tests {
             "192.168.1.2",
         ] {
             assert!(
-                ZebraClient::new(h, 8234, &creds(), default_policy()).is_ok(),
+                ZebraClient::new(h, 8234, &creds(), default_policy(), None).is_ok(),
                 "{h} should be allowed under the default policy"
             );
         }
@@ -1269,8 +1282,8 @@ mod tests {
             rfc1918_is_local: false,
             allow_remote_cleartext: false,
         };
-        assert!(ZebraClient::new("10.0.0.5", 8234, &creds(), strict).is_err());
-        assert!(ZebraClient::new("127.0.0.1", 8234, &creds(), strict).is_ok());
+        assert!(ZebraClient::new("10.0.0.5", 8234, &creds(), strict, None).is_err());
+        assert!(ZebraClient::new("127.0.0.1", 8234, &creds(), strict, None).is_ok());
     }
 
     #[test]
@@ -1280,7 +1293,7 @@ mod tests {
             allow_remote_cleartext: true,
         };
         assert!(
-            ZebraClient::new("203.0.113.5", 8234, &creds(), allow).is_ok(),
+            ZebraClient::new("203.0.113.5", 8234, &creds(), allow, None).is_ok(),
             "explicit allow_remote_cleartext override"
         );
     }
@@ -1289,7 +1302,14 @@ mod tests {
     fn client_allows_unauthenticated_public_connect() {
         // No credentials to leak, so the gate does not apply (traffic is still public chain data).
         assert!(
-            ZebraClient::new("203.0.113.5", 8234, &ZebraAuth::default(), default_policy()).is_ok(),
+            ZebraClient::new(
+                "203.0.113.5",
+                8234,
+                &ZebraAuth::default(),
+                default_policy(),
+                None
+            )
+            .is_ok(),
             "no-auth remote connect is allowed"
         );
     }
@@ -1474,9 +1494,53 @@ mod tests {
             &ZebraAuth::default(),
             ZNetwork::Main,
             CleartextPolicy::default(),
+            None,
         )
         .await
         .expect("connect to fake zebrad")
+    }
+
+    #[tokio::test]
+    async fn a_configured_proxy_carries_the_whole_json_rpc_session() {
+        // The fake zebrad is the only thing listening; the proxy forwards to it.
+        let upstream = serve(Arc::new(Mutex::new(Fake::new()))).await;
+        let proxy = crate::socks::test_proxy::TestProxy::start(upstream).await;
+
+        // Name a destination that resolves nowhere, on a port nothing listens on. A direct dial
+        // cannot possibly succeed, so a working client proves every byte went via the proxy.
+        let mut src = ZebraSource::connect(
+            "zebrad.test.invalid",
+            1,
+            &ZebraAuth::default(),
+            ZNetwork::Main,
+            CleartextPolicy::default(),
+            Some(&proxy.proxy()),
+        )
+        .await
+        .expect("connect through the SOCKS proxy");
+
+        // The connect itself is a getblockchaininfo round-trip; do one more call so the assertion
+        // covers the pooled request path rather than only the dial.
+        src.latest_block().await.expect("tip through the proxy");
+        assert_eq!(proxy.targets(), vec!["zebrad.test.invalid:1".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn without_a_proxy_the_same_unresolvable_endpoint_fails() {
+        // The negative twin of the test above: it is the proxy doing the work, not a fallback.
+        let err = ZebraSource::connect(
+            "zebrad.test.invalid",
+            1,
+            &ZebraAuth::default(),
+            ZNetwork::Main,
+            CleartextPolicy::default(),
+            None,
+        )
+        .await;
+        assert!(
+            err.is_err(),
+            "a direct dial to an unresolvable host must fail"
+        );
     }
 
     #[tokio::test]
@@ -1655,6 +1719,7 @@ mod tests {
             &auth,
             ZNetwork::Main,
             CleartextPolicy::default(),
+            None,
         )
         .await
         .unwrap();
@@ -1687,6 +1752,7 @@ mod tests {
             &auth,
             ZNetwork::Main,
             CleartextPolicy::default(),
+            None,
         )
         .await
         .unwrap();

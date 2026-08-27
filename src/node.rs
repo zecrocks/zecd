@@ -779,6 +779,7 @@ pub(crate) mod testutil {
                 tls_ca_file: None,
                 tls_pins: Vec::new(),
                 assume_transparent_in_compact_blocks: false,
+                proxy: None,
             },
             zebra: Default::default(),
             fleet: Default::default(),

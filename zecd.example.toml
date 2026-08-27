@@ -75,6 +75,19 @@ dir = "./data/default"
 server = "zebra"
 # Per-attempt dial timeout (seconds) so a hung/black-holed endpoint can't stall sync.
 connect_timeout_secs = 10
+# Route EVERY outbound connection through a SOCKS5 proxy - most usefully Tor. Off by default.
+# It covers both upstream kinds (the zebra:// JSON-RPC client and the lightwalletd gRPC
+# channel), so nothing zecd dials bypasses it.
+#
+# The proxy resolves the destination, not zecd, so no DNS leaves this host and a .onion
+# upstream works. lightwalletd TLS is layered over the proxied connection unchanged, with
+# certificate verification still pinned to the destination hostname - the proxy carries
+# ciphertext it cannot read. SOCKS username/password authentication is not supported; use a
+# proxy that restricts access by source address (a loopback listener is the usual answer).
+#
+# Note that with a proxy set, a loopback `server` names the PROXY's loopback rather than this
+# machine's - `zecd config check` warns about that combination.
+# proxy = "socks5://127.0.0.1:9050"
 # Reconnect backoff (seconds): start at base, double up to max, with full jitter.
 reconnect_base_secs = 1
 reconnect_max_secs = 60
