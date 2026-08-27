@@ -16,6 +16,7 @@
 //! A multi-thread tokio runtime is required: the scan and proving paths use
 //! `tokio::task::block_in_place`, which panics on a current-thread runtime.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -23,6 +24,7 @@ use tracing::{error, info, warn};
 use zcash_protocol::consensus::{NetworkUpgrade, Parameters};
 
 use crate::backend;
+use crate::chain;
 use crate::config::{self, AppConfig};
 use crate::error::RpcError;
 use crate::state::AppState;
@@ -145,6 +147,11 @@ impl PreparedNode {
         } else {
             None
         };
+        // The upstream connections this daemon holds, keyed by endpoint - see the hub comment in
+        // the wallet loop below. A wallet joins an existing hub when its resolved endpoint matches
+        // one already dialed, so the common single-backend deployment holds exactly one.
+        let mut hubs: HashMap<String, Arc<chain::hub::ChainHub>> = HashMap::new();
+
         // zecd permits at most one wallet with spending keys; watch-only (UFVK) wallets may be
         // loaded without limit. Record each opened wallet's watch-only flag so the invariant can
         // be enforced once every wallet has been spawned (the flag is only known after the actor
@@ -168,6 +175,18 @@ impl PreparedNode {
                     return Err(e);
                 }
             };
+            // One shared upstream per distinct endpoint (`chain::hub`). Wallets used to dial
+            // individually, so a daemon's upstream load - connections, chain-tip polls and, worst,
+            // the 2s mempool poll - scaled with the wallet count rather than with the chain.
+            // Wallets resolve their own endpoint (a `[wallets.<name>]` may override the global
+            // `[backend]`), so the hubs are keyed by that endpoint: every wallet agreeing on the
+            // dial shares one connection, and a wallet pointed somewhere else gets its own.
+            let hub = Arc::clone(hubs.entry(server.connection_key()).or_insert_with(|| {
+                chain::hub::ChainHub::new(
+                    server.clone(),
+                    Duration::from_secs(config.backend.connect_timeout_secs),
+                )
+            }));
             // Transparent *receives* now ride the block scan on both backends, so a large address
             // set no longer means per-block polling. What stays per-address is spend detection:
             // librustzcash emits one `TransactionsInvolvingAddress` request per funded address, and
@@ -208,10 +227,9 @@ impl PreparedNode {
                 network: entry.zcash_network(),
                 engine_dir: entry.engine_dir(),
                 keys_path: keys_path.clone(),
-                server,
+                hub: Arc::clone(&hub),
                 sync_interval: Duration::from_secs(config.sync.interval_secs),
                 rebroadcast_interval: Duration::from_secs(config.sync.rebroadcast_secs),
-                connect_timeout: Duration::from_secs(config.backend.connect_timeout_secs),
                 reconnect_base: Duration::from_secs(config.backend.reconnect_base_secs),
                 reconnect_max: Duration::from_secs(config.backend.reconnect_max_secs),
                 age_identity: config.keys.age_identity.clone(),

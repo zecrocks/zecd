@@ -29,6 +29,11 @@ use super::{
 };
 
 /// A connected lightwalletd client.
+///
+/// `Clone` because [`crate::chain::hub::ChainHub`] hands every consumer its own handle onto one
+/// shared connection: a tonic `Channel` is a cheap handle onto one multiplexed HTTP/2 connection,
+/// so cloned sources share it rather than dialing again.
+#[derive(Clone)]
 pub struct LwdSource {
     client: CompactTxStreamerClient<Channel>,
     /// Whether the server speaks the versioned lightwallet-protocol (`poolTypes` on

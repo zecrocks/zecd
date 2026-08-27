@@ -613,6 +613,12 @@ struct VerboseTx {
 }
 
 /// A connected zebrad backend.
+///
+/// `Clone` because [`crate::chain::hub::ChainHub`] hands every consumer its own handle onto one
+/// shared connection: the inner [`ZebraClient`] is a hyper client (an HTTP connection pool), so a
+/// clone reuses the same pooled connections rather than opening a second endpoint. The block
+/// stream already relied on this - it clones the client so streaming does not borrow the source.
+#[derive(Clone)]
 pub struct ZebraSource {
     client: ZebraClient,
     network: ZNetwork,

@@ -671,10 +671,12 @@ fn offline_actor_cfg(
         keys_path,
         // Explicitly a zebra endpoint: since light mode returned, a bare host:port resolves
         // to lightwalletd. Port 1 never answers - these actors are offline by construction.
-        server: backend::resolve("zebra://127.0.0.1:1", net).unwrap(),
+        hub: crate::chain::hub::ChainHub::new(
+            backend::resolve("zebra://127.0.0.1:1", net).unwrap(),
+            Duration::from_millis(150),
+        ),
         sync_interval: Duration::from_secs(60),
         rebroadcast_interval: Duration::from_secs(60),
-        connect_timeout: Duration::from_millis(150),
         reconnect_base: Duration::from_secs(30),
         reconnect_max: Duration::from_secs(60),
         age_identity: None,

@@ -10,6 +10,7 @@
 //! mempool-driven 0-conf flow - is backend-agnostic. [`AnySource`] is the enum the actor
 //! stores; a future backend (e.g. an embedded Zaino service) is one more variant + impl.
 
+pub mod hub;
 pub mod lwd;
 pub mod zebra;
 
@@ -349,6 +350,7 @@ pub trait ChainSource: Send {
 // instances (one per actor / one per scan batch / one per subscription), never in collections,
 // so boxing the larger variant would add indirection for no memory win.
 #[allow(clippy::large_enum_variant)]
+#[derive(Clone)]
 pub enum AnySource {
     Zebra(zebra::ZebraSource),
     Lwd(lwd::LwdSource),
@@ -477,6 +479,9 @@ impl CompactBlockStream {
 pub enum MempoolStream {
     Zebra(zebra::ZebraMempoolStream),
     Lwd(lwd::LwdMempoolStream),
+    /// One consumer's view of [`hub::ChainHub`]'s single shared subscription. The hub pumps a
+    /// `Zebra`/`Lwd` stream and fans it out, so many wallets cost one upstream subscription.
+    Hub(hub::HubMempoolStream),
 }
 
 impl MempoolStream {
@@ -486,6 +491,8 @@ impl MempoolStream {
             // lightwalletd's `GetMempoolStream` natively closes on each new block - the same
             // end-of-stream contract the zebra poller synthesizes.
             MempoolStream::Lwd(s) => s.message().await,
+            // The fan-out relays that same close to every subscriber.
+            MempoolStream::Hub(s) => s.message().await,
         }
     }
 }

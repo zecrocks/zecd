@@ -54,11 +54,10 @@ use zcash_transparent::builder::TransparentSigningSet;
 use zip32::DiversifierIndex;
 use zip321::TransactionRequest;
 
-use crate::backend::Server;
 use crate::backoff::Backoff;
 use crate::chain::{
-    AnySource, BroadcastOutcome, ChainSource, MempoolStream, ServerInfo, TxEvidence,
-    UnsupportedUpgrade,
+    hub::{ChainHub, HubSource},
+    BroadcastOutcome, ChainSource, MempoolStream, ServerInfo, TxEvidence, UnsupportedUpgrade,
 };
 use crate::config::SendPrivacy;
 use crate::error::{codes, ErrorDetails, InsufficientFunds, RpcError};
@@ -616,13 +615,13 @@ pub struct ActorConfig {
     pub engine_dir: PathBuf,
     /// Path to this wallet's `keys.toml` (may live outside `engine_dir`, e.g. a mounted Secret).
     pub keys_path: PathBuf,
-    /// The upstream zebrad endpoint.
-    pub server: Server,
+    /// The shared upstream ([`ChainHub`]): one connection, one mempool subscription and one
+    /// chain-tip poll serve every wallet in the daemon, so adding a wallet adds no upstream load
+    /// beyond its own scan. Actors never dial directly.
+    pub hub: Arc<ChainHub>,
     pub sync_interval: Duration,
     /// Minimum spacing between unmined-tx rebroadcast passes.
     pub rebroadcast_interval: Duration,
-    /// Per-attempt dial timeout.
-    pub connect_timeout: Duration,
     /// Reconnect backoff base/max delays.
     pub reconnect_base: Duration,
     pub reconnect_max: Duration,
@@ -684,9 +683,8 @@ struct WalletActor {
     engine_dir: PathBuf,
     /// Path to this wallet's `keys.toml` (may live outside `engine_dir`).
     keys_path: PathBuf,
-    /// The upstream zebrad endpoint.
-    server: Server,
-    connect_timeout: Duration,
+    /// The shared upstream connection every wallet in this daemon uses.
+    hub: Arc<ChainHub>,
     backoff: Backoff,
     /// When the next reconnect attempt is allowed (a backoff deadline, not a fixed tick), so
     /// commands interrupting the idle wait don't advance the backoff.
@@ -776,7 +774,7 @@ struct WalletActor {
     pending_bootstrap: Option<(BlockHeight, BootstrapKey)>,
     db_data: WriteDb,
     db_cache: FsBlockDb,
-    client: Option<AnySource>,
+    client: Option<HubSource>,
     /// Whether the current connection has emitted its "connected ... chain tip N" log line.
     /// Set once per connection (on the first successful tip refresh, when the tip is known)
     /// and reset on disconnect, so connect/disconnect are logged as matched transitions
@@ -1186,8 +1184,7 @@ async fn spawn_inner(
         network: cfg.network,
         engine_dir: cfg.engine_dir.clone(),
         keys_path: cfg.keys_path.clone(),
-        server: cfg.server,
-        connect_timeout: cfg.connect_timeout,
+        hub: cfg.hub,
         backoff: Backoff::new(cfg.reconnect_base, cfg.reconnect_max),
         reconnect_at: Instant::now(),
         sync_interval: cfg.sync_interval,
@@ -2297,7 +2294,10 @@ impl WalletActor {
         self.client = None;
         self.reconnect_at = reconnect_after_backoff(Instant::now(), &mut self.backoff);
         if std::mem::take(&mut self.connected_logged) {
-            warn!("disconnected from {}: {reason}", self.server.describe());
+            warn!(
+                "disconnected from {}: {reason}",
+                self.hub.server().describe()
+            );
         }
     }
 
@@ -2370,9 +2370,11 @@ impl WalletActor {
         // Any open mempool stream belongs to the channel being replaced; drop it so it can't
         // pin the old connection alive. It is reopened on the next caught-up sync pass.
         self.mempool = None;
-        let describe = self.server.describe();
+        let describe = self.hub.server().describe();
         info!("connecting to {}", describe);
-        let client = self.server.connect_timeout(self.connect_timeout).await?;
+        // The hub dials only if the shared connection is down; when many wallets react to one
+        // outage together, the first through re-dials and the rest attach to its result.
+        let client = self.hub.acquire().await?;
         self.client = Some(client);
         let client = self.client.as_mut().expect("just set");
         // A reachable-but-unhealthy upstream can still fail here; treat that as a failed connect.
@@ -3176,7 +3178,7 @@ impl WalletActor {
         if !self.connected_logged {
             self.connected_logged = true;
             info!(
-                server = %self.server.describe(),
+                server = %self.hub.server().describe(),
                 tip = u32::from(tip),
                 "connected to the upstream"
             );
@@ -3689,7 +3691,7 @@ impl WalletActor {
         });
         let status = SyncStatus {
             connected: self.client.is_some(),
-            server: Some(self.server.describe()),
+            server: Some(self.hub.server().describe()),
             conn_state,
             chain_tip: self.tip_height,
             fully_scanned,
