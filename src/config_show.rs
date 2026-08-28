@@ -173,6 +173,11 @@ pub fn render(config: &AppConfig) -> String {
         "untrusted_confirmations",
         config.spend.untrusted_confirmations,
     );
+    kv(
+        &mut s,
+        "trust_own_transactions",
+        config.spend.trust_own_transactions,
+    );
     // The `Debug` spelling is the config spelling (`SendPrivacy::parse` accepts exactly these),
     // so the rendered value round-trips.
     kv(

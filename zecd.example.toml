@@ -365,10 +365,20 @@ rebroadcast_secs = 60
 # must be before it is spendable. Anchors getbalance/getbalances/getwalletinfo and spend
 # proposals; getbalance's explicit minconf argument overrides it per call. Lowering these
 # trades reorg/double-spend safety for latency.
-# Confirmations before the wallet's *own* outputs (change) are spendable.
+# Confirmations before the wallet's *own* outputs are spendable: change, and every output of
+# a transaction this wallet authored (zecd marks its own sends trusted at store time, so a
+# self-send's payment output waits this depth, not the untrusted one - Bitcoin Core's
+# own-transaction trust model).
 trusted_confirmations = 3
 # Confirmations before third-party payments are spendable (must be >= trusted_confirmations).
 untrusted_confirmations = 10
+# Mark transactions this wallet authors as trusted at store time (what makes a self-send's
+# payment output wait trusted_confirmations above rather than untrusted_confirmations). Set
+# false to keep zecd from persisting the trust marker at all: classification then derives only
+# from data a from-seed restore re-derives, so an authoring instance and a restore of the same
+# seed report identical balances at every confirmation depth (the strictest statelessness
+# posture) - at the cost of the wallet's own self-send payments waiting the untrusted depth.
+trust_own_transactions = true
 # What sends may reveal on-chain (zcashd/Zallet's privacy-policy opt-in, zcash/zcash#6240). A
 # five-rung ladder from most to least private; unlike zcashd's policy lattice it is linear, so
 # each rung also permits everything the rungs above it forbid:

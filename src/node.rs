@@ -223,6 +223,7 @@ impl PreparedNode {
                 min_split_output_value: config.spend.min_split_output_value,
                 orchard_keys: orchard_keys.clone(),
                 pipeline_proving: config.spend.pipeline_proving,
+                trust_own_transactions: config.spend.trust_own_transactions,
                 enabled_pools: entry.pools.clone(),
                 default_receivers: entry.default_receivers.clone(),
                 transparent_enabled: entry.transparent_enabled,

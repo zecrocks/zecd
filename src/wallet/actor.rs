@@ -652,6 +652,10 @@ pub struct ActorConfig {
     /// Run the proving step off the actor so a long send doesn't freeze sync (`[spend]
     /// pipeline_proving`). Only engages on the cached-Orchard PCZT path; off by default.
     pub pipeline_proving: bool,
+    /// Mark wallet-authored transactions trusted at store time (`[spend]
+    /// trust_own_transactions`, default on) - see [`mark_own_tx_trusted`]. Off = persist no
+    /// trust marker, so a restore classifies identically to the authoring instance.
+    pub trust_own_transactions: bool,
     /// Shielded pools this wallet receives into and spends from (change pool selection).
     pub enabled_pools: ReceiverSet,
     /// Receivers included by default in this wallet's Unified Addresses.
@@ -799,6 +803,9 @@ struct WalletActor {
     /// `[spend] pipeline_proving`: run a send's prove+sign off the actor so it doesn't freeze
     /// sync. Only engages on the cached-Orchard PCZT path (see [`Self::pipeline_eligible`]).
     pipeline_proving: bool,
+    /// `[spend] trust_own_transactions`: mark wallet-authored transactions trusted at store
+    /// time (see [`mark_own_tx_trusted`]). Off = the full-statelessness posture.
+    trust_own_transactions: bool,
     /// Whether a pipelined send's proof is currently running on a blocking thread. While `true`,
     /// new sends queue (in [`Self::send_queue`]) rather than starting - sends stay serialized.
     send_in_flight: bool,
@@ -1223,6 +1230,7 @@ async fn spawn_inner(
         prover,
         orchard_keys: cfg.orchard_keys,
         pipeline_proving: cfg.pipeline_proving,
+        trust_own_transactions: cfg.trust_own_transactions,
         send_in_flight: false,
         send_queue: VecDeque::new(),
         send_done_tx,
@@ -1457,6 +1465,7 @@ fn build_signed_transparent_tx(
     change: Option<(TransparentAddress, Zatoshis)>,
     fee_amount: Zatoshis,
     prover: &LocalTxProver,
+    trust_own: bool,
 ) -> Result<(TxId, Vec<u8>), RpcError> {
     use rand::rngs::OsRng;
 
@@ -1572,6 +1581,7 @@ fn build_signed_transparent_tx(
     );
     db.store_transactions_to_be_sent(std::slice::from_ref(&sent))
         .map_err(RpcError::database_internal)?;
+    mark_own_tx_trusted(db, txid, trust_own);
 
     Ok((txid, raw))
 }
@@ -4614,6 +4624,7 @@ impl WalletActor {
             .get()
             .await?;
         let prover = self.prover.clone();
+        let trust_own = self.trust_own_transactions;
         let db = &mut self.db_data;
         let (txid, raw, prove, store): (TxId, Vec<u8>, Duration, Duration) =
             tokio::task::block_in_place(move || -> Result<_, RpcError> {
@@ -4621,7 +4632,7 @@ impl WalletActor {
                 let signed = prove_sign_pczt(pczt, &usk, &prover, &keys)?;
                 let prove = p0.elapsed();
                 let s0 = Instant::now();
-                let txid = store_pczt(db, signed)?;
+                let txid = store_pczt(db, signed, trust_own)?;
                 let raw = read_raw_tx(db, txid)?;
                 Ok((txid, raw, prove, s0.elapsed()))
             })?;
@@ -4656,6 +4667,7 @@ impl WalletActor {
         let account_id = self.require_account()?;
         let prover: &LocalTxProver = &self.prover;
         let engine_dir = self.engine_dir.clone();
+        let trust_own = self.trust_own_transactions;
         let db = &mut self.db_data;
         let (txid, raw, shape, build, prove): (TxId, Vec<u8>, SendShape, Duration, Duration) =
             tokio::task::block_in_place(move || -> Result<_, RpcError> {
@@ -4718,6 +4730,7 @@ impl WalletActor {
                     ));
                 }
                 let txid = *txids.first();
+                mark_own_tx_trusted(db, txid, trust_own);
                 let raw = read_raw_tx(db, txid)?;
                 Ok((txid, raw, shape, build, p0.elapsed()))
             })?;
@@ -4923,12 +4936,13 @@ impl WalletActor {
         build: Duration,
         prove: Duration,
     ) -> Result<TxId, RpcError> {
+        let trust_own = self.trust_own_transactions;
         let db = &mut self.db_data;
         let _ = policy; // store rarely surfaces -6; kept for symmetry with the inline path.
         let (txid, raw, store): (TxId, Vec<u8>, Duration) =
             tokio::task::block_in_place(move || -> Result<_, RpcError> {
                 let s0 = Instant::now();
-                let txid = store_pczt(db, signed)?;
+                let txid = store_pczt(db, signed, trust_own)?;
                 let raw = read_raw_tx(db, txid)?;
                 Ok((txid, raw, s0.elapsed()))
             })?;
@@ -4989,6 +5003,7 @@ impl WalletActor {
         // builder wants `&LocalTxProver`, so deref-coerce through the Arc.
         let prover: &LocalTxProver = &self.prover;
         let engine_dir = self.engine_dir.clone();
+        let trust_own = self.trust_own_transactions;
         let db = &mut self.db_data;
 
         let (txid, raw): (TxId, Vec<u8>) =
@@ -5159,6 +5174,7 @@ impl WalletActor {
                     change_recipient,
                     fee_amount,
                     prover,
+                    trust_own,
                 )
             })?;
 
@@ -5338,6 +5354,7 @@ impl WalletActor {
 
         let net = self.network;
         let prover: &LocalTxProver = &self.prover;
+        let trust_own = self.trust_own_transactions;
         let db = &mut self.db_data;
         let (txid, raw): (TxId, Vec<u8>) =
             tokio::task::block_in_place(move || -> Result<_, RpcError> {
@@ -5369,6 +5386,7 @@ impl WalletActor {
                     ));
                 }
                 let txid = *txids.first();
+                mark_own_tx_trusted(db, txid, trust_own);
                 let raw = read_raw_tx(db, txid)?;
                 Ok((txid, raw))
             })?;
@@ -5860,6 +5878,7 @@ impl WalletActor {
         let usk = seed_guard(&self.seed).derive_usk(self.network, account_index)?;
 
         let net = self.network;
+        let trust_own = self.trust_own_transactions;
         let (txid, raw): (TxId, Vec<u8>) = match work {
             MergeWork::UtxoProposal(proposal) => {
                 let prover: &LocalTxProver = &self.prover;
@@ -5882,6 +5901,7 @@ impl WalletActor {
                         ));
                     }
                     let txid = *txids.first();
+                    mark_own_tx_trusted(db, txid, trust_own);
                     let raw = read_raw_tx(db, txid)?;
                     Ok((txid, raw))
                 })?
@@ -5907,6 +5927,7 @@ impl WalletActor {
                         ));
                     }
                     let txid = *txids.first();
+                    mark_own_tx_trusted(db, txid, trust_own);
                     let raw = read_raw_tx(db, txid)?;
                     Ok((txid, raw))
                 })?
@@ -5940,6 +5961,7 @@ impl WalletActor {
                         None,
                         fee,
                         prover,
+                        trust_own,
                     )
                 })?
             }
@@ -6626,11 +6648,51 @@ fn prove_sign_pczt(
 /// node (the compact scan materializes the notes but carries no memos, and enhancement skips a tx
 /// whose raw bytes the send pre-stored). zecd covered that by re-decrypting the just-stored
 /// transaction here; the pass is gone with the version that made it unnecessary.
-fn store_pczt(db: &mut WriteDb, pczt: pczt::Pczt) -> Result<TxId, RpcError> {
-    extract_and_store_transaction_from_pczt::<_, zcash_client_sqlite::ReceivedNoteId>(
+fn store_pczt(db: &mut WriteDb, pczt: pczt::Pczt, trust_own: bool) -> Result<TxId, RpcError> {
+    let txid = extract_and_store_transaction_from_pczt::<_, zcash_client_sqlite::ReceivedNoteId>(
         db, pczt, None, None,
     )
-    .map_err(|e| RpcError::wallet(format!("storing transaction failed: {e}")))
+    .map_err(|e| RpcError::wallet(format!("storing transaction failed: {e}")))?;
+    mark_own_tx_trusted(db, txid, trust_own);
+    Ok(txid)
+}
+
+/// Mark a transaction this wallet just authored as **trusted** (`WalletWrite::set_tx_trust`), so
+/// the ZIP-315 confirmations policy applies `[spend] trusted_confirmations` (default 3) to its
+/// outputs instead of `untrusted_confirmations` (default 10) - Bitcoin Core's own-transaction
+/// trust model. Without this, the payment half of a self-send (an *external*-scope output, unlike
+/// change, whose internal key scope is already trusted) sat in
+/// `getwalletinfo.unconfirmed_balance` until 10 confirmations even though the wallet built the
+/// transaction itself; `zcash_client_sqlite` 0.22.0 added the `trust_status` column and the
+/// `set_tx_trust` hook but nothing upstream calls it. Called at every send-store chokepoint
+/// (the PCZT extract path, the fused path, the transparent builder, `z_shieldcoinbase`, and
+/// `z_mergetoaddress`'s fused arms), right after the store and before broadcast.
+///
+/// Statelessness note: the marker persists in `data.sqlite`, but it is a cache of derivable
+/// data ("this wallet authored this transaction", recoverable in principle from seed + chain
+/// via OVK decryption), so it respects the no-unrebuildable-persistence invariant. A from-seed
+/// restore does not currently re-derive it, so a restored wallet classifies an old self-send's
+/// payment output as untrusted until `untrusted_confirmations` - strictly more conservative
+/// than the authoring instance for that window, never less safe, and moot once the output is
+/// 10 deep.
+///
+/// Best-effort by design: the transaction is already stored (and about to broadcast), so a
+/// failure here must not fail the send - the output just stays on the conservative untrusted
+/// depth, exactly as before this call existed.
+///
+/// `enabled` is `[spend] trust_own_transactions` (default on), threaded from the caller rather
+/// than read here so the free-function call sites (`store_pczt`,
+/// `build_signed_transparent_tx`) stay actor-state-free. With it off, zecd never writes the
+/// marker: classification then derives purely from data every from-seed restore re-derives, so
+/// an authoring instance and a restore report identically at every depth - the operator's
+/// full-statelessness opt-out, paid for in self-send payments waiting the untrusted depth.
+fn mark_own_tx_trusted(db: &mut WriteDb, txid: TxId, enabled: bool) {
+    if !enabled {
+        return;
+    }
+    if let Err(e) = db.set_tx_trust(txid, true) {
+        warn!("failed to mark own transaction {txid} as trusted: {e}");
+    }
 }
 
 /// A send's size, for the latency log line. Proving cost scales with `orchard_actions`; a large,
