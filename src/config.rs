@@ -692,6 +692,17 @@ pub struct SpendConfig {
     /// Confirmations before third-party outputs are spendable. Must be at least
     /// `trusted_confirmations`. Default 10.
     pub untrusted_confirmations: u32,
+    /// Mark transactions this wallet authors as **trusted** at store time
+    /// (`actor::mark_own_tx_trusted`), so their outputs - including the payment half of a
+    /// self-send - are spendable at `trusted_confirmations` instead of
+    /// `untrusted_confirmations` (Bitcoin Core's own-transaction trust model). **On by
+    /// default.** Set `trust_own_transactions = false` to keep zecd from persisting the marker
+    /// at all: every output is then classified purely from data a from-seed restore re-derives
+    /// (key scope + chain), so an authoring instance and a restore of the same seed report
+    /// byte-identical classifications at every confirmation depth - the strictest reading of
+    /// the statelessness invariant, at the cost of self-send payments waiting the untrusted
+    /// depth. Governs new sends only; markers already written remain until a rescan.
+    pub trust_own_transactions: bool,
     /// What sends are allowed to reveal on-chain. Default `AllowRevealedRecipients`.
     pub privacy: SendPrivacy,
     /// Cap on the number of Orchard actions (`max(orchard inputs, orchard outputs)`) a single
@@ -736,6 +747,7 @@ impl Default for SpendConfig {
         Self {
             trusted_confirmations: 3,
             untrusted_confirmations: 10,
+            trust_own_transactions: true,
             privacy: SendPrivacy::AllowRevealedRecipients,
             orchard_action_limit: DEFAULT_ORCHARD_ACTION_LIMIT,
             cache_proving_key: true,
@@ -1071,6 +1083,7 @@ struct SyncFile {
 struct SpendFile {
     trusted_confirmations: Option<u32>,
     untrusted_confirmations: Option<u32>,
+    trust_own_transactions: Option<bool>,
     privacy_policy: Option<String>,
     orchard_action_limit: Option<usize>,
     cache_proving_key: Option<bool>,
@@ -1834,6 +1847,7 @@ impl AppConfig {
         let spend = SpendConfig {
             trusted_confirmations: spend_file.trusted_confirmations.unwrap_or(3),
             untrusted_confirmations: spend_file.untrusted_confirmations.unwrap_or(10),
+            trust_own_transactions: spend_file.trust_own_transactions.unwrap_or(true),
             privacy: spend_file
                 .privacy_policy
                 .as_deref()
@@ -2604,6 +2618,18 @@ mod tests {
         assert_eq!(f.pipeline_proving, Some(true));
         let f: SpendFile = toml::from_str("pipeline_proving = false").unwrap();
         assert_eq!(f.pipeline_proving, Some(false));
+    }
+
+    #[test]
+    fn trust_own_transactions_defaults_on_and_parses() {
+        // Absent -> on: wallet-authored transactions are marked trusted at store time.
+        assert!(SpendConfig::default().trust_own_transactions);
+        // The full-statelessness opt-out round-trips: with it off, zecd persists no trust
+        // marker, so an authoring instance and a from-seed restore classify identically.
+        let f: SpendFile = toml::from_str("trust_own_transactions = false").unwrap();
+        assert_eq!(f.trust_own_transactions, Some(false));
+        let f: SpendFile = toml::from_str("trust_own_transactions = true").unwrap();
+        assert_eq!(f.trust_own_transactions, Some(true));
     }
 
     #[test]

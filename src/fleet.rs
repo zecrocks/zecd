@@ -869,6 +869,8 @@ impl ShardTemplate {
             // Shard members never spend, so the proving keys would be dead weight.
             orchard_keys: None,
             pipeline_proving: false,
+            // Never consulted either: the trust marker is written at send-store time.
+            trust_own_transactions: false,
             enabled_pools: self.enabled_pools.clone(),
             default_receivers: self.default_receivers.clone(),
             // Shielded-only - see `crate::wallet::shard`.

@@ -245,6 +245,7 @@ impl PreparedNode {
                 min_split_output_value: config.spend.min_split_output_value,
                 orchard_keys: orchard_keys.clone(),
                 pipeline_proving: config.spend.pipeline_proving,
+                trust_own_transactions: config.spend.trust_own_transactions,
                 enabled_pools: entry.pools.clone(),
                 default_receivers: entry.default_receivers.clone(),
                 transparent_enabled: entry.transparent_enabled,
@@ -468,6 +469,8 @@ async fn spawn_fleet(
             // Shard members never spend, so the proving keys are dead weight here.
             orchard_keys: None,
             pipeline_proving: false,
+            // Never consulted either: the trust marker is written at send-store time.
+            trust_own_transactions: false,
             enabled_pools: config.pools.enabled.clone(),
             default_receivers: config.pools.default_receivers.clone(),
             // Shielded-only: the transparent matcher keeps per-account gap windows, pre-exposure

@@ -930,6 +930,7 @@ fn offline_actor_cfg(
         // Offline test: the actor never sends, so skip building the (expensive) proving key.
         orchard_keys: None,
         pipeline_proving: false,
+        trust_own_transactions: true,
         enabled_pools: crate::pools::ReceiverSet::single(crate::pools::Receiver::Orchard),
         default_receivers: crate::pools::ReceiverSet::single(crate::pools::Receiver::Orchard),
         transparent_enabled: false,

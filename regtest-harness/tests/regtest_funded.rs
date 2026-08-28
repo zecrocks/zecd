@@ -1320,6 +1320,58 @@ async fn regtest_funded_orchard_receive() {
         tokio::time::sleep(Duration::from_millis(500)).await;
     }
 
+    // ---- Phase 8b: a wallet-authored tx is TRUSTED - its payment output is spendable at 3 ----
+    //
+    // zecd marks its own sends trusted at store time (`actor::mark_own_tx_trusted` ->
+    // `WalletWrite::set_tx_trust`), so the ZIP-315 policy applies `trusted_confirmations` (3) to
+    // BOTH outputs of the self-send above: the internal change (trusted by key scope already)
+    // AND the external-scope payment to our own address. Without the marker the payment output
+    // is classified untrusted and sits in `getbalances.mine.untrusted_pending` /
+    // `getwalletinfo.unconfirmed_balance` from confirmation 3 through 9 - the "getwalletinfo
+    // mis-splits confirmed/unconfirmed" of the 2026-08-22 fleet report. Mine one extra block so
+    // the tx is at 3-4 confirmations regardless of which of the confirming blocks it landed in -
+    // squarely inside the [trusted, untrusted) window where only the marker makes the
+    // difference.
+    let tip = zecd
+        .block_count()
+        .await
+        .expect("getblockcount before the trust-window check");
+    zebrad
+        .generate_blocks(1)
+        .await
+        .expect("put the self-send safely past trusted_confirmations");
+    zecd.wait_until_synced(tip + 1, FUND_TIMEOUT)
+        .await
+        .expect("scan into the trust window");
+    let balances = zecd
+        .call("getbalances", json!([]))
+        .await
+        .expect("getbalances inside the trust window");
+    assert_eq!(
+        balances["mine"]["untrusted_pending"].as_f64(),
+        Some(0.0),
+        "a wallet-authored self-send's payment output must be trusted (spendable at 3 confs), \
+         not untrusted-pending until 10: {balances}"
+    );
+    let wi = zecd
+        .call("getwalletinfo", json!([]))
+        .await
+        .expect("getwalletinfo inside the trust window");
+    assert_eq!(
+        wi["unconfirmed_balance"].as_f64(),
+        Some(0.0),
+        "getwalletinfo agrees: nothing pending while the young self-send outputs are trusted: {wi}"
+    );
+    let gb = zecd
+        .call("getbalance", json!([]))
+        .await
+        .expect("getbalance inside the trust window");
+    assert_eq!(
+        wi["balance"].as_f64(),
+        gb.as_f64(),
+        "getwalletinfo.balance and default-policy getbalance are the same read: {wi} vs {gb}"
+    );
+
     // ---- conformance.py against the live, funded daemon ----
     // The wallet was created encrypted (`init --encrypt`) and is unlocked by now; passing the
     // passphrase enables conformance's lock/unlock state machine (unlock → walletlock → -13 →
@@ -1459,6 +1511,25 @@ async fn regtest_funded_orchard_receive() {
     // encrypted, so this also exercises the locked path: it comes back with no account, refuses
     // address generation, and only rebuilds once `walletpassphrase` supplies the seed.
     drop(watch_only);
+    // Age the Phase-8 self-send past the *untrusted* confirmation window (10) before comparing
+    // balances across the wipe. On the authoring wallet its payment output is trusted (marked at
+    // store time - see `actor::mark_own_tx_trusted`) and spendable from 3 confirmations, but the
+    // wipe below erases the trust marker with the rest of data.sqlite, and by that helper's
+    // documented statelessness caveat a rebuilt wallet classifies the still-young output as
+    // untrusted (spendable at 10). Without this aging, `balance_before` includes the payment and
+    // `balance_after` does not - the deliberate, conservative restore divergence, not the funds
+    // loss this phase exists to catch. Past 10 confirmations both classifications agree.
+    let tip = zecd
+        .block_count()
+        .await
+        .expect("getblockcount before aging the self-send");
+    zebrad
+        .generate_blocks(8)
+        .await
+        .expect("age the self-send past the untrusted window");
+    zecd.wait_until_synced(tip + 8, FUND_TIMEOUT)
+        .await
+        .expect("scan the aging blocks");
     let tip = zecd
         .block_count()
         .await
