@@ -305,6 +305,57 @@ pub fn owned_transparent_output(
         .then_some(output)
 }
 
+/// How many consecutive *zero-progress* reconnects [`download_blocks`] tolerates after a
+/// client-side h2 load shed before giving up on the range. Any attempt that writes at least
+/// one block resets the count, so a download that keeps making progress keeps resuming, and
+/// only a range that cannot advance at all surfaces the error.
+const MAX_STALLED_STREAM_RESTARTS: u32 = 3;
+
+/// The progress one [`download_blocks`] call accumulates across however many streaming
+/// attempts it takes. Carried between attempts so a reconnect resumes rather than restarts:
+/// every block in `block_meta` is already on disk, and the transparent matching state must
+/// not be replayed for it.
+struct DownloadProgress {
+    block_meta: Vec<BlockMeta>,
+    received: Vec<MatchedTransparentReceive>,
+    spent: Vec<MatchedTransparentSpend>,
+    /// The outpoints to watch for spends, seeded from what the wallet already holds and then
+    /// **carried forward as this batch is scanned**: a receive matched in an earlier block of
+    /// the same batch is not in the database yet (receives are recorded only after the whole
+    /// range scans), so without carrying it here a receive and its spend inside one batch
+    /// would leave the spend undetected until some later batch happened to re-cover the block,
+    /// which never happens, because the scan is forward-only. At BATCH_SIZE = 10_000 blocks
+    /// that is not an edge case: it is every from-seed restore of a wallet whose transparent
+    /// history fits in one batch. It is carried across streaming attempts for the same reason
+    /// it is carried across blocks: a resumed download must not lose the earlier blocks' state.
+    watch: Option<UnspentOutpoints>,
+}
+
+/// Where a load-shed reconnect should resume, or `None` once the range has failed
+/// [`MAX_STALLED_STREAM_RESTARTS`] consecutive times without advancing.
+///
+/// `made_progress` is whether the attempt that just failed wrote at least one block;
+/// `last_written` is the highest block now on disk, and `resume_from` the height the failed
+/// attempt started at (the answer when it wrote nothing at all). Resuming one past the last
+/// block written is what keeps the retry cheap: the load shed killed the connection, not the
+/// blocks already on disk.
+fn plan_load_shed_resume(
+    made_progress: bool,
+    last_written: Option<BlockHeight>,
+    resume_from: BlockHeight,
+    stalled_restarts: &mut u32,
+) -> Option<BlockHeight> {
+    if made_progress {
+        *stalled_restarts = 0;
+    } else {
+        *stalled_restarts += 1;
+        if *stalled_restarts > MAX_STALLED_STREAM_RESTARTS {
+            return None;
+        }
+    }
+    Some(last_written.map_or(resume_from, |h| h + 1))
+}
+
 async fn download_blocks<C: ChainSource>(
     client: &mut C,
     engine_dir: &Path,
@@ -318,26 +369,79 @@ async fn download_blocks<C: ChainSource>(
     Vec<MatchedTransparentSpend>,
 )> {
     info!(range = %scan_range, "fetching compact blocks");
-    let mut stream = client
-        .compact_block_range(
-            scan_range.block_range().start,
-            scan_range.block_range().end - 1,
-            transparent.is_some(),
+    let range_end = scan_range.block_range().end - 1;
+    let mut next = scan_range.block_range().start;
+    let mut progress = DownloadProgress {
+        block_meta: vec![],
+        received: vec![],
+        spent: vec![],
+        watch: unspent.cloned(),
+    };
+    let mut stalled_restarts = 0u32;
+
+    while next <= range_end {
+        let before = progress.block_meta.len();
+        match download_range_once(
+            client,
+            engine_dir,
+            next,
+            range_end,
+            transparent,
+            &mut progress,
         )
+        .await
+        {
+            Ok(()) => break,
+            // h2's client-side load shed (see `chain::is_h2_load_shed`) kills the connection,
+            // not the progress: every block file already written stays written, and the next
+            // `compact_block_range` reconnects transparently onto a fresh connection with a
+            // full frame budget. Eager draining alone cannot rule this out, because the
+            // budget is charged as h2's connection task parses frames off the socket - a
+            // burst on datacenter bandwidth can exhaust it before the reader task is
+            // scheduled at all, however fast it drains. So resume from the first block we do
+            // not have instead of failing the whole batch back to the actor, which would
+            // restart the range from the same height and hit the same wall.
+            Err(e) if crate::chain::is_h2_load_shed(&e) => {
+                let made_progress = progress.block_meta.len() > before;
+                let last_written = progress.block_meta.last().map(|m| m.height);
+                let Some(resume_at) =
+                    plan_load_shed_resume(made_progress, last_written, next, &mut stalled_restarts)
+                else {
+                    return Err(e.context(
+                        "block download made no progress across repeated h2 load-shed reconnects",
+                    ));
+                };
+                next = resume_at;
+                warn!(
+                    resume_at = u32::from(next),
+                    "client-side h2 load shed killed the block stream; reconnecting and resuming"
+                );
+            }
+            Err(e) => return Err(e),
+        }
+    }
+
+    db_cache
+        .write_block_metadata(&progress.block_meta)
+        .map_err(|e| anyhow!("{e:?}"))?;
+    Ok((progress.block_meta, progress.received, progress.spent))
+}
+
+/// One streaming attempt of [`download_blocks`]: fetch `[next, range_end]` and fold each block
+/// into `progress`, writing its cache file as it goes. On a stream error everything appended
+/// so far is already on disk, so the caller can resume after the last entry.
+async fn download_range_once<C: ChainSource>(
+    client: &mut C,
+    engine_dir: &Path,
+    next: BlockHeight,
+    range_end: BlockHeight,
+    transparent: Option<&HashSet<TransparentAddress>>,
+    progress: &mut DownloadProgress,
+) -> anyhow::Result<()> {
+    let mut stream = client
+        .compact_block_range(next, range_end, transparent.is_some())
         .await?;
 
-    let mut block_meta = vec![];
-    let mut received = vec![];
-    let mut spent = vec![];
-    // The outpoints to watch for spends, seeded from what the wallet already holds and then
-    // **carried forward as this batch is scanned**: a receive matched in an earlier block of the
-    // same batch is not in the database yet (receives are recorded only after the whole range
-    // scans), so without carrying it here a receive and its spend inside one batch would leave
-    // the spend undetected until some later batch happened to re-cover the block - which never
-    // happens, because the scan is forward-only. At BATCH_SIZE = 10_000 blocks that is not an
-    // edge case: it is every from-seed restore of a wallet whose transparent history fits in one
-    // batch.
-    let mut watch = unspent.cloned();
     while let Some((block, t_outs, t_ins)) = stream.next().await? {
         // The per-block level for diagnosing "stuck at height N" in the field without a
         // custom build; costs one disabled-level check per block when filtered out.
@@ -378,10 +482,10 @@ async fn download_blocks<C: ChainSource>(
                     u.height,
                 ) {
                     // Watch the new output for a spend later in this same batch.
-                    if let Some(w) = watch.as_mut() {
+                    if let Some(w) = progress.watch.as_mut() {
                         w.insert((*output.outpoint().txid(), output.outpoint().n()));
                     }
-                    received.push(MatchedTransparentReceive {
+                    progress.received.push(MatchedTransparentReceive {
                         output,
                         coinbase_tx: u.coinbase_tx,
                     });
@@ -399,15 +503,15 @@ async fn download_blocks<C: ChainSource>(
         // wallet received earlier in this same block is caught too. `remove` both tests
         // membership and retires the outpoint, so one spend is recorded once however many of the
         // wallet's outputs the transaction consumes.
-        if let Some(w) = watch.as_mut() {
+        if let Some(w) = progress.watch.as_mut() {
             for i in t_ins {
                 if w.remove(&(i.prevout_txid, i.prevout_index)) {
                     let matched = MatchedTransparentSpend {
                         spending_txid: i.spending_txid,
                         height: i.height,
                     };
-                    if !spent.contains(&matched) {
-                        spent.push(matched);
+                    if !progress.spent.contains(&matched) {
+                        progress.spent.push(matched);
                     }
                 }
             }
@@ -416,13 +520,9 @@ async fn download_blocks<C: ChainSource>(
         let encoded = block.encode_to_vec();
         let mut block_file = File::create(block_path(engine_dir, &meta)).await?;
         block_file.write_all(&encoded).await?;
-        block_meta.push(meta);
+        progress.block_meta.push(meta);
     }
-
-    db_cache
-        .write_block_metadata(&block_meta)
-        .map_err(|e| anyhow!("{e:?}"))?;
-    Ok((block_meta, received, spent))
+    Ok(())
 }
 
 async fn download_chain_state<C: ChainSource>(
@@ -1657,5 +1757,71 @@ mod tests {
             Some(BlockHeight::from_u32(1)),
             "stale metadata truncated to the rewind height (no longer growing without bound)"
         );
+    }
+
+    /// The load-shed retry resumes one past the last block actually written, so a reconnect
+    /// costs only the blocks the killed connection never delivered. With nothing written yet
+    /// it re-requests the same start.
+    #[test]
+    fn a_load_shed_resumes_past_the_last_block_written() {
+        let mut stalled = 0u32;
+        assert_eq!(
+            plan_load_shed_resume(
+                true,
+                Some(BlockHeight::from_u32(1_234)),
+                BlockHeight::from_u32(1_000),
+                &mut stalled,
+            ),
+            Some(BlockHeight::from_u32(1_235)),
+        );
+        assert_eq!(stalled, 0, "progress resets the stall count");
+
+        // Nothing written at all: retry the same height.
+        assert_eq!(
+            plan_load_shed_resume(false, None, BlockHeight::from_u32(1_000), &mut stalled),
+            Some(BlockHeight::from_u32(1_000)),
+        );
+    }
+
+    /// A download that keeps advancing keeps resuming however many load sheds it takes; only
+    /// a range that cannot advance at all gives up, and only after a bounded number of tries.
+    /// Without the reset, a long first sync on a bad-enough connection would fail the batch
+    /// after three sheds even while making steady progress.
+    #[test]
+    fn only_a_download_that_stops_advancing_gives_up() {
+        let mut stalled = 0u32;
+        // Twenty sheds, each after real progress: never gives up.
+        let mut height = 1_000u32;
+        for _ in 0..20 {
+            height += 500;
+            assert!(
+                plan_load_shed_resume(
+                    true,
+                    Some(BlockHeight::from_u32(height)),
+                    BlockHeight::from_u32(height),
+                    &mut stalled,
+                )
+                .is_some(),
+                "progress must keep the retry alive"
+            );
+        }
+
+        // Now the range stops advancing: tolerated MAX times, then given up on.
+        let stuck = BlockHeight::from_u32(height + 1);
+        for attempt in 1..=MAX_STALLED_STREAM_RESTARTS {
+            assert!(
+                plan_load_shed_resume(false, Some(height.into()), stuck, &mut stalled).is_some(),
+                "zero-progress attempt {attempt} is still within budget"
+            );
+        }
+        assert_eq!(
+            plan_load_shed_resume(false, Some(height.into()), stuck, &mut stalled),
+            None,
+            "past the budget the error surfaces instead of looping"
+        );
+
+        // One block of progress buys the full budget back.
+        assert!(plan_load_shed_resume(true, Some(stuck), stuck, &mut stalled).is_some());
+        assert_eq!(stalled, 0);
     }
 }

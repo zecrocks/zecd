@@ -13,8 +13,11 @@
 //!    blocks entirely; the wallet falls back to address-index queries (`GetAddressUtxos` +
 //!    `GetTaddressTxids`) - the standard librustzcash lightclient mechanism.
 
+use std::sync::Arc;
+
 use anyhow::anyhow;
-use tokio::sync::mpsc;
+use prost::Message;
+use tokio::sync::{mpsc, OwnedSemaphorePermit, Semaphore};
 use tonic::transport::Channel;
 use zcash_client_backend::proto::compact_formats::CompactBlock;
 use zcash_client_backend::proto::service::{
@@ -165,9 +168,12 @@ impl ChainSource for LwdSource {
             pool_types,
         };
         let stream = self.client.get_block_range(range).await?.into_inner();
+        let (rx, task) = spawn_block_reader(stream, BLOCK_BUFFER_BYTES);
+
         Ok(CompactBlockStream::Lwd(LwdBlockStream {
-            stream,
+            rx,
             extract_transparent,
+            _task: task,
         }))
     }
 
@@ -355,11 +361,95 @@ impl LwdMempoolStream {
     }
 }
 
+/// One buffered block plus the buffer permit it holds, or the stream error that ended the
+/// range. See [`spawn_block_reader`].
+type BufferedBlock = anyhow::Result<(CompactBlock, OwnedSemaphorePermit)>;
+
+/// Drain `stream` on a detached task, handing blocks to the consumer through a buffer bounded
+/// at `buffer_bytes` of serialized compact-block data, rather than letting the sync engine's
+/// per-block work (the transparent matching, `encode_to_vec`, and the block-cache
+/// `File::create` + `write_all`) run between stream polls.
+///
+/// h2 (0.4.13+) budgets the framing overhead of received-but-unpolled sub-256-byte DATA
+/// frames as a DoS protection, replenishing the budget only as the application polls frames
+/// off the connection. A mostly empty compact block - the norm on testnet, and on any chain
+/// below its shielded activity - is one such tiny frame, so whenever the disk is slower than
+/// the network (a virus scanner opening every new block file, a CI runner on datacenter
+/// bandwidth) a few hundred frames pile up inside h2 and it kills its own healthy connection
+/// with GOAWAY ENHANCE_YOUR_CALM (`too_many_data_frames`). The failure is self-perpetuating:
+/// the range restarts at the same height on the next pass and dies the same way, so the
+/// wallet never advances past its birthday, while the unary tip probe keeps succeeding and
+/// makes the server look perfectly healthy.
+///
+/// Draining eagerly keeps h2's receive buffer close to empty so the budget replenishes as
+/// fast as frames arrive. The bound is on **bytes**, not messages: the dangerous case is many
+/// tiny blocks, and a message count high enough to help there would hold far too much memory
+/// on a range of large ones. A whole scan batch of small blocks fits well under the bound, so
+/// the reader never stalls in the case that matters; large blocks may backpressure it, but
+/// those replenish the budget by themselves and are safe to read slowly. It is not a complete
+/// defense on its own - the budget is charged as h2's connection task *parses* frames off the
+/// socket, so a fast enough burst can exhaust it before this task is scheduled at all - which
+/// is why `sync::engine` also resumes the range after a shed.
+///
+/// Errors are reported *through* the channel rather than out of band, so the consumer still
+/// sees every block that arrived before the failure. That is what lets the sync engine resume
+/// a load-shed range from the last block it actually wrote instead of restarting it.
+fn spawn_block_reader<S>(
+    stream: S,
+    buffer_bytes: usize,
+) -> (mpsc::UnboundedReceiver<BufferedBlock>, AbortOnDrop)
+where
+    S: futures_util::Stream<Item = Result<CompactBlock, tonic::Status>> + Send + 'static,
+{
+    let permits = Arc::new(Semaphore::new(buffer_bytes));
+    let (tx, rx) = mpsc::unbounded_channel();
+    let task = tokio::spawn(async move {
+        futures_util::pin_mut!(stream);
+        while let Some(next) = futures_util::StreamExt::next(&mut stream).await {
+            let block = match next {
+                Ok(block) => block,
+                Err(e) => {
+                    let _ = tx.send(Err(anyhow::Error::from(e)));
+                    return;
+                }
+            };
+            // Charge the block's serialized size, clamped so an oversized block takes the
+            // whole buffer instead of deadlocking on an unsatisfiable request, and so a
+            // zero-length one still costs something.
+            let cost = block.encoded_len().clamp(1, buffer_bytes) as u32;
+            let Ok(permit) = permits.clone().acquire_many_owned(cost).await else {
+                return; // the semaphore is never closed; nothing to do if it were
+            };
+            // The permit rides with the block and is released once the consumer takes it out
+            // of the channel.
+            if tx.send(Ok((block, permit))).is_err() {
+                return; // consumer dropped the stream
+            }
+        }
+        // End of range: dropping the sender closes the channel, which the consumer reads as
+        // `Ok(None)`.
+    });
+    (rx, AbortOnDrop(task))
+}
+
+/// Upper bound on compact-block bytes buffered between the `GetBlockRange` reader task and
+/// the consumer in [`LwdBlockStream`]. See [`spawn_block_reader`] for why the bound is in
+/// bytes, and why it needs to exist at all.
+const BLOCK_BUFFER_BYTES: usize = 32 * 1024 * 1024;
+
 /// An in-order compact-block stream from `GetBlockRange`, optionally harvesting each block's
 /// transparent outputs (versioned-protocol servers only - see the module doc).
+///
+/// Channel-backed: the gRPC stream is drained by a detached task so the consumer's per-block
+/// work never leaves received frames sitting unpolled inside h2 (see [`spawn_block_reader`]).
+/// This end just takes blocks off the channel and does the transparent extraction, which is
+/// pure CPU over an in-memory block.
 pub struct LwdBlockStream {
-    stream: tonic::Streaming<CompactBlock>,
+    rx: mpsc::UnboundedReceiver<BufferedBlock>,
     extract_transparent: bool,
+    /// Aborts the reader when the stream is dropped (the range finished early, or the sync
+    /// engine is restarting the range after a load shed).
+    _task: AbortOnDrop,
 }
 
 impl LwdBlockStream {
@@ -367,20 +457,24 @@ impl LwdBlockStream {
     pub async fn next(
         &mut self,
     ) -> anyhow::Result<Option<(CompactBlock, Vec<TransparentUtxo>, Vec<TransparentSpend>)>> {
-        match self.stream.message().await? {
-            None => Ok(None),
-            Some(block) => {
-                let (transparent, spends) = if self.extract_transparent {
-                    (
-                        block_transparent_outputs(&block),
-                        block_transparent_spends(&block),
-                    )
-                } else {
-                    (Vec::new(), Vec::new())
-                };
-                Ok(Some((block, transparent, spends)))
-            }
-        }
+        // Channel closed: the reader reached the end of the range, or finished after an error
+        // it already delivered below.
+        let Some(next) = self.rx.recv().await else {
+            return Ok(None);
+        };
+        // Dropping the permit here returns this block's bytes to the buffer. The consumer
+        // holds one block beyond the bound while it works, which is the point: that work no
+        // longer happens between stream polls.
+        let (block, _permit) = next?;
+        let (transparent, spends) = if self.extract_transparent {
+            (
+                block_transparent_outputs(&block),
+                block_transparent_spends(&block),
+            )
+        } else {
+            (Vec::new(), Vec::new())
+        };
+        Ok(Some((block, transparent, spends)))
     }
 }
 
@@ -476,7 +570,9 @@ fn is_tx_not_found(status: &tonic::Status) -> bool {
 mod tests {
     use zcash_client_backend::proto::compact_formats::{CompactBlock, CompactTx, TxOut};
 
-    use super::{block_transparent_outputs, is_tx_not_found, mined_height_from_raw};
+    use super::{
+        block_transparent_outputs, is_tx_not_found, mined_height_from_raw, spawn_block_reader,
+    };
 
     /// `fetch_tx`'s mempool-vs-mined rule: only a positive in-range `height` is a mined
     /// height. A mempool tx (0, or -1 encoded as `u64::MAX`) and an out-of-range value are
@@ -569,5 +665,108 @@ mod tests {
         assert_eq!(outs[0].height, Some(1234));
         assert_eq!(outs[1].index, 1, "vout index is positional");
         assert_eq!(outs[1].value_zat, 7000);
+    }
+
+    /// A compact block whose serialized size is predictable, so the buffer-bound test can do
+    /// arithmetic on it.
+    fn sized_block(height: u64) -> CompactBlock {
+        CompactBlock {
+            height,
+            ..Default::default()
+        }
+    }
+
+    /// The reader must deliver every block, in order, and then close the channel. This is the
+    /// baseline the sync engine's `while let Some(..) = stream.next()` loop depends on.
+    #[tokio::test]
+    async fn the_reader_delivers_every_block_in_order_then_closes() {
+        let blocks: Vec<Result<CompactBlock, tonic::Status>> =
+            (1..=5).map(|h| Ok(sized_block(h))).collect();
+        let (mut rx, _task) =
+            spawn_block_reader(futures_util::stream::iter(blocks), 32 * 1024 * 1024);
+
+        let mut heights = vec![];
+        while let Some(next) = rx.recv().await {
+            let (block, _permit) = next.expect("no error in this stream");
+            heights.push(block.height);
+        }
+        assert_eq!(heights, vec![1, 2, 3, 4, 5]);
+    }
+
+    /// A stream error must arrive *after* the blocks that preceded it, not instead of them.
+    /// The sync engine's load-shed resume is built on exactly this: the blocks already
+    /// delivered are already on disk, so the retry resumes past them instead of restarting
+    /// the range and hitting the same wall.
+    #[tokio::test]
+    async fn blocks_received_before_a_stream_error_are_still_delivered() {
+        let items: Vec<Result<CompactBlock, tonic::Status>> = vec![
+            Ok(sized_block(1)),
+            Ok(sized_block(2)),
+            Err(tonic::Status::resource_exhausted(
+                "h2 protocol error: error reading a body from connection",
+            )),
+            Ok(sized_block(3)),
+        ];
+        let (mut rx, _task) =
+            spawn_block_reader(futures_util::stream::iter(items), 32 * 1024 * 1024);
+
+        let mut heights = vec![];
+        let mut err = None;
+        while let Some(next) = rx.recv().await {
+            match next {
+                Ok((block, _permit)) => heights.push(block.height),
+                Err(e) => {
+                    err = Some(e);
+                    break;
+                }
+            }
+        }
+        assert_eq!(heights, vec![1, 2], "everything before the error survives");
+        assert!(err.is_some(), "the error itself reaches the consumer");
+    }
+
+    /// The buffer is bounded by **bytes**, and the bound actually holds the reader back: with
+    /// room for one block, a second cannot be buffered until the first is taken out. This is
+    /// what keeps a range of large blocks from being pulled wholly into memory, while a range
+    /// of tiny ones (the case that caused the load shed) streams freely.
+    #[tokio::test]
+    async fn the_buffer_bound_is_in_bytes_and_holds_the_reader() {
+        let one = prost::Message::encoded_len(&sized_block(1));
+        let blocks: Vec<Result<CompactBlock, tonic::Status>> =
+            (1..=3).map(|h| Ok(sized_block(h))).collect();
+        // Room for exactly one block at a time.
+        let (mut rx, _task) = spawn_block_reader(futures_util::stream::iter(blocks), one);
+
+        let (first, first_permit) = rx.recv().await.unwrap().unwrap();
+        assert_eq!(first.height, 1);
+        // Give the reader every chance to run: it must still be parked on the semaphore.
+        tokio::task::yield_now().await;
+        assert!(
+            matches!(
+                rx.try_recv(),
+                Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+            ),
+            "the second block must wait for the first one's bytes to be returned"
+        );
+
+        // Returning the first block's bytes unblocks the reader.
+        drop(first_permit);
+        let (second, _permit) = rx.recv().await.unwrap().unwrap();
+        assert_eq!(second.height, 2);
+    }
+
+    /// A block larger than the whole buffer must still get through (clamped to the full
+    /// budget) rather than deadlocking on a permit request that can never be satisfied.
+    #[tokio::test]
+    async fn a_block_larger_than_the_buffer_still_gets_through() {
+        let block = CompactBlock {
+            height: 7,
+            hash: vec![0xAB; 4096],
+            ..Default::default()
+        };
+        assert!(prost::Message::encoded_len(&block) > 8);
+        let (mut rx, _task) = spawn_block_reader(futures_util::stream::iter(vec![Ok(block)]), 8);
+        let (got, _permit) = rx.recv().await.unwrap().unwrap();
+        assert_eq!(got.height, 7);
     }
 }
