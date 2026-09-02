@@ -5,6 +5,34 @@ All notable changes to zecd are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com), and this
 project adheres to [Semantic Versioning](https://semver.org).
 
+## [0.8.0-rc1] - 2026-09-02
+
+A release candidate built around one capability: monitoring a large number of watch-only
+wallets from a single daemon. Everything else here is smaller, and everything defaults to
+0.7.0's behaviour, so a deployment that does not want a fleet can upgrade for the fixes alone.
+
+Two of those fixes matter outside the fleet. A wallet that paid itself reported the payment as
+unconfirmed for ten blocks instead of three, and a long block download over a light backend
+could fail part-way through for a reason that a retry resolves. Both are described below.
+
+Every configuration key and response shape from 0.7.0 still resolves as it did.
+
+### Added
+- **A fleet of watch-only wallets in one daemon.** A view wallet used to cost a full stack of its own: a database, an actor, a scan, note-commitment trees and an enhancement backlog, all of it multiplied by the wallet count against a single upstream. Several view wallets now share a shard - one database, one actor, one scan pass, one tree set - so a block is fetched once and trial-decrypted once against every key in the shard, which is what librustzcash's scanner already does when a database holds more than one account. Each fleet wallet is a small manifest file naming a viewing key and a birthday, so onboarding is not a configuration edit, and placement is read back from the shard databases themselves rather than a side file that could disagree with them. Shards are bounded because importing an account rewinds its database to that account's birthday: a deep-birthday arrival gets a shard of its own instead of dragging a caught-up group through a rescan. Fleet members are watch-only and shielded-only, and a transparent one is refused rather than half-supported. Spending is untouched - one conventional wallet, its own database, its own actor, every existing invariant - and with no manifests present none of this does anything.
+- **`createwallet`, `loadwallet`, `unloadwallet` and `listwalletdir`**, so a fleet can grow without a restart that would cost every other wallet in the daemon a re-sync. `createwallet` places a view wallet into a shard, opening a new one when none has room, writes its manifest, and serves the wallet immediately, before its account exists; its scan begins on the shard's next pass, exactly as a wallet loaded at boot behaves before it catches up. The methods follow Bitcoin Core's dialect where a Zcash wallet allows it and diverge where it does not: a monitored wallet is defined by the viewing key it is given, so a key and a birthday are required and every flag asking for a wallet that generates its own spending keys is refused rather than ignored. `unloadwallet` deletes nothing - the manifest and the account stay, and the shard keeps scanning - so a reload or a restart serves the wallet again with its history intact; a wallet from the configuration file is refused rather than unloaded, since nothing but a restart could bring it back.
+- **`[backend] proxy`**, routing every connection zecd makes through a SOCKS5 proxy, most usefully Tor. It covers both upstream kinds, so nothing zecd dials bypasses it. The proxy resolves the destination rather than this host, so no DNS leaves the machine and a `.onion` upstream works; TLS is layered over the proxied connection unchanged, with certificate verification still pinned to the destination hostname, so the proxy carries ciphertext it cannot read. Proxy authentication is not supported - restrict access by source address instead, which for a local Tor daemon is the usual arrangement. Off by default, and `config check` warns when a loopback upstream is combined with a proxy, since the address then names the proxy's loopback rather than this machine's.
+- **`[spend] trust_own_transactions`**, on by default, governing the fix below. Setting it false keeps zecd from persisting the trust marker at all, so classification derives only from data a from-seed restore re-derives and an authoring instance and a restore of the same seed report identical balances at every confirmation depth, at the cost of the wallet's own payments to itself waiting the untrusted depth.
+
+### Changed
+- **One upstream connection serves every wallet.** Each wallet actor used to dial the node itself, poll its own chain tip and run its own mempool poller, so a daemon holding N wallets opened N connections and issued N mempool polls every two seconds against one zebrad or lightwalletd. A shared chain layer now owns the connection and collapses the dial, the mempool subscription, the subtree roots, the chain tip and transaction fetches to one each, with a late subscriber still seeing the current mempool. Compact block ranges deliberately still pass through uncached, because caching them by height is not safe across a reorg. A failure invalidates only the connection generation that saw it, so one outage produces one re-dial rather than a thundering herd. For a single-wallet deployment this is invisible.
+- **A watch-only wallet no longer builds a Sapling prover.** The bundled proving parameters are tens of megabytes that only a wallet which can spend ever touches, and they were built per actor.
+- Every read that reports a wallet's own money, history or addresses now names the account it means, since one database can hold several. At one account per database, which is every wallet outside a fleet, this is a behavioural no-op.
+- Regtest coverage only, with no effect on a running daemon: a new end-to-end binary runs a fleet against a live chain and asserts that each wallet sees its own balance, history and addresses and none of its neighbours', including one funder transaction paying many fleet wallets and a restart that adopts every account from its shard database rather than re-importing it. The test funder is pinned to 0.7.0.
+
+### Fixed
+- **A wallet's payment to its own address was reported unconfirmed for ten blocks rather than three.** Change is recognized as the wallet's own by its key scope, but the payment half of a self-send is an ordinary external output, and nothing marked the transaction as one this wallet authored, so the confirmations policy applied the untrusted depth to funds the wallet had paid itself. A transaction is now marked trusted immediately after it is stored and before it is broadcast, so its outputs wait `trusted_confirmations`, which is Bitcoin Core's own-transaction trust model. Marking is best-effort: a failure warns and leaves the output on the conservative depth rather than failing the send. The marker is a cache of derivable data, so a from-seed restore does not re-derive it and is briefly more conservative than the wallet that authored the transaction, never less safe.
+- **A long compact-block download could fail part-way through when the HTTP/2 client shed its own connection.** A range of blocks carried as many small frames could momentarily leave more of them unpolled than the client library tolerates, at which point it tore down a healthy connection. Nothing written was lost, but the error surfaced as a failed sync, so a restore over a light backend could stall where retrying would have finished it. The download now recognizes that specific shutdown, drains the stream eagerly enough to make it rare, and resumes one block past the last one written, carrying its scan state across the reconnect so a receive and its spend in the same batch are still matched. Only a range that makes no progress at all across several reconnects gives up, and every other failure surfaces to the caller unchanged.
+
 ## [0.7.0] - 2026-08-23
 
 The 0.7.0 line, released as `0.7.0-rc1` through `0.7.0-rc5`. Everything below is relative to
@@ -593,6 +621,7 @@ Zcash, backed entirely by librustzcash and running as a light client.
 ### Security
 - Pre-release audit hardening; refuse to start on mainnet with the placeholder RPC password; enforce a 12-character passphrase minimum.
 
+[0.8.0-rc1]: https://github.com/zecrocks/zecd/compare/v0.7.0...v0.8.0-rc1
 [0.7.0]: https://github.com/zecrocks/zecd/compare/v0.6.3...v0.7.0
 [0.7.0-rc5]: https://github.com/zecrocks/zecd/compare/v0.7.0-rc4...v0.7.0-rc5
 [0.7.0-rc4]: https://github.com/zecrocks/zecd/compare/v0.7.0-rc3...v0.7.0-rc4
