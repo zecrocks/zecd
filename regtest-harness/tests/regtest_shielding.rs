@@ -116,8 +116,8 @@ async fn shield_send(
 async fn regtest_shielding_via_z_sendmany_fromaddress() {
     let Some(zebrad_bin) = resolve_node_bin() else {
         eprintln!(
-            "SKIP regtest_shielding_via_z_sendmany_fromaddress: set {} to run the shielding e2e \
-             (see README.md). The harness still compiled.",
+            "SKIP regtest_shielding_via_z_sendmany_fromaddress: set {} to run the shielding \
+             e2e. The harness still compiled.",
             RegtestNode::from_env().bin_env()
         );
         return;
