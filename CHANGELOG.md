@@ -5,6 +5,25 @@ All notable changes to zecd are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com), and this
 project adheres to [Semantic Versioning](https://semver.org).
 
+## [0.7.1] - 2026-09-04
+
+Two fixes, no new features, no configuration or response shape moved. A drop-in upgrade from
+0.7.0, and worth taking if you run either of the cases below.
+
+The first affects any wallet that pays its own address, which is what a shielding or a
+consolidation flow does: those funds were reported as unconfirmed for ten blocks instead of
+three. The second affects restores over a light backend, where a long block download could fail
+part-way through for a reason a retry resolves.
+
+Both fixes are also in the 0.8.0 candidate line.
+
+### Added
+- **`[spend] trust_own_transactions`**, on by default, governing the first fix below. Setting it false keeps zecd from persisting the trust marker at all, so classification derives only from data a from-seed restore re-derives and an authoring instance and a restore of the same seed report identical balances at every confirmation depth, at the cost of the wallet's own payments to itself waiting the untrusted depth.
+
+### Fixed
+- **A wallet's payment to its own address was reported unconfirmed for ten blocks rather than three.** Change is recognized as the wallet's own by its key scope, but the payment half of a self-send is an ordinary external output, and nothing marked the transaction as one this wallet authored, so the confirmations policy applied the untrusted depth to funds the wallet had paid itself. A transaction is now marked trusted immediately after it is stored and before it is broadcast, so its outputs wait `trusted_confirmations`, which is Bitcoin Core's own-transaction trust model. Marking is best-effort: a failure warns and leaves the output on the conservative depth rather than failing the send. The marker is a cache of derivable data, so a from-seed restore does not re-derive it and is briefly more conservative than the wallet that authored the transaction, never less safe.
+- **A long compact-block download could fail part-way through when the HTTP/2 client shed its own connection.** A range of blocks carried as many small frames could momentarily leave more of them unpolled than the client library tolerates, at which point it tore down a healthy connection. Nothing written was lost, but the error surfaced as a failed sync, so a restore over a light backend could stall where retrying would have finished it. The download now recognizes that specific shutdown, drains the stream eagerly enough to make it rare, and resumes one block past the last one written, carrying its scan state across the reconnect so a receive and its spend in the same batch are still matched. Only a range that makes no progress at all across several reconnects gives up, and every other failure surfaces to the caller unchanged.
+
 ## [0.7.0] - 2026-08-23
 
 The 0.7.0 line, released as `0.7.0-rc1` through `0.7.0-rc5`. Everything below is relative to
@@ -593,6 +612,7 @@ Zcash, backed entirely by librustzcash and running as a light client.
 ### Security
 - Pre-release audit hardening; refuse to start on mainnet with the placeholder RPC password; enforce a 12-character passphrase minimum.
 
+[0.7.1]: https://github.com/zecrocks/zecd/compare/v0.7.0...v0.7.1
 [0.7.0]: https://github.com/zecrocks/zecd/compare/v0.6.3...v0.7.0
 [0.7.0-rc5]: https://github.com/zecrocks/zecd/compare/v0.7.0-rc4...v0.7.0-rc5
 [0.7.0-rc4]: https://github.com/zecrocks/zecd/compare/v0.7.0-rc3...v0.7.0-rc4
