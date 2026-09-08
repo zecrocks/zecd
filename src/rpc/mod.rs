@@ -317,6 +317,32 @@ pub(crate) async fn dispatch(
     dispatch_zecd(state, wallet, req).await
 }
 
+/// Run a synchronous handler without holding a runtime worker hostage.
+///
+/// Most read RPCs are plain functions that open a SQLite connection and query it, called inline
+/// from this async dispatcher. On a small wallet that is invisible. On a large one a single
+/// `getwalletinfo` or `listtransactions` is hundreds of milliseconds to seconds of blocking
+/// work, and `[rpc] work_queue` admits a hundred requests at once against a worker pool sized
+/// to the core count - so a monitoring poll with any concurrency can occupy every worker and
+/// starve everything else on the runtime, including the health server, whose handlers do no
+/// I/O at all and are only waiting to be polled. That shows up as `/status` and `/readyz`
+/// timing out for minutes while `/healthz`, which needs no work, keeps answering.
+///
+/// `block_in_place` hands this worker's remaining tasks to a replacement thread for the
+/// duration, so the rest of the runtime keeps running; the `work_queue` permit still bounds how
+/// many of these can be in flight.
+///
+/// It panics on a current-thread runtime, which is not this binary (`#[tokio::main]` builds the
+/// multi-thread scheduler) but may be an embedder's, and is every `#[tokio::test]` by default.
+/// So the flavor is checked and the work runs inline when there is no worker to release -
+/// nothing is lost there, since a current-thread runtime has no other worker to starve.
+fn blocking<T>(f: impl FnOnce() -> T) -> T {
+    match tokio::runtime::Handle::try_current().map(|h| h.runtime_flavor()) {
+        Ok(tokio::runtime::RuntimeFlavor::MultiThread) => tokio::task::block_in_place(f),
+        _ => f(),
+    }
+}
+
 /// zecd's method table.
 async fn dispatch_zecd(
     state: &AppState,
@@ -337,18 +363,18 @@ async fn dispatch_zecd(
         "ping" => network::ping(),
 
         // Blockchain
-        "getblockchaininfo" => blockchain::getblockchaininfo(state, wallet),
+        "getblockchaininfo" => blocking(|| blockchain::getblockchaininfo(state, wallet)),
         "getblockcount" => blockchain::getblockcount(state, wallet),
         "getbestblockhash" => blockchain::getbestblockhash(state, wallet),
-        "getblockhash" => blockchain::getblockhash(state, wallet, req),
-        "getblockheader" => blockchain::getblockheader(state, wallet, req),
+        "getblockhash" => blocking(|| blockchain::getblockhash(state, wallet, req)),
+        "getblockheader" => blocking(|| blockchain::getblockheader(state, wallet, req)),
         "waitfornewblock" => blockchain::waitfornewblock(state, wallet, req).await,
         "waitforblock" => blockchain::waitforblock(state, wallet, req).await,
         "waitforblockheight" => blockchain::waitforblockheight(state, wallet, req).await,
         "waitforsync" => blockchain::waitforsync(state, wallet, req).await,
 
         // Utility
-        "validateaddress" => util::validateaddress(state, wallet, req),
+        "validateaddress" => blocking(|| util::validateaddress(state, wallet, req)),
         "signmessage" => signmessage::signmessage(state, wallet, req).await,
         "verifymessage" => signmessage::verifymessage(state, wallet, req),
         "settxfee" => util::settxfee(req),
@@ -361,18 +387,24 @@ async fn dispatch_zecd(
         "sendrawtransaction" => rawtx::sendrawtransaction(state, wallet, req).await,
 
         // Wallet - reads
-        "getbalance" => wallet_methods::getbalance(state, wallet, req),
-        "getbalances" => wallet_methods::getbalances(state, wallet),
-        "getunconfirmedbalance" => wallet_methods::getunconfirmedbalance(state, wallet),
-        "getwalletinfo" => wallet_methods::getwalletinfo(state, wallet),
-        "getaddressinfo" => wallet_methods::getaddressinfo(state, wallet, req),
-        "listtransactions" => wallet_methods::listtransactions(state, wallet, req),
-        "z_listtransactions" => wallet_methods::z_listtransactions(state, wallet, req),
-        "listsinceblock" => wallet_methods::listsinceblock(state, wallet, req),
+        "getbalance" => blocking(|| wallet_methods::getbalance(state, wallet, req)),
+        "getbalances" => blocking(|| wallet_methods::getbalances(state, wallet)),
+        "getunconfirmedbalance" => {
+            blocking(|| wallet_methods::getunconfirmedbalance(state, wallet))
+        }
+        "getwalletinfo" => blocking(|| wallet_methods::getwalletinfo(state, wallet)),
+        "getaddressinfo" => blocking(|| wallet_methods::getaddressinfo(state, wallet, req)),
+        "listtransactions" => blocking(|| wallet_methods::listtransactions(state, wallet, req)),
+        "z_listtransactions" => blocking(|| wallet_methods::z_listtransactions(state, wallet, req)),
+        "listsinceblock" => blocking(|| wallet_methods::listsinceblock(state, wallet, req)),
         "gettransaction" => wallet_methods::gettransaction(state, wallet, req).await,
-        "listunspent" => wallet_methods::listunspent(state, wallet, req),
-        "getreceivedbyaddress" => wallet_methods::getreceivedbyaddress(state, wallet, req),
-        "listreceivedbyaddress" => wallet_methods::listreceivedbyaddress(state, wallet, req),
+        "listunspent" => blocking(|| wallet_methods::listunspent(state, wallet, req)),
+        "getreceivedbyaddress" => {
+            blocking(|| wallet_methods::getreceivedbyaddress(state, wallet, req))
+        }
+        "listreceivedbyaddress" => {
+            blocking(|| wallet_methods::listreceivedbyaddress(state, wallet, req))
+        }
         "listwallets" => wallet_methods::listwallets(state),
 
         // Wallet - writes / async
@@ -383,7 +415,7 @@ async fn dispatch_zecd(
         "walletlock" => wallet_methods::walletlock(state, wallet).await,
 
         // Wallet - async operations (zcashd-style; the send itself runs on a background task)
-        "z_sendmany" => wallet_methods::z_sendmany(state, wallet, req),
+        "z_sendmany" => blocking(|| wallet_methods::z_sendmany(state, wallet, req)),
         "z_shieldcoinbase" => wallet_methods::z_shieldcoinbase(state, wallet, req).await,
         "z_mergetoaddress" => wallet_methods::z_mergetoaddress(state, wallet, req).await,
         "z_getoperationstatus" => wallet_methods::z_getoperationstatus(state, wallet, req),
@@ -440,6 +472,29 @@ mod tests {
             declared.len(),
             "ALL_METHODS contains duplicate method names"
         );
+    }
+
+    /// [`super::blocking`] must run the work on both runtime flavors: releasing the worker on
+    /// a multi-thread runtime, and running inline on a current-thread one rather than panicking
+    /// (`block_in_place` does panic there, and an embedder is free to use one - as is every
+    /// `#[tokio::test]` that does not ask for a multi-thread runtime, including most of this
+    /// crate's).
+    #[test]
+    fn blocking_runs_the_work_on_either_runtime_flavor() {
+        let current = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        assert_eq!(current.block_on(async { super::blocking(|| 7) }), 7);
+
+        let multi = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .build()
+            .unwrap();
+        assert_eq!(multi.block_on(async { super::blocking(|| 7) }), 7);
+
+        // And outside a runtime altogether, which is where a synchronous caller of the library
+        // would land.
+        assert_eq!(super::blocking(|| 7), 7);
     }
 
     /// The arity table must name exactly the methods in `ALL_METHODS` - no gaps (an unlisted
