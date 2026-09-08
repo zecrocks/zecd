@@ -1922,6 +1922,9 @@ pub struct Zecd {
     /// The instance's RPC port - also its log tag (see [`forward_daemon_logs`]), so a
     /// respawn on the same datadir keeps the same discriminator.
     rpc_port: u16,
+    /// The `[health]` port this instance was configured with, so [`Zecd::health_get`] can
+    /// reach `/healthz`, `/readyz` and `/status` without the caller rebuilding the URL.
+    health_port: u16,
     base_url: String,
     user: String,
     password: String,
@@ -2111,6 +2114,7 @@ impl Zecd {
         let zecd = Zecd {
             child,
             rpc_port: cfg.rpc_port,
+            health_port: cfg.health_port,
             base_url: format!("http://127.0.0.1:{}/", cfg.rpc_port),
             user: cfg.rpc_user.clone(),
             password: cfg.rpc_password.clone(),
@@ -2444,6 +2448,58 @@ impl Zecd {
         self.password = cfg.rpc_password.clone();
         self.wait_until_rpc_up().await?;
         Ok(())
+    }
+
+    /// Send `SIGHUP` to the daemon, which makes it re-read its `zecd.toml` and apply the
+    /// settings that can change under a running wallet. Pairs with [`Zecd::edit_config`].
+    ///
+    /// Unix-only, like the signal; the daemon is spawned as a child process, so this needs no
+    /// privileges beyond owning it.
+    pub fn reload_config(&self) -> Result<()> {
+        let pid = self.child.id();
+        // Shelling out to `kill` rather than pulling in a libc dependency and an unsafe block
+        // for one signal. The harness already runs on Linux CI runners, where this is present.
+        let status = std::process::Command::new("kill")
+            .args(["-HUP", &pid.to_string()])
+            .status()
+            .context("run kill -HUP")?;
+        anyhow::ensure!(status.success(), "kill -HUP {pid} failed: {status}");
+        Ok(())
+    }
+
+    /// Rewrite the daemon's `zecd.toml`, applying `edit` to its current text. For testing a
+    /// configuration reload: change the file, then [`Zecd::reload_config`].
+    pub fn edit_config(&self, edit: impl FnOnce(String) -> String) -> Result<()> {
+        let path = self._datadir.path().join("zecd.toml");
+        let text =
+            std::fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?;
+        std::fs::write(&path, edit(text)).with_context(|| format!("write {}", path.display()))?;
+        Ok(())
+    }
+
+    /// GET one of the health endpoints (`"/healthz"`, `"/readyz"`, `"/status"`) and return its
+    /// JSON body. These are a separate, unauthenticated listener, so this bypasses the RPC port
+    /// and its credentials entirely - which is the point of probing them: they are what a
+    /// monitoring stack watches, and they must keep answering while the RPC side is busy.
+    ///
+    /// `/readyz` answers 503 when not ready and `/healthz` returns plain text rather than JSON;
+    /// both are reported as `Ok` with the body parsed where it can be, so a caller can assert on
+    /// the status as data instead of on a transport error.
+    pub async fn health_get(&self, path: &str) -> Result<(reqwest::StatusCode, Value)> {
+        let url = format!("http://127.0.0.1:{}{path}", self.health_port);
+        let resp = self
+            .http
+            .get(&url)
+            .send()
+            .await
+            .with_context(|| format!("GET {url}"))?;
+        let status = resp.status();
+        let body = resp
+            .text()
+            .await
+            .with_context(|| format!("body of {url}"))?;
+        let json = serde_json::from_str(&body).unwrap_or(Value::String(body));
+        Ok((status, json))
     }
 
     /// Issue a JSON-RPC call, returning the `result` on success or an error carrying the

@@ -416,6 +416,23 @@ pub struct OperationError {
     pub message: String,
 }
 
+/// `z_validateaddress` (`rpc/wallet_methods.rs::z_validateaddress`). Everything but `isvalid`
+/// is absent for an address that does not parse or is for another network.
+#[non_exhaustive]
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct ZValidateAddress {
+    pub isvalid: bool,
+    /// Present only when valid.
+    pub address: Option<String>,
+    /// zcashd's kind token: `p2pkh`, `p2sh`, `sapling`, `unified`, or zecd's `tex`.
+    pub address_type: Option<String>,
+    /// Whether the routed wallet owns this address.
+    pub ismine: Option<bool>,
+    /// A unified address's receivers, in zcashd's vocabulary (`p2pkh`, not `transparent`).
+    /// Absent for the bare encodings, where the address kind is already the receiver.
+    pub receivers: Option<Vec<String>>,
+}
+
 /// A successful operation's result: the sends all return `{ "txid": ... }`.
 #[non_exhaustive]
 #[derive(Debug, Clone, serde::Deserialize)]
@@ -896,6 +913,15 @@ impl Client<'_> {
         self.call_typed("z_listoperationids", params).await
     }
 
+    /// `z_validateaddress <address>`: validity, kind and ownership for any address.
+    ///
+    /// Unlike zcashd's, this answers for transparent addresses too rather than reporting them
+    /// invalid; `address_type` names the kind.
+    pub async fn z_validate_address(&self, address: &str) -> Result<ZValidateAddress, ClientError> {
+        self.call_typed("z_validateaddress", vec![json!(address)])
+            .await
+    }
+
     /// `z_waitforoperation <opid> ( timeout_secs )`: block until the operation finishes.
     /// Timeout in SECONDS (unlike the `waitfor*` family's milliseconds): `0` is an immediate
     /// single-operation read, and `None` waits the server-side default (clamped to 3600).
@@ -1186,5 +1212,48 @@ mod tests {
         assert!(serde_json::to_string(&r)
             .unwrap()
             .contains("\"memo\":\"f600\""));
+    }
+}
+
+#[cfg(test)]
+mod z_validate_address_tests {
+    use super::ZValidateAddress;
+
+    /// Fixtures from `wallet_methods::tests::z_validateaddress_reports_kind_and_ownership`,
+    /// which builds them through the handler's own response builder.
+    #[test]
+    fn z_validate_address_decodes_both_shapes() {
+        let valid = serde_json::json!({
+            "isvalid": true,
+            "address": "tmGqwWtL7RsbxikDSN26gsbicxVr2xJNe86",
+            "address_type": "p2pkh",
+            "ismine": false,
+        });
+        let v: ZValidateAddress = serde_json::from_value(valid).unwrap();
+        assert!(v.isvalid);
+        assert_eq!(v.address_type.as_deref(), Some("p2pkh"));
+        assert_eq!(v.ismine, Some(false));
+        assert!(
+            v.receivers.is_none(),
+            "a bare address carries no receiver list"
+        );
+
+        let unified = serde_json::json!({
+            "isvalid": true,
+            "address": "utest1...",
+            "address_type": "unified",
+            "ismine": true,
+            "receivers": ["p2pkh", "orchard"],
+        });
+        let v: ZValidateAddress = serde_json::from_value(unified).unwrap();
+        assert_eq!(
+            v.receivers.as_deref(),
+            Some(&["p2pkh".to_string(), "orchard".to_string()][..])
+        );
+
+        let invalid = serde_json::json!({ "isvalid": false });
+        let v: ZValidateAddress = serde_json::from_value(invalid).unwrap();
+        assert!(!v.isvalid);
+        assert!(v.address.is_none() && v.ismine.is_none());
     }
 }

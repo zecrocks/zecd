@@ -68,6 +68,34 @@ pub fn receiver_types_of(addr: &Address) -> Vec<&'static str> {
     types
 }
 
+/// zcashd's `address_type` token for a (network-checked) address, as `z_validateaddress`
+/// reports it: `p2pkh`, `p2sh`, `sapling`, `unified`, or `tex`.
+///
+/// The first four are zcashd's own vocabulary, and the same one `z_getaddressforaccount` takes
+/// for its receiver list - note that it calls a transparent receiver `p2pkh`, where zecd's own
+/// `receiver_types` extension says `transparent`. `tex` has no zcashd equivalent (ZIP 320
+/// postdates it) and is zecd's token.
+pub fn address_type_of(addr: &Address) -> &'static str {
+    match addr {
+        Address::Transparent(TransparentAddress::PublicKeyHash(_)) => "p2pkh",
+        Address::Transparent(TransparentAddress::ScriptHash(_)) => "p2sh",
+        Address::Sapling(_) => "sapling",
+        Address::Unified(_) => "unified",
+        Address::Tex(_) => "tex",
+    }
+}
+
+/// The receivers a (network-checked) address carries, named in zcashd's vocabulary rather than
+/// zecd's: `p2pkh` where [`receiver_types_of`] says `transparent`. Kept separate rather than
+/// translating at the call site so the two vocabularies stay visibly distinct - they belong to
+/// different fields with different audiences, and neither should drift into the other.
+pub fn zcashd_receiver_types_of(addr: &Address) -> Vec<&'static str> {
+    receiver_types_of(addr)
+        .into_iter()
+        .map(|t| if t == "transparent" { "p2pkh" } else { t })
+        .collect()
+}
+
 /// Reduce a recipient address to the single on-chain receiver a given pool's output actually
 /// pays, re-encoded in its own minimal form: a bare transparent or Sapling address, or a
 /// single-receiver Unified Address for Orchard (Orchard has no standalone encoding). `pool`
@@ -181,6 +209,18 @@ pub fn parse_recipient_on_network<P: Parameters>(
 
 #[cfg(test)]
 mod tests {
+
+    /// The two receiver vocabularies must stay distinct: zecd's own `receiver_types` extension
+    /// says `transparent`, and zcashd's `z_validateaddress` says `p2pkh` for the same receiver.
+    #[test]
+    fn zcashd_receiver_names_differ_from_zecd_s() {
+        let net = crate::network::ZNetwork::Test;
+        let taddr = decode_on_network(&net, "tmGqwWtL7RsbxikDSN26gsbicxVr2xJNe86")
+            .expect("decode testnet t-addr");
+        assert_eq!(receiver_types_of(&taddr), vec!["transparent"]);
+        assert_eq!(zcashd_receiver_types_of(&taddr), vec!["p2pkh"]);
+        assert_eq!(address_type_of(&taddr), "p2pkh");
+    }
     use super::*;
     use crate::network::ZNetwork;
 

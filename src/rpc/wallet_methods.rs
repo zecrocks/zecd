@@ -856,6 +856,65 @@ pub(crate) fn getaddressinfo(
     )
 }
 
+/// `z_validateaddress "address"` - zcashd's shielded-address validator.
+///
+/// zcashd's version answers only for shielded addresses and reports a valid t-address as
+/// `isvalid: false`. zecd's `validateaddress` already validates every address kind, and
+/// answering "invalid" about an address the wallet will happily pay is worse than the
+/// divergence, so this accepts all of them and names which in `address_type`. Callers that need
+/// zcashd's narrower behaviour can branch on that field.
+///
+/// The reason this exists separately from `validateaddress` is `ismine`: zcashd-lineage tooling
+/// uses `z_validateaddress` to decide whether an address is the wallet's own before a self-send
+/// or a consolidation. `validateaddress` deliberately carries no ownership signal (validity and
+/// ownership are split between it and `getaddressinfo`), so a port has nowhere to ask.
+///
+/// The wallet is resolved strictly, unlike `validateaddress`'s best-effort lookup: an `ismine`
+/// of `false` must mean "not this wallet's", never "there was no wallet to ask".
+pub(crate) fn z_validateaddress(
+    state: &AppState,
+    wallet: Option<&str>,
+    req: &RpcRequest,
+) -> Result<Value, RpcError> {
+    let addr = req.require_str(0, "z_validateaddress requires an address")?;
+    let handle = state.registry.get(wallet)?;
+    let decoded = crate::address::decode_on_network(&handle.network, addr);
+    let ismine = decoded.is_some()
+        && read::is_mine(
+            handle.network,
+            &handle.engine_dir,
+            handle.account_scope(),
+            addr,
+        );
+    Ok(z_validateaddress_json(decoded.as_ref(), addr, ismine))
+}
+
+/// Build the `z_validateaddress` response. `decoded` is `None` for an address that does not
+/// parse or belongs to another network, which is `isvalid: false` and nothing else - the same
+/// shape `validateaddress` uses, and zcashd's.
+fn z_validateaddress_json(
+    decoded: Option<&zcash_keys::address::Address>,
+    addr: &str,
+    ismine: bool,
+) -> Value {
+    let Some(decoded) = decoded else {
+        return json!({ "isvalid": false });
+    };
+    let mut out = json!({
+        "isvalid": true,
+        "address": addr,
+        "address_type": crate::address::address_type_of(decoded),
+        "ismine": ismine,
+    });
+    // zcashd reports a unified address's receivers; the names are its own vocabulary, in which
+    // a transparent receiver is `p2pkh`. Only unified addresses carry a receiver list - for the
+    // bare encodings the address kind already is the receiver.
+    if matches!(decoded, zcash_keys::address::Address::Unified(_)) {
+        out["receivers"] = json!(crate::address::zcashd_receiver_types_of(decoded));
+    }
+    out
+}
+
 /// Build the `getaddressinfo` response. Bitcoin Core throws `-5 Invalid address` for an
 /// undecodable address (`isvalid` belongs to `validateaddress`, not this method).
 ///
@@ -2225,11 +2284,15 @@ fn parse_opid_filter(req: &RpcRequest, i: usize) -> Result<Option<Vec<OperationI
 /// zcashd's asynchronous send. Returns an operation id (`opid-...`) immediately; the
 /// transaction is proposed, proved, and broadcast on a background task whose status/result are
 /// fetched with `z_getoperationstatus`/`z_getoperationresult`. `fromaddress` must be one of this
-/// wallet's own addresses (or `ANY_TADDR`) and selects the funding source: a shielded/unified
-/// address spends the account's shielded notes, while a t-address (or `ANY_TADDR`) spends the
-/// wallet's transparent UTXOs - requiring privacyPolicy `AllowRevealedSenders` or weaker - which
-/// with a shielded recipient is the t->z *shielding* send (change shields). Fees are ZIP-317 (an
-/// explicit `fee` is `-8`); `minconf` overrides input-selection depth for this send.
+/// wallet's own addresses or a wildcard, and selects the funding source: a shielded/unified
+/// address spends the account's shielded notes, `ANY_SAPLING` and `ANY_ORCHARD` spend one
+/// shielded pool family only (the same wildcards `z_mergetoaddress` takes, with `ANY_ORCHARD`
+/// covering Ironwood since post-NU6.3 an Orchard receiver holds those notes), and a t-address or
+/// `ANY_TADDR` spends the wallet's transparent UTXOs - requiring privacyPolicy
+/// `AllowRevealedSenders` or weaker - which with a shielded recipient is the t->z *shielding*
+/// send (change shields). `ANY_SPROUT` is rejected as unsupported rather than as an unparseable
+/// address. Fees are ZIP-317 (an explicit `fee` is `-8`); `minconf` overrides input-selection
+/// depth for this send.
 pub(crate) fn z_sendmany(
     state: &AppState,
     wallet: Option<&str>,
@@ -2246,6 +2309,19 @@ pub(crate) fn z_sendmany(
     let fromaddress = req.require_str(0, "z_sendmany requires a fromaddress")?;
     let source = if fromaddress == "ANY_TADDR" {
         SendSource::Transparent(None)
+    } else if fromaddress == "ANY_SAPLING" {
+        SendSource::ShieldedFamily(crate::wallet::ShieldedFamily::Sapling)
+    } else if fromaddress == "ANY_ORCHARD" {
+        // zecd extension, as in `z_mergetoaddress`: zcashd's wildcard set predates Orchard.
+        // One family - post-NU6.3 an Orchard receiver holds Ironwood notes.
+        SendSource::ShieldedFamily(crate::wallet::ShieldedFamily::Orchard)
+    } else if fromaddress == "ANY_SPROUT" {
+        // Named explicitly so the answer is "Sprout is not supported" rather than the generic
+        // "that is not an address", which is what a caller reading zcashd's docs would get.
+        // Matches `z_mergetoaddress`'s wording.
+        return Err(RpcError::invalid_parameter(
+            "Invalid parameter, Sprout is not supported",
+        ));
     } else {
         let Some(decoded) = crate::address::decode_on_network(&handle.network, fromaddress) else {
             return Err(RpcError::invalid_address_or_key(
@@ -3860,6 +3936,52 @@ mod tests {
             false
         )
         .is_ok());
+    }
+
+    /// `z_validateaddress` reports the kind of every address zecd understands, not only
+    /// shielded ones as zcashd does, and carries the ownership flag `validateaddress`
+    /// deliberately lacks. An address that does not parse is the bare verdict and nothing else.
+    #[test]
+    fn z_validateaddress_reports_kind_and_ownership() {
+        use zcash_keys::address::Address;
+        let net = crate::network::regtest();
+
+        let invalid = z_validateaddress_json(None, "nonsense", false);
+        assert_eq!(invalid, json!({ "isvalid": false }));
+        assert!(
+            invalid.get("address").is_none() && invalid.get("ismine").is_none(),
+            "an unparseable address echoes nothing: {invalid}"
+        );
+
+        // A transparent address: zcashd would call this invalid; zecd names its kind.
+        let taddr = "tmGqwWtL7RsbxikDSN26gsbicxVr2xJNe86";
+        let decoded =
+            Address::decode(&crate::network::ZNetwork::Test, taddr).expect("decode t-addr");
+        let v = z_validateaddress_json(Some(&decoded), taddr, false);
+        assert_eq!(v["isvalid"], json!(true));
+        assert_eq!(v["address_type"], json!("p2pkh"));
+        assert_eq!(v["ismine"], json!(false));
+        assert!(
+            v.get("receivers").is_none(),
+            "a bare address is its own receiver, so no list: {v}"
+        );
+
+        // A unified address lists its receivers. The address is the development wallet's
+        // testnet UA, so this needs no chain or wallet database.
+        let ua = concat!(
+            "utest12r53eljnr7kev8ychw3ahzjgm6fwxm7fd8vfay7hn9uylj05x0pxxhze800h9dcgyr8",
+            "hkc7kz3s2crnrhjcy2p90yfce2vl8mq667zw0"
+        );
+        let decoded = Address::decode(&crate::network::ZNetwork::Test, ua).expect("decode UA");
+        let v = z_validateaddress_json(Some(&decoded), ua, true);
+        assert_eq!(v["address_type"], json!("unified"));
+        assert_eq!(v["ismine"], json!(true));
+        let receivers = v["receivers"].as_array().expect("receiver list");
+        assert!(
+            !receivers.is_empty() && !receivers.iter().any(|r| r == "transparent"),
+            "receivers use zcashd's names, never zecd's `transparent`: {receivers:?}"
+        );
+        let _ = net;
     }
 
     #[test]

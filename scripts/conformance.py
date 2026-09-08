@@ -373,6 +373,39 @@ def main() -> int:
        "address" not in bad and "scriptPubKey" not in bad and "isscript" not in bad)
     ck("invalid validateaddress has error fields",
        "error" in bad and "error_locations" in bad)
+    # z_validateaddress: zcashd's shielded-address validator. zecd's accepts every address kind
+    # rather than reporting a t-address invalid, and reports ownership - which is the reason it
+    # exists alongside validateaddress, whose contract carries no ismine.
+    zva = rpc.call("z_validateaddress", addr)
+    ck("z_validateaddress.isvalid", zva["isvalid"] is True)
+    ck("z_validateaddress echoes address", zva.get("address") == addr)
+    ck("z_validateaddress.address_type unified", zva.get("address_type") == "unified",
+       zva.get("address_type"))
+    ck("z_validateaddress.ismine on our own address", zva.get("ismine") is True)
+    # A unified address lists its receivers in zcashd's vocabulary: a transparent receiver is
+    # "p2pkh" there, never zecd's own "transparent" spelling.
+    ck("z_validateaddress lists receivers",
+       isinstance(zva.get("receivers"), list) and "orchard" in zva["receivers"],
+       zva.get("receivers"))
+    ck("z_validateaddress receivers use zcashd names",
+       "transparent" not in zva["receivers"], zva["receivers"])
+    bad_zva = rpc.call("z_validateaddress", "not-an-address")
+    ck("z_validateaddress invalid is the bare verdict",
+       bad_zva["isvalid"] is False and "address" not in bad_zva and "ismine" not in bad_zva,
+       bad_zva)
+    # A well-formed address that is not ours: valid, kind reported, not mine.
+    foreign = rpc.call("z_validateaddress", "tmGqwWtL7RsbxikDSN26gsbicxVr2xJNe86")
+    if foreign["isvalid"]:
+        ck("z_validateaddress foreign t-addr is p2pkh", foreign["address_type"] == "p2pkh",
+           foreign["address_type"])
+        ck("z_validateaddress foreign t-addr is not mine", foreign["ismine"] is False)
+        ck("z_validateaddress bare address has no receiver list", "receivers" not in foreign)
+    try:
+        rpc.call("z_validateaddress", addr, "extra")
+        ck("z_validateaddress over-arity raises", False)
+    except JSONRPCException as e:
+        ck("z_validateaddress over-arity -> -1", e.code == -1, e.code)
+
     ai = rpc.call("getaddressinfo", addr)
     ck("getaddressinfo.ismine", ai["ismine"] is True)
     ck("getaddressinfo has no isvalid", "isvalid" not in ai)
@@ -982,6 +1015,25 @@ def main() -> int:
     ck("z_sendmany ANY_TADDR op failed -6/-13 (no transparent funds)",
        st.get("status") == "failed"
        and st.get("error", {}).get("code") in (-6, -13), st)
+    # The shielded pool-family wildcards, the same vocabulary z_mergetoaddress takes. Each
+    # spawns (the source is valid and the wallet owns it) and then fails async on funds, since
+    # the amount is far above anything the wallet under test holds - so no money can move.
+    for wildcard in ("ANY_SAPLING", "ANY_ORCHARD"):
+        opid = rpc.call("z_sendmany", wildcard, [{"address": addr, "amount": "100.0"}])
+        ck(f"z_sendmany {wildcard} -> opid", opid.startswith("opid-"), opid)
+        st = rpc.call("z_waitforoperation", opid, 60)
+        ck(f"z_sendmany {wildcard} op finished", st.get("finished") is True, st)
+        ck(f"z_sendmany {wildcard} op failed -6/-13 (no funds in that family)",
+           st.get("status") == "failed"
+           and st.get("error", {}).get("code") in (-6, -13), st)
+    try:
+        # Sprout is named explicitly, so the answer says so rather than "not an address".
+        rpc.call("z_sendmany", "ANY_SPROUT", [{"address": addr, "amount": "0.1"}])
+        ck("z_sendmany ANY_SPROUT raises", False)
+    except JSONRPCException as e:
+        ck("z_sendmany ANY_SPROUT -> code -8", e.code == -8, e.code)
+        ck("z_sendmany ANY_SPROUT names Sprout", "Sprout" in str(e), str(e))
+
     # A shielded fromaddress under AllowRevealedSenders spawns too (the policy name is a real
     # rung now, not collapsed onto AllowRevealedRecipients); same guaranteed async failure.
     opid = rpc.call("z_sendmany", addr, [{"address": addr, "amount": "100.0"}],

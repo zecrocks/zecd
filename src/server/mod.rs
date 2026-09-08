@@ -197,6 +197,12 @@ async fn handle(
     }
 }
 
+/// A successful call at or above this many milliseconds is logged at INFO rather than DEBUG.
+/// Every RPC zecd serves is meant to be interactive; seconds means something has outgrown its
+/// query, which an operator should be able to see without turning on DEBUG for everything.
+#[cfg(feature = "server")]
+const SLOW_RPC_MS: u64 = 2_000;
+
 /// HTTP status for an RPC error, matching Bitcoin Core's `JSONErrorReply`.
 #[cfg(feature = "server")]
 fn status_for(err: &crate::error::RpcError) -> StatusCode {
@@ -229,11 +235,30 @@ async fn process_single(state: &AppState, wallet: Option<&str>, v: Value) -> (Va
             let elapsed_ms = start.elapsed().as_millis() as u64;
             match result {
                 Ok(value) => {
-                    tracing::debug!(method = %req.method, wallet = wallet.unwrap_or("default"), elapsed_ms, "rpc ok");
+                    // A successful call is one line per request, so DEBUG - except a slow one.
+                    // A read that takes seconds is the signal that a wallet has outgrown some
+                    // query, and it is invisible at the default level: without this line an
+                    // operator has to measure `getwalletinfo` or `listtransactions` from the
+                    // client, because nothing in the daemon's log says so.
+                    if elapsed_ms >= SLOW_RPC_MS {
+                        tracing::info!(method = %req.method, wallet = wallet.unwrap_or("default"), elapsed_ms, "rpc ok (slow)");
+                    } else {
+                        tracing::debug!(method = %req.method, wallet = wallet.unwrap_or("default"), elapsed_ms, "rpc ok");
+                    }
                     (jsonrpc::success(req.id, value), StatusCode::OK)
                 }
                 Err(err) => {
-                    tracing::info!(method = %req.method, wallet = wallet.unwrap_or("default"), elapsed_ms, code = err.code, message = %err.message, "rpc error");
+                    // A method-not-found is a client-side probe, not an operational event: a
+                    // client whose dialect fallback polls an absent method (zcashd's
+                    // `z_gettotalbalance` is the one field operators hit) would otherwise write
+                    // one INFO line per poll cycle, forever. Same event name and field set at
+                    // both levels, so a JSON consumer's join to the `rpc` span still works.
+                    // Every other code stays at INFO: a `-6` on a send is worth seeing.
+                    if err.code == crate::error::codes::RPC_METHOD_NOT_FOUND {
+                        tracing::debug!(method = %req.method, wallet = wallet.unwrap_or("default"), elapsed_ms, code = err.code, message = %err.message, "rpc error");
+                    } else {
+                        tracing::info!(method = %req.method, wallet = wallet.unwrap_or("default"), elapsed_ms, code = err.code, message = %err.message, "rpc error");
+                    }
                     (jsonrpc::error(req.id, &err), status_for(&err))
                 }
             }
@@ -358,6 +383,9 @@ mod tests {
                 active: crate::state::ActiveCommands::default(),
                 operations: Arc::new(crate::operations::OperationRegistry::new()),
                 fleet: None,
+                spend_limits: crate::config::SpendLimits::new(
+                    &crate::config::SpendConfig::default(),
+                ),
             },
         }
     }
@@ -1191,6 +1219,7 @@ mod tests {
             r#"{"method":"getbalances","id":1,"params":[]}"#,
             r#"{"method":"getrawtransaction","id":1,"params":["00"]}"#,
             r#"{"method":"sendrawtransaction","id":1,"params":["00"]}"#,
+            r#"{"method":"z_validateaddress","id":1,"params":["tmGqwWtL7RsbxikDSN26gsbicxVr2xJNe86"]}"#,
         ] {
             let code = call_err_code(body).await;
             assert!(

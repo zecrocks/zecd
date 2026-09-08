@@ -204,6 +204,11 @@ pub fn render(config: &AppConfig) -> String {
         "min_split_output_value",
         config.spend.min_split_output_value,
     );
+    kv(
+        &mut s,
+        "shutdown_drain_secs",
+        config.spend.shutdown_drain_secs,
+    );
 
     table(&mut s, "pools");
     pools_keys(&mut s, &config.pools);

@@ -114,6 +114,12 @@ impl PreparedNode {
         // carries a receiver and can stop its sync loop between batches.
         let (shutdown_tx, _) = tokio::sync::watch::channel(false);
 
+        // The `[spend]` values a SIGHUP reload can change while running. One cell, shared by
+        // every actor, so a reload reaches all of them at once - and read per send rather than
+        // copied into each actor, so it takes effect on the next send instead of the next
+        // restart. See `crate::config::SpendLimits`.
+        let spend_limits = crate::config::SpendLimits::new(&config.spend);
+
         let registry = WalletRegistry::new(config.default_wallet.clone());
         let mut actor_tasks = Vec::new();
         // Build the Orchard proving keys once (they're wallet-independent) and share them across
@@ -240,11 +246,12 @@ impl PreparedNode {
                 auto_unlock: config.keys.auto_unlock,
                 bootstrap: config.keys.bootstrap_from_keys,
                 confirmations_policy,
-                orchard_action_limit: config.spend.orchard_action_limit,
+                spend_limits: spend_limits.clone(),
                 target_note_count: config.spend.target_note_count,
                 min_split_output_value: config.spend.min_split_output_value,
                 orchard_keys: orchard_keys.clone(),
                 pipeline_proving: config.spend.pipeline_proving,
+                shutdown_drain: Duration::from_secs(config.spend.shutdown_drain_secs),
                 trust_own_transactions: config.spend.trust_own_transactions,
                 enabled_pools: entry.pools.clone(),
                 default_receivers: entry.default_receivers.clone(),
@@ -312,6 +319,7 @@ impl PreparedNode {
             &config,
             &fleet_hub,
             confirmations_policy,
+            &spend_limits,
             &shutdown_tx,
             &registry,
             &mut actor_tasks,
@@ -354,6 +362,7 @@ impl PreparedNode {
             active: crate::state::ActiveCommands::default(),
             operations: Arc::new(crate::operations::OperationRegistry::new()),
             fleet: fleet.clone(),
+            spend_limits,
         };
 
         Ok(Node {
@@ -378,6 +387,7 @@ async fn spawn_fleet(
     config: &AppConfig,
     hub: &Arc<chain::hub::ChainHub>,
     confirmations_policy: zcash_client_backend::data_api::wallet::ConfirmationsPolicy,
+    spend_limits: &crate::config::SpendLimits,
     shutdown_tx: &tokio::sync::watch::Sender<bool>,
     registry: &WalletRegistry,
     actor_tasks: &mut Vec<(String, tokio::task::JoinHandle<()>)>,
@@ -443,7 +453,7 @@ async fn spawn_fleet(
             reconnect_base: Duration::from_secs(config.backend.reconnect_base_secs),
             reconnect_max: Duration::from_secs(config.backend.reconnect_max_secs),
             confirmations_policy,
-            orchard_action_limit: config.spend.orchard_action_limit,
+            spend_limits: spend_limits.clone(),
             target_note_count: config.spend.target_note_count,
             min_split_output_value: config.spend.min_split_output_value,
             enabled_pools: config.pools.enabled.clone(),
@@ -475,7 +485,7 @@ async fn spawn_fleet(
             auto_unlock: false,
             bootstrap: false,
             confirmations_policy,
-            orchard_action_limit: config.spend.orchard_action_limit,
+            spend_limits: spend_limits.clone(),
             // Carried for completeness: a shard member never spends, so the change-splitting
             // knobs are never consulted. Taking the configured values rather than defaults keeps
             // a shard actor's config identical to a wallet actor's on every field it shares.
@@ -484,6 +494,8 @@ async fn spawn_fleet(
             // Shard members never spend, so the proving keys are dead weight here.
             orchard_keys: None,
             pipeline_proving: false,
+            // Nor is there anything to drain: a shard actor accepts no sends.
+            shutdown_drain: Duration::ZERO,
             // Never consulted either: the trust marker is written at send-store time.
             trust_own_transactions: false,
             enabled_pools: config.pools.enabled.clone(),
@@ -679,6 +691,23 @@ impl Node {
             .await
     }
 
+    /// Apply a freshly resolved configuration to this running node.
+    ///
+    /// Only the keys on [`crate::config::RELOADABLE_KEYS`] take effect; every other difference
+    /// is reported as needing a restart rather than being silently dropped. The returned report
+    /// says exactly what changed and what did not, which is what the caller logs - an operator
+    /// who edits a key that cannot be reloaded needs to be told, not left to infer it from
+    /// behaviour that did not change.
+    ///
+    /// This exists for the Orchard-action cap: a wallet whose notes have fragmented fails every
+    /// send until the cap moves, and restarting a live payment wallet to change a number is a
+    /// poor answer. The cap is deliberately not reachable from RPC - it bounds what one call
+    /// can make the daemon prove, so its raise channel must require process-level authority.
+    /// The binary wires this to SIGHUP; an embedder calls it directly.
+    pub fn reload_config(&self, fresh: &AppConfig) -> crate::config::ReloadReport {
+        crate::config::apply_reload(&self.state.config, fresh, &self.state.spend_limits)
+    }
+
     /// Request graceful shutdown (what `stop` and the daemon's SIGINT/SIGTERM handling do):
     /// wallet actors stop their sync loops between batches and blocking `waitfor*` calls
     /// unblock. Await [`Node::shutdown`] to wait for the actors afterwards.
@@ -757,6 +786,7 @@ pub(crate) mod testutil {
             active: crate::state::ActiveCommands::default(),
             operations: Arc::new(crate::operations::OperationRegistry::new()),
             fleet: None,
+            spend_limits: crate::config::SpendLimits::new(&crate::config::SpendConfig::default()),
         })
     }
 

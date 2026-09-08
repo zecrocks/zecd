@@ -235,6 +235,12 @@ struct PendingSend {
     request: TransactionRequest,
     confirmations: Option<ConfirmationsPolicy>,
     privacy: SendPrivacy,
+    /// The funding source, carried so a send that waited in the queue selects its inputs from
+    /// the same pools it would have selected from had it started immediately. A queued send is
+    /// always shielded-sourced (`begin_or_queue_send` routes transparent ones inline), but
+    /// "shielded" is not one thing: `ANY_SAPLING` and `ANY_ORCHARD` each name one pool family,
+    /// and dropping that here would silently widen the selection back to every pool.
+    source: SendSource,
     reply: oneshot::Sender<Result<TxId, RpcError>>,
 }
 
@@ -634,8 +640,9 @@ pub struct ActorConfig {
     /// The wallet-wide confirmations policy (`[spend]` config; ZIP-315 3/10 by default),
     /// anchoring balances, spend proposals, and the `-6` enrichment.
     pub confirmations_policy: ConfirmationsPolicy,
-    /// Cap on Orchard actions per send (`[spend] orchard_action_limit`; 0 disables it).
-    pub orchard_action_limit: usize,
+    /// The `[spend]` limits a SIGHUP reload can change while the daemon runs; shared with
+    /// every other actor and with the reload path (see [`crate::config::SpendLimits`]).
+    pub spend_limits: crate::config::SpendLimits,
     /// Change-splitting target and floor (`[spend] target_note_count` /
     /// `[spend] min_split_output_value`), validated at config resolution.
     pub target_note_count: usize,
@@ -652,6 +659,11 @@ pub struct ActorConfig {
     /// Run the proving step off the actor so a long send doesn't freeze sync (`[spend]
     /// pipeline_proving`). Only engages on the cached-Orchard PCZT path; off by default.
     pub pipeline_proving: bool,
+    /// How long to spend finishing already-accepted sends when shutdown is signalled (`[spend]
+    /// shutdown_drain_secs`, default 60s; `0` drops them immediately). It must fit inside the
+    /// supervisor's own stop timeout - see the config field's docs and
+    /// [`WalletActor::finish_accepted_sends`].
+    pub shutdown_drain: Duration,
     /// Mark wallet-authored transactions trusted at store time (`[spend]
     /// trust_own_transactions`, default on) - see [`mark_own_tx_trusted`]. Off = persist no
     /// trust marker, so a restore classifies identically to the authoring instance.
@@ -701,8 +713,9 @@ struct WalletActor {
     sync_interval: Duration,
     rebroadcast_interval: Duration,
     confirmations_policy: ConfirmationsPolicy,
-    /// Cap on Orchard actions per send (`[spend] orchard_action_limit`; 0 disables it).
-    orchard_action_limit: usize,
+    /// The `[spend]` limits a SIGHUP reload can change while the daemon runs. Read per send,
+    /// never cached, so a reload takes effect on the next send.
+    spend_limits: crate::config::SpendLimits,
     /// Change-splitting target and floor (`[spend]`), validated at config resolution.
     target_note_count: usize,
     /// See [`WalletActor::target_note_count`].
@@ -822,6 +835,9 @@ struct WalletActor {
     /// `[spend] trust_own_transactions`: mark wallet-authored transactions trusted at store
     /// time (see [`mark_own_tx_trusted`]). Off = the full-statelessness posture.
     trust_own_transactions: bool,
+    /// `[spend] shutdown_drain_secs`: how long to finish already-accepted sends once shutdown is
+    /// signalled. See [`Self::finish_accepted_sends`].
+    shutdown_drain: Duration,
     /// Whether a pipelined send's proof is currently running on a blocking thread. While `true`,
     /// new sends queue (in [`Self::send_queue`]) rather than starting - sends stay serialized.
     send_in_flight: bool,
@@ -869,6 +885,10 @@ struct WalletActor {
     /// from the raw error to recovery guidance (see [`sync_failure_hint`]).
     last_sync_error: Option<String>,
     sync_error_streak: u32,
+    /// How far below a detected reorg to rewind, in blocks. Starts at
+    /// [`engine::REORG_BASE_MARGIN`], doubles while consecutive batches keep hitting a reorg, and
+    /// resets on the first clean batch - see [`engine::next_reorg_margin`].
+    reorg_margin: u32,
     /// Sync is stopped for this wallet because a failure that **cannot** succeed on retry was
     /// hit: an [`engine::UnrecoverableReorg`], where no truncation target below the conflict
     /// exists, so the conflicting block can never be removed and every batch re-hits it. The rest
@@ -1290,7 +1310,7 @@ async fn spawn_inner(
         sync_interval: cfg.sync_interval,
         rebroadcast_interval: cfg.rebroadcast_interval,
         confirmations_policy: cfg.confirmations_policy,
-        orchard_action_limit: cfg.orchard_action_limit,
+        spend_limits: cfg.spend_limits.clone(),
         target_note_count: cfg.target_note_count,
         min_split_output_value: cfg.min_split_output_value,
         enabled_pools: cfg.enabled_pools.clone(),
@@ -1323,6 +1343,7 @@ async fn spawn_inner(
         prover,
         orchard_keys: cfg.orchard_keys,
         pipeline_proving: cfg.pipeline_proving,
+        shutdown_drain: cfg.shutdown_drain,
         trust_own_transactions: cfg.trust_own_transactions,
         send_in_flight: false,
         send_queue: VecDeque::new(),
@@ -1343,6 +1364,7 @@ async fn spawn_inner(
         unsupported_upgrades: Vec::new(),
         last_sync_error: None,
         sync_error_streak: 0,
+        reorg_margin: engine::REORG_BASE_MARGIN,
         sync_halted: false,
         force_sync: false,
         enhance_satisfied: std::collections::BTreeSet::new(),
@@ -1919,6 +1941,10 @@ fn transparent_only_recipients(
 fn spend_policy_for_source(source: SendSource) -> SpendPolicy {
     match source {
         SendSource::Unspecified | SendSource::Shielded => SpendPolicy::default(),
+        // One family only, so a shortfall in it is `-6` on the named source rather than a
+        // silent top-up from the other shielded pool - the same rule the transparent arms
+        // enforce with an empty shielded set, one level finer.
+        SendSource::ShieldedFamily(family) => SpendPolicy::shielded_pools(family.pools()),
         SendSource::Transparent(None) => SpendPolicy::shielded_pools(std::iter::empty())
             .with_transparent(
                 TransparentSpendPolicy::any_account_addr()
@@ -2082,6 +2108,7 @@ impl WalletActor {
             // Exit between sync batches once shutdown is signalled, so Ctrl-C/`stop` doesn't
             // wait out a long catch-up scan and the DB connection is dropped cleanly.
             if *self.shutdown.borrow() {
+                self.finish_accepted_sends().await;
                 info!("wallet actor shutting down");
                 return;
             }
@@ -2562,8 +2589,10 @@ impl WalletActor {
                 self.log_unsupported_upgrades();
             }
         }
-        // NB: do not call `update_status()` here - `get_wallet_summary`'s progress
-        // estimator underflows if invoked before the chain tip is set (see `refresh_tip`).
+        // NB: no `update_status()` here. The hazard that originally forbade it is gone (the
+        // publish no longer computes a wallet summary, so the progress estimator's
+        // before-the-tip underflow is out of the picture), but there is still nothing to
+        // publish: every caller refreshes the tip and publishes straight after.
         Ok(())
     }
 
@@ -2782,6 +2811,77 @@ impl WalletActor {
         self.update_status();
         // More to do only if the batch cap stopped us short of the serviceable requests in hand.
         pending.len() > handled
+    }
+
+    /// Finish the sends this wallet already accepted, before the actor stops.
+    ///
+    /// The HTTP layer starts refusing new requests the moment shutdown is triggered, so
+    /// whatever is queued here is exactly the set of sends a client was told would happen. The
+    /// actor used to exit at the top of its loop and drop them: their reply channels closed and
+    /// the operations failed with "actor stopped". Nothing had been stored or broadcast for
+    /// those, so no funds were at risk and no transaction was half-created - but the operator
+    /// lost the record of which in-flight sends happened, on exactly the restart boundary where
+    /// the in-memory operation registry already makes that hardest to reconstruct.
+    ///
+    /// So: commit a pipelined send whose proof is still running, then run the commands already
+    /// buffered on the channel. Both are bounded by `[spend] shutdown_drain_secs`, since a send
+    /// waiting on an upstream that is also going away must not hold the daemon open; anything
+    /// left when it expires is dropped exactly as before, with a warning naming what was lost.
+    /// New commands cannot arrive to extend this - `try_recv` takes only what is already
+    /// buffered - so this drains a set that can only shrink.
+    ///
+    /// The bound is configuration rather than a constant because the value that matters is not
+    /// how long a proof takes but how long the *supervisor* lets the process live after its
+    /// stop signal, and the common defaults straddle any number picked here (systemd 90s,
+    /// Kubernetes 30s, `docker stop` 10s). A drain longer than that is cut short by SIGKILL and
+    /// buys nothing. `0` skips the drain entirely.
+    async fn finish_accepted_sends(&mut self) {
+        let drain = self.shutdown_drain;
+        if drain.is_zero() {
+            return;
+        }
+        let deadline = Instant::now() + drain;
+        let mut finished = 0usize;
+
+        // A pipelined send is mid-proof on a blocking thread; its completion is the only thing
+        // that stores and broadcasts it.
+        while self.send_in_flight && Instant::now() < deadline {
+            match tokio::time::timeout_at(deadline.into(), self.send_done_rx.recv()).await {
+                Ok(Some(done)) => {
+                    self.finish_send_caught(done).await;
+                    finished += 1;
+                }
+                // The sender is gone, or the deadline passed: nothing more will arrive.
+                Ok(None) | Err(_) => break,
+            }
+        }
+
+        while Instant::now() < deadline {
+            match self.cmd_rx.try_recv() {
+                Ok(cmd) => {
+                    if self.handle_command_caught(cmd).await {
+                        return;
+                    }
+                    finished += 1;
+                }
+                Err(_) => break,
+            }
+        }
+
+        if finished > 0 {
+            info!(
+                commands = finished,
+                "finished accepted work before shutting down"
+            );
+        }
+        let abandoned = self.send_queue.len() + usize::from(self.send_in_flight);
+        if abandoned > 0 {
+            warn!(
+                abandoned,
+                "shutting down with sends still unfinished after \
+                 {drain:?}; they were never broadcast"
+            );
+        }
     }
 
     /// Handle one [`TransactionDataRequest`] for [`enhance_step`]. Returns `Err` only
@@ -3435,6 +3535,7 @@ impl WalletActor {
                 &mut self.db_data,
                 transparent,
                 unspent,
+                self.reorg_margin,
             )
             .await?
         };
@@ -3447,6 +3548,18 @@ impl WalletActor {
         // the membership set is stale, so rebuild it before the next pass.
         if outcome.transparent_recorded > 0 || outcome.transparent_spends_recorded > 0 {
             self.transparent_unspent_dirty = true;
+        }
+        // Grow the rewind margin while consecutive batches keep hitting a reorg, and reset it on
+        // the first clean one. A wallet only learns about a fork one block at a time at its own
+        // tip, so a fixed margin walks a deep rollback back a fixed step per round trip; doubling
+        // makes that walk logarithmic without changing what an ordinary shallow reorg costs.
+        let previous_margin = self.reorg_margin;
+        self.reorg_margin = engine::next_reorg_margin(previous_margin, outcome.reorged);
+        if outcome.reorged && self.reorg_margin != previous_margin {
+            info!(
+                margin = self.reorg_margin,
+                "consecutive reorgs; widening the rewind margin"
+            );
         }
         self.update_status();
         Ok(outcome.worked)
@@ -3912,20 +4025,27 @@ impl WalletActor {
     }
 
     fn update_status(&self) {
-        // `get_wallet_summary`'s subtree progress estimator can underflow before the chain
-        // tip's tree size is known (it panics in debug, wraps in release at this librustzcash
-        // rev). Only call it once we have a tip, and isolate it with `catch_unwind` so a
-        // progress-estimation panic can never take down the actor.
-        let summary = if self.tip_height.is_some() {
-            SILENCE_PROGRESS_PANIC.with(|f| f.set(true));
-            let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                self.db_data.get_wallet_summary(self.confirmations_policy)
-            }));
-            SILENCE_PROGRESS_PANIC.with(|f| f.set(false));
-            r.ok().and_then(|r| r.ok()).flatten()
-        } else {
-            None
-        };
+        // The one thing this needs from the wallet database is the fully-scanned height, so ask
+        // for exactly that. It used to come out of `get_wallet_summary`, which computes every
+        // account's balances and a note-weighted scan-progress estimate to produce it - real
+        // work on a large wallet, repeated on every publish, and the enhancement drain publishes
+        // once per batch of 16 serviced requests. It also brought the estimator's underflow
+        // (which panics in debug before the chain tip's tree size is known) close enough to need
+        // a `catch_unwind` around this call; `block_fully_scanned` reads a height and has no
+        // such hazard. The panic guard itself stays for the callers that still need a summary
+        // (`read::balance`, the insufficient-funds enrichment).
+        //
+        // Both database reads here run under `block_in_place`, like every other query the actor
+        // makes: this task holds a runtime worker while it queries, and on a large wallet the
+        // backlog read below is not free. Nesting is harmless if a caller is already in a
+        // blocking region.
+        let fully_scanned_height = tokio::task::block_in_place(|| {
+            self.db_data
+                .block_fully_scanned()
+                .ok()
+                .flatten()
+                .map(|meta| u32::from(meta.block_height()))
+        });
         // `scanning` and `scan_progress` are height-based (`fully_scanned` vs the chain tip), NOT
         // librustzcash's note-weighted `progress().scan()` ratio - that ratio covers only the
         // tip-priority range and reads 1.0 while historical ranges are still scanning (see
@@ -3933,17 +4053,15 @@ impl WalletActor {
         // status RPCs (`getwalletinfo.scanning`, `initialblockdownload`, `getpeerinfo.syncing`)
         // reported the scan done hours early, and `pending_enhancements` was measured (one DB
         // read per status update) throughout the scan it was designed to skip.
-        let (fully_scanned, scan_progress, scanning) = match (summary, self.tip_height) {
-            (Some(s), Some(tip)) => {
-                let scanned = u32::from(s.fully_scanned_height());
-                (
-                    Some(scanned),
-                    scan_progress_ratio(self.birthday, scanned, tip),
-                    scanned < tip,
-                )
-            }
-            // `summary` is only computed once a tip is known, so this is the "no summary yet"
-            // arm either way: heights unknown, conservatively still scanning.
+        let (fully_scanned, scan_progress, scanning) = match (fully_scanned_height, self.tip_height)
+        {
+            (Some(scanned), Some(tip)) => (
+                Some(scanned),
+                scan_progress_ratio(self.birthday, scanned, tip),
+                scanned < tip,
+            ),
+            // Either height still unknown (no tip yet, or nothing scanned): conservatively
+            // report still scanning rather than claiming a caught-up wallet.
             _ => (None, 0.0, true),
         };
 
@@ -3962,7 +4080,7 @@ impl WalletActor {
         let (pending_enhancements, enhanced_through) = if scanning {
             (0, None)
         } else {
-            let (count, lowest) = self.enhancement_backlog();
+            let (count, lowest) = tokio::task::block_in_place(|| self.enhancement_backlog());
             (
                 count,
                 fully_scanned.map(|scanned| enhanced_through(scanned, lowest)),
@@ -4718,11 +4836,19 @@ impl WalletActor {
         request: TransactionRequest,
         policy: ConfirmationsPolicy,
         privacy: SendPrivacy,
+        spend_policy: &SpendPolicy,
     ) -> Result<(pczt::Pczt, SendShape, Duration), RpcError> {
+        // The PCZT prove+sign step has no transparent signing pass, so this path must never be
+        // handed a policy that could select a transparent input. `do_send` routes transparent
+        // sources to the fused path; this is the backstop that says so in code.
+        debug_assert!(
+            spend_policy.transparent().is_none(),
+            "the cached-PCZT path cannot sign transparent inputs"
+        );
         let account_id = self.require_account(None)?;
         let net = self.network;
         let change_pool = self.enabled_pools.change_pool();
-        let orchard_action_limit = self.orchard_action_limit;
+        let orchard_action_limit = self.spend_limits.orchard_action_limit();
         let (target_note_count, min_split_output_value) =
             (self.target_note_count, self.min_split_output_value);
         let engine_dir = self.engine_dir.clone();
@@ -4751,13 +4877,18 @@ impl WalletActor {
                 &change_strategy,
                 request,
                 policy,
-                // Shielded-only input selection, always: `SpendPolicy`'s default permits every
-                // shielded pool with no transparent spending. A transparent-funded send
-                // (`SendSource::Transparent`) never reaches this path - `do_send` routes it to
-                // the fused path, whose `create_proposed_transactions` signs transparent inputs;
-                // the PCZT prove+sign step has no transparent signing pass, so keeping the
-                // default here makes an unsigned-transparent PCZT unconstructible by design.
-                &SpendPolicy::default(),
+                // The send's own source policy, which on this path is always shielded-only: a
+                // transparent-funded send (`SendSource::Transparent`) never reaches here, since
+                // `do_send` routes it to the fused path, whose `create_proposed_transactions`
+                // signs transparent inputs while the PCZT prove+sign step has no transparent
+                // signing pass. That routing is what makes an unsigned-transparent PCZT
+                // unconstructible, and it is asserted below rather than left to the reader.
+                //
+                // It is *not* enough to pass the default here. The default permits every
+                // shielded pool, so a source naming one pool family (`ANY_SAPLING`,
+                // `ANY_ORCHARD`) would silently select from the other - which is precisely the
+                // one-source-per-send guarantee those wildcards exist to make.
+                spend_policy,
                 // No input locking: zecd serializes sends through the single-writer actor, so
                 // there is no concurrent proposer to race for inputs.
                 None,
@@ -4899,7 +5030,7 @@ impl WalletActor {
         // must mean what it says, so it never takes this branch: its transparent recipients are
         // paid from shielded notes with shielded change, like any other policy's. Any other
         // policy, or any shielded recipient, falls through to the proposal path below.
-        if privacy == SendPrivacy::AllowFullyTransparent && source != SendSource::Shielded {
+        if privacy == SendPrivacy::AllowFullyTransparent && !source.is_shielded() {
             if let Some(recipients) = transparent_only_recipients(&self.network, &request)? {
                 // A t-address `fromaddress` narrows the t->t selection to that address's UTXOs
                 // (coin control); `ANY_TADDR` and the source-less Bitcoin-dialect sends spend
@@ -4941,7 +5072,12 @@ impl WalletActor {
         // Cached-Orchard PCZT path: phase A (select+build) -> phase B (prove+sign) -> phase C
         // (store), all on the actor. Each phase is timed so the send-latency log shows where the
         // cost lands on a large, note-fragmented wallet.
-        let (pczt, shape, build) = self.build_proposal_and_pczt(request, policy, privacy)?;
+        let (pczt, shape, build) = self.build_proposal_and_pczt(
+            request,
+            policy,
+            privacy,
+            &spend_policy_for_source(source),
+        )?;
         // Awaits the background keygen if this is the first send of a young daemon; a no-op once
         // it has finished. Only sends wait - reads and sync never touch the key.
         let keys = self
@@ -4988,7 +5124,7 @@ impl WalletActor {
     ) -> Result<TxId, RpcError> {
         let net = self.network;
         let change_pool = self.enabled_pools.change_pool();
-        let orchard_action_limit = self.orchard_action_limit;
+        let orchard_action_limit = self.spend_limits.orchard_action_limit();
         let (target_note_count, min_split_output_value) =
             (self.target_note_count, self.min_split_output_value);
         let account_id = self.require_account(None)?;
@@ -5122,11 +5258,12 @@ impl WalletActor {
                 request,
                 confirmations,
                 privacy,
+                source,
                 reply,
             });
             return;
         }
-        self.start_pipelined_send(request, confirmations, privacy, reply)
+        self.start_pipelined_send(request, confirmations, privacy, source, reply)
             .await;
     }
 
@@ -5139,6 +5276,7 @@ impl WalletActor {
         request: TransactionRequest,
         confirmations: Option<ConfirmationsPolicy>,
         privacy: SendPrivacy,
+        source: SendSource,
         reply: oneshot::Sender<Result<TxId, RpcError>>,
     ) {
         self.relock_if_expired();
@@ -5170,7 +5308,12 @@ impl WalletActor {
             }
         };
         let policy = confirmations.unwrap_or(self.confirmations_policy);
-        let (pczt, shape, build) = match self.build_proposal_and_pczt(request, policy, privacy) {
+        let (pczt, shape, build) = match self.build_proposal_and_pczt(
+            request,
+            policy,
+            privacy,
+            &spend_policy_for_source(source),
+        ) {
             Ok(v) => v,
             Err(e) => {
                 let _ = reply.send(Err(e));
@@ -5237,7 +5380,7 @@ impl WalletActor {
             let Some(p) = self.send_queue.pop_front() else {
                 break;
             };
-            self.start_pipelined_send(p.request, p.confirmations, p.privacy, p.reply)
+            self.start_pipelined_send(p.request, p.confirmations, p.privacy, p.source, p.reply)
                 .await;
         }
     }
@@ -5791,7 +5934,7 @@ impl WalletActor {
         let account_id = self.require_account(None)?;
         let net = self.network;
         let policy = self.confirmations_policy;
-        let orchard_action_limit = self.orchard_action_limit;
+        let orchard_action_limit = self.spend_limits.orchard_action_limit();
         let db = &mut self.db_data;
 
         let (target_height, anchor_height) = db
@@ -7219,9 +7362,11 @@ fn enforce_orchard_action_limit<FeeRuleT, NoteRef>(
         {
             return Err(RpcError::invalid_parameter(format!(
                 "Including {count} Orchard {kind} would exceed the current limit of {limit} \
-                 actions, which exists to bound this send's memory and proving cost. Raise \
-                 [spend] orchard_action_limit (or set it to 0 to disable the cap) to allow this \
-                 transaction."
+                 actions, which exists to bound this send's memory and proving cost. \
+                 Consolidate first with z_mergetoaddress ([\"ANY_ORCHARD\"], your own address, \
+                 repeatedly until remainingNotes is 0), which is usually what a wallet this \
+                 fragmented wants. Or raise [spend] orchard_action_limit (0 disables the cap) \
+                 and send SIGHUP to reload it without restarting."
             )));
         }
     }
@@ -7928,6 +8073,36 @@ mod tests {
         let shielded = spend_policy_for_source(SendSource::Shielded);
         assert!(shielded.transparent().is_none());
         assert!(!shielded.shielded().is_empty());
+
+        // A pool-restricted shielded source permits only its own family, so a shortfall is a
+        // `-6` on the named family rather than a top-up from the other pool - and it must still
+        // read as shielded to the routing that decides whether the t-to-t path engages.
+        for (family, expected) in [
+            (
+                crate::wallet::ShieldedFamily::Sapling,
+                vec![zcash_protocol::ShieldedPool::Sapling],
+            ),
+            (
+                crate::wallet::ShieldedFamily::Orchard,
+                vec![
+                    zcash_protocol::ShieldedPool::Orchard,
+                    zcash_protocol::ShieldedPool::Ironwood,
+                ],
+            ),
+        ] {
+            let source = SendSource::ShieldedFamily(family);
+            assert!(source.is_shielded(), "{family:?} is a shielded source");
+            let policy = spend_policy_for_source(source);
+            assert!(
+                policy.transparent().is_none(),
+                "{family:?}: never transparent inputs"
+            );
+            let mut got: Vec<_> = policy.shielded().iter().copied().collect();
+            got.sort_by_key(|p| format!("{p:?}"));
+            let mut want = expected.clone();
+            want.sort_by_key(|p| format!("{p:?}"));
+            assert_eq!(got, want, "{family:?}: one family only");
+        }
 
         let any = spend_policy_for_source(SendSource::Transparent(None));
         assert!(any.shielded().is_empty(), "one source per send");

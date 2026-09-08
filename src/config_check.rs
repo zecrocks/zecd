@@ -100,6 +100,7 @@ pub fn inspect(config: &AppConfig) -> Vec<Finding> {
 
     check_backend(config, &mut findings);
     check_rpc(config, &mut findings);
+    check_spend(config, &mut findings);
     check_layout(config, &mut findings);
     check_paths(config, &mut findings);
     check_fleet(config, &mut findings);
@@ -147,6 +148,29 @@ fn check_fleet(config: &AppConfig, findings: &mut Vec<Finding>) {
         config.fleet.manifest_dir.display()
     )));
 }
+
+/// `[spend]` settings whose sound value depends on the environment rather than on the config.
+fn check_spend(config: &AppConfig, findings: &mut Vec<Finding>) {
+    // The drain only runs for as long as the *supervisor* lets the process live after its stop
+    // signal, and every common supervisor's default is at or below 90s: systemd's
+    // `DefaultTimeoutStopSec` is 90, Kubernetes' `terminationGracePeriodSeconds` 30, and
+    // `docker stop` 10. A drain longer than the shortest of those is not wrong - the operator
+    // may have raised it - but it is the kind of setting that silently does nothing, which is
+    // exactly what a warning is for.
+    if config.spend.shutdown_drain_secs > SUPERVISOR_STOP_TIMEOUT_HINT_SECS {
+        findings.push(Finding::warning(format!(
+            "[spend] shutdown_drain_secs = {} is longer than the default stop timeout of every \
+             common supervisor (systemd 90s, Kubernetes 30s, `docker stop` 10s). Unless yours \
+             is raised to match, the drain will be cut short by SIGKILL and accepted sends will \
+             be lost anyway",
+            config.spend.shutdown_drain_secs
+        )));
+    }
+}
+
+/// The longest supervisor stop timeout zecd assumes is available by default (systemd's
+/// `DefaultTimeoutStopSec`). Past this, `[spend] shutdown_drain_secs` is warned about.
+const SUPERVISOR_STOP_TIMEOUT_HINT_SECS: u64 = 90;
 
 /// The verdict `zecd config check` derives from a set of findings. The pass/fail and
 /// `--strict` semantics live here so a library caller and the CLI cannot disagree on them.

@@ -218,6 +218,13 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(err.code(), Some(crate::error::codes::RPC_WALLET_NOT_FOUND));
+        // z_validateaddress resolves the wallet strictly too, unlike `validateaddress` above:
+        // its `ismine` would otherwise be ambiguous between "not yours" and "no wallet asked".
+        let err = c
+            .z_validate_address("tmGqwWtL7RsbxikDSN26gsbicxVr2xJNe86")
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), Some(crate::error::codes::RPC_WALLET_NOT_FOUND));
     }
 
     /// Trailing omitted arguments vanish; interior ones become explicit nulls.

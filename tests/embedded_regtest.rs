@@ -308,6 +308,12 @@ async fn embedded_node_serves_typed_calls_end_to_end() {
     assert!(address.starts_with("uregtest"), "{address}");
     let addr_info = c.get_address_info(&address).await.expect("getaddressinfo");
     assert!(addr_info.ismine);
+    let zva = c
+        .z_validate_address(&address)
+        .await
+        .expect("z_validateaddress");
+    assert!(zva.isvalid && zva.ismine == Some(true));
+    assert_eq!(zva.address_type.as_deref(), Some("unified"));
 
     assert_eq!(c.get_balance(None).await.expect("getbalance").zatoshis(), 0);
     let balances = c.get_balances().await.expect("getbalances");

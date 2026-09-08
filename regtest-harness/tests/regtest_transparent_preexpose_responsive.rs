@@ -98,6 +98,18 @@ async fn regtest_transparent_preexpose_stays_responsive() {
         let (_blocks, bc_latency) = timed_read(&zecd, "getblockcount", json!([])).await;
         max_latency = max_latency.max(bc_latency);
 
+        // The health endpoints are what a monitoring stack actually watches, and they were
+        // reported going dark for hours under exactly this kind of sustained actor load. They
+        // read a cached status snapshot and touch neither the actor nor the database, so the
+        // only way they stall is the runtime having no worker free to poll them - which is a
+        // property of the whole daemon, not of these handlers, and so is worth asserting here
+        // rather than trusting. `/healthz` is included as the control: it does no work at all,
+        // so if it stalls too the problem is the runtime rather than anything /status does.
+        for path in ["/healthz", "/readyz", "/status"] {
+            let latency = timed_health(&zecd, path).await;
+            max_latency = max_latency.max(latency);
+        }
+
         let initial = &info["transparent"]["initial_sync"];
         if initial.is_object() {
             if initial["complete"].as_bool().unwrap_or(false) {
@@ -132,6 +144,22 @@ async fn regtest_transparent_preexpose_stays_responsive() {
 /// Issue one read RPC, enforcing [`MAX_READ_LATENCY`] with a hard timeout. Panics with an
 /// actionable message if the call blocks past the bound (the regression) or errors. Returns the
 /// decoded result and the measured latency.
+/// GET a health endpoint, failing if it does not answer within [`MAX_READ_LATENCY`]. The status
+/// code is deliberately not asserted: `/readyz` answers 503 while the wallet is still working,
+/// which is correct and is not what this measures.
+async fn timed_health(zecd: &Zecd, path: &str) -> Duration {
+    let start = Instant::now();
+    match tokio::time::timeout(MAX_READ_LATENCY, zecd.health_get(path)).await {
+        Err(_) => panic!(
+            "GET {path} did not answer within {MAX_READ_LATENCY:?} during transparent \
+             pre-exposure: the health endpoints read a cached snapshot and must stay live even \
+             while the wallet actor is busy."
+        ),
+        Ok(Err(e)) => panic!("GET {path} failed during transparent pre-exposure: {e}"),
+        Ok(Ok(_)) => start.elapsed(),
+    }
+}
+
 async fn timed_read(zecd: &Zecd, method: &str, params: Value) -> (Value, Duration) {
     let start = Instant::now();
     match tokio::time::timeout(MAX_READ_LATENCY, zecd.call(method, params)).await {

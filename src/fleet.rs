@@ -627,7 +627,10 @@ mod tests {
             reconnect_base: std::time::Duration::from_secs(1),
             reconnect_max: std::time::Duration::from_secs(2),
             confirmations_policy: Default::default(),
-            orchard_action_limit: 0,
+            spend_limits: crate::config::SpendLimits::new(&crate::config::SpendConfig {
+                orchard_action_limit: 0,
+                ..Default::default()
+            }),
             target_note_count: crate::config::DEFAULT_TARGET_NOTE_COUNT,
             min_split_output_value: crate::config::DEFAULT_MIN_SPLIT_OUTPUT_VALUE,
             enabled_pools: crate::pools::ReceiverSet::single(crate::pools::Receiver::Orchard),
@@ -752,7 +755,7 @@ pub struct ShardTemplate {
     pub reconnect_base: std::time::Duration,
     pub reconnect_max: std::time::Duration,
     pub confirmations_policy: zcash_client_backend::data_api::wallet::ConfirmationsPolicy,
-    pub orchard_action_limit: usize,
+    pub spend_limits: crate::config::SpendLimits,
     pub target_note_count: usize,
     pub min_split_output_value: u64,
     pub enabled_pools: crate::pools::ReceiverSet,
@@ -1051,7 +1054,7 @@ impl ShardTemplate {
             auto_unlock: false,
             bootstrap: false,
             confirmations_policy: self.confirmations_policy,
-            orchard_action_limit: self.orchard_action_limit,
+            spend_limits: self.spend_limits.clone(),
             // Never consulted - a shard member cannot spend - but carried so a shard actor's
             // config matches a wallet actor's on every field they share.
             target_note_count: self.target_note_count,
@@ -1059,6 +1062,8 @@ impl ShardTemplate {
             // Shard members never spend, so the proving keys would be dead weight.
             orchard_keys: None,
             pipeline_proving: false,
+            // Nor is there anything to drain: a shard actor accepts no sends.
+            shutdown_drain: std::time::Duration::ZERO,
             // Never consulted either: the trust marker is written at send-store time.
             trust_own_transactions: false,
             enabled_pools: self.enabled_pools.clone(),

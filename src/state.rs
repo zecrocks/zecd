@@ -16,6 +16,12 @@ use crate::wallet::WalletRegistry;
 /// cookie file as a side effect.
 #[derive(Clone)]
 pub struct AppState {
+    /// The `[spend]` values a SIGHUP reload can change while the daemon runs, shared with every
+    /// wallet actor. Everything else in `config` is fixed for the process's life; these are
+    /// here because an operator needs to change them while a wallet is stuck, not at the next
+    /// restart. See [`crate::config::SpendLimits`] for why the channel is a signal and not an
+    /// RPC.
+    pub spend_limits: crate::config::SpendLimits,
     pub config: Arc<AppConfig>,
     pub registry: Arc<WalletRegistry>,
     pub started_at: Instant,
@@ -51,12 +57,17 @@ impl AppState {
     pub fn trigger_shutdown(&self) {
         let unfinished = self.operations.unfinished();
         if !unfinished.is_empty() {
-            tracing::warn!(
+            // The wallet actors finish the sends they have already accepted before stopping
+            // (`WalletActor::finish_accepted_sends`), so these operations are expected to
+            // complete rather than be dropped. What does not survive is their *status objects*:
+            // the registry is in-memory, so after the restart a client must resolve fate by
+            // txid on chain. Note that at INFO, not WARN - it is the documented contract, not a
+            // fault; anything actually abandoned is warned about by the actor that drops it.
+            tracing::info!(
                 count = unfinished.len(),
                 operations = ?unfinished,
-                "async operations still in flight at shutdown; their status objects are \
-                 in-memory only and will not survive restart (a transaction that was already \
-                 stored is still rebroadcast on the next start)"
+                "async operations in flight at shutdown; the sends are being finished, but \
+                 their status objects are in-memory only - resolve fate by txid after restart"
             );
         }
         self.shutting_down.store(true, Ordering::Relaxed);

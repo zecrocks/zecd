@@ -445,8 +445,129 @@ async fn regtest_mergetoaddress_consolidates_a_fragmented_wallet() {
     );
     phase("t->z merges done (0 UTXOs left)");
 
-    // 5. Note merges. Round 1: an explicit shielded_limit that binds (8 < 14 eligible) takes
-    //    the manual limited-selection path and reports the remainder.
+    // 4a. A SIGHUP reload changes the Orchard-action cap on a running daemon.
+    //
+    // This wallet runs with the cap disabled, so first set a cap low enough that the next send
+    // cannot fit, confirm the daemon rejects it with the `-8` that names the knob, then put the
+    // cap back and confirm the same send goes through - all without restarting. That is the
+    // whole point: a fragmented payout wallet fails every send until the cap moves, and a live
+    // payment wallet should not have to be restarted to change a number.
+    zecd.edit_config(|toml| toml.replace("orchard_action_limit = 0", "orchard_action_limit = 1"))
+        .expect("lower the action cap in zecd.toml");
+    zecd.reload_config().expect("SIGHUP the daemon");
+
+    let capped =
+        wait_for_send_outcome(&zecd, &own_ua, Some(-8), "the lowered cap takes effect").await;
+    assert_eq!(
+        capped.0,
+        Some(-8),
+        "a send over the reloaded cap is rejected: {:?}",
+        capped.1
+    );
+    assert!(
+        capped.1.contains("orchard_action_limit"),
+        "the refusal names the knob: {}",
+        capped.1
+    );
+    assert!(
+        capped.1.contains("z_mergetoaddress"),
+        "and points at consolidating first: {}",
+        capped.1
+    );
+
+    // Restore it and the same send succeeds, still without a restart.
+    zecd.edit_config(|toml| toml.replace("orchard_action_limit = 1", "orchard_action_limit = 0"))
+        .expect("restore the action cap");
+    zecd.reload_config().expect("SIGHUP the daemon again");
+    let restored =
+        wait_for_send_outcome(&zecd, &own_ua, None, "the restored cap takes effect").await;
+    assert_eq!(
+        restored.0, None,
+        "with the cap back at 0 the send succeeds: {:?}",
+        restored.1
+    );
+
+    // A config the resolver refuses must leave the daemon running on its current values rather
+    // than taking it down - a typo in an edited file is not a reason to stop serving.
+    zecd.edit_config(|toml| format!("{toml}\nnot_a_real_key = true\n"))
+        .expect("write an invalid config");
+    zecd.reload_config().expect("SIGHUP with a bad config");
+    let after_bad =
+        wait_for_send_outcome(&zecd, &own_ua, None, "a bad config changes nothing").await;
+    assert_eq!(
+        after_bad.0, None,
+        "the daemon keeps serving on its previous config: {:?}",
+        after_bad.1
+    );
+    zecd.edit_config(|toml| toml.replace("\nnot_a_real_key = true\n", "\n"))
+        .expect("undo the invalid config");
+    phase("SIGHUP reloads [spend] orchard_action_limit");
+
+    // 4b. `z_sendmany` accepts the same shielded pool-family wildcards as the merge above.
+    //     This wallet's notes are all Orchard-family, so an `ANY_ORCHARD` send must fund and
+    //     confirm normally, while `ANY_SAPLING` must report insufficient funds rather than
+    //     silently drawing on the Orchard notes - which is the whole point of naming a family:
+    //     a shortfall in it is an error, not a top-up from the other side of the turnstile.
+    let opid = zecd
+        .call(
+            "z_sendmany",
+            json!(["ANY_ORCHARD", [{"address": own_ua, "amount": 0.01}]]),
+        )
+        .await
+        .expect("z_sendmany from ANY_ORCHARD");
+    let result = await_op(
+        &zecd,
+        opid.as_str().expect("opid string"),
+        "ANY_ORCHARD send",
+    )
+    .await;
+    assert!(
+        result["txid"].as_str().is_some_and(|t| t.len() == 64),
+        "the ANY_ORCHARD send produced a txid: {result}"
+    );
+
+    let opid = zecd
+        .call(
+            "z_sendmany",
+            json!(["ANY_SAPLING", [{"address": own_ua, "amount": 0.01}]]),
+        )
+        .await
+        .expect("z_sendmany from ANY_SAPLING is accepted, then fails on funds");
+    let waited = zecd
+        .call(
+            "z_waitforoperation",
+            json!([opid, OP_TIMEOUT.as_secs() as i64]),
+        )
+        .await
+        .expect("z_waitforoperation on the ANY_SAPLING send");
+    assert_eq!(
+        waited["status"], "failed",
+        "no Sapling notes to spend: {waited}"
+    );
+    assert_eq!(
+        waited["error"]["code"],
+        json!(-6),
+        "a shortfall in the named family is insufficient funds, not a top-up: {waited}"
+    );
+    phase("z_sendmany pool-family wildcards");
+
+    // Confirm what 4a and 4b just spent and minted, then re-read the eligible note set. The
+    // count captured before those phases is stale by now: every probe that lands before a SIGHUP
+    // takes effect is a real send, so how many notes this wallet holds here is not a fixed
+    // number - it has to be read back rather than carried forward. Mining first is what makes
+    // the two views agree: `unspent_counts` reads `listunspent 1` while the merge selector
+    // honours the untrusted confirmation depth, and 12 blocks satisfies both.
+    confirm_untrusted(&zebrad, &zecd).await;
+    let (_, z_with_merge_outputs) = unspent_counts(&zecd).await;
+    assert!(
+        z_with_merge_outputs > NOTE_MERGE_LIMIT,
+        "the fixture must still hold more notes than the explicit limit ({z_with_merge_outputs} \
+         vs {NOTE_MERGE_LIMIT}) - otherwise round 1 below merges everything and its \"the limit \
+         binds\" assertion passes vacuously"
+    );
+
+    // 5. Note merges. Round 1: an explicit shielded_limit that binds (8 against the count just
+    //    read back) takes the manual limited-selection path and reports the remainder.
     let resp = zecd
         .call(
             "z_mergetoaddress",
@@ -603,4 +724,66 @@ async fn regtest_mergetoaddress_default_shielded_limit() {
     phase("converged to 1 note");
 
     drop(zecd);
+}
+
+/// Issue small self-sends until one produces `expect` as its error code (`None` meaning the
+/// send succeeded), and return that outcome's message.
+///
+/// A SIGHUP reload is asynchronous with respect to the RPC that follows it - the signal handler
+/// re-reads the file on its own task - so a send issued immediately after signalling can still
+/// see the old cap. Retrying until the expected outcome appears (or the deadline passes, which
+/// fails the assertion in the caller with the last message seen) keeps that from being a race.
+///
+/// Two details keep the polling from eating the wallet it is probing. It sleeps **before** each
+/// probe rather than after: this is a wait for a signal-driven state change, so the first send
+/// should come after the daemon has plausibly had the signal, and the common case then costs no
+/// wasted send at all. And the amount is small enough to fund from one `N_FANOUT_ZATS` note plus
+/// the fee, so a probe that does land before the reload spends one note and returns two (payment
+/// plus change) - it can only fragment the fixture further, never consolidate it. The `-8`
+/// coverage is unaffected by the size: with the cap at 1 every shielded send exceeds it, since
+/// the cheapest possible one still has a spend and two outputs.
+async fn wait_for_send_outcome(
+    zecd: &Zecd,
+    to: &str,
+    expect: Option<i64>,
+    what: &str,
+) -> (Option<i64>, String) {
+    let deadline = Instant::now() + Duration::from_secs(60);
+    loop {
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let outcome = match zecd
+            .call(
+                "z_sendmany",
+                json!([to, [{"address": to, "amount": 0.001}]]),
+            )
+            .await
+        {
+            // A transport failure has no RPC code; report it as a distinct value so it can
+            // never be mistaken for the success case (`None`) and time the loop out instead.
+            Err(e) => (Some(e.code().unwrap_or(i64::MIN)), format!("{e}")),
+            Ok(opid) => {
+                let waited = zecd
+                    .call(
+                        "z_waitforoperation",
+                        json!([opid, OP_TIMEOUT.as_secs() as i64]),
+                    )
+                    .await
+                    .unwrap_or_else(|e| panic!("{what}: z_waitforoperation: {e}"));
+                if waited["status"] == "success" {
+                    (None, waited.to_string())
+                } else {
+                    (
+                        waited["error"]["code"].as_i64(),
+                        waited["error"]["message"]
+                            .as_str()
+                            .unwrap_or_default()
+                            .to_string(),
+                    )
+                }
+            }
+        };
+        if outcome.0 == expect || Instant::now() >= deadline {
+            return outcome;
+        }
+    }
 }

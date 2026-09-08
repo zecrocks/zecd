@@ -126,69 +126,71 @@ fn is_locked(st: &crate::wallet::SyncStatus) -> bool {
 }
 
 fn snapshot(state: &AppState) -> Snapshot {
-    let names = state.registry.names();
-    let mut ready = !names.is_empty();
+    // One lock acquisition for the whole registry, not one per wallet: this runs on every
+    // `/status` and `/readyz`, a fleet deployment holds thousands of wallets, and each
+    // acquisition on a busy runtime is a chance to be descheduled. It also reads a consistent
+    // registry, where name-then-lookup could see a wallet unloaded between the two.
+    let loaded = state.registry.snapshot();
+    let mut ready = !loaded.is_empty();
     let mut any_down = false;
     let mut any_actor_down = false;
     let mut any_locked = false;
     let mut any_enhancing = false;
     let mut wallets = Map::new();
-    for name in names {
-        if let Ok(h) = state.registry.get(Some(&name)) {
-            let st = h.status();
-            // A dead writer actor means sends/address-generation are broken even though reads
-            // still answer from the DB - so it must fail readiness, not silently report ready.
-            let actor_alive = h.actor_alive();
-            let w_ready = actor_alive && wallet_ready(&st, &state.config.health);
-            ready = ready && w_ready;
-            if matches!(st.conn_state, crate::wallet::ConnState::Down) {
-                any_down = true;
-            }
-            if !actor_alive {
-                any_actor_down = true;
-            }
-            // A locked wallet stays read-ready and syncs fine; it just can't spend. We surface
-            // it as a distinct signal (not a readiness failure) so an operator/controller can
-            // tell "needs walletpassphrase" apart from "still syncing" without breaking
-            // read-only or watch-only deployments that are legitimately ready while locked.
-            let locked = is_locked(&st);
-            if locked {
-                any_locked = true;
-            }
-            // Block scan caught up to the tip, but the enhancement backlog hasn't drained yet.
-            if !st.scanning && st.pending_enhancements > 0 {
-                any_enhancing = true;
-            }
-            // The block-height gap between the tip and the last fully-scanned height - the
-            // meaningful "how far behind" signal. Surfaced on every wallet regardless of the
-            // configured readiness mode, so an operator on `readiness = "connected"` (which reports
-            // ready before the scan finishes) can still see how stale the wallet's reads may be.
-            // `null` until both heights are known.
-            let scan_lag = match (st.chain_tip, st.fully_scanned) {
-                (Some(tip), Some(scanned)) => Some(tip.saturating_sub(scanned)),
-                _ => None,
-            };
-            wallets.insert(
-                name,
-                json!({
-                    "connected": st.connected,
-                    "actor_alive": actor_alive,
-                    "server": st.server,
-                    "conn_state": st.conn_state.as_str(),
-                    "chain_tip": st.chain_tip,
-                    "fully_scanned": st.fully_scanned,
-                    "scan_lag": scan_lag,
-                    "birthday": st.birthday,
-                    "scan_progress": st.scan_progress,
-                    "scanning": st.scanning,
-                    "pending_enhancements": st.pending_enhancements,
-                    "enhanced_through": st.enhanced_through,
-                    "encrypted": st.encrypted,
-                    "locked": locked,
-                    "ready": w_ready,
-                }),
-            );
+    for (name, h) in loaded {
+        let st = h.status();
+        // A dead writer actor means sends/address-generation are broken even though reads
+        // still answer from the DB - so it must fail readiness, not silently report ready.
+        let actor_alive = h.actor_alive();
+        let w_ready = actor_alive && wallet_ready(&st, &state.config.health);
+        ready = ready && w_ready;
+        if matches!(st.conn_state, crate::wallet::ConnState::Down) {
+            any_down = true;
         }
+        if !actor_alive {
+            any_actor_down = true;
+        }
+        // A locked wallet stays read-ready and syncs fine; it just can't spend. We surface
+        // it as a distinct signal (not a readiness failure) so an operator/controller can
+        // tell "needs walletpassphrase" apart from "still syncing" without breaking
+        // read-only or watch-only deployments that are legitimately ready while locked.
+        let locked = is_locked(&st);
+        if locked {
+            any_locked = true;
+        }
+        // Block scan caught up to the tip, but the enhancement backlog hasn't drained yet.
+        if !st.scanning && st.pending_enhancements > 0 {
+            any_enhancing = true;
+        }
+        // The block-height gap between the tip and the last fully-scanned height - the
+        // meaningful "how far behind" signal. Surfaced on every wallet regardless of the
+        // configured readiness mode, so an operator on `readiness = "connected"` (which reports
+        // ready before the scan finishes) can still see how stale the wallet's reads may be.
+        // `null` until both heights are known.
+        let scan_lag = match (st.chain_tip, st.fully_scanned) {
+            (Some(tip), Some(scanned)) => Some(tip.saturating_sub(scanned)),
+            _ => None,
+        };
+        wallets.insert(
+            name,
+            json!({
+                "connected": st.connected,
+                "actor_alive": actor_alive,
+                "server": st.server,
+                "conn_state": st.conn_state.as_str(),
+                "chain_tip": st.chain_tip,
+                "fully_scanned": st.fully_scanned,
+                "scan_lag": scan_lag,
+                "birthday": st.birthday,
+                "scan_progress": st.scan_progress,
+                "scanning": st.scanning,
+                "pending_enhancements": st.pending_enhancements,
+                "enhanced_through": st.enhanced_through,
+                "encrypted": st.encrypted,
+                "locked": locked,
+                "ready": w_ready,
+            }),
+        );
     }
     Snapshot {
         ready,

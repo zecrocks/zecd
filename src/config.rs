@@ -7,6 +7,8 @@ use std::collections::BTreeMap;
 use std::net::IpAddr;
 use std::num::NonZeroU32;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
 
 use anyhow::Context;
 #[cfg(feature = "cli")]
@@ -756,6 +758,18 @@ pub struct SpendConfig {
     /// faucet-funded testnet wallet, high-frequency low-value sends) should lower this to
     /// roughly its own typical payment size.
     pub min_split_output_value: u64,
+    /// How long, in seconds, the wallet actor spends finishing sends it has already accepted
+    /// when shutdown is signalled, before dropping whatever is left (see
+    /// `actor::WalletActor::finish_accepted_sends`). Default 60.
+    ///
+    /// This has to fit **inside** whatever grace period the supervisor allows between its
+    /// stop signal and `SIGKILL`, and the common ones are shorter than this default: `docker
+    /// stop` kills after 10s and Kubernetes' `terminationGracePeriodSeconds` after 30s, where
+    /// systemd's `DefaultTimeoutStopSec` is 90s. Killed mid-drain nothing is corrupted - a send
+    /// that had not been stored is simply lost, exactly as before this drain existed - but the
+    /// guarantee it buys is silently gone, so raise the supervisor's timeout or lower this.
+    /// `0` disables the drain and restores the old drop-on-shutdown behaviour.
+    pub shutdown_drain_secs: u64,
 }
 
 impl Default for SpendConfig {
@@ -770,6 +784,7 @@ impl Default for SpendConfig {
             pipeline_proving: false,
             target_note_count: DEFAULT_TARGET_NOTE_COUNT,
             min_split_output_value: DEFAULT_MIN_SPLIT_OUTPUT_VALUE,
+            shutdown_drain_secs: DEFAULT_SHUTDOWN_DRAIN_SECS,
         }
     }
 }
@@ -797,6 +812,163 @@ impl SpendConfig {
     }
 }
 
+/// The `[spend]` values a running daemon can change without a restart.
+///
+/// Everything else in the resolved config is copied into per-actor fields at startup and is
+/// immutable for the process's life. These are not, because an operator needs to change them
+/// *while* a wallet is stuck: the Orchard-action cap is the one a fragmented wallet hits, where
+/// every payout fails until the cap moves and the backlog grows while it does not. A mining
+/// pool ran into exactly that and had to restart a live payment wallet to get out.
+///
+/// The cap is a shared cell rather than a per-call RPC argument on purpose. It bounds what a
+/// single call can make the daemon prove - CPU linear in actions across every core, memory in
+/// witness data, and the wait every queued send inherits - and the changelog leans on it as a
+/// security property, citing it as bounding how long one proof can run while a decrypted seed
+/// is resident. A knob an RPC caller could raise would not be that bound. So the only channel
+/// that changes it is one requiring process-level authority: SIGHUP, which re-reads the config
+/// file. See `Node::reload_config`.
+#[derive(Debug, Clone)]
+pub struct SpendLimits {
+    orchard_action_limit: Arc<AtomicUsize>,
+}
+
+impl SpendLimits {
+    pub fn new(spend: &SpendConfig) -> Self {
+        Self {
+            orchard_action_limit: Arc::new(AtomicUsize::new(spend.orchard_action_limit)),
+        }
+    }
+
+    /// The cap in force right now. Read per send rather than cached, so a reload takes effect on
+    /// the next send instead of the next restart.
+    pub fn orchard_action_limit(&self) -> usize {
+        self.orchard_action_limit.load(Ordering::Relaxed)
+    }
+
+    /// Apply a new cap. Returns the previous value, so a caller can report what changed.
+    pub fn set_orchard_action_limit(&self, limit: usize) -> usize {
+        self.orchard_action_limit.swap(limit, Ordering::Relaxed)
+    }
+}
+
+/// What a configuration reload changed, and what it could not.
+///
+/// A reload is deliberately narrow: only the keys on [`RELOADABLE_KEYS`] are applied, and
+/// everything else in a re-read config is reported as needing a restart rather than being
+/// silently ignored or half-applied. An operator who edits the wrong key should be told so by
+/// the daemon, not discover it when the behaviour does not change.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct ReloadReport {
+    /// `(key, old, new)` for each setting this reload applied.
+    pub applied: Vec<(&'static str, String, String)>,
+    /// Keys whose value differs from the running config but that only a restart can change.
+    pub requires_restart: Vec<String>,
+}
+
+impl ReloadReport {
+    /// Whether the reload found nothing to do - the file matches what is running.
+    pub fn is_empty(&self) -> bool {
+        self.applied.is_empty() && self.requires_restart.is_empty()
+    }
+}
+
+/// The configuration keys a running daemon applies on reload. Everything else needs a restart.
+///
+/// Deliberately a list of one. Reloading a setting means it is safe to change under a running
+/// wallet actor, and most are not: an endpoint, a network, a wallet's pools or gap limits are
+/// all baked into state that exists by the time the daemon is serving. This key is here because
+/// an operator needs it *while* a wallet is stuck rather than at the next restart - a
+/// fragmented wallet fails every payout until the cap moves, and the backlog grows while it
+/// does not. Add to this list only when the same is true.
+pub const RELOADABLE_KEYS: &[&str] = &["spend.orchard_action_limit"];
+
+/// Compare a freshly resolved config against the one the daemon is running, apply what can be
+/// applied, and report the rest.
+pub fn apply_reload(running: &AppConfig, fresh: &AppConfig, limits: &SpendLimits) -> ReloadReport {
+    let mut report = ReloadReport::default();
+
+    // The one live key. Compared against the cell rather than against `running`, so a second
+    // reload that changes nothing reports nothing even after the first one moved it.
+    let current = limits.orchard_action_limit();
+    if fresh.spend.orchard_action_limit != current {
+        limits.set_orchard_action_limit(fresh.spend.orchard_action_limit);
+        report.applied.push((
+            "spend.orchard_action_limit",
+            current.to_string(),
+            fresh.spend.orchard_action_limit.to_string(),
+        ));
+    }
+
+    // Everything else: report a difference rather than pretending it took effect.
+    //
+    // The comparison runs over `config_show::render`'s output rather than over the structs,
+    // which buys two things. It names the *key* that differs, using the same spelling an
+    // operator writes in the file (that renderer is already pinned to emit keys a config parse
+    // accepts). And it covers the whole config by construction, so adding a setting cannot
+    // create a change nobody is told about - which is the failure mode a hand-written field
+    // comparison has, and the one that matters here, since silently ignoring an edit is worse
+    // than refusing it.
+    for key in changed_keys(running, fresh) {
+        if !RELOADABLE_KEYS.contains(&key.as_str()) {
+            report.requires_restart.push(key);
+        }
+    }
+
+    report
+}
+
+/// The dotted config keys whose rendered values differ between two configs.
+///
+/// Works off `config_show::render`, whose output is the effective config as TOML using the real
+/// key names - so a differing line names the setting an operator would edit. Comment and blank
+/// lines are skipped; a `[table]` header sets the prefix for the keys under it. A secret is
+/// rendered as a commented-out key name, so a changed password reads as no change here: that is
+/// a deliberate limit of comparing the redacted rendering, and credentials need a restart
+/// anyway.
+fn changed_keys(running: &AppConfig, fresh: &AppConfig) -> Vec<String> {
+    fn keyed(config: &AppConfig) -> Vec<(String, String)> {
+        let mut section = String::new();
+        let mut out = Vec::new();
+        for line in crate::config_show::render(config).lines() {
+            let line = line.trim();
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            if let Some(name) = line.strip_prefix('[').and_then(|l| l.strip_suffix(']')) {
+                section = format!("{name}.");
+                continue;
+            }
+            if let Some((key, value)) = line.split_once('=') {
+                out.push((format!("{section}{}", key.trim()), value.trim().to_string()));
+            }
+        }
+        out
+    }
+    let (a, b) = (keyed(running), keyed(fresh));
+    let bm: std::collections::BTreeMap<_, _> = b.iter().cloned().collect();
+    let mut changed: Vec<String> = a
+        .iter()
+        .filter(|(k, v)| bm.get(k).is_some_and(|other| other != v))
+        .map(|(k, _)| k.clone())
+        .collect();
+    // A key present in one rendering and not the other (an optional setting gained or dropped)
+    // is a change too.
+    let am: std::collections::BTreeMap<_, _> = a.iter().cloned().collect();
+    changed.extend(
+        b.iter()
+            .filter(|(k, _)| !am.contains_key(k))
+            .map(|(k, _)| k.clone()),
+    );
+    changed.extend(
+        a.iter()
+            .filter(|(k, _)| !bm.contains_key(k))
+            .map(|(k, _)| k.clone()),
+    );
+    changed.sort();
+    changed.dedup();
+    changed
+}
+
 /// Default Orchard-action cap, matching Zallet's `orchard_actions` default.
 pub const DEFAULT_ORCHARD_ACTION_LIMIT: usize = 50;
 
@@ -805,6 +977,12 @@ pub const DEFAULT_TARGET_NOTE_COUNT: usize = 4;
 
 /// Default floor on a split change note (0.1 ZEC), matching zcash-devtool's send defaults.
 pub const DEFAULT_MIN_SPLIT_OUTPUT_VALUE: u64 = 10_000_000;
+
+/// Default `[spend] shutdown_drain_secs`: how long the actor finishes accepted sends on
+/// shutdown. Comfortably above a single send's proof (a 50-note merge measured 29-35 s in the
+/// field) and below systemd's 90 s default stop timeout - but above `docker stop`'s 10 s and
+/// Kubernetes' 30 s, which is why it is configurable at all.
+pub const DEFAULT_SHUTDOWN_DRAIN_SECS: u64 = 60;
 
 /// `[spend] privacy_policy` - Zallet/zcashd's privacy-policy idea (zcash/zcash#6240) reduced to
 /// the leaks a zecd send can actually cause: whether a send may cross between shielded pools
@@ -1107,6 +1285,7 @@ struct SpendFile {
     pipeline_proving: Option<bool>,
     target_note_count: Option<usize>,
     min_split_output_value: Option<u64>,
+    shutdown_drain_secs: Option<u64>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -1204,8 +1383,11 @@ impl From<&Cli> for ConfigOverrides {
 // command an operator reaches for when something is already wrong. (A normal comment, not a doc
 // comment: clap renders the doc comment as the command's help text, and this is a note for
 // readers of the source.)
+// `Clone` so the daemon can keep the parsed CLI for a SIGHUP reload: a reload must re-resolve
+// through exactly the path startup took (the same file, the same overrides, the same defaults),
+// which means holding on to the arguments rather than reconstructing them.
 #[cfg(feature = "cli")]
-#[derive(Debug, Parser)]
+#[derive(Debug, Clone, Parser)]
 #[command(name = "zecd", version)]
 pub struct Cli {
     /// Path to the TOML config file (default: <datadir>/zecd.toml, else ./zecd.toml).
@@ -1278,7 +1460,7 @@ pub struct Cli {
 }
 
 #[cfg(feature = "cli")]
-#[derive(Debug, clap::Subcommand)]
+#[derive(Debug, Clone, clap::Subcommand)]
 pub enum Command {
     /// Create and initialize a new wallet (mnemonic + accounts), then exit.
     Init(InitArgs),
@@ -1315,7 +1497,7 @@ pub enum Command {
 }
 
 #[cfg(feature = "cli")]
-#[derive(Debug, clap::Args)]
+#[derive(Debug, Clone, clap::Args)]
 pub struct ChainInfoArgs {
     /// Probe this endpoint instead of `[backend] server`, using the same token grammar, to
     /// test a candidate before committing it to a configuration file.
@@ -1328,7 +1510,7 @@ pub struct ChainInfoArgs {
 }
 
 #[cfg(feature = "cli")]
-#[derive(Debug, clap::Args)]
+#[derive(Debug, Clone, clap::Args)]
 pub struct InitArgs {
     /// Wallet name (selects/creates <datadir>/<name>).
     #[arg(long, default_value = "default")]
@@ -1363,7 +1545,7 @@ pub struct InitArgs {
 }
 
 #[cfg(feature = "cli")]
-#[derive(Debug, clap::Args)]
+#[derive(Debug, Clone, clap::Args)]
 pub struct RpcauthArgs {
     /// RPC username the credential is for.
     pub username: String,
@@ -1373,7 +1555,7 @@ pub struct RpcauthArgs {
 }
 
 #[cfg(feature = "cli")]
-#[derive(Debug, clap::Args)]
+#[derive(Debug, Clone, clap::Args)]
 pub struct ExampleConfigArgs {
     /// Write the config here instead of stdout. `-` also means stdout. Refuses to overwrite an
     /// existing file unless `--force`.
@@ -1386,7 +1568,7 @@ pub struct ExampleConfigArgs {
 }
 
 #[cfg(feature = "cli")]
-#[derive(Debug, clap::Subcommand)]
+#[derive(Debug, Clone, clap::Subcommand)]
 pub enum ConfigCommand {
     /// Validate a configuration file against this zecd build without starting the daemon, and
     /// print the settings it resolves to. Exits non-zero if the daemon would refuse to start.
@@ -1397,7 +1579,7 @@ pub enum ConfigCommand {
 }
 
 #[cfg(feature = "cli")]
-#[derive(Debug, clap::Args)]
+#[derive(Debug, Clone, clap::Args)]
 pub struct ConfigCheckArgs {
     /// Treat warnings as errors, so a config that merely looks risky also exits non-zero
     /// (for CI gates on a deployment repository).
@@ -1413,11 +1595,11 @@ pub struct ConfigCheckArgs {
 /// `zecd config show` takes no options of its own - the configuration it renders is selected by
 /// the global flags (`--conf`, `--datadir`, `--network`, ...), exactly as the daemon selects it.
 #[cfg(feature = "cli")]
-#[derive(Debug, clap::Args)]
+#[derive(Debug, Clone, clap::Args)]
 pub struct ConfigShowArgs {}
 
 #[cfg(feature = "cli")]
-#[derive(Debug, clap::Args)]
+#[derive(Debug, Clone, clap::Args)]
 pub struct ExportUfvkArgs {
     /// Wallet name (selects <datadir>/<name>).
     #[arg(long, default_value = "default")]
@@ -1425,7 +1607,7 @@ pub struct ExportUfvkArgs {
 }
 
 #[cfg(feature = "cli")]
-#[derive(Debug, clap::Args)]
+#[derive(Debug, Clone, clap::Args)]
 pub struct DeriveAddressArgs {
     /// Wallet name (selects <datadir>/<name>). The default key source is this wallet's
     /// `keys.toml`; with `--mnemonic`/`--ufvk` the wallet is only consulted for its receiver
@@ -1472,7 +1654,7 @@ pub struct DeriveAddressArgs {
 }
 
 #[cfg(feature = "cli")]
-#[derive(Debug, clap::Args)]
+#[derive(Debug, Clone, clap::Args)]
 pub struct RescanArgs {
     /// Wallet name (selects <datadir>/<name>).
     #[arg(long, default_value = "default")]
@@ -1882,6 +2064,9 @@ impl AppConfig {
             min_split_output_value: spend_file
                 .min_split_output_value
                 .unwrap_or(DEFAULT_MIN_SPLIT_OUTPUT_VALUE),
+            shutdown_drain_secs: spend_file
+                .shutdown_drain_secs
+                .unwrap_or(DEFAULT_SHUTDOWN_DRAIN_SECS),
         };
         // Fail at startup, not on the first balance/send call.
         spend.confirmations_policy()?;
@@ -2614,6 +2799,156 @@ mod tests {
             ..SpendConfig::default()
         };
         assert!(no_floor.validate_change_splitting().is_ok());
+    }
+
+    /// A reload applies the reloadable key and reports everything else as needing a restart,
+    /// rather than silently dropping it - an operator who edits a key that cannot be reloaded
+    /// has to be told, not left to infer it from behaviour that did not change.
+    #[test]
+    fn reload_applies_the_live_key_and_names_the_rest() {
+        let running = AppConfig::resolve_overrides(&ConfigOverrides {
+            regtest: true,
+            ..Default::default()
+        })
+        .expect("resolve running config");
+        let limits = SpendLimits::new(&running.spend);
+
+        // Nothing changed: nothing applied, nothing to report.
+        let report = apply_reload(&running, &running, &limits);
+        assert!(
+            report.is_empty(),
+            "an identical config is a no-op: {report:?}"
+        );
+        assert_eq!(
+            limits.orchard_action_limit(),
+            running.spend.orchard_action_limit
+        );
+
+        // The live key.
+        let mut fresh = AppConfig::resolve_overrides(&ConfigOverrides {
+            regtest: true,
+            ..Default::default()
+        })
+        .expect("resolve fresh config");
+        fresh.spend.orchard_action_limit = 0;
+        let report = apply_reload(&running, &fresh, &limits);
+        assert_eq!(
+            report.applied,
+            vec![(
+                "spend.orchard_action_limit",
+                DEFAULT_ORCHARD_ACTION_LIMIT.to_string(),
+                "0".to_string()
+            )]
+        );
+        assert!(report.requires_restart.is_empty(), "{report:?}");
+        assert_eq!(
+            limits.orchard_action_limit(),
+            0,
+            "the cell took the new value"
+        );
+
+        // Applying the same value twice reports nothing the second time: the comparison is
+        // against the cell, not against the config the daemon started with.
+        let report = apply_reload(&running, &fresh, &limits);
+        assert!(
+            report.is_empty(),
+            "a repeated reload is a no-op: {report:?}"
+        );
+
+        // A key that cannot be reloaded is named, and does not take effect.
+        let mut fresh = fresh.clone();
+        fresh.rpc.work_queue = running.rpc.work_queue + 7;
+        let report = apply_reload(&running, &fresh, &limits);
+        assert!(
+            report
+                .requires_restart
+                .iter()
+                .any(|k| k == "rpc.work_queue"),
+            "the changed key must be named: {report:?}"
+        );
+
+        // Including another key in the same section as the reloadable one, which a
+        // section-level comparison would have hidden behind it.
+        let mut fresh = fresh.clone();
+        fresh.spend.target_note_count = running.spend.target_note_count + 1;
+        let report = apply_reload(&running, &fresh, &limits);
+        assert!(
+            report
+                .requires_restart
+                .iter()
+                .any(|k| k == "spend.target_note_count"),
+            "a non-reloadable key in the reloadable key's own section must still be named: \
+             {report:?}"
+        );
+    }
+
+    /// `[spend] shutdown_drain_secs` bounds how long a stopping wallet finishes sends it already
+    /// accepted. It is configuration rather than a constant because the value that binds is the
+    /// supervisor's own grace period, not any property of zecd - so the parse, the default, and
+    /// the disabling `0` all have to hold.
+    #[test]
+    fn shutdown_drain_parses_and_defaults_to_the_documented_value() {
+        let dir = tempfile::tempdir().expect("tempdir");
+
+        let default = AppConfig::resolve_overrides(&ConfigOverrides {
+            regtest: true,
+            ..Default::default()
+        })
+        .expect("resolve with no file");
+        assert_eq!(
+            default.spend.shutdown_drain_secs, DEFAULT_SHUTDOWN_DRAIN_SECS,
+            "the default is the documented 60s"
+        );
+
+        let path = dir.path().join("zecd.toml");
+        std::fs::write(&path, "[spend]\nshutdown_drain_secs = 0\n").expect("write config");
+        let disabled = AppConfig::resolve_overrides(&ConfigOverrides {
+            regtest: true,
+            conf: Some(path.clone()),
+            ..Default::default()
+        })
+        .expect("resolve with the drain disabled");
+        assert_eq!(
+            disabled.spend.shutdown_drain_secs, 0,
+            "0 is a legal value - it restores the drop-on-shutdown behaviour"
+        );
+
+        std::fs::write(&path, "[spend]\nshutdown_drain_secs = 25\n").expect("write config");
+        let short = AppConfig::resolve_overrides(&ConfigOverrides {
+            regtest: true,
+            conf: Some(path),
+            ..Default::default()
+        })
+        .expect("resolve with a shortened drain");
+        assert_eq!(short.spend.shutdown_drain_secs, 25);
+
+        // It is not reloadable: the drain is read once, when the actor is already stopping.
+        let limits = SpendLimits::new(&default.spend);
+        let report = apply_reload(&default, &short, &limits);
+        assert!(
+            report
+                .requires_restart
+                .iter()
+                .any(|k| k == "spend.shutdown_drain_secs"),
+            "a changed drain must be named as needing a restart: {report:?}"
+        );
+    }
+
+    /// Every key on the reloadable list must be one `apply_reload` actually applies, or the
+    /// list is a promise the code does not keep.
+    #[test]
+    fn reloadable_keys_are_all_applied() {
+        let running = AppConfig::resolve_overrides(&ConfigOverrides {
+            regtest: true,
+            ..Default::default()
+        })
+        .expect("resolve");
+        let limits = SpendLimits::new(&running.spend);
+        let mut fresh = running.clone();
+        fresh.spend.orchard_action_limit = running.spend.orchard_action_limit + 1;
+        let report = apply_reload(&running, &fresh, &limits);
+        let applied: Vec<&str> = report.applied.iter().map(|(k, _, _)| *k).collect();
+        assert_eq!(applied, RELOADABLE_KEYS, "the list and the code must agree");
     }
 
     #[test]

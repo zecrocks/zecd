@@ -419,6 +419,14 @@ privacy_policy = "AllowRevealedRecipients"
 # proving cost of one z_sendmany and gives a clear -8 ("too many Orchard actions") instead of a
 # deep builder error when a send has too many recipients. Raise it for large batched payouts;
 # set it to 0 to disable the cap entirely.
+#
+# This is the one setting a running daemon re-reads on SIGHUP, because a wallet whose notes have
+# fragmented (a miner receiving shielded coinbase, say) fails every payout until it moves, and
+# restarting a live payment wallet to change a number is a poor answer. Consider consolidating
+# with z_mergetoaddress before raising it - see "Fragmented wallets" in the README - since
+# proving cost and memory scale with the action count, and every other send waits behind one
+# large transaction. There is deliberately no RPC that changes this: the cap bounds what a
+# single call can make the daemon prove, so raising it takes access to the process.
 orchard_action_limit = 50
 # Change splitting. A send divides its change into up to target_note_count notes, so that the
 # next send has confirmed inputs to draw on without waiting for the previous one; change is only
@@ -446,6 +454,19 @@ cache_proving_key = true
 # Orchard-only wallet with cache_proving_key on); a Sapling-spending wallet keeps the inline
 # path. OFF by default - enable once validated for your workload.
 pipeline_proving = false
+# How long the wallet actor spends finishing sends it has ALREADY accepted when it is asked to
+# stop, before dropping whatever is left. A z_sendmany returns an opid immediately and proves on
+# a background task; without this drain, a stop signal arriving in that window discarded the send
+# - nothing had been broadcast, so no funds were at risk, but the record of whether it happened
+# was lost, on exactly the restart boundary where the in-memory operation registry makes that
+# hardest to reconstruct.
+#
+# Set this BELOW your supervisor's own stop timeout, because that is what actually bounds it:
+# `docker stop` sends SIGKILL after 10s and Kubernetes' terminationGracePeriodSeconds defaults to
+# 30s, while systemd's DefaultTimeoutStopSec is 90s. Killed mid-drain nothing is corrupted, but
+# the guarantee is silently gone - so raise the supervisor's timeout to match, or lower this.
+# 0 disables the drain (sends in flight are dropped on stop, as before it existed).
+shutdown_drain_secs = 60
 
 [health]
 # Unauthenticated liveness/readiness probes on a separate port (for Kubernetes/load balancers).

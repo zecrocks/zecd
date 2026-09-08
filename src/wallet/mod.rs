@@ -252,6 +252,14 @@ pub enum SendSource {
     /// coin control is not supported (notes are account-scoped): the account is the source, and
     /// the address only names it.
     Shielded,
+    /// Fund the send from one shielded pool family only (`z_sendmany`'s `ANY_SAPLING` /
+    /// `ANY_ORCHARD`), rather than from whatever the account holds.
+    ///
+    /// This is the same one-source-per-send invariant one level finer: a shortfall in the named
+    /// family is `-6`, never a silent top-up from the other pool. It is what a wallet holding
+    /// both needs in order to say which side of the turnstile a send comes from - the reason
+    /// `z_mergetoaddress` has had these wildcards all along.
+    ShieldedFamily(ShieldedFamily),
     /// Fund the send from the wallet's non-coinbase transparent UTXOs (`z_sendmany` from a
     /// wallet-owned t-address, or `ANY_TADDR`). `None` = any of the account's transparent
     /// receivers (`ANY_TADDR`); `Some(addr)` = only that address's UTXOs. Requires
@@ -286,6 +294,41 @@ pub struct ShieldCoinbasePlan {
     pub remaining_utxos: u64,
     /// Zatoshis of mature coinbase UTXOs left unselected.
     pub remaining_value: u64,
+}
+
+impl SendSource {
+    /// Whether this source funds the send from shielded notes.
+    ///
+    /// Prefer this over comparing against [`SendSource::Shielded`]: a pool-restricted shielded
+    /// source is still a shielded source, and the routing that keys on "is this shielded"
+    /// (notably the fully-transparent t-to-t branch, which must not engage for either) would
+    /// otherwise treat the two differently.
+    pub fn is_shielded(&self) -> bool {
+        matches!(self, SendSource::Shielded | SendSource::ShieldedFamily(_))
+    }
+}
+
+/// One shielded pool *family*, as `z_sendmany` and `z_mergetoaddress`'s wildcards name it.
+///
+/// Orchard and Ironwood are one family rather than two pools: post-NU6.3 an Orchard receiver
+/// holds Ironwood notes, so a caller naming "Orchard" means both, and separating them would ask
+/// for a distinction no address can express.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ShieldedFamily {
+    /// `ANY_SAPLING`.
+    Sapling,
+    /// `ANY_ORCHARD` - Orchard V2 notes and the Ironwood V3 notes that share its receiver.
+    Orchard,
+}
+
+impl ShieldedFamily {
+    /// The pools this family selects from, for a librustzcash spend policy.
+    pub fn pools(&self) -> Vec<ShieldedPool> {
+        match self {
+            ShieldedFamily::Sapling => vec![ShieldedPool::Sapling],
+            ShieldedFamily::Orchard => vec![ShieldedPool::Orchard, ShieldedPool::Ironwood],
+        }
+    }
 }
 
 /// The source selector for `z_mergetoaddress` (zcashd's `fromaddresses` argument), resolved at
@@ -935,6 +978,26 @@ impl WalletRegistry {
         v
     }
 
+    /// Every loaded wallet with its handle, name-sorted, under a single read lock.
+    ///
+    /// For callers that want the whole registry rather than one wallet: taking `names()` and
+    /// then `get()` per name acquires the lock once per wallet, and each acquisition is a fresh
+    /// chance to be descheduled on a busy runtime - which is what made `/status` slow to answer
+    /// on a fleet deployment while `/healthz`, which reads nothing, kept up. It also cannot
+    /// observe a consistent registry: a `createwallet` landing mid-iteration leaves a name whose
+    /// handle is missing, which the per-name form silently skips.
+    pub fn snapshot(&self) -> Vec<(String, WalletHandle)> {
+        let mut v: Vec<(String, WalletHandle)> = self
+            .read()
+            .iter()
+            .map(|(name, wallet)| match wallet {
+                CoinWallet::Zcash(handle) => (name.clone(), handle.clone()),
+            })
+            .collect();
+        v.sort_by(|a, b| a.0.cmp(&b.0));
+        v
+    }
+
     /// The lock guards a plain map and every critical section is a single map operation, so a
     /// poisoned lock cannot leave a half-updated registry; recover rather than take the daemon
     /// down with it.
@@ -978,6 +1041,51 @@ pub(crate) fn make_handle(
         seed,
         cmd_tx,
         status_rx,
+    }
+}
+
+#[cfg(test)]
+mod registry_tests {
+    use super::*;
+
+    fn handle(name: &str) -> WalletHandle {
+        let (cmd_tx, _rx) = mpsc::channel(1);
+        let (_status_tx, status_rx) = watch::channel(SyncStatus::default());
+        make_handle(
+            name.to_string(),
+            PathBuf::from("/nonexistent"),
+            crate::network::regtest(),
+            ConfirmationsPolicy::default(),
+            ReceiverSet::new([crate::pools::Receiver::Orchard]).unwrap(),
+            ReceiverSet::new([crate::pools::Receiver::Orchard]).unwrap(),
+            false,
+            false,
+            20,
+            FirstSeen::default(),
+            None,
+            cmd_tx,
+            status_rx,
+        )
+    }
+
+    /// `snapshot` must return every loaded wallet, name-sorted, so `/status` reports the same
+    /// set and the same order as the per-name walk it replaced.
+    #[test]
+    fn snapshot_returns_every_wallet_name_sorted() {
+        let registry = WalletRegistry::new("default".into());
+        assert!(registry.snapshot().is_empty());
+
+        for name in ["zeta", "alpha", "mu"] {
+            registry.insert(CoinWallet::Zcash(handle(name)));
+        }
+        let got: Vec<String> = registry.snapshot().into_iter().map(|(n, _)| n).collect();
+        assert_eq!(got, vec!["alpha", "mu", "zeta"]);
+        assert_eq!(got, registry.names(), "snapshot agrees with names()");
+
+        // The handles are the same ones `get` hands out, so a caller reading status through
+        // either sees one wallet.
+        let (name, h) = registry.snapshot().remove(0);
+        assert_eq!(h.name, registry.get(Some(&name)).unwrap().name);
     }
 }
 

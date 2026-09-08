@@ -924,12 +924,13 @@ fn offline_actor_cfg(
         auto_unlock: true,
         bootstrap: true,
         confirmations_policy: Default::default(),
-        orchard_action_limit: crate::config::DEFAULT_ORCHARD_ACTION_LIMIT,
+        spend_limits: crate::config::SpendLimits::new(&crate::config::SpendConfig::default()),
         target_note_count: crate::config::DEFAULT_TARGET_NOTE_COUNT,
         min_split_output_value: crate::config::DEFAULT_MIN_SPLIT_OUTPUT_VALUE,
         // Offline test: the actor never sends, so skip building the (expensive) proving key.
         orchard_keys: None,
         pipeline_proving: false,
+        shutdown_drain: std::time::Duration::from_secs(crate::config::DEFAULT_SHUTDOWN_DRAIN_SECS),
         trust_own_transactions: true,
         enabled_pools: crate::pools::ReceiverSet::single(crate::pools::Receiver::Orchard),
         default_receivers: crate::pools::ReceiverSet::single(crate::pools::Receiver::Orchard),
@@ -1384,4 +1385,517 @@ async fn getrawtransaction_error_does_not_leak_upstream_endpoint() {
         "expected the generic upstream message, got: {}",
         err.message
     );
+}
+
+/// [`read::LOAD_OUTPUTS_SQL`] must answer exactly what `v_tx_outputs` answers, and must reach
+/// one transaction's outputs through indexes rather than a whole-wallet aggregation.
+///
+/// The statement is a hand-written restriction of that view to a single transaction, because
+/// SQLite pushes no `WHERE` term through the view itself (measured below: filtering the view by
+/// `transaction_id`, its own grouping column, still scans every note table). Hand-writing it
+/// buys the index seeks and costs a copy of upstream's definition, so this test pins both
+/// halves against the real schema: same rows as the view, and no full scans.
+///
+/// The wallet is populated by inserting directly into librustzcash's tables rather than by
+/// scanning blocks. Nothing here needs the values to be cryptographically meaningful - the
+/// view's shape (its joins, its `to_address` precedence, its grouping) is what is under test -
+/// and minting real notes offline would need a chain. Two transactions are populated so that a
+/// statement which ignored its `transaction_id` parameter would return the other one's rows.
+#[test]
+fn load_outputs_sql_matches_the_view_it_replaces() {
+    let net = network::regtest();
+    let dir = tempfile::tempdir().unwrap();
+    let engine_dir = dir.path();
+    let mut db = open::init_dbs(net, engine_dir).expect("init regtest dbs");
+    db.create_account("primary", &test_seed(), &genesis_birthday(), None)
+        .expect("create regtest account");
+    drop(db);
+
+    let conn = rusqlite::Connection::open(open::data_db_path(engine_dir)).unwrap();
+    let account_id: i64 = conn
+        .query_row("SELECT id FROM accounts LIMIT 1", [], |r| r.get(0))
+        .unwrap();
+    // `create_account` exposes the account's default address, so a row already exists to hang
+    // received outputs off (the view reads `addresses.address`, its cached transparent receiver
+    // and its key scope).
+    let address_id: i64 = conn
+        .query_row("SELECT id FROM addresses LIMIT 1", [], |r| r.get(0))
+        .unwrap();
+
+    populate_two_transactions(&conn, account_id, address_id);
+
+    // The view's own answer, restricted to the transaction under test and read through exactly
+    // the columns zecd reads.
+    let via_view = "SELECT output_pool, output_index, from_account_uuid, to_account_uuid,
+                           to_address, value, is_change, recipient_key_scope, memo
+                    FROM v_tx_outputs
+                    WHERE transaction_id = :id_tx
+                      AND (:scope_account IS NULL OR to_account_uuid = :scope_account
+                           OR from_account_uuid = :scope_account)
+                    ORDER BY output_pool ASC, output_index ASC";
+
+    // The account predicate is compared against `accounts.uuid` as stored, so bind the stored
+    // bytes; both statements get the same binding, which is what makes the comparison meaningful.
+    let account_uuid: Vec<u8> = conn
+        .query_row("SELECT uuid FROM accounts LIMIT 1", [], |r| r.get(0))
+        .unwrap();
+    for (label, scope_param) in [
+        ("unscoped", None),
+        ("account-scoped", Some(account_uuid.clone())),
+    ] {
+        let mine = rows_of(&conn, read::LOAD_OUTPUTS_SQL, 1, scope_param.clone());
+        let theirs = rows_of(&conn, via_view, 1, scope_param);
+        assert_eq!(
+            mine, theirs,
+            "{label}: the hand-written statement must answer what v_tx_outputs answers"
+        );
+        assert!(
+            !mine.is_empty(),
+            "{label}: the fixture must produce rows, or this proves nothing"
+        );
+        // Pool order leads, then index within the pool - transparent (0), sapling (2), then
+        // the two orchard (3) rows in index order.
+        let keys: Vec<(i64, i64)> = mine.iter().map(|r| (r.0, r.1)).collect();
+        assert_eq!(
+            keys,
+            vec![(0, 3), (2, 1), (3, 0), (3, 9)],
+            "{label}: outputs must be ordered by (pool, index)"
+        );
+        // The paired Orchard row must report the address the wallet recorded when it created
+        // the output, not the address it was received at.
+        let paired = mine.iter().find(|r| (r.0, r.1) == (3, 0)).unwrap();
+        assert_eq!(
+            paired.2.as_deref(),
+            Some("u1recorded"),
+            "{label}: the recorded recipient wins over the receiving address"
+        );
+    }
+
+    // Rows belong to the transaction that was asked for.
+    let first = rows_of(&conn, read::LOAD_OUTPUTS_SQL, 1, None);
+    let second = rows_of(&conn, read::LOAD_OUTPUTS_SQL, 2, None);
+    assert_eq!(
+        first, second,
+        "the two fixture transactions are identical in shape, so their outputs must match"
+    );
+
+    // And the plan reaches them by index. A `SCAN` of any table holding a transaction's outputs
+    // is the whole-history aggregation this statement exists to avoid.
+    let plan = query_plan(
+        &conn,
+        read::LOAD_OUTPUTS_SQL,
+        rusqlite::named_params! {":id_tx": 1i64, ":scope_account": None::<Vec<u8>>},
+    );
+    for table in [
+        "sapling_received_notes",
+        "orchard_received_notes",
+        "ironwood_received_notes",
+        "transparent_received_outputs",
+        "sent_notes",
+    ] {
+        assert!(
+            !plan.contains(&format!("SCAN {table}")),
+            "single-transaction output lookup must not scan {table}; plan was:\n{plan}"
+        );
+    }
+
+    // The premise, pinned: the view cannot be filtered cheaply, even on its own grouping
+    // column. If a future SQLite learns to push this down, the hand-written statement stops
+    // being necessary and this assertion is the thing that says so.
+    let view_plan = query_plan(
+        &conn,
+        "SELECT output_pool FROM v_tx_outputs WHERE transaction_id = :id_tx",
+        rusqlite::named_params! {":id_tx": 1i64},
+    );
+    assert!(
+        view_plan.contains("SCAN orchard_received_notes"),
+        "expected the view to still scan its base tables; plan was:\n{view_plan}"
+    );
+}
+
+/// [`read::TX_RECORD_SQL`] must answer exactly what `v_transactions` answers for one
+/// transaction, and must find it - or fail to find it - through the txid index.
+///
+/// Same reasoning as the outputs statement: `v_transactions` is an aggregate over the whole
+/// wallet that no `WHERE` term reaches, so reading one transaction from it costs a full-history
+/// aggregation whether or not the transaction is there. The miss is the case that hurt a real
+/// deployment, where a reconciler probed hundreds of reorged-out txids in a row.
+///
+/// The columns compared are the ones [`read::TxRecord`] carries. `account_balance_delta` is the
+/// interesting one: the view computes it by summing a union of received and spent note values,
+/// and this statement has to reproduce that arithmetic from the base tables.
+#[test]
+fn transaction_record_matches_the_view_it_replaces() {
+    let net = network::regtest();
+    let dir = tempfile::tempdir().unwrap();
+    let engine_dir = dir.path();
+    let mut db = open::init_dbs(net, engine_dir).expect("init regtest dbs");
+    db.create_account("primary", &test_seed(), &genesis_birthday(), None)
+        .expect("create regtest account");
+    drop(db);
+
+    let conn = rusqlite::Connection::open(open::data_db_path(engine_dir)).unwrap();
+    let account_id: i64 = conn
+        .query_row("SELECT id FROM accounts LIMIT 1", [], |r| r.get(0))
+        .unwrap();
+    let address_id: i64 = conn
+        .query_row("SELECT id FROM addresses LIMIT 1", [], |r| r.get(0))
+        .unwrap();
+    let account_uuid: Vec<u8> = conn
+        .query_row("SELECT uuid FROM accounts LIMIT 1", [], |r| r.get(0))
+        .unwrap();
+    conn.execute("INSERT INTO blocks (height, hash, time, sapling_tree) VALUES (100, X'aa', 1700000000, X'00')", [])
+        .unwrap();
+    populate_two_transactions(&conn, account_id, address_id);
+    // Spend one of the first transaction's notes in the second, so the balance delta has both
+    // a positive and a negative term rather than only received value.
+    let spent_note: i64 = conn
+        .query_row(
+            "SELECT id FROM orchard_received_notes WHERE transaction_id = 1",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    conn.execute(
+        "INSERT INTO orchard_received_note_spends (orchard_received_note_id, transaction_id)
+         VALUES (?1, 2)",
+        rusqlite::params![spent_note],
+    )
+    .unwrap();
+
+    let via_view = "SELECT v.mined_height, v.txid, v.expiry_height, v.account_balance_delta,
+                           v.fee_paid, v.block_time, v.expired_unmined, v.tx_index,
+                           b.hash AS block_hash,
+                           CAST(strftime('%s', t.created) AS INTEGER) AS created_time
+                    FROM v_transactions v
+                    LEFT JOIN blocks b ON b.height = v.mined_height
+                    LEFT JOIN transactions t ON t.txid = v.txid
+                    WHERE v.txid = (SELECT txid FROM transactions WHERE id_tx = :id_tx)
+                      AND (:scope_account IS NULL OR v.account_uuid = :scope_account)";
+
+    for id_tx in [1i64, 2] {
+        for (label, scope_param) in [
+            ("unscoped", None),
+            ("account-scoped", Some(account_uuid.clone())),
+        ] {
+            let mine = tx_row_of(&conn, read::TX_RECORD_SQL, id_tx, scope_param.clone());
+            let theirs = tx_row_of(&conn, via_view, id_tx, scope_param);
+            assert_eq!(
+                mine, theirs,
+                "{label}: transaction {id_tx} must read the same as v_transactions"
+            );
+            assert!(
+                mine.is_some(),
+                "{label}: transaction {id_tx} must be present, or this proves nothing"
+            );
+        }
+    }
+    // The spend must actually have moved the delta, or the arithmetic above is untested.
+    let deltas: Vec<i64> = [1i64, 2]
+        .iter()
+        .map(|id| tx_row_of(&conn, read::TX_RECORD_SQL, *id, None).unwrap().3)
+        .collect();
+    assert_ne!(
+        deltas[0], deltas[1],
+        "the spend in transaction 2 must change its balance delta: {deltas:?}"
+    );
+
+    // A transaction the account was not part of reads as absent, exactly as the view emits no
+    // row for it - this is what keeps a foreign unmined transaction out of wallet history.
+    conn.execute(
+        "INSERT INTO transactions (id_tx, txid, mined_height, tx_index, expiry_height,
+                                   min_observed_height)
+         VALUES (99, X'cc', 100, 0, 0, 100)",
+        [],
+    )
+    .unwrap();
+    assert!(
+        tx_row_of(&conn, read::TX_RECORD_SQL, 99, None).is_none(),
+        "a stored transaction with none of the account's outputs must read as absent"
+    );
+    assert!(
+        tx_row_of(&conn, via_view, 99, None).is_none(),
+        "and the view agrees"
+    );
+
+    // A miss must be an index seek, not a scan: this is the reconciliation-sweep case.
+    let plan = query_plan(
+        &conn,
+        "SELECT id_tx FROM transactions WHERE txid = :txid",
+        rusqlite::named_params! {":txid": vec![0xffu8; 32]},
+    );
+    assert!(
+        plan.contains("SEARCH transactions USING")
+            && plan.contains("sqlite_autoindex_transactions_1"),
+        "txid resolution must use the unique index; plan was:\n{plan}"
+    );
+    let plan = query_plan(
+        &conn,
+        read::TX_RECORD_SQL,
+        rusqlite::named_params! {":id_tx": 1i64, ":scope_account": None::<Vec<u8>>},
+    );
+    for table in [
+        "sapling_received_notes",
+        "orchard_received_notes",
+        "ironwood_received_notes",
+        "transparent_received_outputs",
+    ] {
+        assert!(
+            !plan.contains(&format!("SCAN {table}")),
+            "single-transaction record must not scan {table}; plan was:\n{plan}"
+        );
+    }
+}
+
+/// The `TxRecord`-shaped columns of one transaction row, as a comparable tuple.
+#[allow(clippy::type_complexity)]
+fn tx_row_of(
+    conn: &rusqlite::Connection,
+    sql: &str,
+    id_tx: i64,
+    scope_account: Option<Vec<u8>>,
+) -> Option<(
+    Option<u32>,
+    Vec<u8>,
+    Option<u32>,
+    i64,
+    Option<i64>,
+    Option<i64>,
+    bool,
+    Option<u32>,
+    Option<Vec<u8>>,
+    Option<i64>,
+)> {
+    let mut stmt = conn.prepare(sql).expect("prepare transaction statement");
+    let mut rows = stmt
+        .query(rusqlite::named_params! {":id_tx": id_tx, ":scope_account": scope_account})
+        .expect("run transaction statement");
+    let row = rows.next().expect("step transaction statement")?;
+    // The base-table statement reports involvement rather than omitting the row, since it
+    // selects the transaction before it knows whose it is; the view omits it. Normalize.
+    if row
+        .get::<_, Option<i64>>("involved")
+        .ok()
+        .flatten()
+        .is_some_and(|n| n == 0)
+    {
+        return None;
+    }
+    Some((
+        row.get("mined_height").unwrap(),
+        row.get("txid").unwrap(),
+        row.get("expiry_height").unwrap(),
+        row.get("account_balance_delta").unwrap(),
+        row.get("fee_paid").unwrap(),
+        row.get("block_time").unwrap(),
+        row.get("expired_unmined").unwrap(),
+        row.get("tx_index").unwrap(),
+        row.get("block_hash").unwrap(),
+        row.get("created_time").unwrap(),
+    ))
+}
+
+/// `getwalletinfo.txcount` must count what `v_transactions` counts, without aggregating the
+/// whole wallet to do it. The view emits one row per `(account, transaction)` pair; the
+/// replacement unions the same pairs out of the base tables, so the two must agree both
+/// unscoped and scoped to the account.
+#[test]
+fn tx_count_matches_the_view_it_replaces() {
+    let net = network::regtest();
+    let dir = tempfile::tempdir().unwrap();
+    let engine_dir = dir.path();
+    let mut db = open::init_dbs(net, engine_dir).expect("init regtest dbs");
+    db.create_account("primary", &test_seed(), &genesis_birthday(), None)
+        .expect("create regtest account");
+    drop(db);
+
+    let conn = rusqlite::Connection::open(open::data_db_path(engine_dir)).unwrap();
+    let account_id: i64 = conn
+        .query_row("SELECT id FROM accounts LIMIT 1", [], |r| r.get(0))
+        .unwrap();
+    let address_id: i64 = conn
+        .query_row("SELECT id FROM addresses LIMIT 1", [], |r| r.get(0))
+        .unwrap();
+    let account_uuid: Vec<u8> = conn
+        .query_row("SELECT uuid FROM accounts LIMIT 1", [], |r| r.get(0))
+        .unwrap();
+    populate_two_transactions(&conn, account_id, address_id);
+    // A spend as well as receives, so the union's spend arms contribute; and a transaction the
+    // account has no part in, which neither side may count.
+    let spent_note: i64 = conn
+        .query_row(
+            "SELECT id FROM orchard_received_notes WHERE transaction_id = 1",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    conn.execute(
+        "INSERT INTO orchard_received_note_spends (orchard_received_note_id, transaction_id)
+         VALUES (?1, 2)",
+        rusqlite::params![spent_note],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO transactions (id_tx, txid, mined_height, tx_index, expiry_height,
+                                   min_observed_height)
+         VALUES (99, X'cc', 100, 0, 0, 100)",
+        [],
+    )
+    .unwrap();
+
+    for (label, scope_param) in [
+        ("unscoped", None),
+        ("account-scoped", Some(account_uuid.clone())),
+    ] {
+        let count = |sql: &str| -> i64 {
+            conn.query_row(
+                sql,
+                rusqlite::named_params! {":scope_account": scope_param.clone()},
+                |r| r.get(0),
+            )
+            .unwrap()
+        };
+        let mine = count(&format!(
+            "SELECT COUNT(*) FROM ({}) WHERE (:scope_account IS NULL OR account_id = \
+             (SELECT id FROM accounts WHERE uuid = :scope_account))",
+            read::TX_INVOLVEMENT_SQL
+        ));
+        let theirs = count(
+            "SELECT COUNT(*) FROM v_transactions \
+             WHERE (:scope_account IS NULL OR account_uuid = :scope_account)",
+        );
+        assert_eq!(mine, theirs, "{label}: txcount must match v_transactions");
+        assert_eq!(
+            mine, 2,
+            "{label}: the account is part of exactly the two populated transactions"
+        );
+    }
+}
+
+/// Populate two transactions' worth of outputs directly in librustzcash's tables.
+///
+/// Nothing here needs to be cryptographically meaningful: what the tests over this fixture
+/// check is the *shape* of the history queries - their joins, their address precedence, their
+/// grouping and their aggregate arithmetic - and minting real notes offline would need a chain.
+/// Two transactions are populated so a statement that ignored its `transaction_id` parameter
+/// would return the other one's rows.
+fn populate_two_transactions(conn: &rusqlite::Connection, account_id: i64, address_id: i64) {
+    for (id_tx, tag) in [(1i64, 0xa1u8), (2, 0xb2)] {
+        conn.execute(
+            "INSERT INTO transactions (id_tx, txid, mined_height, tx_index, expiry_height,
+                                       min_observed_height)
+             VALUES (?1, ?2, 100, 0, 0, 100)",
+            rusqlite::params![id_tx, vec![tag; 32]],
+        )
+        .unwrap();
+        // One output per pool, so the pool-then-index ordering is exercised and each arm of the
+        // union contributes. Sapling and Orchard carry memos; transparent carries none by
+        // construction (the view hard-codes NULL for it).
+        conn.execute(
+            "INSERT INTO sapling_received_notes
+                 (transaction_id, output_index, account_id, diversifier, value, rcm, nf,
+                  is_change, memo, address_id, recipient_key_scope)
+             VALUES (?1, 1, ?2, X'00', 500, X'00', ?3, 0, X'61', ?4, 0)",
+            rusqlite::params![id_tx, account_id, vec![tag; 32], address_id],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO orchard_received_notes
+                 (transaction_id, action_index, account_id, diversifier, value, rho, rseed, nf,
+                  is_change, memo, address_id, recipient_key_scope)
+             VALUES (?1, 0, ?2, X'00', 700, X'00', X'00', ?3, 1, X'62', ?4, 1)",
+            rusqlite::params![id_tx, account_id, vec![tag ^ 0xff; 32], address_id],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO transparent_received_outputs
+                 (transaction_id, output_index, account_id, address, script, value_zat,
+                  address_id)
+             VALUES (?1, 3, ?2, 'tmtest', X'00', 900, ?3)",
+            rusqlite::params![id_tx, account_id, address_id],
+        )
+        .unwrap();
+        // A sent note that pairs with the Orchard output (same pool and index), so the view's
+        // two arms merge into one row and its `to_address` precedence - the recorded recipient
+        // wins over the receiving address - is exercised rather than assumed. A second sent
+        // note has no received counterpart, the ordinary outgoing-payment shape.
+        conn.execute(
+            "INSERT INTO sent_notes
+                 (transaction_id, output_pool, output_index, from_account_id, to_address, value,
+                  memo)
+             VALUES (?1, 3, 0, ?2, 'u1recorded', 700, X'62')",
+            rusqlite::params![id_tx, account_id],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO sent_notes
+                 (transaction_id, output_pool, output_index, from_account_id, to_address, value,
+                  memo)
+             VALUES (?1, 3, 9, ?2, 'u1elsewhere', 1200, NULL)",
+            rusqlite::params![id_tx, account_id],
+        )
+        .unwrap();
+    }
+}
+
+/// The rows one output-loading statement returns, as comparable tuples.
+type OutputRow = (
+    i64,
+    i64,
+    Option<String>,
+    i64,
+    bool,
+    Option<i64>,
+    Option<Vec<u8>>,
+    Option<Vec<u8>>,
+    Option<Vec<u8>>,
+);
+
+fn rows_of(
+    conn: &rusqlite::Connection,
+    sql: &str,
+    id_tx: i64,
+    scope_account: Option<Vec<u8>>,
+) -> Vec<OutputRow> {
+    let mut stmt = conn.prepare(sql).expect("prepare output statement");
+    let rows = stmt
+        .query_map(
+            rusqlite::named_params! {":id_tx": id_tx, ":scope_account": scope_account},
+            |row| {
+                Ok((
+                    row.get("output_pool")?,
+                    row.get("output_index")?,
+                    row.get("to_address")?,
+                    row.get("value")?,
+                    row.get("is_change")?,
+                    row.get("recipient_key_scope")?,
+                    row.get("memo")?,
+                    row.get("from_account_uuid")?,
+                    row.get("to_account_uuid")?,
+                ))
+            },
+        )
+        .expect("run output statement");
+    rows.map(|r| r.unwrap()).collect()
+}
+
+/// `EXPLAIN QUERY PLAN` for `sql`, as one newline-joined string. The parameters are bound
+/// because SQLite requires every one of a prepared statement's parameters to be bound before
+/// the statement steps, even under `EXPLAIN QUERY PLAN`; their values do not steer the plan
+/// (an empty database has no `sqlite_stat1`, and what is under test is which index can serve a
+/// predicate at all).
+fn query_plan(
+    conn: &rusqlite::Connection,
+    sql: &str,
+    params: &[(&str, &dyn rusqlite::ToSql)],
+) -> String {
+    let mut stmt = conn
+        .prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
+        .expect("prepare EXPLAIN QUERY PLAN");
+    let rows: Vec<String> = stmt
+        .query_map(params, |row| row.get::<_, String>("detail"))
+        .expect("run EXPLAIN QUERY PLAN")
+        .map(|r| r.unwrap())
+        .collect();
+    rows.join("\n")
 }

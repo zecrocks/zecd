@@ -249,10 +249,16 @@ work-queue 503s; daemon restarts.
 ## Reorgs
 
 zecd follows chain reorgs automatically: the scanner detects the fork via a block-hash
-continuity error, rewinds the wallet ~10 blocks below it, and rescans the replacement
-chain. Transactions in reorged-away blocks revert to unconfirmed (`confirmations: 0`)
-until re-mined - confirmation thresholds keep doing their job. Operator-visible
-consequences:
+continuity error, rewinds the wallet below it, and rescans the replacement chain. The first
+rewind goes 10 blocks below the break. That is all an ordinary reorg needs, but the wallet
+only learns of a fork one block at a time, at its own tip - it is never told how deep the
+disagreement goes - so if the replacement chain still disagrees, the next rewind goes twice as
+far, and so on until the scan comes back clean, at which point the distance resets to 10. A
+deep rollback therefore costs a handful of round trips rather than one per ten blocks: an
+1,835-block rollback takes about eight, where a fixed step took 62 and roughly ten minutes.
+
+Transactions in reorged-away blocks revert to unconfirmed (`confirmations: 0`) until re-mined -
+confirmation thresholds keep doing their job. Operator-visible consequences:
 
 - **A `listsinceblock` cursor pointing at a reorged-away block returns `-5 Block not
   found`** (zecd keeps no stale-header history to walk back through, unlike bitcoind).
@@ -300,6 +306,31 @@ zecd diagnoses the two known causes and says so in the log:
   first `walletpassphrase`; a watch-only wallet has no seed to rebuild from - recreate it with
   `zecd init --ufvk` instead.
 
+## Shutdown and the send drain
+
+`z_sendmany` returns an opid immediately and does the proving on a background task. A stop
+signal arriving in that window used to discard the send: nothing had been broadcast, so no funds
+were at risk, but the record of whether it happened was lost - on exactly the restart boundary
+where the in-memory operation registry makes that hardest to reconstruct.
+
+On shutdown the wallet now finishes what it has already accepted, bounded by `[spend]
+shutdown_drain_secs` (default 60). Set it **below your supervisor's own stop timeout**, because
+that is what actually bounds it:
+
+| supervisor | default grace period | setting to raise |
+|---|---|---|
+| `docker stop` | 10s | `--time`, or compose's `stop_grace_period` |
+| Kubernetes | 30s | `terminationGracePeriodSeconds` |
+| systemd | 90s | `TimeoutStopSec` |
+
+Killed mid-drain nothing is corrupted - a send that had not been stored is simply lost, as it
+was before the drain existed - but the guarantee is silently gone, so raise the supervisor's
+timeout to match or lower `shutdown_drain_secs`. `zecd config check` warns when the value
+exceeds every common default. `0` disables the drain.
+
+Operation status objects are in-memory and do not survive the restart either way; reconcile by
+txid (`gettransaction`), not by opid.
+
 ## Upgrades
 
 1. Check the config against the **new** binary before anything else, while the old one is
@@ -327,7 +358,8 @@ zecd diagnoses the two known causes and says so in the log:
    pin it: `./zecd-old config show --conf /etc/zecd/zecd.toml > effective.toml` renders the
    current settings as TOML you can adopt as the config file, with the values now explicit
    rather than inherited. Re-add the credential lines by hand - they are redacted, deliberately.
-2. `zecd stop` (or SIGINT) - graceful: in-flight requests finish, new ones get 503.
+2. `zecd stop` (or SIGINT) - graceful: in-flight requests finish, new ones get 503, and the
+   wallet finishes any send it had already accepted (see **Shutdown and the send drain**).
 3. Replace the binary / pull the new image.
 4. Start. Wallet DB migrations run automatically at open; the first start after a big
    librustzcash bump can take longer.

@@ -55,6 +55,16 @@ impl Receiver {
             "sapling" => Ok(Receiver::Sapling),
             "orchard" => Ok(Receiver::Orchard),
             "transparent" => Ok(Receiver::Transparent),
+            // Ironwood is a real value pool but not a *receiver*, so it is the one rejected token
+            // an operator can reach while doing everything right: the release notes advertise
+            // ironwood support, and `enabled = ["ironwood"]` is the obvious way to ask for it. Say
+            // where the support actually lives rather than only listing the accepted tokens.
+            "ironwood" => anyhow::bail!(
+                "unknown pool \"ironwood\"; ironwood notes are received at Orchard addresses \
+                 (they are Orchard V3 notes, so there is no separate receiver to enable) - \
+                 enable \"orchard\" and a NU6.3-active chain gives you ironwood. See the \
+                 [pools] notes in zecd.example.toml"
+            ),
             other => anyhow::bail!(
                 "unknown pool {other:?}; supported pools are {}, transparent",
                 supported_names()
@@ -269,11 +279,23 @@ mod tests {
 
     #[test]
     fn rejects_unknown_pool() {
+        let err = Receiver::from_config_str("bogus").unwrap_err().to_string();
+        assert!(err.contains("bogus"), "{err}");
+        assert!(err.contains("sapling"), "{err}");
+        assert!(err.contains("orchard"), "{err}");
+    }
+
+    /// Ironwood is the rejection an operator reaches while doing everything right (the release
+    /// notes advertise ironwood; `enabled = ["ironwood"]` is the obvious way to ask for it), so
+    /// its refusal must name the pool that actually carries it rather than only listing tokens.
+    #[test]
+    fn ironwood_refusal_points_at_orchard() {
         let err = Receiver::from_config_str("ironwood")
             .unwrap_err()
             .to_string();
         assert!(err.contains("ironwood"), "{err}");
-        assert!(err.contains("sapling"), "{err}");
+        assert!(err.contains("orchard"), "{err}");
+        assert!(err.contains("zecd.example.toml"), "{err}");
     }
 
     #[test]

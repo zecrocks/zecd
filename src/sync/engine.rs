@@ -592,6 +592,7 @@ fn perform_rewind(
     db_data: &mut WriteDb,
     at_height: BlockHeight,
     requested: BlockHeight,
+    base_requested: BlockHeight,
 ) -> anyhow::Result<BlockHeight> {
     let safe_rewind_height = match db_data.truncate_to_height(requested) {
         Ok(h) => return Ok(h),
@@ -600,6 +601,20 @@ fn perform_rewind(
         }) => safe_rewind_height,
         Err(e) => return Err(e.into()),
     };
+    // A grown margin (see `next_reorg_margin`) can ask to go deeper than the wallet's retained
+    // checkpoints reach, on a wallet that could still have rewound the base distance. Try that
+    // before the ladder below, which escalates *upward* toward the conflict and would otherwise
+    // turn a refused deep request into two-block steps - worse than never having grown.
+    if base_requested < at_height && base_requested > requested {
+        match db_data.truncate_to_height(base_requested) {
+            Ok(h) => {
+                info!("Rewound to {h} (no valid target at or below {requested})");
+                return Ok(h);
+            }
+            Err(SqliteClientError::RequestedRewindInvalid { .. }) => {}
+            Err(e) => return Err(e.into()),
+        }
+    }
     // Candidates, in order. The shallow bound must be *strictly below* the known-stale block at
     // `at_height - 1`, or the conflicting block survives the rewind and the next batch re-hits it.
     // The storage layer's own `safe_rewind_height` is tried too, but only when it is below what it
@@ -643,7 +658,39 @@ pub struct ScanOutcome {
     pub reorged: bool,
 }
 
+/// The rewind margin a wallet starts from, and returns to after any clean scan: how far below a
+/// detected continuity break to truncate. Upstream's own example heuristic.
+pub const REORG_BASE_MARGIN: u32 = 10;
+
+/// The largest rewind margin the doubling in [`next_reorg_margin`] will reach. One batch is the
+/// natural ceiling - rewinding further than a batch would scan back is all cost and no benefit -
+/// and it also bounds how much work a mistakenly-grown margin can throw away.
+pub const REORG_MAX_MARGIN: u32 = BATCH_SIZE;
+
+/// The margin to use after a scan pass, given the one just used and whether that pass hit a
+/// reorg.
+///
+/// A wallet only ever learns about a fork one block at a time, at its own tip: the scanner
+/// reports a continuity break at the first block whose `prev_hash` disagrees, and nothing tells
+/// it how deep the disagreement goes. With a fixed margin, recovery therefore walks the fork
+/// backwards a fixed step per round trip - and each round trip is a tree-state fetch, a block
+/// download and a truncation. A pool that rolled its node back 1,835 blocks watched that take 62
+/// rounds and about ten minutes.
+///
+/// Doubling turns that walk into a logarithmic one (1,835 blocks becomes about eight rounds)
+/// while leaving the common case alone: an ordinary one- or two-block reorg is resolved by the
+/// first rewind, and the margin resets, so a wallet that is keeping up never grows one. The cost
+/// of overshooting is rescanning blocks the wallet would have scanned anyway.
+pub fn next_reorg_margin(current: u32, reorged: bool) -> u32 {
+    if reorged {
+        current.saturating_mul(2).min(REORG_MAX_MARGIN)
+    } else {
+        REORG_BASE_MARGIN
+    }
+}
+
 /// Scan a downloaded range; handle continuity (reorg) errors by rewinding. See [`ScanOutcome`].
+#[allow(clippy::too_many_arguments)]
 fn scan_blocks(
     params: &ZNetwork,
     engine_dir: &Path,
@@ -651,6 +698,7 @@ fn scan_blocks(
     db_data: &mut WriteDb,
     initial_chain_state: &ChainState,
     scan_range: &ScanRange,
+    reorg_margin: u32,
 ) -> anyhow::Result<ScanOutcome> {
     info!(range = %scan_range, "scanning blocks");
     let scan_result = scan_cached_blocks(
@@ -664,8 +712,10 @@ fn scan_blocks(
 
     match scan_result {
         Err(ChainError::Scan(err)) if err.is_continuity_error() => {
-            let requested = err.at_height().saturating_sub(10);
+            let margin = reorg_margin.max(REORG_BASE_MARGIN);
+            let requested = err.at_height().saturating_sub(margin);
             info!(
+                margin,
                 "Chain reorg detected at {}, rewinding to {}",
                 err.at_height(),
                 requested
@@ -675,7 +725,8 @@ fn scan_blocks(
             // (virtually all real blocks). `perform_rewind` falls back to the nearest
             // valid checkpoint when the requested height has none; the cache is then
             // truncated to the height actually rewound to.
-            let rewind_height = perform_rewind(db_data, err.at_height(), requested)?;
+            let base = err.at_height().saturating_sub(REORG_BASE_MARGIN);
+            let rewind_height = perform_rewind(db_data, err.at_height(), requested, base)?;
             // Delete the now-stale cached block files above the rewind height. A metadata row
             // whose backing file is already gone (rows left behind by an older zecd that removed
             // files but not their `compactblocks_meta` rows) must not abort this: `with_blocks`
@@ -751,6 +802,10 @@ fn scan_blocks(
 /// exposed-address set - a recorded receive may have extended the transparent gap).
 pub struct BatchOutcome {
     pub worked: bool,
+    /// Whether this batch hit a chain reorg and rewound instead of applying the range. The
+    /// actor uses it to grow its rewind margin while a deep reorg is being walked back, and to
+    /// reset it on the first clean batch (see [`next_reorg_margin`]).
+    pub reorged: bool,
     pub transparent_recorded: usize,
     /// Spends of the wallet's own transparent outputs discovered by matching this batch's
     /// transparent inputs against its unspent outpoints.
@@ -774,6 +829,7 @@ pub async fn sync_one_batch<C: ChainSource>(
     db_data: &mut WriteDb,
     transparent: Option<&TransparentMatcher>,
     unspent: Option<&UnspentOutpoints>,
+    reorg_margin: u32,
 ) -> anyhow::Result<BatchOutcome> {
     let scan_ranges = db_data.suggest_scan_ranges()?;
     tracing::debug!(
@@ -793,6 +849,7 @@ pub async fn sync_one_batch<C: ChainSource>(
     let Some(first) = scan_ranges.first() else {
         return Ok(BatchOutcome {
             worked: false,
+            reorged: false,
             transparent_recorded: 0,
             transparent_spends_recorded: 0,
         });
@@ -838,6 +895,7 @@ pub async fn sync_one_batch<C: ChainSource>(
                 db_data,
                 &chain_state,
                 &scan_range,
+                reorg_margin,
             )
         })?;
         Ok::<ScanOutcome, anyhow::Error>(outcome)
@@ -975,6 +1033,7 @@ pub async fn sync_one_batch<C: ChainSource>(
 
     Ok(BatchOutcome {
         worked: true,
+        reorged: outcome.reorged,
         transparent_recorded,
         transparent_spends_recorded,
     })
@@ -1218,6 +1277,135 @@ mod tests {
             .map(|m| u32::from(m.block_height()))
     }
 
+    /// The rewind margin decides how far one reorg round trip walks back, and doubling it is
+    /// what turns a deep rollback from a linear walk into a logarithmic one. Drive the same
+    /// continuity-error branch with two margins and require the wallet to land where each says.
+    ///
+    /// This is the arithmetic behind a real incident: a node rolled back 1,835 blocks, and the
+    /// wallet - which only ever sees a fork one block at a time, at its own tip - took 62 rounds
+    /// of ten blocks each, about ten minutes, to walk back to it.
+    #[test]
+    fn rewind_margin_sets_how_far_one_reorg_round_trip_walks_back() {
+        for (margin, expected_tip) in [(REORG_BASE_MARGIN, 51u32), (40, 21)] {
+            let net = crate::network::regtest();
+            let dir = tempfile::tempdir().unwrap();
+            let wd = dir.path();
+            let mut db_data = crate::wallet::open::init_dbs(net, wd).expect("init dbs");
+            let mut db_cache = crate::wallet::open::open_fsblockdb(wd).expect("open cache");
+            std::fs::create_dir_all(wd.join("blocks")).expect("blocks dir");
+
+            let genesis = fake_hash(0xAA, 0);
+            let birthday = AccountBirthday::from_parts(
+                ChainState::empty(BlockHeight::from_u32(0), BlockHash(genesis)),
+                None,
+            );
+            db_data
+                .create_account("t", &SecretVec::new(vec![1u8; 64]), &birthday, None)
+                .expect("create account");
+            db_data
+                .update_chain_tip(BlockHeight::from_u32(60))
+                .expect("set tip");
+
+            // A chain long enough that a 40-block rewind still lands well above the birthday,
+            // so what is under test is the margin rather than the wallet running out of
+            // rewindable history.
+            let mut frontier = OrchardFrontier::empty();
+            let mut prev = genesis;
+            for h in 1..=60u32 {
+                let from = chain_state(h - 1, prev, &frontier);
+                let hash = fake_hash(0xA1, h);
+                let cmx = cmx_bytes(0x0A, h);
+                write_block(wd, &mut db_cache, h, hash, prev, cmx, h);
+                scan_blocks(
+                    &net,
+                    wd,
+                    &mut db_cache,
+                    &mut db_data,
+                    &from,
+                    &range(h, h + 1),
+                    REORG_BASE_MARGIN,
+                )
+                .expect("scan block");
+                assert!(frontier.append(MerkleHashOrchard::from_cmx(
+                    &ExtractedNoteCommitment::from_bytes(&cmx).unwrap()
+                )));
+                prev = hash;
+            }
+            assert_eq!(max_scanned(&db_data), Some(60), "chain fully scanned");
+
+            // Block 61 arrives claiming a different block 60 as its parent.
+            let alien_60 = fake_hash(0xB1, 60);
+            write_block(
+                wd,
+                &mut db_cache,
+                61,
+                fake_hash(0xB1, 61),
+                alien_60,
+                cmx_bytes(0x0B, 61),
+                61,
+            );
+            let outcome = scan_blocks(
+                &net,
+                wd,
+                &mut db_cache,
+                &mut db_data,
+                &chain_state(60, alien_60, &frontier),
+                &range(61, 62),
+                margin,
+            )
+            .expect("continuity error is handled, not propagated");
+
+            assert!(
+                outcome.reorged,
+                "margin {margin}: the reorg must be reported"
+            );
+            assert_eq!(
+                max_scanned(&db_data),
+                Some(expected_tip),
+                "margin {margin}: one round trip rewinds to (conflict height - margin)"
+            );
+        }
+    }
+
+    /// The margin grows only while reorgs keep coming, and snaps back on the first clean batch,
+    /// so a wallet that is keeping up never carries a widened one.
+    #[test]
+    fn reorg_margin_doubles_while_reorging_and_resets_when_clean() {
+        let mut margin = REORG_BASE_MARGIN;
+        let mut seen = vec![margin];
+        for _ in 0..7 {
+            margin = next_reorg_margin(margin, true);
+            seen.push(margin);
+        }
+        assert_eq!(seen, vec![10, 20, 40, 80, 160, 320, 640, 1280]);
+        // Eight rounds cover the 1,835-block rollback that motivated this, against the 62 the
+        // fixed margin took. (Seven would not: they reach 1,270.)
+        assert!(
+            seen.iter().sum::<u32>() >= 1_835,
+            "doubling must reach a deep rollback in a handful of rounds: {seen:?}"
+        );
+        assert!(
+            seen[..seen.len() - 1].iter().sum::<u32>() < 1_835,
+            "and eight is the number of rounds it takes, not fewer: {seen:?}"
+        );
+
+        assert_eq!(
+            next_reorg_margin(1280, false),
+            REORG_BASE_MARGIN,
+            "a clean batch resets the margin"
+        );
+        assert_eq!(
+            next_reorg_margin(REORG_BASE_MARGIN, false),
+            REORG_BASE_MARGIN
+        );
+        // And it is bounded: a wallet stuck reorging cannot grow the margin without limit.
+        let mut m = REORG_BASE_MARGIN;
+        for _ in 0..64 {
+            m = next_reorg_margin(m, true);
+        }
+        assert_eq!(m, REORG_MAX_MARGIN);
+    }
+
     /// Drive `scan_blocks`\' continuity-error branch - the only code in zecd that handles
     /// reorgs - end to end and offline: scan a fabricated chain, present a block whose
     /// `prev_hash` contradicts the wallet\'s stored tip (what a post-reorg lightwalletd
@@ -1265,6 +1453,7 @@ mod tests {
                 &mut db_data,
                 &from,
                 &range(h, h + 1),
+                REORG_BASE_MARGIN,
             )
             .expect("scan chain A block");
             assert!(frontier.append(MerkleHashOrchard::from_cmx(
@@ -1298,6 +1487,7 @@ mod tests {
             // reorg server tree state never comes into play; empty stands in for it.
             &ChainState::empty(BlockHeight::from_u32(10), BlockHash(alien_10)),
             &range(11, 12),
+            REORG_BASE_MARGIN,
         )
         .expect("the continuity error is handled, not propagated");
         assert!(
@@ -1347,6 +1537,7 @@ mod tests {
             &mut db_data,
             &chain_state(1, fake_hash(0xA1, 1), &frontier_at_1),
             &range(2, 13),
+            REORG_BASE_MARGIN,
         )
         .expect("scan the replacement chain");
         assert_eq!(
@@ -1390,6 +1581,7 @@ mod tests {
                 &mut db_data,
                 &from,
                 &range(h, h + 1),
+                REORG_BASE_MARGIN,
             )
             .expect("scan block");
             assert!(frontier.append(MerkleHashOrchard::from_cmx(
@@ -1417,6 +1609,7 @@ mod tests {
             &mut db_data,
             BlockHeight::from_u32(6),
             BlockHeight::from_u32(0),
+            BlockHeight::from_u32(0),
         )
         .expect("shallow fallback rewinds");
         assert_eq!(
@@ -1443,6 +1636,7 @@ mod tests {
         let err = perform_rewind(
             &mut db_data,
             BlockHeight::from_u32(2),
+            BlockHeight::from_u32(0),
             BlockHeight::from_u32(0),
         )
         .expect_err("nothing below the conflict to rewind to");
@@ -1584,6 +1778,7 @@ mod tests {
                 &mut db_data,
                 &from,
                 &range(h, h + 1),
+                REORG_BASE_MARGIN,
             )
             .expect("scan chain A block");
             delete_cached_blocks(wd, &mut db_cache, vec![meta]);
@@ -1620,6 +1815,7 @@ mod tests {
             &mut db_data,
             &ChainState::empty(BlockHeight::from_u32(10), BlockHash(alien_10)),
             &range(11, 12),
+            REORG_BASE_MARGIN,
         )
         .expect("reorg recovery must succeed even though prior batch files are gone");
         assert!(
@@ -1658,6 +1854,7 @@ mod tests {
             &mut db_data,
             &chain_state(1, fake_hash(0xA1, 1), &frontier_at_1),
             &range(2, 13),
+            REORG_BASE_MARGIN,
         )
         .expect("scan the replacement chain");
         assert_eq!(
@@ -1709,6 +1906,7 @@ mod tests {
                 &mut db_data,
                 &from,
                 &range(h, h + 1),
+                REORG_BASE_MARGIN,
             )
             .expect("scan chain A block");
             assert!(frontier.append(MerkleHashOrchard::from_cmx(
@@ -1744,6 +1942,7 @@ mod tests {
             &mut db_data,
             &ChainState::empty(BlockHeight::from_u32(10), BlockHash(alien_10)),
             &range(11, 12),
+            REORG_BASE_MARGIN,
         )
         .expect("reorg recovery tolerates orphaned metadata rows");
 
