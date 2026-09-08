@@ -220,6 +220,8 @@ pub fn render(config: &AppConfig) -> String {
     kv(&mut s, "max_scan_lag", config.health.max_scan_lag);
 
     table(&mut s, "fleet");
+    // First, because every other key here is inert without it.
+    kv(&mut s, "enabled", config.fleet.enabled);
     // Rendered as absolute paths, as resolved: the config accepts either, and an operator
     // reading "which directory is this daemon actually watching for wallet manifests" wants the
     // answer, not the datadir-relative form they may have written.

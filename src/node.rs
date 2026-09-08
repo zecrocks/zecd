@@ -382,12 +382,27 @@ async fn spawn_fleet(
     registry: &WalletRegistry,
     actor_tasks: &mut Vec<(String, tokio::task::JoinHandle<()>)>,
 ) -> anyhow::Result<Option<Arc<crate::fleet::FleetManager>>> {
-    let members = crate::fleet::load_manifests(&config.fleet.manifest_dir)?;
-    // No manifests is an *empty* fleet, not an absent one: the manager is still built (it is
-    // only data - nothing dials or spawns until a wallet exists) so `createwallet` can onboard
-    // the first fleet wallet at runtime. Returning `None` here would leave the RPC that exists
-    // to avoid config-file-and-restart onboarding unable to bootstrap on exactly the daemons
-    // that have not bootstrapped yet.
+    // Experimental and opt-in: with `[fleet] enabled` false (the default) the manifest
+    // directory is never read, no shard is opened, and `state.fleet` stays `None`, which is
+    // what makes the wallet-management RPCs refuse. Checked before the directory read so a
+    // stray file in the datadir cannot enrol a daemon that never asked for a fleet.
+    if !config.fleet.enabled {
+        return Ok(None);
+    }
+    let (members, skipped) = crate::fleet::load_manifests(&config.fleet.manifest_dir)?;
+    for skip in &skipped {
+        warn!(
+            "fleet manifest {} is not being served: {}",
+            skip.path.display(),
+            skip.reason
+        );
+    }
+    // Past the gate, no manifests is an *empty* fleet, not an absent one: the manager is still
+    // built (it is only data - nothing dials or spawns until a wallet exists) so `createwallet`
+    // can onboard the first fleet wallet at runtime. Returning `None` for an empty directory
+    // would leave the RPC that exists to avoid config-file-and-restart onboarding unable to
+    // bootstrap on exactly the daemons that have not bootstrapped yet. `None` means "this
+    // operator did not ask for a fleet", which is the check above, and nothing else.
     // A fleet wallet name must not collide with a configured one: both are addressed as
     // `/wallet/<name>`, and a collision would silently route one of them to the other's actor.
     for member in &members {

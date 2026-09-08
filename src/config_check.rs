@@ -102,8 +102,50 @@ pub fn inspect(config: &AppConfig) -> Vec<Finding> {
     check_rpc(config, &mut findings);
     check_layout(config, &mut findings);
     check_paths(config, &mut findings);
+    check_fleet(config, &mut findings);
 
     findings
+}
+
+/// The fleet: experimental, and off unless asked for.
+///
+/// Two findings, and the first is the one that matters. Manifests present with the fleet
+/// disabled means wallets an operator provisioned are silently not being watched - the files
+/// look exactly the same either way, and nothing else in the daemon mentions them. That is the
+/// failure mode this whole key introduces, so it is worth naming precisely.
+fn check_fleet(config: &AppConfig, findings: &mut Vec<Finding>) {
+    let manifests = match crate::fleet::load_manifests(&config.fleet.manifest_dir) {
+        // Only the count matters here; an unreadable individual manifest is reported by the
+        // daemon at startup and by `listwalletdir`, not by a config check.
+        Ok((members, _skipped)) => members.len(),
+        // An unreadable directory is not a config problem - `check_paths` covers permissions,
+        // and a missing directory is the normal case for every deployment without a fleet.
+        Err(_) => 0,
+    };
+
+    if !config.fleet.enabled {
+        if manifests > 0 {
+            findings.push(Finding::warning(format!(
+                "{manifests} fleet manifest(s) in {} are not being served: [fleet] enabled is \
+                 false, so the directory is never read. Set [fleet] enabled = true to watch \
+                 them, or move the files aside",
+                config.fleet.manifest_dir.display()
+            )));
+        }
+        return;
+    }
+
+    // Enabled. Say the experimental part once, here, where an operator checking a config they
+    // are about to deploy will see it.
+    findings.push(Finding::warning(format!(
+        "[fleet] is enabled and is EXPERIMENTAL: the manifest format, the [fleet] keys and the \
+         wallet-management RPCs may change in a patch release. {} holds viewing keys that exist \
+         nowhere else in zecd and is written at runtime - back it up like keys.toml. Known \
+         limitations: placement groups wallets by arrival rather than birthday, so a recent \
+         wallet can wait behind the oldest member of its shard; and a wallet cannot be removed \
+         from a shard once imported",
+        config.fleet.manifest_dir.display()
+    )));
 }
 
 /// The verdict `zecd config check` derives from a set of findings. The pass/fail and
@@ -513,6 +555,74 @@ mod tests {
             .filter(|f| f.level == Level::Warning)
             .map(|f| f.message.as_str())
             .collect()
+    }
+
+    /// Manifests present with the fleet disabled is the failure mode `[fleet] enabled`
+    /// introduces: the files look identical either way, and nothing else in the daemon mentions
+    /// them, so an operator who provisioned wallets sees them silently unwatched.
+    #[test]
+    fn manifests_with_the_fleet_disabled_are_reported() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("wallets.d")).unwrap();
+        std::fs::write(
+            dir.path().join("wallets.d").join("w1.toml"),
+            "ufvk = \"uview1a\"\nbirthday = 100\n",
+        )
+        .unwrap();
+        let config = resolve(
+            &format!("network = \"regtest\"\ndatadir = {:?}\n", dir.path()),
+            dir.path(),
+        );
+        assert!(!config.fleet.enabled);
+        let findings = inspect(&config);
+        let hit = warnings(&findings)
+            .into_iter()
+            .find(|w| w.contains("fleet manifest"))
+            .expect("a warning naming the unserved manifests");
+        assert!(hit.contains("enabled is false"), "{hit}");
+        // The remedy has to be in the message: this is the one finding whose fix is a config
+        // key the operator has never heard of.
+        assert!(hit.contains("[fleet] enabled = true"), "{hit}");
+    }
+
+    /// No manifests and no fleet is every conventional deployment - it must stay silent, or the
+    /// warning becomes noise that operators learn to skip past.
+    #[test]
+    fn a_daemon_with_no_fleet_says_nothing_about_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = resolve(
+            &format!("network = \"regtest\"\ndatadir = {:?}\n", dir.path()),
+            dir.path(),
+        );
+        let findings = inspect(&config);
+        assert!(
+            !warnings(&findings).iter().any(|w| w.contains("[fleet]")),
+            "{:?}",
+            warnings(&findings)
+        );
+    }
+
+    /// Enabling it warns once, where an operator checking a config before deploying sees it.
+    #[test]
+    fn enabling_the_fleet_warns_that_it_is_experimental() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = resolve(
+            &format!(
+                "network = \"regtest\"\ndatadir = {:?}\n\n[fleet]\nenabled = true\n",
+                dir.path()
+            ),
+            dir.path(),
+        );
+        assert!(config.fleet.enabled);
+        let hit = warnings(&inspect(&config))
+            .into_iter()
+            .find(|w| w.contains("EXPERIMENTAL"))
+            .map(|w| w.to_string())
+            .expect("an experimental warning");
+        // The three things an operator must know before turning it on.
+        assert!(hit.contains("patch release"), "{hit}");
+        assert!(hit.contains("back it up"), "{hit}");
+        assert!(hit.contains("cannot be removed"), "{hit}");
     }
 
     /// The global flags must be accepted on either side of the subcommand - `zecd config check

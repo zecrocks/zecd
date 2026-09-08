@@ -3094,6 +3094,9 @@ fn write_zecd_toml(datadir: &Path, cfg: &ZecdConfig) -> Result<()> {
     // other regtest must keep exercising exactly that.
     if !cfg.fleet.is_empty() {
         wallets.push_str("\n[fleet]\n");
+        // The fleet is experimental and off by default, so a harness that writes manifests must
+        // also ask for it - exactly as a real deployment does.
+        wallets.push_str("enabled = true\n");
         if let Some(n) = cfg.fleet_shard_size {
             wallets.push_str(&format!("shard_size = {n}\n"));
         }

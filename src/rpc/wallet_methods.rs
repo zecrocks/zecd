@@ -47,14 +47,31 @@ pub(crate) fn listwallets(state: &AppState) -> Result<Value, RpcError> {
 /// against when a name is missing from `listwallets`. Configured `[wallets.<name>]` entries are
 /// listed too - they are equally "on disk available", and omitting them would make the two RPCs
 /// disagree for reasons that have nothing to do with the fleet.
+///
+/// zecd extension: a `warnings` array naming any manifest that could not be read. Those wallets
+/// are skipped at startup rather than taking the daemon down, so this is where an operator sees
+/// that a file they wrote is not being served - without it, a skipped wallet is indistinguishable
+/// from one that was never provisioned. Absent when there are none, so the Core-shaped response
+/// is unchanged for a healthy fleet.
 pub(crate) fn listwalletdir(state: &AppState) -> Result<Value, RpcError> {
     let mut names: Vec<String> = state.config.wallets.keys().cloned().collect();
+    let mut warnings: Vec<String> = Vec::new();
     if let Some(fleet) = &state.fleet {
         match crate::fleet::load_manifests(fleet.manifest_dir()) {
-            Ok(members) => names.extend(members.into_iter().map(|m| m.name)),
-            // A manifest the daemon cannot read is an operator-visible problem, but it must not
-            // make listing the rest fail - that is exactly when this RPC is being used.
-            Err(e) => tracing::warn!("listwalletdir: reading the fleet manifests: {e:#}"),
+            Ok((members, skipped)) => {
+                names.extend(members.into_iter().map(|m| m.name));
+                warnings.extend(
+                    skipped
+                        .into_iter()
+                        .map(|s| format!("{}: {}", s.path.display(), s.reason)),
+                );
+            }
+            // A manifest directory the daemon cannot read is an operator-visible problem, but it
+            // must not make listing the rest fail - that is exactly when this RPC is being used.
+            Err(e) => {
+                tracing::warn!("listwalletdir: reading the fleet manifests: {e:#}");
+                warnings.push(format!("{}: {e:#}", fleet.manifest_dir().display()));
+            }
         }
     }
     names.sort();
@@ -63,7 +80,11 @@ pub(crate) fn listwalletdir(state: &AppState) -> Result<Value, RpcError> {
         .into_iter()
         .map(|name| json!({ "name": name }))
         .collect();
-    Ok(json!({ "wallets": wallets }))
+    let mut out = json!({ "wallets": wallets });
+    if !warnings.is_empty() {
+        out["warnings"] = json!(warnings);
+    }
+    Ok(out)
 }
 
 /// `createwallet "wallet_name" ( disable_private_keys blank passphrase avoid_reuse descriptors
@@ -133,8 +154,10 @@ pub(crate) async fn createwallet(state: &AppState, params: &[Value]) -> Result<V
 
     let fleet = state.fleet.as_ref().ok_or_else(|| {
         RpcError::wallet(
-            "this node has no fleet manager, so view wallets cannot be onboarded here \
-             (an embedded host built without one; the zecd daemon always has it)"
+            "no fleet on this node, so view wallets cannot be onboarded. Set [fleet] \
+             enabled = true and restart. The fleet is experimental: its manifest format, \
+             [fleet] keys and wallet-management RPCs may change in a patch release. (An \
+             embedded host may also have been built without a fleet manager.)"
                 .to_string(),
         )
     })?;
@@ -203,13 +226,18 @@ pub(crate) async fn loadwallet(state: &AppState, params: &[Value]) -> Result<Val
         .to_string();
     let fleet = state.fleet.as_ref().ok_or_else(|| {
         RpcError::wallet(
-            "this node has no fleet manager, so wallets cannot be loaded at runtime \
-             (an embedded host built without one; the zecd daemon always has it)"
+            "no fleet on this node, so wallets cannot be loaded at runtime. Set [fleet] \
+             enabled = true and restart. The fleet is experimental: its manifest format, \
+             [fleet] keys and wallet-management RPCs may change in a patch release. (An \
+             embedded host may also have been built without a fleet manager.)"
                 .to_string(),
         )
     })?;
-    let member = crate::fleet::load_manifests(fleet.manifest_dir())
-        .map_err(|e| RpcError::wallet(format!("reading the fleet manifests: {e:#}")))?
+    let (members, _skipped) = crate::fleet::load_manifests(fleet.manifest_dir())
+        .map_err(|e| RpcError::wallet(format!("reading the fleet manifests: {e:#}")))?;
+    // A skipped manifest is not found here, so an unreadable file for this very name surfaces as
+    // "no wallet '<name>'" - correct as far as it goes, and `listwalletdir`'s warnings say why.
+    let member = members
         .into_iter()
         .find(|m| m.name == name)
         .ok_or_else(|| {

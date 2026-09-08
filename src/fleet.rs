@@ -21,16 +21,30 @@
 //! it is operator-supplied key material, and balances, history and addresses are all rebuilt from
 //! it plus the chain. Which shard a wallet ended up in is deliberately *not* recorded here - that
 //! is read back from the shard databases themselves (see [`crate::wallet::shard`]), so there is
-//! no placement file that can disagree with reality.
+//! no placement file that can disagree with reality. Note the operational consequence of being
+//! key material rather than a cache: unlike `keys.toml` this directory is written *at runtime*,
+//! by `createwallet`, and nothing on the chain can rebuild it - so it needs backing up, which
+//! `docs/OPERATIONS.md` spells out. The write is atomic (temp, fsync, rename) for the same
+//! reason: a torn manifest is a lost viewing key.
 //!
-//! The fleet is **additive**. With no manifest directory present, none of this runs and
-//! `[wallets.<name>]` behaves exactly as before.
+//! # Experimental
+//!
+//! The fleet is **off unless `[fleet] enabled` says otherwise**, and while it carries that label
+//! the manifest format, the `[fleet]` keys and the wallet-management RPCs may change in a patch
+//! release. Two known limitations are why: placement groups wallets by arrival rather than by
+//! birthday, so a wide birthday spread can leave a recent wallet waiting behind the oldest
+//! member of its shard; and a wallet cannot be removed from a shard once imported.
+//!
+//! The fleet is **additive**. Disabled - the default - none of this runs and `[wallets.<name>]`
+//! behaves exactly as before.
 
 use std::collections::BTreeMap;
+use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
 use anyhow::{anyhow, Context as _};
 use serde::Deserialize;
+use tracing::warn;
 use zcash_protocol::consensus::BlockHeight;
 
 use crate::config::FleetConfig;
@@ -50,19 +64,44 @@ struct ManifestFile {
     birthday: u32,
 }
 
-/// Read every wallet manifest in `dir`, in name order.
+/// A manifest that could not be served, and why.
+///
+/// Kept rather than discarded because the operator needs to see it: the file exists, so somebody
+/// meant that wallet to be watched, and a silently ignored one looks identical to a wallet that
+/// is merely still catching up.
+#[derive(Debug, Clone)]
+pub struct SkippedManifest {
+    /// The file that could not be read.
+    pub path: PathBuf,
+    /// Why, rendered for a log line and for `listwalletdir`.
+    pub reason: String,
+}
+
+/// Read every wallet manifest in `dir`, in name order, plus the ones that could not be read.
 ///
 /// The wallet's name is its file stem, so `acct-00417.toml` is `/wallet/acct-00417`. A missing
 /// directory is not an error - it is simply a daemon with no fleet, which is every existing
 /// deployment. Non-`.toml` entries are ignored so an operator's notes or a partially written
 /// `.tmp` file cannot break startup.
-pub fn load_manifests(dir: &Path) -> anyhow::Result<Vec<ShardMember>> {
+///
+/// **One unreadable manifest does not stop the daemon.** It is skipped, reported here, and
+/// logged; every other wallet is served. Aborting instead would let a single truncated file -
+/// the exact residue a crash mid-`createwallet` used to leave, before the write became atomic -
+/// keep every wallet in the daemon, fleet and configured alike, from starting. A skipped wallet
+/// is visible in the startup log and in `listwalletdir`, and returns once its file is fixed.
+///
+/// Two conditions are still fatal, because neither is confined to one wallet: an unreadable
+/// *directory* (nothing can be served, and pretending the fleet is empty would quietly resurrect
+/// nothing) and a duplicate name (two files disagree about who owns a route, and picking one
+/// silently would serve the wrong wallet's history at that name).
+pub fn load_manifests(dir: &Path) -> anyhow::Result<(Vec<ShardMember>, Vec<SkippedManifest>)> {
     if !dir.exists() {
-        return Ok(Vec::new());
+        return Ok((Vec::new(), Vec::new()));
     }
     let entries = std::fs::read_dir(dir)
         .with_context(|| format!("reading the fleet manifest directory {}", dir.display()))?;
     let mut members = Vec::new();
+    let mut skipped = Vec::new();
     for entry in entries {
         let path = entry
             .with_context(|| format!("listing {}", dir.display()))?
@@ -70,18 +109,90 @@ pub fn load_manifests(dir: &Path) -> anyhow::Result<Vec<ShardMember>> {
         if path.extension().and_then(|e| e.to_str()) != Some("toml") {
             continue;
         }
-        members.push(read_manifest(&path)?);
+        match read_manifest(&path) {
+            Ok(member) => members.push(member),
+            Err(e) => skipped.push(SkippedManifest {
+                path,
+                reason: format!("{e:#}"),
+            }),
+        }
     }
     // Name order, so placement (and therefore the shard layout) is reproducible rather than
     // dependent on directory iteration order.
     members.sort_by(|a, b| a.name.cmp(&b.name));
+    skipped.sort_by(|a, b| a.path.cmp(&b.path));
     if let Some(dup) = first_duplicate(&members) {
         return Err(anyhow!(
             "two fleet manifests both name the wallet '{dup}' in {}",
             dir.display()
         ));
     }
-    Ok(members)
+    Ok((members, skipped))
+}
+
+/// Write one manifest into `manifest_dir`, atomically, refusing to overwrite an existing one.
+///
+/// Free-standing rather than a [`FleetManager`] method so it can be exercised without a shard
+/// template: the operation needs only a directory and a member.
+fn write_manifest_in(manifest_dir: &Path, member: &ShardMember) -> anyhow::Result<()> {
+    std::fs::create_dir_all(manifest_dir).with_context(|| {
+        format!(
+            "creating the fleet manifest directory {}",
+            manifest_dir.display()
+        )
+    })?;
+    let path = manifest_path_in(manifest_dir, &member.name);
+    if path.exists() {
+        return Err(anyhow!(
+            "a manifest for '{}' already exists at {}",
+            member.name,
+            path.display()
+        ));
+    }
+    let body = format!(
+        "# Written by zecd createwallet.\nufvk = \"{}\"\nbirthday = {}\n",
+        member.ufvk,
+        u32::from(member.birthday)
+    );
+    // Write to a sibling temporary and rename over the target, so the manifest is only ever
+    // observed whole. A bare `write` truncates first, and a crash in that window leaves a
+    // zero-or-partial-length `.toml` holding a wallet's only copy of its viewing key - the
+    // file is the key material, not a cache, so there is nothing to rebuild it from. The
+    // temporary carries a `.tmp` suffix rather than `.toml` so `load_manifests` skips it if
+    // one is ever left behind, and the rename is atomic within the directory because both
+    // paths sit in `manifest_dir`.
+    let tmp = path.with_extension("toml.tmp");
+    let mut f = std::fs::File::create(&tmp)
+        .with_context(|| format!("creating the temporary manifest {}", tmp.display()))?;
+    f.write_all(body.as_bytes())
+        .with_context(|| format!("writing the temporary manifest {}", tmp.display()))?;
+    // Durability before visibility: the rename can otherwise land while the contents are
+    // still only in the page cache, which on a crash yields the empty file this is avoiding.
+    f.sync_all()
+        .with_context(|| format!("flushing the temporary manifest {}", tmp.display()))?;
+    drop(f);
+    std::fs::rename(&tmp, &path).with_context(|| {
+        format!(
+            "renaming {} into place as {}",
+            tmp.display(),
+            path.display()
+        )
+    })?;
+    // Best-effort: the manifest is durable and in place at this point, so a directory that
+    // cannot be fsynced (or a filesystem that does not support it) must not fail the
+    // onboarding. It only affects whether the *rename* survives a power loss.
+    if let Some(parent) = path.parent() {
+        if let Ok(dir) = std::fs::File::open(parent) {
+            let _ = dir.sync_all();
+        }
+    }
+    Ok(())
+}
+
+/// A manifest's path: the wallet name is the file stem, which is what makes the name routable
+/// and unique within the directory.
+fn manifest_path_in(manifest_dir: &Path, name: &str) -> PathBuf {
+    manifest_dir.join(format!("{name}.toml"))
 }
 
 /// Read one manifest file into a member.
@@ -312,8 +423,9 @@ mod tests {
     #[test]
     fn a_missing_manifest_directory_is_an_empty_fleet() {
         let dir = tempfile::tempdir().unwrap();
-        let members = load_manifests(&dir.path().join("absent")).unwrap();
+        let (members, skipped) = load_manifests(&dir.path().join("absent")).unwrap();
         assert!(members.is_empty());
+        assert!(skipped.is_empty());
     }
 
     #[test]
@@ -324,44 +436,131 @@ mod tests {
         // Ignored: not a manifest. A half-written temp file must not break startup.
         write(dir.path(), "notes.txt", "scratch");
         write(dir.path(), "c.toml.tmp", "garbage");
-        let members = load_manifests(dir.path()).unwrap();
+        let (members, skipped) = load_manifests(dir.path()).unwrap();
         assert_eq!(
             members.iter().map(|m| m.name.as_str()).collect::<Vec<_>>(),
             ["a", "b"]
         );
         assert_eq!(members[0].ufvk, "uview1a");
         assert_eq!(u32::from(members[1].birthday), 20);
+        assert!(skipped.is_empty(), "{skipped:?}");
     }
 
     /// An unknown key is a wallet that is not what the operator meant - the same reason the main
-    /// config denies them.
+    /// config denies them. Skipped, not fatal: the mistake is confined to one file.
     #[test]
-    fn an_unknown_manifest_key_is_refused() {
+    fn an_unknown_manifest_key_is_skipped() {
         let dir = tempfile::tempdir().unwrap();
         write(
             dir.path(),
             "w.toml",
             "ufvk = \"uview1w\"\nbirthday = 1\nbirthdya = 2\n",
         );
-        let err = load_manifests(dir.path()).unwrap_err().to_string();
-        assert!(err.contains("w.toml"), "{err}");
+        let (members, skipped) = load_manifests(dir.path()).unwrap();
+        assert!(members.is_empty());
+        assert_eq!(skipped.len(), 1);
+        assert!(skipped[0].path.ends_with("w.toml"), "{:?}", skipped[0]);
     }
 
     /// Omitting the birthday would silently choose between a full-chain rescan and a tip-only
-    /// scan that misses the wallet's funds. Both are worse than refusing.
+    /// scan that misses the wallet's funds. Both are worse than serving it.
     #[test]
-    fn a_manifest_without_a_birthday_is_refused() {
+    fn a_manifest_without_a_birthday_is_skipped() {
         let dir = tempfile::tempdir().unwrap();
         write(dir.path(), "w.toml", "ufvk = \"uview1w\"\n");
-        assert!(load_manifests(dir.path()).is_err());
+        let (members, skipped) = load_manifests(dir.path()).unwrap();
+        assert!(members.is_empty());
+        assert_eq!(skipped.len(), 1);
     }
 
     #[test]
-    fn a_name_that_is_not_routable_is_refused() {
+    fn a_name_that_is_not_routable_is_skipped() {
         let dir = tempfile::tempdir().unwrap();
         write(dir.path(), "we ird.toml", "ufvk = \"u\"\nbirthday = 1\n");
-        let err = load_manifests(dir.path()).unwrap_err().to_string();
-        assert!(err.contains("/wallet/<name>"), "{err}");
+        let (members, skipped) = load_manifests(dir.path()).unwrap();
+        assert!(members.is_empty());
+        assert_eq!(skipped.len(), 1);
+        assert!(
+            skipped[0].reason.contains("/wallet/<name>"),
+            "{:?}",
+            skipped[0]
+        );
+    }
+
+    /// The point of skipping rather than aborting: one bad file must not cost every other wallet
+    /// in the daemon its startup. Before this, a single truncated manifest - the residue a crash
+    /// mid-`createwallet` could leave - kept the whole daemon, configured wallets included, from
+    /// starting at all.
+    #[test]
+    fn one_unreadable_manifest_does_not_hide_the_others() {
+        let dir = tempfile::tempdir().unwrap();
+        write(
+            dir.path(),
+            "good.toml",
+            "ufvk = \"uview1g\"\nbirthday = 10\n",
+        );
+        // Exactly what an interrupted non-atomic write used to leave behind.
+        write(dir.path(), "torn.toml", "ufvk = \"uvie");
+        write(dir.path(), "empty.toml", "");
+        let (members, skipped) = load_manifests(dir.path()).unwrap();
+        assert_eq!(
+            members.iter().map(|m| m.name.as_str()).collect::<Vec<_>>(),
+            ["good"]
+        );
+        assert_eq!(skipped.len(), 2);
+        // Reported in path order, so the log and `listwalletdir` are stable across restarts.
+        assert!(skipped[0].path.ends_with("empty.toml"), "{:?}", skipped[0]);
+        assert!(skipped[1].path.ends_with("torn.toml"), "{:?}", skipped[1]);
+        assert!(!skipped[1].reason.is_empty());
+    }
+
+    /// The manifest holds a wallet's only copy of its viewing key, so it must never be observed
+    /// half-written. Asserts the target is whole and that no `.tmp` residue is left behind - and
+    /// `load_manifests` ignores a `.tmp` anyway, which is why that suffix was chosen.
+    #[test]
+    fn a_written_manifest_is_atomic_and_leaves_no_residue() {
+        let dir = tempfile::tempdir().unwrap();
+        let manifest_dir = dir.path().join("wallets.d");
+        let member = ShardMember {
+            name: "w".to_string(),
+            ufvk: "uview1w".to_string(),
+            birthday: BlockHeight::from_u32(42),
+        };
+        write_manifest_in(&manifest_dir, &member).unwrap();
+
+        let (members, skipped) = load_manifests(&manifest_dir).unwrap();
+        assert!(skipped.is_empty(), "{skipped:?}");
+        assert_eq!(members.len(), 1);
+        assert_eq!(members[0].ufvk, "uview1w");
+        assert_eq!(u32::from(members[0].birthday), 42);
+
+        let leftovers: Vec<_> = std::fs::read_dir(&manifest_dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|n| n.ends_with(".tmp"))
+            .collect();
+        assert!(leftovers.is_empty(), "temporary left behind: {leftovers:?}");
+    }
+
+    /// Writing over an existing manifest is refused before the temporary is created, so a second
+    /// `createwallet` for a name already in use cannot clobber the first wallet's key.
+    #[test]
+    fn writing_a_manifest_that_already_exists_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let manifest_dir = dir.path().join("wallets.d");
+        let member = ShardMember {
+            name: "w".to_string(),
+            ufvk: "uview1w".to_string(),
+            birthday: BlockHeight::from_u32(42),
+        };
+        write_manifest_in(&manifest_dir, &member).unwrap();
+        let second = ShardMember {
+            ufvk: "uview1OTHER".to_string(),
+            ..member.clone()
+        };
+        assert!(write_manifest_in(&manifest_dir, &second).is_err());
+        let (members, _) = load_manifests(&manifest_dir).unwrap();
+        assert_eq!(members[0].ufvk, "uview1w", "the first key was overwritten");
     }
 
     /// A wallet already imported stays in its shard whatever the placement rules would now say -
@@ -695,7 +894,20 @@ impl FleetManager {
                 // Don't leave a manifest for a wallet that never started: the next restart would
                 // try to import it again with no explanation of why it is not being served.
                 if persist {
-                    let _ = std::fs::remove_file(self.manifest_path(&member.name));
+                    let path = self.manifest_path(&member.name);
+                    if let Err(rm) = std::fs::remove_file(&path) {
+                        // Reported rather than swallowed: the rollback failing is the one way
+                        // this path leaves a manifest whose wallet is not placed, so the next
+                        // restart will retry the import. That is recoverable, but only if the
+                        // operator knows the file is there.
+                        warn!(
+                            "createwallet: '{}' failed to start and its manifest {} could not \
+                             be removed: {rm}. The next restart will try to import it again; \
+                             delete the file to abandon the wallet.",
+                            member.name,
+                            path.display()
+                        );
+                    }
                 }
                 Err(OnboardError::Failed(e))
             }
@@ -797,33 +1009,11 @@ impl FleetManager {
     }
 
     fn manifest_path(&self, name: &str) -> PathBuf {
-        self.config.manifest_dir.join(format!("{name}.toml"))
+        manifest_path_in(&self.config.manifest_dir, name)
     }
 
     fn write_manifest(&self, member: &ShardMember) -> anyhow::Result<()> {
-        std::fs::create_dir_all(&self.config.manifest_dir).with_context(|| {
-            format!(
-                "creating the fleet manifest directory {}",
-                self.config.manifest_dir.display()
-            )
-        })?;
-        let path = self.manifest_path(&member.name);
-        if path.exists() {
-            return Err(anyhow!(
-                "a manifest for '{}' already exists at {}",
-                member.name,
-                path.display()
-            ));
-        }
-        std::fs::write(
-            &path,
-            format!(
-                "# Written by zecd createwallet.\nufvk = \"{}\"\nbirthday = {}\n",
-                member.ufvk,
-                u32::from(member.birthday)
-            ),
-        )
-        .with_context(|| format!("writing the manifest {}", path.display()))
+        write_manifest_in(&self.config.manifest_dir, member)
     }
 
     /// The `RwLock`/`Mutex` critical sections here are all short and cannot leave a half-built

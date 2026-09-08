@@ -477,3 +477,62 @@ port = 9233
 readiness = "synced"
 # Only consulted in "synced" and "scanned" modes:
 max_scan_lag = 4
+
+# ---------------------------------------------------------------------------
+# [fleet] - EXPERIMENTAL. Monitoring many watch-only wallets in one daemon.
+# ---------------------------------------------------------------------------
+# Off by default, and almost nobody needs it: this exists for an operator running a
+# service that watches viewing keys on other people's behalf. A conventional
+# deployment - one wallet, or a handful of [wallets.<name>] entries - should leave
+# this alone and is completely unaffected by it.
+#
+# What it does: a view wallet normally costs a full stack of its own (a database, an
+# actor, a scan pass, note-commitment trees). At tens or thousands of wallets that
+# duplication is what stops zecd scaling. A fleet puts many viewing keys behind ONE
+# scan domain - a "shard" - so a block is fetched once and trial-decrypted once
+# against every key in the shard. Spending is untouched: one conventional wallet, its
+# own database, its own actor.
+#
+# EXPERIMENTAL means what it says. While the fleet carries this label, the manifest
+# format, the [fleet] keys below, and the createwallet/loadwallet/unloadwallet/
+# listwalletdir RPCs may all change in a PATCH release, with no migration. Two known
+# limitations you should read before enabling it:
+#
+#   * Placement groups wallets by ARRIVAL, not by birthday. A shard's scan floor is
+#     its oldest member's birthday, so a wallet born at today's tip that lands in a
+#     shard holding a 2018 wallet waits for that shard to scan from 2018. If your
+#     wallets arrive with a wide spread of birthdays, expect placement to be well
+#     short of optimal.
+#   * There is NO way to remove a wallet once imported. `unloadwallet` stops serving
+#     it but deletes nothing - the manifest stays, the account stays, and the shard
+#     keeps scanning its key. Removing it means deleting and rebuilding the shard.
+#
+# Backup note: with a fleet enabled, `manifest_dir` below holds viewing keys that
+# exist NOWHERE ELSE in zecd, and it is written at runtime by `createwallet`. It is
+# key material, not a cache, and the "the whole data directory is disposable" rule in
+# docs/OPERATIONS.md does NOT cover it. Back it up like keys.toml.
+#
+# [fleet]
+# Run the fleet at all. Off means the manifest directory is never read, no shard is
+# opened, and createwallet/loadwallet/unloadwallet refuse.
+# enabled = false
+#
+# Directory of per-wallet manifests, one small TOML each, relative to the datadir.
+# Each file is `<name>.toml` holding `ufvk = "uview1..."` and `birthday = <height>`;
+# the file stem is the wallet name, served at /wallet/<name>. Drop a file in and
+# restart, or use `createwallet` to add one without a restart.
+# manifest_dir = "wallets.d"
+#
+# Directory holding the shard databases, relative to the datadir. Derived data: this
+# one IS a cache, rebuildable from the manifests plus the chain.
+# dir = "fleet"
+#
+# Accounts per shard. A shard is one scan domain, so this trades scan sharing against
+# blast radius: importing a wallet rewinds its whole shard to that wallet's birthday,
+# so a bigger shard shares more work but is dragged backwards by more arrivals.
+# shard_size = 128
+#
+# How far below a shard's oldest birthday an arriving wallet may be before it starts
+# a new shard instead of joining. See the placement limitation above - this bounds
+# how far one arrival can drag a shard back, but it does not bound the total spread.
+# cohort_depth = 10000

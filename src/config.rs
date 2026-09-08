@@ -150,10 +150,25 @@ pub const DEFAULT_FLEET_COHORT_DEPTH: u32 = 10_000;
 
 /// `[fleet]` - monitoring many watch-only wallets in one daemon.
 ///
-/// The fleet is **additive**: with no manifests present none of this does anything, and
-/// `[wallets.<name>]` entries keep behaving exactly as they always have.
+/// **Experimental, and off unless [`FleetConfig::enabled`] says otherwise.** The manifest
+/// format, the `[fleet]` keys and the four wallet-management RPCs carry no compatibility
+/// guarantee while the feature is experimental: they may change in a patch release. Two known
+/// limitations are the reason: shard placement groups wallets by arrival rather than by
+/// birthday, so a wide spread of birthdays makes a recent wallet wait behind the oldest member
+/// of its shard; and there is no path to remove a wallet from a shard once it is imported.
+///
+/// The fleet is **additive**: disabled (the default) none of this runs, and `[wallets.<name>]`
+/// entries keep behaving exactly as they always have.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FleetConfig {
+    /// Run the fleet at all (`[fleet] enabled`, default `false`).
+    ///
+    /// Off means the manifest directory is never read, no shard is opened, and the wallet
+    /// management RPCs (`createwallet`, `loadwallet`, `unloadwallet`) refuse with a message
+    /// naming this key. It is a deliberate opt-in rather than "on when manifests exist": the
+    /// feature is experimental, so an operator should have said so, and a stray file in the
+    /// datadir should not enrol a daemon into it.
+    pub enabled: bool,
     /// Directory of per-wallet manifests, one small TOML each (absolute after resolution).
     pub manifest_dir: PathBuf,
     /// Directory holding the shard databases (absolute after resolution).
@@ -167,6 +182,7 @@ pub struct FleetConfig {
 impl Default for FleetConfig {
     fn default() -> Self {
         FleetConfig {
+            enabled: false,
             manifest_dir: PathBuf::from(DEFAULT_FLEET_MANIFEST_DIR),
             dir: PathBuf::from(DEFAULT_FLEET_DIR),
             shard_size: DEFAULT_FLEET_SHARD_SIZE,
@@ -940,6 +956,7 @@ struct ConfigFile {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct FleetFile {
+    enabled: Option<bool>,
     manifest_dir: Option<PathBuf>,
     dir: Option<PathBuf>,
     shard_size: Option<usize>,
@@ -1900,12 +1917,14 @@ impl AppConfig {
         };
 
         let fleet_file = file.fleet.unwrap_or(FleetFile {
+            enabled: None,
             manifest_dir: None,
             dir: None,
             shard_size: None,
             cohort_depth: None,
         });
         let fleet = FleetConfig {
+            enabled: fleet_file.enabled.unwrap_or(false),
             manifest_dir: fleet_file
                 .manifest_dir
                 .map(|p| datadir.join(p))
@@ -2630,6 +2649,27 @@ mod tests {
         assert_eq!(f.trust_own_transactions, Some(false));
         let f: SpendFile = toml::from_str("trust_own_transactions = true").unwrap();
         assert_eq!(f.trust_own_transactions, Some(true));
+    }
+
+    #[test]
+    fn fleet_defaults_off_and_parses() {
+        // Absent -> off. The fleet is experimental and opt-in: a daemon that never mentions
+        // [fleet] must not read the manifest directory or accept a runtime `createwallet`,
+        // and a stray file in the datadir must not enrol it.
+        assert!(!FleetConfig::default().enabled);
+        // An omitted [fleet] table resolves to the same thing as an empty one.
+        let f: FleetFile = toml::from_str("").unwrap();
+        assert_eq!(f.enabled, None);
+        let f: FleetFile = toml::from_str("enabled = true").unwrap();
+        assert_eq!(f.enabled, Some(true));
+        let f: FleetFile = toml::from_str("enabled = false").unwrap();
+        assert_eq!(f.enabled, Some(false));
+        // The other keys are inert but still parse, so a config can be written before the
+        // feature is switched on.
+        let f: FleetFile = toml::from_str("shard_size = 64\ncohort_depth = 500").unwrap();
+        assert_eq!(f.enabled, None);
+        assert_eq!(f.shard_size, Some(64));
+        assert_eq!(f.cohort_depth, Some(500));
     }
 
     #[test]
