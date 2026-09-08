@@ -22,7 +22,7 @@
 //! Setup mirrors `regtest_funded.rs`/`regtest_sapling.rs`: mine a transparent coinbase to the
 //! funder, mature it, shield it, then have the funder pay zecd. The difference is that zecd is
 //! configured with `[pools] transparent = true` (Orchard-only enabled, as default), zecd hands out
-//! a `t…` receiving address, and the funder pays *that* - an ordinary shielded→transparent send.
+//! a `t...` receiving address, and the funder pays *that* - an ordinary shielded→transparent send.
 //!
 //! Skips cleanly unless `ZEBRAD_BIN` is set.
 
@@ -81,7 +81,7 @@ async fn regtest_transparent_receive_and_autoshield_spend() {
         .to_string();
     assert!(
         taddr.starts_with("tm"),
-        "transparent address should be a bare t-addr (tm…), got {taddr}"
+        "transparent address should be a bare t-addr (tm...), got {taddr}"
     );
 
     // validateaddress: a bare transparent address carries exactly the transparent receiver.

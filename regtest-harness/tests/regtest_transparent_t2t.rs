@@ -68,7 +68,7 @@ async fn regtest_fully_transparent_spend_keeps_change_transparent() {
         .to_string();
     assert!(
         taddr.starts_with("tm"),
-        "zecd hands out a bare t-addr (tm…), got {taddr}"
+        "zecd hands out a bare t-addr (tm...), got {taddr}"
     );
 
     // 6. Wait until zecd is caught up before funding.
@@ -183,7 +183,7 @@ async fn regtest_fully_transparent_spend_keeps_change_transparent() {
     // 11. THE DIFFERENTIATOR: the change stayed transparent. The wallet only ever held transparent
     //     funds, so any remaining balance that is reported with a bare `t`-address (not an empty /
     //     shielded note) proves the change did NOT auto-shield. Every unspent output must be
-    //     transparent (a `tm…` address); `getbalance` reflects ~0.5 ZEC minus the fee.
+    //     transparent (a `tm...` address); `getbalance` reflects ~0.5 ZEC minus the fee.
     let lu = zecd
         .call("listunspent", json!([0]))
         .await

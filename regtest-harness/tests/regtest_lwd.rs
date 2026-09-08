@@ -74,7 +74,7 @@ async fn regtest_lwd_e2e() {
         .await
         .expect("start the zebra-backed comparison zecd");
 
-    // 4. Both instances scan the same chain to the same tip…
+    // 4. Both instances scan the same chain to the same tip...
     let tip = zebrad
         .rpc("getblockchaininfo", json!([]))
         .await
@@ -89,7 +89,7 @@ async fn regtest_lwd_e2e() {
         .await
         .expect("zebra-backed zecd syncs to the tip");
 
-    // …and must agree on what that chain is. This pins the lightwalletd backend's hash byte
+    // ...and must agree on what that chain is. This pins the lightwalletd backend's hash byte
     // order and tip handling against the zebra backend's, end to end.
     assert_chain_views_agree(&zecd, &zecd_zebra).await;
     let info = zecd

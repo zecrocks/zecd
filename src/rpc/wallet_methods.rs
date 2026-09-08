@@ -338,7 +338,7 @@ pub(crate) fn parse_receiver_tokens(
 ///   `/wallet/<name>` path instead.
 /// - **One receiver kind per call:** the valid `receiver_type`s are this wallet's enabled
 ///   shielded pools (`sapling`/`orchard`) or - on a wallet with `[pools] transparent = true` -
-///   `p2pkh` **alone**, which derives the *bare* `t1…`/`tm…` address at the requested index
+///   `p2pkh` **alone**, which derives the *bare* `t1...`/`tm...` address at the requested index
 ///   (ZIP-316 forbids a transparent-only UA, and zecd never mixes a transparent receiver into a
 ///   UA it hands out). Mixing `p2pkh` with a shielded pool is `-8`, as are `p2sh` (zecd derives
 ///   no script addresses), a pool the wallet has not enabled, and any unknown token.

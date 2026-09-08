@@ -210,7 +210,7 @@ pub enum ReceiverRequest {
     Default,
     /// An explicit shielded receiver set (already validated as a subset of the enabled pools).
     Shielded(ReceiverSet),
-    /// A bare transparent (`t1…`/`tm…`) address. Only valid when the wallet enables transparent
+    /// A bare transparent (`t1...`/`tm...`) address. Only valid when the wallet enables transparent
     /// receiving (checked at the RPC layer and re-checked by the actor).
     Transparent,
 }
@@ -223,7 +223,7 @@ pub enum ReceiverRequest {
 /// handed).
 #[derive(Debug, Clone)]
 pub struct DerivedAddress {
-    /// The encoded address (a Unified Address, or a bare `t1…`/`tm…` for a transparent request).
+    /// The encoded address (a Unified Address, or a bare `t1...`/`tm...` for a transparent request).
     pub address: String,
     /// The index the address was derived at (diversifier index, or transparent child index).
     pub index: u128,

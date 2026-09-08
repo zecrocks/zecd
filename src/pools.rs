@@ -240,7 +240,7 @@ impl ReceiverSet {
 /// shielded receiver is discarded after extraction) and a p2pkh receiver, omitting Sapling. Keys
 /// always derive all pools regardless of a wallet's enabled set, so the Orchard receiver is always
 /// available. The caller extracts the transparent receiver from the resulting UA and encodes it
-/// bare (`t1…`/`tm…`).
+/// bare (`t1...`/`tm...`).
 pub fn transparent_extraction_request() -> UnifiedAddressRequest {
     use ReceiverRequirement::*;
     // Argument order is (orchard, sapling, p2pkh), matching `to_unified_address_request`.

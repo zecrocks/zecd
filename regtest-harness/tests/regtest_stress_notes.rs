@@ -19,7 +19,7 @@
 //!   2. **Correctness:** the send still completes and moves funds (it is committed and broadcast).
 //!
 //! The per-send phase-timing log lines (`send complete (pipelined): N inputs, M orchard actions;
-//! select+build … prove+sign … store … broadcast …`) are the Layer-0 profiling artifact - set
+//! select+build ... prove+sign ... store ... broadcast ...`) are the Layer-0 profiling artifact - set
 //! `ZECD_STDERR=1` to stream them into the CI log.
 //!
 //! Skips cleanly unless `ZEBRAD_BIN` is set *and*

@@ -77,7 +77,7 @@ async fn regtest_fully_transparent_sendmany_keeps_change_transparent() {
         .to_string();
     assert!(
         taddr.starts_with("tm"),
-        "zecd hands out a bare t-addr (tm…), got {taddr}"
+        "zecd hands out a bare t-addr (tm...), got {taddr}"
     );
 
     // 6. Wait until zecd is caught up before funding.
@@ -140,7 +140,7 @@ async fn regtest_fully_transparent_sendmany_keeps_change_transparent() {
     //    config. The received UTXO is third-party (untrusted), so it becomes spendable only at the
     //    confirmations-policy depth; mine toward it and retry on -6 (a failed attempt builds and
     //    broadcasts nothing, so retrying is safe).
-    let second_taddr = SEED_MINER_ADDRESS; // a valid regtest transparent address (t2… P2SH)
+    let second_taddr = SEED_MINER_ADDRESS; // a valid regtest transparent address (t2... P2SH)
     let deadline = Instant::now() + SPEND_TIMEOUT;
     let txid = loop {
         let tip = zebrad
@@ -201,7 +201,7 @@ async fn regtest_fully_transparent_sendmany_keeps_change_transparent() {
     // 11. THE DIFFERENTIATOR: the change stayed transparent. The wallet only ever held transparent
     //     funds, so any remaining balance reported with a bare `t`-address (not an empty / shielded
     //     note) proves the `sendmany` change did NOT auto-shield. Every unspent output must be
-    //     transparent (a `tm…` address); `getbalance` reflects ~0.5 ZEC minus the fee.
+    //     transparent (a `tm...` address); `getbalance` reflects ~0.5 ZEC minus the fee.
     let lu = zecd
         .call("listunspent", json!([0]))
         .await

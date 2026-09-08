@@ -37,7 +37,7 @@ fn test_seed() -> SecretVec<u8> {
     secret
 }
 
-/// A second, unrelated seed (standard BIP-39 "abandon…art" test vector) for "foreign wallet"
+/// A second, unrelated seed (standard BIP-39 "abandon...art" test vector) for "foreign wallet"
 /// negative cases - its addresses must never be attributed to [`test_seed`]'s account.
 const FOREIGN_PHRASE: &str = "abandon abandon abandon abandon abandon abandon abandon abandon \
     abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon \

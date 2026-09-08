@@ -196,7 +196,7 @@ fn process_mantissa_digit(ch: char, mantissa: &mut i64, mantissa_tzeros: &mut i6
 /// Exact port of Bitcoin Core's [`ParseFixedPoint`] (the parser behind `AmountFromValue`),
 /// returning the value scaled by 10^`decimals` zatoshis. A decimal-library parse is not a
 /// substitute: `rust_decimal` silently truncates sub-representable mantissas to zero, so
-/// e.g. `0.0…01e+68` (= 1 zatoshi) or a 64-zero mantissa meaning 1 ZEC would parse as 0.
+/// e.g. `0.0...01e+68` (= 1 zatoshi) or a 64-zero mantissa meaning 1 ZEC would parse as 0.
 ///
 /// [`ParseFixedPoint`]: https://github.com/bitcoin/bitcoin/blob/master/src/util/strencodings.cpp
 fn parse_fixed_point(mut val: &str, decimals: i64) -> Option<i64> {

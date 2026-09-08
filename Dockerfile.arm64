@@ -15,7 +15,7 @@
 # [patch.crates-io] in Cargo.toml and the project docs "Gotchas") - without it, `age`'s fl! macro
 # flips two fluent args' order per build.
 #
-# MAINTENANCE: the exact apk pins (gcc/g++/musl-dev/binutils/protoc/…) are Alpine 3.24
+# MAINTENANCE: the exact apk pins (gcc/g++/musl-dev/binutils/protoc/...) are Alpine 3.24
 # versions; Alpine garbage-collects superseded versions from the CDN, so when a build starts
 # failing on "package not found", bump the base-image digest and refresh these pins together
 # (and keep RUSTUP_TOOLCHAIN in lockstep with the image tag).

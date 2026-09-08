@@ -402,7 +402,7 @@ async fn regtest_funded_orchard_receive() {
     // Even with the scan at the tip, a note reads as spendable in `getbalance` (a confirmation
     // count over `get_wallet_summary`) a beat before `propose_transfer` can build its
     // commitment-tree anchor, so a freshly-confirmed spend can transiently fail with -6
-    // ("…become spendable as blocks arrive"). Retry until the anchor catches up, bounded by
+    // ("...become spendable as blocks arrive"). Retry until the anchor catches up, bounded by
     // FUND_TIMEOUT. A genuine shortfall would persist and still panic past the deadline.
     let send_args =
         json!([funder_ua, 0.4, "", "", null, null, null, null, null, null, null, memo_hex]);

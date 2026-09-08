@@ -574,7 +574,7 @@ mod tests {
         let mut state = test_state();
         state.app.registry = Arc::new(reg);
 
-        // The default route reports the default wallet's height…
+        // The default route reports the default wallet's height...
         let r = router(state.clone())
             .oneshot(req(
                 r#"{"method":"getblockcount","id":1}"#,
@@ -584,7 +584,7 @@ mod tests {
             .unwrap();
         assert_eq!(body_json(r).await["result"].as_u64(), Some(2000));
 
-        // …while /wallet/w2 reports w2's own (still-scanning) height, not the default's.
+        // ...while /wallet/w2 reports w2's own (still-scanning) height, not the default's.
         let r = router(state)
             .oneshot(req_to(
                 "/wallet/w2",

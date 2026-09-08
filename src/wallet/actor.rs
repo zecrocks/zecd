@@ -2135,7 +2135,7 @@ impl WalletActor {
                             self.enhance_progress = None;
                         } else {
                             // Caught up: give any unmined wallet txs another shot at the mempool,
-                            // pull the full data (memos, …) for transactions seen only as compact
+                            // pull the full data (memos, ...) for transactions seen only as compact
                             // blocks, and (re)subscribe to incoming mempool txs for 0-conf visibility.
                             // (Transparent receives are discovered by the block scan itself - see
                             // `sync_step` - and at 0-conf by the mempool path below, on every
@@ -4263,7 +4263,7 @@ impl WalletActor {
         Ok(encoded)
     }
 
-    /// Derive and persist a fresh bare transparent (`t1…`/`tm…`) receiving address for the
+    /// Derive and persist a fresh bare transparent (`t1...`/`tm...`) receiving address for the
     /// account. ZIP-316 forbids a transparent-only Unified Address, so we derive a UA that
     /// requires both an Orchard and a transparent receiver (keys always derive all pools, so the
     /// Orchard receiver is always available), then extract and bare-encode the transparent
@@ -6710,7 +6710,7 @@ fn sanitize_upstream_msg(msg: &str) -> String {
     const MAX: usize = 200;
     let mut out: String = msg.chars().filter(|c| !c.is_control()).take(MAX).collect();
     if msg.chars().filter(|c| !c.is_control()).nth(MAX).is_some() {
-        out.push('…');
+        out.push_str("...");
     }
     out
 }
@@ -6811,7 +6811,7 @@ fn now_unix() -> i64 {
 }
 
 /// Whether any recipient in `request` forces a **Sapling output**: a shielded address carrying a
-/// Sapling receiver but *no* Orchard receiver (a bare `zs…`, or a UA whose only shielded receiver
+/// Sapling receiver but *no* Orchard receiver (a bare `zs...`, or a UA whose only shielded receiver
 /// is Sapling). This is the sole way a send on the Orchard-only cached PCZT path produces a PCZT
 /// with a non-empty Sapling bundle - spends are always Orchard and change goes to Orchard (Sapling
 /// isn't an enabled pool on that path, or `cached_pczt_path` is already false). The PCZT extractor
@@ -8507,11 +8507,12 @@ mod tests {
         assert_eq!(sanitize_upstream_msg(real), real);
         // Control characters (log/terminal injection) are stripped.
         assert_eq!(sanitize_upstream_msg("a\r\nb\x1b[31mc"), "ab[31mc");
-        // Oversized messages are truncated with an ellipsis marker.
+        // Oversized messages are truncated with a trailing "..." marker. The cap bounds the
+        // upstream *content* at MAX; the marker is added on top of it, so the total is MAX + 3.
         let long = "x".repeat(500);
         let bounded = sanitize_upstream_msg(&long);
-        assert_eq!(bounded.chars().count(), 201);
-        assert!(bounded.ends_with('…'));
+        assert_eq!(bounded.chars().count(), 203);
+        assert!(bounded.ends_with("..."));
         // Exactly at the cap: no marker.
         let exact = "y".repeat(200);
         assert_eq!(sanitize_upstream_msg(&exact), exact);

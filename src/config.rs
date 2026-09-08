@@ -186,7 +186,7 @@ pub struct PoolsConfig {
     /// Receivers included in the UAs handed out by `getnewaddress` when no per-call override is
     /// given. Always a subset of `enabled`.
     pub default_receivers: ReceiverSet,
-    /// Whether the wallet may hand out bare transparent (`t1…`/`tm…`) receiving addresses - via
+    /// Whether the wallet may hand out bare transparent (`t1...`/`tm...`) receiving addresses - via
     /// `getnewaddress "" "transparent"`, and (when `transparent_default`) as the no-argument
     /// default. Off preserves zecd's shielded-only behaviour: `address_type = "transparent"` is
     /// rejected `-8`. Received transparent UTXOs are spendable only by auto-shielding them into a
@@ -1097,7 +1097,7 @@ struct SpendFile {
 struct PoolsFile {
     enabled: Option<Vec<String>>,
     default_receivers: Option<Vec<String>>,
-    /// Enable bare transparent (`t1…`/`tm…`) receiving addresses.
+    /// Enable bare transparent (`t1...`/`tm...`) receiving addresses.
     transparent: Option<bool>,
     /// Make a bare transparent address the no-argument `getnewaddress` default (implies
     /// `transparent`).
@@ -2813,7 +2813,7 @@ mod tests {
         assert_eq!(f.tls_insecure_skip_verify, None);
         assert_eq!(f.tls_ca_file, None);
         assert_eq!(f.tls_pinned_sha256, None);
-        // …and each of the three trust knobs has to be asked for explicitly.
+        // ...and each of the three trust knobs has to be asked for explicitly.
         let f: BackendFile = toml::from_str("tls_insecure_skip_verify = true").unwrap();
         assert_eq!(f.tls_insecure_skip_verify, Some(true));
         let f: BackendFile = toml::from_str(
@@ -2887,14 +2887,14 @@ mod tests {
         assert!(err.to_string().contains("tls_insecure_skip_verify"));
 
         // Nor can they ride a connection that will not be TLS at all, whether that is forced by
-        // `tls = "no"`…
+        // `tls = "no"`...
         assert!(validate_backend_tls(&BackendConfig {
             tls: Some(false),
             tls_pins: vec![pin],
             ..backend_cfg()
         })
         .is_err());
-        // …or by an http:// endpoint.
+        // ...or by an http:// endpoint.
         assert!(validate_backend_tls(&BackendConfig {
             server: "http://lwd.example.com:9067".into(),
             tls_ca_pem: Some(b"pem".to_vec()),

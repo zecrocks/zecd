@@ -317,7 +317,7 @@ pub trait ChainSource: Send {
     /// `getaddresstxids`, which accepts a batch of addresses in one call). Legacy-server compact
     /// blocks omit transparent inputs/outputs, so this is how the wallet discovers *mined*
     /// transparent receives and spends in order to enhance (fetch+store) them. Each address is
-    /// the bare encoding (`t1…`/`tm…`). Ordering is not guaranteed, and entries may repeat
+    /// the bare encoding (`t1...`/`tm...`). Ordering is not guaranteed, and entries may repeat
     /// across addresses (callers de-dupe / store idempotently). See [`TxEvidence`] for why the
     /// item is an enum rather than a bare txid.
     fn transparent_tx_evidence(

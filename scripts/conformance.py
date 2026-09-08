@@ -401,7 +401,7 @@ def main() -> int:
     # compares the address (Bitcoin Core's pair, ported from zallet). This wallet is shielded-only
     # (no transparent addresses to own), so the happy-path round-trip is covered by the
     # regtest_transparent e2e; here we assert the argument/error contract, which is
-    # network-independent. A "t2…" regtest P2SH address is a valid transparent address that does
+    # network-independent. A "t2..." regtest P2SH address is a valid transparent address that does
     # not refer to a key.
     P2SH_ADDR = "t27eWDgjFYJGVXmzrXeVjnb5J3uXDM9xH9v"
     try:
