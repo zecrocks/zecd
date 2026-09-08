@@ -1,0 +1,52 @@
+name: Style
+
+# House style: ASCII punctuation only. Typographic dashes and ellipses read as generation
+# artifacts in source, so the tree uses a spaced hyphen and three periods instead.
+#
+# Deliberately its own workflow rather than a job in ci.yml: that workflow's `paths-ignore`
+# skips `**.md`, `docs/**` and the Dockerfiles, which is precisely where prose (and therefore
+# an em-dash) is most likely to land. No ignores here - every path is checked.
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+
+concurrency:
+  group: style-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  punctuation:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # The pattern is built with printf rather than written literally so this file does not
+      # match its own check, and by byte value rather than as a PCRE `\x{2014}` because
+      # `git grep -P` only interprets that escape under a UTF-8 locale - on a C-locale runner
+      # it aborts with "character code point value ... is too large", which silently turns the
+      # gate into a no-op. `git grep -F` compares bytes, so it holds in any locale.
+      #
+      # vendor/ is excluded: it is third-party source, so its punctuation is not ours to
+      # rewrite. THIRD-PARTY-LICENSES.txt is excluded for the same reason - it is generated
+      # (scripts/generate-licenses.sh) and consists entirely of upstream license texts, which
+      # must be reproduced verbatim.
+      - name: No em-dashes (U+2014)
+        run: |
+          if git grep -nF -e "$(printf '\xe2\x80\x94')" -- ':!vendor' ':!THIRD-PARTY-LICENSES.txt'; then
+            echo "::error::Em-dash (U+2014) found at the locations above. House style is ASCII punctuation only: use a spaced hyphen ' - ', a comma, or parentheses."
+            exit 1
+          fi
+
+      # Same construction and the same exclusions as the em-dash gate above, for the same
+      # reason: the character reads as a generation artifact, and source that looks
+      # machine-written costs the project credibility with anyone reading it. Note this one is
+      # not purely cosmetic - sanitize_upstream_msg's truncation marker is echoed into RPC
+      # errors, so it reaches clients.
+      - name: No ellipsis character (U+2026)
+        run: |
+          if git grep -nF -e "$(printf '\xe2\x80\xa6')" -- ':!vendor' ':!THIRD-PARTY-LICENSES.txt'; then
+            echo "::error::Ellipsis character (U+2026) found at the locations above. House style is ASCII punctuation only: use three periods '...'."
+            exit 1
+          fi
