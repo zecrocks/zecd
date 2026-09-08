@@ -22,7 +22,7 @@ required-features = ["server", "cli"]
 # `server` feature; it is also a dev-dependency (below) because `chain/zebra.rs`'s offline tests
 # run a fake zebrad on it under every feature combination.
 tokio = { version = "1.21", features = ["rt-multi-thread", "macros", "fs", "signal", "sync", "time", "io-util"] }
-axum = { version = "0.7", features = ["json"], optional = true }
+axum = { version = "0.8", features = ["json"], optional = true }
 hyper = { version = "1", features = ["client", "http1"] }
 http-body-util = "0.1"
 bytes = "1"
@@ -37,12 +37,18 @@ serde_json = { version = "1.0", features = ["arbitrary_precision"] }
 # parsing and the binary's tracing init), so both ride the `cli` feature; the `tracing` facade
 # stays unconditional.
 clap = { version = "4.5", features = ["derive", "string", "env"], optional = true }
-toml = "0.8"
+toml = "0.9"
 anyhow = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json"], optional = true }
 
 # Auth. hmac+sha2 implement Bitcoin Core's salted `rpcauth` scheme (HMAC-SHA256).
+#
+# base64/hmac/sha2/ripemd are held at the versions the rest of the tree already compiles
+# (`age` and `zcash_client_backend` on base64 0.22, the whole librustzcash stack on the
+# RustCrypto 0.10/0.12 generation). Newer majors exist - base64 0.23, hmac 0.13, sha2 0.11,
+# ripemd 0.2 - but taking them here would compile a second copy of each for zecd's own two
+# call sites without changing any behaviour, so they stay in lockstep instead.
 base64 = "0.22"
 subtle = "2"
 hmac = "0.12"
@@ -55,12 +61,21 @@ ripemd = "0.1"
 # recoverable-ECDSA API (compact 65-byte header+sig, as zcashd/zallet produce). Already in the
 # tree via the zcash crates; matches zallet's pin.
 secp256k1 = { version = "0.29", features = ["recovery"] }
+# rand 0.8, not the newer 0.9/0.10 line: the RNG is handed to orchard/sapling/librustzcash
+# APIs, which are all on rand 0.8's `RngCore`, so the versions have to unify.
 rand = { version = "0.8", default-features = false, features = ["std", "std_rng"] }
 hex = "0.4"
 
 # Seed handling
-age = { version = "0.11", features = ["armor"] }
-bip0039 = { version = "0.12", features = ["std", "all-languages"] }
+# age 0.12 (from 0.11) is what retired the tree's last `[patch.crates-io]`: it depends on
+# i18n-embed-fl 0.10, which carries the deterministic-argument-order fix that the vendored
+# 0.9.4 used to backport for the reproducible Docker builds. It also adds the age v2 hybrid
+# recipient types, so hpke/ml-kem/p256/sha3 arrive as non-optional transitive dependencies;
+# the x25519 and scrypt formats zecd writes are unchanged, so existing `keys.toml` files
+# decrypt exactly as before.
+age = { version = "0.12", features = ["armor"] }
+bip0039 = { version = "0.14", features = ["std", "all-languages"] }
+# secrecy 0.8, not 0.10: `SecretVec` crosses into librustzcash's seed APIs, which are on 0.8.
 secrecy = "0.8"
 
 # `prost` deserializes the compact-block / treestate / mempool protobuf types that
@@ -88,6 +103,8 @@ hyper-util = { version = "0.1", features = ["tokio", "client-legacy", "http1"] }
 # so the SOCKS connector needs only this, not all of `tower` (which stays a dev-dependency).
 tokio-socks = "0.5"
 tower-service = "0.3"
+# rusqlite 0.37 is `zcash_client_sqlite`'s own requirement; zecd opens connections to the
+# same database, so the two must be the same crate version, not merely compatible ones.
 rusqlite = { version = "0.37", features = ["time"] }
 time = "0.3"
 uuid = { version = "1", features = ["v4", "serde"] }
@@ -100,7 +117,8 @@ orchard = { version = "0.15", default-features = false, features = ["circuit"] }
 zcash_address = "0.13"
 # `CompactSize` builds the length-prefixed preimage for the `signmessage`/`verifymessage`
 # message hash (magic + message, each CompactSize-prefixed, double-SHA256), byte-identical to
-# zcashd's `rpc/misc.cpp` and zallet.
+# zcashd's `rpc/misc.cpp` and zallet. 0.4, matching the rest of the librustzcash stack -
+# 0.5 exists but taking it would add a second copy for one call site.
 zcash_encoding = "0.4"
 # `transparent-inputs` lets transparent receivers surface in getrawtransaction/getaddressinfo
 # and the received-by-address read paths; zecd's own wallets never expose transparent receivers.
@@ -119,7 +137,8 @@ zcash_script = "0.4.5"
 sapling = { package = "sapling-crypto", version = "0.7" }
 # `NonEmpty` is the shape librustzcash's proposal API speaks (`ShieldedInputs::from_parts`,
 # `Proposal` steps); needed by the hand-built z_mergetoaddress proposals. Same version the
-# librustzcash workspace pins, so the types unify.
+# librustzcash workspace pins, so the types unify - which is why this stays at 0.11 rather than
+# following the released 0.12.
 nonempty = "0.11"
 # PCZT roles (Prover/Signer) for the cached-proving-key send path. Versions track the
 # zcash_client_backend `pczt` feature's own pin (0.9.3).
@@ -186,7 +205,7 @@ incrementalmerkletree = "0.8"
 # integration tests drive `server::router` with `tower::ServiceExt::oneshot`. Dev-dependencies
 # so both compile under every feature combination (axum is otherwise `server`-only, and tower
 # is test-only).
-axum = { version = "0.7", features = ["json"] }
+axum = { version = "0.8", features = ["json"] }
 tower = { version = "0.5", features = ["util"] }
 
 # Dependency notes.
@@ -267,9 +286,8 @@ tower = { version = "0.5", features = ["util"] }
 #   (`requires_ironwood_proof`/`create_ironwood_proof`) using a `PostNu6_3` proving key (see
 #   `actor.rs`; mirrors devtool's `pczt/prove.rs`).
 #
-# The only remaining patch: i18n-embed-fl, a vendored 0.9.4 with the deterministic-argument-order
-# fix from kellpossible/cargo-i18n#151 backported, so `age`'s fl! macro expansions (and therefore the
-# reproducible Docker builds) stop being a per-build coin flip. Remove when an `age` release depends
-# on i18n-embed-fl 0.10+.
-[patch.crates-io]
-i18n-embed-fl = { path = "vendor/i18n-embed-fl" }
+# There are **no `[patch.crates-io]` entries**. The tree carried one until `age 0.12`: a vendored
+# `i18n-embed-fl` 0.9.4 with the deterministic-argument-order fix from kellpossible/cargo-i18n#151
+# backported, without which `age`'s `fl!` macro expansions (and therefore the reproducible Docker
+# builds) were a per-build coin flip. `age` 0.12 depends on `i18n-embed-fl` 0.10, which carries
+# that fix upstream, so the vendored copy and the patch entry are gone.

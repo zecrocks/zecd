@@ -21,6 +21,8 @@ use axum::response::{IntoResponse, Response};
 #[cfg(feature = "server")]
 use axum::routing::post;
 #[cfg(feature = "server")]
+use axum::Extension;
+#[cfg(feature = "server")]
 use axum::Router;
 #[cfg(feature = "server")]
 use serde_json::Value;
@@ -77,7 +79,7 @@ const MAX_BODY_BYTES: usize = 2 * 1024 * 1024;
 fn router(state: HttpState) -> Router {
     Router::new()
         .route("/", post(handle_root))
-        .route("/wallet/:name", post(handle_wallet))
+        .route("/wallet/{name}", post(handle_wallet))
         .layer(axum::extract::DefaultBodyLimit::max(MAX_BODY_BYTES))
         .with_state(state)
 }
@@ -85,7 +87,7 @@ fn router(state: HttpState) -> Router {
 #[cfg(feature = "server")]
 async fn handle_root(
     State(state): State<HttpState>,
-    peer: Option<ConnectInfo<SocketAddr>>,
+    peer: Option<Extension<ConnectInfo<SocketAddr>>>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
@@ -95,7 +97,7 @@ async fn handle_root(
 #[cfg(feature = "server")]
 async fn handle_wallet(
     State(state): State<HttpState>,
-    peer: Option<ConnectInfo<SocketAddr>>,
+    peer: Option<Extension<ConnectInfo<SocketAddr>>>,
     Path(name): Path<String>,
     headers: HeaderMap,
     body: Bytes,
@@ -103,11 +105,17 @@ async fn handle_wallet(
     handle(state, peer_addr(peer), Some(name), headers, body).await
 }
 
-/// Unwrap the optional `ConnectInfo` extractor into the peer socket address, if known. It is
+/// Unwrap the optional connection-info extension into the peer socket address, if known. It is
 /// `None` for requests that arrive without connection info (the in-process `oneshot` tests).
+///
+/// The extension is read through `Option<Extension<ConnectInfo<_>>>` rather than
+/// `Option<ConnectInfo<_>>`: since axum 0.8 an `Option<T>` extractor needs
+/// `T: OptionalFromRequestParts`, which `ConnectInfo` does not implement while `Extension` does.
+/// `into_make_service_with_connect_info` inserts exactly this extension, so the two read the
+/// same value.
 #[cfg(feature = "server")]
-fn peer_addr(peer: Option<ConnectInfo<SocketAddr>>) -> Option<SocketAddr> {
-    peer.map(|ConnectInfo(addr)| addr)
+fn peer_addr(peer: Option<Extension<ConnectInfo<SocketAddr>>>) -> Option<SocketAddr> {
+    peer.map(|Extension(ConnectInfo(addr))| addr)
 }
 
 #[cfg(feature = "server")]

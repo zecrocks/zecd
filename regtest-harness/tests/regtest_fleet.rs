@@ -389,11 +389,20 @@ async fn regtest_fleet_many_view_wallets_are_scanned_together_and_stay_isolated(
         .expect("mine the late payment past the untrusted depth");
     funder.sync(&zebrad).await.expect("funder follows the tip");
     let tip = node_height(&zebrad).await;
-    let late = zecd_regtest_harness::ViewWallet {
+    // Wait for the *whole* fleet, not just the newcomer. The 12 blocks above advanced every
+    // shard's recorded chain tip, and `zcash_client_sqlite` reports a zero balance for as long as
+    // the spend anchor falls in a range the shard has not scanned yet - so a wallet whose shard is
+    // merely a few blocks behind reads 0 until it catches up. Waiting only for `late-arrival` left
+    // the balance assertions below racing the other shards' catch-up (seen in CI, with
+    // 'view-0000' reading 0). The assertions keep their teeth either way: if onboarding really did
+    // rewind a shard and lose funds, the balance is still wrong once every wallet reports the tip.
+    // This mirrors what the restart section further down already does.
+    let mut whole_fleet = wallets.clone();
+    whole_fleet.push(zecd_regtest_harness::ViewWallet {
         name: "late-arrival".to_string(),
         ..newcomer.clone()
-    };
-    wait_for_fleet(&zecd, std::slice::from_ref(&late), tip).await;
+    });
+    wait_for_fleet(&zecd, &whole_fleet, tip).await;
     assert_eq!(
         zec_to_zats(
             &zecd

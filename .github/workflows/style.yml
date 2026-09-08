@@ -28,13 +28,13 @@ jobs:
       # it aborts with "character code point value ... is too large", which silently turns the
       # gate into a no-op. `git grep -F` compares bytes, so it holds in any locale.
       #
-      # vendor/ is excluded: it is third-party source, so its punctuation is not ours to
-      # rewrite. THIRD-PARTY-LICENSES.txt is excluded for the same reason - it is generated
-      # (scripts/generate-licenses.sh) and consists entirely of upstream license texts, which
-      # must be reproduced verbatim.
+      # THIRD-PARTY-LICENSES.txt is excluded: it is generated (scripts/generate-licenses.sh)
+      # and consists entirely of upstream license texts, which must be reproduced verbatim.
+      # (A `vendor/` exclusion sat here too until `age` 0.12 let the vendored i18n-embed-fl
+      # patch go; there is no third-party source in the tree any more.)
       - name: No em-dashes (U+2014)
         run: |
-          if git grep -nF -e "$(printf '\xe2\x80\x94')" -- ':!vendor' ':!THIRD-PARTY-LICENSES.txt'; then
+          if git grep -nF -e "$(printf '\xe2\x80\x94')" -- ':!THIRD-PARTY-LICENSES.txt'; then
             echo "::error::Em-dash (U+2014) found at the locations above. House style is ASCII punctuation only: use a spaced hyphen ' - ', a comma, or parentheses."
             exit 1
           fi
@@ -46,7 +46,7 @@ jobs:
       # errors, so it reaches clients.
       - name: No ellipsis character (U+2026)
         run: |
-          if git grep -nF -e "$(printf '\xe2\x80\xa6')" -- ':!vendor' ':!THIRD-PARTY-LICENSES.txt'; then
+          if git grep -nF -e "$(printf '\xe2\x80\xa6')" -- ':!THIRD-PARTY-LICENSES.txt'; then
             echo "::error::Ellipsis character (U+2026) found at the locations above. House style is ASCII punctuation only: use three periods '...'."
             exit 1
           fi

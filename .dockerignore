@@ -7,7 +7,6 @@
 !Cargo.lock
 !rust-toolchain.toml
 !src
-!vendor
 # `example-config` embeds this with include_str!, so the build needs it in the context.
 !zecd.example.toml
 # License texts shipped in the runtime image (zecd is statically linked, so the

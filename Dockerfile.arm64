@@ -11,9 +11,9 @@
 # are upstream binary artifacts (Docker official images / Alpine repos), not
 # full-source-bootstrapped.
 #
-# Bit-for-bit reproducibility additionally requires the vendored i18n-embed-fl patch (see
-# [patch.crates-io] in Cargo.toml and the project docs "Gotchas") - without it, `age`'s fl! macro
-# flips two fluent args' order per build.
+# Bit-for-bit reproducibility used to additionally require a vendored i18n-embed-fl patch,
+# without which `age`'s fl! macro flipped two fluent args' order per build. `age` 0.12 depends
+# on i18n-embed-fl 0.10, which carries that fix, so the vendored copy is gone.
 #
 # MAINTENANCE: the exact apk pins (gcc/g++/musl-dev/binutils/protoc/...) are Alpine 3.24
 # versions; Alpine garbage-collects superseded versions from the CDN, so when a build starts
