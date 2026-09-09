@@ -752,6 +752,10 @@ impl Client<'_> {
 
     /// `unloadwallet "name"`: stop serving a wallet, without deleting anything
     /// (`rpc/wallet_methods.rs::unloadwallet`).
+    ///
+    /// The reply's `warning` says what the call did *not* do: the account stays in its shard and
+    /// is still scanned. Core's `load_on_startup` is deliberately not exposed here - zecd accepts
+    /// only the value it can honor (`true`), so there is nothing for a typed caller to choose.
     pub async fn unload_wallet(&self, name: &str) -> Result<WalletLoaded, ClientError> {
         self.call_typed("unloadwallet", vec![json!(name)]).await
     }

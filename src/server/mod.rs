@@ -633,6 +633,60 @@ mod tests {
         assert_eq!(body_json(r).await["result"].as_u64(), Some(500));
     }
 
+    /// `unloadwallet` takes its wallet from the positional argument *or* the `/wallet/<name>`
+    /// route, and refuses the call when the two name different wallets (Bitcoin Core's rule).
+    /// Preferring either one silently unloads a wallet the caller did not name, and the route is
+    /// only visible to the handler over HTTP - hence an end-to-end test rather than a unit one.
+    #[tokio::test]
+    async fn unloadwallet_refuses_a_route_that_contradicts_its_argument() {
+        use crate::network::ZNetwork;
+        use crate::wallet::{CoinWallet, SyncStatus, WalletHandle};
+
+        let reg = WalletRegistry::new("default".into());
+        for name in ["default", "w2"] {
+            reg.insert(CoinWallet::Zcash(WalletHandle::for_test(
+                name,
+                ZNetwork::Test,
+                SyncStatus::default(),
+            )));
+        }
+        let mut state = test_state();
+        state.app.registry = Arc::new(reg);
+
+        let call = |state: HttpState, uri: &'static str, params: &'static str| async move {
+            let body = format!(r#"{{"method":"unloadwallet","params":{params},"id":1}}"#);
+            let r = router(state)
+                .oneshot(req_to(uri, &body, Some(("u", "p"))))
+                .await
+                .unwrap();
+            body_json(r).await
+        };
+
+        // The endpoint says one wallet, the argument says another: -8, and nothing is unloaded.
+        let v = call(state.clone(), "/wallet/w2", r#"["default"]"#).await;
+        assert_eq!(v["error"]["code"], serde_json::json!(-8), "{v}");
+        assert!(state.app.registry.contains("default"), "{v}");
+        assert!(state.app.registry.contains("w2"), "{v}");
+
+        // `load_on_startup = false` is refused before any wallet is touched, so it answers the
+        // same way whichever wallet it names.
+        let v = call(state.clone(), "/", r#"["w2",false]"#).await;
+        assert_eq!(v["error"]["code"], serde_json::json!(-8), "{v}");
+        assert!(state.app.registry.contains("w2"), "{v}");
+
+        // The route alone unloads the routed wallet, and reports what it did not do.
+        let v = call(state.clone(), "/wallet/w2", "[]").await;
+        assert_eq!(v["result"]["name"], serde_json::json!("w2"), "{v}");
+        assert!(
+            v["result"]["warning"]
+                .as_str()
+                .is_some_and(|w| w.contains("still")),
+            "the warning must say the account is still scanned: {v}"
+        );
+        assert!(!state.app.registry.contains("w2"), "{v}");
+        assert!(state.app.registry.contains("default"), "{v}");
+    }
+
     /// A state whose default wallet publishes `status`, plus the sender - so a test can move the
     /// wallet's view of the chain the way the actor's `update_status` does. `fully_scanned` is
     /// deliberately left `None` by callers: `best_block` then answers purely from the published

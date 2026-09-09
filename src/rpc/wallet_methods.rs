@@ -185,18 +185,21 @@ pub(crate) async fn createwallet(state: &AppState, params: &[Value]) -> Result<V
 /// where they are, so a restart (or `loadwallet`) serves it again. Its shard also keeps scanning
 /// for it - the account is still in that database, and removing it would rewind the shard and
 /// re-scan every other wallet in it, which is a far larger action than "stop answering for this
-/// name".
+/// name". That is the whole operation: the name leaves the RPC surface and nothing else changes,
+/// which is why the response says so in its `warning` rather than leaving a caller to infer that
+/// unloading freed some scanning work. Retiring a wallet for good is a different job: remove its
+/// manifest, then rebuild the shard to stop scanning its account.
+///
+/// The arguments are validated **before** the wallet is resolved, so a malformed call answers the
+/// same way whichever wallet it names - the rule `getnewaddress` already follows for its
+/// `address_type`.
 pub(crate) fn unloadwallet(
     state: &AppState,
     params: &[Value],
     routed: Option<&str>,
 ) -> Result<Value, RpcError> {
-    // Core takes the name positionally *or* from the /wallet/<name> route.
-    let name = params
-        .first()
-        .and_then(|v| v.as_str())
-        .or(routed)
-        .ok_or_else(|| RpcError::invalid_parameter("unloadwallet requires a wallet name"))?;
+    let name = unloadwallet_target(params, routed)?;
+    reject_unsupported_load_on_startup(params.get(1))?;
     // Only fleet wallets are unloadable: `loadwallet` restores from the fleet manifests, so
     // unloading a configured `[wallets.<name>]` entry (the spending wallet included) would be
     // irreversible until a restart - and `listwalletdir` would keep calling it loadable.
@@ -212,7 +215,72 @@ pub(crate) fn unloadwallet(
             "Requested wallet does not exist or is not loaded: {name}"
         )));
     }
-    Ok(json!({ "name": name, "warning": "" }))
+    Ok(json!({
+        "name": name,
+        // Core's `warning` is where a caller learns what this call did not do, and here that is
+        // most of what "unload" usually implies: the account stays in its shard, which keeps
+        // trial-decrypting every block for it, so nothing is freed and nothing is deleted.
+        "warning": "the wallet is no longer served; its account stays in its shard and is still \
+                    scanned, so unloading frees no scanning work, and a restart or loadwallet \
+                    serves this wallet again",
+    }))
+}
+
+/// Resolve which wallet `unloadwallet` was asked to unload, from its positional argument and the
+/// `/wallet/<name>` route.
+///
+/// Bitcoin Core accepts either and **refuses** the two when they disagree, which is the behavior
+/// worth copying: one of them is a client bug, and quietly preferring either can unload a wallet
+/// the caller never named. Core's message is reproduced verbatim so a Core-shaped client's error
+/// handling matches.
+fn unloadwallet_target<'a>(
+    params: &'a [Value],
+    routed: Option<&'a str>,
+) -> Result<&'a str, RpcError> {
+    let named = match params.first() {
+        // Absent or an explicit null: Core's "take it from the endpoint" spelling.
+        None | Some(Value::Null) => None,
+        Some(Value::String(name)) => Some(name.as_str()),
+        Some(_) => {
+            return Err(RpcError::type_error(
+                "unloadwallet wallet_name must be a string",
+            ))
+        }
+    };
+    match (named, routed) {
+        (Some(named), Some(routed)) if named != routed => Err(RpcError::invalid_parameter(
+            "RPC endpoint wallet and wallet_name parameter specify different wallets",
+        )),
+        (Some(name), _) => Ok(name),
+        (None, Some(routed)) => Ok(routed),
+        (None, None) => Err(RpcError::invalid_parameter(
+            "unloadwallet requires a wallet name",
+        )),
+    }
+}
+
+/// Accept `unloadwallet`'s `load_on_startup` only where zecd can honor it.
+///
+/// The fleet manifest **is** zecd's startup list, and `unloadwallet` deliberately leaves it in
+/// place (that is what lets `loadwallet` restore the wallet). So `true` ("keep loading this wallet
+/// at startup") is already the truth and costs nothing to accept, while `false` ("stop loading it
+/// at startup") is a promise this RPC cannot keep - and silently ignoring it would have the wallet
+/// reappear at the next restart of a daemon the operator believes they retired it from. Refusing
+/// it names the manifest the operator actually has to remove, and follows `createwallet`, which
+/// likewise rejects the Core flags it cannot honor rather than dropping them.
+fn reject_unsupported_load_on_startup(value: Option<&Value>) -> Result<(), RpcError> {
+    match value {
+        None | Some(Value::Null) | Some(Value::Bool(true)) => Ok(()),
+        Some(Value::Bool(false)) => Err(RpcError::invalid_parameter(
+            "unloadwallet does not support load_on_startup = false: a fleet wallet's manifest is \
+             zecd's startup list, and unloading leaves it in place so loadwallet can restore the \
+             wallet. Delete the wallet's manifest from the fleet manifest directory to keep it \
+             unloaded across restarts (its account stays in its shard either way)",
+        )),
+        Some(_) => Err(RpcError::type_error(
+            "unloadwallet load_on_startup must be a boolean",
+        )),
+    }
 }
 
 /// `loadwallet "filename" ( load_on_startup )` - serve a wallet that is provisioned but not
@@ -3246,6 +3314,67 @@ mod tests {
     // so `display_address`'s single-receiver reduction is a no-op and the recorded string is
     // shown verbatim; any network works as the reduction context.
     const NET: crate::network::ZNetwork = crate::network::ZNetwork::Test;
+
+    /// The positional name and the `/wallet/<name>` route must not silently disagree: Bitcoin
+    /// Core refuses that call, and here the cost of guessing is unloading a wallet the caller
+    /// never named.
+    #[test]
+    fn unloadwallet_refuses_a_route_that_contradicts_its_argument() {
+        let params = vec![json!("view-0001")];
+        let err = unloadwallet_target(&params, Some("view-0002"))
+            .expect_err("a route naming another wallet is a client bug, not a preference");
+        assert_eq!(err.code, crate::error::codes::RPC_INVALID_PARAMETER);
+
+        // Agreeing is fine, and so is either one on its own.
+        assert_eq!(
+            unloadwallet_target(&params, Some("view-0001")).unwrap(),
+            "view-0001"
+        );
+        assert_eq!(unloadwallet_target(&params, None).unwrap(), "view-0001");
+        assert_eq!(
+            unloadwallet_target(&[], Some("view-0002")).unwrap(),
+            "view-0002"
+        );
+        // An explicit null is Core's spelling of "take it from the endpoint".
+        assert_eq!(
+            unloadwallet_target(&[Value::Null], Some("view-0002")).unwrap(),
+            "view-0002"
+        );
+    }
+
+    /// Neither source, or a name that is not a string, leaves nothing to unload.
+    #[test]
+    fn unloadwallet_needs_a_wallet_name_and_it_must_be_a_string() {
+        let err = unloadwallet_target(&[], None).expect_err("no name anywhere");
+        assert_eq!(err.code, crate::error::codes::RPC_INVALID_PARAMETER);
+        let err = unloadwallet_target(&[json!(42)], Some("view-0001"))
+            .expect_err("a non-string name must not fall through to the route");
+        assert_eq!(err.code, crate::error::codes::RPC_TYPE_ERROR);
+    }
+
+    /// `load_on_startup = false` asks for the wallet to stay unloaded across restarts, which
+    /// zecd cannot do while its manifest (the startup list) is deliberately left in place. It is
+    /// refused rather than ignored, so the wallet cannot silently return at the next restart.
+    #[test]
+    fn unloadwallet_rejects_a_load_on_startup_it_cannot_honor() {
+        let err = reject_unsupported_load_on_startup(Some(&json!(false)))
+            .expect_err("false is a promise this RPC cannot keep");
+        assert_eq!(err.code, crate::error::codes::RPC_INVALID_PARAMETER);
+        assert!(
+            err.message.contains("manifest"),
+            "the refusal must name the operator's actual remedy: {}",
+            err.message
+        );
+
+        // `true` is already true (the manifest stays), and absent/null asks for nothing.
+        reject_unsupported_load_on_startup(Some(&json!(true))).expect("true is already the case");
+        reject_unsupported_load_on_startup(Some(&Value::Null)).expect("null leaves it unchanged");
+        reject_unsupported_load_on_startup(None).expect("an omitted flag asks for nothing");
+
+        let err = reject_unsupported_load_on_startup(Some(&json!("yes")))
+            .expect_err("a non-boolean flag is a type error");
+        assert_eq!(err.code, crate::error::codes::RPC_TYPE_ERROR);
+    }
 
     /// Extract the shielded set from a [`ReceiverRequest`], or panic (test helper).
     fn shielded_set(r: ReceiverRequest) -> crate::pools::ReceiverSet {

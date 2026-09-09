@@ -721,6 +721,32 @@ def main() -> int:
     ck("the configured wallet is still served after the refusal",
        isinstance(rpc.call("getwalletinfo"), dict))
 
+    # load_on_startup: zecd keeps a fleet wallet's manifest when it unloads (that is what lets
+    # loadwallet restore it), so `true` is already the case and `false` is a promise this RPC
+    # cannot keep. It is refused rather than ignored - silently dropping it would have the wallet
+    # reappear at the next restart of a daemon the operator believes it was retired from.
+    try:
+        rpc.call("unloadwallet", "default", False)
+        ck("unloadwallet load_on_startup=false raises", False)
+    except JSONRPCException as e:
+        # -8, not the configured wallet's -4: arguments are validated before the wallet is
+        # resolved, so a malformed call answers the same way whichever wallet it names.
+        ck("unloadwallet load_on_startup=false -> -8", e.code == -8, e.code)
+    try:
+        rpc.call("unloadwallet", "default", True)
+        ck("unloadwallet load_on_startup=true raises (configured wallet)", False)
+    except JSONRPCException as e:
+        ck("unloadwallet load_on_startup=true is accepted, wallet still refused -> -4",
+           e.code == -4, e.code)
+    for label, params in (("wallet_name", (42,)), ("load_on_startup", ("default", "yes"))):
+        try:
+            rpc.call("unloadwallet", *params)
+            ck(f"unloadwallet non-typed {label} raises", False)
+        except JSONRPCException as e:
+            ck(f"unloadwallet {label} of the wrong type -> -3", e.code == -3, e.code)
+    ck("the configured wallet is still served after every argument refusal",
+       isinstance(rpc.call("getwalletinfo"), dict))
+
     print("== listunspent ==")
     lu = rpc.call("listunspent")
     ck("listunspent is list", isinstance(lu, list))
