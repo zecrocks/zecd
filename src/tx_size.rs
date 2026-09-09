@@ -217,23 +217,63 @@ pub fn step_shape<NoteRef>(step: &Step<NoteRef>, branch: BranchId) -> TxShape {
 /// Returns `usize::MAX` when `max_bytes` is 0 (the ceiling disabled), so a caller can `min` with
 /// it unconditionally.
 pub fn max_orchard_family_actions(max_bytes: usize) -> usize {
+    max_orchard_family_actions_alongside(max_bytes, TxShape::default())
+}
+
+/// [`max_orchard_family_actions`], for a transaction that also carries `alongside` (whose
+/// `ironwood_actions` is ignored). A merge pays for its destination output before its inputs.
+pub fn max_orchard_family_actions_alongside(max_bytes: usize, alongside: TxShape) -> usize {
+    largest_fitting(max_bytes, alongside, |shape, n| shape.ironwood_actions = n)
+}
+
+/// The largest number of Sapling spends that fit in `max_bytes`, alongside the rest of the
+/// transaction described by `alongside` (whose `sapling_spends` is ignored).
+///
+/// The Sapling counterpart of [`max_orchard_family_actions`], for the same reason: a merge
+/// truncates its selection to what fits rather than refusing it.
+pub fn max_sapling_spends(max_bytes: usize, alongside: TxShape) -> usize {
+    largest_fitting(max_bytes, alongside, |shape, n| shape.sapling_spends = n)
+}
+
+/// The largest number of transparent inputs that fit in `max_bytes`, alongside the rest of the
+/// transaction described by `alongside` (whose `transparent_inputs` is ignored).
+pub fn max_transparent_inputs(max_bytes: usize, alongside: TxShape) -> usize {
+    largest_fitting(max_bytes, alongside, |shape, n| {
+        shape.transparent_inputs = n
+    })
+}
+
+/// The largest `n` for which `set(shape, n)` still estimates within `max_bytes`, or
+/// `usize::MAX` when `max_bytes` is 0 (the ceiling disabled) so a caller can `min` with it
+/// unconditionally.
+///
+/// Solved by bisection rather than division because a transaction's size is not quite linear in
+/// any one count: a bundle's fixed fields and its proof's constant term appear only once the
+/// count is non-zero, and the compact-size widths step.
+fn largest_fitting(max_bytes: usize, shape: TxShape, set: impl Fn(&mut TxShape, usize)) -> usize {
     if max_bytes == 0 {
         return usize::MAX;
     }
-    // The bundle's own overhead is not linear in the action count (the proof's constant term,
-    // the compact sizes), so solve by walking down from the linear over-estimate rather than
-    // dividing. At most a couple of iterations: only the compact-size widths step.
-    let per_action = ORCHARD_ACTION_BYTES + ORCHARD_PROOF_PER_ACTION_BYTES;
-    let mut actions = max_bytes / per_action;
-    while actions > 0
-        && estimate_bytes(TxShape {
-            ironwood_actions: actions,
-            ..TxShape::default()
-        }) > max_bytes
-    {
-        actions -= 1;
+    let fits = |n: usize| {
+        let mut probe = shape;
+        set(&mut probe, n);
+        estimate_bytes(probe) <= max_bytes
+    };
+    if !fits(0) {
+        // The rest of the transaction alone is already over: no count of this input helps.
+        return 0;
     }
-    actions
+    // An upper bound that certainly does not fit: every input costs at least one byte.
+    let (mut lo, mut hi) = (0usize, max_bytes);
+    while lo < hi {
+        let mid = lo + (hi - lo).div_ceil(2);
+        if fits(mid) {
+            lo = mid;
+        } else {
+            hi = mid - 1;
+        }
+    }
+    lo
 }
 
 #[cfg(test)]
@@ -352,10 +392,90 @@ mod tests {
         );
     }
 
-    /// A disabled ceiling never truncates a selection.
+    /// A disabled ceiling never truncates a selection, whichever input it is asked about.
     #[test]
-    fn a_disabled_ceiling_admits_any_action_count() {
+    fn a_disabled_ceiling_admits_any_count() {
+        let anything = TxShape {
+            ironwood_actions: 3,
+            transparent_outputs: 1,
+            ..TxShape::default()
+        };
         assert_eq!(max_orchard_family_actions(0), usize::MAX);
+        assert_eq!(max_transparent_inputs(0, anything), usize::MAX);
+        assert_eq!(max_sapling_spends(0, anything), usize::MAX);
+    }
+
+    /// Every input ceiling is the largest count that fits *alongside the rest of the
+    /// transaction*, and one more does not - the property `z_mergetoaddress` truncates its
+    /// selection with, so that a merge converges instead of being refused.
+    #[test]
+    fn every_input_ceiling_is_the_largest_count_that_fits_alongside_the_rest() {
+        // A merge's own destination output, the shape the caps are solved beside.
+        let dest = TxShape {
+            orchard_actions: 1,
+            transparent_outputs: 1,
+            ..TxShape::default()
+        };
+        /// `(label, the ceiling under test, how to set that input's count on a shape)`.
+        type Case = (
+            &'static str,
+            fn(usize, TxShape) -> usize,
+            fn(&mut TxShape, usize),
+        );
+        let cases: [Case; 3] = [
+            (
+                "orchard family",
+                max_orchard_family_actions_alongside,
+                |shape, n| shape.ironwood_actions = n,
+            ),
+            ("sapling", max_sapling_spends, |shape, n| {
+                shape.sapling_spends = n
+            }),
+            ("transparent", max_transparent_inputs, |shape, n| {
+                shape.transparent_inputs = n
+            }),
+        ];
+        for (name, ceiling, set) in cases {
+            for max_bytes in [10_000, crate::config::DEFAULT_MAX_TX_BYTES, 1_000_000] {
+                let n = ceiling(max_bytes, dest);
+                let fits = |count| {
+                    let mut probe = dest;
+                    set(&mut probe, count);
+                    estimate_bytes(probe) <= max_bytes
+                };
+                assert!(fits(n), "{name}: {n} should fit in {max_bytes}");
+                assert!(
+                    !fits(n + 1),
+                    "{name}: {} should not fit in {max_bytes}",
+                    n + 1
+                );
+            }
+        }
+    }
+
+    /// A ceiling smaller than the transaction's own fixed cost admits nothing, rather than
+    /// wrapping into a huge count. The merge turns this into a message naming the knob.
+    #[test]
+    fn a_ceiling_below_the_fixed_cost_admits_nothing() {
+        let dest = TxShape {
+            ironwood_actions: 1,
+            ..TxShape::default()
+        };
+        assert_eq!(max_transparent_inputs(100, dest), 0);
+        assert_eq!(max_sapling_spends(100, dest), 0);
+    }
+
+    /// Under the shipped ceiling a defaults `z_mergetoaddress` is bounded by *size*, not by
+    /// zcashd's 200-note `shielded_limit`: the byte cap is the smaller of the two, so a merge
+    /// on a large wallet truncates to it and converges over more rounds.
+    #[test]
+    fn the_default_ceiling_binds_before_the_default_shielded_limit() {
+        const DEFAULT_SHIELDED_LIMIT: usize = 200;
+        let fit = max_orchard_family_actions(crate::config::DEFAULT_MAX_TX_BYTES);
+        assert!(
+            fit < DEFAULT_SHIELDED_LIMIT,
+            "the size ceiling should bind first, but {fit} notes fit"
+        );
     }
 
     #[test]

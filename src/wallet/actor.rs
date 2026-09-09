@@ -1831,10 +1831,15 @@ fn build_signed_transparent_tx(
     Ok((txid, raw))
 }
 
-/// The most transparent inputs one `z_mergetoaddress` call may select, mirroring librustzcash's
-/// shielding block-space bound (`shielding_max_inputs` at its default 10% of the 2,000,000-byte
-/// block over the ~150-byte P2PKH input size). Both the caller's `transparent_limit` and this
-/// cap apply; zcashd's `transparent_limit = 0` means "as many as will fit", which is this.
+/// The most transparent inputs one `z_mergetoaddress` call may select when `[spend]
+/// max_tx_bytes` is disabled, mirroring librustzcash's shielding block-space bound
+/// (`shielding_max_inputs` at its default 10% of the 2,000,000-byte block over the ~150-byte
+/// P2PKH input size).
+///
+/// With the size ceiling enabled - the default - it is the *smaller* bound that applies, and
+/// that is `max_tx_bytes`: 10% of a block is 200 KB, still short of what a node will relay, but
+/// only just. Both the caller's `transparent_limit` and whichever of these binds apply;
+/// zcashd's `transparent_limit = 0` means "as many as will fit", which is that minimum.
 const MERGE_MAX_TRANSPARENT_INPUTS: usize = (2_000_000 * 10 / 100) / 150;
 
 /// The exact ZIP-317 fee for a fully-transparent merge: `n_in` standard P2PKH inputs and ONE
@@ -6226,14 +6231,39 @@ impl WalletActor {
                         "Could not find any funds to merge.",
                     ));
                 }
-                // Smallest-first (outpoint tiebreak for determinism), then the count limit and
-                // the block-space cap.
+                // Smallest-first (outpoint tiebreak for determinism), then the count limit,
+                // the block-space cap, and what a node will relay.
+                //
+                // The last of those truncates rather than refusing, as everywhere else in a
+                // merge: the call exists to be repeated, and its `remaining*` counts already
+                // say so. A transparent input is cheap next to a shielded one (~150 bytes
+                // against ~3.2 KB), so this binds only on a wallet with well over a thousand
+                // UTXOs - but that is exactly the wallet a merge is for.
+                let dest_shape = match &dest_transparent {
+                    Some(_) => tx_size::TxShape {
+                        transparent_outputs: 1,
+                        ..Default::default()
+                    },
+                    // A shielded payout is one Orchard-family action (or a Sapling output,
+                    // which is smaller); count the larger.
+                    None => tx_size::TxShape {
+                        ironwood_actions: 1,
+                        ..Default::default()
+                    },
+                };
                 utxos.sort_by_key(|u| (u.value(), *u.outpoint().hash(), u.outpoint().n()));
                 utxos.truncate(
                     transparent_limit
                         .unwrap_or(usize::MAX)
-                        .min(MERGE_MAX_TRANSPARENT_INPUTS),
+                        .min(MERGE_MAX_TRANSPARENT_INPUTS)
+                        .min(tx_size::max_transparent_inputs(max_tx_bytes, dest_shape)),
                 );
+                if utxos.is_empty() {
+                    return Err(RpcError::invalid_parameter(format!(
+                        "[spend] max_tx_bytes = {max_tx_bytes} is too small to merge even one \
+                         transparent output; raise it (0 disables the ceiling)"
+                    )));
+                }
                 let merging_count = utxos.len() as u64;
                 let merging_value: u64 = utxos.iter().map(|u| u64::from(u.value())).sum();
 
@@ -6404,13 +6434,45 @@ impl WalletActor {
                 }
 
                 let limit = shielded_limit.unwrap_or(usize::MAX);
+                // What the transaction costs before any input is selected, so the byte caps
+                // below are solved for the inputs alone.
+                let merge_dest_shape = tx_size::TxShape {
+                    // A transparent payout (z->t) adds an output; a shielded destination
+                    // shares an action with one of the spends and adds nothing.
+                    transparent_outputs: usize::from(dest_transparent.is_some()),
+                    // One spare Orchard-family bundle. A post-NU6.3 selection that draws
+                    // legacy Orchard V2 notes into an Ironwood output splits into *two*
+                    // bundles, and the second one's fixed fields and proof constant are not in
+                    // the per-action term the caps below solve against. A whole extra action
+                    // covers that constant with room over: it costs the selection one note,
+                    // where under-counting costs it the refusal this truncation exists to
+                    // avoid.
+                    orchard_actions: 1,
+                    ..Default::default()
+                };
                 // The Orchard-family action cap: one payment output at most, so the family's
                 // proposal actions = max(spends, 1) = spends; `enforce_orchard_action_limit`
                 // runs on the built proposal as a backstop.
                 let family_fits_action_limit =
                     orchard_action_limit == 0 || orchard_family_n <= orchard_action_limit;
+                // And the size ceiling, in the same shape. A merge is the one caller that
+                // deliberately selects as many inputs as it can, so `max_tx_bytes` binds here
+                // long before it binds on any ordinary send: at the shipped 250 KB about 78
+                // Orchard-family notes fit, against a `shielded_limit` default of 200. Unlike
+                // a send, a merge *truncates* to what fits rather than refusing - it exists to
+                // be called repeatedly, and its `remaining*` counts already tell the caller to
+                // call again - so an over-large selection takes the manual path below, which
+                // caps at the ceiling, instead of failing at `enforce_max_tx_bytes`.
+                let family_bytes_cap =
+                    tx_size::max_orchard_family_actions_alongside(max_tx_bytes, merge_dest_shape);
+                let sapling_bytes_cap = tx_size::max_sapling_spends(max_tx_bytes, merge_dest_shape);
+                let fits_size_ceiling =
+                    orchard_family_n <= family_bytes_cap && sapling_n <= sapling_bytes_cap;
 
-                if sapling_n + orchard_family_n <= limit && family_fits_action_limit {
+                if sapling_n + orchard_family_n <= limit
+                    && family_fits_action_limit
+                    && fits_size_ceiling
+                {
                     // No limit binds: delegate the whole proposal (selection, fee, pool
                     // routing, TEX rejection) to librustzcash's send-max primitive.
                     let proposal = propose_send_max_transfer::<_, _, _, Infallible>(
@@ -6463,12 +6525,21 @@ impl WalletActor {
                     // family holding more notes), smallest-first within it.
                     let family_is_sapling = sapling_n >= orchard_family_n;
                     let cap = if family_is_sapling {
-                        limit
+                        limit.min(sapling_bytes_cap)
                     } else if orchard_action_limit > 0 {
-                        limit.min(orchard_action_limit)
+                        limit.min(orchard_action_limit).min(family_bytes_cap)
                     } else {
-                        limit
+                        limit.min(family_bytes_cap)
                     };
+                    // A ceiling too small for even one note is a configuration error, not an
+                    // empty selection: truncating to zero would surface as "insufficient
+                    // funds" against a wallet that plainly has some.
+                    if cap == 0 {
+                        return Err(RpcError::invalid_parameter(format!(
+                            "[spend] max_tx_bytes = {max_tx_bytes} is too small to merge even \
+                             one note; raise it (0 disables the ceiling)"
+                        )));
+                    }
                     let mut fam: Vec<_> = notes
                         .into_vec(&RetainAllNotes)
                         .into_iter()

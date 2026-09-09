@@ -710,17 +710,26 @@ async fn regtest_mergetoaddress_consolidates_a_fragmented_wallet() {
     // `zebrad` and `funder` clean up on drop.
 }
 
-/// The >200-notes case: a defaults call against a 225-note wallet reports exactly
-/// `mergingNotes: 200` (zcashd's default `shielded_limit` binding on the manual selection
-/// path), and the follow-up drains the rest. ~200 actions of proving on both the fan-out and
-/// the merge sides puts this well past the PR tier's envelope, so it runs on the extended tier
-/// (`ZECD_REGTEST_EXTENDED=1`: weekly schedule + workflow dispatch), like the other heavy e2es.
+/// The >200-notes case, and the size ceiling that binds before it.
+///
+/// A defaults call against a 225-note wallet reports exactly `mergingNotes: 200` (zcashd's
+/// default `shielded_limit` binding on the manual selection path), and the follow-up drains
+/// the rest. Before that, a deliberately small `[spend] max_tx_bytes` proves the other half of
+/// the same behaviour: a merge over the size ceiling **truncates** its selection rather than
+/// failing, which is what lets a fragmented wallet consolidate at all under the shipped
+/// default (about 78 notes fit in 250000, so the byte cap is what a real deployment meets
+/// first, not `shielded_limit`).
+///
+/// ~200 actions of proving on both the fan-out and the merge sides puts this well past the PR
+/// tier's envelope, so it runs on the extended tier (`ZECD_REGTEST_EXTENDED=1`: weekly
+/// schedule + workflow dispatch), like the other heavy e2es.
 ///
 /// The 200-input merge serializes to ~634 KB, which a stock zakura node will not relay (its
 /// `[mempool] max_transaction_bytes` defaults to 250 KB - a node-local policy zebra does not
-/// have). The harness raises that ceiling to the consensus block limit on the zakura leg, so
-/// what this asserts stays the *selection* limit; see `mempool_policy_section` in the harness
-/// for why that hides nothing a default zecd deployment would meet.
+/// have). The harness raises that ceiling to the consensus block limit on the zakura leg, and
+/// `merge_stack` disables zecd's own, so what the 200 asserts stays the *selection* limit; see
+/// `mempool_policy_section` in the harness for why that hides nothing a default zecd
+/// deployment would meet.
 #[tokio::test]
 async fn regtest_mergetoaddress_default_shielded_limit() {
     if !extended_enabled() {
@@ -762,7 +771,55 @@ async fn regtest_mergetoaddress_default_shielded_limit() {
     );
     phase("fragmented: 225 notes");
 
-    // Defaults: the 200-note default shielded_limit binds against 225 eligible.
+    // A binding `[spend] max_tx_bytes` **truncates** the selection rather than refusing it.
+    //
+    // This is the difference between a merge and a send. A send pays what the caller asked or
+    // nothing, so an over-large one is an error; a merge exists to be called repeatedly and
+    // already reports what it left behind, so the size ceiling is just another limit to select
+    // under. Under the shipped 250000 the byte cap is what binds first on a wallet like this
+    // one - about 78 notes against a `shielded_limit` of 200 - so without truncation a default
+    // deployment could not consolidate a fragmented wallet at all.
+    //
+    // Set the ceiling small enough that the cap is unmistakably *it* rather than any note
+    // limit, and small enough that the round it merges leaves the wallet above 200 notes, so
+    // the `shielded_limit` assertions below still have something to bind against. The exact
+    // count is the byte arithmetic's business (unit-tested in `tx_size`); what matters here is
+    // that the call succeeded, selected far fewer notes than `shielded_limit` would have, and
+    // accounted for the rest.
+    zecd.edit_config(|toml| toml.replace("max_tx_bytes = 0", "max_tx_bytes = 20000"))
+        .expect("lower the size ceiling in zecd.toml");
+    zecd.reload_config().expect("SIGHUP the daemon");
+    let resp = zecd
+        .call("z_mergetoaddress", json!([["ANY_ORCHARD"], own_ua]))
+        .await
+        .expect("a size-capped merge is planned, not refused");
+    let capped = resp["mergingNotes"].as_u64().expect("mergingNotes");
+    assert!(
+        (1..20).contains(&capped),
+        "the size ceiling should have bound the selection well below shielded_limit: {resp}"
+    );
+    assert_eq!(
+        resp["remainingNotes"].as_u64(),
+        Some(225 - capped),
+        "and the rest must be reported as remaining: {resp}"
+    );
+    let opid = resp["opid"].as_str().expect("opid").to_string();
+    await_op(&zecd, &opid, "size-capped merge").await;
+    confirm_untrusted(&zebrad, &zecd).await;
+    // The merged notes are gone and their single output has taken their place.
+    let remaining = 225 - capped + 1;
+    let (_, z_after_cap) = unspent_counts(&zecd).await;
+    assert_eq!(
+        z_after_cap as u64, remaining,
+        "a truncated merge consolidated its selection and left the rest"
+    );
+    phase(&format!("size-capped merge done ({capped} notes)"));
+
+    zecd.edit_config(|toml| toml.replace("max_tx_bytes = 20000", "max_tx_bytes = 0"))
+        .expect("restore the size ceiling");
+    zecd.reload_config().expect("SIGHUP the daemon again");
+
+    // Defaults, with only the note limit left to bind: 200 against `remaining` eligible.
     let resp = zecd
         .call("z_mergetoaddress", json!([["ANY_ORCHARD"], own_ua]))
         .await
@@ -772,7 +829,11 @@ async fn regtest_mergetoaddress_default_shielded_limit() {
         json!(200),
         "zcashd's default shielded_limit is 200: {resp}"
     );
-    assert_eq!(resp["remainingNotes"], json!(25), "{resp}");
+    assert_eq!(
+        resp["remainingNotes"].as_u64(),
+        Some(remaining - 200),
+        "{resp}"
+    );
     let opid = resp["opid"].as_str().expect("opid").to_string();
     await_op(&zecd, &opid, "default-limit note merge").await;
     confirm_untrusted(&zebrad, &zecd).await;
@@ -783,7 +844,11 @@ async fn regtest_mergetoaddress_default_shielded_limit() {
         .call("z_mergetoaddress", json!([["ANY_ORCHARD"], own_ua]))
         .await
         .expect("drain merge");
-    assert_eq!(resp["mergingNotes"], json!(26), "{resp}");
+    assert_eq!(
+        resp["mergingNotes"].as_u64(),
+        Some(remaining - 200 + 1),
+        "{resp}"
+    );
     assert_eq!(resp["remainingNotes"], json!(0), "{resp}");
     let opid = resp["opid"].as_str().expect("opid").to_string();
     await_op(&zecd, &opid, "drain merge").await;
