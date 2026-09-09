@@ -152,6 +152,29 @@ fn check_fleet(config: &AppConfig, findings: &mut Vec<Finding>) {
 
 /// `[spend]` settings whose sound value depends on the environment rather than on the config.
 fn check_spend(config: &AppConfig, findings: &mut Vec<Finding>) {
+    // The two spend bounds are in different units and neither implies the other, so a config
+    // can set an action cap that no transaction under the size ceiling could ever reach. That
+    // is not an error - the ceiling still stops the send, correctly - but it means the cap the
+    // operator tuned is not the one that will bind, and the refusal they eventually get will
+    // name the other knob. Say so at check time instead.
+    let ceiling = config.spend.max_tx_bytes;
+    let actions_that_fit = crate::tx_size::max_orchard_family_actions(ceiling);
+    if ceiling > 0
+        && (config.spend.orchard_action_limit == 0
+            || config.spend.orchard_action_limit > actions_that_fit)
+    {
+        let cap = match config.spend.orchard_action_limit {
+            0 => "is disabled".to_string(),
+            n => format!("is {n}"),
+        };
+        findings.push(Finding::warning(format!(
+            "[spend] orchard_action_limit {cap}, but [spend] max_tx_bytes = {ceiling} holds \
+             only about {actions_that_fit} Orchard actions - so a large send is refused for \
+             its size rather than its action count. That is the intended order (the size \
+             ceiling is what a node will actually relay); raise max_tx_bytes only if every \
+             node between this wallet and a miner accepts the larger size"
+        )));
+    }
     // The drain only runs for as long as the *supervisor* lets the process live after its stop
     // signal, and every common supervisor's default is at or below 90s: systemd's
     // `DefaultTimeoutStopSec` is 90, Kubernetes' `terminationGracePeriodSeconds` 30, and

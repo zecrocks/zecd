@@ -137,6 +137,12 @@ async fn merge_stack(zebrad_bin: &std::path::Path) -> (Zebrad, Funder, Zecd, Opt
     // window)"). At 80 that ingest measured ~47s per round against ~78s for the funder's send.
     cfg.transparent_gap_limit = Some(40);
     cfg.orchard_action_limit = Some(0);
+    // And the transaction-size ceiling, for the same reason: these tests measure
+    // `shielded_limit`, and zcashd's 200-note default builds a ~634 KB transaction - larger
+    // than any node relays, which is exactly what `[spend] max_tx_bytes` refuses by default.
+    // Disabling it here keeps the assertion on the limit under test; the node's own relay
+    // policy is raised to match on the zakura leg (see `mempool_policy_section`).
+    cfg.max_tx_bytes = Some(0);
     let zecd_lwd = attach_backend(&mut cfg, zebrad.rpc_port)
         .await
         .expect("attach zecd backend");
@@ -502,6 +508,63 @@ async fn regtest_mergetoaddress_consolidates_a_fragmented_wallet() {
     zecd.edit_config(|toml| toml.replace("\nnot_a_real_key = true\n", "\n"))
         .expect("undo the invalid config");
     phase("SIGHUP reloads [spend] orchard_action_limit");
+
+    // 4a'. The same, for the *other* send bound: `[spend] max_tx_bytes`.
+    //
+    // It is worth its own probe rather than folding into the block above, because the two
+    // bounds fail for different reasons and an operator has to be able to tell which one
+    // stopped a send. This wallet has the ceiling disabled (see `merge_stack`), so drop it to
+    // a size no shielded transaction can fit in - one action alone is about 6 KB - and the
+    // next send must be refused for its *size*, naming `max_tx_bytes` and not the action cap.
+    //
+    // This is also the only live proof that the estimate is wired into the send path at all:
+    // the arithmetic is unit-tested offline against ZIP 225 and against a transaction zakura
+    // measured, but only a real proposal, built against a real wallet, exercises the path from
+    // proposal to refusal.
+    zecd.edit_config(|toml| toml.replace("max_tx_bytes = 0", "max_tx_bytes = 1000"))
+        .expect("lower the size ceiling in zecd.toml");
+    zecd.reload_config().expect("SIGHUP the daemon");
+
+    let too_large = wait_for_send_outcome(
+        &zecd,
+        &own_ua,
+        Some(-8),
+        "the lowered size ceiling takes effect",
+    )
+    .await;
+    assert_eq!(
+        too_large.0,
+        Some(-8),
+        "a send over the reloaded size ceiling is rejected: {:?}",
+        too_large.1
+    );
+    assert!(
+        too_large.1.contains("max_tx_bytes"),
+        "the refusal names the knob: {}",
+        too_large.1
+    );
+    assert!(
+        !too_large.1.contains("orchard_action_limit"),
+        "and not the other bound, which is not what stopped this send: {}",
+        too_large.1
+    );
+
+    zecd.edit_config(|toml| toml.replace("max_tx_bytes = 1000", "max_tx_bytes = 0"))
+        .expect("restore the size ceiling");
+    zecd.reload_config().expect("SIGHUP the daemon again");
+    let restored = wait_for_send_outcome(
+        &zecd,
+        &own_ua,
+        None,
+        "the restored size ceiling takes effect",
+    )
+    .await;
+    assert_eq!(
+        restored.0, None,
+        "with the ceiling back at 0 the send succeeds: {:?}",
+        restored.1
+    );
+    phase("SIGHUP reloads [spend] max_tx_bytes");
 
     // 4b. `z_sendmany` accepts the same shielded pool-family wildcards as the merge above.
     //     This wallet's notes are all Orchard-family, so an `ANY_ORCHARD` send must fund and

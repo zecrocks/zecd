@@ -448,14 +448,29 @@ privacy_policy = "AllowRevealedRecipients"
 # deep builder error when a send has too many recipients. Raise it for large batched payouts;
 # set it to 0 to disable the cap entirely.
 #
-# This is the one setting a running daemon re-reads on SIGHUP, because a wallet whose notes have
-# fragmented (a miner receiving shielded coinbase, say) fails every payout until it moves, and
-# restarting a live payment wallet to change a number is a poor answer. Consider consolidating
-# with z_mergetoaddress before raising it - see "Fragmented wallets" in the README - since
+# This is one of two settings a running daemon re-reads on SIGHUP (max_tx_bytes below is the
+# other), because a wallet whose notes have fragmented (a miner receiving shielded coinbase,
+# say) fails every payout until it moves, and restarting a live payment wallet to change a
+# number is a poor answer. Consider consolidating with z_mergetoaddress before raising it, since
 # proving cost and memory scale with the action count, and every other send waits behind one
 # large transaction. There is deliberately no RPC that changes this: the cap bounds what a
 # single call can make the daemon prove, so raising it takes access to the process.
 orchard_action_limit = 50
+# Largest transaction, in bytes, that a send may build (0 disables the ceiling). This is a
+# *relay* bound, not a consensus one, and it is the binding one: consensus only asks that a
+# transaction fit in a 2 MB block, while a node refuses to forward a much smaller one - zakura's
+# default mempool policy is exactly the 250000 below. Past it a transaction is not rejected so
+# much as never mined, after the wallet has paid for its proof, so the ceiling is applied when
+# the transaction is planned rather than when it is broadcast.
+#
+# It bounds bytes where orchard_action_limit bounds actions, and neither implies the other: an
+# Orchard-family action costs about 3.2 KB, so the 50-action cap above sits comfortably inside
+# this, while a post-NU6.3 send carrying both an Orchard and an Ironwood bundle pays for two
+# proofs and reaches the ceiling sooner than its action count suggests. Raise it only if every
+# node between this wallet and a miner raises its own policy to match: relay is hop by hop, so
+# a larger transaction gets into one mempool and no further. `zecd config check` warns when
+# these two settings disagree about which will bind first.
+max_tx_bytes = 250000
 # Change splitting. A send divides its change into up to target_note_count notes, so that the
 # next send has confirmed inputs to draw on without waiting for the previous one; change is only
 # split while every resulting note would be at least min_split_output_value zatoshis, so a small

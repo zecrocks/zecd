@@ -193,5 +193,6 @@ pub mod server;
 pub mod socks;
 pub mod state;
 pub mod sync;
+pub mod tx_size;
 pub mod typed;
 pub mod wallet;

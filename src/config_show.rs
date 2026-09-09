@@ -197,6 +197,7 @@ pub fn render(config: &AppConfig) -> String {
         "orchard_action_limit",
         config.spend.orchard_action_limit,
     );
+    kv(&mut s, "max_tx_bytes", config.spend.max_tx_bytes);
     kv(&mut s, "cache_proving_key", config.spend.cache_proving_key);
     kv(&mut s, "pipeline_proving", config.spend.pipeline_proving);
     kv(&mut s, "target_note_count", config.spend.target_note_count);

@@ -2038,6 +2038,11 @@ pub struct ZecdConfig {
     /// (zecd defaults to 50). The stress test lifts the cap so its big fan-out/sweep sends aren't
     /// rejected.
     pub orchard_action_limit: Option<usize>,
+    /// `[spend] max_tx_bytes`: `Some(n)` writes the transaction-size ceiling (`0` disables it),
+    /// `None` omits it (zecd defaults to 250000, matching zakura's relay policy). The merge e2e
+    /// disables it for the same reason it disables the action cap: it is measuring a third
+    /// limit, `shielded_limit`, and a 200-note merge is larger than any node relays.
+    pub max_tx_bytes: Option<usize>,
     /// Optional `[pools]` section as `(enabled, default_receivers)`. `None` omits the section
     /// (the Orchard-only default). Used by the multi-pool (Sapling) e2e.
     pub pools: Option<(Vec<String>, Vec<String>)>,
@@ -2108,6 +2113,7 @@ impl ZecdConfig {
             privacy_policy: None,
             pipeline_proving: None,
             orchard_action_limit: None,
+            max_tx_bytes: None,
             pools: None,
             transparent: false,
             transparent_gap_limit: None,
@@ -3114,7 +3120,8 @@ fn write_zecd_toml(datadir: &Path, cfg: &ZecdConfig) -> Result<()> {
     };
     // Optional `[spend]` knobs: `cache_proving_key` (proving-key-cache benchmark),
     // `privacy_policy` (fully-transparent spend e2e), `pipeline_proving` and
-    // `orchard_action_limit` (stress test). Emit the section only if at least one is set.
+    // `orchard_action_limit` (stress test), `max_tx_bytes` (merge e2e). Emit the section only
+    // if at least one is set.
     let spend_section = {
         let mut lines = String::new();
         if let Some(b) = cfg.cache_proving_key {
@@ -3128,6 +3135,9 @@ fn write_zecd_toml(datadir: &Path, cfg: &ZecdConfig) -> Result<()> {
         }
         if let Some(n) = cfg.orchard_action_limit {
             lines.push_str(&format!("orchard_action_limit = {n}\n"));
+        }
+        if let Some(n) = cfg.max_tx_bytes {
+            lines.push_str(&format!("max_tx_bytes = {n}\n"));
         }
         if lines.is_empty() {
             String::new()

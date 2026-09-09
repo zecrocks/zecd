@@ -83,12 +83,16 @@ async fn regtest_stress_many_notes() {
     // The funder's own bare t-address, used here as an external transparent counterparty.
     let funder_taddr = funder.transparent_address().to_string();
 
-    // --- zecd with the pipeline on (and the action cap lifted so big fan-out/sweep sends aren't
-    //     rejected by `orchard_action_limit`). cache_proving_key stays default-on: the pipeline
-    //     only engages on that cached-Orchard PCZT path. ---
+    // --- zecd with the pipeline on, and both send bounds lifted so the big fan-out/sweep sends
+    //     aren't rejected: `orchard_action_limit` bounds the action count and `max_tx_bytes`
+    //     the serialized size, and a deliberately many-input sweep exceeds both. A long proof
+    //     is the point here - it is what the actor must stay live through - so this test wants
+    //     the transaction the defaults exist to prevent. cache_proving_key stays default-on:
+    //     the pipeline only engages on that cached-Orchard PCZT path. ---
     let mut cfg = ZecdConfig::new(zebrad.rpc_port, pick_port().expect("pick zecd rpc port"));
     cfg.pipeline_proving = Some(true);
     cfg.orchard_action_limit = Some(0);
+    cfg.max_tx_bytes = Some(0);
     let zecd = Zecd::start(&cfg)
         .await
         .expect("start zecd against regtest zebra");

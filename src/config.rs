@@ -765,6 +765,23 @@ pub struct SpendConfig {
     /// bounds memory/proving cost and gives a clean `-8` instead of a deep librustzcash error
     /// when a `z_sendmany` has too many recipients. `0` disables the cap. Default 50.
     pub orchard_action_limit: usize,
+    /// Ceiling on the serialized size, in bytes, of a transaction a send may build. `0`
+    /// disables it. Default [`DEFAULT_MAX_TX_BYTES`].
+    ///
+    /// This is a *relay* bound, not a consensus one, and it is the binding one: consensus only
+    /// requires a transaction to fit in a block (2 MB), while a node forwards a much smaller
+    /// one. A transaction over what nodes relay is not rejected so much as never mined - after
+    /// the wallet has paid for its proof - so the ceiling is applied when the proposal is
+    /// built, before proving.
+    ///
+    /// It bounds bytes where `orchard_action_limit` bounds actions, and neither implies the
+    /// other: an Orchard-family action costs ~3.2 KB, so the shipped action cap of 50 sits
+    /// comfortably inside a 250 KB ceiling, while a post-NU6.3 send carrying both an Orchard
+    /// and an Ironwood bundle pays two proofs and reaches the ceiling sooner than its action
+    /// count suggests. Raise it only if every node between this wallet and a miner raises its
+    /// own policy to match - relay is hop by hop, so a locally raised limit gets a transaction
+    /// into one mempool and no further.
+    pub max_tx_bytes: usize,
     /// Prove sends through the PCZT roles with the Orchard proving keys warmed in the background
     /// at startup (and their prepared commitment tables armed), instead of the fused
     /// `create_proposed_transactions` path. On the Zakura stack both paths share one
@@ -820,6 +837,7 @@ impl Default for SpendConfig {
             trust_own_transactions: true,
             privacy: SendPrivacy::AllowRevealedRecipients,
             orchard_action_limit: DEFAULT_ORCHARD_ACTION_LIMIT,
+            max_tx_bytes: DEFAULT_MAX_TX_BYTES,
             cache_proving_key: true,
             pipeline_proving: false,
             target_note_count: DEFAULT_TARGET_NOTE_COUNT,
@@ -870,12 +888,14 @@ impl SpendConfig {
 #[derive(Debug, Clone)]
 pub struct SpendLimits {
     orchard_action_limit: Arc<AtomicUsize>,
+    max_tx_bytes: Arc<AtomicUsize>,
 }
 
 impl SpendLimits {
     pub fn new(spend: &SpendConfig) -> Self {
         Self {
             orchard_action_limit: Arc::new(AtomicUsize::new(spend.orchard_action_limit)),
+            max_tx_bytes: Arc::new(AtomicUsize::new(spend.max_tx_bytes)),
         }
     }
 
@@ -888,6 +908,18 @@ impl SpendLimits {
     /// Apply a new cap. Returns the previous value, so a caller can report what changed.
     pub fn set_orchard_action_limit(&self, limit: usize) -> usize {
         self.orchard_action_limit.swap(limit, Ordering::Relaxed)
+    }
+
+    /// The transaction-size ceiling in force right now, in bytes (`0` = disabled). Reloadable
+    /// for the same reason the action cap is: it is the other setting that can leave a wallet
+    /// unable to pay out until it moves, and the operator needs it while that is happening.
+    pub fn max_tx_bytes(&self) -> usize {
+        self.max_tx_bytes.load(Ordering::Relaxed)
+    }
+
+    /// Apply a new size ceiling. Returns the previous value.
+    pub fn set_max_tx_bytes(&self, bytes: usize) -> usize {
+        self.max_tx_bytes.swap(bytes, Ordering::Relaxed)
     }
 }
 
@@ -914,21 +946,21 @@ impl ReloadReport {
 
 /// The configuration keys a running daemon applies on reload. Everything else needs a restart.
 ///
-/// Deliberately a list of one. Reloading a setting means it is safe to change under a running
+/// Deliberately a short list. Reloading a setting means it is safe to change under a running
 /// wallet actor, and most are not: an endpoint, a network, a wallet's pools or gap limits are
-/// all baked into state that exists by the time the daemon is serving. This key is here because
-/// an operator needs it *while* a wallet is stuck rather than at the next restart - a
-/// fragmented wallet fails every payout until the cap moves, and the backlog grows while it
-/// does not. Add to this list only when the same is true.
-pub const RELOADABLE_KEYS: &[&str] = &["spend.orchard_action_limit"];
+/// all baked into state that exists by the time the daemon is serving. These two are here
+/// because an operator needs them *while* a wallet is stuck rather than at the next restart -
+/// a wallet that fails every payout on one of these bounds keeps failing, and its backlog
+/// grows, until the bound moves. Add to this list only when the same is true.
+pub const RELOADABLE_KEYS: &[&str] = &["spend.orchard_action_limit", "spend.max_tx_bytes"];
 
 /// Compare a freshly resolved config against the one the daemon is running, apply what can be
 /// applied, and report the rest.
 pub fn apply_reload(running: &AppConfig, fresh: &AppConfig, limits: &SpendLimits) -> ReloadReport {
     let mut report = ReloadReport::default();
 
-    // The one live key. Compared against the cell rather than against `running`, so a second
-    // reload that changes nothing reports nothing even after the first one moved it.
+    // The live keys. Compared against the cells rather than against `running`, so a second
+    // reload that changes nothing reports nothing even after the first one moved them.
     let current = limits.orchard_action_limit();
     if fresh.spend.orchard_action_limit != current {
         limits.set_orchard_action_limit(fresh.spend.orchard_action_limit);
@@ -936,6 +968,15 @@ pub fn apply_reload(running: &AppConfig, fresh: &AppConfig, limits: &SpendLimits
             "spend.orchard_action_limit",
             current.to_string(),
             fresh.spend.orchard_action_limit.to_string(),
+        ));
+    }
+    let current = limits.max_tx_bytes();
+    if fresh.spend.max_tx_bytes != current {
+        limits.set_max_tx_bytes(fresh.spend.max_tx_bytes);
+        report.applied.push((
+            "spend.max_tx_bytes",
+            current.to_string(),
+            fresh.spend.max_tx_bytes.to_string(),
         ));
     }
 
@@ -1011,6 +1052,22 @@ fn changed_keys(running: &AppConfig, fresh: &AppConfig) -> Vec<String> {
 
 /// Default Orchard-action cap, matching Zallet's `orchard_actions` default.
 pub const DEFAULT_ORCHARD_ACTION_LIMIT: usize = 50;
+
+/// Default `[spend] max_tx_bytes`: the largest transaction a send may build, in bytes.
+///
+/// 250 000, which is zakura's `[mempool] max_transaction_bytes` default
+/// (`DEFAULT_MAX_TRANSACTION_BYTES`, in its `crates/zakurad/src/components/mempool/config.rs`):
+/// the per-transaction ceiling a stock node applies before it will relay one. Matching it is
+/// the point, since a wallet that builds past what nodes forward has spent its proving time on
+/// a transaction that never reaches a miner.
+///
+/// It is a *policy* number rather than a consensus one, so it can move; but it cannot be
+/// treated as a local setting. Relay is hop by hop, so what bounds a transaction in practice is
+/// the default every unconfigured peer applies, not whatever the operator's own node is set to.
+/// Zebra and zcashd have no equivalent per-transaction cap - zcashd dropped its standard-size
+/// limit for shielded transactions - so on a network of those this ceiling costs a wallet only
+/// the consolidation rounds it would have taken anyway.
+pub const DEFAULT_MAX_TX_BYTES: usize = 250_000;
 
 /// Default change-splitting target, matching zcash-devtool's send defaults.
 pub const DEFAULT_TARGET_NOTE_COUNT: usize = 4;
@@ -1323,6 +1380,7 @@ struct SpendFile {
     trust_own_transactions: Option<bool>,
     privacy_policy: Option<String>,
     orchard_action_limit: Option<usize>,
+    max_tx_bytes: Option<usize>,
     cache_proving_key: Option<bool>,
     pipeline_proving: Option<bool>,
     target_note_count: Option<usize>,
@@ -2100,6 +2158,7 @@ impl AppConfig {
             orchard_action_limit: spend_file
                 .orchard_action_limit
                 .unwrap_or(DEFAULT_ORCHARD_ACTION_LIMIT),
+            max_tx_bytes: spend_file.max_tx_bytes.unwrap_or(DEFAULT_MAX_TX_BYTES),
             cache_proving_key: spend_file.cache_proving_key.unwrap_or(true),
             pipeline_proving: spend_file.pipeline_proving.unwrap_or(false),
             target_note_count: spend_file
@@ -2989,7 +3048,10 @@ mod tests {
         .expect("resolve");
         let limits = SpendLimits::new(&running.spend);
         let mut fresh = running.clone();
+        // Move every reloadable key, so the report names all of them and the assertion below
+        // fails if the list grows without `apply_reload` growing with it.
         fresh.spend.orchard_action_limit = running.spend.orchard_action_limit + 1;
+        fresh.spend.max_tx_bytes = running.spend.max_tx_bytes + 1;
         let report = apply_reload(&running, &fresh, &limits);
         let applied: Vec<&str> = report.applied.iter().map(|(k, _, _)| *k).collect();
         assert_eq!(applied, RELOADABLE_KEYS, "the list and the code must agree");

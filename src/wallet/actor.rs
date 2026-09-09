@@ -64,6 +64,7 @@ use crate::error::{codes, ErrorDetails, InsufficientFunds, RpcError};
 use crate::network::ZNetwork;
 use crate::pools::{Receiver, ReceiverSet};
 use crate::sync::engine;
+use crate::tx_size;
 use crate::wallet::binding;
 use crate::wallet::keys::{self, SeedKeeper};
 use crate::wallet::open::{self, WriteDb};
@@ -5020,6 +5021,7 @@ impl WalletActor {
         let net = self.network;
         let change_pool = self.enabled_pools.change_pool();
         let orchard_action_limit = self.spend_limits.orchard_action_limit();
+        let max_tx_bytes = self.spend_limits.max_tx_bytes();
         let (target_note_count, min_split_output_value) =
             (self.target_note_count, self.min_split_output_value);
         let engine_dir = self.engine_dir.clone();
@@ -5073,7 +5075,8 @@ impl WalletActor {
                 enforce_full_privacy(&proposal)?;
             }
             enforce_orchard_action_limit(&proposal, orchard_action_limit)?;
-            let shape = proposal_shape(&proposal);
+            enforce_max_tx_bytes(&proposal, proposal_branch(&net, &proposal), max_tx_bytes)?;
+            let shape = proposal_shape(&proposal, proposal_branch(&net, &proposal));
             let pczt = create_pczt_from_proposal::<_, _, Infallible, _, Infallible, _>(
                 db,
                 &net,
@@ -5271,10 +5274,13 @@ impl WalletActor {
                 Ok((txid, raw, prove, s0.elapsed()))
             })?;
 
+        // Read before `raw` is handed to the broadcast: the real serialized size is what
+        // the estimate that gated this send is judged against.
+        let tx_bytes = raw.len();
         let b0 = Instant::now();
         self.broadcast_committed(txid, raw).await?;
         self.update_status();
-        log_send_latency("inline", shape, build, prove, store, b0.elapsed());
+        log_send_latency("inline", shape, build, prove, store, b0.elapsed(), tx_bytes);
         Ok(txid)
     }
 
@@ -5298,6 +5304,7 @@ impl WalletActor {
         let net = self.network;
         let change_pool = self.enabled_pools.change_pool();
         let orchard_action_limit = self.spend_limits.orchard_action_limit();
+        let max_tx_bytes = self.spend_limits.max_tx_bytes();
         let (target_note_count, min_split_output_value) =
             (self.target_note_count, self.min_split_output_value);
         let account_id = self.require_account(None)?;
@@ -5349,7 +5356,8 @@ impl WalletActor {
                     enforce_full_privacy(&proposal)?;
                 }
                 enforce_orchard_action_limit(&proposal, orchard_action_limit)?;
-                let shape = proposal_shape(&proposal);
+                enforce_max_tx_bytes(&proposal, proposal_branch(&net, &proposal), max_tx_bytes)?;
+                let shape = proposal_shape(&proposal, proposal_branch(&net, &proposal));
                 let build = start.elapsed();
                 let p0 = Instant::now();
                 let txids = create_proposed_transactions(
@@ -5378,10 +5386,21 @@ impl WalletActor {
                 Ok((txid, raw, shape, build, p0.elapsed()))
             })?;
 
+        // Read before `raw` is handed to the broadcast: the real serialized size is what
+        // the estimate that gated this send is judged against.
+        let tx_bytes = raw.len();
         let b0 = Instant::now();
         self.broadcast_committed(txid, raw).await?;
         self.update_status();
-        log_send_latency("fused", shape, build, prove, Duration::ZERO, b0.elapsed());
+        log_send_latency(
+            "fused",
+            shape,
+            build,
+            prove,
+            Duration::ZERO,
+            b0.elapsed(),
+            tx_bytes,
+        );
         Ok(txid)
     }
 
@@ -5610,10 +5629,21 @@ impl WalletActor {
                 let raw = read_raw_tx(db, txid)?;
                 Ok((txid, raw, s0.elapsed()))
             })?;
+        // Read before `raw` is handed to the broadcast: the real serialized size is what
+        // the estimate that gated this send is judged against.
+        let tx_bytes = raw.len();
         let b0 = Instant::now();
         self.broadcast_committed(txid, raw).await?;
         self.update_status();
-        log_send_latency("pipelined", shape, build, prove, store, b0.elapsed());
+        log_send_latency(
+            "pipelined",
+            shape,
+            build,
+            prove,
+            store,
+            b0.elapsed(),
+            tx_bytes,
+        );
         Ok(txid)
     }
 
@@ -5990,6 +6020,17 @@ impl WalletActor {
             }
         })?;
 
+        // A shield is bounded by size too, and by nothing else: its inputs are transparent
+        // (so they cost no Orchard actions and `orchard_action_limit` never binds), and
+        // `limit` is the caller's own argument rather than a ceiling. A pool sweeping a large
+        // backlog of coinbase outputs in one call is exactly the shape that reaches the relay
+        // limit through sheer input count.
+        enforce_max_tx_bytes(
+            &proposal,
+            proposal_branch(&net, &proposal),
+            self.spend_limits.max_tx_bytes(),
+        )?;
+
         let (shielding_utxos, shielding_value) = {
             let inputs = proposal.steps().head.transparent_inputs();
             (
@@ -6116,6 +6157,7 @@ impl WalletActor {
         let net = self.network;
         let policy = self.confirmations_policy;
         let orchard_action_limit = self.spend_limits.orchard_action_limit();
+        let max_tx_bytes = self.spend_limits.max_tx_bytes();
         let db = &mut self.db_data;
 
         let (target_height, anchor_height) = db
@@ -6315,6 +6357,11 @@ impl WalletActor {
                     )
                     .map_err(|e| RpcError::wallet(format!("merge proposal invalid: {e}")))?;
                     enforce_orchard_action_limit(&proposal, orchard_action_limit)?;
+                    enforce_max_tx_bytes(
+                        &proposal,
+                        proposal_branch(&net, &proposal),
+                        max_tx_bytes,
+                    )?;
                     MergeWork::UtxoProposal(proposal)
                 };
 
@@ -6395,6 +6442,11 @@ impl WalletActor {
                         enforce_full_privacy(&proposal)?;
                     }
                     enforce_orchard_action_limit(&proposal, orchard_action_limit)?;
+                    enforce_max_tx_bytes(
+                        &proposal,
+                        proposal_branch(&net, &proposal),
+                        max_tx_bytes,
+                    )?;
                     Ok(MergePlan {
                         work: MergeWork::NoteProposal(proposal),
                         merging_utxos: 0,
@@ -6521,6 +6573,11 @@ impl WalletActor {
                         enforce_full_privacy(&proposal)?;
                     }
                     enforce_orchard_action_limit(&proposal, orchard_action_limit)?;
+                    enforce_max_tx_bytes(
+                        &proposal,
+                        proposal_branch(&net, &proposal),
+                        max_tx_bytes,
+                    )?;
 
                     Ok(MergePlan {
                         work: MergeWork::NoteProposal(proposal),
@@ -7398,15 +7455,28 @@ struct SendShape {
     inputs: usize,
     /// Orchard actions built across all steps (`sum of max(spends, outputs)`).
     orchard_actions: usize,
+    /// What [`tx_size`] expected this send to serialize to, in bytes - the number
+    /// `[spend] max_tx_bytes` was applied to. Logged beside the transaction's real size so an
+    /// estimate that came in under what was built cannot pass unnoticed; see
+    /// [`log_send_latency`].
+    est_tx_bytes: usize,
 }
 
-/// Summarize a built proposal's spend/action counts for the send-latency log.
-fn proposal_shape<FeeRuleT, NoteRef>(proposal: &Proposal<FeeRuleT, NoteRef>) -> SendShape {
+/// Summarize a built proposal's spend/action counts and expected size for the send-latency log.
+fn proposal_shape<FeeRuleT, NoteRef>(
+    proposal: &Proposal<FeeRuleT, NoteRef>,
+    branch: BranchId,
+) -> SendShape {
     let mut shape = SendShape::default();
     for step in proposal.steps() {
         let (spends, outputs) = step_orchard_actions(step);
         shape.inputs += spends;
         shape.orchard_actions += spends.max(outputs);
+        // Per *step*, because each step is its own transaction: the ceiling applies to the
+        // largest one, not to their sum.
+        shape.est_tx_bytes = shape
+            .est_tx_bytes
+            .max(tx_size::estimate_bytes(tx_size::step_shape(step, branch)));
     }
     shape
 }
@@ -7434,6 +7504,7 @@ fn log_send_latency(
     prove: Duration,
     store: Duration,
     broadcast: Duration,
+    tx_bytes: usize,
 ) {
     // Fields, not prose: this is the line an operator graphs, so each phase duration and the
     // proposal shape must be queryable without a log parser.
@@ -7441,12 +7512,27 @@ fn log_send_latency(
         path,
         inputs = shape.inputs,
         orchard_actions = shape.orchard_actions,
+        tx_bytes,
+        est_tx_bytes = shape.est_tx_bytes,
         build_ms = build.as_millis() as u64,
         prove_ms = prove.as_millis() as u64,
         store_ms = store.as_millis() as u64,
         broadcast_ms = broadcast.as_millis() as u64,
         "send complete"
     );
+    // `[spend] max_tx_bytes` was applied to the estimate, so an estimate that came in under
+    // the real transaction is the one way this wallet still builds something a node may refuse
+    // to relay. It cannot be caught offline - only a real proposal, built against a real
+    // wallet, exercises the counts - so say so loudly where it can be: here, on every send.
+    if tx_bytes > shape.est_tx_bytes {
+        warn!(
+            tx_bytes,
+            est_tx_bytes = shape.est_tx_bytes,
+            "the built transaction is larger than estimated, so [spend] max_tx_bytes was \
+             applied to too small a number; please report this at \
+             forum.zcashcommunity.com with the zecd version"
+        );
+    }
 }
 
 /// Map a PCZT create/extract error to an `RpcError`, surfacing insufficient-funds conditions as
@@ -7591,6 +7677,43 @@ fn orchard_action_overflow(
     } else {
         (spends.max(outputs), "actions")
     })
+}
+
+/// The consensus branch a proposal will be built against: its target height decides the
+/// transaction version, and with it how many actions each Orchard-protocol bundle needs.
+fn proposal_branch<FeeRuleT, NoteRef>(
+    net: &ZNetwork,
+    proposal: &Proposal<FeeRuleT, NoteRef>,
+) -> BranchId {
+    BranchId::for_height(net, BlockHeight::from(proposal.min_target_height()))
+}
+
+/// Enforce `[spend] max_tx_bytes` on a built proposal: no step may serialize to more than
+/// `max_bytes`. `0` disables the ceiling.
+///
+/// This runs beside [`enforce_orchard_action_limit`] and catches what that cannot. The action
+/// cap bounds proving cost; this bounds what a *node* will relay, and the two are not
+/// proportional - a post-NU6.3 send carrying both an Orchard and an Ironwood bundle pays two
+/// proofs, so its bytes outrun its action count. Refusing here, before the prover runs, is the
+/// whole point: past this line the wallet spends minutes on a transaction the network would
+/// drop.
+fn enforce_max_tx_bytes<FeeRuleT, NoteRef>(
+    proposal: &Proposal<FeeRuleT, NoteRef>,
+    branch: BranchId,
+    max_bytes: usize,
+) -> Result<(), RpcError> {
+    if max_bytes == 0 {
+        return Ok(());
+    }
+    for step in proposal.steps() {
+        let bytes = tx_size::estimate_bytes(tx_size::step_shape(step, branch));
+        if bytes > max_bytes {
+            return Err(RpcError::invalid_parameter(format!(
+                "This send would build a transaction of about {bytes} bytes, over the current                  limit of {max_bytes}, which exists because a node will not relay a transaction                  larger than its own mempool policy - such a transaction is proved at full cost                  and then never mined. Send to fewer recipients, or consolidate first with                  z_mergetoaddress ([\"ANY_ORCHARD\"], your own address, repeatedly until                  remainingNotes is 0), which spends fewer, larger notes. Or raise [spend]                  max_tx_bytes (0 disables the ceiling) and send SIGHUP to reload it without                  restarting - but only if every node between this wallet and a miner accepts                  the larger size."
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// Classify a librustzcash spend/proposal error into a Bitcoin-Core RPC code. Insufficient
