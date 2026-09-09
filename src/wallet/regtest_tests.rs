@@ -208,11 +208,15 @@ fn regtest_wallet_lifecycle() {
     assert!(read::list_transactions(engine_dir, read::AccountScope::Any)
         .expect("listtransactions")
         .is_empty());
-    assert!(
-        read::get_transaction(net, engine_dir, read::AccountScope::Any, &"ab".repeat(32))
-            .expect("gettransaction")
-            .is_none()
-    );
+    assert!(read::get_transaction(
+        net,
+        engine_dir,
+        read::AccountScope::Any,
+        &"ab".repeat(32),
+        false
+    )
+    .expect("gettransaction")
+    .is_none());
     assert!(!read::tx_exists(engine_dir, &"ab".repeat(32)));
     assert!(read::first_scanned_block(engine_dir)
         .expect("first_scanned_block")
@@ -927,6 +931,7 @@ fn offline_actor_cfg(
         ),
         sync_interval: Duration::from_secs(60),
         rebroadcast_interval: Duration::from_secs(60),
+        fetch_memos: true,
         reconnect_base: Duration::from_secs(30),
         reconnect_max: Duration::from_secs(60),
         age_identity: None,
@@ -1907,4 +1912,219 @@ fn query_plan(
         .map(|r| r.unwrap())
         .collect();
     rows.join("\n")
+}
+
+/// `[sync] fetch_memos = false` must drop **memos and nothing else** from the history reads.
+///
+/// That is the setting's whole contract, and the half a unit test can pin exhaustively: run the
+/// same wallet through `query_transactions` and `get_transaction` both ways and require the two
+/// records to be equal field for field once the memos are put back. A suppression that also
+/// dropped an output, reordered them, or lost an address, a value or a key scope would pass a
+/// test that only asserted "no memos"; this one fails.
+///
+/// Populated by inserting into librustzcash's tables directly, like the differential tests
+/// above - the shape of the read is what is under test, not note cryptography. The fixture's
+/// Sapling and Orchard outputs carry memos and its transparent output does not, so the test
+/// covers both the dropped and the already-absent cases.
+#[test]
+fn omitting_memos_changes_nothing_but_the_memos() {
+    let net = network::regtest();
+    let dir = tempfile::tempdir().unwrap();
+    let engine_dir = dir.path();
+    let mut db = open::init_dbs(net, engine_dir).expect("init regtest dbs");
+    db.create_account("primary", &test_seed(), &genesis_birthday(), None)
+        .expect("create regtest account");
+    drop(db);
+
+    let conn = rusqlite::Connection::open(open::data_db_path(engine_dir)).unwrap();
+    let account_id: i64 = conn
+        .query_row("SELECT id FROM accounts LIMIT 1", [], |r| r.get(0))
+        .unwrap();
+    let address_id: i64 = conn
+        .query_row("SELECT id FROM addresses LIMIT 1", [], |r| r.get(0))
+        .unwrap();
+    populate_two_transactions(&conn, account_id, address_id);
+    drop(conn);
+
+    let query = |omit_memos: bool| {
+        read::query_transactions(
+            engine_dir,
+            read::AccountScope::Any,
+            &read::TxQuery {
+                omit_memos,
+                ..read::TxQuery::default()
+            },
+        )
+        .expect("query_transactions")
+    };
+    let with = query(false);
+    let without = query(true);
+
+    assert!(
+        with.iter()
+            .any(|t| t.outputs.iter().any(|o| o.memo.is_some())),
+        "the fixture must carry memos, or this test proves nothing"
+    );
+    assert!(
+        without
+            .iter()
+            .all(|t| t.outputs.iter().all(|o| o.memo.is_none())),
+        "omit_memos must leave no memo on any output: {without:?}"
+    );
+    assert_eq!(
+        with.len(),
+        without.len(),
+        "omit_memos must not change which transactions are returned"
+    );
+    for (a, b) in with.iter().zip(without.iter()) {
+        // Compare whole records with the memos put back, so any *other* field this suppression
+        // disturbed shows up here rather than going unnoticed.
+        let mut restored = b.clone();
+        assert_eq!(
+            restored.outputs.len(),
+            a.outputs.len(),
+            "omit_memos must not change how many outputs a transaction has"
+        );
+        for (out, original) in restored.outputs.iter_mut().zip(a.outputs.iter()) {
+            out.memo.clone_from(&original.memo);
+        }
+        assert_eq!(
+            format!("{restored:?}"),
+            format!("{a:?}"),
+            "omit_memos must change only the memo fields"
+        );
+    }
+
+    // The single-transaction read is a separate statement (see `TX_RECORD_SQL`), so it gets the
+    // same treatment rather than being assumed to follow.
+    let txid = &with[0].txid_hex;
+    let one = |omit_memos: bool| {
+        read::get_transaction(net, engine_dir, read::AccountScope::Any, txid, omit_memos)
+            .expect("get_transaction")
+            .expect("the fixture transaction resolves")
+    };
+    let one_with = one(false);
+    let mut one_without = one(true);
+    assert!(
+        one_without.outputs.iter().all(|o| o.memo.is_none()),
+        "gettransaction must report no memos under omit_memos: {one_without:?}"
+    );
+    for (out, original) in one_without.outputs.iter_mut().zip(one_with.outputs.iter()) {
+        out.memo.clone_from(&original.memo);
+    }
+    assert_eq!(
+        format!("{one_without:?}"),
+        format!("{one_with:?}"),
+        "omit_memos must change only the memo fields on the single-transaction read"
+    );
+}
+
+/// `read::wallet_spending_txids` must find a spend recorded in **every** pool's spend table.
+///
+/// This is the set `actor::request_in_scope` keeps enhancing under `[sync] fetch_memos = false`,
+/// so a pool missing from its `UNION` would silently stop that pool's sends from being fetched -
+/// and the symptom (a restored wallet's Sapling sends absent from `listtransactions`, its
+/// Orchard ones present) is one no offline test would otherwise catch. Ironwood is in the list
+/// deliberately: post-NU6.3 it is the pool the wallet's own sends actually spend from.
+///
+/// A transaction the wallet only received in must NOT be in the set - that is the other half of
+/// the predicate, and the reason the setting saves anything at all.
+#[test]
+fn wallet_spending_txids_covers_every_pool() {
+    let net = network::regtest();
+    let dir = tempfile::tempdir().unwrap();
+    let engine_dir = dir.path();
+    let mut db = open::init_dbs(net, engine_dir).expect("init regtest dbs");
+    db.create_account("primary", &test_seed(), &genesis_birthday(), None)
+        .expect("create regtest account");
+    drop(db);
+
+    let conn = rusqlite::Connection::open(open::data_db_path(engine_dir)).unwrap();
+    let account_id: i64 = conn
+        .query_row("SELECT id FROM accounts LIMIT 1", [], |r| r.get(0))
+        .unwrap();
+    let address_id: i64 = conn
+        .query_row("SELECT id FROM addresses LIMIT 1", [], |r| r.get(0))
+        .unwrap();
+
+    // Transactions 1 and 2 hold the wallet's received outputs (one per pool); transactions
+    // 3..=6 each spend one of them, one pool apiece. Transaction 7 is the control: the wallet
+    // received in it and spent nothing, so the whole point is that it stays out of the set.
+    populate_two_transactions(&conn, account_id, address_id);
+    for (id_tx, tag) in [(3i64, 0xc3u8), (4, 0xc4), (5, 0xc5), (6, 0xc6), (7, 0xc7)] {
+        conn.execute(
+            "INSERT INTO transactions (id_tx, txid, mined_height, tx_index, expiry_height,
+                                       min_observed_height)
+             VALUES (?1, ?2, 101, 1, 0, 101)",
+            rusqlite::params![id_tx, vec![tag; 32]],
+        )
+        .unwrap();
+    }
+    // An ironwood note to spend: `populate_two_transactions` does not create one (the views it
+    // pins predate the pool), so add it here rather than widening that shared fixture.
+    conn.execute(
+        "INSERT INTO ironwood_received_notes
+             (transaction_id, action_index, account_id, diversifier, value, rho, rseed, nf,
+              is_change, memo, address_id, recipient_key_scope, note_version)
+         VALUES (1, 1, ?1, X'00', 1100, X'00', X'00', X'dd', 0, X'63', ?2, 0, 3)",
+        rusqlite::params![account_id, address_id],
+    )
+    .unwrap();
+
+    let note_id = |table: &str| -> i64 {
+        conn.query_row(&format!("SELECT id FROM {table} LIMIT 1"), [], |r| r.get(0))
+            .unwrap_or_else(|e| panic!("a row in {table}: {e}"))
+    };
+    for (table, column, source, spender) in [
+        (
+            "sapling_received_note_spends",
+            "sapling_received_note_id",
+            "sapling_received_notes",
+            3i64,
+        ),
+        (
+            "orchard_received_note_spends",
+            "orchard_received_note_id",
+            "orchard_received_notes",
+            4,
+        ),
+        (
+            "ironwood_received_note_spends",
+            "ironwood_received_note_id",
+            "ironwood_received_notes",
+            5,
+        ),
+        (
+            "transparent_received_output_spends",
+            "transparent_received_output_id",
+            "transparent_received_outputs",
+            6,
+        ),
+    ] {
+        conn.execute(
+            &format!("INSERT INTO {table} ({column}, transaction_id) VALUES (?1, ?2)"),
+            rusqlite::params![note_id(source), spender],
+        )
+        .unwrap();
+    }
+    drop(conn);
+
+    let spending = read::wallet_spending_txids(engine_dir).expect("wallet_spending_txids");
+    for (tag, pool) in [
+        (0xc3u8, "sapling"),
+        (0xc4, "orchard"),
+        (0xc5, "ironwood"),
+        (0xc6, "transparent"),
+    ] {
+        assert!(
+            spending.contains(&zcash_protocol::TxId::from_bytes([tag; 32])),
+            "a {pool} spend must put its transaction in the set: {spending:?}"
+        );
+    }
+    assert!(
+        !spending.contains(&zcash_protocol::TxId::from_bytes([0xc7u8; 32])),
+        "a transaction the wallet did not spend in must stay out of the set - that exclusion \
+         is what fetch_memos = false actually skips: {spending:?}"
+    );
+    assert_eq!(spending.len(), 4, "no other transaction qualifies");
 }

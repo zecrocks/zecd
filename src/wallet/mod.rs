@@ -113,7 +113,10 @@ pub struct SyncStatus {
     /// transparent spend-search requests re-emit on every tip advance for a wallet holding
     /// unspent transparent UTXOs, so it transiently rises after sends/new blocks in steady state
     /// (which is what `readiness = "scanned"` exists for). Surfaced on `/status`, factored into
-    /// `synced` readiness, and reflected in `getwalletinfo.scanning`.
+    /// `synced` readiness, and reflected in `getwalletinfo.scanning`. With `[sync]
+    /// fetch_memos = false` the memo-backfill requests are out of scope and never counted here
+    /// (skipping them in the drain while counting them would pin this above zero and the wallet
+    /// would never report ready); only status tracking and the transparent address checks remain.
     pub pending_enhancements: u64,
     /// The height through which the wallet is **fully enhanced**: every transaction mined at or
     /// below it has had its full data fetched, so its memos are readable. `None` means "not
@@ -130,9 +133,10 @@ pub struct SyncStatus {
     /// It is a floor, not a promise about anything above it: heights above may be enhanced too.
     /// It is `None` while the block scan is running (the backlog is unmeasured there, see
     /// `pending_enhancements`), when the backlog is too large to resolve cheaply
-    /// (`actor::ENHANCED_THROUGH_MAX_PROBE`), and on a database read error - all cases where a
-    /// consumer should hold its cursor still rather than advance it. Surfaced on `/status`,
-    /// `getwalletinfo.scanning`, and `waitforsync`.
+    /// (`actor::ENHANCED_THROUGH_MAX_PROBE`), on a database read error, and - permanently - on a
+    /// wallet with `[sync] fetch_memos = false`, where the memos below any height are never going
+    /// to be fetched - all cases where a consumer should hold its cursor still rather than
+    /// advance it. Surfaced on `/status`, `getwalletinfo.scanning`, and `waitforsync`.
     pub enhanced_through: Option<u32>,
     /// True when the wallet is passphrase-encrypted (Bitcoin Core's `HasEncryptionKeys()`).
     /// Drives whether `getwalletinfo` reports `unlocked_until` and how the passphrase RPCs behave.
@@ -541,6 +545,14 @@ pub struct WalletHandle {
     /// This wallet's external transparent gap limit - the stateless-restore scan depth, surfaced
     /// in `getwalletinfo` so an operator can audit transparent coverage.
     pub transparent_gap_limit: u32,
+    /// `[sync] fetch_memos`. `false` means this wallet never fetches a compact-block-only
+    /// transaction's full data to recover its memo, so the history RPCs must not report memos
+    /// at all: the read layer drops them (`read::load_outputs`), because otherwise a memo's
+    /// presence would depend on whether the mempool path happened to store the transaction
+    /// before the block scan reached it - present on the wallet that caught it live, absent on
+    /// a restore of that same wallet. Surfaced on `getwalletinfo` so a consumer can assert the
+    /// wallet kind it is talking to rather than infer it from empty memo fields.
+    pub fetch_memos: bool,
     /// Transient first-seen times for unmined txs, shared with the actor (the writer). See
     /// [`FirstSeen`].
     first_seen: FirstSeen,
@@ -625,6 +637,7 @@ impl WalletHandle {
             transparent_enabled: false,
             transparent_default: false,
             transparent_gap_limit: 20,
+            fetch_memos: true,
             // Inert test handle: no encrypted seed, so `walletlock` is a no-op (returns -15).
             seed: None,
             cmd_tx,
@@ -1022,6 +1035,7 @@ pub(crate) fn make_handle(
     transparent_enabled: bool,
     transparent_default: bool,
     transparent_gap_limit: u32,
+    fetch_memos: bool,
     first_seen: FirstSeen,
     seed: Option<SharedSeed>,
     cmd_tx: mpsc::Sender<WalletCommand>,
@@ -1037,6 +1051,7 @@ pub(crate) fn make_handle(
         transparent_enabled,
         transparent_default,
         transparent_gap_limit,
+        fetch_memos,
         first_seen,
         seed,
         cmd_tx,
@@ -1061,6 +1076,7 @@ mod registry_tests {
             false,
             false,
             20,
+            true,
             FirstSeen::default(),
             None,
             cmd_tx,
@@ -1113,6 +1129,7 @@ mod tests {
             false,
             false,
             20,
+            true,
             Arc::new(Mutex::new(HashMap::new())),
             seed,
             cmd_tx,

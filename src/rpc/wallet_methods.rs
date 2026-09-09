@@ -740,6 +740,14 @@ pub(crate) fn getwalletinfo(state: &AppState, wallet: Option<&str>) -> Result<Va
     if st.encrypted {
         obj["unlocked_until"] = json!(st.unlocked_until.unwrap_or(0));
     }
+    // zecd extension: `[sync] fetch_memos`. Emitted only when it is off, so the default
+    // wallet's response shape is unchanged (Bitcoin Core conformance) and its presence alone is
+    // the signal. A consumer that reads memos asserts on this at startup rather than inferring
+    // the wallet's kind from memo fields that are simply absent - which is indistinguishable
+    // from a history that genuinely carries no memos.
+    if !handle.fetch_memos {
+        obj["fetch_memos"] = json!(false);
+    }
     // zecd extension: surface the transparent receiving configuration so an operator can audit
     // restore coverage (the `gap_limit` is how far past the last funded address a stateless
     // restore rescans the address index). Present only when transparent receiving is enabled, so
@@ -1218,10 +1226,14 @@ struct HistoryPage {
 /// entries are pushed reversed so that, after a final reverse of the accumulated
 /// newest-first list, the original within-tx order is restored - matching the build-all-then-
 /// slice output exactly.
+///
+/// `omit_memos` is the caller's `!handle.fetch_memos` - see [`read::TxQuery::omit_memos`] for
+/// why the suppression lives in the read layer rather than in `expand`.
 fn paginate_history(
     wallet_dir: &std::path::Path,
     scope: read::AccountScope,
     page: HistoryPage,
+    omit_memos: bool,
     expand: impl Fn(&read::TxRecord) -> Vec<Value>,
 ) -> Result<Vec<Value>, RpcError> {
     let HistoryPage {
@@ -1243,6 +1255,7 @@ fn paginate_history(
             offset: 0,
             limit: Some(limit),
             newest_first: true,
+            omit_memos,
         };
         let txs = read::query_transactions(wallet_dir, scope, &query)?;
         let full_page = txs.len() as u32 >= limit;
@@ -1363,11 +1376,17 @@ pub(crate) fn listtransactions(
         count,
         ..HistoryPage::default()
     };
-    let entries = paginate_history(&handle.engine_dir, handle.account_scope(), page, |tx| {
-        let confirmations = tx_confirmations(&st, tx);
-        let time = tx_time(tx, first_seen.get(&tx.txid_hex).copied());
-        tx_entries(&network, tx, confirmations, time, label_filter.as_deref())
-    })?;
+    let entries = paginate_history(
+        &handle.engine_dir,
+        handle.account_scope(),
+        page,
+        !handle.fetch_memos,
+        |tx| {
+            let confirmations = tx_confirmations(&st, tx);
+            let time = tx_time(tx, first_seen.get(&tx.txid_hex).copied());
+            tx_entries(&network, tx, confirmations, time, label_filter.as_deref())
+        },
+    )?;
     Ok(Value::Array(entries))
 }
 
@@ -1516,11 +1535,17 @@ pub(crate) fn z_listtransactions(
         start_height,
         end_height,
     };
-    let entries = paginate_history(&handle.engine_dir, handle.account_scope(), page, |tx| {
-        let confirmations = tx_confirmations(&st, tx);
-        let time = tx_time(tx, first_seen.get(&tx.txid_hex).copied());
-        z_tx_entries(&network, tx, confirmations, time)
-    })?;
+    let entries = paginate_history(
+        &handle.engine_dir,
+        handle.account_scope(),
+        page,
+        !handle.fetch_memos,
+        |tx| {
+            let confirmations = tx_confirmations(&st, tx);
+            let time = tx_time(tx, first_seen.get(&tx.txid_hex).copied());
+            z_tx_entries(&network, tx, confirmations, time)
+        },
+    )?;
     Ok(Value::Array(entries))
 }
 
@@ -1746,6 +1771,7 @@ pub(crate) fn listsinceblock(
         offset: 0,
         limit: None,
         newest_first: false,
+        omit_memos: !handle.fetch_memos,
     };
     let txs = read::query_transactions(&handle.engine_dir, handle.account_scope(), &query)?;
     let network = handle.network;
@@ -1799,6 +1825,7 @@ pub(crate) async fn gettransaction(
         &handle.engine_dir,
         handle.account_scope(),
         txid,
+        !handle.fetch_memos,
     )?
     .ok_or_else(|| RpcError::invalid_address_or_key("Invalid or non-wallet transaction id"))?;
 

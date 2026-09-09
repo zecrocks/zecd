@@ -364,6 +364,7 @@ mod tests {
             sync: SyncConfig {
                 interval_secs: 20,
                 rebroadcast_secs: 60,
+                fetch_memos: true,
             },
             spend: crate::config::SpendConfig::default(),
             pools: crate::config::PoolsConfig::default(),

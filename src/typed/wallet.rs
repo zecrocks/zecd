@@ -167,6 +167,11 @@ pub struct WalletInfo {
     pub descriptors: bool,
     /// Present only for passphrase-encrypted wallets: unix relock time, or 0 while locked.
     pub unlocked_until: Option<i64>,
+    /// `false` when this wallet does not recover memos (`[sync] fetch_memos = false`), so the
+    /// history RPCs report none at all and `enhanced_through` stays `None`. Absent - and so
+    /// `None` here - on a wallet that does, which is the default; a consumer that reads memos
+    /// checks this rather than reading empty memo fields as "no memo was attached".
+    pub fetch_memos: Option<bool>,
     /// Present only when transparent receiving is enabled.
     pub transparent: Option<TransparentInfo>,
 }

@@ -221,7 +221,14 @@ it reveals the wallet's entire transaction graph, though it cannot spend.
   reports done. While it drains, `conn_state` stays `syncing`, `getwalletinfo.scanning` and
   `getblockchaininfo.initialblockdownload` stay truthy, and `synced` readiness stays 503
   (`reason=enhancing`). Watch `pending_enhancements` trend to zero; if zebra's
-  `getrawtransaction` is slow, confirm its transaction index is enabled.
+  `getrawtransaction` is slow, confirm its transaction index is enabled. A deployment that
+  never reads memos (crediting deposits by address) can skip most of this drain with
+  `[sync] fetch_memos = false` and reach ready at scan-tip. Memos are all it costs - the
+  transactions the wallet spent in are still fetched, so its own sends keep their recipients
+  and fees, and every other RPC is unchanged - but memos are then withheld everywhere
+  (`memo`/`memoStr` omitted, `enhanced_through` null, `getwalletinfo.fetch_memos: false`), so
+  a memo-based deposit flow must keep it on. Reversible: setting it back to `true` backfills
+  the memos with no rescan.
 - `locked` (top-level on both `/readyz` and `/status`, plus per-wallet `locked`/`encrypted`)
  - `true` when a passphrase-encrypted wallet is synced and serving reads but still needs a
   `walletpassphrase` before it can spend. It is reported independently of readiness (a locked

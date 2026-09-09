@@ -465,9 +465,53 @@ fn is_serviceable_request(req: &TransactionDataRequest) -> bool {
     )
 }
 
+/// Whether a [`TransactionDataRequest`] is in scope for this wallet's enhancement drain:
+/// serviceable ([`is_serviceable_request`]) and not excluded by policy.
+///
+/// The one policy exclusion is an `Enhancement` request under `[sync] fetch_memos = false`, and
+/// only for a transaction the wallet did **not** spend in (`spending`, from
+/// [`read::wallet_spending_txids`]). That split is what makes the setting cost exactly the
+/// memos and nothing else, so it is the whole reason the predicate takes a set rather than
+/// matching on the variant alone:
+///
+/// - A transaction the wallet only **received** in is already complete from the compact scan -
+///   the note, its value, its nullifier and the receiving address all ride the compact output.
+///   The one thing the full-transaction fetch would add is the memo (compact outputs carry the
+///   note plaintext minus its memo), and the operator has said they do not read memos. Its fee
+///   is the sender's, not the wallet's, and is not reported on a receive entry.
+/// - A transaction the wallet **spent** in is not complete: its outgoing records (recipient and
+///   amount, recovered by OVK-decrypting the full transaction into `sent_notes`) and its fee
+///   exist nowhere else. Skipping those would make a restored wallet's own sends vanish from
+///   `listtransactions` while the balance still moved - so they are always fetched, and every
+///   RPC but the memo fields stays exact whether the wallet is live or freshly restored.
+///
+/// `GetStatus` and `TransactionsInvolvingAddress` are never excluded either: status tracking and
+/// the transparent spend/ephemeral checks are correctness, not history detail.
+///
+/// Both the drain ([`WalletActor::enhance_step`]) and the backlog count
+/// ([`WalletActor::enhancement_backlog`], which feeds `SyncStatus.pending_enhancements` and
+/// therefore `/readyz` and `conn_state`) apply this predicate via [`outstanding_requests`]:
+/// skipping a request in the drain while still counting it would pin the backlog above zero
+/// forever and the wallet would never report ready. The skipped requests stay queued in the
+/// wallet DB (librustzcash removes a request only when it is satisfied), which is what makes
+/// the knob reversible - flipping `fetch_memos` back on picks the backlog up and backfills the
+/// memos, no rescan needed.
+fn request_in_scope(
+    req: &TransactionDataRequest,
+    fetch_memos: bool,
+    spending: &std::collections::BTreeSet<TxId>,
+) -> bool {
+    is_serviceable_request(req)
+        && match req {
+            TransactionDataRequest::Enhancement(txid) => fetch_memos || spending.contains(txid),
+            _ => true,
+        }
+}
+
 /// Filter one `transaction_data_requests()` read down to the requests actually outstanding in
-/// this drain: serviceable ([`is_serviceable_request`]), not yet attempted (`satisfied`), and
-/// **deduplicated**, preserving first-occurrence order.
+/// this drain: in scope ([`request_in_scope`] - serviceable, and not policy-excluded by `[sync]
+/// fetch_memos = false`), not yet attempted (`satisfied`), and **deduplicated**, preserving
+/// first-occurrence order.
 ///
 /// The dedup is load-bearing, not cosmetic. `zcash_client_sqlite`'s spend-search generation (the
 /// non-`spend-index` arm of `wallet/transparent.rs::transaction_data_requests`) joins the
@@ -485,11 +529,17 @@ fn is_serviceable_request(req: &TransactionDataRequest) -> bool {
 fn outstanding_requests(
     requests: Vec<TransactionDataRequest>,
     satisfied: &std::collections::BTreeSet<TransactionDataRequest>,
+    fetch_memos: bool,
+    spending: &std::collections::BTreeSet<TxId>,
 ) -> Vec<TransactionDataRequest> {
     let mut seen = std::collections::BTreeSet::new();
     requests
         .into_iter()
-        .filter(|r| is_serviceable_request(r) && !satisfied.contains(r) && seen.insert(r.clone()))
+        .filter(|r| {
+            request_in_scope(r, fetch_memos, spending)
+                && !satisfied.contains(r)
+                && seen.insert(r.clone())
+        })
         .collect()
 }
 
@@ -665,6 +715,11 @@ pub struct ActorConfig {
     pub sync_interval: Duration,
     /// Minimum spacing between unmined-tx rebroadcast passes.
     pub rebroadcast_interval: Duration,
+    /// Whether the enhancement step fetches full transactions to complete the ones the wallet
+    /// only saw as compact blocks - memos, fees, outgoing-send records (`[sync] fetch_memos`;
+    /// on by default). Off skips only `Enhancement` requests - transaction-status tracking and
+    /// the transparent address checks still run. See [`request_in_scope`].
+    pub fetch_memos: bool,
     /// Reconnect backoff base/max delays.
     pub reconnect_base: Duration,
     pub reconnect_max: Duration,
@@ -751,6 +806,9 @@ struct WalletActor {
     reconnect_at: Instant,
     sync_interval: Duration,
     rebroadcast_interval: Duration,
+    /// Whether the enhancement step fetches full transactions to recover memos (`[sync]
+    /// fetch_memos`). See [`request_in_scope`].
+    fetch_memos: bool,
     confirmations_policy: ConfirmationsPolicy,
     /// The `[spend]` limits a SIGHUP reload can change while the daemon runs. Read per send,
     /// never cached, so a reload takes effect on the next send.
@@ -1057,6 +1115,17 @@ async fn spawn_inner(
             );
         }
     }
+    if !cfg.fetch_memos {
+        // One line at spawn so an operator reading a memo-less history knows it is configured,
+        // not broken - and knows the way back (the skipped requests stay queued, so re-enabling
+        // backfills without a rescan).
+        info!(
+            "memo retrieval disabled ([sync] fetch_memos = false): memos, fees and the \
+             recipient/amount of the wallet's own sends are not backfilled for transactions \
+             seen only as compact blocks; transaction-status tracking and transparent address \
+             checks still run. Re-enable fetch_memos to backfill the skipped data later."
+        );
+    }
     let db_cache = open::open_fsblockdb(&cfg.engine_dir)?;
     // A shard has no `keys.toml`; stand in the values its wallets imply (watch-only, never
     // encrypted, birthday at the earliest member's so the scan covers all of them).
@@ -1348,6 +1417,7 @@ async fn spawn_inner(
         reconnect_at: Instant::now(),
         sync_interval: cfg.sync_interval,
         rebroadcast_interval: cfg.rebroadcast_interval,
+        fetch_memos: cfg.fetch_memos,
         confirmations_policy: cfg.confirmations_policy,
         spend_limits: cfg.spend_limits.clone(),
         target_note_count: cfg.target_note_count,
@@ -1439,6 +1509,7 @@ async fn spawn_inner(
                 cfg.transparent_enabled,
                 cfg.transparent_default,
                 cfg.transparent_gap_limit,
+                cfg.fetch_memos,
                 first_seen.clone(),
                 handle_seed.clone(),
                 cmd_tx.clone(),
@@ -2679,8 +2750,9 @@ impl WalletActor {
     /// backlog surfaced on `SyncStatus.pending_enhancements`. This is the work that remains
     /// *after* the block scan reaches the tip: compact blocks carry no memos, so each pending
     /// request is one full-transaction fetch + decrypt/store away from being served. Requests
-    /// already attempted this drain (`enhance_satisfied`) and unsupported ones
-    /// ([`is_serviceable_request`]) are excluded, so a clean drain converges to zero.
+    /// already attempted this drain (`enhance_satisfied`) and out-of-scope ones
+    /// ([`request_in_scope`] - unsupported variants, and memo `Enhancement` requests when
+    /// `[sync] fetch_memos` is off) are excluded, so a clean drain converges to zero.
     ///
     /// The second element is what [`SyncStatus::enhanced_through`] is derived from: the lowest
     /// block height any still-pending request refers to, so every height strictly below it is
@@ -2707,7 +2779,12 @@ impl WalletActor {
         };
         // Deduplicated (see `outstanding_requests`): the count is *distinct* outstanding
         // requests, so upstream's duplicate spend-search rows can't inflate it five-fold.
-        let pending = outstanding_requests(reqs, &self.enhance_satisfied);
+        let pending = outstanding_requests(
+            reqs,
+            &self.enhance_satisfied,
+            self.fetch_memos,
+            &self.spending_txids(),
+        );
         let count = pending.len() as u64;
         if pending.is_empty() {
             return (0, None);
@@ -2747,6 +2824,29 @@ impl WalletActor {
               // "bounds nothing" - which would silently let the watermark run past work the new
               // variant represents. Match `is_serviceable_request`, which faces the same choice.
         }
+    }
+
+    /// The transactions this wallet spent in, which [`request_in_scope`] keeps enhancing when
+    /// `[sync] fetch_memos` is off (their outgoing records and fees exist nowhere else - see
+    /// that predicate's docs).
+    ///
+    /// Empty, without touching the database, whenever `fetch_memos` is on: the predicate
+    /// short-circuits on the flag before it consults the set, so a default wallet pays nothing
+    /// for this. Under the setting it is one indexed read over the four `*_spends` tables per
+    /// filter call, bounded by the wallet's own spend count - which for the deployments the
+    /// setting exists for (a deposit wallet whose history is nearly all receives) is a handful
+    /// of rows. It is read fresh rather than cached because a spend recorded between passes
+    /// must bring its transaction back into scope on the very next one, and a stale set would
+    /// hold it out; a read error is logged and treated as "nothing spent", which only leaves
+    /// more requests skipped for this pass - they stay queued either way.
+    fn spending_txids(&self) -> std::collections::BTreeSet<TxId> {
+        if self.fetch_memos {
+            return std::collections::BTreeSet::new();
+        }
+        read::wallet_spending_txids(&self.engine_dir).unwrap_or_else(|e| {
+            tracing::debug!("reading the wallet's spending transactions: {e}");
+            std::collections::BTreeSet::new()
+        })
     }
 
     /// Emit an enhancement-drain progress heartbeat, throttled to one line per
@@ -2824,7 +2924,12 @@ impl WalletActor {
         // because the upstream couldn't satisfy it) guarantees forward progress: the unattempted
         // set strictly shrinks every call, so the drain terminates instead of re-fetching the same
         // front-of-queue requests forever.
-        let pending = outstanding_requests(requests, &self.enhance_satisfied);
+        let pending = outstanding_requests(
+            requests,
+            &self.enhance_satisfied,
+            self.fetch_memos,
+            &self.spending_txids(),
+        );
         if pending.is_empty() {
             self.enhance_progress = None;
         } else {
@@ -4136,7 +4241,20 @@ impl WalletActor {
             let (count, lowest) = tokio::task::block_in_place(|| self.enhancement_backlog());
             (
                 count,
-                fully_scanned.map(|scanned| enhanced_through(scanned, lowest)),
+                // With memo retrieval disabled (`[sync] fetch_memos = false`) the watermark is
+                // permanently unknown, not advanced. It promises "every transaction at or below
+                // here has had its full data fetched, so its memos are readable" - and the
+                // receive-side `Enhancement` requests this wallet skips mean that is never true
+                // of any height, however small the remaining backlog gets. Reporting a height
+                // would hand a memo-cursor consumer exactly the silent permanent skip the field
+                // exists to prevent; `None` makes it hold still. NB this is the field's own
+                // memo-specific contract failing closed, not a statement that history is
+                // incomplete: the sends and fees such a consumer would also read *are* fetched
+                // (see `request_in_scope`), and `getwalletinfo.fetch_memos` is what tells a
+                // consumer which kind of wallet it is talking to.
+                self.fetch_memos
+                    .then(|| fully_scanned.map(|scanned| enhanced_through(scanned, lowest)))
+                    .flatten(),
             )
         };
 
@@ -8498,6 +8616,75 @@ mod tests {
         );
     }
 
+    /// `[sync] fetch_memos = false` takes **only** the `Enhancement` requests of transactions
+    /// the wallet did not spend in out of the drain's scope. That narrow cut is the whole
+    /// contract: for a pure receive the skipped fetch would have added nothing but the memo, so
+    /// the setting costs exactly the memos; for a transaction the wallet spent in, the fetch is
+    /// the only source of its outgoing records and its fee, so skipping it would make a
+    /// restored wallet's own sends vanish from `listtransactions` while the balance still moved.
+    ///
+    /// The correctness requests stay in under either flag: `GetStatus` (transaction
+    /// status/expiry tracking) and `TransactionsInvolvingAddress` (transparent spend detection
+    /// and ephemeral ZIP-320 checks) are not history detail, and skipping either would leave
+    /// the wallet's view of the chain wrong rather than merely memo-less. With the default
+    /// (`fetch_memos = true`) every serviceable request is in scope regardless of the set, so a
+    /// default wallet's behaviour cannot depend on it.
+    #[test]
+    fn fetch_memos_off_skips_only_receive_side_enhancement_requests() {
+        use super::request_in_scope;
+        use zcash_client_backend::data_api::{
+            OutputStatusFilter, TransactionDataRequest, TransactionStatusFilter,
+        };
+        use zcash_protocol::TxId;
+        use zcash_transparent::address::TransparentAddress;
+
+        let received = TxId::from_bytes([7u8; 32]);
+        let spent = TxId::from_bytes([9u8; 32]);
+        let spending = std::collections::BTreeSet::from([spent]);
+        let none: std::collections::BTreeSet<TxId> = std::collections::BTreeSet::new();
+
+        let recv_enhancement = TransactionDataRequest::Enhancement(received);
+        let spend_enhancement = TransactionDataRequest::Enhancement(spent);
+        let status = TransactionDataRequest::GetStatus(received);
+        let tia = TransactionDataRequest::transactions_involving_address(
+            TransparentAddress::PublicKeyHash([0u8; 20]),
+            zcash_protocol::consensus::BlockHeight::from_u32(100),
+            None,
+            None,
+            TransactionStatusFilter::All,
+            OutputStatusFilter::All,
+        );
+
+        // fetch_memos on: everything serviceable is in scope, and the spend set is not even
+        // consulted (pass the empty one, which would exclude both enhancements if it were).
+        for req in [&recv_enhancement, &spend_enhancement, &status, &tia] {
+            assert!(
+                request_in_scope(req, true, &none),
+                "with fetch_memos on, every serviceable request is in scope: {req:?}"
+            );
+        }
+
+        // fetch_memos off: only the receive-side enhancement is skipped.
+        assert!(
+            !request_in_scope(&recv_enhancement, false, &spending),
+            "fetch_memos off must skip the Enhancement of a transaction the wallet only \
+             received in - the fetch would have added nothing but its memo"
+        );
+        assert!(
+            request_in_scope(&spend_enhancement, false, &spending),
+            "fetch_memos off must still enhance a transaction the wallet spent in: its \
+             outgoing records and fee exist nowhere else"
+        );
+        assert!(
+            request_in_scope(&status, false, &spending),
+            "GetStatus is correctness, not history detail - never excluded"
+        );
+        assert!(
+            request_in_scope(&tia, false, &spending),
+            "TransactionsInvolvingAddress is correctness, not history detail - never excluded"
+        );
+    }
+
     /// `outstanding_requests` deduplicates the raw `transaction_data_requests()` read and drops
     /// already-attempted requests. Upstream's spend-search generation emits k identical
     /// `TransactionsInvolvingAddress` requests for a transaction with k unspent wallet outputs
@@ -8527,12 +8714,17 @@ mod tests {
         ];
 
         // No satisfied set: duplicates collapse, first-occurrence order is preserved.
-        let out = outstanding_requests(raw.clone(), &std::collections::BTreeSet::new());
+        let out = outstanding_requests(
+            raw.clone(),
+            &std::collections::BTreeSet::new(),
+            true,
+            &std::collections::BTreeSet::new(),
+        );
         assert_eq!(out, vec![a.clone(), b.clone(), c.clone()]);
 
         // Already-attempted requests are dropped entirely, duplicates included.
         let satisfied = std::collections::BTreeSet::from([a.clone()]);
-        let out = outstanding_requests(raw, &satisfied);
+        let out = outstanding_requests(raw, &satisfied, true, &std::collections::BTreeSet::new());
         assert_eq!(out, vec![b, c]);
     }
 
@@ -8651,7 +8843,12 @@ mod tests {
              outstanding_requests' docs"
         );
 
-        let deduped = outstanding_requests(reqs, &std::collections::BTreeSet::new());
+        let deduped = outstanding_requests(
+            reqs,
+            &std::collections::BTreeSet::new(),
+            true,
+            &std::collections::BTreeSet::new(),
+        );
         let distinct = deduped.iter().filter(|r| is_our_spend_search(r)).count();
         assert_eq!(
             distinct, K,

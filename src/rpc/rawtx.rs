@@ -86,6 +86,11 @@ pub(crate) async fn getrawtransaction(
         &handle.engine_dir,
         handle.account_scope(),
         txid_str,
+        // This handler reads only the record's mined height and time - it renders the
+        // transaction from its raw bytes, never from the wallet's output rows - so the memo
+        // setting cannot change its output. Passed through anyway so every `get_transaction`
+        // call site states the wallet's setting rather than a convenient constant.
+        !handle.fetch_memos,
     )
     .ok()
     .flatten();

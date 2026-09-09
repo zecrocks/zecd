@@ -167,6 +167,7 @@ pub fn render(config: &AppConfig) -> String {
     table(&mut s, "sync");
     kv(&mut s, "interval_secs", config.sync.interval_secs);
     kv(&mut s, "rebroadcast_secs", config.sync.rebroadcast_secs);
+    kv(&mut s, "fetch_memos", config.sync.fetch_memos);
 
     table(&mut s, "spend");
     kv(

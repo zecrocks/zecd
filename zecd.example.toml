@@ -380,6 +380,26 @@ interval_secs = 20
 # How often (at most) to re-broadcast wallet txs that are unmined and unexpired (seconds).
 # Covers sends whose initial broadcast failed and mempool drops across upstream restarts.
 rebroadcast_secs = 60
+#
+# fetch_memos (default true) - whether this wallet recovers MEMOS. Compact blocks carry the whole
+# note except its memo, so recovering memos means fetching each received transaction's full data
+# and trial-decrypting it: one upstream round trip per transaction, which on a from-seed restore
+# is the multi-hour "enhancement" drain that keeps /readyz at 503 after the block scan has already
+# reached the tip. A deployment that never reads memos (e.g. an exchange crediting deposits by
+# address) sets false and is ready at scan-tip instead.
+#
+# Memos are the only thing it costs. The fetch is skipped only for transactions this wallet did
+# not spend in, where the memo is all it would have added; a transaction the wallet spent in is
+# still fetched, so the wallet's own sends keep their recipients, amounts and fees. Balances,
+# receives, status tracking, the transparent checks and gettransaction.hex are unaffected, and
+# every one of them reads the same live or after a restore.
+#
+# With it off, memos are withheld everywhere rather than only where the fetch was skipped:
+# memo/memoStr are omitted from the history RPCs, enhanced_through reports null, and
+# getwalletinfo reports fetch_memos: false. Reversible without a rescan - the skipped work stays
+# queued in the wallet DB, so setting it back to true backfills the memos. Keep it true if
+# depositors are identified BY MEMO.
+# fetch_memos = true
 
 [spend]
 # The wallet-wide confirmations policy (ZIP 315 defaults, like Zallet): how deep an output

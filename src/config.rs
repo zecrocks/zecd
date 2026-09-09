@@ -704,6 +704,36 @@ pub struct SyncConfig {
     pub interval_secs: u64,
     /// How often (at most) to re-broadcast wallet txs that are unmined and unexpired.
     pub rebroadcast_secs: u64,
+    /// Whether this wallet recovers **memos**. Default `true`.
+    ///
+    /// Compact blocks carry the whole note plaintext except its memo, so recovering memos means
+    /// fetching each received transaction's full data and trial-decrypting it - one upstream
+    /// round trip per transaction, which on a from-seed restore is the multi-hour backlog that
+    /// keeps `/readyz` at 503 long after the block scan has reached the tip. An operator who
+    /// never reads memos (an exchange crediting deposits by address, or by transparent
+    /// receives) sets `fetch_memos = false` and the wallet is ready at scan-tip instead.
+    ///
+    /// **Memos are the only thing it costs.** The fetch is skipped only for transactions the
+    /// wallet did not spend in, where the memo is genuinely all it would have added
+    /// (`actor::request_in_scope`); a transaction the wallet spent in is still fetched, because
+    /// its outgoing records and its fee exist nowhere else. So balances, receives, the wallet's
+    /// own sends with their recipients and amounts, fees, transaction-status tracking, the
+    /// transparent address checks and `gettransaction.hex` are all exactly as they would be
+    /// with the setting on - and identical whether the wallet caught a transaction live or
+    /// recovered it in a restore.
+    ///
+    /// Memos are then withheld **uniformly**, not just where the fetch was skipped: the history
+    /// RPCs omit `memo`/`memoStr` outright (`read::load_outputs`), and `enhanced_through` - the
+    /// watermark that promises "memos at or below here are readable" - reports `None`. Without
+    /// that, a memo's presence would depend on whether the mempool path happened to store a
+    /// transaction before the block scan reached it, so the same wallet would answer
+    /// differently before and after a restore. `getwalletinfo` reports `fetch_memos: false`, so
+    /// a consumer asserts the wallet's kind rather than inferring it from absent memo fields.
+    ///
+    /// Reversible: the skipped requests stay queued in the wallet database, so flipping this
+    /// back on drains the backlog and backfills the memos with no rescan. NB a deployment whose
+    /// shielded deposit flow identifies depositors *by memo* must keep it on.
+    pub fetch_memos: bool,
 }
 
 /// `[spend]` - the wallet-wide confirmations policy (ZIP 315 defaults, like Zallet's
@@ -1281,6 +1311,8 @@ struct KeysFile {
 struct SyncFile {
     interval_secs: Option<u64>,
     rebroadcast_secs: Option<u64>,
+    /// See [`SyncConfig::fetch_memos`].
+    fetch_memos: Option<bool>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -2044,12 +2076,14 @@ impl AppConfig {
         let sync_file = file.sync.unwrap_or(SyncFile {
             interval_secs: None,
             rebroadcast_secs: None,
+            fetch_memos: None,
         });
         let sync = SyncConfig {
             // Clamp to >= 1s so a misconfigured `interval_secs = 0` can't make the actor busy-poll
             // the backend with no idle delay between passes (same guard as `rebroadcast_secs`).
             interval_secs: sync_file.interval_secs.unwrap_or(20).max(1),
             rebroadcast_secs: sync_file.rebroadcast_secs.unwrap_or(60).max(1),
+            fetch_memos: sync_file.fetch_memos.unwrap_or(true),
         };
 
         let spend_file = file.spend.unwrap_or_default();
@@ -3441,6 +3475,29 @@ mod tests {
         let cli = Cli::parse_from(["zecd", "--conf", conf.to_str().unwrap()]);
         let cfg = AppConfig::resolve(&cli).unwrap();
         assert_eq!(cfg.sync.interval_secs, 20);
+    }
+
+    /// `[sync] fetch_memos` defaults on (memos are part of the standard history surface) and
+    /// parses both ways - `false` is the exchange-style opt-out that skips the memo-backfill
+    /// half of the enhancement drain.
+    #[cfg(feature = "cli")]
+    #[test]
+    fn fetch_memos_defaults_on_and_parses_off() {
+        use clap::Parser as _;
+        let dir = tempfile::tempdir().unwrap();
+        let conf = dir.path().join("zecd.toml");
+
+        for (body, want) in [
+            ("datadir = \"/tmp/zecd-x\"\n", true),
+            ("[sync]\ninterval_secs = 20\n", true),
+            ("[sync]\nfetch_memos = true\n", true),
+            ("[sync]\nfetch_memos = false\n", false),
+        ] {
+            std::fs::write(&conf, body).unwrap();
+            let cli = Cli::parse_from(["zecd", "--conf", conf.to_str().unwrap()]);
+            let cfg = AppConfig::resolve(&cli).unwrap();
+            assert_eq!(cfg.sync.fetch_memos, want, "config body: {body:?}");
+        }
     }
 
     /// The multi-spender opt-in defaults off, parses both ways, and - the load-bearing half -

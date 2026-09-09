@@ -1738,6 +1738,166 @@ async fn regtest_funded_orchard_receive() {
         );
         tokio::time::sleep(Duration::from_millis(500)).await;
     }
+    drop(watch_only);
+
+    // ---- memo-less twin: [sync] fetch_memos = false skips the drain, reversibly ----
+    //
+    // The guard above proved enhancement recovers the received memo from nothing but compact
+    // blocks. This twin is the opt-out's contract, on the identical restore: with
+    // `[sync] fetch_memos = false` the wallet must
+    //
+    // (1) still reach a fully-synced state - the skipped requests are excluded from
+    //     `pending_enhancements`, or readiness would wedge at "enhancing" forever;
+    // (2) report NO memo anywhere, while the received funds stay visible (the note rides the
+    //     compact scan; only the memo needed the full-tx fetch);
+    // (3) still report the wallet's own mined sends in full, with their recipients and fees -
+    //     the load-bearing assertion for the receive-only cut in `actor::request_in_scope`. A
+    //     send's outgoing record exists only in the full transaction, so an implementation that
+    //     skipped every `Enhancement` request (this knob's first draft did) leaves a restored
+    //     wallet's sends missing from `listtransactions` while its balance still moved. Nothing
+    //     else in this file would notice, because the authoring wallet stores its own sends at
+    //     send time - only a restore like this one can;
+    // (4) report `enhanced_through: null` and `getwalletinfo.fetch_memos: false` - the watermark
+    //     promises "memos at or below here are readable", which will never be true here, and a
+    //     height would hand a memo-cursor consumer a silent permanent skip; and
+    // (5) the reversibility contract - flipping the knob back on over the SAME data directory
+    //     must backfill the memo with no rescan: the skipped requests stay queued in the wallet
+    //     DB, so re-enabling drains them on the next caught-up pass.
+    let ufvk = zecd
+        .export_ufvk("default")
+        .expect("export the funded wallet's UFVK for the memo-less twin");
+    let mut memoless_cfg = ZecdConfig::new(
+        zebrad.rpc_port,
+        pick_port().expect("pick memo-less rpc port"),
+    );
+    memoless_cfg.ufvk = Some(ufvk);
+    memoless_cfg.birthday = Some(2);
+    memoless_cfg.fetch_memos = Some(false);
+    let _memoless_lwd = attach_backend(&mut memoless_cfg, zebrad.rpc_port)
+        .await
+        .expect("attach memo-less backend");
+    let mut memoless = Zecd::start(&memoless_cfg)
+        .await
+        .expect("start the memo-less watch-only wallet");
+    let tip = zecd
+        .block_count()
+        .await
+        .expect("getblockcount before the memo-less sync");
+    memoless
+        .wait_until_synced(tip, FUND_TIMEOUT)
+        .await
+        .expect("the memo-less wallet scans from birthday to the tip");
+    let sync = memoless
+        .call("waitforsync", json!([FUND_TIMEOUT.as_millis() as u64]))
+        .await
+        .expect("waitforsync on the memo-less wallet");
+    assert_eq!(
+        sync["synced"], true,
+        "fetch_memos = false must not wedge readiness - skipped memo requests may not keep \
+         the wallet 'enhancing': {sync}"
+    );
+    assert_eq!(
+        sync["pending_enhancements"], 0,
+        "skipped memo requests must be excluded from the pending count: {sync}"
+    );
+    assert!(
+        sync["enhanced_through"].is_null(),
+        "the enhancement watermark must stay unknown when memos are never fetched: {sync}"
+    );
+    let wi = memoless
+        .call("getwalletinfo", json!([]))
+        .await
+        .expect("getwalletinfo on the memo-less wallet");
+    assert_eq!(
+        wi["fetch_memos"],
+        json!(false),
+        "a memo-less wallet must advertise itself, so a consumer can assert the wallet kind \
+         instead of inferring it from memo fields that are merely absent: {wi}"
+    );
+
+    let txs = memoless
+        .call("listtransactions", json!(["*", 100]))
+        .await
+        .expect("listtransactions on the memo-less wallet");
+    let txs = txs.as_array().expect("listtransactions is an array");
+    assert!(
+        txs.iter().any(|t| t["category"] == "receive"),
+        "the memo-less wallet still discovers the received funds: {txs:?}"
+    );
+    // No memo on ANY entry, not merely the funder's. The suppression is uniform by design: a
+    // memo recovered because the mempool path happened to store a transaction before the scan
+    // reached it would make this wallet answer differently from a restore of itself, which is
+    // the divergence the whole setting is built to avoid.
+    assert!(
+        txs.iter()
+            .all(|t| t["memo"].is_null() && t["memoStr"].is_null()),
+        "fetch_memos = false must report no memo on any entry: {txs:?}"
+    );
+
+    // (3) The wallet's own sends survive the setting, in full. This restore has never sent
+    // anything itself, so every `send` entry here was reconstructed by OVK-decrypting a full
+    // transaction that the drain fetched *because the wallet spent in it* - exactly the
+    // requests `request_in_scope` keeps. A `fee` proves the same fetch, from the other side:
+    // the fee is only knowable from the full transaction.
+    let sends: Vec<_> = txs.iter().filter(|t| t["category"] == "send").collect();
+    assert!(
+        !sends.is_empty(),
+        "the wallet's own sends must still be reported under fetch_memos = false - skipping \
+         their enhancement would drop them from history while the balance still moved: {txs:?}"
+    );
+    assert!(
+        sends
+            .iter()
+            .any(|t| t["address"].as_str().is_some_and(|a| !a.is_empty())
+                && t["fee"].as_f64().is_some_and(|f| f < 0.0)),
+        "a recovered send must carry its recipient and its fee, both of which exist only in \
+         the full transaction: {sends:?}"
+    );
+
+    // (5) Reversibility: same datadir, knob back on, the backlog drains and the memo appears.
+    memoless_cfg.fetch_memos = Some(true);
+    memoless
+        .restart(&memoless_cfg)
+        .await
+        .expect("restart the memo-less wallet with fetch_memos back on");
+    let sync = memoless
+        .call("waitforsync", json!([FUND_TIMEOUT.as_millis() as u64]))
+        .await
+        .expect("waitforsync after re-enabling fetch_memos");
+    assert_eq!(
+        sync["synced"], true,
+        "the re-enabled wallet must drain the queued memo backlog and sync: {sync}"
+    );
+    let enhanced_through = sync["enhanced_through"]
+        .as_u64()
+        .expect("a memo-fetching wallet reports a known enhancement watermark once synced");
+    assert!(
+        enhanced_through >= tip,
+        "after re-enabling, the watermark ({enhanced_through}) must cover the tip ({tip}): {sync}"
+    );
+    let txs = memoless
+        .call("listtransactions", json!(["*", 100]))
+        .await
+        .expect("listtransactions after re-enabling fetch_memos");
+    assert!(
+        txs.as_array()
+            .expect("listtransactions is an array")
+            .iter()
+            .any(|t| t["category"] == "receive" && t["memoStr"].as_str() == Some(RECEIVE_MEMO)),
+        "re-enabling fetch_memos must backfill the skipped memo from the queued requests, \
+         with no rescan: {txs}"
+    );
+    // ...and the wallet stops advertising itself as memo-less, so the flag tracks the setting
+    // rather than sticking from the datadir it was first created under.
+    let wi = memoless
+        .call("getwalletinfo", json!([]))
+        .await
+        .expect("getwalletinfo after re-enabling fetch_memos");
+    assert!(
+        wi["fetch_memos"].is_null(),
+        "a memo-fetching wallet must not carry the memo-less marker: {wi}"
+    );
+    drop(memoless);
 
     // ---- bootstrap: rebuild data.sqlite from keys.toml on an empty data directory ----
     //
@@ -1746,7 +1906,6 @@ async fn regtest_funded_orchard_receive() {
     // the account from keys.toml and the funds - and spendability - come back. The wallet is
     // encrypted, so this also exercises the locked path: it comes back with no account, refuses
     // address generation, and only rebuilds once `walletpassphrase` supplies the seed.
-    drop(watch_only);
     // Age every wallet transaction past the *untrusted* confirmation window before comparing
     // balances across the wipe. On the authoring wallet a self-send's payment output is trusted
     // (marked at store time - see `actor::mark_own_tx_trusted`) and spendable from 3

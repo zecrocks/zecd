@@ -1959,6 +1959,11 @@ pub struct ZecdConfig {
     pub rpc_password: String,
     /// `[sync] rebroadcast_secs` - tight by default so outage tests don't idle a minute.
     pub rebroadcast_secs: u64,
+    /// `[sync] fetch_memos`: `Some(false)` disables memo retrieval (the memo-backfill half of
+    /// the enhancement drain), `None` omits the key (zecd defaults to `true`). The funded e2e's
+    /// memo-less twin phase runs a watch-only restore with it off, then flips it back on over
+    /// the same data directory to prove the skipped memos backfill without a rescan.
+    pub fetch_memos: Option<bool>,
     /// Additional **spending** `[wallets.<name>]` entries beyond `default` (each gets its own
     /// `zecd init --wallet <name>` before the daemon starts). NB: zecd permits only ONE
     /// spending wallet, so configuring any of these alongside the spending `default` makes the
@@ -2053,6 +2058,7 @@ impl ZecdConfig {
             rpc_user: "user".to_string(),
             rpc_password: "pass".to_string(),
             rebroadcast_secs: 2,
+            fetch_memos: None,
             extra_wallets: Vec::new(),
             extra_watch_only_wallets: Vec::new(),
             restore_mnemonic: None,
@@ -3182,7 +3188,7 @@ auto_unlock = true
 [sync]
 interval_secs = 2
 rebroadcast_secs = {rebroadcast}
-
+{fetch_memos}
 [health]
 enabled = true
 bind = "127.0.0.1"
@@ -3195,6 +3201,10 @@ port = {health_port}
         user = cfg.rpc_user,
         password = cfg.rpc_password,
         rebroadcast = cfg.rebroadcast_secs,
+        fetch_memos = match cfg.fetch_memos {
+            Some(b) => format!("fetch_memos = {b}\n"),
+            None => String::new(),
+        },
         health_port = cfg.health_port(),
         readiness = cfg
             .readiness

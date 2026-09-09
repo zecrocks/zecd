@@ -99,6 +99,7 @@ pub fn inspect(config: &AppConfig) -> Vec<Finding> {
     }
 
     check_backend(config, &mut findings);
+    check_sync(config, &mut findings);
     check_rpc(config, &mut findings);
     check_spend(config, &mut findings);
     check_layout(config, &mut findings);
@@ -204,6 +205,26 @@ impl CheckOutcome {
 pub fn check(config: &AppConfig) -> CheckOutcome {
     CheckOutcome {
         findings: inspect(config),
+    }
+}
+
+/// `[sync]`: the one setting here with a consequence an operator should meet before deploying
+/// rather than after.
+///
+/// A warning, never an error - a memo-less wallet is a legitimate and supported deployment, and
+/// the setting is reversible without a rescan. But it is silent in operation (a history with no
+/// memos looks exactly like a history whose senders attached none), so name the consequence
+/// where an operator is already reading findings.
+fn check_sync(config: &AppConfig, findings: &mut Vec<Finding>) {
+    if !config.sync.fetch_memos {
+        findings.push(Finding::warning(
+            "[sync] fetch_memos = false: this wallet never fetches the full data of a \
+             transaction it saw only as a compact block, so memos are never reported (the \
+             history RPCs omit them entirely, and getwalletinfo reports fetch_memos: false). \
+             Everything else stays exact - balances, receives, and the wallet's own sends with \
+             their recipients and fees. Keep it true if depositors are identified BY MEMO. \
+             Reversible: setting it back to true backfills the skipped memos with no rescan",
+        ));
     }
 }
 
@@ -579,6 +600,50 @@ mod tests {
             .filter(|f| f.level == Level::Warning)
             .map(|f| f.message.as_str())
             .collect()
+    }
+
+    /// `[sync] fetch_memos = false` is warned about, and only then. The setting is legitimate
+    /// and reversible, so it is never an error - but it is silent in operation (a history with
+    /// no memos is indistinguishable from one whose senders attached none), which is exactly
+    /// the class of thing this command exists to say out loud before a deployment, not after.
+    #[test]
+    fn fetch_memos_off_is_warned_about_and_on_is_silent() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = format!("network = \"regtest\"\ndatadir = {:?}\n", dir.path());
+
+        let off = inspect(&resolve(
+            &format!("{base}[sync]\nfetch_memos = false\n"),
+            dir.path(),
+        ));
+        assert!(
+            errors(&off).is_empty(),
+            "a memo-less wallet is a supported deployment, never an error: {:?}",
+            errors(&off)
+        );
+        let warned: Vec<&str> = warnings(&off)
+            .into_iter()
+            .filter(|w| w.contains("fetch_memos"))
+            .collect();
+        assert_eq!(
+            warned.len(),
+            1,
+            "exactly one finding must name the setting: {:?}",
+            warnings(&off)
+        );
+        assert!(
+            warned[0].contains("memos are never reported"),
+            "the warning must name the consequence, not just the key: {}",
+            warned[0]
+        );
+
+        for body in ["", "[sync]\nfetch_memos = true\n"] {
+            let on = inspect(&resolve(&format!("{base}{body}"), dir.path()));
+            assert!(
+                !warnings(&on).iter().any(|w| w.contains("fetch_memos")),
+                "the default must not warn (config body: {body:?}): {:?}",
+                warnings(&on)
+            );
+        }
     }
 
     /// Manifests present with the fleet disabled is the failure mode `[fleet] enabled`

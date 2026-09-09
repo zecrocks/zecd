@@ -639,10 +639,21 @@ ORDER BY output_pool ASC, output_index ASC";
 /// Outputs come back ordered by `(output_pool, output_index)` - see [`LOAD_OUTPUTS_SQL`],
 /// which also explains why the transaction is named by its `transactions.id_tx` row id rather
 /// than by its txid.
+///
+/// `omit_memos` drops every output's memo (`[sync] fetch_memos = false`). The suppression is
+/// here, at the one place outputs are loaded, rather than at each RPC that renders them,
+/// because the point is a property of the wallet's data - "this wallet has no memos" - and a
+/// renderer-side filter would have to be repeated by every future consumer. Under that setting
+/// a memo survives only where the mempool path happened to store the full transaction before
+/// the block scan reached it, so returning them would make a memo's presence depend on how the
+/// wallet met the transaction: caught live it would have one, recovered by a restore of the
+/// same wallet it would not. Dropping them unconditionally is what keeps a restored wallet's
+/// history identical to the live one, which is the invariant the setting would otherwise break.
 fn load_outputs(
     conn: &Connection,
     scope: AccountScope,
     id_tx: i64,
+    omit_memos: bool,
 ) -> anyhow::Result<Vec<TxOutputRecord>> {
     let mut stmt = conn.prepare(LOAD_OUTPUTS_SQL)?;
     let rows = stmt.query_map(
@@ -657,7 +668,7 @@ fn load_outputs(
                 value: row.get("value")?,
                 is_change: row.get("is_change")?,
                 recipient_key_scope: row.get::<_, Option<i64>>("recipient_key_scope")?,
-                memo: row.get("memo")?,
+                memo: if omit_memos { None } else { row.get("memo")? },
             })
         },
     )?;
@@ -815,6 +826,12 @@ pub struct TxQuery {
     pub limit: Option<u32>,
     /// Order newest-first (`sort_height DESC NULLS FIRST`) instead of oldest-first.
     pub newest_first: bool,
+    /// Drop every output's memo (`[sync] fetch_memos = false`; see [`load_outputs`]).
+    ///
+    /// Phrased as *omit* rather than *include* so the derived `Default` - `false` - is the
+    /// memo-preserving one: a call site that does not know about this field keeps the existing
+    /// behaviour instead of silently dropping memos.
+    pub omit_memos: bool,
 }
 
 /// The statement [`query_transactions`] runs, for the requested direction. Extracted (with
@@ -893,7 +910,7 @@ pub fn query_transactions(
     let mut records = Vec::with_capacity(pending.len());
     for (id_tx, mut rec) in pending {
         if let Some(id_tx) = id_tx {
-            rec.outputs = load_outputs(&conn, scope, id_tx)?;
+            rec.outputs = load_outputs(&conn, scope, id_tx, q.omit_memos)?;
         }
         records.push(rec);
     }
@@ -1005,6 +1022,7 @@ pub fn get_transaction(
     engine_dir: &Path,
     scope: AccountScope,
     txid_hex: &str,
+    omit_memos: bool,
 ) -> anyhow::Result<Option<TxRecord>> {
     let Some(internal) = txid_internal(txid_hex) else {
         return Ok(None);
@@ -1029,7 +1047,7 @@ pub fn get_transaction(
     }
     let (_, mut rec) = tx_from_row(row)?;
     drop(rows);
-    rec.outputs = load_outputs(&conn, scope, id_tx)?;
+    rec.outputs = load_outputs(&conn, scope, id_tx, omit_memos)?;
     // Fetch the raw transaction bytes for `gettransaction.hex` via the public `WalletRead` API
     // (mirroring the actor's `do_get_raw_tx`) instead of reading librustzcash's internal
     // `transactions.raw` column directly: this yields the canonical consensus serialization off
@@ -1131,6 +1149,50 @@ pub fn unmined_raw_txs(engine_dir: &Path, tip: u32) -> anyhow::Result<Vec<(Strin
     for r in rows {
         let (txid, raw) = r?;
         out.push((txid_display(&txid), raw));
+    }
+    Ok(out)
+}
+
+/// Every transaction that spends funds this wallet holds, by txid - the set
+/// `actor::request_in_scope` keeps enhancing under `[sync] fetch_memos = false`.
+///
+/// A transaction the wallet only **received** in is complete from the compact scan alone except
+/// for its memo, so skipping its full-transaction fetch costs exactly the memo. A transaction
+/// the wallet **spent** in is not: its outgoing side (recipient, amount) is recoverable only by
+/// OVK-decrypting the full transaction, and its fee only from the full transaction's values. So
+/// the fetch is skipped for the first kind and kept for the second, which is what lets the
+/// setting leave every RPC except the memo fields exact - see `request_in_scope`.
+///
+/// Spends are recorded by the compact scan itself (nullifier matches for the shielded pools,
+/// zecd's own transparent-input matcher for pool 0), so this is populated on a from-seed restore
+/// before any enhancement runs - the case the whole setting exists for. It reads the four
+/// `*_spends` tables directly rather than `v_received_output_spends`: the view adds a join to
+/// each note table for an `account_id` this has no use for, and this runs on the actor's sync
+/// path. It is deliberately **not** account-scoped, because a fleet shard's actor drains one
+/// queue for every account in its database.
+pub fn wallet_spending_txids(
+    engine_dir: &Path,
+) -> anyhow::Result<std::collections::BTreeSet<TxId>> {
+    let conn = open_conn(engine_dir)?;
+    let mut stmt = conn.prepare(
+        "SELECT t.txid FROM transactions t
+         WHERE t.id_tx IN (
+             SELECT transaction_id FROM sapling_received_note_spends
+             UNION SELECT transaction_id FROM orchard_received_note_spends
+             UNION SELECT transaction_id FROM ironwood_received_note_spends
+             UNION SELECT transaction_id FROM transparent_received_output_spends
+         )",
+    )?;
+    let rows = stmt.query_map([], |r| r.get::<_, Vec<u8>>(0))?;
+    let mut out = std::collections::BTreeSet::new();
+    for row in rows {
+        let txid_bytes = row?;
+        // A txid column that is not 32 bytes is corrupt rather than merely unexpected; skip it
+        // (the request it would have matched simply stays in scope, which is the safe side).
+        let Ok(bytes) = <[u8; 32]>::try_from(txid_bytes.as_slice()) else {
+            continue;
+        };
+        out.insert(TxId::from_bytes(bytes));
     }
     Ok(out)
 }
