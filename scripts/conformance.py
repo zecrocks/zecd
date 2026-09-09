@@ -66,6 +66,31 @@ class AuthServiceProxy:
         return self._post(payload)
 
 
+def read_together(first, second, key=lambda v: v, attempts=6, delay=0.5):
+    """Sample two live readings that are required to agree, bracketing the pair.
+
+    zecd is a live daemon under this script: the sync loop, the mempool stream and the
+    transaction-enhancement drain all keep running while the checks execute, so a value read
+    now and a value read twenty calls later describe two different wallets. Comparing them is
+    a race, not a conformance property, and it fired in CI: `getbalance` read 0.02932500 and,
+    moments later, `getbalances.mine.trusted` read 0 - re-queueing a range for scanning had
+    moved every note from spendable to pending-spendability. The wallet total was unchanged;
+    nothing was spent, and nothing about the wire format was wrong.
+
+    So read the pair back to back and bracket it with a second reading of `first`: when the
+    bracket agrees, the wallet did not move across the window and the caller's comparison is
+    authoritative. Otherwise re-sample. After `attempts` the last pair is returned anyway, so
+    a genuine mismatch is still reported rather than looped on forever.
+    """
+    for _ in range(attempts - 1):
+        a = first()
+        b = second()
+        if key(first()) == key(a):
+            return a, b
+        time.sleep(delay)
+    return first(), second()
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--url", default="http://127.0.0.1:18232/")
@@ -270,9 +295,12 @@ def main() -> int:
 
     # minconf is honored: 1-conf balance includes at least everything the (stricter)
     # default spendability policy counts; an impossibly deep minconf excludes everything.
-    bal1 = rpc.call("getbalance", "*", 1)
+    # The two readings are sampled together (see read_together) because they are only
+    # comparable against one wallet state.
+    bal_now, bal1 = read_together(lambda: rpc.call("getbalance"),
+                                  lambda: rpc.call("getbalance", "*", 1))
     ck("getbalance('*',1) is Decimal", isinstance(bal1, decimal.Decimal), repr(bal1))
-    ck("getbalance('*',1) >= getbalance()", bal1 >= bal, f"{bal1} < {bal}")
+    ck("getbalance('*',1) >= getbalance()", bal1 >= bal_now, f"{bal1} < {bal_now}")
     ck("getbalance('*',99999999) == 0", rpc.call("getbalance", "*", 99999999) == 0)
     try:
         rpc.call("getbalance", "account1")
@@ -312,11 +340,18 @@ def main() -> int:
         ck("verbose=false -> code -8", e.code == -8, e.code)
 
     print("== getbalances ==")
-    gb = rpc.call("getbalances")
+    # `mine.trusted` and `getbalance` are the same read behind two method names, so they must
+    # report the same number. Sample them together (see read_together) rather than against the
+    # `getbalance` taken further up: the wallet moves between calls, and that comparison is
+    # what failed in CI while both RPCs were answering correctly.
+    gb, bal_now = read_together(lambda: rpc.call("getbalances"),
+                                lambda: rpc.call("getbalance"),
+                                key=lambda v: v.get("mine", {}).get("trusted"))
     mine = gb.get("mine", {})
     for f in ("trusted", "untrusted_pending", "immature"):
         ck(f"mine.{f} is Decimal", isinstance(mine.get(f), decimal.Decimal), repr(mine.get(f)))
-    ck("mine.trusted == getbalance", mine.get("trusted") == bal)
+    ck("mine.trusted == getbalance", mine.get("trusted") == bal_now,
+       f"{mine.get('trusted')} != {bal_now}")
     # zecd extension: mine.coinbase is the portion of trusted that is mature transparent
     # coinbase - spendable only via z_shieldcoinbase, so it is broken out for callers to see
     # how much of trusted cannot move through the regular send paths. A subset of trusted (not
