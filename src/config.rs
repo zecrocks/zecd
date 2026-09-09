@@ -760,8 +760,13 @@ pub struct SpendConfig {
     pub trust_own_transactions: bool,
     /// What sends are allowed to reveal on-chain. Default `AllowRevealedRecipients`.
     pub privacy: SendPrivacy,
-    /// Cap on the number of Orchard actions (`max(orchard inputs, orchard outputs)`) a single
-    /// send may build, mirroring Zallet's `[builder.limits] orchard_actions` (default 50). It
+    /// Cap on the number of Orchard-family actions a single send may build, mirroring Zallet's
+    /// `[builder.limits] orchard_actions` (default 50).
+    ///
+    /// Counted **per bundle and summed** - what the prover will run. Within one bundle that is
+    /// `max(spends, outputs)`, but post-NU6.3 a send that spends legacy Orchard V2 notes into
+    /// Ironwood outputs builds two bundles whose actions add up, and a single family-wide
+    /// `max` would report the larger of the two rather than their total. It
     /// bounds memory/proving cost and gives a clean `-8` instead of a deep librustzcash error
     /// when a `z_sendmany` has too many recipients. `0` disables the cap. Default 50.
     pub orchard_action_limit: usize,

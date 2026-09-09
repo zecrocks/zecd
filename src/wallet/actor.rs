@@ -5079,7 +5079,11 @@ impl WalletActor {
             if privacy == SendPrivacy::FullPrivacy {
                 enforce_full_privacy(&proposal)?;
             }
-            enforce_orchard_action_limit(&proposal, orchard_action_limit)?;
+            enforce_orchard_action_limit(
+                &proposal,
+                proposal_branch(&net, &proposal),
+                orchard_action_limit,
+            )?;
             enforce_max_tx_bytes(&proposal, proposal_branch(&net, &proposal), max_tx_bytes)?;
             let shape = proposal_shape(&proposal, proposal_branch(&net, &proposal));
             let pczt = create_pczt_from_proposal::<_, _, Infallible, _, Infallible, _>(
@@ -5360,7 +5364,11 @@ impl WalletActor {
                 if privacy == SendPrivacy::FullPrivacy {
                     enforce_full_privacy(&proposal)?;
                 }
-                enforce_orchard_action_limit(&proposal, orchard_action_limit)?;
+                enforce_orchard_action_limit(
+                    &proposal,
+                    proposal_branch(&net, &proposal),
+                    orchard_action_limit,
+                )?;
                 enforce_max_tx_bytes(&proposal, proposal_branch(&net, &proposal), max_tx_bytes)?;
                 let shape = proposal_shape(&proposal, proposal_branch(&net, &proposal));
                 let build = start.elapsed();
@@ -6386,7 +6394,11 @@ impl WalletActor {
                         ironwood_active,
                     )
                     .map_err(|e| RpcError::wallet(format!("merge proposal invalid: {e}")))?;
-                    enforce_orchard_action_limit(&proposal, orchard_action_limit)?;
+                    enforce_orchard_action_limit(
+                        &proposal,
+                        proposal_branch(&net, &proposal),
+                        orchard_action_limit,
+                    )?;
                     enforce_max_tx_bytes(
                         &proposal,
                         proposal_branch(&net, &proposal),
@@ -6503,7 +6515,11 @@ impl WalletActor {
                     if privacy == SendPrivacy::FullPrivacy {
                         enforce_full_privacy(&proposal)?;
                     }
-                    enforce_orchard_action_limit(&proposal, orchard_action_limit)?;
+                    enforce_orchard_action_limit(
+                        &proposal,
+                        proposal_branch(&net, &proposal),
+                        orchard_action_limit,
+                    )?;
                     enforce_max_tx_bytes(
                         &proposal,
                         proposal_branch(&net, &proposal),
@@ -6553,20 +6569,6 @@ impl WalletActor {
                         .collect();
                     fam.sort_by_key(|n| u64::from(n.note().value()));
                     fam.truncate(cap);
-                    let merging_count = fam.len() as u64;
-                    let merging_value: u64 = fam.iter().map(|n| u64::from(n.note().value())).sum();
-                    let sapling_spends = fam
-                        .iter()
-                        .filter(|n| n.note().pool() == ShieldedPool::Sapling)
-                        .count();
-                    let orchard_spends = fam
-                        .iter()
-                        .filter(|n| n.note().pool() == ShieldedPool::Orchard)
-                        .count();
-                    let ironwood_spends = fam
-                        .iter()
-                        .filter(|n| n.note().pool() == ShieldedPool::Ironwood)
-                        .count();
 
                     let (dest_pool, out_sizes): (PoolType, Vec<usize>) = match dest_transparent {
                         Some(t) => (PoolType::Transparent, vec![transparent_txout_size(&t)]),
@@ -6575,14 +6577,66 @@ impl WalletActor {
                             vec![],
                         ),
                     };
-                    let (sapling_out, orchard_act, ironwood_act) = merge_action_counts(
-                        &net,
-                        target_height,
-                        dest_pool,
-                        sapling_spends,
-                        orchard_spends,
-                        ironwood_spends,
-                    )?;
+
+                    // Shrink the selection until the **built** action count fits the cap, rather
+                    // than assuming it equals the note count.
+                    //
+                    // `cap` above bounds notes, and those are the same number only while the
+                    // selection is one bundle. Post-NU6.3 they are not: a selection of legacy
+                    // Orchard V2 notes paying an Ironwood destination puts the spends in one
+                    // bundle and the payment output in another, so the payment costs an action
+                    // of its own instead of sharing one with a spend. A selection clamped to
+                    // exactly `orchard_action_limit` then builds one action over it - and
+                    // `enforce_orchard_action_limit`, which counts per bundle, refuses the
+                    // proposal this code just made. That is a wedge, not a retry: every round
+                    // clamps to the same number and fails the same way, on a wallet whose whole
+                    // reason for merging is that it has too many notes.
+                    //
+                    // So the loop asks `merge_action_counts` - the same function the fee is
+                    // priced from, and the counts the builder is configured with - and drops the
+                    // largest note until it fits. Bounded by the selection length, and normally
+                    // zero iterations: it bites only on a mixed-pool wallet at the cap.
+                    let (sapling_spends, sapling_out, orchard_act, ironwood_act) = loop {
+                        let sapling_spends = fam
+                            .iter()
+                            .filter(|n| n.note().pool() == ShieldedPool::Sapling)
+                            .count();
+                        let orchard_spends = fam
+                            .iter()
+                            .filter(|n| n.note().pool() == ShieldedPool::Orchard)
+                            .count();
+                        let ironwood_spends = fam
+                            .iter()
+                            .filter(|n| n.note().pool() == ShieldedPool::Ironwood)
+                            .count();
+                        let (sapling_out, orchard_act, ironwood_act) = merge_action_counts(
+                            &net,
+                            target_height,
+                            dest_pool,
+                            sapling_spends,
+                            orchard_spends,
+                            ironwood_spends,
+                        )?;
+                        if orchard_action_limit == 0
+                            || orchard_act + ironwood_act <= orchard_action_limit
+                        {
+                            break (sapling_spends, sapling_out, orchard_act, ironwood_act);
+                        }
+                        // One note that still does not fit means the cap cannot express any
+                        // merge of this shape at all - a configuration answer, not a smaller
+                        // selection.
+                        if fam.len() <= 1 {
+                            return Err(RpcError::invalid_parameter(format!(
+                                "[spend] orchard_action_limit = {orchard_action_limit} is too \
+                                 small to merge even one note into this destination, which \
+                                 needs {} actions; raise it (0 disables the cap)",
+                                orchard_act + ironwood_act
+                            )));
+                        }
+                        fam.pop();
+                    };
+                    let merging_count = fam.len() as u64;
+                    let merging_value: u64 = fam.iter().map(|n| u64::from(n.note().value())).sum();
                     let fee = StandardFeeRule::Zip317
                         .fee_required(
                             &net,
@@ -6643,7 +6697,11 @@ impl WalletActor {
                     if privacy == SendPrivacy::FullPrivacy {
                         enforce_full_privacy(&proposal)?;
                     }
-                    enforce_orchard_action_limit(&proposal, orchard_action_limit)?;
+                    enforce_orchard_action_limit(
+                        &proposal,
+                        proposal_branch(&net, &proposal),
+                        orchard_action_limit,
+                    )?;
                     enforce_max_tx_bytes(
                         &proposal,
                         proposal_branch(&net, &proposal),
@@ -7540,14 +7598,16 @@ fn proposal_shape<FeeRuleT, NoteRef>(
 ) -> SendShape {
     let mut shape = SendShape::default();
     for step in proposal.steps() {
-        let (spends, outputs) = step_orchard_actions(step);
+        let (spends, _) = step_orchard_actions(step);
+        let step_shape = tx_size::step_shape(step, branch);
         shape.inputs += spends;
-        shape.orchard_actions += spends.max(outputs);
+        // The per-bundle sum, matching what the cap is enforced against and what the prover
+        // will actually run - not `max(spends, outputs)` over the family, which under-counts a
+        // two-bundle post-NU6.3 send.
+        shape.orchard_actions += step_shape.orchard_family_actions();
         // Per *step*, because each step is its own transaction: the ceiling applies to the
         // largest one, not to their sum.
-        shape.est_tx_bytes = shape
-            .est_tx_bytes
-            .max(tx_size::estimate_bytes(tx_size::step_shape(step, branch)));
+        shape.est_tx_bytes = shape.est_tx_bytes.max(tx_size::estimate_bytes(step_shape));
     }
     shape
 }
@@ -7701,25 +7761,48 @@ fn step_orchard_actions<NoteRef>(
     (orchard_spends, orchard_outputs)
 }
 
-/// Enforce `[spend] orchard_action_limit` on a built proposal: no step may exceed `limit` Orchard
-/// actions. `limit == 0` disables the cap. Returns `-8` naming whether inputs or outputs (or both)
-/// overflow, like Zallet's error, so an over-large `z_sendmany` is self-diagnosing rather than
-/// failing deep in proving. The check sits on the proposal because the input (spend) count is only
-/// known once note selection has run.
+/// Enforce `[spend] orchard_action_limit` on a built proposal: no step may exceed `limit`
+/// Orchard-family actions. `limit == 0` disables the cap. Returns `-8` naming whether inputs or
+/// outputs (or both) overflow, like Zallet's error, so an over-large `z_sendmany` is
+/// self-diagnosing rather than failing deep in proving. The check sits on the proposal because
+/// the input (spend) count is only known once note selection has run.
+///
+/// The count is **per bundle, summed** - what the builder will actually prove - rather than one
+/// `max(spends, outputs)` over the Orchard family. Post-NU6.3 those differ: the Orchard pool no
+/// longer lets a spend and an output share an action, so a send that draws legacy Orchard V2
+/// notes into Ironwood outputs builds two bundles whose actions add up. Counted family-wide, a
+/// 50-spend, 49-output send of that shape reads as 50 actions and passes the shipped cap while
+/// proving 99.
 fn enforce_orchard_action_limit<FeeRuleT, NoteRef>(
     proposal: &Proposal<FeeRuleT, NoteRef>,
+    branch: BranchId,
     limit: usize,
 ) -> Result<(), RpcError> {
     if limit == 0 {
         return Ok(());
     }
     for step in proposal.steps() {
+        let shape = tx_size::step_shape(step, branch);
         let (orchard_spends, orchard_outputs) = step_orchard_actions(step);
-        if let Some((count, kind)) = orchard_action_overflow(orchard_spends, orchard_outputs, limit)
+        if let Some((count, kind)) =
+            orchard_action_overflow(shape, orchard_spends, orchard_outputs, limit)
         {
+            // Only when it applies: on the ordinary single-bundle send this sentence would be
+            // noise, but where it does apply the count is otherwise inexplicable - the caller
+            // named far fewer recipients than the number they are being refused for.
+            let split = if shape.orchard_actions > 0 && shape.ironwood_actions > 0 {
+                format!(
+                    " This send carries two shielded bundles that are proved separately and \
+                     counted together: {} Orchard actions spending legacy notes, and {} \
+                     Ironwood actions.",
+                    shape.orchard_actions, shape.ironwood_actions
+                )
+            } else {
+                String::new()
+            };
             return Err(RpcError::invalid_parameter(format!(
                 "Including {count} Orchard {kind} would exceed the current limit of {limit} \
-                 actions, which exists to bound this send's memory and proving cost. \
+                 actions, which exists to bound this send's memory and proving cost.{split} \
                  Consolidate first with z_mergetoaddress ([\"ANY_ORCHARD\"], your own address, \
                  repeatedly until remainingNotes is 0), which is usually what a wallet this \
                  fragmented wants. Or raise [spend] orchard_action_limit (0 disables the cap) \
@@ -7730,23 +7813,30 @@ fn enforce_orchard_action_limit<FeeRuleT, NoteRef>(
     Ok(())
 }
 
-/// Decide whether an Orchard-action count overflows `limit` (assumed non-zero), and if so report
-/// the offending `(count, kind)` for the error message: blame `inputs` or `outputs` when only one
-/// side overflows, else `actions` (the `max`). Returns `None` when within the cap.
+/// Decide whether a step's Orchard-family action count overflows `limit` (assumed non-zero),
+/// and if so report the offending `(count, kind)` for the error message.
+///
+/// `count` is the action count the builder will produce - the per-bundle sum carried on
+/// `shape`, not `max(spends, outputs)`. `kind` blames `inputs` or `outputs` when one side alone
+/// overflows the cap and the step is a single bundle (where that attribution is meaningful),
+/// and is `actions` otherwise. Returns `None` when within the cap.
 fn orchard_action_overflow(
+    shape: tx_size::TxShape,
     spends: usize,
     outputs: usize,
     limit: usize,
 ) -> Option<(usize, &'static str)> {
-    if spends.max(outputs) <= limit {
+    let actions = shape.orchard_family_actions();
+    if actions <= limit {
         return None;
     }
-    Some(if outputs <= limit {
-        (spends, "inputs")
-    } else if spends <= limit {
-        (outputs, "outputs")
+    let one_bundle = shape.orchard_actions == 0 || shape.ironwood_actions == 0;
+    Some(if one_bundle && outputs <= limit && spends > limit {
+        (actions, "inputs")
+    } else if one_bundle && spends <= limit && outputs > limit {
+        (actions, "outputs")
     } else {
-        (spends.max(outputs), "actions")
+        (actions, "actions")
     })
 }
 
@@ -8362,6 +8452,55 @@ mod tests {
     /// `resolve_shielded_destination`: Orchard receivers take precedence and land in Ironwood
     /// once NU6.3 is active (else Orchard); Sapling-only recipients land in Sapling. Getting
     /// this wrong desynchronizes the hand-computed fee from the transaction the builder makes.
+    /// Post-NU6.3, a merge of legacy Orchard V2 notes into an Ironwood destination costs
+    /// **more actions than it selects notes**: the spends and the single payment output land in
+    /// different bundles, so the payment cannot share an action with a spend the way a
+    /// same-pool merge's does.
+    ///
+    /// That is the premise the selection loop in `do_propose_merge_to_address` exists for -
+    /// clamping the note count to `orchard_action_limit` would build one action over it, and
+    /// `enforce_orchard_action_limit` (which counts per bundle) would then refuse the proposal
+    /// the merge just planned, wedging every round. If this assertion ever flips to equality,
+    /// that loop is dead weight and should go.
+    #[test]
+    fn a_cross_bundle_merge_costs_one_more_action_than_it_selects() {
+        use super::merge_action_counts;
+        use crate::network::ZNetwork;
+        use zcash_client_backend::data_api::wallet::TargetHeight;
+        use zcash_protocol::consensus::{NetworkUpgrade, Parameters};
+        use zcash_protocol::PoolType;
+
+        let net = ZNetwork::Test;
+        let nu6_3 = net
+            .activation_height(NetworkUpgrade::Nu6_3)
+            .expect("testnet activates NU6.3");
+        let target = TargetHeight::from(u32::from(nu6_3) + 1_000);
+
+        // 50 legacy Orchard V2 notes paying an Ironwood destination: two bundles.
+        let (_, orchard_act, ironwood_act) =
+            merge_action_counts(&net, target, PoolType::IRONWOOD, 0, 50, 0).expect("bundle shapes");
+        assert_eq!(orchard_act, 50, "the spends fill the Orchard bundle");
+        assert!(
+            ironwood_act >= 1,
+            "the payment output needs a bundle of its own: {ironwood_act}"
+        );
+        assert!(
+            orchard_act + ironwood_act > 50,
+            "the built action count must exceed the 50 notes selected, or the selection loop \
+             is unnecessary"
+        );
+
+        // The same selection paying an Ironwood destination from Ironwood notes is one bundle,
+        // where the payment does share an action - the case the loop must not shrink.
+        let (_, orchard_act, ironwood_act) =
+            merge_action_counts(&net, target, PoolType::IRONWOOD, 0, 0, 50).expect("bundle shapes");
+        assert_eq!(
+            orchard_act + ironwood_act,
+            50,
+            "a same-pool merge costs exactly its note count"
+        );
+    }
+
     #[test]
     fn merge_shielded_destination_pool_resolves_by_receiver_and_activation() {
         use super::merge_shielded_destination_pool;
@@ -9091,23 +9230,62 @@ mod tests {
         assert!(single_pool_violated(true, false, false, true));
     }
 
-    /// The Orchard-action cap: `max(spends, outputs)` must not exceed the limit; the error blames
-    /// whichever side overflows (or `actions` when both do).
+    /// The Orchard-action cap counts what the builder will prove: the **per-bundle sum**. The
+    /// error blames whichever side overflows when a single bundle makes that meaningful, and
+    /// `actions` otherwise.
     #[test]
     fn orchard_action_overflow_decision() {
         use super::orchard_action_overflow;
+        use crate::tx_size::TxShape;
+
+        // One bundle, whose action count is `max(spends, outputs)`: the pre-NU6.3 shape, and
+        // the shape of any send whose notes and outputs are all in one pool.
+        let one = |actions| TxShape {
+            ironwood_actions: actions,
+            ..TxShape::default()
+        };
         // Within the cap - no overflow regardless of which side is larger.
-        assert_eq!(orchard_action_overflow(50, 50, 50), None);
-        assert_eq!(orchard_action_overflow(10, 50, 50), None);
-        assert_eq!(orchard_action_overflow(0, 0, 50), None);
+        assert_eq!(orchard_action_overflow(one(50), 50, 50, 50), None);
+        assert_eq!(orchard_action_overflow(one(50), 10, 50, 50), None);
+        assert_eq!(orchard_action_overflow(one(0), 0, 0, 50), None);
         // Only outputs overflow -> blame outputs.
-        assert_eq!(orchard_action_overflow(3, 51, 50), Some((51, "outputs")));
+        assert_eq!(
+            orchard_action_overflow(one(51), 3, 51, 50),
+            Some((51, "outputs"))
+        );
         // Only inputs overflow -> blame inputs.
-        assert_eq!(orchard_action_overflow(80, 2, 50), Some((80, "inputs")));
-        // Both overflow -> blame actions (the max).
-        assert_eq!(orchard_action_overflow(60, 70, 50), Some((70, "actions")));
+        assert_eq!(
+            orchard_action_overflow(one(80), 80, 2, 50),
+            Some((80, "inputs"))
+        );
+        // Both overflow -> blame actions.
+        assert_eq!(
+            orchard_action_overflow(one(70), 60, 70, 50),
+            Some((70, "actions"))
+        );
         // A tight cap of 1: a single extra output trips it.
-        assert_eq!(orchard_action_overflow(1, 2, 1), Some((2, "outputs")));
+        assert_eq!(
+            orchard_action_overflow(one(2), 1, 2, 1),
+            Some((2, "outputs"))
+        );
+
+        // The case a family-wide `max(spends, outputs)` misses. Post-NU6.3, a send spending 50
+        // legacy Orchard V2 notes into 49 Ironwood outputs builds two bundles - 50 actions and
+        // 49 - and proves 99. Counted family-wide it reads as 50 and slips under the shipped
+        // cap; counted per bundle it is refused, and blamed on neither side alone, because
+        // neither is what made it large.
+        let two_bundles = TxShape {
+            orchard_actions: 50,
+            ironwood_actions: 49,
+            ..TxShape::default()
+        };
+        assert_eq!(two_bundles.orchard_family_actions(), 99);
+        assert_eq!(
+            orchard_action_overflow(two_bundles, 50, 49, 50),
+            Some((99, "actions"))
+        );
+        // And it still passes when the cap genuinely covers both bundles.
+        assert_eq!(orchard_action_overflow(two_bundles, 50, 49, 99), None);
     }
 
     /// Resubmitting a tx the node already has must follow Bitcoin Core's idempotent
