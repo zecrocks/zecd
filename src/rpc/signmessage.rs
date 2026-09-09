@@ -196,10 +196,10 @@ mod tests {
 
     /// A random secp256k1 keypair, for the sign→verify round-trips.
     fn test_keypair() -> (secp256k1::SecretKey, secp256k1::PublicKey) {
-        use rand::RngCore;
+        use rand::Rng;
         let secp = Secp256k1::new();
         let mut secret_bytes = [0u8; 32];
-        rand::thread_rng().fill_bytes(&mut secret_bytes);
+        rand::rng().fill_bytes(&mut secret_bytes);
         let secret_key = secp256k1::SecretKey::from_slice(&secret_bytes)
             .expect("32 random bytes should be a valid secret key");
         let public_key = secp256k1::PublicKey::from_secret_key(&secp, &secret_key);

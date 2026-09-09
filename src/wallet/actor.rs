@@ -89,18 +89,26 @@ type ProposalError = zcash_client_backend::data_api::error::Error<
     zcash_client_sqlite::ReceivedNoteId,
 >;
 
-/// The Orchard (+ Ironwood) proving keys, built once and shared (read-only) across
-/// every wallet actor via `Arc`. These are wallet-independent (they're the circuit's keys), and
-/// `ProvingKey::build()` is a full `keygen_vk`+`keygen_pk` - seconds of work - so the fused
-/// librustzcash send path (which rebuilds the proving key on *every* transaction) pays that
-/// cost per send. Building them here once and feeding them to the PCZT prove path eliminates that
-/// per-send overhead (the `[spend] cache_proving_key` knob, default on).
+/// The Orchard (+ Ironwood) proving keys every send proves with, plus their verifying keys,
+/// shared (read-only) across every wallet actor via `Arc`.
 ///
-/// Deliberately **no verifying key**: the extract step's only use for one was a PCZT with no
-/// Ironwood actions, and post-NU6.3 - live on both public networks - every send's outputs are
-/// Ironwood, so it went unread while costing ~1.2 s of every startup. [`store_pczt`] now always
-/// passes `None`, and the extractor generates the right key per bundle on the fly, exactly as it
-/// already did for every Ironwood send.
+/// The keys themselves live in **the Zakura stack's process-wide cache**
+/// (`zcash_primitives::transaction::builder::cached_orchard_proving_key`, one `OnceLock` per
+/// circuit version): the fork's fused transaction builder reads its key from there on every
+/// `Builder::build`, so holding `&'static` references to the same cells means the PCZT prove
+/// path and the fused path (`create_proposed_transactions`, used by Sapling-spending wallets,
+/// transparent-source sends, `z_shieldcoinbase`, `z_mergetoaddress` and `cache_proving_key =
+/// false`) prove with **one** key set. zecd used to build its own copy, which was the whole
+/// point of this type when the upstream builder regenerated a key per transaction (a
+/// `Params::new` + `keygen_vk` + `keygen_pk`, seconds of work); the fork caches it, reads the
+/// commitment parameters from an embedded artifact instead of regenerating them, and leaves
+/// zecd two jobs: warm the cells in the background at startup rather than on the first send,
+/// and arm the fork's prepared commitment tables (see [`ProvingKeyCache::build`]).
+///
+/// The **verifying keys** are cloned out of the proving keys (`ProvingKey::verifying_key` copies
+/// key material, no keygen) so [`store_pczt`] can hand the extractor the key it would otherwise
+/// regenerate per bundle on every send (`VerifyingKey::build`, the bulk of the old `store_ms`).
+/// They share the proving keys' `Params`, so the prepared tables serve verification too.
 ///
 /// Two circuit versions exist (orchard `bundle.rs`): a **V2 Orchard** bundle uses `FixedPostNu6_2`,
 /// a **V3 Ironwood** bundle uses `PostNu6_3`, and `Bundle::create_proof` rejects a key whose circuit
@@ -112,12 +120,17 @@ type ProposalError = zcash_client_backend::data_api::error::Error<
 /// `ZECD_REGTEST_NU63_HEIGHT` - where the PostNu6_3 keygen would be ~4.5 s of wasted startup for a
 /// key no send can use.
 pub struct ProvingKeyCache {
-    /// `FixedPostNu6_2` proving key - proves the V2 Orchard bundle.
-    orchard_pk: orchard::circuit::ProvingKey,
+    /// `FixedPostNu6_2` proving key - proves the V2 Orchard bundle. A reference into the
+    /// stack's process-wide cache, shared with the fused builder.
+    orchard_pk: &'static orchard::circuit::ProvingKey,
     /// `PostNu6_3` proving key - proves the V3 Ironwood bundle. `None` only when the network has
     /// no NU6.3 activation height at all (so no send produces an Ironwood bundle); mainnet and
     /// testnet both have one. See [`ProvingKeyCache::build`].
-    ironwood_pk: Option<orchard::circuit::ProvingKey>,
+    ironwood_pk: Option<&'static orchard::circuit::ProvingKey>,
+    /// Verifying key matching `orchard_pk`, for the extract step.
+    orchard_vk: orchard::circuit::VerifyingKey,
+    /// Verifying key matching `ironwood_pk`, for the extract step.
+    ironwood_vk: Option<orchard::circuit::VerifyingKey>,
 }
 
 impl ProvingKeyCache {
@@ -134,19 +147,42 @@ impl ProvingKeyCache {
     /// `zcash_primitives`' default features), so on a single-core host the two simply interleave
     /// and cost what they always did.
     pub fn build(build_ironwood: bool) -> Self {
-        use orchard::circuit::{OrchardCircuitVersion, ProvingKey};
+        use orchard::circuit::OrchardCircuitVersion;
+        use zcash_primitives::transaction::builder::cached_orchard_proving_key;
+        // `cached_orchard_proving_key` is the stack's own `OnceLock` per circuit version: the
+        // first caller builds the key (from the embedded k=11 commitment parameters, so no
+        // `Params::new` any more), every later caller - this cache, and the fused builder on
+        // every `Builder::build` - gets the same `&'static` key back. Warming both cells here,
+        // in the background at startup, is what keeps the first send from paying the keygen.
         let (orchard_pk, ironwood_pk) = std::thread::scope(|scope| {
-            let ironwood = build_ironwood
-                .then(|| scope.spawn(|| ProvingKey::build(OrchardCircuitVersion::PostNu6_3)));
-            let orchard_pk = ProvingKey::build(OrchardCircuitVersion::FixedPostNu6_2);
+            let ironwood = build_ironwood.then(|| {
+                scope.spawn(|| cached_orchard_proving_key(OrchardCircuitVersion::PostNu6_3))
+            });
+            let orchard_pk = cached_orchard_proving_key(OrchardCircuitVersion::FixedPostNu6_2);
             // A keygen panic is not recoverable (it means this build cannot prove at all), so
             // propagate it to the caller's `spawn_blocking`, which reports it as a failed build.
             let ironwood_pk = ironwood.map(|h| h.join().expect("Ironwood keygen panicked"));
             (orchard_pk, ironwood_pk)
         });
+        // Arm the Zakura fork's prepared fixed-base commitment tables on each key. The prover's
+        // polynomial commitments then evaluate through the preparations on bounded-width rayon
+        // pools (up to eight effective threads; halo2 falls back to its usual multiexp on wider
+        // ones, so this never slows proving down). It costs hundreds of milliseconds and tens of
+        // MiB per key, once, and is a no-op returning `false` unless orchard was built with its
+        // opt-in `orbits` feature - which `Cargo.toml` enables for exactly this call. Because the
+        // tables hang off the shared `Params`, the fused path's proofs go through them too.
+        let armed = orchard_pk.prepare_proving();
+        let ironwood_armed = ironwood_pk.map(|pk| pk.prepare_proving());
+        info!(
+            orchard = armed,
+            ironwood = ?ironwood_armed,
+            "prepared Orchard proving-key commitment tables"
+        );
         ProvingKeyCache {
             orchard_pk,
             ironwood_pk,
+            orchard_vk: orchard_pk.verifying_key(),
+            ironwood_vk: ironwood_pk.map(|pk| pk.verifying_key()),
         }
     }
 }
@@ -1593,7 +1629,7 @@ fn build_signed_transparent_tx(
     prover: &LocalTxProver,
     trust_own: bool,
 ) -> Result<(TxId, Vec<u8>), RpcError> {
-    use rand::rngs::OsRng;
+    use rand::{rand_core::UnwrapErr, rngs::SysRng};
 
     let fee_rule = Zip317FeeRule::standard();
     let mut builder = Builder::new(
@@ -1661,7 +1697,15 @@ fn build_signed_transparent_tx(
     }
 
     let result = builder
-        .build(&signing_set, &[], &[], OsRng, prover, prover, &fee_rule)
+        .build(
+            &signing_set,
+            &[],
+            &[],
+            UnwrapErr(SysRng),
+            prover,
+            prover,
+            &fee_rule,
+        )
         .map_err(|e| RpcError::wallet(format!("transparent transaction build failed: {e}")))?;
     let tx = result.transaction();
     let txid = tx.txid();
@@ -5095,7 +5139,7 @@ impl WalletActor {
                 let signed = prove_sign_pczt(pczt, &usk, &prover, &keys)?;
                 let prove = p0.elapsed();
                 let s0 = Instant::now();
-                let txid = store_pczt(db, signed, trust_own)?;
+                let txid = store_pczt(db, signed, &keys, trust_own)?;
                 let raw = read_raw_tx(db, txid)?;
                 Ok((txid, raw, prove, s0.elapsed()))
             })?;
@@ -5420,12 +5464,20 @@ impl WalletActor {
         prove: Duration,
     ) -> Result<TxId, RpcError> {
         let trust_own = self.trust_own_transactions;
+        // The pipeline only engages on the cached-key path, and the prove phase that just
+        // finished already awaited the keys, so this resolves immediately.
+        let keys = self
+            .orchard_keys
+            .clone()
+            .expect("pipelined sends run only on the cached-key path")
+            .get()
+            .await?;
         let db = &mut self.db_data;
         let _ = policy; // store rarely surfaces -6; kept for symmetry with the inline path.
         let (txid, raw, store): (TxId, Vec<u8>, Duration) =
             tokio::task::block_in_place(move || -> Result<_, RpcError> {
                 let s0 = Instant::now();
-                let txid = store_pczt(db, signed, trust_own)?;
+                let txid = store_pczt(db, signed, &keys, trust_own)?;
                 let raw = read_raw_tx(db, txid)?;
                 Ok((txid, raw, s0.elapsed()))
             })?;
@@ -7027,7 +7079,7 @@ fn prove_sign_pczt(
     let prover = Prover::new(pczt);
     let prover = if prover.requires_orchard_proof() {
         prover
-            .create_orchard_proof(&keys.orchard_pk)
+            .create_orchard_proof(keys.orchard_pk)
             .map_err(|e| RpcError::wallet(format!("Orchard proof generation failed: {e:?}")))?
     } else {
         prover
@@ -7040,7 +7092,7 @@ fn prove_sign_pczt(
     // it is always present when `requires_ironwood_proof()` is true; its absence would mean NU6.3
     // fired without the cache expecting it, which is a bug worth surfacing).
     let prover = if prover.requires_ironwood_proof() {
-        let ironwood_pk = keys.ironwood_pk.as_ref().ok_or_else(|| {
+        let ironwood_pk = keys.ironwood_pk.ok_or_else(|| {
             RpcError::wallet(
                 "Ironwood proof required but the PostNu6_3 proving key was not built \
                  (NU6.3 not expected on this network)",
@@ -7142,9 +7194,28 @@ fn prove_sign_pczt(
 /// node (the compact scan materializes the notes but carries no memos, and enhancement skips a tx
 /// whose raw bytes the send pre-stored). zecd covered that by re-decrypting the just-stored
 /// transaction here; the pass is gone with the version that made it unnecessary.
-fn store_pczt(db: &mut WriteDb, pczt: pczt::Pczt, trust_own: bool) -> Result<TxId, RpcError> {
+fn store_pczt(
+    db: &mut WriteDb,
+    pczt: pczt::Pczt,
+    keys: &ProvingKeyCache,
+    trust_own: bool,
+) -> Result<TxId, RpcError> {
+    // The extractor verifies every shielded bundle before storing, and takes ONE Orchard
+    // verifying key for both the V2 Orchard and the V3 Ironwood bundle; handed `None` it runs a
+    // `VerifyingKey::build` per bundle on every send instead. So pass the cached key whenever the
+    // transaction carries a single bundle version (every send from a wallet holding only one of
+    // the two note kinds - the steady state post-NU6.3), and fall back to `None` only for the
+    // mixed case (legacy V2 spends plus Ironwood outputs in one transaction), where one key
+    // cannot serve both and the extractor's per-bundle keygen is the correct answer.
+    let has_orchard = !pczt.orchard().actions().is_empty();
+    let has_ironwood = !pczt.ironwood().actions().is_empty();
+    let orchard_vk = match (has_orchard, has_ironwood) {
+        (true, false) => Some(&keys.orchard_vk),
+        (false, true) => keys.ironwood_vk.as_ref(),
+        _ => None,
+    };
     let txid = extract_and_store_transaction_from_pczt::<_, zcash_client_sqlite::ReceivedNoteId>(
-        db, pczt, None, None,
+        db, pczt, None, orchard_vk,
     )
     .map_err(|e| RpcError::wallet(format!("storing transaction failed: {e}")))?;
     mark_own_tx_trusted(db, txid, trust_own);

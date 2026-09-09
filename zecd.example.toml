@@ -441,10 +441,12 @@ orchard_action_limit = 50
 # usual case).
 target_note_count = 4
 min_split_output_value = 10000000
-# Build the Orchard proving key once at startup and reuse it for every send (via the PCZT
-# prove path), instead of librustzcash's fused path which rebuilds it (~seconds of keygen) on
-# every transaction. On by default. Set false to fall back to the fused path (e.g. to
-# benchmark, or if a PCZT issue is suspected); both paths produce identical transactions.
+# Warm the Orchard proving keys in the background at startup and prove sends through the PCZT
+# prove path with them. The Zakura stack caches the keys process-wide, so the fused path shares
+# the same keys; setting this false only gives up the startup warm-up (the first send builds
+# the key inline), the cached verifying key at the store step, and pipeline_proving. On by
+# default. Set false to fall back to the fused path (e.g. to benchmark, or if a PCZT issue is
+# suspected); both paths produce identical transactions.
 cache_proving_key = true
 # Run a send's proving step OFF the single-writer actor, so a long send (which, on a large,
 # note-fragmented wallet, can take minutes) no longer freezes background sync, reads, and the

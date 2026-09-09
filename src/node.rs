@@ -122,9 +122,10 @@ impl PreparedNode {
 
         let registry = WalletRegistry::new(config.default_wallet.clone());
         let mut actor_tasks = Vec::new();
-        // Build the Orchard proving keys once (they're wallet-independent) and share them across
-        // every actor, so each send reuses the cached key instead of rebuilding it per transaction.
-        // On by default (`[spend] cache_proving_key`).
+        // Warm the Orchard proving keys once (they're wallet-independent; the Zakura stack
+        // caches them process-wide, and the fused builder reads the same cells) and share the
+        // handle across every actor, so the first send finds them built and their prepared
+        // commitment tables armed. On by default (`[spend] cache_proving_key`).
         //
         // The keygen runs **in the background**: it is seconds of CPU, and only sends need its
         // result, so blocking here would delay spawning the actors (and, in the daemon, binding

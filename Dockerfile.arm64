@@ -26,8 +26,9 @@
 #   docker build -f Dockerfile.arm64 -t zecd .
 #   docker build -f Dockerfile.arm64 --target export -o ./out .   # extract the binaries
 #
-# Dependencies are released librustzcash crates from crates.io (versions pinned by the
-# committed Cargo.lock), so the build needs network access to fetch them.
+# Dependencies are released crates from crates.io - the Zakura Common `zakura-*` forks of
+# librustzcash plus the upstream crates they leave in place (versions pinned by the committed
+# Cargo.lock), so the build needs network access to fetch them.
 
 # rust:1.96.0-alpine3.24 (multi-arch index digest; keep RUSTUP_TOOLCHAIN below in lockstep)
 FROM rust:1.96.0-alpine3.24@sha256:f87aa870663e2b57ec8c69de82c7eedf7383bee987eef7612c0359635eaadb41 AS builder

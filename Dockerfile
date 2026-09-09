@@ -11,8 +11,9 @@
 #   docker build -t zecd .                      # runtime image (zecd)
 #   docker build --target export -o ./out .     # extract the static binaries
 #
-# Dependencies are released librustzcash crates from crates.io (versions pinned by the
-# committed Cargo.lock), so the build needs network access to fetch them.
+# Dependencies are released crates from crates.io - the Zakura Common `zakura-*` forks of
+# librustzcash plus the upstream crates they leave in place (versions pinned by the committed
+# Cargo.lock), so the build needs network access to fetch them.
 
 FROM stagex/pallet-rust:1.91.1@sha256:4062550919db682ebaeea07661551b5b89b3921e3f3a2b0bc665ddea7f6af1ca AS pallet-rust
 # protoc (+ the abseil it links) is needed by zcash_client_backend's build script.

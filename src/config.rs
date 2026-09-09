@@ -728,11 +728,14 @@ pub struct SpendConfig {
     /// bounds memory/proving cost and gives a clean `-8` instead of a deep librustzcash error
     /// when a `z_sendmany` has too many recipients. `0` disables the cap. Default 50.
     pub orchard_action_limit: usize,
-    /// Build the Orchard proving key once at startup and prove sends through the PCZT roles,
-    /// instead of librustzcash's fused `create_proposed_transactions` path which rebuilds the
-    /// proving key (a full `keygen_vk`+`keygen_pk`) on *every* transaction. On by default;
-    /// set `cache_proving_key = false` to fall back to the fused path (e.g. for benchmarking
-    /// or if a PCZT issue is suspected). Both paths produce identical transactions.
+    /// Prove sends through the PCZT roles with the Orchard proving keys warmed in the background
+    /// at startup (and their prepared commitment tables armed), instead of the fused
+    /// `create_proposed_transactions` path. On the Zakura stack both paths share one
+    /// process-wide key set, so the fused path no longer rebuilds a key per transaction; what
+    /// `false` gives up is the startup warm-up (the first fused send builds the key inline),
+    /// the cached verifying key at the extract step, and `pipeline_proving`. On by default; set
+    /// `cache_proving_key = false` to fall back to the fused path (e.g. for benchmarking or if
+    /// a PCZT issue is suspected). Both paths produce identical transactions.
     pub cache_proving_key: bool,
     /// Run a send's proving step *off* the single-writer actor so it no longer freezes the
     /// background sync (and reads/status/mempool) for the whole proof - which, on a large,

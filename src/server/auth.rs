@@ -8,7 +8,7 @@ use std::str::FromStr;
 use anyhow::{anyhow, Context};
 use base64::Engine;
 use hmac::{Hmac, Mac};
-use rand::RngCore;
+use rand::Rng;
 use sha2::Sha256;
 use subtle::{Choice, ConstantTimeEq};
 
@@ -35,7 +35,7 @@ pub fn generate_rpcauth(username: &str, password: Option<&str>) -> (String, Opti
         None => {
             // 32 random bytes, URL-safe base64 - the same shape rpcauth.py mints.
             let mut buf = [0u8; 32];
-            rand::thread_rng().fill_bytes(&mut buf);
+            rand::rng().fill_bytes(&mut buf);
             let p = base64::engine::general_purpose::URL_SAFE.encode(buf);
             (p.clone(), Some(p))
         }
@@ -229,7 +229,7 @@ pub fn basic_auth_username(header: Option<&str>) -> Option<String> {
 
 fn random_hex(bytes: usize) -> String {
     let mut buf = vec![0u8; bytes];
-    rand::thread_rng().fill_bytes(&mut buf);
+    rand::rng().fill_bytes(&mut buf);
     hex::encode(buf)
 }
 

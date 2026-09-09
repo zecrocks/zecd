@@ -60,7 +60,10 @@ mod tests {
             listed > 100,
             "the bundle lists the crates it covers (found {listed})"
         );
-        for crate_name in ["orchard ", "zcash_client_backend ", "tokio "] {
+        // The Zcash stack is the Zakura Common forks (crates.io `zakura-*` names), so those are
+        // the names the bundle must carry - a bare `orchard` here would mean a crates.io
+        // original had crept back into the graph.
+        for crate_name in ["zakura-orchard ", "zakura-client-backend ", "tokio "] {
             assert!(
                 THIRD_PARTY_LICENSES
                     .lines()

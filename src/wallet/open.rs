@@ -3,7 +3,8 @@
 
 use std::path::{Path, PathBuf};
 
-use rand::rngs::OsRng;
+use rand::rand_core::UnwrapErr;
+use rand::rngs::SysRng;
 
 use zcash_client_sqlite::chain::init::init_blockmeta_db;
 use zcash_client_sqlite::chain::BlockMeta;
@@ -17,8 +18,10 @@ use crate::network::ZNetwork;
 const DATA_DB: &str = "data.sqlite";
 const BLOCKS_FOLDER: &str = "blocks";
 
-/// A read/write wallet handle (uses a real clock + OS RNG, required for writes).
-pub type WriteDb = WalletDb<rusqlite::Connection, ZNetwork, SystemClock, OsRng>;
+/// A read/write wallet handle (uses a real clock + OS RNG, required for writes). The OS RNG is
+/// fallible in `rand_core 0.10` (`SysRng: TryRng`), while `WalletDb` wants an infallible `Rng`;
+/// `UnwrapErr` is the adapter the wallet stack itself uses for that.
+pub type WriteDb = WalletDb<rusqlite::Connection, ZNetwork, SystemClock, UnwrapErr<SysRng>>;
 /// A read-only wallet handle (no clock/RNG needed), as used by devtool's read paths.
 pub type ReadDb = WalletDb<rusqlite::Connection, ZNetwork, (), ()>;
 
@@ -83,7 +86,7 @@ pub fn open_write_with_gap_limit(
 ) -> anyhow::Result<WriteDb> {
     let conn = rusqlite::Connection::open(data_db_path(engine_dir))?;
     configure_writer_conn(&conn)?;
-    let db = WalletDb::from_connection(conn, network, SystemClock, OsRng);
+    let db = WalletDb::from_connection(conn, network, SystemClock, UnwrapErr(SysRng));
     Ok(match external_gap_limit {
         Some(n) => db.with_gap_limits(GapLimits::new(
             n,

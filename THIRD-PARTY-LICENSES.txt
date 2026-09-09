@@ -1515,7 +1515,6 @@ Used by:
   - regex-automata 0.4.18
   - regex-syntax 0.8.11
   - regex 1.13.1
-  - xdg 3.0.0
 
 Copyright (c) 2014 The Rust Project Developers
 
@@ -2002,7 +2001,6 @@ MIT License
 
 Used by:
   - httparse 1.10.1
-  - num_cpus 1.17.0
 
 Copyright (c) 2015-2025 Sean McArthur
 
@@ -2646,34 +2644,6 @@ OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR
 IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
 
-
-
-================================================================================
-MIT License
-================================================================================
-
-Used by:
-  - jubjub 0.10.0
-
-Copyright (c) 2017 The Zcash developers
-
-Permission is hereby granted, free of charge, to any person obtaining a copy
-of this software and associated documentation files (the "Software"), to deal
-in the Software without restriction, including without limitation the rights
-to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-copies of the Software, and to permit persons to whom the Software is
-furnished to do so, subject to the following conditions:
-
-The above copyright notice and this permission notice shall be included in
-all copies or substantial portions of the Software.
-
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
-THE SOFTWARE.
 
 
 ================================================================================
@@ -4845,7 +4815,7 @@ MIT License
 ================================================================================
 
 Used by:
-  - rand_distr 0.4.3
+  - rand_distr 0.6.0
 
 Copyright 2018 Developers of the Rand project
 
@@ -4944,34 +4914,6 @@ CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
 OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR
 IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
-
-================================================================================
-MIT License
-================================================================================
-
-Used by:
-  - reddsa 0.5.2
-  - redjubjub 0.8.0
-
-Copyright 2019-2021 Zcash Foundation
-
-Permission is hereby granted, free of charge, to any person obtaining a copy of
-this software and associated documentation files (the "Software"), to deal in
-the Software without restriction, including without limitation the rights to
-use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies of
-the Software, and to permit persons to whom the Software is furnished to do so,
-subject to the following conditions:
-
-The above copyright notice and this permission notice shall be included in all
-copies or substantial portions of the Software.
-
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS
-FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR
-COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER
-IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN
-CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
-
 
 ================================================================================
 MIT License
@@ -5245,7 +5187,7 @@ MIT License
 ================================================================================
 
 Used by:
-  - zcash_client_backend 0.24.0
+  - zakura-client-backend 0.1.0-rc4
 
 MIT License
 
@@ -5641,36 +5583,6 @@ MIT License
 ================================================================================
 
 Used by:
-  - visibility 0.1.1
-
-MIT License
-
-Copyright (c) 2024 Daniel Henry-Mantilla
-
-Permission is hereby granted, free of charge, to any person obtaining a copy
-of this software and associated documentation files (the "Software"), to deal
-in the Software without restriction, including without limitation the rights
-to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-copies of the Software, and to permit persons to whom the Software is
-furnished to do so, subject to the following conditions:
-
-The above copyright notice and this permission notice shall be included in all
-copies or substantial portions of the Software.
-
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
-SOFTWARE.
-
-
-================================================================================
-MIT License
-================================================================================
-
-Used by:
   - zecd 0.8.0-rc1
 
 MIT License
@@ -5708,22 +5620,17 @@ Used by:
   - cookie-factory 0.3.3
   - equihash 0.3.0
   - fluent-langneg 0.13.1
-  - halo2_gadgets 0.5.0
-  - halo2_poseidon 0.1.0
-  - halo2_proofs 0.3.5
   - intl_pluralrules 7.0.2
   - io_tee 0.1.1
   - libm 0.2.16
-  - pczt 0.9.3
   - schemerz-rusqlite 0.370.0
   - schemerz 0.2.0
   - siphasher 1.0.3
   - tonic-prost-build 0.14.6
   - tonic-prost 0.14.6
   - type-map 0.5.1
-  - uint 0.9.5
-  - zcash_client_sqlite 0.22.0
-  - zcash_pool_migration 0.1.0
+  - zakura-client-sqlite 0.1.0-rc4
+  - zakura-pczt 0.1.0-rc2
 
 MIT License
 
@@ -5969,21 +5876,17 @@ Used by:
   - async-trait 0.1.92
   - atomic-waker 1.1.2
   - basic-toml 0.1.10
-  - bellman 0.14.0
-  - bls12_381 0.8.0
   - curve25519-dalek-derive 0.1.1
   - displaydoc 0.2.7
   - fastrand 2.5.0
   - find-crate 0.6.3
   - fpe 0.6.1
   - group 0.13.0
-  - home 0.5.12
+  - group 0.14.0
   - itoa 1.0.18
   - linux-raw-sys 0.12.1
   - minimal-lexical 0.2.1
   - once_cell 1.21.4
-  - pairing 0.23.0
-  - pastey 0.2.3
   - pin-project-internal 1.1.13
   - pin-project-lite 0.2.17
   - pin-project 1.1.13
@@ -5992,7 +5895,6 @@ Used by:
   - quote 1.0.47
   - rustix 1.1.4
   - rustversion 1.0.23
-  - sapling-crypto 0.7.0
   - semver 1.0.28
   - serde 1.0.229
   - serde_core 1.0.229
@@ -6417,42 +6319,11 @@ MIT License
 
 Used by:
   - ff 0.13.1
+  - ff 0.14.0
 
 The MIT License (MIT)
 
 Copyright (c) 2017 Sean Bowe
-
-Permission is hereby granted, free of charge, to any person obtaining a copy
-of this software and associated documentation files (the "Software"), to deal
-in the Software without restriction, including without limitation the rights
-to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-copies of the Software, and to permit persons to whom the Software is
-furnished to do so, subject to the following conditions:
-
-The above copyright notice and this permission notice shall be included in
-all copies or substantial portions of the Software.
-
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
-THE SOFTWARE.
-
-
-================================================================================
-MIT License
-================================================================================
-
-Used by:
-  - zcash_keys 0.16.1
-  - zcash_primitives 0.30.1
-  - zcash_proofs 0.30.0
-
-The MIT License (MIT)
-
-Copyright (c) 2017-2019 Electric Coin Company
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal
@@ -6542,7 +6413,6 @@ MIT License
 ================================================================================
 
 Used by:
-  - crossbeam-channel 0.5.17
   - crossbeam-deque 0.8.8
   - crossbeam-epoch 0.9.21
   - crossbeam-utils 0.8.23
@@ -6601,98 +6471,6 @@ NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPO
 NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES
 OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN
 CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
-
-
-================================================================================
-MIT License
-================================================================================
-
-Used by:
-  - pasta_curves 0.5.2
-
-The MIT License (MIT)
-
-Copyright (c) 2020-2021 The Electric Coin Company
-
-Permission is hereby granted, free of charge, to any person obtaining a copy
-of this software and associated documentation files (the "Software"), to deal
-in the Software without restriction, including without limitation the rights
-to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-copies of the Software, and to permit persons to whom the Software is
-furnished to do so, subject to the following conditions:
-
-The above copyright notice and this permission notice shall be included in
-all copies or substantial portions of the Software.
-
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
-THE SOFTWARE.
-
-
-================================================================================
-MIT License
-================================================================================
-
-Used by:
-  - sinsemilla 0.1.0
-
-The MIT License (MIT)
-
-Copyright (c) 2020-2022 The Electric Coin Company
-Copyright (c) 2022 The Halo 2 developers
-
-Permission is hereby granted, free of charge, to any person obtaining a copy
-of this software and associated documentation files (the "Software"), to deal
-in the Software without restriction, including without limitation the rights
-to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-copies of the Software, and to permit persons to whom the Software is
-furnished to do so, subject to the following conditions:
-
-The above copyright notice and this permission notice shall be included in
-all copies or substantial portions of the Software.
-
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
-THE SOFTWARE.
-
-
-================================================================================
-MIT License
-================================================================================
-
-Used by:
-  - orchard 0.15.5
-
-The MIT License (MIT)
-
-Copyright (c) 2020-2025 The Electric Coin Company
-Copyright (c) 2026 Zcash Open Development Lab
-
-Permission is hereby granted, free of charge, to any person obtaining a copy
-of this software and associated documentation files (the "Software"), to deal
-in the Software without restriction, including without limitation the rights
-to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-copies of the Software, and to permit persons to whom the Software is
-furnished to do so, subject to the following conditions:
-
-The above copyright notice and this permission notice shall be included in
-all copies or substantial portions of the Software.
-
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
-THE SOFTWARE.
 
 
 ================================================================================
@@ -6793,72 +6571,11 @@ MIT License
 ================================================================================
 
 Used by:
-  - known-folders 1.4.2
-
-The MIT License (MIT)
-
-Copyright (c) 2023 Ryan Lopopolo <rjl@hyperbo.la>
-
-Permission is hereby granted, free of charge, to any person obtaining a copy
-of this software and associated documentation files (the "Software"), to deal
-in the Software without restriction, including without limitation the rights
-to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-copies of the Software, and to permit persons to whom the Software is
-furnished to do so, subject to the following conditions:
-
-The above copyright notice and this permission notice shall be included in all
-copies or substantial portions of the Software.
-
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
-SOFTWARE.
-
-
-================================================================================
-MIT License
-================================================================================
-
-Used by:
   - zcash_spec 0.2.1
 
 The MIT License (MIT)
 
 Copyright (c) 2023 The Electric Coin Company
-
-Permission is hereby granted, free of charge, to any person obtaining a copy
-of this software and associated documentation files (the "Software"), to deal
-in the Software without restriction, including without limitation the rights
-to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-copies of the Software, and to permit persons to whom the Software is
-furnished to do so, subject to the following conditions:
-
-The above copyright notice and this permission notice shall be included in
-all copies or substantial portions of the Software.
-
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
-THE SOFTWARE.
-
-
-================================================================================
-MIT License
-================================================================================
-
-Used by:
-  - halo2_legacy_pdqsort 0.1.0
-
-The MIT License (MIT)
-
-Copyright (c) 2023 The Electric Coin Company
-Copyright (c) 2023 The Halo 2 developers
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal
@@ -6914,11 +6631,27 @@ MIT License
 ================================================================================
 
 Used by:
-  - crunchy 0.2.4
+  - zakura-bellman 1.2.0
+  - zakura-bls12-381 1.0.0
+  - zakura-halo2-gadgets 1.0.0
+  - zakura-halo2-legacy-pdqsort 1.2.0
+  - zakura-halo2-poseidon 1.0.0
+  - zakura-halo2-proofs 1.0.0
+  - zakura-jubjub 1.0.0
+  - zakura-keys 1.0.0
+  - zakura-orchard 1.0.0
+  - zakura-pairing 1.2.0
+  - zakura-pasta-curves 1.0.0
+  - zakura-primitives 1.0.0
+  - zakura-proofs 1.0.0
+  - zakura-reddsa 1.0.0
+  - zakura-redjubjub 1.0.0
+  - zakura-sapling-crypto 1.0.0
+  - zakura-sinsemilla 1.0.0
 
 The MIT License (MIT)
 
-Copyright 2017-2023 Eira Fransham.
+Copyright (c) The Zakura Contributors
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal
@@ -6927,16 +6660,16 @@ to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
 copies of the Software, and to permit persons to whom the Software is
 furnished to do so, subject to the following conditions:
 
-The above copyright notice and this permission notice shall be included in all
-copies or substantial portions of the Software.
+The above copyright notice and this permission notice shall be included in
+all copies or substantial portions of the Software.
 
 THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
 IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
 FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
 AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
 LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
-SOFTWARE.
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+THE SOFTWARE.
 
 
 ================================================================================

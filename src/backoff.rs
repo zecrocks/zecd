@@ -3,7 +3,7 @@
 
 use std::time::Duration;
 
-use rand::Rng;
+use rand::RngExt;
 
 /// Exponential backoff with full jitter. [`next_delay`](Backoff::next_delay) returns the next
 /// wait and advances the attempt counter; [`reset`](Backoff::reset) returns to the base delay
@@ -38,7 +38,7 @@ impl Backoff {
     pub fn next_delay(&mut self) -> Duration {
         let cap_millis = self.cap().as_millis() as u64;
         self.attempt = self.attempt.saturating_add(1);
-        let jittered = rand::thread_rng().gen_range(0..=cap_millis);
+        let jittered = rand::rng().random_range(0..=cap_millis);
         Duration::from_millis(jittered)
     }
 
