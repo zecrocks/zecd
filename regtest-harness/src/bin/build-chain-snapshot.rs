@@ -4,8 +4,8 @@
 //! Every binary that calls `start_funded_chain` needs the same starting state: a chain whose
 //! funder holds a spendable shielded balance. Producing it means mining past the 100-block
 //! coinbase maturity (consensus - it cannot be shortened), starting the funder, shielding its
-//! coinbase, and ageing the note. That measured ~89s, and 12 binaries on the zebra leg each paid
-//! it for an identical result.
+//! coinbase, and ageing the note. That measured ~89s, and every funded binary on a leg - 14 of
+//! the 24 in `HARNESS_TESTS` - used to pay it for an identical result.
 //!
 //! This is a separate binary rather than lazy build-on-first-use inside the harness because
 //! `run-tests.sh` starts many binaries at once: with build-on-use they would all find no snapshot
@@ -15,8 +15,10 @@
 //! Usage:  build-chain-snapshot <dest-dir>        (or set ZECD_REGTEST_CHAIN_SNAPSHOT)
 //!
 //! The node binary comes from `ZEBRAD_BIN`/`ZAKURAD_BIN` as usual, and the funder from
-//! `ZECD_FUNDER_BIN`. A snapshot is only valid for the binaries that built it, so CI keys its
-//! cache on the node and funder images plus the NU6.3 activation height.
+//! `ZECD_FUNDER_BIN`. A snapshot is only valid for the binaries and the chain schedule that built
+//! it, so CI keys its cache on the node kind, the node and funder image pins, and a hash of
+//! `regtest-harness/src/lib.rs` - which is what carries `NU6_3_ACTIVATION_HEIGHT` and the rest of
+//! the bring-up, so a change to any of them rebuilds rather than restoring a mismatched chain.
 
 use std::path::PathBuf;
 

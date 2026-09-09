@@ -1,14 +1,23 @@
-//! Offline regtest wallet-lifecycle test.
+//! Offline wallet-database tests, run against a real `WalletDb` on a regtest network.
 //!
-//! Real zebra/zcashd regtest can't fund an Orchard-only wallet on-chain (coinbase is
-//! transparent-only, there is no Orchard coinbase, and shielding regtest coinbase is blocked
-//! upstream), and librustzcash's funded test harness (`zcash_client_sqlite`'s `TestDbFactory`)
-//! is crate-private - so an actual *funded* note can't be materialised here. What we can do
-//! deterministically and offline is drive zecd's own regtest code path end to end: initialise
-//! the wallet DB on regtest, create an account, derive/encode a regtest Unified Address, and
-//! exercise the read + key-derivation helpers. This is exactly the regtest plumbing the live
-//! `deploy/regtest` stack relies on. Funded receive/spend is covered separately by the live
-//! testnet flow (see the project docs) and by the harness's insufficient-funds (`-6`) check.
+//! librustzcash's funded test harness (`zcash_client_sqlite`'s `TestDbFactory`) is crate-private,
+//! so an actual *funded* note cannot be materialised here; funded receive/spend lives in the
+//! regtest tier (`regtest-harness/`, whose funder is a released zecd that shields regtest
+//! coinbase with `z_shieldcoinbase`) and, for the public network, in the manual testnet flow.
+//! What this file does is everything that needs a real database but no chain, in five groups:
+//!
+//!  * wallet lifecycle - DB init, account creation, address derivation/encoding, and the
+//!    `keys.toml` bootstrap rebuilding the same account;
+//!  * `is_mine` attribution, including the viewing-key path for an address that was never
+//!    recorded, and the refusal of a spliced UA carrying a foreign receiver;
+//!  * multi-account databases - a fleet shard serving many view wallets from one actor, and
+//!    the isolation between accounts sharing one DB;
+//!  * the actor-level paths that need a spawned actor (encryption plumbing, the account-to-keys
+//!    binding checks, watch-only refusals). These are `#[ignore]`d only because `actor::spawn`
+//!    loads the bundled prover, which is slow - they are offline like everything else here;
+//!  * the differential pins for the hand-written SQL in [`crate::wallet::read`]: each statement
+//!    is required to return exactly what the `v_transactions` / `v_tx_outputs` view it replaces
+//!    returns, so a `zcash_client_sqlite` bump that changes a view fails here.
 
 use bip0039::{English, Mnemonic};
 use secrecy::{SecretVec, Zeroize};

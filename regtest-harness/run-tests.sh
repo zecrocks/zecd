@@ -3,10 +3,18 @@
 # Drive the regtest harness test binaries, up to $REGTEST_JOBS of them at a time.
 #
 # Why this exists: every harness test binary brings up its own zebrad (+ lightwalletd, + zecd)
-# stack and then spends most of its wall clock *waiting* on that stack - mining blocks, polling for
-# a sync to catch up, waiting out a confirmation. Run one at a time, the tier's ~15 binaries add up
-# to ~22 minutes of mostly-idle CPU. They are fully independent (tempdir datadirs, no shared
-# fixture), so the only thing that stopped them overlapping was the runner having two cores.
+# stack, and much of its wall clock is spent waiting on that stack - mining blocks, polling for a
+# sync to catch up, waiting out a confirmation. Run one at a time the tier's 24 binaries took over
+# twenty minutes. They are fully independent (tempdir datadirs, no shared fixture), so the only
+# thing that stopped them overlapping was the runner having two cores.
+#
+# NB the "mostly idle" half of that premise no longer holds: since NU6.3 went live on the regtest
+# chain and the funder became a zecd, a funded binary runs *two* proving daemons, so the tier is
+# bounded by total CPU work over available cores rather than by slot count. Raising REGTEST_JOBS
+# without more cores buys nothing (measured: 6 -> 8 slots on the zebra leg moved elapsed 524s ->
+# 521s while every binary inflated 22-38%), and splitting a slow binary costs a whole extra chain
+# bring-up to shorten a bound that is not what binds. The levers are less CPU work or a bigger
+# runner.
 #
 # `cargo test --test a --test b` will NOT do this: cargo runs test *binaries* strictly one after
 # another, and `--test-threads` only parallelises tests *within* a binary - which does nothing here,

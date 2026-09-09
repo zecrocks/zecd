@@ -1785,7 +1785,7 @@ pub(crate) fn listsinceblock(
 
 /// `gettransaction <txid>` - detailed info on one wallet transaction: net `amount`
 /// (fee-exclusive, see [`gettransaction_amount`]), per-output `details`, and the raw `hex`
-/// (fetched from lightwalletd on demand for received txs only seen as compact outputs).
+/// (fetched from the chain upstream on demand for received txs only seen as compact outputs).
 pub(crate) async fn gettransaction(
     state: &AppState,
     wallet: Option<&str>,

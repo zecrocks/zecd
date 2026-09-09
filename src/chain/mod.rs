@@ -332,7 +332,8 @@ pub trait ChainSource: Send {
     /// block locally); a lightwalletd server can only if it speaks the versioned
     /// lightwallet-protocol (`poolTypes` on `BlockRange`), which lightwalletd 0.5.0 and later
     /// do. A server that cannot is refused for a transparent-enabled wallet rather than worked
-    /// around - see `actor::verify_transparent_capability`. Capability, not configuration:
+    /// around - see `actor::transparent_capability_error`, which `actor::prepare_client` checks on
+    /// every connect. Capability, not configuration:
     /// constant for the life of the connection.
     fn block_scan_covers_transparent(&self) -> bool;
 

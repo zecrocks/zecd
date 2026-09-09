@@ -21,8 +21,9 @@ pub mod codes {
     pub const RPC_PARSE_ERROR: i32 = -32700;
 
     // General application errors. (Bitcoin Core's `protocol.h` defines more - including a P2P
-    // client block - but a shielded light wallet has no occasion to emit them; only the codes
-    // zecd actually returns are kept. Clients still match on the numeric values.)
+    // client block - but zecd has no occasion to emit them, so this is Core's taxonomy narrowed
+    // to what zecd returns rather than a copy of the whole header. Clients still match on the
+    // numeric values.)
     pub const RPC_MISC_ERROR: i32 = -1;
     pub const RPC_TYPE_ERROR: i32 = -3;
     pub const RPC_INVALID_ADDRESS_OR_KEY: i32 = -5;
@@ -35,9 +36,12 @@ pub mod codes {
 
     // Wallet errors. NB: these are Bitcoin Core's `protocol.h` numbers; `-11` (invalid label)
     // and `-18` (wallet not found) differ in *meaning* from zcashd's `protocol.h` (where they are
-    // "accounts unsupported" / "backup required"). The collision is harmless - those codes are only
-    // emitted by the label/multiwallet methods zcashd lacks - so don't "reconcile" the numbers: the
-    // Bitcoin Core values are the conformance target.
+    // "accounts unsupported" / "backup required"). The collision is harmless - those codes belong
+    // to the label/multiwallet methods zcashd lacks - so don't "reconcile" the numbers: the
+    // Bitcoin Core values are the conformance target. `-11` is the one code here zecd no longer
+    // emits at all: the label methods it belonged to were removed with the address-label feature
+    // (see the statelessness invariant). It is kept so the wallet block stays Core's, and so
+    // re-adding a label-shaped method cannot invent a different number.
     pub const RPC_WALLET_ERROR: i32 = -4;
     pub const RPC_WALLET_INSUFFICIENT_FUNDS: i32 = -6;
     pub const RPC_WALLET_INVALID_LABEL_NAME: i32 = -11;

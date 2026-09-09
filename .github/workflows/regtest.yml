@@ -174,9 +174,9 @@ jobs:
           # Light mode: the same funded/conformance flow plus the transparent suites (incl. the
           # regtest_transparent_gap regression trap) rerun with zecd on a lightwalletd upstream
           # (ZECD_REGTEST_BACKEND=lwd), and the dedicated regtest_lwd e2e (equivalence vs a
-          # zebra-backed twin, outage/reconnect, the offline-window sweep on both server
-          # generations). A parallel leg, so PR wall-time is unchanged. The zecd suite falls
-          # back to the full HARNESS_TESTS list (env above).
+          # zebra-backed twin, outage/reconnect, offline-window recovery of a transparent
+          # receive-then-spend pair from the compact blocks). A parallel leg, so PR wall-time is
+          # unchanged. The zecd suite falls back to the full HARNESS_TESTS list (env above).
           - suite: zecd-lwd
             backend: lwd
             # regtest_multibackend is extended-tier (it skips in seconds otherwise) and lives
@@ -470,8 +470,8 @@ jobs:
           # its binaries brings up a lightwalletd *in addition to* the node+zecd stack (regtest_lwd
           # runs two lightwalletds and a second zebra-backed zecd twin), so a slot there costs
           # meaningfully more RAM and processes than the zebra suite the 6 was measured against.
-          # Its list is also only 6 binaries, so the ceiling costs little wall clock. Raise it if
-          # the per-binary timing table shows slots idling.
+          # Its list is also only 10 binaries, so the ceiling costs little wall clock. Raise it
+          # if the per-binary timing table shows slots idling.
           REGTEST_JOBS: ${{ matrix.jobs || vars.REGTEST_JOBS || 12 }}
           REGTEST_LOG_DIR: ${{ runner.temp }}/regtest-logs
         # run-tests.sh builds the binaries once (--locked, against the committed lock) and then

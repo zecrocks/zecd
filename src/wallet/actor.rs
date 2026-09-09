@@ -685,12 +685,15 @@ pub struct ActorConfig {
     /// See [`ActorConfig::target_note_count`].
     pub min_split_output_value: u64,
     /// Shared cached Orchard proving/verifying keys (`[spend] cache_proving_key`). `Some`
-    /// selects the PCZT prove path with the cached key; `None` selects the legacy fused path
-    /// (`create_proposed_transactions`), which rebuilds the proving key per send. Created once in
-    /// `daemon::run` and cloned into every actor (the key is wallet-independent), with the keygen
-    /// itself running in the background - a send awaits it. NB: the PCZT path here signs only
-    /// Orchard spends, so a wallet that can spend Sapling notes (`enabled_pools` includes
-    /// Sapling) falls back to the fused path regardless - see `do_send`.
+    /// selects the PCZT prove path; `None` selects the fused path
+    /// (`create_proposed_transactions`). Both prove from the same keys on the Zakura stack - the
+    /// fork caches them process-wide and this type holds `&'static` references into those cells
+    /// (see [`ProvingKeyCache`]), so the choice is about the prove/store seam (and therefore
+    /// `pipeline_proving`), not about who pays a keygen. Created once in
+    /// `node::PreparedNode::start` and cloned into every actor (the keys are wallet-independent),
+    /// with the warm-up itself running in the background - a send awaits it. NB: the PCZT path
+    /// here signs only Orchard spends, so a wallet that can spend Sapling notes (`enabled_pools`
+    /// includes Sapling) falls back to the fused path regardless - see `do_send`.
     pub orchard_keys: Option<Arc<ProvingKeys>>,
     /// Run the proving step off the actor so a long send doesn't freeze sync (`[spend]
     /// pipeline_proving`). Only engages on the cached-Orchard PCZT path; off by default.
@@ -2961,9 +2964,13 @@ impl WalletActor {
                 }
             }
             // `TransactionsInvolvingAddress` discovers transactions that receive or spend funds at
-            // one of the wallet's transparent addresses. Compact blocks omit transparent I/O, so
-            // mined transparent receives/spends are invisible to the block scan - this is the only
-            // path that finds them. Query the upstream's address index for the requested range,
+            // one of the wallet's transparent addresses. librustzcash emits it only to find
+            // *spends* of UTXOs the wallet already holds and to check ephemeral (ZIP-320)
+            // addresses - ordinary receives, and the spends of receives zecd recorded itself, are
+            // found by zecd's own block-scan matcher instead (the zebra backend parses each full
+            // block; a versioned-protocol lightwalletd carries the transparent data in the compact
+            // blocks). So this is the librustzcash-driven half of transparent discovery, not the
+            // only path to it. Query the upstream's address index for the requested range,
             // fetch+store each tx (filling in the transparent outputs), then record the address as
             // checked up to the range end so librustzcash stops re-requesting it.
             TransactionDataRequest::TransactionsInvolvingAddress(addr_req) => {
@@ -3032,7 +3039,9 @@ impl WalletActor {
 
     /// Store every transaction named by a batch of [`TxEvidence`] (from a transparent
     /// address-history query): parse-or-fetch, `decrypt_and_store_transaction`, and run the
-    /// transparent receive matcher. Shared by the TIA servicing arm and the offline-window sweep.
+    /// transparent receive matcher. Its one caller is the `TransactionsInvolvingAddress`
+    /// servicing arm above; it was shared with the offline-window sweep until that half of the
+    /// address-index fallback was deleted.
     ///
     /// The receive matcher runs belt-and-braces: librustzcash's `store_decrypted_tx` attributes
     /// transparent outputs against the `addresses` table itself on this line, but
@@ -5151,8 +5160,10 @@ impl WalletActor {
         Ok(txid)
     }
 
-    /// The legacy fused send path: librustzcash's `create_proposed_transactions` builds, proves,
-    /// and stores under one `&mut` (rebuilding the proving key per send). Used by a Sapling-
+    /// The fused send path: librustzcash's `create_proposed_transactions` builds, proves, and
+    /// stores under one `&mut`. It proves from the same cached keys as the PCZT path (the Zakura
+    /// fork's process-wide cells, which [`ProvingKeyCache`] warms), so what distinguishes it is
+    /// the absence of a prove/store seam, not a per-send keygen. Used by a Sapling-
     /// spending wallet (the PCZT path here signs only Orchard spends), by a transparent-funded
     /// send (`create_proposed_transactions` signs transparent inputs from the USK; the PCZT
     /// prove+sign step cannot), or when `cache_proving_key` is off. Not pipelined - there is no

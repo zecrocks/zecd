@@ -388,9 +388,10 @@ async fn offline_window_leg(zebrad: &Zebrad, funder: &Funder, lwd_bin: &Path) {
         .await
         .expect("the light-mode restore scans to the tip");
 
-    // The receive+send pair must surface - recovered by the offline sweep (legacy server) or
-    // the transparent-carrying block scan (versioned server); either way, identical history to
-    // what the zebra-backed authoring instance recorded.
+    // The receive+send pair must surface, recovered by the transparent-carrying block scan -
+    // the hardest case, since the output is already spent, so nothing but the compact blocks'
+    // transparent data can produce it. The result must be identical history to what the
+    // zebra-backed authoring instance recorded.
     let deadline = Instant::now() + Duration::from_secs(90);
     loop {
         let txs = restore

@@ -88,8 +88,10 @@ pub fn regtest() -> ZNetwork {
     // Ironwood is always compiled, so the *code* is unconditional; only the regtest activation
     // height is a knob, because regtest has no protocol-assigned height (real networks get theirs
     // from the pinned protocol crate). The regtest harness configures zebra with NU6.3 at height 8
-    // and sets this env var so zecd commits to the matching consensus branch id; the funding
-    // wallet is a zecd too and inherits it. All three MUST agree.
+    // and sets this env var so zecd commits to the matching consensus branch id. The funding
+    // wallet is itself a zecd and reads the same variable out of the inherited environment, so
+    // all three heights MUST agree (the harness's `NU6_3_ACTIVATION_HEIGHT` is the canonical
+    // copy).
     //
     // Unset means no NU6.3 on regtest (a chain built against a zebra without the `"NU6.3"` key).
     // A *set but unparseable* value is fatal rather than silently ignored: falling back to "no

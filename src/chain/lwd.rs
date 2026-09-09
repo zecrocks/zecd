@@ -8,10 +8,17 @@
 //!  * a **versioned-protocol** server (zcash/lightwalletd master and later releases) accepts
 //!    `poolTypes` on `BlockRange` and returns each block's transparent inputs/outputs inside
 //!    the compact blocks - so `include_transparent` works exactly like the zebra backend's
-//!    per-block extraction ([`Self::block_scan_covers_transparent`] is `true`);
-//!  * a **legacy** server (≤ v0.4.x, today's public fleet) omits transparent data from compact
-//!    blocks entirely; the wallet falls back to address-index queries (`GetAddressUtxos` +
-//!    `GetTaddressTxids`) - the standard librustzcash lightclient mechanism.
+//!    per-block extraction ([`LwdSource::block_scan_covers_transparent`] is `true`);
+//!  * a **legacy** server (pre-0.5.0) omits transparent data from compact blocks entirely. There
+//!    is no fallback: a transparent-enabled wallet is *refused* on such a server
+//!    (`actor::transparent_capability_error`) rather than run against a second, parallel
+//!    discovery path. The address-index triad that used to fill the gap (`GetAddressUtxos`
+//!    refresh, offline-window sweep, `ChainSource::get_address_utxos`) is deleted; shielded-only
+//!    wallets, the default, still run against any server.
+//!
+//! Note no released lightwalletd populates `lightwalletProtocolVersion`, so the probe reports
+//! *incapable* for every real server - `[backend] assume_transparent_in_compact_blocks` is the
+//! operator's out-of-band assertion, and is what the regtest harness sets in lwd mode.
 
 use std::sync::Arc;
 

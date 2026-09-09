@@ -405,7 +405,7 @@ async fn dispatch_zecd(
         "estimatefee" => util::estimatefee(req),
         "getmempoolinfo" => util::getmempoolinfo(),
 
-        // Raw transactions (served via the wallet's lightwalletd connection)
+        // Raw transactions (served via the wallet's chain upstream connection)
         "getrawtransaction" => rawtx::getrawtransaction(state, wallet, req).await,
         "sendrawtransaction" => rawtx::sendrawtransaction(state, wallet, req).await,
 

@@ -219,12 +219,15 @@ mimalloc-secure = ["mimalloc", "mimalloc/secure"]
 # published ironwood librustzcash line exposes the ironwood APIs unconditionally).
 # Activation is purely consensus-height driven via `is_nu_active(NetworkUpgrade::Nu6_3, ...)`: LIVE
 # on mainnet at height 3_428_143 and on testnet at 4_134_000 (both carried by `zcash_protocol`), and
-# opt-in on regtest via the `ZECD_REGTEST_NU63_HEIGHT` env var (the ironwood harness sets it to 8;
-# the standard harness leaves it unset, so that chain stays pre-NU6.3). So ironwood is "always
-# built, live on both public networks" with no build flag - a mainnet send past 3_428_143 is an
-# ironwood send. Every
-# librustzcash crate is now a crates.io **stable release** (see the version reqs above) - there are
-# no release-candidate pins left.
+# opt-in on regtest via the `ZECD_REGTEST_NU63_HEIGHT` env var, which CI sets to 8 for the whole
+# regtest tier - so every regtest flow runs NU6.3-active, matching the public networks (the one
+# deliberate exception is `tests/embedded_regtest.rs`, whose chain stays pre-NU6.3). So ironwood
+# is "always built, live on both public networks" with no build flag - a mainnet send past
+# 3_428_143 is an ironwood send. Every dependency here is a crates.io release and there are no
+# git pins or `[patch.crates-io]` entries, but not every one is a *stable* release: the Zakura
+# wallet layer (`zakura-client-backend`/`zakura-client-sqlite` 0.1.0-rc4, `zakura-pczt`
+# 0.1.0-rc2) is still on release candidates, and it is those candidates' `=1.0.0` requirements
+# that pin the crypto family. Both move together, on a wallet-layer release.
 
 [dev-dependencies]
 tempfile = "3"

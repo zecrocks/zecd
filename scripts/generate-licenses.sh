@@ -2,7 +2,7 @@
 #
 # Regenerate THIRD-PARTY-LICENSES.txt - the bundled license texts of every crate
 # compiled into the zecd binary. Committed to the repo (not generated at build time)
-# so the reproducible StageX/Debian Docker builds stay tooling-free; the packaging
+# so the reproducible StageX (amd64) / Alpine (arm64) Docker builds stay tooling-free; the packaging
 # (build-deb.sh, the release tarball, the Docker runtime image) just ships this file.
 #
 # cargo-about enriches license data from clearlydefined.io by default, which can pull a

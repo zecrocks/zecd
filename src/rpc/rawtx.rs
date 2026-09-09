@@ -52,7 +52,8 @@ fn parse_txid_param(s: &str) -> Result<TxId, RpcError> {
 }
 
 /// `getrawtransaction <txid> [verbose] [blockhash]` - fetch any transaction by txid:
-/// wallet-stored raw bytes when available, otherwise via lightwalletd's `GetTransaction`.
+/// wallet-stored raw bytes when available, otherwise via the chain upstream's tx fetch
+/// (zebrad `getrawtransaction`, lightwalletd `GetTransaction`).
 pub(crate) async fn getrawtransaction(
     state: &AppState,
     wallet: Option<&str>,
@@ -79,7 +80,7 @@ pub(crate) async fn getrawtransaction(
     let handle = state.registry.get(wallet)?.clone();
     let st = handle.status();
     // Wallet-known txs carry their mined height/time locally; anything else comes from
-    // lightwalletd, which reports the mined height alongside the raw bytes.
+    // the chain upstream, which reports the mined height alongside the raw bytes.
     let rec = read::get_transaction(
         handle.network,
         &handle.engine_dir,
@@ -139,7 +140,7 @@ pub(crate) async fn getrawtransaction(
 }
 
 /// `sendrawtransaction <hexstring> [maxfeerate]` - broadcast caller-built raw transaction
-/// bytes through lightwalletd. `maxfeerate` is accepted and ignored: fees are ZIP-317 and a
+/// bytes through the chain upstream. `maxfeerate` is accepted and ignored: fees are ZIP-317 and a
 /// shielded transaction's fee is not computable from its serialization alone.
 pub(crate) async fn sendrawtransaction(
     state: &AppState,
@@ -151,7 +152,7 @@ pub(crate) async fn sendrawtransaction(
         .map_err(|_| RpcError::new(codes::RPC_DESERIALIZATION_ERROR, "TX decode failed"))?;
     let handle = state.registry.get(wallet)?.clone();
     // Parse before broadcasting: an undecodable tx is -22 (and parsing yields the txid to
-    // return, which lightwalletd's SendTransaction response does not reliably provide).
+    // return, which neither backend's broadcast response reliably provides).
     let branch_height = handle
         .status()
         .chain_tip
