@@ -132,7 +132,14 @@ impl PreparedNode {
         // the health and RPC listeners) - leaving the node unreachable and not syncing for the
         // whole window. The first send awaits `ProvingKeys::get`; by then it is normally long
         // finished.
-        let orchard_keys = if config.spend.cache_proving_key {
+        // ...but only where a send is possible at all. A daemon whose every wallet is
+        // watch-only - a `[fleet]` of view wallets, or `init --ufvk` replicas - cannot sign a
+        // transaction, so warming and arming these keys spends startup CPU and holds the armed
+        // commitment tables resident for something nothing in the process can reach. This is the
+        // same cut the actor already makes one level down, where a watch-only actor builds no
+        // Sapling prover.
+        let spender_present = any_wallet_can_spend(&config.wallets);
+        let orchard_keys = if config.spend.cache_proving_key && spender_present {
             // Also build the PostNu6_3 (Ironwood) proving key when this network can activate
             // NU6.3, so post-NU6.3 sends prove the Ironwood bundle from the cache instead of
             // rebuilding a key per send. NU6.3 is live on mainnet (3_428_143) and testnet
@@ -153,6 +160,23 @@ impl PreparedNode {
             let keys = actor::ProvingKeys::new(build_ironwood);
             keys.spawn_build();
             Some(keys)
+        } else if config.spend.cache_proving_key {
+            // Not `None`: the handle still builds on demand (`ProvingKeys::get` is a
+            // `OnceCell::get_or_try_init`), so a send that arrives anyway - a wallet this
+            // predicate read as watch-only, or one added by a future runtime path - still
+            // proves, paying the warm-up inline exactly as a send arriving before the
+            // background task would. Skipping the *eager* warm-up is the whole change; it
+            // cannot make a send fail.
+            info!(
+                "no wallet holds spending keys; not warming the Orchard proving keys (they build \
+                 on demand if a send ever arrives)"
+            );
+            Some(actor::ProvingKeys::new(
+                config
+                    .network
+                    .activation_height(NetworkUpgrade::Nu6_3)
+                    .is_some(),
+            ))
         } else {
             None
         };
@@ -549,6 +573,42 @@ async fn spawn_fleet(
 }
 
 /// How many shards the manager currently tracks (for the startup line).
+/// Whether any configured wallet could ever sign a transaction - i.e. whether this daemon has
+/// any use for the Orchard proving keys.
+///
+/// Reads `keys.toml`, not the wallet database. A `zecd init --ufvk` wallet is seedless by
+/// construction (`WalletStore::init_view_only`), and `keys.toml` is written before the database
+/// exists, so this is answerable at startup - before any actor has spawned and reported the
+/// `watch_only` flag the single-spender invariant later uses. An *encrypted* wallet still holds
+/// its seed as ciphertext, so a locked spender counts as a spender without decrypting anything.
+///
+/// Fleet shards are deliberately not consulted: a manifest carries a viewing key and nothing
+/// else, so a shard member can never spend (`wallet/shard.rs` imports it watch-only).
+///
+/// An unreadable or absent `keys.toml` counts as **spending**. Both directions are safe - the
+/// keys build on demand either way - but being wrong this way costs one eager warm-up, where
+/// being wrong the other way costs a send its warm-up latency, and this is also the reading
+/// that leaves a misconfigured datadir behaving exactly as it does today.
+fn any_wallet_can_spend(
+    wallets: &std::collections::BTreeMap<String, crate::config::WalletEntry>,
+) -> bool {
+    wallets
+        .values()
+        .any(|entry| keys_file_can_spend(&entry.keys_path()))
+}
+
+/// The per-wallet half of [`any_wallet_can_spend`]: whether the `keys.toml` at this path holds
+/// spending material.
+fn keys_file_can_spend(keys_path: &std::path::Path) -> bool {
+    if !WalletStore::exists(keys_path) {
+        return true;
+    }
+    match WalletStore::read(keys_path) {
+        Ok(store) => store.has_seed(),
+        Err(_) => true,
+    }
+}
+
 fn shard_count(manager: &crate::fleet::FleetManager) -> usize {
     manager.shards()
 }
@@ -871,6 +931,68 @@ mod tests {
     use super::testutil::{
         walletless_node as test_node, walletless_node_with_safelist as test_node_with_safelist,
     };
+
+    /// The check that decides whether to warm the Orchard proving keys reads `keys.toml`, so it
+    /// must answer for a watch-only wallet (seedless, `init --ufvk`) and a spending one - and,
+    /// the case that matters most, for anything it cannot read, which has to count as spending
+    /// so an unexpected datadir keeps today's behaviour rather than quietly losing the warm-up.
+    #[test]
+    fn only_a_seedless_keys_file_skips_the_proving_key_warmup() {
+        use crate::wallet::store::WalletStore;
+        use zcash_protocol::consensus::BlockHeight;
+
+        // The committed testnet development phrase (valueless) - a deterministic spending seed.
+        const PHRASE: &str = "mechanic vehicle helmet decide plug gorilla frost dial october \
+                              midnight culture idea mountain fame park social drip bid doctor \
+                              scatter glance defy moment stage";
+        // Stored verbatim by `init_view_only` and never parsed here, so an obvious placeholder
+        // is better than a real-looking key nobody can verify (as in `store.rs`'s own tests).
+        const UFVK: &str = "uviewtest1nodeplaceholder";
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let net = crate::network::regtest();
+
+        let seedless = dir.path().join("view-only.toml");
+        WalletStore::init_view_only(&seedless, BlockHeight::from_u32(1), net, UFVK)
+            .expect("write a seedless keys.toml");
+        assert!(
+            !super::keys_file_can_spend(&seedless),
+            "a seedless wallet cannot sign, so nothing needs the proving keys"
+        );
+
+        // An encrypted spender still counts: the seed is present as ciphertext, so this decides
+        // without unlocking anything.
+        let encrypted = dir.path().join("encrypted.toml");
+        let mnemonic = <bip0039::Mnemonic<bip0039::English>>::from_phrase(PHRASE).expect("phrase");
+        WalletStore::init_with_passphrase(
+            &encrypted,
+            crate::wallet::store::Passphrase::from("correct horse battery".to_string()),
+            &mnemonic,
+            BlockHeight::from_u32(1),
+            net,
+            UFVK,
+        )
+        .expect("write an encrypted keys.toml");
+        assert!(
+            super::keys_file_can_spend(&encrypted),
+            "a locked spending wallet is still a spending wallet"
+        );
+
+        // A `keys.toml` that is not there at all: the wallet loop warns and skips such a wallet,
+        // but reading its absence as watch-only would be inferring custody from a missing file.
+        assert!(
+            super::keys_file_can_spend(&dir.path().join("does-not-exist.toml")),
+            "an absent keys.toml must not be read as watch-only"
+        );
+
+        // Likewise one that does not parse.
+        let corrupt = dir.path().join("corrupt.toml");
+        std::fs::write(&corrupt, b"this is not toml at all").expect("write");
+        assert!(
+            super::keys_file_can_spend(&corrupt),
+            "an unreadable keys.toml must not be read as watch-only"
+        );
+    }
 
     /// `call` runs the same dispatch table as HTTP: a method that does not exist is -32601,
     /// with the same message shape.
