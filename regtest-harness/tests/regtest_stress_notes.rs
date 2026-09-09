@@ -186,9 +186,19 @@ async fn regtest_stress_many_notes() {
     //     fraction forces the greedy selector to pull in many of the small notes → a large Orchard
     //     bundle → a long proof. While that proof runs off the actor, mine blocks and require zecd
     //     to scan them: that is only possible if the actor is NOT frozen by the proof. ---
-    let balance = getbalance_zec(&zecd).await;
-    let sweep = balance * 0.7;
-    assert!(sweep > 0.0, "wallet has no balance to sweep: {balance}");
+    let balance = getbalance_zats(&zecd).await;
+    // Take the fraction in **zatoshis**, not in ZEC. zecd parses an amount with Bitcoin Core's
+    // `ParseFixedPoint`, which accepts at most 8 decimal places, and an f64 product routinely has
+    // more: a 0.78225 ZEC wallet gives `balance * 0.7 == 0.5475749999999999`, which serde_json
+    // serializes in full and zecd rejects with -3 "Invalid amount" - the failure this replaced,
+    // and one that depends on the balance the build loop happens to land on. Integer zatoshis
+    // through `zec_str` can only ever render 8 places.
+    let sweep_zats = balance * 7 / 10;
+    assert!(
+        sweep_zats > 0,
+        "wallet has no balance to sweep: {balance} zatoshis"
+    );
+    let sweep = zec_str(sweep_zats);
     eprintln!("stress: measured send sweeps {sweep} ZEC ({notes}-note wallet)");
 
     let before = zecd.block_count().await.expect("block_count before send");
@@ -220,10 +230,10 @@ async fn regtest_stress_many_notes() {
     zecd.wait_until_synced(tip, SYNC_TIMEOUT)
         .await
         .expect("zecd sync (post-sweep)");
-    let after = getbalance_zec(&zecd).await;
+    let after = getbalance_zats(&zecd).await;
     assert!(
         after < balance,
-        "sweep did not move funds: balance {balance} -> {after}"
+        "sweep did not move funds: balance {balance} -> {after} zatoshis"
     );
 
     let _ = zecd.call("stop", json!([])).await;
@@ -249,15 +259,23 @@ async fn confirmed_note_count(zecd: &Zecd) -> usize {
         .unwrap_or(0)
 }
 
-/// zecd's spendable balance in ZEC.
-async fn getbalance_zec(zecd: &Zecd) -> f64 {
+/// zecd's spendable balance in zatoshis.
+///
+/// `getbalance` answers with a bare 8-decimal JSON number, and the harness's `serde_json` has no
+/// `arbitrary_precision`, so it arrives as an `f64` and is converted back to an exact integer
+/// here. That conversion is lossless at any balance a regtest chain can hold (a whole number of
+/// zatoshis is far inside f64's 2^53 exactly-representable range), and reading the balance as an
+/// integer is what lets every amount this test derives from it stay an exact 8-dp decimal.
+async fn getbalance_zats(zecd: &Zecd) -> u64 {
     let v = zecd
         .call("getbalance", json!([]))
         .await
         .expect("getbalance");
-    v.as_f64()
+    let zec = v
+        .as_f64()
         .or_else(|| v.as_str().and_then(|s| s.parse().ok()))
-        .expect("getbalance number")
+        .expect("getbalance number");
+    (zec * 1e8).round() as u64
 }
 
 /// Await an async operation (`z_sendmany`) via `z_waitforoperation`, panicking on

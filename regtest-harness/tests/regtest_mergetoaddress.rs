@@ -652,6 +652,12 @@ async fn regtest_mergetoaddress_consolidates_a_fragmented_wallet() {
 /// path), and the follow-up drains the rest. ~200 actions of proving on both the fan-out and
 /// the merge sides puts this well past the PR tier's envelope, so it runs on the extended tier
 /// (`ZECD_REGTEST_EXTENDED=1`: weekly schedule + workflow dispatch), like the other heavy e2es.
+///
+/// The 200-input merge serializes to ~634 KB, which a stock zakura node will not relay (its
+/// `[mempool] max_transaction_bytes` defaults to 250 KB - a node-local policy zebra does not
+/// have). The harness raises that ceiling to the consensus block limit on the zakura leg, so
+/// what this asserts stays the *selection* limit; see `mempool_policy_section` in the harness
+/// for why that hides nothing a default zecd deployment would meet.
 #[tokio::test]
 async fn regtest_mergetoaddress_default_shielded_limit() {
     if !extended_enabled() {

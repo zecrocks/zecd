@@ -290,6 +290,7 @@ impl Zebrad {
                 miner_address,
                 &cache_dir.to_string_lossy(),
                 nu6_3_height,
+                RegtestNode::from_env(),
             ),
         )
         .context("write zebrad.toml")?;
@@ -321,6 +322,7 @@ impl Zebrad {
                 miner_address,
                 &cache_dir.to_string_lossy(),
                 self.nu6_3_height,
+                RegtestNode::from_env(),
             ),
         )
         .context("rewrite zebrad.toml for restart")?;
@@ -385,6 +387,7 @@ impl Zebrad {
                 miner_address,
                 &cache_dir.to_string_lossy(),
                 nu6_3_height,
+                RegtestNode::from_env(),
             ),
         )
         .context("write zebrad.toml")?;
@@ -488,6 +491,7 @@ fn zebrad_toml(
     miner_address: &str,
     cache_dir: &str,
     nu6_3_height: u32,
+    node: RegtestNode,
 ) -> String {
     let nu6_2 = NU6_2_ACTIVATION_HEIGHT;
     let lockbox_addr = LOCKBOX_DISBURSEMENT_ADDR;
@@ -495,6 +499,7 @@ fn zebrad_toml(
     // NU6.3 (ironwood) activation. Needs zebrad >= 6.2.2; older releases have no `"NU6.3"` key and
     // reject an unknown activation-height entry at startup.
     let nu6_3_line = format!("\"NU6.3\" = {nu6_3_height}\n");
+    let mempool_section = mempool_policy_section(node);
     format!(
         r#"[network]
 network = "Regtest"
@@ -531,7 +536,7 @@ addresses = []
 address = "{lockbox_addr}"
 amount = {lockbox_amount}
 
-[mining]
+{mempool_section}[mining]
 miner_address = "{miner_address}"
 
 [state]
@@ -547,6 +552,41 @@ enable_cookie_auth = false
 "#
     )
 }
+
+/// The node-local mempool policy this regtest chain needs, as a `zebrad.toml` section (empty for
+/// zebra).
+///
+/// zakura caps an individual mempool transaction at 250 000 bytes by default
+/// (`[mempool] max_transaction_bytes`) - a relay policy of its own, with no consensus force and
+/// no counterpart in zebra, which has no such key at all. A 200-input Orchard merge, which is
+/// exactly what `regtest_mergetoaddress_default_shielded_limit` builds to pin zcashd's default
+/// `shielded_limit`, serializes to ~634 KB, so on the zakura leg the node refused a transaction
+/// zecd had built correctly and the test read it as a wallet failure (every extended run since
+/// the zakura leg was promoted to the full test list).
+///
+/// Raising the policy to the consensus block limit lets the regtest node relay anything the
+/// wallet can legally build, which is what the suite is here to exercise - the same reason it
+/// disables proof-of-work. It hides nothing an operator would meet by default: zecd's own
+/// `[spend] orchard_action_limit` (default 50) binds long before 250 KB, and only a config that
+/// lifts that cap - as the merge e2e deliberately does - can build a transaction a stock zakura
+/// node would decline to relay.
+///
+/// Written for zakura only. Zebra's mempool config is `deny_unknown_fields`, so an unknown key
+/// there is a startup failure, not an ignored line.
+fn mempool_policy_section(node: RegtestNode) -> String {
+    match node {
+        RegtestNode::Zebra => String::new(),
+        RegtestNode::Zakura => format!(
+            "[mempool]\n\
+             # Relay anything that fits in a block; see mempool_policy_section().\n\
+             max_transaction_bytes = {MAX_BLOCK_BYTES}\n\n"
+        ),
+    }
+}
+
+/// The Zcash consensus maximum block size, and so the largest transaction that can ever be
+/// mined. Used as the regtest mempool's per-transaction ceiling.
+const MAX_BLOCK_BYTES: u64 = 2_000_000;
 
 // =============================== lightwalletd (indexer) ===============================
 
@@ -3265,6 +3305,32 @@ mod tests {
         }
         let unique: std::collections::HashSet<u16> = picked.iter().map(|(p, _)| *p).collect();
         assert_eq!(unique.len(), picked.len(), "duplicate ports handed out");
+    }
+
+    /// The zakura-only mempool relay policy: present, naming the consensus block limit, on the
+    /// zakura leg and absent on zebra - where the key does not exist and zebra's
+    /// `deny_unknown_fields` config would refuse to start on it.
+    #[test]
+    fn the_mempool_relay_policy_is_written_for_zakura_only() {
+        assert_eq!(mempool_policy_section(RegtestNode::Zebra), "");
+        let zakura = mempool_policy_section(RegtestNode::Zakura);
+        assert!(zakura.starts_with("[mempool]\n"), "{zakura}");
+        assert!(
+            zakura.contains(&format!("max_transaction_bytes = {MAX_BLOCK_BYTES}")),
+            "{zakura}"
+        );
+        // A trailing blank line: the section is spliced straight in front of `[mining]`.
+        assert!(zakura.ends_with("\n\n"), "{zakura}");
+
+        // And it lands in the rendered config as its own top-level table, ahead of `[mining]`.
+        let render = |node| zebrad_toml(1, 2, SEED_MINER_ADDRESS, "/tmp/state", 8, node);
+        let zakura_toml = render(RegtestNode::Zakura);
+        let mempool_at = zakura_toml
+            .find("\n[mempool]\n")
+            .expect("[mempool] section");
+        let mining_at = zakura_toml.find("\n[mining]\n").expect("[mining] section");
+        assert!(mempool_at < mining_at, "{zakura_toml}");
+        assert!(!render(RegtestNode::Zebra).contains("[mempool]"));
     }
 
     #[test]
