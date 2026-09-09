@@ -193,13 +193,19 @@ impl Default for FleetConfig {
     }
 }
 
-/// `[pools]` - the wallet's shielded pool configuration: which pools are enabled and which
-/// receivers the Unified Addresses it hands out include by default. A default receiver may never
-/// name a pool that isn't enabled (validated at startup). Per-wallet `[wallets.<name>]` entries
-/// can override either field; this is the global default.
+/// `[pools]` - the wallet's shielded **receiver** configuration: which receivers its addresses
+/// may carry, and which of those the Unified Addresses it hands out include by default. A default
+/// receiver may never name one that isn't enabled (validated at startup). Per-wallet
+/// `[wallets.<name>]` entries can override either field; this is the global default.
+///
+/// Both fields name receivers rather than value pools, so this list is shorter than the set of
+/// pools zecd reports funds in: ironwood has no receiver of its own (see `crate::pools`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PoolsConfig {
-    /// Shielded pools the wallet receives into and spends from.
+    /// The shielded receivers the wallet may hand out, and so the pools it receives into. Also
+    /// picks the pool change is sent to (the strongest of them). It does **not** restrict
+    /// spending: a send draws on every pool the wallet holds notes in, ironwood and any
+    /// pool whose receiver is absent here included.
     pub enabled: ReceiverSet,
     /// Receivers included in the UAs handed out by `getnewaddress` when no per-call override is
     /// given. Always a subset of `enabled`.

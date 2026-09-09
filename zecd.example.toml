@@ -268,11 +268,16 @@ bootstrap_from_keys = true
 # allow_multiple_spending_wallets = false
 
 [pools]
-# Shielded value pools this wallet uses. zecd is shielded-only; supported pools are "sapling"
-# and "orchard". These are the GLOBAL defaults; any [wallets.<name>] section can override
-# `pools`/`default_receivers` independently.
+# Shielded RECEIVERS this wallet's addresses may carry. zecd is shielded-only; the receivers are
+# "sapling" and "orchard". These are the GLOBAL defaults; any [wallets.<name>] section can
+# override `pools`/`default_receivers` independently.
 #
-# "ironwood" is not a value HERE - not because it isn't a pool, but because this key selects
+# Both keys below name receivers, not value pools, which is why this list is shorter than the set
+# of pools zecd reports funds in. The section is called [pools] because a receiver and the pool
+# funds arriving at it land in are usually one and the same; ironwood is the exception that makes
+# the difference worth stating.
+#
+# "ironwood" is not a value HERE - not because it isn't a pool, but because these keys select
 # *receivers*. Ironwood (NU6.3) very much is a value pool: its own bundle in V6 transactions,
 # its own valueBalance, and `pool == "ironwood"` in balances and history. What it lacks is a
 # *receiver*: ironwood notes are Orchard V3 notes reusing Orchard's keys, addresses and
@@ -282,11 +287,14 @@ bootstrap_from_keys = true
 # into ironwood is a real pool crossing that publishes the amount (see [spend] privacy_policy
 # below). enabled = ["ironwood"] is a startup error.
 #
-# `enabled` - pools the wallet receives into and spends from. Change is sent to the
-#                       strongest enabled pool (Orchard if enabled).
-# `default_receivers` - receivers included in the Unified Addresses getnewaddress hands out
+# `enabled` - the receivers this wallet may hand out, and so the pools it receives into.
+#                       Change is sent to the strongest enabled one (Orchard if enabled). It does
+#                       NOT restrict spending: a send draws on every pool the wallet holds notes
+#                       in, ironwood included, whatever is listed here.
+# `default_receivers` - the receivers included in the Unified Addresses getnewaddress hands out
 #                       when no per-call override is given. Must be a SUBSET of `enabled`
-#                       (naming a disabled pool is a startup error). Defaults to `enabled`.
+#                       (naming a receiver that is not enabled is a startup error). Defaults to
+#                       `enabled`.
 #
 # The default (this section omitted) is the Orchard receiver only, preserving zecd's historical
 # behaviour; post-NU6.3 such a wallet holds ironwood notes at that receiver.
@@ -296,7 +304,7 @@ bootstrap_from_keys = true
 # getnewaddress accepts a per-call override in its address_type argument, e.g.
 #   getnewaddress "" "sapling"          (Sapling receiver only)
 #   getnewaddress "" "sapling,orchard"  (both)
-# constrained to the enabled pools (else -8).
+# constrained to the enabled receivers (else -8).
 enabled = ["orchard"]
 default_receivers = ["orchard"]
 #

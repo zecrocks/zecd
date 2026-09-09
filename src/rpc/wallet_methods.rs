@@ -327,7 +327,7 @@ pub(crate) async fn getnewaddress(
 pub(crate) fn parse_receiver_tokens(
     address_type: Option<&str>,
 ) -> Result<ReceiverRequest, RpcError> {
-    use crate::pools::{Receiver, ReceiverSet};
+    use crate::pools::{Receiver, ReceiverParseError, ReceiverSet};
     let Some(raw) = address_type.map(str::trim).filter(|s| !s.is_empty()) else {
         return Ok(ReceiverRequest::Default);
     };
@@ -341,8 +341,15 @@ pub(crate) fn parse_receiver_tokens(
     let mut pools = Vec::new();
     for token in raw.split(',') {
         let token = token.trim();
-        let pool = Receiver::from_config_str(token).map_err(|_| {
-            RpcError::invalid_address_or_key(format!("Unknown address type '{token}'"))
+        let pool = Receiver::from_config_str(token).map_err(|e| match e {
+            // "ironwood" names a pool this build fully supports - it loads an ironwood proving
+            // key and reports `pool == "ironwood"` on the caller's own notes - so answering
+            // "unknown address type" would contradict what the caller has already seen. What it
+            // is not is a receiver, which is what this argument selects, so say that instead.
+            ReceiverParseError::Ironwood => RpcError::invalid_address_or_key(e.to_string()),
+            ReceiverParseError::UnknownToken(_) => {
+                RpcError::invalid_address_or_key(format!("Unknown address type '{token}'"))
+            }
         })?;
         if pool.is_transparent() {
             return Err(RpcError::invalid_address_or_key(
@@ -447,7 +454,7 @@ fn parse_receiver_types_array(
     v: Option<&Value>,
     handle: &WalletHandle,
 ) -> Result<ReceiverRequest, RpcError> {
-    use crate::pools::{Receiver, ReceiverSet};
+    use crate::pools::{Receiver, ReceiverParseError, ReceiverSet};
     let arr = match v {
         None | Some(Value::Null) => return Ok(ReceiverRequest::Default),
         Some(Value::Array(a)) => a,
@@ -474,7 +481,12 @@ fn parse_receiver_types_array(
         }
         match Receiver::from_config_str(s) {
             Ok(p) => pools.push(p),
-            Err(_) => invalid.push(s.to_string()),
+            // A pool that has no receiver of its own is answered rather than lumped in with the
+            // unrecognized tokens: there is a right thing to ask for and the error can name it.
+            Err(e @ ReceiverParseError::Ironwood) => {
+                return Err(RpcError::invalid_parameter(e.to_string()))
+            }
+            Err(ReceiverParseError::UnknownToken(_)) => invalid.push(s.to_string()),
         }
     }
     if !invalid.is_empty() {
@@ -3229,6 +3241,33 @@ mod tests {
                 ReceiverRequest::Default
             ));
         }
+    }
+
+    /// Both receiver-taking RPC arguments must give an ironwood token the same answer the config
+    /// key does. They render `ReceiverParseError` rather than their own text precisely so the
+    /// three surfaces cannot disagree about whether zecd supports ironwood; before that, an
+    /// operator asking these got "unknown address type" and an invalid-receiver list, neither of
+    /// which mentions that the support they read about lives at the orchard receiver.
+    #[test]
+    fn receiver_arguments_point_ironwood_at_orchard() {
+        let err = parse_receiver_tokens(Some("ironwood")).unwrap_err();
+        assert_eq!(err.code, crate::error::codes::RPC_INVALID_ADDRESS_OR_KEY);
+        assert!(err.message.contains("orchard"), "{}", err.message);
+        assert!(
+            !err.message.contains("Unknown address type"),
+            "{}",
+            err.message
+        );
+
+        let wallet = handle_with_pools(false, crate::pools::ReceiverSet::single(Receiver::Orchard));
+        let err = parse_receiver_types_array(Some(&json!(["ironwood"])), &wallet).unwrap_err();
+        assert_eq!(err.code, crate::error::codes::RPC_INVALID_PARAMETER);
+        assert!(err.message.contains("orchard"), "{}", err.message);
+        assert!(
+            !err.message.contains("invalid receiver type"),
+            "{}",
+            err.message
+        );
     }
 
     #[test]

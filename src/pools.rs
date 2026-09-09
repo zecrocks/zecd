@@ -1,9 +1,15 @@
-//! Shielded value pools, and the per-wallet receiver sets that select between them.
+//! Shielded receivers, and the per-wallet sets of them that a wallet's addresses carry.
 //!
-//! zecd is shielded-only. Historically it was Orchard-only for *receiving*; now each wallet can
-//! declare which shielded pools it uses (`enabled` pools) and which receivers the Unified
-//! Addresses it hands out should include (`default_receivers`). A default receiver may never name
-//! a pool that isn't enabled - that's a configuration error, caught at parse time.
+//! zecd is shielded-only. Historically it was Orchard-only for *receiving*; now each wallet
+//! declares which receivers its addresses may carry (`[pools] enabled`) and which of those the
+//! Unified Addresses `getnewaddress` hands out include by default (`default_receivers`). A
+//! default receiver may never name one that isn't enabled - that's a configuration error, caught
+//! at parse time.
+//!
+//! **Both keys select receivers, not value pools**, which is why `[pools]` accepts a shorter list
+//! than the pools zecd reports on a balance. `enabled` additionally decides which pool change is
+//! sent to (the strongest receiver's, via [`ReceiverSet::change_pool`]); it does **not** restrict
+//! which notes a send may spend, and spending draws on every pool the wallet holds notes in.
 //!
 //! The [`Receiver`] enum is a zecd-local type rather than `zcash_protocol::ShieldedPool`, and note
 //! that **Ironwood (NU6.3) is NOT a third [`Receiver`] here** - even though upstream `ShieldedPool` now
@@ -44,31 +50,25 @@ pub enum Receiver {
 }
 
 impl Receiver {
-    /// Every *shielded* pool zecd supports today, in canonical (precedence) order. Transparent is
-    /// deliberately excluded: this list drives [`ReceiverSet`] ordering and the shielded-protocol
-    /// enumeration in balances/`listunspent`, neither of which apply to transparent.
+    /// Every *shielded receiver* zecd supports today, in canonical (precedence) order.
+    /// Transparent is deliberately excluded: this list drives [`ReceiverSet`] ordering and the
+    /// shielded-protocol enumeration in balances/`listunspent`, neither of which apply to
+    /// transparent. It is shorter than the list of pools zecd reports funds in, which also has
+    /// ironwood.
     pub const SUPPORTED: &'static [Receiver] = &[Receiver::Sapling, Receiver::Orchard];
 
     /// Parse a config/RPC token (`"sapling"` | `"orchard"` | `"transparent"`), case-insensitively.
-    pub fn from_config_str(s: &str) -> anyhow::Result<Self> {
-        match s.trim().to_ascii_lowercase().as_str() {
+    ///
+    /// The token names a **receiver**, not a value pool - see the module docs for why those are
+    /// different lists, and [`ReceiverParseError`] for what a rejection tells the caller.
+    pub fn from_config_str(s: &str) -> Result<Self, ReceiverParseError> {
+        let token = s.trim();
+        match token.to_ascii_lowercase().as_str() {
             "sapling" => Ok(Receiver::Sapling),
             "orchard" => Ok(Receiver::Orchard),
             "transparent" => Ok(Receiver::Transparent),
-            // Ironwood is a real value pool but not a *receiver*, so it is the one rejected token
-            // an operator can reach while doing everything right: the release notes advertise
-            // ironwood support, and `enabled = ["ironwood"]` is the obvious way to ask for it. Say
-            // where the support actually lives rather than only listing the accepted tokens.
-            "ironwood" => anyhow::bail!(
-                "unknown pool \"ironwood\"; ironwood notes are received at Orchard addresses \
-                 (they are Orchard V3 notes, so there is no separate receiver to enable) - \
-                 enable \"orchard\" and a NU6.3-active chain gives you ironwood. See the \
-                 [pools] notes in zecd.example.toml"
-            ),
-            other => anyhow::bail!(
-                "unknown pool {other:?}; supported pools are {}, transparent",
-                supported_names()
-            ),
+            "ironwood" => Err(ReceiverParseError::Ironwood),
+            _ => Err(ReceiverParseError::UnknownToken(token.to_string())),
         }
     }
 
@@ -127,6 +127,62 @@ impl fmt::Display for Receiver {
     }
 }
 
+/// Why [`Receiver::from_config_str`] rejected a token.
+///
+/// The two cases want different answers, which is what makes this an enum rather than a string:
+/// a token naming a real value pool that simply has no receiver of its own has somewhere to point
+/// the operator, where an unrecognized token has only the accepted list to offer. Every surface
+/// that parses a receiver renders its message from this one type, so `[pools] enabled`,
+/// `getnewaddress`'s `address_type` and `z_getaddressforaccount`'s `receiver_types` cannot drift
+/// into disagreeing about what ironwood is.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReceiverParseError {
+    /// `"ironwood"`: a real value pool - its own bundle in V6 transactions, its own
+    /// `valueBalance`, and `pool == "ironwood"` on balances and history - that is nonetheless not
+    /// a receiver, because its notes are Orchard V3 notes reusing Orchard's keys and addresses.
+    /// There is no ironwood receiver typecode for a config key or an RPC argument to name.
+    ///
+    /// It gets a variant of its own because it is the one rejected token an operator reaches
+    /// while doing everything right: the release notes advertise ironwood, the daemon loads an
+    /// ironwood proving key, and `enabled = ["ironwood"]` is the obvious way to ask for it. A
+    /// future pool that likewise has no receiver gets a sibling variant, not a rename.
+    Ironwood,
+    /// A token naming no receiver zecd knows.
+    UnknownToken(String),
+}
+
+impl ReceiverParseError {
+    /// The receiver that actually carries the rejected pool's notes, for a caller that wants to
+    /// name it in a message of its own. `None` when the token named nothing.
+    pub fn received_at(&self) -> Option<Receiver> {
+        match self {
+            ReceiverParseError::Ironwood => Some(Receiver::Orchard),
+            ReceiverParseError::UnknownToken(_) => None,
+        }
+    }
+}
+
+impl fmt::Display for ReceiverParseError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            ReceiverParseError::Ironwood => f.write_str(
+                "\"ironwood\" is a value pool, not a receiver: ironwood notes are Orchard V3 \
+                 notes received at ordinary \"orchard\" addresses, so there is no ironwood \
+                 receiver to name here. Name \"orchard\" instead - on a NU6.3-active chain an \
+                 orchard receiver is already holding ironwood notes. See the [pools] notes in \
+                 zecd.example.toml",
+            ),
+            ReceiverParseError::UnknownToken(token) => write!(
+                f,
+                "unknown receiver {token:?}; receivers are {}, transparent",
+                supported_names()
+            ),
+        }
+    }
+}
+
+impl std::error::Error for ReceiverParseError {}
+
 fn supported_names() -> String {
     Receiver::SUPPORTED
         .iter()
@@ -137,8 +193,8 @@ fn supported_names() -> String {
 
 /// An ordered, de-duplicated, non-empty set of [`Receiver`]s.
 ///
-/// Used for both a wallet's enabled pools and its default UA receivers. Order follows
-/// [`Receiver::SUPPORTED`] so display/encoding is deterministic.
+/// Used for both a wallet's `[pools] enabled` receivers and the subset its UAs carry by default.
+/// Order follows [`Receiver::SUPPORTED`] so display/encoding is deterministic.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReceiverSet {
     pools: Vec<Receiver>,
@@ -228,9 +284,9 @@ impl ReceiverSet {
         UnifiedAddressRequest::unsafe_custom(req(Receiver::Orchard), req(Receiver::Sapling), Omit)
     }
 
-    /// The pool to receive change into when spending. Prefer Orchard (the strongest pool) when
-    /// enabled, else the first enabled pool. (Ironwood change is an Orchard-V3 note, so it rides
-    /// the Orchard arm here - there is no separate ironwood change pool.)
+    /// The pool to receive change into when spending. Prefer Orchard (the strongest receiver)
+    /// when enabled, else the first enabled one. (Ironwood change is an Orchard V3 note, so it
+    /// rides the Orchard arm here - there is no separate ironwood change pool.)
     pub fn change_pool(&self) -> ShieldedPool {
         if self.contains(Receiver::Orchard) {
             ShieldedPool::Orchard
@@ -279,23 +335,52 @@ mod tests {
 
     #[test]
     fn rejects_unknown_pool() {
-        let err = Receiver::from_config_str("bogus").unwrap_err().to_string();
-        assert!(err.contains("bogus"), "{err}");
-        assert!(err.contains("sapling"), "{err}");
-        assert!(err.contains("orchard"), "{err}");
+        let err = Receiver::from_config_str("bogus").unwrap_err();
+        assert_eq!(err, ReceiverParseError::UnknownToken("bogus".into()));
+        assert_eq!(err.received_at(), None);
+        let msg = err.to_string();
+        assert!(msg.contains("bogus"), "{msg}");
+        assert!(msg.contains("sapling"), "{msg}");
+        assert!(msg.contains("orchard"), "{msg}");
     }
 
     /// Ironwood is the rejection an operator reaches while doing everything right (the release
     /// notes advertise ironwood; `enabled = ["ironwood"]` is the obvious way to ask for it), so
-    /// its refusal must name the pool that actually carries it rather than only listing tokens.
+    /// its refusal must name the receiver that actually carries it rather than only listing
+    /// tokens.
     #[test]
     fn ironwood_refusal_points_at_orchard() {
-        let err = Receiver::from_config_str("ironwood")
+        let err = Receiver::from_config_str("ironwood").unwrap_err();
+        assert_eq!(err, ReceiverParseError::Ironwood);
+        assert_eq!(err.received_at(), Some(Receiver::Orchard));
+        let msg = err.to_string();
+        assert!(msg.contains("ironwood"), "{msg}");
+        assert!(msg.contains("orchard"), "{msg}");
+        assert!(msg.contains("zecd.example.toml"), "{msg}");
+    }
+
+    /// The refusal must not open by calling ironwood an unknown pool. It is a pool zecd fully
+    /// supports; what it is not is a *receiver*, and an operator reading "unknown pool" against a
+    /// build that loads an ironwood proving key and reports `pool == "ironwood"` on their notes
+    /// reads a contradiction rather than an answer.
+    #[test]
+    fn ironwood_refusal_does_not_call_it_an_unknown_pool() {
+        let msg = Receiver::from_config_str("ironwood")
             .unwrap_err()
             .to_string();
-        assert!(err.contains("ironwood"), "{err}");
-        assert!(err.contains("orchard"), "{err}");
-        assert!(err.contains("zecd.example.toml"), "{err}");
+        assert!(!msg.contains("unknown pool"), "{msg}");
+        assert!(!msg.contains("unknown receiver"), "{msg}");
+        assert!(msg.contains("value pool, not a receiver"), "{msg}");
+    }
+
+    /// The unknown-token message names receivers, not pools: `[pools] enabled` selects receivers,
+    /// and calling its accepted list "pools" is what made the ironwood refusal read as a denial
+    /// that ironwood exists.
+    #[test]
+    fn unknown_token_message_says_receiver_not_pool() {
+        let msg = Receiver::from_config_str("bogus").unwrap_err().to_string();
+        assert!(msg.contains("receiver"), "{msg}");
+        assert!(!msg.contains("pool"), "{msg}");
     }
 
     #[test]
