@@ -421,8 +421,10 @@ impl Server {
     /// This is what lets [`crate::chain::hub`] keep collapsing N wallets onto one connection now
     /// that each wallet resolves its own endpoint. It covers TLS trust and credentials as well as
     /// host and port, because sharing a connection across those would silently carry one wallet's
-    /// trust configuration - or its zebra credentials - onto another wallet's traffic. The key can
-    /// therefore contain a credential, so it is a map key and nothing else: never log it.
+    /// trust configuration - or its zebra credentials - onto another wallet's traffic. The
+    /// credentials ride as [`ZebraAuth::identity_digest`], not in the clear: separating two
+    /// endpoints only needs a value that differs whenever the credential does, so the key stays
+    /// free of a secret and a `HashMap` of them can be rendered without leaking one.
     ///
     /// The proxy belongs here for the same reason: it decides how the socket is opened at all, so
     /// two endpoints that disagree about it must never share one. Today `[backend] proxy` is
@@ -432,13 +434,13 @@ impl Server {
     /// traffic through another's proxy.
     pub fn connection_key(&self) -> String {
         format!(
-            "{:?}|{}|{}|{:?}|{:?}|{:?}|{:?}|{}|{:?}",
+            "{:?}|{}|{}|{:?}|{:?}|{}|{:?}|{}|{:?}",
             self.kind,
             self.host,
             self.port,
             self.network,
             self.tls,
-            self.zebra_auth,
+            self.zebra_auth.identity_digest(),
             self.cleartext_policy,
             self.assume_transparent_in_compact_blocks,
             self.proxy,
@@ -1263,6 +1265,46 @@ mod tests {
                 assert_ne!(a.connection_key(), b.connection_key(), "{fa} vs {fb}");
             }
         }
+    }
+
+    /// The key is a `HashMap` key that ends up in whatever renders that map, so it must
+    /// separate two credentials without carrying either. That is a different property from
+    /// "the key changes when the credential does" (which
+    /// `connection_key_separates_every_dial_affecting_field` covers), and it is the one a
+    /// future `{:?}` of `self.zebra_auth` would silently undo.
+    #[test]
+    fn connection_key_separates_credentials_without_carrying_them() {
+        let with_auth = |user: &str, password: &str| {
+            let mut s = Server::new(
+                Cow::Borrowed("example.test"),
+                1234,
+                ServerKind::ZebraRpc,
+                ZNetwork::Main,
+            );
+            s.zebra_auth = crate::chain::zebra::ZebraAuth {
+                user: Some(user.to_string()),
+                password: Some(password.into()),
+                cookie: None,
+            };
+            s
+        };
+
+        let key = with_auth("operator", "s3cret-p4ssword").connection_key();
+        assert!(!key.contains("s3cret-p4ssword"), "credential in key: {key}");
+        assert!(!key.contains("operator"), "username in key: {key}");
+
+        // Still separating: a different password, and a different user, are different
+        // connections. Length-prefixed hashing also keeps ("ab", "c") and ("a", "bc") apart.
+        assert_ne!(key, with_auth("operator", "other").connection_key());
+        assert_ne!(key, with_auth("other", "s3cret-p4ssword").connection_key());
+        assert_ne!(
+            with_auth("ab", "c").connection_key(),
+            with_auth("a", "bc").connection_key()
+        );
+        assert_eq!(
+            key,
+            with_auth("operator", "s3cret-p4ssword").connection_key()
+        );
     }
 
     /// The production seam: a wallet may point at its own upstream, and `node.rs` gives each

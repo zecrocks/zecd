@@ -188,6 +188,7 @@ pub mod operations;
 pub mod pools;
 pub mod progress;
 pub mod rpc;
+pub mod secret;
 pub mod server;
 pub mod socks;
 pub mod state;

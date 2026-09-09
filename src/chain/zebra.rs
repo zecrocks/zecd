@@ -45,6 +45,7 @@ use hyper_util::client::legacy::Client as HyperClient;
 use hyper_util::rt::TokioExecutor;
 use serde::Deserialize;
 use serde_json::{json, Value};
+use sha2::{Digest as _, Sha256};
 use tokio::sync::mpsc;
 use zcash_client_backend::proto::compact_formats as pb;
 use zcash_client_backend::proto::service;
@@ -57,6 +58,7 @@ use super::{
     MempoolStream, ServerInfo, SubtreeRootInfo, UpgradeInfo, UpgradeStatus,
 };
 use crate::network::ZNetwork;
+use crate::secret::Password;
 
 /// Hard per-request deadline. Every zebra operation is a unary HTTP call to a local node,
 /// so unlike the lightwalletd streams there is no long-lived response to keep open; a peer
@@ -78,7 +80,7 @@ const MEMPOOL_POLL_INTERVAL: Duration = Duration::from_secs(2);
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ZebraAuth {
     pub user: Option<String>,
-    pub password: Option<String>,
+    pub password: Option<Password>,
     /// Path to zebrad's RPC cookie file; re-read on every connect, since zebrad regenerates
     /// it at startup.
     pub cookie: Option<PathBuf>,
@@ -106,6 +108,48 @@ impl ZebraAuth {
         }
     }
 
+    /// A one-way, credential-free identity for these credentials, for
+    /// [`Server::connection_key`](crate::backend::Server::connection_key).
+    ///
+    /// The connection key has to separate two endpoints that dial the same host with different
+    /// credentials - sharing a connection across them would carry one wallet's credential onto
+    /// another wallet's traffic - but it does not need the credential itself, only a value that
+    /// differs whenever the credential does. So the key carries this digest instead of the
+    /// password, which keeps every `HashMap` key in the hub free of a secret.
+    ///
+    /// Each field is tagged and length-prefixed before hashing, so `(user "ab", password "c")`
+    /// and `(user "a", password "bc")` cannot collide.
+    pub fn identity_digest(&self) -> String {
+        fn field(hasher: &mut Sha256, tag: u8, value: Option<&[u8]>) {
+            hasher.update([tag]);
+            match value {
+                Some(bytes) => {
+                    hasher.update([1u8]);
+                    hasher.update((bytes.len() as u64).to_le_bytes());
+                    hasher.update(bytes);
+                }
+                None => hasher.update([0u8]),
+            }
+        }
+
+        let mut hasher = Sha256::new();
+        hasher.update(b"zecd zebra auth v1");
+        field(&mut hasher, 0, self.user.as_deref().map(str::as_bytes));
+        field(
+            &mut hasher,
+            1,
+            self.password.as_ref().map(|p| p.expose().as_bytes()),
+        );
+        field(
+            &mut hasher,
+            2,
+            self.cookie
+                .as_deref()
+                .map(|p| p.as_os_str().as_encoded_bytes()),
+        );
+        hex::encode(hasher.finalize())
+    }
+
     /// Build the `Authorization` header value, if any. Errors are configuration problems
     /// (unreadable cookie, user without password) and should fail the connect loudly.
     pub fn header(&self) -> anyhow::Result<Option<String>> {
@@ -123,7 +167,7 @@ impl ZebraAuth {
             return Ok(Some(basic(cred)));
         }
         match (&self.user, &self.password) {
-            (Some(u), Some(p)) => Ok(Some(basic(&format!("{u}:{p}")))),
+            (Some(u), Some(p)) => Ok(Some(basic(&format!("{u}:{}", p.expose())))),
             (None, None) => Ok(None),
             _ => Err(anyhow!(
                 "[zebra] rpc_user and rpc_password must be set together"

@@ -19,6 +19,7 @@ use zcash_client_backend::data_api::wallet::ConfirmationsPolicy;
 use crate::coin::{Coin, CoinNetwork};
 use crate::network::ZNetwork;
 use crate::pools::{Receiver, ReceiverSet};
+use crate::secret::Password;
 
 /// Default chain upstream: a local zebrad's JSON-RPC ("full mode"). Public keeps the bare
 /// `zebra` shorthand as the default rather than spelling the authority out; `backend::resolve`
@@ -103,10 +104,10 @@ fn select_server_token(cli_server: Option<String>, file_server: Option<String>) 
 /// Read a single secret (e.g. the RPC password) from a file, trimming a trailing newline/CR
 /// (the common `echo "secret" > file` gotcha) but preserving any other surrounding whitespace.
 /// Used for `[rpc] password_file` so the secret can live in a mounted Secret, not the TOML.
-fn read_secret_file(path: &std::path::Path) -> anyhow::Result<String> {
+fn read_secret_file(path: &std::path::Path) -> anyhow::Result<Password> {
     let raw = std::fs::read_to_string(path)
         .with_context(|| format!("reading secret file {}", path.display()))?;
-    Ok(raw.trim_end_matches(['\n', '\r']).to_string())
+    Ok(Password::new(raw.trim_end_matches(['\n', '\r'])))
 }
 
 #[derive(Debug, Clone)]
@@ -617,7 +618,7 @@ impl BackendConfig {
 #[derive(Debug, Clone, Default)]
 pub struct ZebraConfig {
     pub rpc_user: Option<String>,
-    pub rpc_password: Option<String>,
+    pub rpc_password: Option<Password>,
     pub rpc_cookie: Option<PathBuf>,
 }
 
@@ -637,7 +638,7 @@ pub struct RpcConfig {
     pub bind: IpAddr,
     pub port: u16,
     pub user: Option<String>,
-    pub password: Option<String>,
+    pub password: Option<Password>,
     /// Bitcoin-Core-style `rpcauth` entries (`<user>:<salt>$<hmac-sha256 hex>`), each an
     /// additional accepted credential; generate them with `zecd rpcauth <user> [password]`.
     pub auth: Vec<String>,
@@ -1238,7 +1239,7 @@ struct BackendFile {
 #[serde(deny_unknown_fields)]
 struct ZebraFile {
     rpc_user: Option<String>,
-    rpc_password: Option<String>,
+    rpc_password: Option<Password>,
     rpc_cookie: Option<PathBuf>,
 }
 
@@ -1248,7 +1249,7 @@ struct RpcFile {
     bind: Option<String>,
     port: Option<u16>,
     user: Option<String>,
-    password: Option<String>,
+    password: Option<Password>,
     /// Read the RPC password from this file (trailing newline trimmed) instead of inlining it.
     /// Lets the password - which is spend-equivalent for clients - live in a Kubernetes Secret
     /// rather than the ConfigMap the rest of the config lands in. Overrides `password`; the
@@ -1349,7 +1350,7 @@ pub struct ConfigOverrides {
     /// RPC username (HTTP Basic auth).
     pub rpc_user: Option<String>,
     /// RPC password (HTTP Basic auth).
-    pub rpc_password: Option<String>,
+    pub rpc_password: Option<Password>,
     /// rpcauth credentials (`<user>:<salt>$<hmac-sha256 hex>`).
     pub rpc_auth: Vec<String>,
     /// Chain upstream token (`zebra`, `zebra://host:port`, `zecrocks`, `https://...`, ...).
@@ -1439,7 +1440,7 @@ pub struct Cli {
         value_name = "PASS",
         env = "ZECD_RPC_PASSWORD"
     )]
-    pub rpc_password: Option<String>,
+    pub rpc_password: Option<Password>,
 
     /// rpcauth credential (`<user>:<salt>$<hmac-sha256 hex>`); may be repeated.
     #[arg(long = "rpcauth", global = true, value_name = "USER:SALT$HASH")]
@@ -1560,7 +1561,7 @@ pub struct RpcauthArgs {
     pub username: String,
 
     /// Password to hash. If omitted, a strong random password is generated and printed once.
-    pub password: Option<String>,
+    pub password: Option<Password>,
 }
 
 #[cfg(feature = "cli")]
@@ -2219,8 +2220,8 @@ pub fn reject_placeholder_password(config: &AppConfig) -> anyhow::Result<()> {
         && config
             .rpc
             .password
-            .as_deref()
-            .is_some_and(|p| p.trim().eq_ignore_ascii_case("change-me"))
+            .as_ref()
+            .is_some_and(|p| p.expose().trim().eq_ignore_ascii_case("change-me"))
     {
         anyhow::bail!(
             "[rpc] password is still the example placeholder \"CHANGE-ME\"; \
@@ -3307,7 +3308,7 @@ mod tests {
         .unwrap();
         let z = f.zebra.unwrap();
         assert_eq!(z.rpc_user.as_deref(), Some("u"));
-        assert_eq!(z.rpc_password.as_deref(), Some("p"));
+        assert_eq!(z.rpc_password.as_ref().map(Password::expose), Some("p"));
         assert_eq!(z.rpc_cookie, Some(PathBuf::from("/tmp/.cookie")));
         // The section maps onto the zebra backend's auth type.
         let auth = ZebraConfig {
@@ -3556,7 +3557,7 @@ mod tests {
         // The classic `echo "secret" > file` leaves a trailing newline; it must be stripped,
         // but interior/leading whitespace is preserved (a password may legitimately contain it).
         std::fs::write(&p, "  hunter2 spaces \n").unwrap();
-        assert_eq!(read_secret_file(&p).unwrap(), "  hunter2 spaces ");
+        assert_eq!(read_secret_file(&p).unwrap().expose(), "  hunter2 spaces ");
         // A missing file is an error (fail fast), not an empty password.
         assert!(read_secret_file(&dir.path().join("nope")).is_err());
     }
@@ -3581,7 +3582,10 @@ mod tests {
         // password_file overrides the inline [rpc] password...
         let cli = Cli::parse_from(["zecd", "--conf", conf.to_str().unwrap()]);
         let cfg = AppConfig::resolve(&cli).unwrap();
-        assert_eq!(cfg.rpc.password.as_deref(), Some("from-file"));
+        assert_eq!(
+            cfg.rpc.password.as_ref().map(Password::expose),
+            Some("from-file")
+        );
 
         // ...but an explicit --rpcpassword still wins over the file.
         let cli = Cli::parse_from([
@@ -3592,7 +3596,10 @@ mod tests {
             "from-cli",
         ]);
         let cfg = AppConfig::resolve(&cli).unwrap();
-        assert_eq!(cfg.rpc.password.as_deref(), Some("from-cli"));
+        assert_eq!(
+            cfg.rpc.password.as_ref().map(Password::expose),
+            Some("from-cli")
+        );
 
         // A configured-but-missing password_file is a startup error.
         std::fs::write(
