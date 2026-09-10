@@ -342,6 +342,11 @@ mod tests {
         assert!(msg.contains("bogus"), "{msg}");
         assert!(msg.contains("sapling"), "{msg}");
         assert!(msg.contains("orchard"), "{msg}");
+        // The message names receivers, not pools: `[pools] enabled` selects receivers, and
+        // calling its accepted list "pools" is what made the ironwood refusal below read as a
+        // denial that ironwood exists.
+        assert!(msg.contains("receiver"), "{msg}");
+        assert!(!msg.contains("pool"), "{msg}");
     }
 
     /// Ironwood is the rejection an operator reaches while doing everything right (the release
@@ -357,30 +362,13 @@ mod tests {
         assert!(msg.contains("ironwood"), "{msg}");
         assert!(msg.contains("orchard"), "{msg}");
         assert!(msg.contains("zecd.example.toml"), "{msg}");
-    }
-
-    /// The refusal must not open by calling ironwood an unknown pool. It is a pool zecd fully
-    /// supports; what it is not is a *receiver*, and an operator reading "unknown pool" against a
-    /// build that loads an ironwood proving key and reports `pool == "ironwood"` on their notes
-    /// reads a contradiction rather than an answer.
-    #[test]
-    fn ironwood_refusal_does_not_call_it_an_unknown_pool() {
-        let msg = Receiver::from_config_str("ironwood")
-            .unwrap_err()
-            .to_string();
+        // Nor may it open by calling ironwood an unknown pool. It is a pool zecd fully supports;
+        // what it is not is a *receiver*, and an operator reading "unknown pool" against a build
+        // that loads an ironwood proving key and reports `pool == "ironwood"` on their notes
+        // reads a contradiction rather than an answer.
         assert!(!msg.contains("unknown pool"), "{msg}");
         assert!(!msg.contains("unknown receiver"), "{msg}");
         assert!(msg.contains("value pool, not a receiver"), "{msg}");
-    }
-
-    /// The unknown-token message names receivers, not pools: `[pools] enabled` selects receivers,
-    /// and calling its accepted list "pools" is what made the ironwood refusal read as a denial
-    /// that ironwood exists.
-    #[test]
-    fn unknown_token_message_says_receiver_not_pool() {
-        let msg = Receiver::from_config_str("bogus").unwrap_err().to_string();
-        assert!(msg.contains("receiver"), "{msg}");
-        assert!(!msg.contains("pool"), "{msg}");
     }
 
     #[test]

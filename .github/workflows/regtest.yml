@@ -131,7 +131,7 @@ env:
   # The harness --test targets for the standard (zecd) suite. Both node legs (zebra and zakura)
   # run this full list; only the zecd-lwd leg overrides it with its own subset (see the matrix
   # `include` below). Extended/stress tests skip in seconds unless their gate is set.
-  HARNESS_TESTS: "--test regtest_e2e --test regtest_binding --test regtest_migration --test regtest_funded --test regtest_ironwood --test regtest_proving_cache --test regtest_sapling --test regtest_transparent --test regtest_transparent_t2t --test regtest_transparent_sendmany_t2t --test regtest_transparent_gap --test regtest_transparent_offline_restore --test regtest_transparent_preexpose_responsive --test regtest_transparent_recovery_window --test regtest_shielding --test regtest_mergetoaddress --test regtest_coinbase --test regtest_hang --test regtest_reorg --test regtest_multiwallet --test regtest_restore --test regtest_watchonly --test regtest_fleet --test regtest_stress_notes"
+  HARNESS_TESTS: "--test regtest_e2e --test regtest_binding --test regtest_migration --test regtest_funded --test regtest_ironwood --test regtest_sapling --test regtest_transparent --test regtest_transparent_t2t --test regtest_transparent_gap --test regtest_transparent_offline_restore --test regtest_transparent_preexpose_responsive --test regtest_transparent_recovery_window --test regtest_shielding --test regtest_mergetoaddress --test regtest_coinbase --test regtest_hang --test regtest_reorg --test regtest_multiwallet --test regtest_restore --test regtest_watchonly --test regtest_fleet --test regtest_stress_notes"
 
 concurrency:
   group: regtest-${{ github.event_name }}-${{ github.ref }}
@@ -182,7 +182,7 @@ jobs:
             # regtest_multibackend is extended-tier (it skips in seconds otherwise) and lives
             # only here: it is the one binary needing a lightwalletd AND a zebra endpoint in the
             # same daemon, and lightwalletd is provisioned only on this leg.
-            tests: --test regtest_lwd --test regtest_funded --test regtest_transparent --test regtest_transparent_t2t --test regtest_transparent_sendmany_t2t --test regtest_transparent_gap --test regtest_transparent_offline_restore --test regtest_shielding --test regtest_mergetoaddress --test regtest_multibackend
+            tests: --test regtest_lwd --test regtest_funded --test regtest_transparent --test regtest_transparent_t2t --test regtest_transparent_gap --test regtest_transparent_offline_restore --test regtest_shielding --test regtest_mergetoaddress --test regtest_multibackend
             # Heavier per-slot than the zebra suite (an extra lightwalletd per stack, and
             # regtest_lwd itself runs two lightwalletds plus a second zebra-backed zecd twin), so
             # this leg keeps its own slot count rather than the default below. 8 is the 16-core

@@ -11,11 +11,12 @@
 //! or conversion bug would skew hashes, balances, or history), and the mirror image of the
 //! pre-zebra-only `regtest_zebra.rs` equivalence test.
 //!
-//! The **offline-window recovery leg** then proves backend behavior-identity for the hardest
-//! case: a transparent output received *and spent* while zecd wasn't watching. An authoring
-//! (zebra-backed) instance receives-then-spends on a t-addr and is stopped; a light-mode restore
-//! of the same seed must still show the full receive+send history, recovered from the compact
-//! blocks' transparent data.
+//! The offline-window recovery case - a transparent output received *and spent* while zecd
+//! wasn't watching, which only the compact blocks' transparent data can reconstruct - used to
+//! have a leg of its own here. It is now `regtest_transparent_offline_restore.rs`, which runs
+//! that same shape on whichever backend `ZECD_REGTEST_BACKEND` selects and so covers light mode
+//! on this very leg; the version here differed only in that its *authoring* wallet was
+//! zebra-backed, which the restore cannot observe.
 //!
 //! Unlike the suites that honor `ZECD_REGTEST_BACKEND`, this test is always light-mode (it IS
 //! the lightwalletd e2e), so it needs `LIGHTWALLETD_BIN` for the zecd under test. The funder is
@@ -23,13 +24,11 @@
 //! killing zecd's lightwalletd cannot stall it. Skips cleanly unless `ZEBRAD_BIN` and
 //! `LIGHTWALLETD_BIN` are set.
 
-use std::path::Path;
 use std::time::{Duration, Instant};
 
 use serde_json::json;
 use zecd_regtest_harness::{
-    pick_port, resolve_bin, start_funded_chain, Funder, Lightwalletd, Zebrad, Zecd, ZecdConfig,
-    SEED_MINER_ADDRESS,
+    pick_port, resolve_bin, start_funded_chain, Lightwalletd, Zebrad, Zecd, ZecdConfig,
 };
 
 /// 1 ZEC, in zatoshis.
@@ -264,158 +263,6 @@ async fn regtest_lwd_e2e() {
     drop(zecd_lwd_upstream);
     drop(zecd);
     drop(zecd_zebra);
-
-    // 10. Offline-window recovery: behavior-identity with the zebra backend for
-    //     received-and-spent-while-offline transparent history.
-    offline_window_leg(&zebrad, &funder, &lwd_bin).await;
-}
-
-/// Offline-window recovery: an authoring (zebra-backed) wallet receives on a t-addr and spends
-/// it, then goes away; a light-mode restore of the same seed - which never saw either tx live -
-/// must recover the full receive+send pair in history.
-///
-/// This is the shape that used to need the per-address `GetTaddressTxids` sweep, because the
-/// output is already spent (so a UTXO query cannot see it) and legacy compact blocks carried no
-/// transparent data. A lightwalletd serving the versioned protocol puts that data in the compact
-/// blocks, so the ordinary block scan recovers it and the two backends agree - which is exactly
-/// what this asserts now that the sweep is gone.
-async fn offline_window_leg(zebrad: &Zebrad, funder: &Funder, lwd_bin: &Path) {
-    eprintln!("== offline-window recovery leg ==");
-    // A. The authoring wallet: zebra-backed, transparent receiving + fully-transparent spends.
-    let pre_fund_height = zebrad
-        .rpc("getblockcount", json!([]))
-        .await
-        .expect("getblockcount")
-        .as_u64()
-        .expect("height") as u32;
-    let mut author_cfg = ZecdConfig::new(zebrad.rpc_port, pick_port().expect("rpc port"));
-    author_cfg.transparent = true;
-    author_cfg.privacy_policy = Some("AllowFullyTransparent".to_string());
-    let author = Zecd::start(&author_cfg)
-        .await
-        .expect("start the authoring zecd");
-    let mnemonic = author
-        .mnemonic
-        .clone()
-        .expect("a fresh init prints its mnemonic");
-    let taddr = author
-        .call("getnewaddress", json!(["", "transparent"]))
-        .await
-        .expect("getnewaddress transparent")
-        .as_str()
-        .expect("address string")
-        .to_string();
-
-    // Fund the t-addr and wait for the (mined) receive.
-    funder
-        .send(&taddr, FUND_ZATOSHIS / 2)
-        .await
-        .expect("fund the authoring wallet's t-addr");
-    zebrad
-        .generate_blocks(2)
-        .await
-        .expect("mine the funding tx");
-    let deadline = Instant::now() + FUND_TIMEOUT;
-    loop {
-        let tip = zecd_zebra_tip(zebrad).await;
-        author
-            .wait_until_synced(tip, Duration::from_secs(30))
-            .await
-            .expect("author scans to the tip");
-        let bal = author
-            .call("getbalance", json!([]))
-            .await
-            .ok()
-            .and_then(|v| v.as_f64())
-            .unwrap_or(0.0);
-        if bal >= 0.5 {
-            break;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "the authoring wallet never saw its transparent funding (got {bal})"
-        );
-        tokio::time::sleep(Duration::from_millis(500)).await;
-    }
-
-    // Spend from the t-addr (fully transparent), confirm, and stop the authoring wallet. The
-    // destination only has to be a valid regtest t-address the wallet doesn't own.
-    let spend_target = SEED_MINER_ADDRESS;
-    let deadline = Instant::now() + FUND_TIMEOUT;
-    let spend_txid = loop {
-        match author
-            .call("sendtoaddress", json!([spend_target, 0.2]))
-            .await
-        {
-            Ok(v) => break v.as_str().expect("txid string").to_string(),
-            Err(e) if e.code() == Some(-6) => {
-                assert!(
-                    Instant::now() < deadline,
-                    "the transparent UTXO never became spendable: {e}"
-                );
-                zebrad
-                    .generate_blocks(1)
-                    .await
-                    .expect("mine toward spendable depth");
-                let tip = zecd_zebra_tip(zebrad).await;
-                author
-                    .wait_until_synced(tip, Duration::from_secs(30))
-                    .await
-                    .expect("author rescans");
-                tokio::time::sleep(Duration::from_millis(500)).await;
-            }
-            Err(e) => panic!("fully-transparent spend failed: {e}"),
-        }
-    };
-    mine_until_confirmed(zebrad, &author, &spend_txid, "authoring t-spend").await;
-    drop(author);
-
-    // B. The light-mode restore: same seed, birthday before the funding, its own lightwalletd.
-    let restore_lwd = Lightwalletd::start(lwd_bin, zebrad.rpc_port)
-        .await
-        .expect("start the restore's lightwalletd");
-    let mut restore_cfg = ZecdConfig::new(zebrad.rpc_port, pick_port().expect("rpc port"));
-    restore_cfg.lightwalletd_grpc_port = Some(restore_lwd.grpc_port);
-    restore_cfg.transparent = true;
-    restore_cfg.restore_mnemonic = Some(mnemonic);
-    restore_cfg.birthday = Some(pre_fund_height.saturating_sub(1).max(1));
-    let restore = Zecd::start(&restore_cfg)
-        .await
-        .expect("restore the wallet in light mode");
-    let tip = zecd_zebra_tip(zebrad).await;
-    restore
-        .wait_until_synced(tip, FUND_TIMEOUT)
-        .await
-        .expect("the light-mode restore scans to the tip");
-
-    // The receive+send pair must surface, recovered by the transparent-carrying block scan -
-    // the hardest case, since the output is already spent, so nothing but the compact blocks'
-    // transparent data can produce it. The result must be identical history to what the
-    // zebra-backed authoring instance recorded.
-    let deadline = Instant::now() + Duration::from_secs(90);
-    loop {
-        let txs = restore
-            .call("listtransactions", json!(["*", 100]))
-            .await
-            .expect("listtransactions on the restore");
-        let arr = txs.as_array().cloned().unwrap_or_default();
-        let has_receive = arr
-            .iter()
-            .any(|t| t["category"] == "receive" && t["address"] == json!(taddr));
-        let has_send = arr
-            .iter()
-            .any(|t| t["category"] == "send" && t["txid"] == json!(spend_txid));
-        if has_receive && has_send {
-            break;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "offline receive+spend history not recovered: \
-             receive={has_receive} send={has_send}: {txs}"
-        );
-        tokio::time::sleep(Duration::from_secs(1)).await;
-    }
-    eprintln!("== offline-window recovery leg OK ==");
 }
 
 async fn zecd_zebra_tip(zebrad: &Zebrad) -> u64 {

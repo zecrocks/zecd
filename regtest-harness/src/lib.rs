@@ -2023,8 +2023,9 @@ pub struct ZecdConfig {
     /// its own).
     pub birthday: Option<u32>,
     /// `[spend] cache_proving_key`: `Some(true/false)` writes the knob explicitly, `None`
-    /// omits it (zecd defaults to `true`). The proving-key-cache benchmark runs one instance
-    /// each way.
+    /// omits it (zecd defaults to `true`). No test sets it today - both routes prove from one
+    /// shared key set since the Zakura forks, so the binary that flipped it was removed - but
+    /// the knob is still real, and this is how a test would pin the fused route deliberately.
     pub cache_proving_key: Option<bool>,
     /// `[spend] privacy_policy`: `Some("AllowFullyTransparent")` etc. writes the knob explicitly,
     /// `None` omits it (zecd defaults to `AllowRevealedRecipients`). The fully-transparent spend
@@ -2464,9 +2465,9 @@ impl Zecd {
 
     /// Gracefully stop the daemon (via the `stop` RPC) and relaunch it against the *same*
     /// datadir/wallet with a (possibly different) config - e.g. flipping
-    /// `[spend] cache_proving_key`. The wallet DB, keys, and funds persist across the restart;
+    /// `[sync] fetch_memos`. The wallet DB, keys, and funds persist across the restart;
     /// `cfg` must keep the same RPC port so this handle's `base_url` stays valid. Used by the
-    /// proving-key-cache benchmark to measure both paths on one funded wallet.
+    /// funded e2e's memo-less phase to re-open one funded wallet under a changed knob.
     pub async fn restart(&mut self, cfg: &ZecdConfig) -> Result<()> {
         let _ = self.call("stop", json!([])).await;
         let deadline = Instant::now() + Duration::from_secs(30);
@@ -3118,7 +3119,7 @@ fn write_zecd_toml(datadir: &Path, cfg: &ZecdConfig) -> Result<()> {
         Some(_) => "assume_transparent_in_compact_blocks = true\n",
         None => "",
     };
-    // Optional `[spend]` knobs: `cache_proving_key` (proving-key-cache benchmark),
+    // Optional `[spend]` knobs: `cache_proving_key` (no current test - see the field's docs),
     // `privacy_policy` (fully-transparent spend e2e), `pipeline_proving` and
     // `orchard_action_limit` (stress test), `max_tx_bytes` (merge e2e). Emit the section only
     // if at least one is set.

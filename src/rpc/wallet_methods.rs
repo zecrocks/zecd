@@ -3557,15 +3557,10 @@ mod tests {
         }
     }
 
-    #[test]
-    fn requested_receivers_must_be_subset_of_enabled() {
-        // The enablement check (a `-8`) is what getnewaddress applies once it has the handle.
-        let enabled = crate::pools::ReceiverSet::single(Receiver::Orchard);
-        let requested = shielded_set(parse_receiver_tokens(Some("sapling")).unwrap());
-        assert!(!requested.is_subset_of(&enabled));
-        let ok = shielded_set(parse_receiver_tokens(Some("orchard")).unwrap());
-        assert!(ok.is_subset_of(&enabled));
-    }
+    // The enablement check `getnewaddress` applies once it has the handle is
+    // `ReceiverSet::is_subset_of`, asserted in both directions by `pools::tests::subset_check`;
+    // the token parsing that feeds it is `receiver_tokens_single_and_list` above. Composing the
+    // two here proved neither.
 
     #[test]
     fn account_arg_only_zero_is_valid() {
@@ -4127,7 +4122,7 @@ mod tests {
         // must ALSO accept a transparent recipient - otherwise the `build_payment` pre-check -8s
         // the recipient and the fully-transparent (t->t) spend path is unreachable. (Regression
         // guard: the edge-fixes merge left `allows_transparent_recipient` without this rung, which
-        // broke the regtest_transparent_t2t / _sendmany_t2t e2e.)
+        // broke the regtest_transparent_t2t e2e.)
         assert!(build_payment(
             Coin::Zcash,
             &net,

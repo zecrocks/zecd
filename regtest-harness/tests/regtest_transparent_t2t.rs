@@ -14,6 +14,14 @@
 //! self-send to the wallet's own EXTERNAL address stays visible (send+receive), proving the
 //! change-hiding does not swallow deliberate self-payments.
 //!
+//! That second send is deliberately a **two-recipient `sendmany`** rather than another
+//! `sendtoaddress`, which folds in what a separate `regtest_transparent_sendmany_t2t.rs` used to
+//! cover with a whole chain bring-up of its own: `sendmany`'s only route to a fully-transparent
+//! spend is the `[spend] privacy_policy` config knob (it has no per-call `privacyPolicy`
+//! argument), and paying two recipients from one transparent input exercises
+//! `select_transparent_inputs` across several outputs and the multi-output ZIP-317 fee. All three
+//! send RPCs funnel through the same `do_send` path, so one send can carry all of it.
+//!
 //! Skips cleanly unless `ZEBRAD_BIN` is set.
 
 use std::time::{Duration, Instant};
@@ -21,6 +29,7 @@ use std::time::{Duration, Instant};
 use serde_json::json;
 use zecd_regtest_harness::{
     attach_backend, pick_port, resolve_node_bin, start_funded_chain, RegtestNode, Zecd, ZecdConfig,
+    SEED_MINER_ADDRESS,
 };
 
 const FUND_ZATOSHIS: u64 = 100_000_000; // 1 ZEC
@@ -240,8 +249,17 @@ async fn regtest_fully_transparent_spend_keeps_change_transparent() {
         "the single send is to the external recipient, not the change address: {gt}"
     );
 
-    // 12. Spend the change: a second t→t send consuming the change UTXO. This proves the change was
-    //     recorded, rediscovered by the receive scan, and signable with the change address's key.
+    // 12. Spend the change, through `sendmany`, paying TWO transparent recipients at once. Three
+    //     things ride on this one send. The change from step 9 is spendable at all, which proves
+    //     it was recorded, rediscovered by the receive scan, and signable with the change
+    //     address's key. `sendmany` reaches the fully-transparent path, and its only route there
+    //     is the `[spend] privacy_policy` config knob read at startup - unlike `z_sendmany` it
+    //     takes no per-call `privacyPolicy`, and unlike the default policy it must opt in to
+    //     funding from transparent UTXOs with kept-transparent change. And two outputs from one
+    //     transparent input exercise `select_transparent_inputs` spanning several recipient
+    //     outputs, plus the multi-output ZIP-317 fee. (The second recipient is a foreign
+    //     throwaway t-address, so it cannot disturb the own-address aggregations in step 14.)
+    let second_taddr = SEED_MINER_ADDRESS; // a valid regtest transparent address (t2... P2SH)
     let deadline = Instant::now() + SPEND_TIMEOUT;
     let txid2 = loop {
         let tip = zebrad
@@ -253,7 +271,10 @@ async fn regtest_fully_transparent_spend_keeps_change_transparent() {
         zecd.wait_until_synced(tip, Duration::from_secs(30))
             .await
             .expect("zecd scans before the second spend");
-        match zecd.call("sendtoaddress", json!([funder_taddr, 0.1])).await {
+        let mut recipients = serde_json::Map::new();
+        recipients.insert(funder_taddr.clone(), json!(0.1));
+        recipients.insert(second_taddr.to_string(), json!(0.05));
+        match zecd.call("sendmany", json!(["", recipients])).await {
             Ok(v) => break v.as_str().expect("txid string").to_string(),
             Err(e) if e.code() == Some(-6) => {
                 assert!(
@@ -265,7 +286,7 @@ async fn regtest_fully_transparent_spend_keeps_change_transparent() {
                     .await
                     .expect("mine a block toward spendable depth");
             }
-            Err(e) => panic!("unexpected second sendtoaddress error: {e}"),
+            Err(e) => panic!("unexpected sendmany error: {e}"),
         }
     };
     assert_eq!(
@@ -277,6 +298,59 @@ async fn regtest_fully_transparent_spend_keeps_change_transparent() {
         .generate_blocks(3)
         .await
         .expect("confirm the change spend");
+
+    // 12b. The `sendmany` lists exactly its two external recipients - its own change went to the
+    //      internal chain like step 9's, so it is hidden rather than surfacing as a third
+    //      payment - and it did not auto-shield: the wallet still holds transparent funds only.
+    let tip = zebrad
+        .rpc("getblockcount", json!([]))
+        .await
+        .expect("zebra getblockcount")
+        .as_u64()
+        .expect("tip height");
+    zecd.wait_until_synced(tip, Duration::from_secs(60))
+        .await
+        .expect("zecd scans the sendmany's confirmation");
+    let gt2 = zecd
+        .call("gettransaction", json!([txid2]))
+        .await
+        .expect("gettransaction for the sendmany");
+    let details2 = gt2["details"]
+        .as_array()
+        .expect("gettransaction details array");
+    let sends2: Vec<&serde_json::Value> = details2
+        .iter()
+        .filter(|d| d["category"] == json!("send"))
+        .collect();
+    assert_eq!(
+        sends2.len(),
+        2,
+        "exactly two sends (the two recipients) - the sendmany's change is hidden as change, not \
+         a phantom self-payment: {gt2}"
+    );
+    assert!(
+        sends2
+            .iter()
+            .any(|d| d["address"].as_str() == Some(funder_taddr.as_str())),
+        "one send is the 0.1 ZEC payment to the funder recipient: {gt2}"
+    );
+    assert!(
+        sends2
+            .iter()
+            .any(|d| d["address"].as_str() == Some(second_taddr)),
+        "the other send is the 0.05 ZEC payment to the second recipient: {gt2}"
+    );
+    let lu2 = zecd
+        .call("listunspent", json!([0]))
+        .await
+        .expect("listunspent after the sendmany");
+    for n in lu2.as_array().expect("listunspent array") {
+        let addr = n["address"].as_str().unwrap_or("");
+        assert!(
+            addr.starts_with("tm"),
+            "the sendmany's change stayed transparent too, got address {addr:?}: {lu2}"
+        );
+    }
 
     // 13. An INTENTIONAL self-send stays VISIBLE. Paying the wallet's own *external* (receive)
     //     address is a deliberate payment, not change, so it must surface in history as a

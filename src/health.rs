@@ -346,16 +346,6 @@ mod tests {
     }
 
     #[test]
-    fn connected_mode_ignores_the_enhancement_backlog() {
-        // The lenient mode is "upstream is live past our birthday"; it deliberately doesn't wait on
-        // the scan, so it shouldn't wait on enhancement either.
-        let connected = cfg(ReadinessMode::Connected);
-        let mut enhancing = st(true, Some(4_080_983), Some(4_080_983));
-        enhancing.pending_enhancements = 29_660;
-        assert!(wallet_ready(&enhancing, &connected));
-    }
-
-    #[test]
     fn connected_mode_only_requires_a_live_upstream_past_the_birthday() {
         let connected = cfg(ReadinessMode::Connected);
         // Far behind on the scan (gap 357k) but connected and the tip is past birthday 50: ready.
@@ -375,6 +365,12 @@ mod tests {
         // Disconnected, or no tip yet: never ready.
         assert!(!wallet_ready(&st(false, Some(4_080_983), None), &connected));
         assert!(!wallet_ready(&st(true, None, None), &connected));
+
+        // The mode deliberately doesn't wait on the scan, so it doesn't wait on the enhancement
+        // backlog either - the one piece of scan state that is not a height.
+        let mut enhancing = st(true, Some(4_080_983), Some(4_080_983));
+        enhancing.pending_enhancements = 29_660;
+        assert!(wallet_ready(&enhancing, &connected));
     }
 
     #[test]

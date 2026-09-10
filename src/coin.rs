@@ -127,6 +127,12 @@ mod tests {
         assert_eq!(Coin::parse("zzz"), None);
         assert_eq!(Coin::parse("ZCASH"), None, "tokens are case-sensitive");
         assert_eq!(Coin::supported_names(), "zcash");
+        // The round trip, over the whole table rather than the one literal above: while `Coin`
+        // has a single variant these are the same assertion, but a second coin makes them
+        // diverge, and the loop is where that would show up.
+        for coin in Coin::SUPPORTED {
+            assert_eq!(Coin::parse(coin.name()), Some(*coin));
+        }
     }
 
     #[test]
@@ -158,13 +164,6 @@ mod tests {
                 "two coins share the data directory {:?}",
                 coin.data_dir()
             );
-        }
-    }
-
-    #[test]
-    fn names_round_trip_through_parse() {
-        for coin in Coin::SUPPORTED {
-            assert_eq!(Coin::parse(coin.name()), Some(*coin));
         }
     }
 }

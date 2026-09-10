@@ -96,8 +96,14 @@ fn version_prints_name_and_semver() {
     );
 }
 
+/// The subcommand table in `--help` is exactly the set the binary ships. One run, one table: this
+/// was four near-identical tests, each spawning the binary to grep its help for one word, which
+/// cost four process spawns, missed half the subcommands, and matched substrings - `config` is
+/// satisfied by `example-config`, `chain` by `chain-info` - so it is the first token of each line
+/// in clap's `Commands:` block that is compared here, as a set, so a renamed or dropped subcommand
+/// fails and a new one has to be added below.
 #[test]
-fn help_lists_init_subcommand() {
+fn help_lists_every_subcommand() {
     let out = run_with_timeout(
         {
             let mut c = zecd();
@@ -108,10 +114,29 @@ fn help_lists_init_subcommand() {
     );
     assert!(out.status.success());
     let stdout = String::from_utf8_lossy(&out.stdout);
-    assert!(
-        stdout.contains("init"),
-        "help should list the init subcommand"
-    );
+    let listed: std::collections::BTreeSet<&str> = stdout
+        .lines()
+        .skip_while(|l| l.trim_end() != "Commands:")
+        .skip(1)
+        .take_while(|l| l.starts_with("  "))
+        .filter_map(|l| l.split_whitespace().next())
+        .collect();
+    let expected: std::collections::BTreeSet<&str> = [
+        "init",
+        "export-ufvk",
+        "derive-address",
+        "rpcauth",
+        "example-config",
+        "licenses",
+        "config",
+        "rescan",
+        "chain-info",
+        "run",
+        "help",
+    ]
+    .into_iter()
+    .collect();
+    assert_eq!(listed, expected, "help's Commands block: {stdout}");
 }
 
 #[test]
@@ -449,30 +474,9 @@ fn init_ufvk_conflicts_with_restore_and_encrypt() {
     }
 }
 
-/// `export-ufvk` refuses cleanly when the wallet does not exist (nothing to export).
-#[test]
-fn export_ufvk_requires_an_initialized_wallet() {
-    let dir = tempfile::tempdir().unwrap();
-    let out = run_with_timeout(
-        {
-            let mut c = zecd();
-            c.args([
-                "--datadir",
-                dir.path().to_str().unwrap(),
-                "--regtest",
-                "export-ufvk",
-            ]);
-            c
-        },
-        Duration::from_secs(10),
-    );
-    assert_eq!(out.status.code(), Some(1), "stderr: {}", stderr_of(&out));
-    assert!(
-        stderr_of(&out).contains("not initialized"),
-        "stderr: {}",
-        stderr_of(&out)
-    );
-}
+// `export-ufvk` refusing cleanly on an uninitialized wallet is asserted by
+// `export_ufvk_is_not_blocked_by_the_datadir_lock` below, which makes the same two claims (exit 1,
+// "not initialized") and one more - that the refusal is its own, not the lock guard's.
 
 /// Single-instance guard: a datadir-writing command (`init`) refuses to start when the datadir
 /// is already locked by another zecd. The test process holds the lock (standing in for a running
@@ -732,24 +736,6 @@ fn example_config_output_file_refuses_to_clobber_without_force() {
     );
 }
 
-#[test]
-fn help_lists_example_config_subcommand() {
-    let out = run_with_timeout(
-        {
-            let mut c = zecd();
-            c.arg("--help");
-            c
-        },
-        Duration::from_secs(10),
-    );
-    assert!(out.status.success());
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    assert!(
-        stdout.contains("example-config"),
-        "help should list example-config: {stdout}"
-    );
-}
-
 // ---------------------------------------------------------------------------
 // licenses
 // ---------------------------------------------------------------------------
@@ -819,24 +805,6 @@ fn licenses_works_without_a_usable_config_and_writes_nothing() {
     );
 }
 
-#[test]
-fn help_lists_licenses_subcommand() {
-    let out = run_with_timeout(
-        {
-            let mut c = zecd();
-            c.arg("--help");
-            c
-        },
-        Duration::from_secs(10),
-    );
-    assert!(out.status.success());
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    assert!(
-        stdout.contains("licenses"),
-        "help should list licenses: {stdout}"
-    );
-}
-
 // ---------------------------------------------------------------------------
 // config check
 // ---------------------------------------------------------------------------
@@ -857,36 +825,12 @@ fn stdout_of(out: &Output) -> String {
     String::from_utf8_lossy(&out.stdout).into_owned()
 }
 
+/// The happy path and the stream contract, on one run of one valid config.
+///
 /// The happy path: a config this build accepts exits 0 and reports the settings it resolves
 /// to - including the ones the file never mentions, which is what makes the command useful
 /// across an upgrade or a rollback (every unset key takes the *binary's* default).
-#[test]
-fn config_check_accepts_a_valid_config_and_prints_the_effective_settings() {
-    let dir = tempfile::tempdir().unwrap();
-    let conf = dir.path().join("zecd.toml");
-    std::fs::write(
-        &conf,
-        format!(
-            "network = \"test\"\ndatadir = {:?}\n[rpc]\nuser = \"u\"\npassword = \"p\"\n",
-            dir.path()
-        ),
-    )
-    .unwrap();
-
-    let out = config_check(&conf, &[]);
-    assert!(out.status.success(), "stderr: {}", stderr_of(&out));
-    let stdout = stdout_of(&out);
-    // Resolved from the file...
-    assert!(
-        stdout.contains("network") && stdout.contains("test"),
-        "{stdout}"
-    );
-    // ...and defaulted by this binary.
-    assert!(stdout.contains("AllowRevealedRecipients"), "{stdout}");
-    assert!(stdout.contains("zebra-rpc 127.0.0.1:18234"), "{stdout}");
-    assert!(stderr_of(&out).contains("OK:"), "{}", stderr_of(&out));
-}
-
+///
 /// The stream contract (`nginx -t`/`-T`): stdout is the effective configuration and *only* that,
 /// so `zecd config check > effective.txt` captures settings a later version's output can be
 /// diffed against; the verdict, the findings, and the header are diagnostics on stderr. `-q`
@@ -905,8 +849,17 @@ fn config_check_puts_the_settings_on_stdout_and_the_verdict_on_stderr() {
     .unwrap();
 
     let out = config_check(&conf, &[]);
+    assert!(out.status.success(), "stderr: {}", stderr_of(&out));
     let (stdout, stderr) = (stdout_of(&out), stderr_of(&out));
     assert!(stdout.contains("[backend]"), "{stdout}");
+    // Resolved from the file...
+    assert!(
+        stdout.contains("network") && stdout.contains("test"),
+        "{stdout}"
+    );
+    // ...and defaulted by this binary.
+    assert!(stdout.contains("AllowRevealedRecipients"), "{stdout}");
+    assert!(stdout.contains("zebra-rpc 127.0.0.1:18234"), "{stdout}");
     // Every stdout line is config or comment - no diagnostic leaks in. (Line-based, so the
     // header comment mentioning "zecd" isn't mistaken for the "zecd <version>" banner.)
     for line in stdout.lines() {
@@ -1822,24 +1775,6 @@ fn derive_address_refuses_a_mismatched_or_missing_keys_file() {
         stderr_of(&wrong_network).contains("is a main wallet"),
         "stderr: {}",
         stderr_of(&wrong_network)
-    );
-}
-
-#[test]
-fn help_lists_derive_address_subcommand() {
-    let out = run_with_timeout(
-        {
-            let mut c = zecd();
-            c.arg("--help");
-            c
-        },
-        Duration::from_secs(10),
-    );
-    assert!(out.status.success());
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    assert!(
-        stdout.contains("derive-address"),
-        "help should list derive-address: {stdout}"
     );
 }
 

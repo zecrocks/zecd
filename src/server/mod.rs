@@ -1297,28 +1297,18 @@ mod tests {
         }
     }
 
-    /// zecd is stateless: the off-chain label store is gone entirely, so the label-dedicated
-    /// methods are not implemented at all and must surface as method-not-found (-32601), like any
-    /// other unknown method - never reach a handler.
+    /// zecd is stateless: it keeps no off-chain label store, so `getnewaddress` stays available
+    /// but rejects a non-empty label argument with `-8`.
+    ///
+    /// The label-dedicated methods (`setlabel`, `getaddressesbylabel`, `listlabels`,
+    /// `getreceivedbylabel`, `listreceivedbylabel`) used to be probed here for `-32601` as well.
+    /// That is structural rather than behavioural: they are absent from `rpc::ALL_METHODS` and
+    /// from the dispatch `match`, which `rpc::tests::all_methods_matches_dispatch_tables` pins
+    /// against each other, and every unlisted method falls to the same catch-all arm that
+    /// `unknown_method_is_404_with_error_code` covers. Re-implementing one without adding a
+    /// dispatch arm is not a reachable regression.
     #[tokio::test]
-    async fn label_methods_are_not_implemented() {
-        use crate::error::codes::RPC_METHOD_NOT_FOUND;
-        for body in [
-            r#"{"method":"setlabel","id":1,"params":["uaddr","x"]}"#,
-            r#"{"method":"getaddressesbylabel","id":1,"params":["x"]}"#,
-            r#"{"method":"listlabels","id":1,"params":[]}"#,
-            r#"{"method":"getreceivedbylabel","id":1,"params":["x"]}"#,
-            r#"{"method":"listreceivedbylabel","id":1,"params":[]}"#,
-        ] {
-            let code = call_err_code(body).await;
-            assert_eq!(
-                code,
-                Some(RPC_METHOD_NOT_FOUND as i64),
-                "label method must be unimplemented: {body}"
-            );
-        }
-        // getnewaddress stays available, but a non-empty label argument is rejected (-8): a label
-        // would be off-chain state zecd doesn't keep.
+    async fn a_label_argument_to_getnewaddress_is_rejected() {
         let code = call_err_code(r#"{"method":"getnewaddress","id":1,"params":["mylabel"]}"#).await;
         assert_eq!(
             code,

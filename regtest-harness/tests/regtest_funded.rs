@@ -96,8 +96,11 @@ async fn regtest_funded_orchard_receive() {
     // pipeline_proving`): this wallet is Orchard-only with the cached proving key, so the pipeline
     // engages, and every send below (sendtoaddress/sendmany/z_sendmany, the self-send, the
     // concurrent burst, the send-during-outage) becomes correctness coverage for it on every PR
-    // run. The inline PCZT path stays covered by regtest_proving_cache, the fused path by
-    // regtest_sapling, so all three send paths are exercised across the funded tier.
+    // run. The inline (non-pipelined) PCZT path stays covered by every other shielded-source
+    // send from a cache-on wallet - regtest_ironwood, regtest_coinbase's closing UA spend,
+    // regtest_shielding's deshield, regtest_lwd - and the fused path by
+    // regtest_sapling/regtest_shielding/regtest_mergetoaddress, so all three send paths are
+    // exercised across the funded tier without a binary dedicated to any of them.
     cfg.pipeline_proving = Some(true);
     // `ZECD_REGTEST_BACKEND=lwd` reruns this whole suite with zecd on a dedicated lightwalletd
     // (light mode) instead of zebra's JSON-RPC. The funder is unaffected either way - it always

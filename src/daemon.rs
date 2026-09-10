@@ -393,6 +393,24 @@ mod tests {
         assert!(msg.contains("'default'"), "{msg}");
         assert!(msg.contains("'second'"), "{msg}");
         assert!(msg.contains("at most one"), "{msg}");
+
+        // Watch-only wallets interleaved with the spenders neither mask the violation nor get
+        // named by it: the two names are the first two *spenders* in order, not the first two
+        // entries.
+        let err = ensure_single_spending_wallet(
+            &wallets(&[
+                ("view-a", true),
+                ("spend-a", false),
+                ("view-b", true),
+                ("spend-b", false),
+            ]),
+            false,
+        )
+        .expect_err("two spending wallets must be rejected across watch-only entries");
+        let msg = err.to_string();
+        assert!(msg.contains("'spend-a'"), "{msg}");
+        assert!(msg.contains("'spend-b'"), "{msg}");
+        assert!(!msg.contains("'view-a'"), "{msg}");
     }
 
     /// The library opt-in turns the refusal into an audit record rather than an error. Only an
@@ -435,25 +453,6 @@ mod tests {
         assert!(msg.contains("allow_multiple_spending_wallets"), "{msg}");
         assert!(msg.contains("embedding zecd as a library"), "{msg}");
         assert!(msg.contains("one zecd per wallet"), "{msg}");
-    }
-
-    #[test]
-    fn two_spending_wallets_mixed_with_watch_only_are_rejected() {
-        // Watch-only wallets interleaved with the spenders don't mask the violation; the first
-        // two spenders in order are named.
-        let err = ensure_single_spending_wallet(
-            &wallets(&[
-                ("view-a", true),
-                ("spend-a", false),
-                ("view-b", true),
-                ("spend-b", false),
-            ]),
-            false,
-        )
-        .expect_err("two spending wallets must be rejected");
-        let msg = err.to_string();
-        assert!(msg.contains("'spend-a'"), "{msg}");
-        assert!(msg.contains("'spend-b'"), "{msg}");
     }
 
     #[cfg(feature = "server")]

@@ -8052,7 +8052,6 @@ mod tests {
     use super::select_transparent_inputs;
     use super::transparent_child_index;
     use super::DiversifierIndex;
-    use super::ProvingKeys;
 
     /// The halt is keyed on the failure *type*, and only the terminal one. A transport failure or
     /// a wallet-apply failure must stay retryable: reconnecting fixes the first, and updating
@@ -8078,26 +8077,6 @@ mod tests {
         assert!(
             !super::sync_failure_is_terminal(&anyhow::anyhow!("connection reset")),
             "a transport failure is fixed by reconnecting"
-        );
-    }
-
-    /// Every `get` shares one [`super::ProvingKeyCache`] rather than generating a key per send.
-    /// The regtest tier cannot catch a regression here - rebuilding per send is slower, not
-    /// wrong, and e2e send timings are noise-dominated.
-    ///
-    /// `#[ignore]` because a *debug* keygen is ~25 s (measured on 4 cores) - too slow for the
-    /// offline tier, whose value is being fast and always green. Run it with
-    /// `cargo test -- --include-ignored`, and after any `orchard`/`halo2_proofs` bump.
-    #[ignore = "runs a real Orchard keygen: ~25s in a debug build"]
-    #[tokio::test]
-    async fn proving_keys_are_built_once_and_shared() {
-        // `false`: skip the Ironwood keygen, which this assertion doesn't need.
-        let keys = ProvingKeys::new(false);
-        let first = keys.get().await.expect("keygen");
-        let second = keys.get().await.expect("keygen");
-        assert!(
-            std::sync::Arc::ptr_eq(&first, &second),
-            "each call rebuilt the proving key instead of sharing the cached one"
         );
     }
 

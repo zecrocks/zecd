@@ -4,8 +4,8 @@
 #
 # Why this exists: every harness test binary brings up its own zebrad (+ lightwalletd, + zecd)
 # stack, and much of its wall clock is spent waiting on that stack - mining blocks, polling for a
-# sync to catch up, waiting out a confirmation. Run one at a time the tier's 24 binaries took over
-# twenty minutes. They are fully independent (tempdir datadirs, no shared fixture), so the only
+# sync to catch up, waiting out a confirmation. Run one at a time the tier's binaries (24 of them
+# when this was written; 22 today) took over twenty minutes. They are fully independent (tempdir datadirs, no shared fixture), so the only
 # thing that stopped them overlapping was the runner having two cores.
 #
 # NB the "mostly idle" half of that premise no longer holds: since NU6.3 went live on the regtest

@@ -121,17 +121,16 @@ mod tests {
         assert!(doc.get("backend").is_some(), "declares a backend section");
     }
 
-    #[test]
-    fn writes_to_the_requested_path() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("zecd.toml");
-        run(&args(Some(path.to_str().unwrap()), false)).unwrap();
-        assert_eq!(std::fs::read_to_string(&path).unwrap(), EXAMPLE_CONFIG);
-    }
-
+    /// Also covers the plain write: `--force` over an existing file and a first write to a fresh
+    /// path both land the same bytes, so the fresh-path case is the last block here rather than a
+    /// test of its own.
     #[test]
     fn refuses_to_clobber_an_existing_file_without_force() {
         let dir = tempfile::tempdir().unwrap();
+        let fresh = dir.path().join("fresh.toml");
+        run(&args(Some(fresh.to_str().unwrap()), false)).unwrap();
+        assert_eq!(std::fs::read_to_string(&fresh).unwrap(), EXAMPLE_CONFIG);
+
         let path = dir.path().join("zecd.toml");
         std::fs::write(&path, "network = \"main\"\n").unwrap();
 

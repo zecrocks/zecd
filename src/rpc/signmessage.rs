@@ -215,24 +215,11 @@ mod tests {
         assert!(verified, "Valid signature should verify successfully");
     }
 
-    #[test]
-    fn verify_wrong_message_fails() {
-        let verified = verify_message(&mainnet(), TEST_ADDRESS, TEST_SIGNATURE, "wrongmessage")
-            .expect("verification call should succeed");
-        assert!(!verified, "Wrong message should fail verification");
-    }
-
-    #[test]
-    fn verify_wrong_address_fails() {
-        let verified = verify_message(
-            &mainnet(),
-            "t1VtArtnn1dGPiD2WFfMXYXW5mHM3q1GpgV",
-            TEST_SIGNATURE,
-            TEST_MESSAGE,
-        )
-        .expect("verification call should succeed");
-        assert!(!verified, "Wrong address should fail verification");
-    }
+    // The wrong-message and wrong-address rejections are not repeated against this vector:
+    // `sign_verify_wrong_message_fails` and `sign_verify_wrong_address_fails` below assert the
+    // same `Ok(false)` outcomes on a generated keypair, and the branch is the same either way.
+    // What only this vector can prove is the positive above - that zecd verifies a signature it
+    // did not produce, i.e. cross-implementation compatibility.
 
     #[test]
     fn verify_invalid_address_returns_error() {
