@@ -5,6 +5,16 @@ All notable changes to zecd are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com), and this
 project adheres to [Semantic Versioning](https://semver.org).
 
+## [0.7.2] - 2026-09-09
+
+One fix, no new features, no configuration or response shape moved. A drop-in upgrade from 0.7.1.
+
+It matters to any deployment whose wallet has grown large enough for a read RPC to take
+seconds, and that polls zecd's health endpoints. Below that size nothing changes.
+
+### Fixed
+- **A busy read RPC could make `/status` and `/readyz` time out for minutes while `/healthz` kept answering.** Most read methods are synchronous functions that open a SQLite connection and query it, and they were called inline from the async dispatcher. On a large wallet one `getwalletinfo` or `listtransactions` is hundreds of milliseconds to seconds of blocking work, while `[rpc] work_queue` admits a hundred requests at once against a worker pool sized to the core count. A monitoring poll with any concurrency could therefore occupy every worker and starve the rest of the runtime, the health server included, whose handlers do no I/O and were only waiting to be polled. The sixteen handlers that can block now release their worker for the duration, so the runtime keeps making progress; request admission is unchanged, and the reads themselves answer exactly as before. Also in the 0.8.0 candidate line.
+
 ## [0.7.1] - 2026-09-04
 
 Two fixes, no new features, no configuration or response shape moved. A drop-in upgrade from
@@ -612,6 +622,7 @@ Zcash, backed entirely by librustzcash and running as a light client.
 ### Security
 - Pre-release audit hardening; refuse to start on mainnet with the placeholder RPC password; enforce a 12-character passphrase minimum.
 
+[0.7.2]: https://github.com/zecrocks/zecd/compare/v0.7.1...v0.7.2
 [0.7.1]: https://github.com/zecrocks/zecd/compare/v0.7.0...v0.7.1
 [0.7.0]: https://github.com/zecrocks/zecd/compare/v0.6.3...v0.7.0
 [0.7.0-rc5]: https://github.com/zecrocks/zecd/compare/v0.7.0-rc4...v0.7.0-rc5
