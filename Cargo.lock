@@ -4526,7 +4526,7 @@ dependencies = [
 
 [[package]]
 name = "zecd"
-version = "0.8.0-rc1"
+version = "0.8.0-rc2"
 dependencies = [
  "age",
  "anyhow",
