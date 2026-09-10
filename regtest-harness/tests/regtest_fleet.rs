@@ -300,8 +300,10 @@ async fn regtest_fleet_many_view_wallets_are_scanned_together_and_stay_isolated(
     //
     // The fleet is spread over several shard databases, and each one is caught up. The scan work
     // therefore scaled with shards, not with wallets - which is the whole point of the design.
-    let shard_dirs = std::fs::read_dir(zecd.datadir().join("fleet"))
-        .expect("the fleet directory exists")
+    // `<datadir>/fleet/zec/shards`, not `<datadir>/fleet`: the fleet root holds one coin
+    // directory, and the shard databases sit inside it.
+    let shard_dirs = std::fs::read_dir(zecd.datadir().join("fleet").join("zec").join("shards"))
+        .expect("the fleet shard directory exists")
         .filter_map(|e| e.ok())
         .filter(|e| e.path().is_dir())
         .count();
