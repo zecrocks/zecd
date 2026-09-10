@@ -154,6 +154,15 @@ pub struct SyncStatus {
     /// Publishing it rather than fixing it at spawn is what lets the scope start reporting an
     /// account the moment one of those completes.
     pub accounts: Arc<BTreeMap<String, AccountUuid>>,
+    /// Why a wallet this actor serves will never get an account, keyed by wallet name.
+    ///
+    /// Only a fleet shard populates this, and only for a member whose import failed in a way
+    /// that retrying cannot fix (a birthday no tree state can serve, a viewing key the database
+    /// refuses). Such a member is dropped from the import queue, which otherwise makes it
+    /// indistinguishable from one still waiting its turn - both hold no account and read empty.
+    /// Surfaced on `waitforsync` and `getwalletinfo` so a caller stops waiting, and cleared when
+    /// the member is queued again (`loadwallet` after fixing the manifest).
+    pub import_errors: Arc<BTreeMap<String, String>>,
     /// True for a watch-only wallet (imported UFVK; no spending material anywhere). Drives
     /// `getwalletinfo.private_keys_enabled` - the wallet-level signal, as in Bitcoin Core's
     /// descriptor wallets (per-address `iswatchonly` is deprecated there and stays false).
@@ -553,6 +562,16 @@ pub struct WalletHandle {
     /// a restore of that same wallet. Surfaced on `getwalletinfo` so a consumer can assert the
     /// wallet kind it is talking to rather than infer it from empty memo fields.
     pub fetch_memos: bool,
+    /// Whether this handle belongs to a **fleet shard** - an actor whose one database holds
+    /// several wallets' accounts.
+    ///
+    /// Static for the life of the handle (a shard's siblings are clones differing only in
+    /// name), and read by [`WalletHandle::account_scope`] alone: it is what distinguishes a
+    /// wallet whose account does not exist yet in a database holding *other wallets' accounts*
+    /// from one whose database is simply empty. Carried on the handle rather than published on
+    /// [`SyncStatus`] because it is decided at spawn and cannot change, unlike everything on
+    /// that snapshot.
+    pub is_shard: bool,
     /// Transient first-seen times for unmined txs, shared with the actor (the writer). See
     /// [`FirstSeen`].
     first_seen: FirstSeen,
@@ -578,12 +597,21 @@ impl WalletHandle {
 
     /// Which account in this wallet's database its reads apply to.
     ///
-    /// [`read::AccountScope::Any`] until the account exists (a pending bootstrap), which is also
-    /// exactly the pre-fleet behaviour - and identical to naming the account whenever the
-    /// database holds only one, which is every non-fleet wallet.
+    /// [`read::AccountScope::Only`] once the account exists. Before that the answer depends on
+    /// what else the database holds, and the two cases are not interchangeable:
+    ///
+    /// - A conventional wallet awaiting its bootstrap (an encrypted wallet before its first
+    ///   `walletpassphrase`) has a database with **no** accounts in it, so
+    ///   [`read::AccountScope::Any`] reports nothing - the pre-fleet behaviour, and identical to
+    ///   naming the account whenever the database holds only one.
+    /// - A **shard member** awaiting import shares its database with its shard-mates' accounts,
+    ///   so `Any` there would report their money and history under this wallet's name. It scopes
+    ///   to [`read::AccountScope::NoAccount`] instead, which reports nothing until its own
+    ///   account exists.
     pub fn account_scope(&self) -> read::AccountScope {
         match self.account() {
             Some(account) => read::AccountScope::Only(account),
+            None if self.is_shard => read::AccountScope::NoAccount,
             None => read::AccountScope::Any,
         }
     }
@@ -592,6 +620,17 @@ impl WalletHandle {
     /// pending bootstrap, or a shard member awaiting import).
     pub fn account(&self) -> Option<AccountUuid> {
         self.status_rx.borrow().accounts.get(&self.name).copied()
+    }
+
+    /// Why this wallet will never get an account, if its actor has recorded such a failure. See
+    /// [`SyncStatus::import_errors`]; `None` for every wallet outside that case, which is every
+    /// conventional wallet.
+    pub fn import_error(&self) -> Option<String> {
+        self.status_rx
+            .borrow()
+            .import_errors
+            .get(&self.name)
+            .cloned()
     }
 
     /// A private receiver on the actor's published [`SyncStatus`], for RPC handlers that must
@@ -611,6 +650,15 @@ impl WalletHandle {
     #[cfg(test)]
     pub(crate) fn for_test(name: &str, network: ZNetwork, status: SyncStatus) -> Self {
         WalletHandle::for_test_publishing(name, network, status).0
+    }
+
+    /// Mark a test handle as a shard's, so [`WalletHandle::account_scope`] takes the shard
+    /// branch. A builder rather than a `for_test` parameter because the handle's other fields
+    /// are private, so a caller outside this module cannot set one by struct update.
+    #[cfg(test)]
+    pub(crate) fn into_shard_for_test(mut self) -> Self {
+        self.is_shard = true;
+        self
     }
 
     /// [`WalletHandle::for_test`] plus the live sender, for tests that need to *publish* a new
@@ -638,6 +686,10 @@ impl WalletHandle {
             transparent_default: false,
             transparent_gap_limit: 20,
             fetch_memos: true,
+            // A conventional wallet: an unset account map means an empty database, not a shard
+            // holding other wallets' accounts. A test that wants the shard behaviour builds
+            // `WalletHandle { is_shard: true, ..for_test(..) }`.
+            is_shard: false,
             // Inert test handle: no encrypted seed, so `walletlock` is a no-op (returns -15).
             seed: None,
             cmd_tx,
@@ -1036,6 +1088,7 @@ pub(crate) fn make_handle(
     transparent_default: bool,
     transparent_gap_limit: u32,
     fetch_memos: bool,
+    is_shard: bool,
     first_seen: FirstSeen,
     seed: Option<SharedSeed>,
     cmd_tx: mpsc::Sender<WalletCommand>,
@@ -1052,6 +1105,7 @@ pub(crate) fn make_handle(
         transparent_default,
         transparent_gap_limit,
         fetch_memos,
+        is_shard,
         first_seen,
         seed,
         cmd_tx,
@@ -1077,6 +1131,7 @@ mod registry_tests {
             false,
             20,
             true,
+            false,
             FirstSeen::default(),
             None,
             cmd_tx,
@@ -1130,6 +1185,7 @@ mod tests {
             false,
             20,
             true,
+            false,
             Arc::new(Mutex::new(HashMap::new())),
             seed,
             cmd_tx,
@@ -1198,5 +1254,66 @@ mod tests {
         let err = handle.lock().await.unwrap_err();
         assert_eq!(err.message, "from actor");
         actor.await.unwrap();
+    }
+
+    /// A wallet with no account of its own scopes two different ways, and picking the wrong one
+    /// leaks money between wallets.
+    ///
+    /// Both cases publish the same thing, a status whose account map does not name this wallet,
+    /// so the handle cannot tell them apart from the map alone; `is_shard` is what does. A
+    /// conventional wallet in that window has a database with no accounts in it, where `Any`
+    /// reports nothing and is the behaviour every pre-fleet release had. A shard member in that
+    /// window shares its database with its shard-mates' accounts, where `Any` would report their
+    /// balances and history under this wallet's name, and it is servable before its import runs,
+    /// so those reads are actually served.
+    #[test]
+    fn a_wallet_without_an_account_scopes_by_whether_it_shares_a_database() {
+        let net = crate::network::regtest();
+        let (conventional, _tx) =
+            WalletHandle::for_test_publishing("w", net, SyncStatus::default());
+        assert_eq!(
+            conventional.account_scope(),
+            read::AccountScope::Any,
+            "a conventional wallet awaiting its bootstrap keeps the pre-fleet scope"
+        );
+
+        let member = conventional.clone().into_shard_for_test();
+        assert_eq!(
+            member.account_scope(),
+            read::AccountScope::NoAccount,
+            "a shard member awaiting import must not read its shard-mates' accounts"
+        );
+
+        // Once the account exists both name it, and the distinction stops mattering.
+        let account = AccountUuid::from_uuid(uuid::Uuid::from_u128(1));
+        let status = SyncStatus {
+            accounts: Arc::new([("w".to_string(), account)].into_iter().collect()),
+            ..Default::default()
+        };
+        let (imported, _tx2) = WalletHandle::for_test_publishing("w", net, status);
+        assert_eq!(imported.account_scope(), read::AccountScope::Only(account));
+        assert_eq!(
+            imported.clone().into_shard_for_test().account_scope(),
+            read::AccountScope::Only(account)
+        );
+    }
+
+    /// A recorded import failure is readable through the handle, keyed by wallet name - so one
+    /// shard member's bad manifest is not reported on its shard-mates.
+    #[test]
+    fn import_errors_are_reported_per_wallet() {
+        let net = crate::network::regtest();
+        let status = SyncStatus {
+            import_errors: Arc::new(
+                [("broken".to_string(), "no tree state".to_string())]
+                    .into_iter()
+                    .collect(),
+            ),
+            ..Default::default()
+        };
+        let (broken, _tx) = WalletHandle::for_test_publishing("broken", net, status.clone());
+        assert_eq!(broken.import_error().as_deref(), Some("no tree state"));
+        let (fine, _tx2) = WalletHandle::for_test_publishing("fine", net, status);
+        assert_eq!(fine.import_error(), None);
     }
 }

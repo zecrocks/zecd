@@ -63,6 +63,16 @@ pub struct SyncState {
     /// `wallet::SyncStatus::enhanced_through`). `None` means "not currently known", never
     /// "everything is enhanced" - a consumer advancing a memo cursor must hold it still.
     pub enhanced_through: Option<u32>,
+    /// Whether this wallet's own account exists in its database yet. `false` only for a fleet
+    /// member that has been onboarded but not imported, where every read is legitimately empty;
+    /// `None` from a node predating the field, which is not the same answer as `false` and is
+    /// why this is an `Option` (as `chain_tip` is).
+    #[serde(default)]
+    pub imported: Option<bool>,
+    /// Why this wallet's import can never succeed, when its actor has recorded such a failure.
+    /// The call returns immediately rather than waiting when this is set.
+    #[serde(default)]
+    pub import_error: Option<String>,
 }
 
 /// `getblockheader` verbose result (`rpc/blockchain.rs::getblockheader`). Served from the
@@ -170,12 +180,15 @@ mod tests {
             "synced": true,
             "pending_enhancements": 0,
             "enhanced_through": 240,
+            "imported": true,
         }))
         .unwrap();
         assert!(synced.synced);
         assert_eq!(synced.pending_enhancements, 0);
         assert_eq!(synced.enhanced_through, Some(240));
         assert_eq!(synced.chain_tip, Some(240));
+        assert_eq!(synced.imported, Some(true));
+        assert_eq!(synced.import_error, None);
 
         // Mid-sync is the case `chain_tip` exists for: `height` alone cannot express progress,
         // since what it is measured against is the tip.
@@ -204,6 +217,26 @@ mod tests {
         }))
         .unwrap();
         assert_eq!(no_tip.chain_tip, None);
+        // Same reasoning for `imported`: a node predating the field omits it, and "unknown" is
+        // not "not imported" - the latter beside `synced: true` would be a contradiction.
+        assert_eq!(no_tip.imported, None);
+
+        // A fleet member whose import was refused: served, holding nothing, and never going to
+        // be synced. The reason is what stops a caller waiting for a state that cannot arrive.
+        let refused: SyncState = serde_json::from_value(serde_json::json!({
+            "hash": "0000000000000000000000000000000000000000000000000000000000abc123",
+            "height": 240,
+            "chain_tip": 240,
+            "synced": false,
+            "pending_enhancements": 0,
+            "enhanced_through": 240,
+            "imported": false,
+            "import_error": "account import failed: the viewing key is already in this database",
+        }))
+        .unwrap();
+        assert!(!refused.synced);
+        assert_eq!(refused.imported, Some(false));
+        assert!(refused.import_error.unwrap().contains("already"));
     }
 
     /// Fixture captured from a synced regtest wallet's `getblockchaininfo`.

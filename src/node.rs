@@ -653,6 +653,30 @@ pub struct SendOptions {
     pub source: crate::wallet::SendSource,
 }
 
+/// Where one wallet's librustzcash database is, and which account in it is that wallet's.
+///
+/// Both halves are needed to call [`crate::wallet::read`] against a running node's wallet, and
+/// neither was reachable before: a wallet's engine directory is computable from
+/// [`crate::config::WalletEntry::engine_dir`] only for a configured `[wallets.<name>]` entry,
+/// and a fleet member has no such entry - its account lives in a shard directory the config
+/// layer knows nothing about. See [`Node::wallet_location`].
+#[non_exhaustive]
+#[derive(Debug, Clone)]
+pub struct WalletLocation {
+    /// The directory holding this wallet's `data.sqlite`, as [`crate::wallet::read`] takes it.
+    /// Shared with the rest of a shard for a fleet member.
+    pub engine_dir: std::path::PathBuf,
+    /// This wallet's account, or `None` while it does not exist yet (a wallet awaiting its
+    /// bootstrap, or a fleet member awaiting import - `waitforsync`'s `imported` tells them
+    /// apart).
+    pub account: Option<crate::AccountUuid>,
+    /// The scope to hand [`crate::wallet::read::query_transactions`] and its siblings. Not
+    /// derivable from `account` alone: a `None` account means "every account in this database"
+    /// for a conventional wallet, whose database holds none, and "no account" for a fleet member
+    /// awaiting import, whose database holds its shard-mates'.
+    pub scope: crate::wallet::read::AccountScope,
+}
+
 /// A running embedded zecd node: the wallet actors, registry, and async-operation registry,
 /// behind the same dispatch table the HTTP server uses. Owns the datadir lock for its
 /// lifetime; call [`Node::shutdown`] to stop the actors and release it cleanly.
@@ -664,6 +688,25 @@ pub struct Node {
 }
 
 impl Node {
+    /// Where `wallet`'s database is and which account in it to read, for an embedder querying
+    /// [`crate::wallet::read`] directly instead of going through [`Node::call`].
+    ///
+    /// `wallet` names the wallet as the HTTP `/wallet/<name>` segment does, `None` meaning the
+    /// default; an unknown name is the usual `-18`. This is the only supported route to a
+    /// **fleet** member's files, whose shard directory no config helper can produce.
+    ///
+    /// The account is `None` in the window before it exists, which is why the scope is reported
+    /// beside it rather than left for the caller to derive - the two `None` cases scope
+    /// differently (see [`WalletLocation::scope`]).
+    pub fn wallet_location(&self, wallet: Option<&str>) -> Result<WalletLocation, RpcError> {
+        let handle = self.state.registry.get(wallet)?;
+        Ok(WalletLocation {
+            engine_dir: handle.engine_dir.clone(),
+            account: handle.account(),
+            scope: handle.account_scope(),
+        })
+    }
+
     /// Dispatch one RPC with wire-identical semantics: the same dispatch table, the same
     /// `[rpc] allowed_methods` safelist, the same positional-arity checks, and the same error
     /// codes as an HTTP call. `wallet` plays the role of the HTTP `/wallet/<name>` path
@@ -854,6 +897,27 @@ pub(crate) mod testutil {
         })
     }
 
+    /// A node serving exactly one wallet, built from a [`crate::wallet::WalletHandle::for_test`]
+    /// handle: no actor, no database, only the registry lookups and the fields the handle
+    /// publishes. Enough for the accessors that read a handle without dispatching.
+    pub(crate) fn node_with_test_wallet(
+        name: &str,
+        status: crate::wallet::SyncStatus,
+        is_shard: bool,
+    ) -> Node {
+        let node = walletless_node();
+        let handle = crate::wallet::WalletHandle::for_test(name, crate::network::regtest(), status);
+        let handle = if is_shard {
+            handle.into_shard_for_test()
+        } else {
+            handle
+        };
+        node.state
+            .registry
+            .insert(crate::wallet::CoinWallet::Zcash(handle));
+        node
+    }
+
     /// The resolved config behind [`walletless_node`], for tests that check a *policy* over a
     /// config rather than dispatch behaviour.
     pub(crate) fn walletless_config() -> AppConfig {
@@ -929,8 +993,57 @@ mod tests {
     use serde_json::Value;
 
     use super::testutil::{
-        walletless_node as test_node, walletless_node_with_safelist as test_node_with_safelist,
+        node_with_test_wallet, walletless_node as test_node,
+        walletless_node_with_safelist as test_node_with_safelist,
     };
+
+    /// `wallet_location` is the only supported route to a fleet member's database, so it has to
+    /// answer three ways, and the third is the one the config helpers cannot express: an account
+    /// that does not exist *yet* in a database that holds other wallets' accounts.
+    #[test]
+    fn wallet_location_reports_the_account_and_the_scope_it_implies() {
+        use crate::wallet::read::AccountScope;
+        use crate::wallet::SyncStatus;
+        use std::sync::Arc;
+        use zcash_client_sqlite::AccountUuid;
+
+        // Imported: the account, and a scope naming it.
+        let account = AccountUuid::from_uuid(uuid::Uuid::from_u128(7));
+        let status = SyncStatus {
+            accounts: Arc::new([("w".to_string(), account)].into_iter().collect()),
+            ..Default::default()
+        };
+        let node = node_with_test_wallet("w", status, true);
+        let loc = node.wallet_location(Some("w")).expect("a loaded wallet");
+        assert_eq!(loc.account, Some(account));
+        assert_eq!(loc.scope, AccountScope::Only(account));
+
+        // A conventional wallet awaiting its bootstrap: no account, and the database holds none,
+        // so every account in it is the same as this wallet's - the pre-fleet scope.
+        let node = node_with_test_wallet("w", SyncStatus::default(), false);
+        let loc = node.wallet_location(Some("w")).expect("a loaded wallet");
+        assert_eq!(loc.account, None);
+        assert_eq!(loc.scope, AccountScope::Any);
+
+        // A shard member awaiting import: also no account, but its database is its shard's, so
+        // the same `None` must scope to nothing instead. This is why the scope is reported
+        // rather than left for the caller to derive from `account`.
+        let node = node_with_test_wallet("w", SyncStatus::default(), true);
+        let loc = node.wallet_location(Some("w")).expect("a loaded wallet");
+        assert_eq!(loc.account, None);
+        assert_eq!(loc.scope, AccountScope::NoAccount);
+    }
+
+    /// An unknown wallet is the same `-18` the RPC path gives, so a caller handles one error for
+    /// both seams.
+    #[test]
+    fn wallet_location_rejects_an_unknown_wallet() {
+        let node = test_node();
+        let err = node
+            .wallet_location(Some("nope"))
+            .expect_err("no such wallet");
+        assert_eq!(err.code, crate::error::codes::RPC_WALLET_NOT_FOUND);
+    }
 
     /// The check that decides whether to warm the Orchard proving keys reads `keys.toml`, so it
     /// must answer for a watch-only wallet (seedless, `init --ufvk`) and a spending one - and,

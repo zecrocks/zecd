@@ -650,6 +650,115 @@ async fn a_shard_serves_many_view_wallets_from_one_actor() {
     task.abort();
 }
 
+/// A shard member that has been **placed but not imported** must read nothing - not its shard's
+/// everything.
+///
+/// A member is servable the moment the actor accepts it: `createwallet` returns before the
+/// import runs, because importing needs the tree state below the member's birthday and so waits
+/// for a connected pass. In that window the wallet has no account of its own, and a wallet with
+/// no account scoped to "every account in this database" - which for a shard is its shard-mates'
+/// accounts. So the new wallet answered `getbalance`, `listtransactions` and `is_mine` with
+/// *other wallets'* money, history and addresses, under its own name.
+///
+/// Offline, and against the real actor rather than a hand-built handle, because the fix spans
+/// three layers that all have to agree: the actor knows it is a shard, the handle carries that,
+/// and the read layer honours the scope it implies. The upstream is a dead port, so the pending
+/// member stays pending for the life of the test - which is exactly the window under test.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_shard_member_awaiting_import_reads_nothing_rather_than_its_shards_everything() {
+    use zcash_keys::keys::UnifiedSpendingKey;
+
+    let net = network::regtest();
+    let dir = tempfile::tempdir().unwrap();
+    let shard_dir = dir.path().to_path_buf();
+
+    let member_of = |i: u64| {
+        let mut raw = [0u8; 32];
+        raw[..8].copy_from_slice(&i.to_le_bytes());
+        let usk = UnifiedSpendingKey::from_seed(&net, &raw, 0u32.try_into().unwrap()).unwrap();
+        crate::wallet::shard::ShardMember {
+            name: format!("view-{i:04}"),
+            ufvk: usk.to_unified_full_viewing_key().encode(&net),
+            birthday: BlockHeight::from_u32(1),
+        }
+    };
+
+    // One member imported (it has an account and an address), one only placed.
+    let resident = member_of(1);
+    let newcomer = member_of(2);
+    let mut db = open::init_dbs(net, &shard_dir).unwrap();
+    let resident_account =
+        crate::wallet::shard::import_member(&mut db, &resident, &genesis_birthday()).unwrap();
+    let resident_address = db
+        .list_addresses(resident_account)
+        .unwrap()
+        .first()
+        .expect("import exposes the account's default address")
+        .address()
+        .encode(&net);
+    drop(db);
+
+    let (mut cfg, _shutdown_tx) = offline_actor_cfg("shard-0000", shard_dir.clone());
+    cfg.shard_members = vec![resident.clone(), newcomer.clone()];
+    let (handles, task) = actor::spawn_shard(cfg).await.expect("shard spawns");
+
+    let handle_named = |name: &str| {
+        handles
+            .iter()
+            .find(|h| h.name == name)
+            .unwrap_or_else(|| panic!("a handle for {name}"))
+            .clone()
+    };
+    let resident_handle = handle_named(&resident.name);
+    let newcomer_handle = handle_named(&newcomer.name);
+
+    // The premise: one has an account, the other does not - and both read the same database.
+    assert_eq!(resident_handle.account(), Some(resident_account));
+    assert_eq!(
+        newcomer_handle.account(),
+        None,
+        "the newcomer's import needs a connected upstream, which this test does not give it"
+    );
+    assert_eq!(resident_handle.engine_dir, newcomer_handle.engine_dir);
+
+    // The fix: no account in a shared database scopes to no account, not to every account.
+    assert_eq!(
+        newcomer_handle.account_scope(),
+        read::AccountScope::NoAccount
+    );
+    let scope = newcomer_handle.account_scope();
+    assert!(
+        read::all_addresses(net, &newcomer_handle.engine_dir, scope).is_empty(),
+        "a member awaiting import must not list its shard-mates' addresses"
+    );
+    assert!(
+        !read::is_mine(net, &newcomer_handle.engine_dir, scope, &resident_address),
+        "nor claim one of them as its own - `is_mine` is what a send's fromaddress is checked \
+         against"
+    );
+    assert_eq!(
+        read::tx_count(&newcomer_handle.engine_dir, scope).unwrap(),
+        0
+    );
+    assert!(read::list_transactions(&newcomer_handle.engine_dir, scope)
+        .unwrap()
+        .is_empty());
+    assert!(read::list_unspent(net, &newcomer_handle.engine_dir, scope)
+        .unwrap()
+        .is_empty());
+
+    // And the resident is undisturbed: the scoping must not cost a wallet its own address.
+    assert!(read::is_mine(
+        net,
+        &resident_handle.engine_dir,
+        resident_handle.account_scope(),
+        &resident_address
+    ));
+
+    drop(handles);
+    task.abort();
+}
+
 /// Two accounts in **one** wallet database must not see each other through the read helpers.
 ///
 /// This is the shape a fleet shard has: many watch-only wallets sharing one `WalletDb` so the
@@ -748,6 +857,28 @@ fn accounts_sharing_one_database_do_not_see_each_others_addresses() {
         let bal = read::balance(net, engine_dir, scope, Default::default()).unwrap();
         assert_eq!(bal.total_spendable, 0);
     }
+
+    // `NoAccount` - the scope of a shard member placed but not yet imported - must report
+    // nothing, including that it owns *neither* of the addresses in this database. `Any` would
+    // claim both, which is exactly the confusion this variant exists to prevent: the wallet is
+    // servable in that window, so an unscoped read answers under its name.
+    let none = read::AccountScope::NoAccount;
+    assert!(!read::is_mine(net, engine_dir, none, &addr_a));
+    assert!(!read::is_mine(net, engine_dir, none, &addr_b));
+    assert!(read::all_addresses(net, engine_dir, none).is_empty());
+    assert_eq!(read::tx_count(engine_dir, none).unwrap(), 0);
+    assert!(read::list_transactions(engine_dir, none)
+        .unwrap()
+        .is_empty());
+    assert!(read::list_unspent(net, engine_dir, none)
+        .unwrap()
+        .is_empty());
+    assert_eq!(
+        read::balance(net, engine_dir, none, Default::default())
+            .unwrap()
+            .total_spendable,
+        0
+    );
 }
 
 /// The watch-only (UFVK) pairing guarantee, offline on regtest:

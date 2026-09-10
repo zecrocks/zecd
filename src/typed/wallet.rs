@@ -34,6 +34,11 @@ pub struct WalletDirEntry {
 #[derive(Debug, Clone, serde::Deserialize)]
 pub struct WalletDir {
     pub wallets: Vec<WalletDirEntry>,
+    /// zecd extension: fleet manifests that could not be read, and so name wallets the daemon is
+    /// not serving. Empty when there are none (the handler omits the key), which is why a typed
+    /// consumer that ignored this could not tell a skipped wallet from one never provisioned.
+    #[serde(default)]
+    pub warnings: Vec<String>,
 }
 
 /// The reply shape shared by `createwallet`, `loadwallet` and `unloadwallet`
@@ -172,6 +177,10 @@ pub struct WalletInfo {
     /// `None` here - on a wallet that does, which is the default; a consumer that reads memos
     /// checks this rather than reading empty memo fields as "no memo was attached".
     pub fetch_memos: Option<bool>,
+    /// zecd extension, present only when this wallet's import can never succeed: why. Only a
+    /// fleet member whose viewing key the database refused has one, and without it that wallet is
+    /// a healthy-looking zero balance forever.
+    pub import_error: Option<String>,
     /// Present only when transparent receiving is enabled.
     pub transparent: Option<TransparentInfo>,
 }
@@ -1027,6 +1036,31 @@ mod tests {
         let w: WalletInfo = serde_json::from_value(idle).unwrap();
         assert!(!w.scanning.is_scanning());
         assert!(w.transparent.is_none() && w.unlocked_until.is_none());
+        assert!(
+            w.import_error.is_none(),
+            "a healthy wallet carries no import failure, and the key is absent rather than empty"
+        );
+    }
+
+    /// `listwalletdir`'s `warnings` names fleet manifests the daemon could not read, so those
+    /// wallets are listed but not served. The key is absent when there are none, which is the
+    /// common case and the reason it needs a default rather than being required.
+    #[test]
+    fn wallet_dir_decodes_with_and_without_warnings() {
+        let healthy: WalletDir = serde_json::from_value(serde_json::json!({
+            "wallets": [{ "name": "default" }, { "name": "view-1" }],
+        }))
+        .unwrap();
+        assert_eq!(healthy.wallets.len(), 2);
+        assert!(healthy.warnings.is_empty());
+
+        let skipped: WalletDir = serde_json::from_value(serde_json::json!({
+            "wallets": [{ "name": "default" }],
+            "warnings": ["/data/wallets.d/view-2.toml: invalid ufvk"],
+        }))
+        .unwrap();
+        assert_eq!(skipped.warnings.len(), 1);
+        assert!(skipped.warnings[0].contains("view-2"));
     }
 
     /// Fixture shaped like `regtest_funded`'s memo receive: a mined receive entry with the

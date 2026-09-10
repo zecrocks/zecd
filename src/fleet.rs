@@ -133,8 +133,18 @@ pub fn load_manifests(dir: &Path) -> anyhow::Result<(Vec<ShardMember>, Vec<Skipp
 /// Write one manifest into `manifest_dir`, atomically, refusing to overwrite an existing one.
 ///
 /// Free-standing rather than a [`FleetManager`] method so it can be exercised without a shard
-/// template: the operation needs only a directory and a member.
-fn write_manifest_in(manifest_dir: &Path, member: &ShardMember) -> anyhow::Result<()> {
+/// template, and public because provisioning a member is a thing hosts do *without* a running
+/// node: the alternative is re-implementing the write below, whose atomicity is the difference
+/// between a torn file and a lost viewing key. Pairs with [`load_manifests`].
+///
+/// The write is temp + fsync + rename within `manifest_dir`, so the manifest is only ever
+/// observed whole, and an existing manifest for the same wallet is an error rather than an
+/// overwrite. A daemon already running picks the new file up on `loadwallet` (which re-reads the
+/// directory) without a restart, and `listwalletdir` lists it either way.
+///
+/// Experimental, like the rest of [`the fleet`](crate::fleet): the manifest format may change in
+/// a patch release.
+pub fn write_manifest(manifest_dir: &Path, member: &ShardMember) -> anyhow::Result<()> {
     std::fs::create_dir_all(manifest_dir).with_context(|| {
         format!(
             "creating the fleet manifest directory {}",
@@ -526,7 +536,7 @@ mod tests {
             ufvk: "uview1w".to_string(),
             birthday: BlockHeight::from_u32(42),
         };
-        write_manifest_in(&manifest_dir, &member).unwrap();
+        write_manifest(&manifest_dir, &member).unwrap();
 
         let (members, skipped) = load_manifests(&manifest_dir).unwrap();
         assert!(skipped.is_empty(), "{skipped:?}");
@@ -553,12 +563,12 @@ mod tests {
             ufvk: "uview1w".to_string(),
             birthday: BlockHeight::from_u32(42),
         };
-        write_manifest_in(&manifest_dir, &member).unwrap();
+        write_manifest(&manifest_dir, &member).unwrap();
         let second = ShardMember {
             ufvk: "uview1OTHER".to_string(),
             ..member.clone()
         };
-        assert!(write_manifest_in(&manifest_dir, &second).is_err());
+        assert!(write_manifest(&manifest_dir, &second).is_err());
         let (members, _) = load_manifests(&manifest_dir).unwrap();
         assert_eq!(members[0].ufvk, "uview1w", "the first key was overwritten");
     }
@@ -890,7 +900,7 @@ impl FleetManager {
             .map_err(|e| OnboardError::BadKey(format!("{e:#}")))?;
 
         if persist {
-            self.write_manifest(&member).map_err(OnboardError::Failed)?;
+            write_manifest(&self.config.manifest_dir, &member).map_err(OnboardError::Failed)?;
         }
         match self.place(member.clone()).await {
             Ok(handle) => {
@@ -930,6 +940,22 @@ impl FleetManager {
         // for a second account under one name, which the actor rightly refuses - so serving it is
         // a rename of any handle from that shard, exactly as onboarding is.
         if let Some(prototype) = self.shard_holding(&member.name) {
+            // Unless its import was refused, in which case the account is *not* there and the
+            // shard is not scanning for it - the actor dropped it from the queue because
+            // retrying unchanged would fail identically. Re-queuing here is what makes
+            // `loadwallet` the retry after the manifest is fixed; without it the only route back
+            // is a daemon restart, since this branch matches on a name the manager still lists.
+            // Asked of the shard's published status keyed by *this* member's name, not through
+            // `prototype.import_error()`: the prototype is any handle from the shard, so it
+            // carries some other member's name and would answer for that wallet instead.
+            if prototype.status().import_errors.contains_key(&member.name) {
+                tracing::info!(
+                    wallet = %member.name,
+                    "re-queuing a view wallet whose import had failed"
+                );
+                prototype.add_shard_member(member.clone()).await?;
+                return Ok(prototype.sibling(member.name));
+            }
             tracing::info!(wallet = %member.name, "reloaded a view wallet already in a shard");
             return Ok(prototype.sibling(member.name));
         }
@@ -1017,10 +1043,6 @@ impl FleetManager {
 
     fn manifest_path(&self, name: &str) -> PathBuf {
         manifest_path_in(&self.config.manifest_dir, name)
-    }
-
-    fn write_manifest(&self, member: &ShardMember) -> anyhow::Result<()> {
-        write_manifest_in(&self.config.manifest_dir, member)
     }
 
     /// The `RwLock`/`Mutex` critical sections here are all short and cannot leave a half-built

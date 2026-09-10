@@ -362,6 +362,59 @@ async fn regtest_fleet_many_view_wallets_are_scanned_together_and_stay_isolated(
         .await
         .expect("the new wallet answers immediately");
     assert_eq!(info["private_keys_enabled"], json!(false));
+    assert!(
+        info.get("import_error").is_none(),
+        "a healthy onboarding reports no import failure: {info:?}"
+    );
+
+    // And in that window it reads **nothing**, not its shard's everything.
+    //
+    // This is the sharp assertion of the whole section. The wallet is placed into a shard whose
+    // other members are already funded (the payments above), and it is servable before its
+    // viewing key is imported - so its reads are answered while it has no account of its own. A
+    // wallet with no account used to scope to "every account in this database", which here is
+    // its shard-mates': `getbalance` would report their money under this wallet's name. It holds
+    // whether or not the import has landed by the time this runs, because its own payment comes
+    // later - what it pins is that the answer is its own, either way.
+    let balance_before_funding = zec_to_zats(
+        &zecd
+            .call_wallet("late-arrival", "getbalance", json!([]))
+            .await
+            .expect("getbalance on a freshly onboarded wallet"),
+    );
+    assert_eq!(
+        balance_before_funding, 0,
+        "an unfunded new member must read its own (empty) account, never its shard's"
+    );
+    let history = zecd
+        .call_wallet("late-arrival", "listtransactions", json!([]))
+        .await
+        .expect("listtransactions on a freshly onboarded wallet");
+    assert_eq!(
+        history.as_array().map(|a| a.len()),
+        Some(0),
+        "nor its shard-mates' history: {history:?}"
+    );
+
+    // `waitforsync` reports the import as its own field, so a caller can tell "not imported yet"
+    // from "imported and empty" - two states that read identically in every balance and history
+    // RPC. A zero timeout makes this a read of the current state rather than a wait.
+    let state = zecd
+        .call_wallet("late-arrival", "waitforsync", json!([1]))
+        .await
+        .expect("waitforsync answers for a freshly onboarded wallet");
+    assert!(
+        state["imported"].is_boolean(),
+        "waitforsync must carry `imported`: {state:?}"
+    );
+    if state["imported"] == json!(false) {
+        assert_eq!(
+            state["synced"],
+            json!(false),
+            "a wallet with no account of its own is not synced, however far its shard has \
+             scanned: {state:?}"
+        );
+    }
 
     // Onboarding is idempotent-proof: the same name twice is refused rather than served by two
     // accounts, which would leave one of them silently unreachable.
@@ -403,6 +456,18 @@ async fn regtest_fleet_many_view_wallets_are_scanned_together_and_stay_isolated(
         ..newcomer.clone()
     });
     wait_for_fleet(&zecd, &whole_fleet, tip).await;
+    // Now that it has caught up, both halves must be true: the account exists, and the wallet is
+    // synced. `imported` is what `synced` folds in, so a caught-up member asserts them together.
+    let state = zecd
+        .call_wallet("late-arrival", "waitforsync", json!([60_000]))
+        .await
+        .expect("waitforsync on a caught-up member");
+    assert_eq!(
+        state["imported"],
+        json!(true),
+        "a caught-up member has its own account: {state:?}"
+    );
+    assert_eq!(state["synced"], json!(true), "{state:?}");
     assert_eq!(
         zec_to_zats(
             &zecd

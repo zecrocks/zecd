@@ -37,6 +37,7 @@ use crate::wallet::open::{data_db_path, open_read};
 /// are the actor's own maintenance reads (the rebroadcast set, the transparent spend-watch set),
 /// which must cover every account the actor scans for.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum AccountScope {
     /// Every account in the database. The pre-fleet behaviour, and what a wallet whose account
     /// does not exist yet (an encrypted wallet awaiting its first `walletpassphrase`, so the
@@ -47,6 +48,21 @@ pub enum AccountScope {
     Any,
     /// Exactly one account.
     Only(AccountUuid),
+    /// **No** account: every scoped read reports nothing.
+    ///
+    /// This is [`AccountScope::Any`]'s counterpart for the one case where "the account does not
+    /// exist yet" and "every account in this database" are not the same answer: a fleet shard
+    /// member that has been placed but whose viewing key has not been imported yet. Its
+    /// database is its shard's, holding its shard-mates' accounts, so answering `Any` there
+    /// reports *other wallets'* money and history under this wallet's name. A conventional
+    /// wallet awaiting its bootstrap keeps using `Any`, where the database holds no accounts at
+    /// all and the two are identical.
+    ///
+    /// It is a scope rather than an error because the wallet is legitimately servable in that
+    /// window - `createwallet` returns before the import runs, by design - and "nothing yet" is
+    /// the truthful answer to what it holds. `waitforsync`'s `imported` field is how a caller
+    /// tells that window from a wallet that really is empty.
+    NoAccount,
 }
 
 impl AccountScope {
@@ -61,6 +77,12 @@ impl AccountScope {
         match self {
             AccountScope::Any => None,
             AccountScope::Only(account) => Some(account.expose_uuid()),
+            // The nil UUID, which no account can carry: `AccountUuid`s are random v4s. Binding a
+            // non-NULL value that matches nothing is what lets `NoAccount` ride the same single
+            // SQL string as the other two variants - the predicates below are all
+            // `:scope_account IS NULL OR column = :scope_account`, so this fails the `IS NULL`
+            // arm and then compares unequal to every row.
+            AccountScope::NoAccount => Some(Uuid::nil()),
         }
     }
 
@@ -68,7 +90,14 @@ impl AccountScope {
     /// come from librustzcash's own API rather than SQL written here, so the filter is applied in
     /// Rust instead.
     fn excludes(&self, account: AccountUuid) -> bool {
-        matches!(self, AccountScope::Only(only) if *only != account)
+        // Written as an exhaustive match rather than a `matches!`, so that a variant added later
+        // is a compile error here instead of silently defaulting to "excludes nothing" - which
+        // for this predicate means leaking every account's rows into a scoped read.
+        match self {
+            AccountScope::Any => false,
+            AccountScope::Only(only) => *only != account,
+            AccountScope::NoAccount => true,
+        }
     }
 }
 
@@ -2389,6 +2418,19 @@ mod tests {
             super::mature_coinbase_zats(dir.path(), AccountScope::Any, target).unwrap(),
             9_001_000,
             "AccountScope::Any sums every account, as it always did"
+        );
+        // And `NoAccount` is the opposite of `Any` rather than a synonym for it: a wallet whose
+        // own account does not exist yet must not be handed its shard-mates' money. This is the
+        // whole point of the variant - `Any` in a shared database reports 9_001_000 zats under a
+        // wallet that owns none of it.
+        assert_eq!(
+            super::mature_coinbase_zats(dir.path(), AccountScope::NoAccount, target).unwrap(),
+            0,
+            "AccountScope::NoAccount reports no account's money"
+        );
+        assert_eq!(
+            super::immature_coinbase_zats(dir.path(), AccountScope::NoAccount, target).unwrap(),
+            0
         );
     }
 

@@ -1426,6 +1426,15 @@ struct PoolsFile {
 /// behavior on the corresponding [`Cli`] flags and do NOT apply here - a library caller sets
 /// the fields explicitly. `ZECD_DATADIR` still applies (it is resolved during resolution, not
 /// by clap).
+///
+/// Deliberately **not** `#[non_exhaustive]`, unlike the option structs elsewhere on the
+/// supported surface: that attribute forbids a struct literal outside this crate entirely, even
+/// with `..Default::default()`, so it would break every embedder rather than protect them. The
+/// contract is upheld by construction instead - fields only ever arrive, and always with a
+/// `Default` - so `ConfigOverrides { .., ..Default::default() }` stays source-compatible across
+/// versions. This mirrors the CLI's global flags one for one; a setting with no flag (the
+/// `[fleet]` section, `[sync] fetch_memos`, the `[pools]` knobs) is set on the resolved
+/// [`AppConfig`], whose fields are public for that reason.
 #[derive(Debug, Default, Clone)]
 pub struct ConfigOverrides {
     /// Path to the TOML config file (default: `<datadir>/zecd.toml`).
@@ -3565,6 +3574,33 @@ mod tests {
             let cfg = AppConfig::resolve(&cli).unwrap();
             assert_eq!(cfg.sync.fetch_memos, want, "config body: {body:?}");
         }
+    }
+
+    /// The **embedded** resolution path defaults `fetch_memos` on, exactly as the daemon's does.
+    ///
+    /// The test above goes through `resolve`, which is clap's path; an embedder calls
+    /// `resolve_overrides`, and `ConfigOverrides` carries no `fetch_memos` field at all (it
+    /// mirrors the CLI's global flags, and there is no such flag). So a library consumer that
+    /// ships no `zecd.toml` - which is the common case, and what `examples/embedded.rs` does -
+    /// reaches the default through a seam the clap test never exercises. Pinning it here is what
+    /// makes "memos are on unless you asked otherwise" true of the library and not just the
+    /// binary: the two share one `unwrap_or(true)`, and this is the assertion that fails if a
+    /// future refactor gives the embedded path a resolver of its own.
+    #[test]
+    fn embedded_resolution_defaults_fetch_memos_on() {
+        // A datadir of our own, so a `zecd.toml` sitting in the default location cannot answer
+        // for the default we are trying to observe.
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = AppConfig::resolve_overrides(&ConfigOverrides {
+            regtest: true,
+            datadir: Some(dir.path().to_path_buf()),
+            ..Default::default()
+        })
+        .expect("resolve with no config file");
+        assert!(
+            cfg.sync.fetch_memos,
+            "an embedded node with no config file must recover memos"
+        );
     }
 
     /// The multi-spender opt-in defaults off, parses both ways, and - the load-bearing half -

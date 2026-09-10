@@ -154,9 +154,17 @@ def main() -> int:
     ck("waitforsync returns the sync-state shape",
        isinstance(w, dict)
        and set(w) == {"hash", "height", "chain_tip", "synced",
-                      "pending_enhancements", "enhanced_through"}, w)
+                      "pending_enhancements", "enhanced_through", "imported"}, w)
     ck("waitforsync reports synced on a caught-up wallet", w["synced"] is True, w)
     ck("waitforsync drained backlog is 0", w["pending_enhancements"] == 0, w)
+    # `imported` says whether this wallet's own account exists in its database. A conventional
+    # wallet's does by the time it can be read at all; the field exists for fleet members, which
+    # are servable before their viewing key is imported and read empty until it is. `synced`
+    # folds it in, so this must be true wherever `synced` is.
+    ck("waitforsync reports a conventional wallet as imported", w["imported"] is True, w)
+    # `import_error` is emitted only when an import can never succeed, so a healthy wallet must
+    # not carry the key at all (the same only-when-it-applies rule as `fetch_memos`).
+    ck("waitforsync omits import_error on a healthy wallet", "import_error" not in w, w)
     # `height` is the scanned height and `chain_tip` is what it is measured against, which is
     # what lets a caller render progress without opening its own connection to the chain.
     # `synced` is exactly `scanned >= tip` (and is false while the tip is unknown), so on a
@@ -258,6 +266,9 @@ def main() -> int:
     # daemon is shielded-only, so it must be absent (the default response shape is unchanged). The
     # present-and-populated case is asserted by the regtest_transparent e2e.
     ck("getwalletinfo omits transparent block when disabled", "transparent" not in wi)
+    # Same only-when-it-applies rule: `import_error` names a fleet member whose viewing key the
+    # database refused, and must be absent on any wallet that is being served normally.
+    ck("getwalletinfo omits import_error on a healthy wallet", "import_error" not in wi, wi.keys())
     # `scanning` is Core's union: an object while scanning or draining the enhancement backlog,
     # literal False when idle. When it is an object it carries zecd's `pending_enhancements`
     # extension - the only route to the backlog count for a caller with no health server (an

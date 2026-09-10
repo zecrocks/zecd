@@ -816,6 +816,13 @@ pub(crate) fn getwalletinfo(state: &AppState, wallet: Option<&str>) -> Result<Va
     if !handle.fetch_memos {
         obj["fetch_memos"] = json!(false);
     }
+    // zecd extension, same only-when-it-applies convention: why this wallet will never get an
+    // account. Only a fleet member whose import was refused has one, and without it such a
+    // wallet is a healthy-looking zero balance forever. `waitforsync` carries the same field
+    // beside `imported`, which is where a caller polling for readiness meets it.
+    if let Some(reason) = st.import_errors.get(&handle.name) {
+        obj["import_error"] = json!(reason);
+    }
     // zecd extension: surface the transparent receiving configuration so an operator can audit
     // restore coverage (the `gap_limit` is how far past the last funded address a stateless
     // restore rescans the address index). Present only when transparent receiving is enabled, so

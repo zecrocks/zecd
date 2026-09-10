@@ -23,6 +23,7 @@ use zcash_protocol::{ShieldedPool, TxId};
 
 /// The chain tip as reported by the upstream. `hash` is in internal byte order (reverse of
 /// the familiar display hex); it may be empty if the upstream didn't report one.
+#[non_exhaustive]
 #[derive(Clone, Debug)]
 pub struct ChainTip {
     pub height: u64,
@@ -104,6 +105,7 @@ pub struct TransparentSpend {
 /// authoritative list of consensus rules this wallet must understand to scan that chain. All
 /// three are best-effort - an upstream that doesn't report them yields an empty list / `None`,
 /// which simply disables the detection (never an error).
+#[non_exhaustive]
 #[derive(Clone, Debug)]
 pub struct ServerInfo {
     pub chain_name: String,
@@ -120,6 +122,7 @@ pub struct ServerInfo {
 }
 
 /// One `getblockchaininfo.upgrades` entry, as the upstream reports it.
+#[non_exhaustive]
 #[derive(Clone, Debug)]
 pub struct UpgradeInfo {
     /// The upgrade's consensus branch ID (the map key, parsed from hex).
@@ -133,6 +136,7 @@ pub struct UpgradeInfo {
 }
 
 /// A `getblockchaininfo.upgrades` entry's `status`.
+#[non_exhaustive]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum UpgradeStatus {
     /// Announced with a future activation height.
@@ -511,9 +515,18 @@ impl MempoolStream {
 /// `Display`, so neither `{e}` nor `{e:?}` alone is enough - hence the explicit walk. Keep
 /// the match this narrow: a plain transport failure or an upstream refusal must surface to
 /// the caller rather than be retried in a loop that can never succeed.
+///
+/// **The initiator is what makes it narrow.** h2 renders a GOAWAY as
+/// `GoAway(<debug data>, <reason>, <initiator>)`, and `ENHANCE_YOUR_CALM` alone does not say who
+/// sent it: a *server* can send exactly that reason to shed load or rate-limit a client, and
+/// that is an upstream refusal, not this. Retrying it would reconnect into the same refusal for
+/// as long as the bound below allows. So the text must also name `Library` - h2 itself as the
+/// origin - which is precisely the case where the connection died over frames the client failed
+/// to poll and where resuming the range is the right answer.
 pub fn is_h2_load_shed(e: &anyhow::Error) -> bool {
     fn names_the_load_shed(text: &str) -> bool {
-        text.contains("too_many_data_frames") || text.contains("ENHANCE_YOUR_CALM")
+        (text.contains("too_many_data_frames") || text.contains("ENHANCE_YOUR_CALM"))
+            && text.contains("Library")
     }
     names_the_load_shed(&format!("{e:?}"))
         || e.chain()
@@ -659,11 +672,14 @@ mod tests {
         enum Initiator {
             #[allow(dead_code)]
             Library,
+            #[allow(dead_code)]
+            Remote,
         }
         struct HyperLike(H2Kind);
         impl std::fmt::Debug for HyperLike {
             fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-                // h2 spells the reason `ENHANCE_YOUR_CALM` in its own Debug output.
+                // h2 spells the reason `ENHANCE_YOUR_CALM` in its own Debug output, and the
+                // GOAWAY's third field is the initiator - `Library` for one h2 raised itself.
                 write!(
                     f,
                     "hyper::Error(Body, Error {{ kind: GoAway(b\"too_many_data_frames\", \
@@ -697,6 +713,24 @@ mod tests {
             "status: ResourceExhausted, source: Some(GoAway(b\"too_many_data_frames\", \
              ENHANCE_YOUR_CALM, Library))"
         )));
+    }
+
+    /// The same reason from the **server** is an upstream refusal, not a client-side load shed.
+    /// Retrying it reconnects straight back into whatever made the server shed us, so it has to
+    /// surface - which is what the `Library` half of the predicate is for, and it is the one
+    /// case the reason string alone cannot distinguish.
+    #[test]
+    fn a_server_sent_enhance_your_calm_is_not_a_load_shed() {
+        for remote in [
+            "status: ResourceExhausted, source: Some(GoAway(b\"\", ENHANCE_YOUR_CALM, Remote))",
+            "hyper::Error(Body, Error { kind: GoAway(b\"slow down\", ENHANCE_YOUR_CALM, \
+             Remote) })",
+        ] {
+            assert!(
+                !is_h2_load_shed(&anyhow::anyhow!("{remote}")),
+                "a server-initiated GOAWAY must surface: {remote}"
+            );
+        }
     }
 
     /// The retry loop must never swallow an error that reconnecting cannot fix: those have to

@@ -900,6 +900,16 @@ struct WalletActor {
     /// Shard members whose account does not exist yet. Importing one needs the tree state at its
     /// birthday, so it waits for a connected sync pass - the same shape as `pending_bootstrap`.
     shard_pending: Vec<shard::ShardMember>,
+    /// Shard members dropped from `shard_pending` because their import can never succeed (a
+    /// birthday no tree state can serve, or a database refusal), keyed by wallet name.
+    ///
+    /// Published on [`SyncStatus`] so `waitforsync` and `getwalletinfo` can report *why* a
+    /// wallet is being served but holds nothing. Without it such a member is indistinguishable
+    /// from one still queued: both have no account, so both read empty, and a caller waiting for
+    /// the import to land would wait forever on an error only the log carries. An entry is
+    /// cleared when the same name is queued again, which is what makes `loadwallet` a retry
+    /// after the manifest is fixed.
+    shard_import_errors: Arc<BTreeMap<String, String>>,
     /// When `Some`, the account must be (re)created from `keys.toml` at this birthday height once
     /// the seed is available and an upstream is connected. `None` once an account exists.
     pending_bootstrap: Option<(BlockHeight, BootstrapKey)>,
@@ -1445,6 +1455,7 @@ async fn spawn_inner(
         is_shard,
         shard_accounts: Arc::new(shard_accounts),
         shard_pending,
+        shard_import_errors: Arc::new(BTreeMap::new()),
         pending_bootstrap,
         db_data,
         db_cache,
@@ -1511,6 +1522,7 @@ async fn spawn_inner(
                 cfg.transparent_default,
                 cfg.transparent_gap_limit,
                 cfg.fetch_memos,
+                is_shard,
                 first_seen.clone(),
                 handle_seed.clone(),
                 cmd_tx.clone(),
@@ -3861,7 +3873,10 @@ impl WalletActor {
     /// is nowhere for a foreign viewing key to go. Refused for a name the shard already serves,
     /// which would otherwise queue a second account under it.
     fn add_shard_member(&mut self, member: shard::ShardMember) -> Result<(), RpcError> {
-        if self.shard_accounts.is_empty() && self.shard_pending.is_empty() {
+        // Asked of `is_shard` rather than of the member maps: a shard whose only member was
+        // dropped for a bad manifest has both of them empty, and inferring from that would make
+        // the shard refuse the very re-queue that fixing the manifest is supposed to perform.
+        if !self.is_shard {
             return Err(RpcError::wallet(
                 "this wallet is not a fleet shard; view wallets are onboarded into the fleet"
                     .to_string(),
@@ -3876,8 +3891,33 @@ impl WalletActor {
             )));
         }
         info!(wallet = %member.name, "queued a view wallet for import into this shard");
+        // Queuing it again is the retry, so any recorded failure stops being the current answer.
+        self.clear_shard_import_error(&member.name);
         self.shard_pending.push(member);
         Ok(())
+    }
+
+    /// Record why `name`'s import can never succeed, and publish it (see
+    /// [`WalletActor::shard_import_errors`]).
+    fn record_shard_import_error(&mut self, name: &str, reason: String) {
+        let mut errors = (*self.shard_import_errors).clone();
+        errors.insert(name.to_string(), reason);
+        self.shard_import_errors = Arc::new(errors);
+        self.update_status();
+    }
+
+    /// Forget a recorded import failure for `name`, if there is one, and publish that.
+    ///
+    /// Publishing here is load-bearing rather than tidy: `waitforsync` returns *immediately* on a
+    /// recorded error instead of waiting, so a stale one would make the retry this clearing
+    /// represents look like it had failed again, for as long as it took the next pass to publish.
+    fn clear_shard_import_error(&mut self, name: &str) {
+        if self.shard_import_errors.contains_key(name) {
+            let mut errors = (*self.shard_import_errors).clone();
+            errors.remove(name);
+            self.shard_import_errors = Arc::new(errors);
+            self.update_status();
+        }
     }
 
     /// Import each shard member that has no account yet, one per pass.
@@ -3945,9 +3985,16 @@ impl WalletActor {
                         wallet = %member.name,
                         "shard import: could not derive an account birthday from the tree state \
                          at {prior}: {e}. Dropping this wallet from the shard - fix its manifest \
-                         birthday and restart."
+                         birthday, then loadwallet it again (or restart)."
                     );
                     self.shard_pending.remove(0);
+                    self.record_shard_import_error(
+                        &member.name,
+                        format!(
+                            "could not derive an account birthday from the tree state at \
+                             {prior}: {e}"
+                        ),
+                    );
                     return;
                 }
             };
@@ -3974,9 +4021,11 @@ impl WalletActor {
                 error!(
                     wallet = %member.name,
                     "shard import failed: {e}. Dropping this wallet from the shard - it would \
-                     fail identically on every retry. Fix its manifest entry and restart."
+                     fail identically on every retry. Fix its manifest entry, then loadwallet it \
+                     again (or restart)."
                 );
                 self.shard_pending.remove(0);
+                self.record_shard_import_error(&member.name, format!("{e:#}"));
             }
         }
     }
@@ -4295,6 +4344,7 @@ impl WalletActor {
             enhanced_through,
             encrypted: self.encrypted,
             accounts: self.published_accounts(),
+            import_errors: Arc::clone(&self.shard_import_errors),
             watch_only: self.watch_only,
             unlocked_until,
             transparent_frontier: self.transparent_frontier,

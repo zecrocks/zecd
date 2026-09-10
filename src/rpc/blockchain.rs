@@ -362,6 +362,13 @@ pub(crate) async fn waitforblockheight(
 /// current state with `synced: false`, so a caller branches on the field rather than catching.
 /// That boolean is load-bearing - without it "the wait gave up" and "the wallet is ready" would
 /// be told apart only by re-deriving the predicate from the other fields.
+///
+/// Two fields exist for the fleet, where a wallet is servable before it has an account (see
+/// [`crate::fleet`]). `imported` says whether this wallet's own account exists in its database;
+/// until it does, the wallet reads empty however far its shard has scanned, so `synced` is false
+/// regardless of the scan. `import_error` appears when that import failed in a way retrying
+/// cannot fix, and the call returns immediately rather than waiting out a timeout it can never
+/// satisfy. Both are `true`/absent for a conventional wallet.
 pub(crate) async fn waitforsync(
     state: &AppState,
     wallet: Option<&str>,
@@ -381,10 +388,18 @@ pub(crate) async fn waitforsync(
         // the wait below instead of being missed (as in `wait_for_best_block`).
         drop(status.borrow_and_update());
         let st = handle.status();
-        let synced = !st.scanning && st.pending_enhancements == 0;
+        // Both read from the snapshot taken above rather than through the handle, so every field
+        // of one answer describes one instant.
+        let imported = st.accounts.contains_key(&handle.name);
+        let import_error = st.import_errors.get(&handle.name).cloned();
+        // A wallet with no account of its own has scanned nothing *for itself*, however far its
+        // database has scanned - which for a fleet shard member is as far as its shard-mates
+        // have got. Folding it into `synced` is what keeps the field meaning "history and memos
+        // are complete as of `height`" for a member as well as for a conventional wallet.
+        let synced = imported && !st.scanning && st.pending_enhancements == 0;
         let answer = || {
             let (height, hash, _) = best_block(state, wallet)?;
-            Ok(json!({
+            let mut out = json!({
                 "hash": hash.unwrap_or_default(),
                 "height": height,
                 // The upstream's tip, so a caller can render "scanned H of TIP" without opening
@@ -395,9 +410,23 @@ pub(crate) async fn waitforsync(
                 "synced": synced,
                 "pending_enhancements": st.pending_enhancements,
                 "enhanced_through": st.enhanced_through,
-            }))
+                // zecd extension: whether this wallet's own account exists in its database yet.
+                // Always true for a conventional wallet by the time it can be read; the case it
+                // exists for is a fleet member that has been onboarded but not yet imported,
+                // where every read is legitimately empty and `synced` alone would not say why.
+                "imported": imported,
+            });
+            if let Some(reason) = &import_error {
+                out["import_error"] = json!(reason);
+            }
+            Ok(out)
         };
         if synced {
+            return answer();
+        }
+        // A recorded import failure is terminal: this wallet cannot become synced, so waiting out
+        // the timeout would only delay the answer that already exists.
+        if import_error.is_some() {
             return answer();
         }
         let now = Instant::now();

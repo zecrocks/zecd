@@ -507,6 +507,14 @@ async fn embedded_node_send_pays_a_funded_duplicate_recipient_batch() {
     .await
     .expect("init_wallet restores the funded wallet");
 
+    // The engine directory the config layer computes for this wallet, captured before the config
+    // is handed to the builder - `wallet_location` must agree with it (asserted below).
+    let configured_engine_dir = config
+        .wallets
+        .get("default")
+        .expect("the default wallet is configured")
+        .engine_dir();
+
     let node = zecd::node::NodeBuilder::new(config)
         .start()
         .await
@@ -517,6 +525,28 @@ async fn embedded_node_send_pays_a_funded_duplicate_recipient_batch() {
     //    fully readable - the barrier this crate added for exactly this question.
     let synced = c.wait_for_sync(Some(180_000)).await.expect("waitforsync");
     assert!(synced.synced, "wallet never caught up: {synced:?}");
+    assert_eq!(
+        synced.imported,
+        Some(true),
+        "a conventional wallet's account exists by the time it is synced: {synced:?}"
+    );
+
+    // The other half of reading a wallet directly: where its database is, and which account in
+    // it. For a configured wallet this must be the path the config helper computes - the two are
+    // separate code paths and an embedder mixing them would read the wrong directory.
+    let location = node
+        .wallet_location(None)
+        .expect("the default wallet is loaded");
+    assert_eq!(
+        location.engine_dir, configured_engine_dir,
+        "wallet_location must agree with config::WalletEntry::engine_dir for a configured wallet"
+    );
+    let account = location.account.expect("a synced wallet has an account");
+    assert_eq!(
+        location.scope,
+        zecd::wallet::read::AccountScope::Only(account),
+        "an existing account scopes to itself: {location:?}"
+    );
 
     let spendable = c.get_balance(None).await.expect("getbalance").zatoshis();
     assert!(

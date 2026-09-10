@@ -25,6 +25,15 @@
 //!   order its results are in - `(mined_height, txid)`, with outputs in `(pool, output_index)`
 //!   order - which is what a consumer replaying wallet history as a log needs in order to
 //!   paginate and resume deterministically.
+//! - [`node::Node::wallet_location`] + [`node::WalletLocation`] - where a **loaded** wallet's
+//!   database is and which account in it is that wallet's
+//!   ([`wallet::read::AccountScope`], which every [`wallet::read`] query takes). The config
+//!   helpers below answer the same question for a configured `[wallets.<name>]` entry, but a
+//!   fleet member has no such entry - its account lives in a shard database shared with other
+//!   wallets - so this is the only route to one. The scope is reported rather than derived from
+//!   the account because a wallet with no account yet scopes two different ways: to every
+//!   account for a conventional wallet, whose database holds none, and to no account for a fleet
+//!   member awaiting import, whose database holds its shard-mates'.
 //! - [`config::engine_dir`] and [`config::WalletEntry::engine_dir`] - the only supported way to
 //!   compute the `engine_dir` path that [`wallet::read`] takes. A wallet's librustzcash files
 //!   live in a per-coin engine subdirectory of its wallet directory, and nothing outside these
@@ -115,6 +124,13 @@
 //! uphold (datadir lock, binding verification, the single-spending-wallet rule) and which a
 //! direct caller would have to re-uphold by hand.
 //!
+//! Configuration defaults are the same for an embedded node as for the daemon, because both
+//! resolve through one function ([`config::AppConfig::resolve_overrides`] is `resolve`'s body
+//! without clap). Worth stating for one of them, since it decides how much work a wallet does:
+//! `[sync] fetch_memos` is **on**, so an embedded node recovers memos, and the only ways off are
+//! the config key or assigning [`config::SyncConfig::fetch_memos`] on the resolved config -
+//! [`config::ConfigOverrides`] has no such field.
+//!
 //! Supported items keep their names and semantics; they may gain fields and variants, so match
 //! non-exhaustively and construct option structs with `..Default::default()`. One caveat
 //! inherent to this surface: [`node::Node::send`] takes a `zip321::TransactionRequest` and
@@ -159,6 +175,9 @@
 // are `node::Node::send`'s parameter and return types.
 pub use zcash_protocol::TxId;
 pub use zip321;
+// `AccountUuid` identifies an account within a wallet database; it appears on
+// `node::WalletLocation` and in `wallet::read::AccountScope`.
+pub use zcash_client_sqlite::AccountUuid;
 
 pub mod address;
 pub mod amount;
