@@ -58,14 +58,17 @@ no label store), so the whole data directory is disposable: with the mnemonic (a
 can recreate everything via `zecd init --restore`.
 
 > **One exception, and only with the experimental fleet enabled.** `[fleet] enabled = true` adds
-> a manifest directory (`wallets.d/` by default) holding one file per watched wallet, each
+> a manifest directory (`<datadir>/fleet/zec/wallets.d/` by default) holding one file per
+> watched wallet, each
 > carrying a **viewing key that exists nowhere else in zecd**. It is operator-supplied key
 > material in the same class as `keys.toml`, not a cache - nothing on the chain can rebuild it -
 > and unlike `keys.toml` it is *written at runtime*, every time `createwallet` onboards a wallet.
 > So with a fleet, "the whole data directory is disposable" is no longer true: back up
-> `wallets.d/` on the same footing as `keys.toml`, and back it up continuously rather than once.
+> that directory on the same footing as `keys.toml`, and back it up continuously rather than
+> once.
 > Losing it means those wallets silently stop being watched, with nothing in the daemon to say
-> which ones went missing. The shard databases under `fleet/` *are* ordinary caches, rebuilt from
+> which ones went missing. The shard databases under `fleet/zec/shards/` *are* ordinary caches,
+> rebuilt from
 > the manifests plus the chain. If the viewing keys also live in a system upstream of zecd (the
 > usual arrangement for a service that watches keys on someone's behalf), that system is your
 > real backup and the manifest directory can be regenerated from it - but nothing in zecd
@@ -84,7 +87,21 @@ A running wallet's data directory holds the daemon-level files (`zecd.toml`, `.l
   default/
     keys.toml
     zec/lrz/    data.sqlite  blockmeta.sqlite  blocks/
+  fleet/                                  # experimental fleet only
+    zec/
+      wallets.d/  <name>.toml
+      shards/     shard-0000/lrz/  ...
 ```
+
+The fleet is one subtree, and inside it everything is coin-scoped: a manifest holds a UFVK,
+which - unlike the mnemonic in `keys.toml` - serves exactly one currency, and which shard a
+wallet lands in is decided by its birthday, a height on one chain. The fleet is the outer unit
+and the coin sits inside it, the same shape as `<datadir>/<wallet>/<coin>/`.
+
+Because a wallet's directory is `<datadir>/<name>`, the name `fleet` is effectively reserved: a
+`[wallets.fleet]` entry would resolve to the fleet's own tree, and zecd refuses to start rather
+than let two owners share it (a warning from `zecd config check` while `[fleet] enabled` is
+false, an error once it is true).
 
 | Path | Role | Ship it? |
 |---|---|---|
@@ -93,8 +110,8 @@ A running wallet's data directory holds the daemon-level files (`zecd.toml`, `.l
 | `<dir>/zec/lrz/data.sqlite` (+ `-wal`/`-shm`) | Wallet state: the account plus scan progress, balances, and tx history. A **cache** - rebuilt from `keys.toml` + a rescan when absent (see bootstrap below). | No (disposable). |
 | `<dir>/zec/lrz/blocks/` | **Cache** - downloaded compact blocks. **Never ship this** - it can grow large and is fully re-derivable. | No. |
 | `<datadir>/.cookie` | Ephemeral RPC cookie, minted at startup and removed on clean shutdown. | No. |
-| `<datadir>/wallets.d/` | **Secret**, and only with the experimental `[fleet] enabled = true` - one manifest per watched wallet, each holding a viewing key held nowhere else. Written at runtime by `createwallet`. See the note above. | Yes - back up continuously. |
-| `<datadir>/fleet/` | **Cache** - the shard databases, rebuilt from `wallets.d/` plus the chain. Experimental fleet only. | No (disposable). |
+| `<datadir>/fleet/zec/wallets.d/` | **Secret**, and only with the experimental `[fleet] enabled = true` - one manifest per watched wallet, each holding a viewing key held nowhere else. Written at runtime by `createwallet`. See the note above. | Yes - back up continuously. |
+| `<datadir>/fleet/zec/shards/` | **Cache** - the shard databases (each under a `shard-NNNN/lrz/`), rebuilt from the sibling `wallets.d/` plus the chain. Experimental fleet only. | No (disposable). |
 
 For a cloud deployment: put `keys.toml` (and `identity.txt`, if used) in a read-only Secret
 and point `ZECD_KEYS_FILE` / `ZECD_AGE_IDENTITY` at the mount. `blocks/` is always disposable -

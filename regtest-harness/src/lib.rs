@@ -2074,7 +2074,7 @@ pub struct ZecdConfig {
     /// spend-search backlog transiently rises.
     pub readiness: Option<String>,
     /// View wallets the daemon monitors as a **fleet**: each becomes a manifest under
-    /// `<datadir>/wallets.d/`, and the daemon groups them into shard databases that scan once for
+    /// `<datadir>/fleet/zec/wallets.d/`, and the daemon groups them into shard databases that scan once for
     /// all of their accounts. Empty (the default) writes no manifests and no `[fleet]` section,
     /// so the daemon behaves exactly as it always has.
     pub fleet: Vec<ViewWallet>,
@@ -2246,7 +2246,10 @@ impl Zecd {
         // Fleet manifests, before the daemon starts: one small TOML per view wallet, which is
         // all a monitored wallet is (a name, a viewing key, a birthday).
         if !cfg.fleet.is_empty() {
-            let manifest_dir = datadir.path().join("wallets.d");
+            // The fleet's default paths sit under its own coin directory, like the wallet
+            // data - so provision where the daemon will actually look, rather than relying on
+            // the one-time layout migration to move them.
+            let manifest_dir = datadir.path().join("fleet").join("zec").join("wallets.d");
             std::fs::create_dir_all(&manifest_dir).context("create the fleet manifest dir")?;
             for wallet in &cfg.fleet {
                 std::fs::write(

@@ -126,6 +126,21 @@ fn check_fleet(config: &AppConfig, findings: &mut Vec<Finding>) {
     };
 
     if !config.fleet.enabled {
+        // Latent, because `resolve` only refuses this when the fleet actually runs: switching
+        // `enabled` on would then make the daemon refuse to start, which is worth knowing before
+        // the flip rather than after it.
+        if let Some((name, wallet_path, fleet_path)) =
+            crate::config::fleet_path_conflict(&config.wallets, &config.fleet)
+        {
+            findings.push(Finding::warning(format!(
+                "wallet '{name}' has its data directory at {}, which overlaps the fleet's {}. \
+                 Harmless while [fleet] enabled is false - those paths are never read - but \
+                 setting it true would make zecd refuse to start. Rename the wallet, or point \
+                 [wallets.{name}] dir (or the [fleet] manifest_dir/dir) somewhere else",
+                wallet_path.display(),
+                fleet_path.display(),
+            )));
+        }
         if manifests > 0 {
             findings.push(Finding::warning(format!(
                 "{manifests} fleet manifest(s) in {} are not being served: [fleet] enabled is \
@@ -675,9 +690,10 @@ mod tests {
     #[test]
     fn manifests_with_the_fleet_disabled_are_reported() {
         let dir = tempfile::tempdir().unwrap();
-        std::fs::create_dir_all(dir.path().join("wallets.d")).unwrap();
+        let manifests = dir.path().join("fleet").join("zec").join("wallets.d");
+        std::fs::create_dir_all(&manifests).unwrap();
         std::fs::write(
-            dir.path().join("wallets.d").join("w1.toml"),
+            manifests.join("w1.toml"),
             "ufvk = \"uview1a\"\nbirthday = 100\n",
         )
         .unwrap();

@@ -49,20 +49,109 @@ pub fn wallet_dir(datadir: &Path, name: &str) -> PathBuf {
     datadir.join(name)
 }
 
-/// Where `coin`'s state lives inside a wallet directory: `<wallet dir>/zec` for Zcash
-/// ([`Coin::data_dir`]).
+/// Where `coin`'s state lives inside `parent`: `<parent>/zec` for Zcash ([`Coin::data_dir`]).
 ///
-/// The seed in `keys.toml` serves every coin, so the coin sits *inside* the wallet rather than
-/// above it: one wallet, one seed, one subdirectory per coin underneath.
-pub fn coin_dir(wallet_dir: &Path, coin: Coin) -> PathBuf {
-    wallet_dir.join(coin.data_dir())
+/// `parent` is a wallet directory for a configured wallet, and the fleet root ([`fleet_root`])
+/// for the fleet. Either way the coin sits one level inside the unit that owns it, never above
+/// it: a wallet's `keys.toml` wraps a BIP-39 seed that serves every coin and so must sit above
+/// the per-coin directories, and the fleet keeps the same shape for a different reason - see
+/// [`fleet_root`].
+pub fn coin_dir(parent: &Path, coin: Coin) -> PathBuf {
+    parent.join(coin.data_dir())
+}
+
+/// The fleet's root: `<datadir>/fleet`, holding one coin directory
+/// ([`fleet_coin_dir`]) and nothing else.
+///
+/// The fleet is the outer unit and the coin sits inside it, mirroring
+/// `<datadir>/<wallet>/<coin>/` - so a datadir's top level is a list of *units* (wallets, plus
+/// the fleet) rather than a mix of units and currencies. That ordering also keeps the reserved
+/// names down to one: `wallet_dir` is `datadir.join(name)`, so anything zecd puts at the datadir
+/// root is a name a `[wallets.<name>]` entry could claim. One reserved `fleet` is checkable
+/// ([`fleet_path_conflict`]); a reserved name per coin token would mean a wallet called `zec`
+/// silently sharing a directory with the fleet.
+///
+/// Everything below is coin-scoped for the fleet's own reasons - see [`fleet_manifest_dir`] and
+/// [`fleet_dir`].
+pub fn fleet_root(datadir: &Path) -> PathBuf {
+    datadir.join(DEFAULT_FLEET_ROOT)
+}
+
+/// Where `coin`'s fleet state lives: `<datadir>/fleet/zec` for Zcash.
+pub fn fleet_coin_dir(datadir: &Path, coin: Coin) -> PathBuf {
+    coin_dir(&fleet_root(datadir), coin)
+}
+
+/// Where the fleet's wallet manifests live by default: `<datadir>/fleet/zec/wallets.d`.
+///
+/// Coin-scoped, unlike `keys.toml`, because a manifest holds a **UFVK** and a UFVK is not the
+/// cross-coin secret a mnemonic is: "unified" there means unified across Zcash's shielded pools,
+/// not across currencies, and no other coin's viewing key can be derived from one. A second coin
+/// therefore gets a sibling manifest directory with its own wallets, not a share of this one.
+///
+/// It is named under the fleet rather than beside it because `<datadir>/<wallet>/` directories
+/// are wallets too: at the datadir root, `wallets.d` would read as zecd's wallets in general
+/// rather than the fleet's.
+///
+/// A `[fleet] manifest_dir` override replaces this outright, exactly as `[wallets.<name>] dir`
+/// does for a wallet.
+pub fn fleet_manifest_dir(datadir: &Path, coin: Coin) -> PathBuf {
+    fleet_coin_dir(datadir, coin).join(DEFAULT_FLEET_MANIFEST_DIR)
+}
+
+/// Where the fleet's shard databases live by default: `<datadir>/fleet/zec/shards`, holding one
+/// `shard-NNNN/` directory per shard.
+///
+/// The coin sits **above** the shard index rather than below it. A shard is a scan domain, and
+/// which shard a wallet lands in is decided by its birthday - a block height on one chain - so
+/// `shard-0000` is a per-coin membership decision. Nesting the coin inside the shard would claim
+/// that shard numbering means the same thing on every chain, which it cannot.
+///
+/// The `shards` level of its own keeps that numbered namespace clean:
+/// [`crate::fleet::existing_shard_dirs`] enumerates `shard-NNNN` by pattern from index 0, so the
+/// series must not share a parent with a named directory like `wallets.d`.
+pub fn fleet_dir(datadir: &Path, coin: Coin) -> PathBuf {
+    fleet_coin_dir(datadir, coin).join(DEFAULT_FLEET_SHARD_DIR)
+}
+
+/// Where a shard's engine files live: `<shard dir>/lrz` for Zcash ([`Coin::engine_dir`]).
+///
+/// The coin level is already above the shards directory ([`fleet_dir`]), so a shard directory
+/// takes only the engine level - which it takes for the same reason a wallet does: what
+/// librustzcash owns stays separable from zecd's own shard-index namespace, so replacing the
+/// storage library is a sibling directory and a rescan.
+pub fn shard_engine_dir(shard_dir: &Path, coin: Coin) -> PathBuf {
+    shard_dir.join(coin.engine_dir())
+}
+
+/// The first wallet whose directory overlaps one of the fleet's, with the two paths.
+///
+/// `wallet_dir` is `datadir.join(name)`, so a wallet named after anything zecd puts at the
+/// datadir root claims that path - a wallet called `fleet` resolves to [`fleet_root`] itself.
+/// Nothing would be *overwritten* (the fleet's files sit deeper), but one directory would hold
+/// two owners' state, `zecd rescan` on that wallet would delete through it, and a backup scoped
+/// to the wallet would silently carry viewing keys. An explicit `[wallets.<name>] dir` or a
+/// `[fleet]` override can produce the same overlap from either side, so the test is containment
+/// in both directions rather than a reserved-name list.
+pub fn fleet_path_conflict(
+    wallets: &BTreeMap<String, WalletEntry>,
+    fleet: &FleetConfig,
+) -> Option<(String, PathBuf, PathBuf)> {
+    for (name, entry) in wallets {
+        for fleet_path in [&fleet.manifest_dir, &fleet.dir] {
+            if fleet_path.starts_with(&entry.dir) || entry.dir.starts_with(fleet_path) {
+                return Some((name.clone(), entry.dir.clone(), fleet_path.clone()));
+            }
+        }
+    }
+    None
 }
 
 /// Where the wallet-storage engine's own files live: `<wallet dir>/zec/lrz` for Zcash, holding
 /// everything librustzcash owns - `data.sqlite`, `blockmeta.sqlite`, `blocks/`
 /// ([`Coin::engine_dir`]).
 ///
-/// Nothing outside these three functions and [`crate::migrate`] should join a coin or engine
+/// Nothing outside these functions and [`crate::migrate`] should join a coin or engine
 /// directory name onto a path: callers take a wallet directory from [`WalletEntry::dir`] and an
 /// engine directory from [`WalletEntry::engine_dir`].
 pub fn engine_dir(wallet_dir: &Path, coin: Coin) -> PathBuf {
@@ -131,10 +220,12 @@ pub struct AppConfig {
     pub fleet: FleetConfig,
 }
 
-/// Where the fleet's wallet manifests live, relative to the datadir.
+/// The fleet's root directory, relative to the datadir ([`fleet_root`]).
+pub const DEFAULT_FLEET_ROOT: &str = "fleet";
+/// The fleet's manifest directory, relative to its coin directory ([`fleet_manifest_dir`]).
 pub const DEFAULT_FLEET_MANIFEST_DIR: &str = "wallets.d";
-/// Where the fleet's shard databases live, relative to the datadir.
-pub const DEFAULT_FLEET_DIR: &str = "fleet";
+/// The fleet's shard-database directory, relative to its coin directory ([`fleet_dir`]).
+pub const DEFAULT_FLEET_SHARD_DIR: &str = "shards";
 /// Accounts per shard database.
 ///
 /// Sharding buys nothing in trial-decryption cost - that is the sum over viewing keys however
@@ -173,9 +264,20 @@ pub struct FleetConfig {
     /// datadir should not enrol a daemon into it.
     pub enabled: bool,
     /// Directory of per-wallet manifests, one small TOML each (absolute after resolution).
+    ///
+    /// Defaults to [`fleet_manifest_dir`] - under the fleet's own *coin* directory, since a
+    /// manifest holds a coin-specific viewing key.
     pub manifest_dir: PathBuf,
-    /// Directory holding the shard databases (absolute after resolution).
+    /// Directory holding the `shard-NNNN/` databases (absolute after resolution).
+    ///
+    /// Defaults to [`fleet_dir`], the sibling of the manifest directory under the same coin.
     pub dir: PathBuf,
+    /// The coin this fleet's wallets are watched on.
+    ///
+    /// Not a config key (nothing in `zecd.toml` selects it and `config show` renders nothing for
+    /// it), exactly like [`WalletEntry::coin`]: it is carried so the shard directories can be
+    /// laid out without the fleet code naming a currency itself.
+    pub coin: Coin,
     /// Accounts per shard - see [`DEFAULT_FLEET_SHARD_SIZE`].
     pub shard_size: usize,
     /// Cohort depth for placement - see [`DEFAULT_FLEET_COHORT_DEPTH`].
@@ -186,8 +288,9 @@ impl Default for FleetConfig {
     fn default() -> Self {
         FleetConfig {
             enabled: false,
-            manifest_dir: PathBuf::from(DEFAULT_FLEET_MANIFEST_DIR),
-            dir: PathBuf::from(DEFAULT_FLEET_DIR),
+            manifest_dir: fleet_manifest_dir(Path::new(""), Coin::Zcash),
+            dir: fleet_dir(Path::new(""), Coin::Zcash),
+            coin: Coin::Zcash,
             shard_size: DEFAULT_FLEET_SHARD_SIZE,
             cohort_depth: DEFAULT_FLEET_COHORT_DEPTH,
         }
@@ -2225,16 +2328,21 @@ impl AppConfig {
             shard_size: None,
             cohort_depth: None,
         });
+        // The fleet is Zcash's, like every wallet this build serves. Both defaults sit under the
+        // datadir's coin directory; an override is taken verbatim, so an operator's path keeps
+        // its meaning exactly as a `[wallets.<name>] dir` does.
+        let fleet_coin = Coin::Zcash;
         let fleet = FleetConfig {
             enabled: fleet_file.enabled.unwrap_or(false),
             manifest_dir: fleet_file
                 .manifest_dir
                 .map(|p| datadir.join(p))
-                .unwrap_or_else(|| datadir.join(DEFAULT_FLEET_MANIFEST_DIR)),
+                .unwrap_or_else(|| fleet_manifest_dir(&datadir, fleet_coin)),
             dir: fleet_file
                 .dir
                 .map(|p| datadir.join(p))
-                .unwrap_or_else(|| datadir.join(DEFAULT_FLEET_DIR)),
+                .unwrap_or_else(|| fleet_dir(&datadir, fleet_coin)),
+            coin: fleet_coin,
             shard_size: fleet_file.shard_size.unwrap_or(DEFAULT_FLEET_SHARD_SIZE),
             cohort_depth: fleet_file
                 .cohort_depth
@@ -2243,6 +2351,22 @@ impl AppConfig {
         // A shard is a scan domain: zero accounts per shard would mean no wallet is ever placed.
         if fleet.shard_size == 0 {
             anyhow::bail!("[fleet] shard_size must be at least 1");
+        }
+        // A wallet directory that overlaps one of the fleet's would put two owners' state in one
+        // tree - see `fleet_path_conflict`. Refused only when the fleet actually runs: with
+        // `[fleet] enabled` false nothing reads or writes those paths, so a deployment that has
+        // long had a wallet called `fleet` keeps starting, and `zecd config check` reports the
+        // latent overlap as a warning instead.
+        if fleet.enabled {
+            if let Some((name, wallet_path, fleet_path)) = fleet_path_conflict(&wallets, &fleet) {
+                anyhow::bail!(
+                    "wallet '{name}' has its data directory at {}, which overlaps the fleet's \
+                     {}. Rename the wallet, or point [wallets.{name}] dir (or the [fleet] \
+                     manifest_dir/dir) somewhere else",
+                    wallet_path.display(),
+                    fleet_path.display(),
+                );
+            }
         }
 
         let log_file = file.log.unwrap_or(LogFile {
@@ -3955,5 +4079,84 @@ mod tests {
             .expect("deploy/zecd.toml");
         toml::from_str::<ConfigFile>(include_str!("../deploy/zecd.mainnet.toml"))
             .expect("deploy/zecd.mainnet.toml");
+    }
+
+    /// `wallet_dir` is `datadir.join(name)`, so a wallet named after the fleet root claims it.
+    /// Nothing is overwritten - the fleet's own files sit deeper - which is exactly why this
+    /// needs catching: two owners would share a tree, `zecd rescan` on the wallet would delete
+    /// through it, and a backup scoped to the wallet would quietly carry viewing keys.
+    #[test]
+    fn a_wallet_named_after_the_fleet_root_is_refused_when_the_fleet_runs() {
+        let dir = tempfile::tempdir().unwrap();
+        let conf = dir.path().join("zecd.toml");
+        std::fs::write(
+            &conf,
+            format!(
+                "network = \"test\"\ndatadir = {:?}\n[wallets.fleet]\n[fleet]\nenabled = true\n",
+                dir.path()
+            ),
+        )
+        .unwrap();
+
+        let err = AppConfig::resolve_overrides(&ConfigOverrides {
+            conf: Some(conf),
+            ..Default::default()
+        })
+        .expect_err("a wallet directory holding the fleet's own tree is refused");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("wallet 'fleet'"), "names the wallet: {msg}");
+        assert!(msg.contains("overlaps the fleet"), "names the clash: {msg}");
+    }
+
+    /// The same config starts fine with the fleet off, because nothing then reads or writes
+    /// those paths - a deployment that has long had a wallet called `fleet` keeps working, and
+    /// `config check` reports the latent overlap instead.
+    #[test]
+    fn a_wallet_named_after_the_fleet_root_is_allowed_while_the_fleet_is_off() {
+        let dir = tempfile::tempdir().unwrap();
+        let conf = dir.path().join("zecd.toml");
+        std::fs::write(
+            &conf,
+            format!(
+                "network = \"test\"\ndatadir = {:?}\n[wallets.fleet]\n",
+                dir.path()
+            ),
+        )
+        .unwrap();
+
+        let config = AppConfig::resolve_overrides(&ConfigOverrides {
+            conf: Some(conf),
+            ..Default::default()
+        })
+        .expect("resolves with the fleet disabled");
+        assert!(!config.fleet.enabled);
+        assert!(fleet_path_conflict(&config.wallets, &config.fleet).is_some());
+    }
+
+    /// The ordinary shape: a wallet beside the fleet, sharing only the data directory itself.
+    #[test]
+    fn an_ordinary_wallet_does_not_overlap_the_fleet() {
+        let dir = tempfile::tempdir().unwrap();
+        let conf = dir.path().join("zecd.toml");
+        std::fs::write(
+            &conf,
+            format!(
+                "network = \"test\"\ndatadir = {:?}\n[wallets.default]\n[fleet]\nenabled = true\n",
+                dir.path()
+            ),
+        )
+        .unwrap();
+
+        let config = AppConfig::resolve_overrides(&ConfigOverrides {
+            conf: Some(conf),
+            ..Default::default()
+        })
+        .expect("resolves");
+        assert_eq!(
+            config.fleet.manifest_dir,
+            dir.path().join("fleet/zec/wallets.d")
+        );
+        assert_eq!(config.fleet.dir, dir.path().join("fleet/zec/shards"));
+        assert_eq!(fleet_path_conflict(&config.wallets, &config.fleet), None);
     }
 }

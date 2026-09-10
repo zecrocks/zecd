@@ -460,8 +460,9 @@ async fn spawn_fleet(
     let mut placed = std::collections::BTreeMap::new();
     let mut existing = Vec::with_capacity(shard_dirs.len());
     for (index, dir) in shard_dirs.iter().enumerate() {
-        let state = crate::fleet::inspect_shard(config.network, dir, index, &mut placed)
-            .with_context(|| format!("inspecting shard {}", dir.display()))?;
+        let state =
+            crate::fleet::inspect_shard(config.network, config.fleet.coin, dir, index, &mut placed)
+                .with_context(|| format!("inspecting shard {}", dir.display()))?;
         existing.push(state);
     }
 
@@ -473,6 +474,7 @@ async fn spawn_fleet(
         config.fleet.clone(),
         crate::fleet::ShardTemplate {
             network: config.network,
+            coin: config.fleet.coin,
             hub: Arc::clone(hub),
             sync_interval: Duration::from_secs(config.sync.interval_secs),
             rebroadcast_interval: Duration::from_secs(config.sync.rebroadcast_secs),
@@ -499,9 +501,11 @@ async fn spawn_fleet(
         let actor_cfg = ActorConfig {
             name: name.clone(),
             network: config.network,
-            engine_dir: dir.clone(),
+            engine_dir: crate::config::shard_engine_dir(&dir, config.fleet.coin),
             // A shard has no keys.toml: its wallets are watch-only accounts imported from the
             // manifest's viewing keys, so there is no seed, passphrase or bootstrap involved.
+            // The path still points at the shard root, where a wallet's would sit - above the
+            // engine directory, which nothing but librustzcash owns.
             keys_path: dir.join("keys.toml"),
             hub: Arc::clone(hub),
             sync_interval: Duration::from_secs(config.sync.interval_secs),

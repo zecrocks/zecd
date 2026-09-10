@@ -12,10 +12,17 @@
 //! actually *is* - a name, a viewing key, a birthday:
 //!
 //! ```toml
-//! # <datadir>/wallets.d/acct-00417.toml
+//! # <datadir>/fleet/zec/wallets.d/acct-00417.toml
 //! ufvk = "uview1..."
 //! birthday = 2837400
 //! ```
+//!
+//! The fleet is one subtree, `<datadir>/fleet/`, and everything inside it is coin-scoped:
+//! `<datadir>/fleet/zec/wallets.d/` and `<datadir>/fleet/zec/shards/shard-NNNN/lrz/`. See
+//! [`crate::config::fleet_root`] for why the fleet is the outer unit and the coin sits inside
+//! it, and [`crate::config::fleet_manifest_dir`] / [`crate::config::fleet_dir`] for why the coin
+//! is there at all: a UFVK is coin-specific in a way a mnemonic is not, and shard placement is a
+//! per-chain decision.
 //!
 //! This is the same class of datum `keys.toml` holds, so it respects the statelessness invariant:
 //! it is operator-supplied key material, and balances, history and addresses are all rebuilt from
@@ -345,16 +352,19 @@ fn next_free_shard_dir(fleet_dir: &Path, from: usize) -> (usize, PathBuf) {
 /// precisely so it cannot disagree with reality: a wallet's shard *is* wherever its account is,
 /// and a wallet with no account anywhere is simply one that has not been imported yet.
 ///
-/// Opened read-only, so this never disturbs a database (and never creates one).
+/// Opened read-only, so this never disturbs a database (and never creates one). `dir` is the
+/// shard directory; the databases sit one engine level inside it
+/// ([`crate::config::shard_engine_dir`]).
 pub fn inspect_shard(
     network: crate::network::ZNetwork,
+    coin: crate::coin::Coin,
     dir: &Path,
     index: usize,
     placed: &mut BTreeMap<String, usize>,
 ) -> anyhow::Result<ShardState> {
     use zcash_client_backend::data_api::{Account as _, WalletRead as _};
 
-    let db = crate::wallet::open::open_read(network, dir)?;
+    let db = crate::wallet::open::open_read(network, &crate::config::shard_engine_dir(dir, coin))?;
     let ids = db.get_account_ids()?;
     let mut lowest_birthday: Option<u32> = None;
     for id in &ids {
@@ -627,6 +637,7 @@ mod tests {
         let (shutdown, _) = tokio::sync::watch::channel(false);
         let template = ShardTemplate {
             network: crate::network::ZNetwork::Test,
+            coin: crate::coin::Coin::Zcash,
             hub: crate::chain::hub::ChainHub::new(
                 crate::backend::resolve("zebra://127.0.0.1:18234", crate::network::ZNetwork::Test)
                     .expect("a loopback zebra endpoint resolves"),
@@ -760,6 +771,9 @@ pub struct FleetManager {
 #[derive(Clone)]
 pub struct ShardTemplate {
     pub network: crate::network::ZNetwork,
+    /// The coin the shards serve, which is what gives them their engine directory
+    /// ([`crate::config::shard_engine_dir`]).
+    pub coin: crate::coin::Coin,
     pub hub: std::sync::Arc<crate::chain::hub::ChainHub>,
     pub sync_interval: std::time::Duration,
     pub rebroadcast_interval: std::time::Duration,
@@ -1067,9 +1081,11 @@ impl ShardTemplate {
         crate::wallet::actor::ActorConfig {
             name: name.to_string(),
             network: self.network,
-            engine_dir: dir.to_path_buf(),
+            engine_dir: crate::config::shard_engine_dir(dir, self.coin),
             // A shard has no keys.toml: its wallets are watch-only accounts imported from the
-            // manifest's viewing keys.
+            // manifest's viewing keys. The path is carried anyway, at the shard root where a
+            // wallet's would sit - above the engine directory, which nothing but librustzcash
+            // owns.
             keys_path: dir.join("keys.toml"),
             hub: std::sync::Arc::clone(&self.hub),
             sync_interval: self.sync_interval,

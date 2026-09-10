@@ -578,20 +578,31 @@ max_scan_lag = 4
 # key material, not a cache, and the "the whole data directory is disposable" rule in
 # docs/OPERATIONS.md does NOT cover it. Back it up like keys.toml.
 #
+# Both directories live under <datadir>/fleet/<coin>/: the fleet is one subtree, and
+# inside it everything is coin-scoped, because a manifest holds a UFVK (which serves
+# one currency where the mnemonic in keys.toml serves every one) and which shard a
+# wallet lands in is decided by its birthday - a height on one chain. NB this makes
+# `fleet` a reserved wallet name: a
+# [wallets.fleet] entry would resolve to <datadir>/fleet, and zecd refuses to start
+# rather than let a wallet and the fleet share a directory tree.
+#
 # [fleet]
 # Run the fleet at all. Off means the manifest directory is never read, no shard is
 # opened, and createwallet/loadwallet/unloadwallet refuse.
 # enabled = false
 #
-# Directory of per-wallet manifests, one small TOML each, relative to the datadir.
-# Each file is `<name>.toml` holding `ufvk = "uview1..."` and `birthday = <height>`;
-# the file stem is the wallet name, served at /wallet/<name>. Drop a file in and
-# restart, or use `createwallet` to add one without a restart.
-# manifest_dir = "wallets.d"
+# Directory of per-wallet manifests, one small TOML each. Each file is `<name>.toml`
+# holding `ufvk = "uview1..."` and `birthday = <height>`; the file stem is the wallet
+# name, served at /wallet/<name>. Drop a file in and restart, or use `createwallet` to
+# add one without a restart. A value set here is taken relative to the datadir and
+# replaces the default outright, coin directory included.
+# manifest_dir = "fleet/zec/wallets.d"
 #
-# Directory holding the shard databases, relative to the datadir. Derived data: this
-# one IS a cache, rebuildable from the manifests plus the chain.
-# dir = "fleet"
+# Directory holding the shard databases, one `shard-NNNN/lrz/` each. Relative to the
+# datadir, and replaces the default outright, as above. Derived data: this one IS a
+# cache, rebuildable from the manifests plus the chain - so it is the half you can put
+# on scratch storage while the manifests go somewhere backed up.
+# dir = "fleet/zec/shards"
 #
 # Accounts per shard. A shard is one scan domain, so this trades scan sharing against
 # blast radius: importing a wallet rewinds its whole shard to that wallet's birthday,
