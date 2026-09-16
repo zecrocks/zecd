@@ -2009,6 +2009,13 @@ async fn mine_until_confirmed(zebrad: &Zebrad, zecd: &Zecd, txid: &str, what: &s
             .await
             .expect("gettransaction while polling for confirmation");
         if gt["confirmations"].as_i64().unwrap_or(0) >= 1 {
+            // Confirmed is not caught up: a block mined on the poll that found the wallet one
+            // behind is still unscanned here, and a phase that reads the history twice over
+            // the next second sees `confirmations` move between its reads (it did, in CI:
+            // 20 against 21 for the same transaction). Leave the wallet at the node's tip.
+            zecd.wait_until_synced_to_node(zebrad, FUND_TIMEOUT)
+                .await
+                .expect("scan the blocks mined while polling for confirmation");
             return;
         }
     }
