@@ -787,12 +787,18 @@ impl ChainSource for ZebraSource {
         end: BlockHeight,
         include_transparent: bool,
     ) -> anyhow::Result<CompactBlockStream> {
-        Ok(CompactBlockStream::Zebra(ZebraBlockStream {
-            client: self.client.clone(),
-            network: self.network,
-            next: u32::from(start),
-            end: u32::from(end),
+        let (tx, rx) = mpsc::channel(BLOCK_FETCH_BUFFER);
+        let task = tokio::spawn(pump_blocks(
+            self.client.clone(),
+            self.network,
+            u32::from(start),
+            u32::from(end),
             include_transparent,
+            tx,
+        ));
+        Ok(CompactBlockStream::Zebra(ZebraBlockStream {
+            rx,
+            _task: AbortOnDrop(task),
         }))
     }
 
@@ -914,75 +920,133 @@ impl ChainSource for ZebraSource {
     }
 }
 
-/// Sequentially materializes the compact blocks for one scan range: two RPCs per block
-/// (raw bytes by height, then `trees` sizes by the parsed hash), converted locally.
+/// How many blocks a [`ZebraBlockStream`] materializes at once.
+///
+/// A full node serves a compact block in two dependent round trips - the raw bytes by height,
+/// then the `trees` sizes keyed by the hash the parse yields - and has no range request to
+/// batch them into. Fetched one block at a time, a scan is `2 x blocks` sequential round
+/// trips: on a 238,000-block restore, 476,000 of them, which even against a node on loopback
+/// dominated everything else the sync did (measured: 803 s against a local node, where a
+/// lightwalletd across the internet took 214 s for the same wallet).
+///
+/// The two halves of a pair are dependent, but the pairs for different blocks are not, so this
+/// many blocks are kept in flight and the results are re-ordered before they reach the
+/// scanner, which requires ascending height. Sized for a co-located node, the intended
+/// `zebra://` deployment: the bound is the node's own request handling rather than a link.
+/// It is a window, not a rate - memory is bounded by this many parsed blocks.
+const BLOCK_FETCH_CONCURRENCY: usize = 32;
+
+/// How many materialized blocks may queue ahead of the scanner, on top of the
+/// [`BLOCK_FETCH_CONCURRENCY`] in flight. Bounds what a fast node can build up in front of a
+/// consumer that is busy writing the previous block to the cache.
+const BLOCK_FETCH_BUFFER: usize = 64;
+
+/// One materialized block: its compact form plus the transparent data harvested from the same
+/// parse (both empty for a shielded-only wallet).
+type MaterializedBlock = (
+    pb::CompactBlock,
+    Vec<crate::chain::TransparentUtxo>,
+    Vec<crate::chain::TransparentSpend>,
+);
+
+/// Materializes the compact blocks for one scan range, [`BLOCK_FETCH_CONCURRENCY`] at a time:
+/// two RPCs per block (raw bytes by height, then `trees` sizes by the parsed hash), converted
+/// locally, delivered in ascending height order through a bounded channel.
 pub struct ZebraBlockStream {
+    /// Materialized blocks in ascending height order; an error ends the range at the block
+    /// that hit it, exactly as the sequential stream this replaced did.
+    rx: mpsc::Receiver<anyhow::Result<MaterializedBlock>>,
+    /// Aborts the fetch task when the stream is dropped, so abandoning a range (a reorg, a
+    /// shutdown) stops the work rather than letting it run to the end of the range.
+    _task: AbortOnDrop,
+}
+
+/// Fetch and convert one block: the two dependent RPCs, the parse, and the checks that the
+/// node served the block that was asked for.
+async fn materialize_block(
+    client: &ZebraClient,
+    network: &ZNetwork,
+    height: u32,
+    include_transparent: bool,
+) -> anyhow::Result<MaterializedBlock> {
+    let raw = client.block_raw(&height.to_string()).await?;
+    let block =
+        Block::read(&raw[..], network).with_context(|| format!("parsing block {height}"))?;
+    // The coinbase-claimed height is the only height a raw block carries; a mismatch
+    // means the node served something other than what we asked for.
+    if block.claimed_height() != BlockHeight::from_u32(height) {
+        bail!(
+            "zebra served block claiming height {} for requested height {height}",
+            u32::from(block.claimed_height()),
+        );
+    }
+    // The scanner's per-block transaction index is a 16-bit integer, so more than
+    // `u16::MAX` transactions overflows it and panics librustzcash. A real block can't
+    // hold that many (non-consensus), so this only guards a malicious or buggy upstream;
+    // reject it as a transport error before `block_to_compact` feeds the scanner.
+    if block.vtx().len() > usize::from(u16::MAX) {
+        bail!(
+            "zebra served block {height} with {} transactions, exceeding the {} the scanner supports",
+            block.vtx().len(),
+            u16::MAX,
+        );
+    }
+    let (sapling_size, orchard_size, ironwood_size) = client
+        .block_trees(&block.header().hash().to_string())
+        .await?;
+    // The raw block was already fetched and parsed for the shielded compact block, so
+    // harvesting its transparent outputs here is free (no extra request). The matcher
+    // filters to the wallet's addresses; we just surface every output.
+    let (transparent, spends) = if include_transparent {
+        (
+            block_transparent_outputs(&block, height),
+            block_transparent_spends(&block, height),
+        )
+    } else {
+        (Vec::new(), Vec::new())
+    };
+    let compact = block_to_compact(&block, sapling_size, orchard_size, ironwood_size);
+    Ok((compact, transparent, spends))
+}
+
+/// Drive one range: keep [`BLOCK_FETCH_CONCURRENCY`] blocks in flight and forward them in
+/// height order. `buffered` (not `buffer_unordered`) is what preserves the order the scanner
+/// requires - the fetches overlap, only the delivery is serialized.
+///
+/// Stops at the first error, which the consumer surfaces as the range's failure, and when
+/// the consumer goes away (a dropped stream closes the channel).
+async fn pump_blocks(
     client: ZebraClient,
     network: ZNetwork,
-    next: u32,
-    /// Inclusive end height.
+    start: u32,
     end: u32,
-    /// Extract each block's transparent outputs alongside its compact block (the wallet's
-    /// transparent receive-discovery path). Off for shielded-only wallets so the extraction is
-    /// skipped entirely.
     include_transparent: bool,
+    tx: mpsc::Sender<anyhow::Result<MaterializedBlock>>,
+) {
+    use futures_util::stream::{self, StreamExt as _};
+
+    let mut blocks = stream::iter(start..=end)
+        .map(|height| {
+            let client = client.clone();
+            async move { materialize_block(&client, &network, height, include_transparent).await }
+        })
+        .buffered(BLOCK_FETCH_CONCURRENCY);
+
+    while let Some(result) = blocks.next().await {
+        let failed = result.is_err();
+        if tx.send(result).await.is_err() || failed {
+            return;
+        }
+    }
 }
 
 impl ZebraBlockStream {
-    #[allow(clippy::type_complexity)]
-    pub async fn next(
-        &mut self,
-    ) -> anyhow::Result<
-        Option<(
-            pb::CompactBlock,
-            Vec<crate::chain::TransparentUtxo>,
-            Vec<crate::chain::TransparentSpend>,
-        )>,
-    > {
-        if self.next > self.end {
-            return Ok(None);
+    /// The next block in the range, or `None` once the range is exhausted.
+    pub async fn next(&mut self) -> anyhow::Result<Option<MaterializedBlock>> {
+        match self.rx.recv().await {
+            Some(result) => result.map(Some),
+            None => Ok(None),
         }
-        let height = self.next;
-        let raw = self.client.block_raw(&height.to_string()).await?;
-        let block = Block::read(&raw[..], &self.network)
-            .with_context(|| format!("parsing block {height}"))?;
-        // The coinbase-claimed height is the only height a raw block carries; a mismatch
-        // means the node served something other than what we asked for.
-        if block.claimed_height() != BlockHeight::from_u32(height) {
-            bail!(
-                "zebra served block claiming height {} for requested height {height}",
-                u32::from(block.claimed_height()),
-            );
-        }
-        // The scanner's per-block transaction index is a 16-bit integer, so more than
-        // `u16::MAX` transactions overflows it and panics librustzcash. A real block can't
-        // hold that many (non-consensus), so this only guards a malicious or buggy upstream;
-        // reject it as a transport error before `block_to_compact` feeds the scanner.
-        if block.vtx().len() > usize::from(u16::MAX) {
-            bail!(
-                "zebra served block {height} with {} transactions, exceeding the {} the scanner supports",
-                block.vtx().len(),
-                u16::MAX,
-            );
-        }
-        let (sapling_size, orchard_size, ironwood_size) = self
-            .client
-            .block_trees(&block.header().hash().to_string())
-            .await?;
-        // The raw block was already fetched and parsed for the shielded compact block, so
-        // harvesting its transparent outputs here is free (no extra request). The matcher
-        // filters to the wallet's addresses; we just surface every output.
-        let (transparent, spends) = if self.include_transparent {
-            (
-                block_transparent_outputs(&block, height),
-                block_transparent_spends(&block, height),
-            )
-        } else {
-            (Vec::new(), Vec::new())
-        };
-        let compact = block_to_compact(&block, sapling_size, orchard_size, ironwood_size);
-        self.next += 1;
-        Ok(Some((compact, transparent, spends)))
     }
 }
 
@@ -1389,6 +1453,9 @@ mod tests {
         /// `getblock` responses keyed by the hash-or-height parameter, per verbosity.
         raw_blocks: HashMap<String, String>,
         verbose_blocks: HashMap<String, Value>,
+        /// Extra latency for a `getblock verbosity=0` reply, keyed like `raw_blocks`. Slept
+        /// *after* the state lock is released, so slow blocks do not serialize the others.
+        block_delay: HashMap<String, Duration>,
         treestate: Value,
         subtrees: Value,
         mempool: Vec<String>,
@@ -1418,6 +1485,7 @@ mod tests {
                 best: BLOCK_415000_HASH.into(),
                 raw_blocks: HashMap::new(),
                 verbose_blocks: HashMap::new(),
+                block_delay: HashMap::new(),
                 treestate: Value::Null,
                 subtrees: Value::Null,
                 mempool: Vec::new(),
@@ -1439,85 +1507,101 @@ mod tests {
         headers: axum::http::HeaderMap,
         Json(req): Json<Value>,
     ) -> Json<Value> {
-        let mut fake = state.lock().unwrap();
-        fake.seen_auth.push(
-            headers
-                .get(axum::http::header::AUTHORIZATION)
-                .map(|v| v.to_str().unwrap().to_string()),
-        );
-        let method = req["method"].as_str().unwrap_or_default().to_string();
-        let params = req["params"].clone();
-        let reply = |v: Value| Json(json!({ "result": v, "error": null, "id": "zecd" }));
-        let err = |code: i64, msg: &str| {
-            Json(json!({
-                "result": null,
-                "error": { "code": code, "message": msg },
-                "id": "zecd"
-            }))
-        };
-        match method.as_str() {
-            "getblockchaininfo" => {
-                let mut body = json!({
-                    "chain": fake.chain,
-                    "blocks": fake.blocks,
-                    "bestblockhash": fake.best,
-                });
-                if let Some(u) = &fake.upgrades {
-                    body["upgrades"] = u.clone();
-                }
-                if let Some(c) = &fake.consensus {
-                    body["consensus"] = c.clone();
-                }
-                reply(body)
-            }
-            "getbestblockhash" => reply(json!(fake.best)),
-            "getblock" => {
-                let key = params[0].as_str().unwrap_or_default().to_string();
-                let verbosity = params[1].as_i64().unwrap_or(1);
-                if verbosity == 0 {
-                    match fake.raw_blocks.get(&key) {
-                        Some(hex) => reply(json!(hex)),
-                        None => err(-8, "Block not found"),
-                    }
-                } else {
-                    match fake.verbose_blocks.get(&key) {
-                        Some(v) => reply(v.clone()),
-                        None => err(-8, "Block not found"),
-                    }
-                }
-            }
-            "z_gettreestate" => reply(fake.treestate.clone()),
-            "z_getsubtreesbyindex" => reply(fake.subtrees.clone()),
-            "getrawmempool" => reply(json!(fake.mempool)),
-            "getrawtransaction" => {
-                let txid = params[0].as_str().unwrap_or_default();
-                match fake.raw_txs.get(txid) {
-                    Some(v) => reply(v.clone()),
-                    None => err(-5, "No such mempool or main chain transaction"),
-                }
-            }
-            "getaddresstxids" => {
-                // Param is an object `{ "addresses": [...], "start": N, "end": M }`.
-                let arg = &params[0];
-                let addrs = arg["addresses"].as_array().cloned().unwrap_or_default();
-                let txids: Vec<String> = addrs
-                    .iter()
-                    .filter_map(|a| a.as_str())
-                    .flat_map(|a| fake.addr_txids.get(a).cloned().unwrap_or_default())
-                    .collect();
-                reply(json!(txids))
-            }
-            "sendrawtransaction" => match (&fake.send_error_object, &fake.send) {
-                (Some(error), _) => Json(json!({
+        // The lock is released before any sleep, in a block rather than an explicit `drop`:
+        // the edition-2021 `Send` analysis only sees the guard's scope end at the block.
+        let (response, delay) = {
+            let mut fake = state.lock().unwrap();
+            fake.seen_auth.push(
+                headers
+                    .get(axum::http::header::AUTHORIZATION)
+                    .map(|v| v.to_str().unwrap().to_string()),
+            );
+            let method = req["method"].as_str().unwrap_or_default().to_string();
+            let params = req["params"].clone();
+            let delay = (method == "getblock" && params[1].as_i64() == Some(0))
+                .then(|| {
+                    fake.block_delay
+                        .get(params[0].as_str().unwrap_or_default())
+                        .copied()
+                })
+                .flatten();
+            let reply = |v: Value| Json(json!({ "result": v, "error": null, "id": "zecd" }));
+            let err = |code: i64, msg: &str| {
+                Json(json!({
                     "result": null,
-                    "error": error.clone(),
+                    "error": { "code": code, "message": msg },
                     "id": "zecd"
-                })),
-                (None, Ok(txid)) => reply(json!(txid)),
-                (None, Err((code, msg))) => err(*code, msg),
-            },
-            other => err(-32601, &format!("Method not found: {other}")),
+                }))
+            };
+            let response = match method.as_str() {
+                "getblockchaininfo" => {
+                    let mut body = json!({
+                        "chain": fake.chain,
+                        "blocks": fake.blocks,
+                        "bestblockhash": fake.best,
+                    });
+                    if let Some(u) = &fake.upgrades {
+                        body["upgrades"] = u.clone();
+                    }
+                    if let Some(c) = &fake.consensus {
+                        body["consensus"] = c.clone();
+                    }
+                    reply(body)
+                }
+                "getbestblockhash" => reply(json!(fake.best)),
+                "getblock" => {
+                    let key = params[0].as_str().unwrap_or_default().to_string();
+                    let verbosity = params[1].as_i64().unwrap_or(1);
+                    if verbosity == 0 {
+                        match fake.raw_blocks.get(&key) {
+                            Some(hex) => reply(json!(hex)),
+                            None => err(-8, "Block not found"),
+                        }
+                    } else {
+                        match fake.verbose_blocks.get(&key) {
+                            Some(v) => reply(v.clone()),
+                            None => err(-8, "Block not found"),
+                        }
+                    }
+                }
+                "z_gettreestate" => reply(fake.treestate.clone()),
+                "z_getsubtreesbyindex" => reply(fake.subtrees.clone()),
+                "getrawmempool" => reply(json!(fake.mempool)),
+                "getrawtransaction" => {
+                    let txid = params[0].as_str().unwrap_or_default();
+                    match fake.raw_txs.get(txid) {
+                        Some(v) => reply(v.clone()),
+                        None => err(-5, "No such mempool or main chain transaction"),
+                    }
+                }
+                "getaddresstxids" => {
+                    // Param is an object `{ "addresses": [...], "start": N, "end": M }`.
+                    let arg = &params[0];
+                    let addrs = arg["addresses"].as_array().cloned().unwrap_or_default();
+                    let txids: Vec<String> = addrs
+                        .iter()
+                        .filter_map(|a| a.as_str())
+                        .flat_map(|a| fake.addr_txids.get(a).cloned().unwrap_or_default())
+                        .collect();
+                    reply(json!(txids))
+                }
+                "sendrawtransaction" => match (&fake.send_error_object, &fake.send) {
+                    (Some(error), _) => Json(json!({
+                        "result": null,
+                        "error": error.clone(),
+                        "id": "zecd"
+                    })),
+                    (None, Ok(txid)) => reply(json!(txid)),
+                    (None, Err((code, msg))) => err(*code, msg),
+                },
+                other => err(-32601, &format!("Method not found: {other}")),
+            };
+            (response, delay)
+        };
+        if let Some(delay) = delay {
+            tokio::time::sleep(delay).await;
         }
+        response
     }
 
     async fn serve(fake: Shared) -> SocketAddr {
@@ -2208,6 +2292,116 @@ mod tests {
         assert!(
             msg.contains("65536") && msg.contains("transactions"),
             "got: {msg}"
+        );
+    }
+
+    /// A minimal raw block whose coinbase claims `height`: a v4 header with an empty Equihash
+    /// solution and one output-less coinbase. Enough to parse, claim a height, and hash (the
+    /// header time is the height, so every block hashes differently). Heights are limited to
+    /// `17..=127` so the BIP 34 height push is a single byte.
+    fn minimal_block(height: u8) -> Vec<u8> {
+        assert!((17..=127).contains(&height), "single-byte height push");
+        let mut raw = Vec::new();
+        raw.extend_from_slice(&4i32.to_le_bytes()); // version
+        raw.extend_from_slice(&[0u8; 32]); // prev hash
+        raw.extend_from_slice(&[0u8; 32]); // merkle root
+        raw.extend_from_slice(&[0u8; 32]); // final sapling root
+        raw.extend_from_slice(&u32::from(height).to_le_bytes()); // time
+        raw.extend_from_slice(&0u32.to_le_bytes()); // bits
+        raw.extend_from_slice(&[0u8; 32]); // nonce
+        raw.push(0x00); // solution: empty vector
+        raw.push(0x01); // one transaction
+        raw.extend_from_slice(&1u32.to_le_bytes()); // coinbase: version
+        raw.push(0x01); // one input
+        raw.extend_from_slice(&[0u8; 32]); // prevout hash (NULL)
+        raw.extend_from_slice(&0xFFFF_FFFFu32.to_le_bytes()); // prevout index (NULL)
+        raw.extend_from_slice(&[0x02, 0x01, height]); // scriptSig: push the 1-byte height
+        raw.extend_from_slice(&0xFFFF_FFFFu32.to_le_bytes()); // sequence
+        raw.push(0x00); // no outputs
+        raw.extend_from_slice(&0u32.to_le_bytes()); // lock_time
+        raw
+    }
+
+    /// The full-node backend has no range request, so the stream materializes each block with
+    /// two dependent round trips of its own. Those must overlap across blocks - issued one
+    /// block at a time they made a node on loopback the slowest upstream there was - and yet
+    /// the scanner requires ascending height, so delivery stays ordered even when the node
+    /// answers for later blocks first. A block that fails to parse ends the range at that
+    /// block, after everything below it, exactly as the sequential stream did.
+    #[tokio::test]
+    async fn block_range_overlaps_fetches_and_delivers_in_height_order() {
+        const FIRST: u8 = 17;
+        const LAST: u8 = 24;
+        const PER_BLOCK: Duration = Duration::from_millis(200);
+        let count = u32::from(LAST - FIRST + 1);
+
+        let fake = Arc::new(Mutex::new(Fake::new()));
+        {
+            let mut f = fake.lock().unwrap();
+            for height in FIRST..=LAST {
+                let raw = minimal_block(height);
+                let hash = Block::read(&raw[..], &ZNetwork::Main)
+                    .expect("the minimal block parses")
+                    .header()
+                    .hash()
+                    .to_string();
+                f.raw_blocks.insert(height.to_string(), hex::encode(&raw));
+                f.verbose_blocks.insert(
+                    hash,
+                    json!({ "trees": { "sapling": { "size": u32::from(height) } } }),
+                );
+                // The lowest block is the slowest to arrive, so a stream that delivered in
+                // arrival order would hand the scanner the highest block first.
+                f.block_delay
+                    .insert(height.to_string(), PER_BLOCK * u32::from(LAST - height + 1));
+            }
+            f.raw_blocks
+                .insert((LAST + 1).to_string(), "00ff00ff".into());
+        }
+        let mut src = source_for(fake).await;
+
+        let started = std::time::Instant::now();
+        let mut stream = src
+            .compact_block_range(
+                BlockHeight::from_u32(FIRST.into()),
+                BlockHeight::from_u32((LAST + 1).into()),
+                false,
+            )
+            .await
+            .unwrap();
+        let mut heights = Vec::new();
+        let err = loop {
+            match stream.next().await {
+                Ok(Some((cb, _, _))) => {
+                    assert_eq!(
+                        cb.chain_metadata.unwrap().sapling_commitment_tree_size,
+                        cb.height as u32,
+                        "the trees lookup is keyed by the block's own hash"
+                    );
+                    heights.push(cb.height);
+                }
+                Ok(None) => panic!("the unparseable block must end the range with an error"),
+                Err(e) => break e,
+            }
+        };
+        let elapsed = started.elapsed();
+
+        assert_eq!(
+            heights,
+            (u64::from(FIRST)..=u64::from(LAST)).collect::<Vec<_>>(),
+            "every block, in ascending height order, before the error"
+        );
+        assert!(
+            format!("{err:#}").contains(&format!("parsing block {}", LAST + 1)),
+            "got: {err:#}"
+        );
+        // Served one at a time the delays add up (count + ... + 1 units); overlapped, the
+        // range costs its slowest block (count units). Half the sum is a comfortable line
+        // between the two.
+        let sequential = PER_BLOCK * (count * (count + 1) / 2);
+        assert!(
+            elapsed < sequential / 2,
+            "fetches overlapped: {elapsed:?} against {sequential:?} served sequentially"
         );
     }
 
