@@ -213,6 +213,10 @@ pub struct AddressInfo {
     pub ischange: Option<bool>,
     /// zecd extension: the bare BIP 44 child index (what `z_getaddressforaccount` takes).
     pub address_index: Option<u32>,
+    /// zecd extension: the ZIP 32 diversifier index of any own address, shielded or
+    /// transparent - the stateless identity every encoding of one address shares, and what
+    /// history entries report as `diversifier_index`. Absent for a foreign address.
+    pub diversifier_index: Option<u64>,
 }
 
 /// One `listtransactions`/`listsinceblock` entry (`rpc/wallet_methods.rs::tx_entries` +
@@ -233,6 +237,9 @@ pub struct TransactionEntry {
     /// `(txid, pool, vout)` - not `(txid, vout)` - identifies an output. Optional so an entry
     /// from a zecd predating the field still decodes.
     pub pool: Option<String>,
+    /// zecd extension: the diversifier index of the own address a *received* output landed
+    /// on; absent on sends. Restore-stable, and shared by every encoding of that address.
+    pub diversifier_index: Option<u64>,
     /// -1 for an expired unmined transaction (it can never confirm).
     pub confirmations: i64,
     pub txid: String,
@@ -271,6 +278,9 @@ pub struct ZTransactionEntry {
     pub walletconflicts: Vec<Value>,
     /// `"transparent"` / `"sapling"` / `"orchard"` / `"ironwood"`.
     pub pool: String,
+    /// zecd extension: the diversifier index of the own address a *received* output landed
+    /// on; absent on sends. Restore-stable, and shared by every encoding of that address.
+    pub diversifier_index: Option<u64>,
     pub category: String,
     pub amount: SignedAmount,
     #[serde(rename = "amountZat")]
@@ -361,6 +371,9 @@ pub struct Unspent {
     pub safe: bool,
     /// `"transparent"` / `"sapling"` / `"orchard"` / `"ironwood"`.
     pub pool: String,
+    /// zecd extension: the diversifier index of the own address a *received* output landed
+    /// on; absent on sends. Restore-stable, and shared by every encoding of that address.
+    pub diversifier_index: Option<u64>,
     /// Transparent entries only: true iff produced by a coinbase transaction.
     pub generated: Option<bool>,
 }
@@ -445,6 +458,18 @@ pub struct ZValidateAddress {
     /// A unified address's receivers, in zcashd's vocabulary (`p2pkh`, not `transparent`).
     /// Absent for the bare encodings, where the address kind is already the receiver.
     pub receivers: Option<Vec<String>>,
+}
+
+/// `z_listunifiedreceivers` (`rpc/wallet_methods.rs::z_listunifiedreceivers`): a unified
+/// address taken apart, one field per receiver present, each re-encoded on its own in zcashd's
+/// vocabulary. `orchard` is a single-receiver unified address (Orchard has no bare encoding).
+#[non_exhaustive]
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct ZListUnifiedReceivers {
+    pub p2pkh: Option<String>,
+    pub p2sh: Option<String>,
+    pub sapling: Option<String>,
+    pub orchard: Option<String>,
 }
 
 /// A successful operation's result: the sends all return `{ "txid": ... }`.
@@ -940,6 +965,16 @@ impl Client<'_> {
             .await
     }
 
+    /// `z_listunifiedreceivers <unified_address>`: the address taken apart into its receivers,
+    /// each re-encoded on its own - the strings history reports for outputs paid to it.
+    pub async fn z_list_unified_receivers(
+        &self,
+        address: &str,
+    ) -> Result<ZListUnifiedReceivers, ClientError> {
+        self.call_typed("z_listunifiedreceivers", vec![json!(address)])
+            .await
+    }
+
     /// `z_waitforoperation <opid> ( timeout_secs )`: block until the operation finishes.
     /// Timeout in SECONDS (unlike the `waitfor*` family's milliseconds): `0` is an immediate
     /// single-operation read, and `None` waits the server-side default (clamped to 3600).
@@ -1255,6 +1290,30 @@ mod tests {
         assert!(serde_json::to_string(&r)
             .unwrap()
             .contains("\"memo\":\"f600\""));
+    }
+}
+
+#[cfg(test)]
+mod z_list_unified_receivers_tests {
+    use super::ZListUnifiedReceivers;
+
+    /// Fixture from `address::tests::unified_receivers_are_the_strings_history_reports`: a
+    /// three-receiver address yields all three keys; a single-receiver one yields only its own.
+    #[test]
+    fn z_list_unified_receivers_decodes_partial_shapes() {
+        let full = serde_json::json!({
+            "p2pkh": "tmGqwWtL7RsbxikDSN26gsbicxVr2xJNe86",
+            "sapling": "ztestsapling1...",
+            "orchard": "utest1...",
+        });
+        let v: ZListUnifiedReceivers = serde_json::from_value(full).unwrap();
+        assert!(v.p2pkh.is_some() && v.sapling.is_some() && v.orchard.is_some());
+        assert!(v.p2sh.is_none());
+
+        let orchard_only = serde_json::json!({ "orchard": "utest1..." });
+        let v: ZListUnifiedReceivers = serde_json::from_value(orchard_only).unwrap();
+        assert!(v.orchard.is_some());
+        assert!(v.p2pkh.is_none() && v.sapling.is_none());
     }
 }
 

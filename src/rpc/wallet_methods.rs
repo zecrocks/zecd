@@ -15,6 +15,7 @@ use crate::coin::Coin;
 use crate::config::SendPrivacy;
 use crate::error::RpcError;
 use crate::operations::{ContextInfo, OperationId};
+use crate::pools::ReceiverSet;
 use crate::server::jsonrpc::RpcRequest;
 use crate::state::AppState;
 use crate::wallet::store::Passphrase;
@@ -942,12 +943,28 @@ pub(crate) fn getaddressinfo(
     } else {
         None
     };
+    // For an own *shielded* address, the same read-back: its diversifier index and scope,
+    // recovered from the account's viewing key (one diversifier decrypt, no index search). This
+    // is the shielded half of `address_index`, and what lets a caller resolve any address
+    // history reports back to the index it stored at issuance.
+    let shielded_index = if ismine && derivation.is_none() {
+        read::diversifier_index_of(
+            handle.network,
+            &handle.engine_dir,
+            handle.account_scope(),
+            addr,
+        )
+        .map(|(index, _scope)| u128::from(index))
+    } else {
+        None
+    };
     addressinfo_json(
         v,
         addr,
         ismine,
         receivers_consistent,
         derivation.map(|d| (d, handle.network)),
+        shielded_index,
     )
 }
 
@@ -984,6 +1001,43 @@ pub(crate) fn z_validateaddress(
     Ok(z_validateaddress_json(decoded.as_ref(), addr, ismine))
 }
 
+/// `z_listunifiedreceivers "unified_address"` - zcashd's shape: the address taken apart into its
+/// receivers, one field per receiver present (`p2pkh`/`p2sh`/`sapling`/`orchard`), each
+/// re-encoded on its own. The Orchard receiver comes back as a single-receiver Unified Address,
+/// since Orchard has no bare encoding.
+///
+/// This exists because history names each output by the receiver it actually paid (see
+/// `display_address`), so a consumer holding a multi-receiver address it handed out needs
+/// exactly these strings to match a history entry back to it - and had no way to get them from
+/// zecd, short of implementing ZIP 316 parsing itself. Pure and key-free: any valid unified
+/// address on this network is taken apart, owned or not, so an integrator can also use it on
+/// addresses it is about to pay. An undecodable or wrong-network address is `-5`; a valid
+/// address of another kind is `-8`, since a bare address is already its one receiver.
+pub(crate) fn z_listunifiedreceivers(
+    state: &AppState,
+    wallet: Option<&str>,
+    req: &RpcRequest,
+) -> Result<Value, RpcError> {
+    let addr = req.require_str(0, "z_listunifiedreceivers requires a unified address")?;
+    let handle = state.registry.get(wallet)?;
+    let Some(decoded) = crate::address::decode_on_network(&handle.network, addr) else {
+        return Err(RpcError::invalid_address_or_key(format!(
+            "Invalid Zcash address: {addr}"
+        )));
+    };
+    let zcash_keys::address::Address::Unified(ua) = decoded else {
+        return Err(RpcError::invalid_parameter(format!(
+            "{addr} is not a unified address (its kind is {})",
+            crate::address::address_type_of(&decoded)
+        )));
+    };
+    let mut out = serde_json::Map::new();
+    for (kind, encoded) in crate::address::unified_receivers(&handle.network, &ua) {
+        out.insert(kind.to_string(), json!(encoded));
+    }
+    Ok(Value::Object(out))
+}
+
 /// Build the `z_validateaddress` response. `decoded` is `None` for an address that does not
 /// parse or belongs to another network, which is `isvalid: false` and nothing else - the same
 /// shape `validateaddress` uses, and zcashd's.
@@ -1016,12 +1070,16 @@ fn z_validateaddress_json(
 /// `derivation` carries the BIP 44 path of an own **transparent** address (with the network the
 /// path's coin type comes from); it is `None` for shielded addresses, foreign ones, and imported
 /// keys without derivation metadata, and the derivation fields are then omitted entirely.
+/// `shielded_index` is the counterpart for an own **shielded** address: its diversifier index.
+/// Both kinds report `diversifier_index`, so a caller has one field to read whatever the
+/// address kind; the BIP 44 fields (`hdkeypath`/`ischange`/`address_index`) stay transparent-only.
 fn addressinfo_json(
     v: crate::address::Validation,
     addr: &str,
     ismine: bool,
     receivers_consistent: Option<bool>,
     derivation: Option<(read::TransparentDerivation, crate::network::ZNetwork)>,
+    shielded_index: Option<u128>,
 ) -> Result<Value, RpcError> {
     if !v.is_valid {
         return Err(RpcError::invalid_address_or_key("Invalid address"));
@@ -1065,6 +1123,16 @@ fn addressinfo_json(
         }
         out["ischange"] = json!(d.is_change());
         out["address_index"] = json!(d.address_index);
+        // The transparent child index *is* the diversifier index (ZIP 32 reuses it as the BIP
+        // 44 child), reported under the uniform name too so a caller need not branch on kind.
+        out["diversifier_index"] = json!(d.address_index);
+    }
+    // An own shielded address: the index history reports for receipts on it. Nothing else -
+    // `ischange` stays a transparent-derivation field (a shielded change address is never
+    // handed out, never shown in history, and so never reaches this RPC), so the documented
+    // "absent for shielded" shape of the three BIP 44 fields holds.
+    if let Some(index) = shielded_index {
+        out["diversifier_index"] = json!(index);
     }
     Ok(out)
 }
@@ -1184,10 +1252,8 @@ fn display_address(network: &crate::network::ZNetwork, out: &read::TxOutputRecor
     let Some(addr) = out.to_address.as_deref() else {
         return String::new();
     };
-    if out.to_account.is_none() {
-        if let Some(single) = crate::address::single_receiver_for_pool(network, addr, out.pool) {
-            return single;
-        }
+    if let Some(single) = crate::address::single_receiver_for_pool(network, addr, out.pool) {
+        return single;
     }
     addr.to_string()
 }
@@ -1238,6 +1304,18 @@ fn tx_entries(
                 "txid": tx.txid_hex,
                 "bip125-replaceable": "no",
             });
+            // zecd extension, `receive` entries only: the diversifier index of the own address
+            // this output landed on. Keyed on the category, not on `to_account`, so the send
+            // half of a self-transfer pair stays index-free like every other send. Read from the address row the note links to, so it costs
+            // nothing and is identical after a from-seed restore. It is the stateless identity
+            // every encoding of an address shares - a consumer that stored the index at issuance
+            // (`z_getaddressforaccount` returns it, `getaddressinfo` reads it back) matches
+            // receipts by integer with no address parsing at all.
+            if *category == "receive" {
+                if let Some(index) = out.diversifier_index {
+                    entry["diversifier_index"] = json!(index);
+                }
+            }
             if *category == "send" {
                 // Bitcoin Core carries `abandoned` on send entries only.
                 entry["abandoned"] = json!(tx.expired_unmined);
@@ -1529,6 +1607,18 @@ fn z_tx_entries(
                 "change": false,
                 "outgoing": send,
             });
+            // zecd extension, `receive` entries only: the diversifier index of the own address
+            // this output landed on. Keyed on the category, not on `to_account`, so the send
+            // half of a self-transfer pair stays index-free like every other send. Read from the address row the note links to, so it costs
+            // nothing and is identical after a from-seed restore. It is the stateless identity
+            // every encoding of an address shares - a consumer that stored the index at issuance
+            // (`z_getaddressforaccount` returns it, `getaddressinfo` reads it back) matches
+            // receipts by integer with no address parsing at all.
+            if *category == "receive" {
+                if let Some(index) = out.diversifier_index {
+                    entry["diversifier_index"] = json!(index);
+                }
+            }
             let obj = entry.as_object_mut().expect("entry is a JSON object");
             if let Some(h) = tx.mined_height {
                 if let Some(hash) = &tx.block_hash {
@@ -1632,6 +1722,35 @@ pub(crate) fn z_listtransactions(
 /// excluded.
 const COINBASE_MATURITY: i64 = read::COINBASE_MATURITY as i64;
 
+/// The key `received_by_address` files an address under: the encoding this wallet issues at that
+/// address's diversifier index, so a caller's query and the wallet's stored outputs are compared
+/// in one spelling. Falls back to the string as given for anything with no unified encoding of
+/// its own - a bare transparent address, which is its own key.
+fn received_address_key(handle: &WalletHandle, addr: &str) -> String {
+    crate::address::issued_encoding(&handle.network, addr, &handle.default_receivers)
+        .unwrap_or_else(|| addr.to_string())
+}
+
+/// The `to_address` strings a receipt at `addr`'s diversifier index could be stored under, for
+/// the SQL filter. That is every encoding the wallet has recorded at that index, plus `addr`
+/// itself - which is what covers a bare transparent address (no diversifier sibling to find) and
+/// an address whose row the wallet holds under exactly the queried spelling.
+///
+/// Never empty, so the filter cannot degenerate into "match nothing" for an address the caller
+/// legitimately owns; an index with no receipts simply aggregates to zero.
+fn received_address_candidates(handle: &WalletHandle, addr: &str) -> Vec<String> {
+    let mut candidates = read::recorded_encodings_of(
+        handle.network,
+        &handle.engine_dir,
+        handle.account_scope(),
+        addr,
+    );
+    if !candidates.iter().any(|c| c == addr) {
+        candidates.push(addr.to_string());
+    }
+    candidates
+}
+
 /// Aggregate wallet-received outputs (non-change, paying one of our accounts) per address,
 /// counting only transactions with at least `minconf` confirmations. Returns
 /// `(amount_zats, confirmations_of_most_recent_counted_tx, txids)` keyed by address.
@@ -1643,6 +1762,8 @@ const COINBASE_MATURITY: i64 = read::COINBASE_MATURITY as i64;
 /// `immature_balance`), so counting it as received would overstate income that a chain reorg
 /// can still revoke. Shielded coinbase notes (ZIP-213) carry no maturity rule and always count.
 fn received_by_address(
+    network: &crate::network::ZNetwork,
+    receivers: &ReceiverSet,
     txs: &[read::TxRecord],
     st: &SyncStatus,
     minconf: i64,
@@ -1665,7 +1786,14 @@ fn received_by_address(
             let Some(addr) = &out.to_address else {
                 continue;
             };
-            let e = map.entry(addr.clone()).or_insert((0, i64::MAX, Vec::new()));
+            // Key by the encoding this wallet issues, not the one it happens to have recorded -
+            // the same canonicalization `display_address` applies to an incoming output, and the
+            // one `received_address_key` applies to the caller's query, so a lookup by any
+            // encoding of a diversifier index finds that index's receipts. See
+            // `address::issued_encoding`.
+            let addr = crate::address::issued_encoding(network, addr, receivers)
+                .unwrap_or_else(|| addr.clone());
+            let e = map.entry(addr).or_insert((0, i64::MAX, Vec::new()));
             e.0 += out.value.max(0) as u64;
             e.1 = e.1.min(conf);
             e.2.push(tx.txid_hex.clone());
@@ -1679,16 +1807,24 @@ fn received_by_address(
 /// Immature transparent coinbase value is excluded unless `include_immature_coinbase` (Core's
 /// default-false third parameter); see [`received_by_address`].
 ///
-/// Matching is whole-UA string equality, not receiver-level: round-tripping the exact value
-/// `getnewaddress` returned always works (and sums receipts across all its receivers, which
-/// share one diversifier index), but a re-encoding with a different receiver subset, or a
-/// different UA that merely shares a receiver, is a different string -> `-4`/no contribution.
+/// Matching is by **diversifier index**, not by the recorded address string: any encoding of an
+/// index the wallet owns - the one `getnewaddress` returned, the all-receivers one the block
+/// scanner records when it meets an index with no `addresses` row (every index after a from-seed
+/// restore or `zecd rescan`), or a narrower re-encoding of either - answers with that index's
+/// receipts, summed across its receivers. String equality was the rule until it was found to
+/// return `0.00000000` for a wallet's own `getnewaddress` address after a restore, silently, with
+/// the funds reported under an address the wallet never issued. Two halves make it hold: the
+/// query and every stored output are put through [`crate::address::issued_encoding`] so they
+/// agree on one spelling, and the SQL filter is built from [`read::recorded_encodings_of`] so it
+/// still names the strings actually on disk.
+///
 /// A *spliced* UA (receivers stapled together from different diversifier indices, or one of this
 /// wallet's receivers mixed with a stranger's) is caught earlier by [`read::classify_unified_receivers`]
-/// and rejected with `-5` rather than silently treated as foreign. A **bare transparent address**
-/// is its own key, not a sub-receiver query against the UA enclosing it: a transparent receive is
-/// recorded under the t-address that was paid, so asking about the t-address returns it and asking
-/// about the enclosing UA returns only that UA's shielded receipts.
+/// and rejected with `-5` rather than silently treated as foreign - so by the time an address is
+/// resolved to an index, it is known to sit at exactly one. A **bare transparent address** is
+/// still its own key, not a sub-receiver query against the UA enclosing it: a transparent receive
+/// is recorded under the t-address that was paid, so asking about the t-address returns it and
+/// asking about the enclosing UA returns only that UA's shielded receipts.
 pub(crate) fn getreceivedbyaddress(
     state: &AppState,
     wallet: Option<&str>,
@@ -1720,13 +1856,27 @@ pub(crate) fn getreceivedbyaddress(
         return Err(RpcError::wallet("Address not found in wallet"));
     }
     let st = handle.status();
-    // Push the single-address filter into SQL (sublinear) rather than scanning the whole
-    // history; the aggregation then sees only this address's outputs.
-    let txs = read::received_tx_records(&handle.engine_dir, handle.account_scope(), Some(addr))?;
-    let total = received_by_address(&txs, &st, minconf, include_immature_coinbase)
-        .remove(addr)
-        .map(|(amt, _, _)| amt)
-        .unwrap_or(0);
+    // Push the single-address filter into SQL rather than loading the whole history; the
+    // aggregation then sees only this address's outputs. The filter names every encoding the
+    // wallet has recorded at this address's diversifier index, since which one is on disk
+    // depends on whether `getnewaddress` or the block scanner wrote the row.
+    let candidates = received_address_candidates(&handle, addr);
+    let txs = read::received_tx_records(
+        &handle.engine_dir,
+        handle.account_scope(),
+        Some(&candidates),
+    )?;
+    let total = received_by_address(
+        &handle.network,
+        &handle.default_receivers,
+        &txs,
+        &st,
+        minconf,
+        include_immature_coinbase,
+    )
+    .remove(&received_address_key(&handle, addr))
+    .map(|(amt, _, _)| amt)
+    .unwrap_or(0);
     Ok(zats_to_value(total))
 }
 
@@ -1741,6 +1891,13 @@ pub(crate) fn getreceivedbyaddress(
 /// outputs instead of scanning the whole history and discarding the rest. The unfiltered
 /// call necessarily loads everything - it is a full-history aggregation, like Bitcoin Core's.
 /// The in-loop filter below still runs to prune the `include_empty` address universe.
+///
+/// Every address this reports - the ones that received, and with `include_empty` the ones that
+/// have not - is rendered through [`received_address_key`], so the enumeration is in the same
+/// spelling `getnewaddress` hands out and feeding any entry back to `getreceivedbyaddress`
+/// answers. Without that the recorded strings leak through, and after a from-seed restore or
+/// `zecd rescan` those are the block scanner's all-receivers encodings: addresses this wallet
+/// never issued, carrying a transparent receiver a shielded-only wallet does not even watch.
 pub(crate) fn listreceivedbyaddress(
     state: &AppState,
     wallet: Option<&str>,
@@ -1752,27 +1909,44 @@ pub(crate) fn listreceivedbyaddress(
     let include_immature_coinbase = req.param(4).and_then(|v| v.as_bool()).unwrap_or(false);
     let handle = state.registry.get(wallet)?;
     let st = handle.status();
+    let candidates = address_filter
+        .as_deref()
+        .map(|f| received_address_candidates(&handle, f));
     let txs = read::received_tx_records(
         &handle.engine_dir,
         handle.account_scope(),
-        address_filter.as_deref(),
+        candidates.as_deref(),
     )?;
-    let mut received = received_by_address(&txs, &st, minconf, include_immature_coinbase);
+    let mut received = received_by_address(
+        &handle.network,
+        &handle.default_receivers,
+        &txs,
+        &st,
+        minconf,
+        include_immature_coinbase,
+    );
 
     // The address universe: everything that received (already restricted by the pushed-down
-    // filter), plus (with include_empty) every address the wallet has ever generated.
+    // filter), plus (with include_empty) every address the wallet has ever generated. Both are
+    // already in - or are put into - the issued spelling, so the two halves cannot list one
+    // diversifier index twice under two encodings.
     let mut addrs: BTreeSet<String> = received.keys().cloned().collect();
     if include_empty {
-        addrs.extend(read::all_addresses(
-            handle.network,
-            &handle.engine_dir,
-            handle.account_scope(),
-        ));
+        addrs.extend(
+            read::all_addresses(handle.network, &handle.engine_dir, handle.account_scope())
+                .iter()
+                .map(|a| received_address_key(&handle, a)),
+        );
     }
 
+    // The caller's filter is compared in the same spelling everything else is keyed by, so
+    // filtering by any encoding of an index selects that index's entry.
+    let filter_key = address_filter
+        .as_deref()
+        .map(|f| received_address_key(&handle, f));
     let mut out = Vec::new();
     for addr in addrs {
-        if address_filter.as_deref().is_some_and(|f| f != addr) {
+        if filter_key.as_deref().is_some_and(|f| f != addr) {
             continue;
         }
         let (amount, conf, txids) = received.remove(&addr).unwrap_or((0, 0, Vec::new()));
@@ -1960,6 +2134,18 @@ fn gettransaction_details(network: &crate::network::ZNetwork, rec: &read::TxReco
                 // zecd is stateless and keeps no address labels; retained empty for Core shape.
                 "label": "",
             });
+            // zecd extension, `receive` entries only: the diversifier index of the own address
+            // this output landed on. Keyed on the category, not on `to_account`, so the send
+            // half of a self-transfer pair stays index-free like every other send. Read from the address row the note links to, so it costs
+            // nothing and is identical after a from-seed restore. It is the stateless identity
+            // every encoding of an address shares - a consumer that stored the index at issuance
+            // (`z_getaddressforaccount` returns it, `getaddressinfo` reads it back) matches
+            // receipts by integer with no address parsing at all.
+            if *category == "receive" {
+                if let Some(index) = out.diversifier_index {
+                    d["diversifier_index"] = json!(index);
+                }
+            }
             if *category == "send" {
                 d["abandoned"] = json!(rec.expired_unmined);
                 if let Some(fee) = rec.fee_paid {
@@ -3322,6 +3508,13 @@ mod tests {
     // shown verbatim; any network works as the reduction context.
     const NET: crate::network::ZNetwork = crate::network::ZNetwork::Test;
 
+    /// The receiver set the renderers canonicalize incoming addresses to. Orchard-only, which is
+    /// zecd's default `[pools] default_receivers` and so what these fixtures should be read
+    /// against; a test that cares about a wider set builds its own.
+    fn receivers() -> ReceiverSet {
+        ReceiverSet::single(crate::pools::Receiver::Orchard)
+    }
+
     /// The positional name and the `/wallet/<name>` route must not silently disagree: Bitcoin
     /// Core refuses that call, and here the cost of guessing is unloading a wallet the caller
     /// never named.
@@ -3770,6 +3963,7 @@ mod tests {
             // self-payment (external scope) is built with [`self_payment_out`].
             recipient_key_scope: None,
             memo: None,
+            diversifier_index: None,
         }
     }
 
@@ -3782,6 +3976,64 @@ mod tests {
             recipient_key_scope: Some(read::EXTERNAL_KEY_SCOPE),
             ..out(true, true, value, Some(addr), true)
         }
+    }
+
+    /// The property that makes one display rule right for both directions: a payer and a payee
+    /// looking at the same on-chain output print the **same** address.
+    ///
+    /// Both sides are reduced to the receiver the output actually paid, which is the only thing
+    /// the chain carries. Reporting an incoming output under a multi-receiver encoding instead
+    /// would have the recipient name an envelope the sender never saw, and would make the string
+    /// depend on `[pools] default_receivers` - so changing that setting would rewrite history.
+    #[test]
+    fn a_payer_and_a_payee_print_the_same_address_for_one_output() {
+        use zcash_keys::keys::UnifiedAddressRequest;
+
+        let net = crate::network::ZNetwork::Test;
+        // The all-receivers encoding a restored wallet records for a funded index, and the
+        // Orchard-only one this wallet issues - two spellings of one diversifier index.
+        let mnemonic = <bip0039::Mnemonic<bip0039::English>>::from_phrase(
+            "mechanic vehicle helmet decide plug gorilla frost dial october \
+             midnight culture idea mountain fame park social drip bid doctor scatter glance defy \
+             moment stage",
+        )
+        .unwrap();
+        let ufvk = zcash_keys::keys::UnifiedSpendingKey::from_seed(
+            &net,
+            &mnemonic.to_seed(""),
+            zip32::AccountId::try_from(0u32).unwrap(),
+        )
+        .unwrap()
+        .to_unified_full_viewing_key();
+        let j = zip32::DiversifierIndex::from(0u32);
+        let all_receivers = ufvk
+            .address(j, UnifiedAddressRequest::ALLOW_ALL)
+            .unwrap()
+            .encode(&net);
+        let orchard_only = crate::address::issued_encoding(
+            &net,
+            &all_receivers,
+            &ReceiverSet::single(crate::pools::Receiver::Orchard),
+        )
+        .unwrap();
+
+        // The payee's row: received, recorded under whichever encoding was on disk.
+        let received = TxOutputRecord {
+            to_account: Some(uuid::Uuid::new_v4()),
+            from_account: None,
+            ..out(false, true, 1, Some(&all_receivers), false)
+        };
+        // The payer's row: sent, recorded under the address they typed - either spelling.
+        let sent_full = out(true, false, 1, Some(&all_receivers), false);
+        let sent_narrow = out(true, false, 1, Some(&orchard_only), false);
+
+        let payee = display_address(&net, &received);
+        assert_eq!(payee, display_address(&net, &sent_full));
+        assert_eq!(payee, display_address(&net, &sent_narrow));
+        assert_eq!(
+            payee, orchard_only,
+            "an Orchard output reduces to the Orchard receiver, whatever envelope carried it"
+        );
     }
 
     /// ZIP-302 text memo bytes (a 512-byte field whose UTF-8 prefix decodes to `s`).
@@ -4192,21 +4444,26 @@ mod tests {
             script_pub_key: None,
             is_script: false,
         };
-        let e = addressinfo_json(invalid, "nonsense", false, None, None).unwrap_err();
+        let e = addressinfo_json(invalid, "nonsense", false, None, None, None).unwrap_err();
         assert_eq!(e.code, crate::error::codes::RPC_INVALID_ADDRESS_OR_KEY);
 
         // Valid: Bitcoin Core's field set, without an isvalid field. The shape is identical
         // on watch-only (UFVK) wallets: master's `iswatchonly` is deprecated/always-false
         // and `solvable` ignores the lack of private keys, so neither field varies - the
         // watch-only signal is `getwalletinfo.private_keys_enabled`.
-        let valid = Validation {
+        let valid = || Validation {
             is_valid: true,
             is_orchard: true,
             receiver_types: vec!["orchard"],
             script_pub_key: None,
             is_script: false,
         };
-        let o = addressinfo_json(valid, "utest1abc", true, Some(false), None).unwrap();
+        let o = addressinfo_json(valid(), "utest1abc", true, Some(false), None, Some(7)).unwrap();
+        // The resolved diversifier index is reported; it is the only derivation-shaped field
+        // a shielded address carries (the BIP 44 trio stays absent, asserted below).
+        assert_eq!(o["diversifier_index"], json!(7));
+        let o = addressinfo_json(valid(), "utest1abc", true, Some(false), None, None).unwrap();
+        assert!(o.get("diversifier_index").is_none());
         assert!(o.get("isvalid").is_none());
         assert_eq!(o["address"], json!("utest1abc"));
         assert_eq!(o["ismine"], json!(true));
@@ -4253,6 +4510,7 @@ mod tests {
             true,
             None,
             Some((external, crate::network::ZNetwork::Test)),
+            None,
         )
         .unwrap();
         // Testnet's BIP 44 coin type is 1 (mainnet's is 133).
@@ -4272,6 +4530,7 @@ mod tests {
             true,
             None,
             Some((internal, crate::network::ZNetwork::Main)),
+            None,
         )
         .unwrap();
         assert_eq!(o["hdkeypath"], json!("m/44'/133'/0'/1/3"));
@@ -4290,6 +4549,7 @@ mod tests {
             true,
             None,
             Some((no_account, crate::network::ZNetwork::Test)),
+            None,
         )
         .unwrap();
         assert!(o.get("hdkeypath").is_none());
@@ -4356,10 +4616,19 @@ mod tests {
             Some(50),
             false,
             Some(10_000),
-            vec![out(true, true, 200, Some("self"), false)],
+            vec![TxOutputRecord {
+                diversifier_index: Some(42),
+                ..out(true, true, 200, Some("self"), false)
+            }],
         );
         let e = tx_entries(&NET, &t, 1, 0, None);
         assert_eq!(e.len(), 2);
+        // The index belongs to the receiving side of the pair: the receive entry carries it
+        // and the send entry never does, even though both come from one own output. (It
+        // shipped keyed on `to_account`, which put it on the send half too; conformance's
+        // "no send entry carries diversifier_index" caught it in CI.)
+        assert_eq!(e[1]["diversifier_index"], json!(42));
+        assert!(e[0].get("diversifier_index").is_none());
         assert_eq!(e[0]["category"], "send");
         assert_eq!(e[0]["amount"].to_string(), "-0.00000200");
         assert_eq!(e[0]["fee"].to_string(), "-0.00010000");
@@ -4558,6 +4827,7 @@ mod tests {
             is_change: false, // transparent outputs never carry the is_change flag
             recipient_key_scope: Some(1), // internal/change scope
             memo: None,
+            diversifier_index: None,
         };
         assert!(
             transparent_change.is_internal_change(),
@@ -4693,14 +4963,17 @@ mod tests {
                 vec![out(true, true, 11, Some("a"), true)],
             ), // change: skipped
         ];
-        let m = received_by_address(&txs, &st, 1, false);
+        let m = received_by_address(&NET, &receivers(), &txs, &st, 1, false);
         let (amt, conf, txids) = m.get("a").cloned().unwrap();
         assert_eq!(amt, 150);
         assert_eq!(conf, 1); // confirmations of the most recent counted tx
         assert_eq!(txids.len(), 2);
         // minconf 0 picks up the unmined receive but still never the expired/change outputs.
         assert_eq!(
-            received_by_address(&txs, &st, 0, false).get("a").unwrap().0,
+            received_by_address(&NET, &receivers(), &txs, &st, 0, false)
+                .get("a")
+                .unwrap()
+                .0,
             157
         );
     }
@@ -4731,19 +5004,28 @@ mod tests {
             tx(Some(90), false, None, vec![t_out(5, "a")]),
         ];
         assert_eq!(
-            received_by_address(&txs, &st, 1, false).get("a").unwrap().0,
+            received_by_address(&NET, &receivers(), &txs, &st, 1, false)
+                .get("a")
+                .unwrap()
+                .0,
             42
         );
         // include_immature_coinbase counts the immature transparent coinbase too.
         assert_eq!(
-            received_by_address(&txs, &st, 1, true).get("a").unwrap().0,
+            received_by_address(&NET, &receivers(), &txs, &st, 1, true)
+                .get("a")
+                .unwrap()
+                .0,
             142
         );
         // minconf still applies on top of the maturity override: at minconf 60 only the
         // 100-conf coinbase survives (both height-50 txs sit at 51 conf, the ordinary receive
         // at 11).
         assert_eq!(
-            received_by_address(&txs, &st, 60, true).get("a").unwrap().0,
+            received_by_address(&NET, &receivers(), &txs, &st, 60, true)
+                .get("a")
+                .unwrap()
+                .0,
             30
         );
     }

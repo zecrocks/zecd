@@ -611,6 +611,49 @@ def main() -> int:
     except JSONRPCException as e:
         ck("z_getaddressforaccount no args -> -1", e.code == -1, e.code)
 
+    print("== z_listunifiedreceivers / diversifier_index ==")
+    # The three pieces a payment processor reconciles with, checked as one contract.
+    #
+    # (1) z_listunifiedreceivers takes a unified address apart into the per-receiver strings that
+    #     history reports for outputs paid to it. On this Orchard-only wallet a getnewaddress UA
+    #     is already single-receiver, so it takes apart into exactly itself under "orchard".
+    parts = rpc.call("z_listunifiedreceivers", addr)
+    ck("z_listunifiedreceivers on an orchard-only UA is {orchard: itself}",
+       parts == {"orchard": addr}, parts)
+    try:
+        rpc.call("z_listunifiedreceivers", "not-an-address")
+        ck("z_listunifiedreceivers invalid raises", False)
+    except JSONRPCException as e:
+        ck("z_listunifiedreceivers invalid -> -5", e.code == -5, e.code)
+    # (2) getaddressinfo reads a shielded address's diversifier index back, and it is the index
+    #     z_getaddressforaccount issued it at - so a site that stored the index at issuance can
+    #     resolve any address it later sees to that integer.
+    info_a = rpc.call("getaddressinfo", a["address"])
+    ck("getaddressinfo.diversifier_index is an int for an own shielded address",
+       isinstance(info_a.get("diversifier_index"), int), repr(info_a.get("diversifier_index")))
+    ck("getaddressinfo.diversifier_index round-trips z_getaddressforaccount's",
+       info_a.get("diversifier_index") == a["diversifier_index"],
+       (info_a.get("diversifier_index"), a["diversifier_index"]))
+    # (3) Every received history entry carries the index of the address it landed on, and sends
+    #     never do - the recipient's index is theirs. The funded wallet has receives by now.
+    hist = rpc.call("listtransactions", "*", 200)
+    receives = [t for t in hist if t.get("category") == "receive"]
+    sends = [t for t in hist if t.get("category") == "send"]
+    ck("history has receives to check", len(receives) > 0, len(hist))
+    ck("every received entry carries an int diversifier_index",
+       all(isinstance(t.get("diversifier_index"), int) for t in receives),
+       [t.get("diversifier_index") for t in receives][:5])
+    ck("no send entry carries diversifier_index",
+       all("diversifier_index" not in t for t in sends), len(sends))
+    # ...and the index on a receive resolves through getaddressinfo to the same value, from the
+    # address string the entry itself reports - the two read-backs agree.
+    if receives:
+        r = receives[0]
+        ri = rpc.call("getaddressinfo", r["address"])
+        ck("a receive entry's diversifier_index matches getaddressinfo on its address",
+           ri.get("diversifier_index") == r.get("diversifier_index"),
+           (ri.get("diversifier_index"), r.get("diversifier_index")))
+
     print("== received-by-address ==")
     recv = rpc.call("getreceivedbyaddress", addr)
     ck("getreceivedbyaddress is Decimal", isinstance(recv, decimal.Decimal), repr(recv))
@@ -649,6 +692,35 @@ def main() -> int:
         ck("invalid address raises", False)
     except JSONRPCException as e:
         ck("invalid address -> code -5", e.code == -5, e.code)
+    # Everything listreceivedbyaddress reports must be an address the wallet answers for, and
+    # answers with the same total. The two RPCs share one aggregation but reach it by different
+    # routes (a whole-history walk vs a pushed-down per-address filter), so this is the check
+    # that the address identity they key on is the same one. It is what goes wrong when the
+    # reported spelling of an address and the looked-up spelling drift apart.
+    #
+    # Sampled through read_together, and the per-address probes are batched into ONE reading so
+    # the whole comparison is bracketed: the daemon is live, so a list read now against totals
+    # read a round trip later is a race rather than a property. Capped at a few addresses -
+    # each is a round trip, and an exchange wallet lists many.
+    def listed_with_totals():
+        pairs = []
+        for e in rpc.call("listreceivedbyaddress", 1, True)[:8]:
+            listed = e.get("address")
+            try:
+                pairs.append((listed, e.get("amount"), rpc.call("getreceivedbyaddress", listed, 1)))
+            except JSONRPCException as err:
+                pairs.append((listed, e.get("amount"), "error %s" % err.code))
+        return pairs
+
+    _, pairs = read_together(
+        lambda: rpc.call("listreceivedbyaddress", 1, True),
+        listed_with_totals,
+    )
+    for listed, amount, queried in pairs:
+        ck("every listed address is queryable (%s)" % listed,
+           not isinstance(queried, str), repr(queried))
+        ck("listed and queried totals agree for %s" % listed,
+           queried == amount, "%r vs %r" % (queried, amount))
 
     print("== stateless: label methods are removed ==")
     # zecd keeps no off-chain label store, so the label-dedicated methods are not implemented at

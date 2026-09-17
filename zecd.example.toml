@@ -305,6 +305,15 @@ bootstrap_from_keys = true
 #   getnewaddress "" "sapling"          (Sapling receiver only)
 #   getnewaddress "" "sapling,orchard"  (both)
 # constrained to the enabled receivers (else -8).
+#
+# Changing `default_receivers` later is safe, and changes less than it looks like it might.
+# New getnewaddress results carry the new receiver set at once; addresses already handed out keep
+# working, because which receivers a diversifier index has is a property of the key rather than of
+# this setting. Transaction history does NOT move: listtransactions and friends name each output
+# by the receiver actually paid, which is an on-chain fact. listreceivedbyaddress DOES follow this
+# setting, since it enumerates the addresses you have now and names them the way getnewaddress
+# would today. getreceivedbyaddress resolves any encoding of an address you own, so lookups keep
+# working across the change either way.
 enabled = ["orchard"]
 default_receivers = ["orchard"]
 #

@@ -250,6 +250,21 @@ impl ReceiverSet {
         self.pools.iter().copied()
     }
 
+    /// Whether addresses built from this set carry more than one receiver, so the address the
+    /// wallet hands out can differ from the receiver an output actually pays (see the
+    /// spawn-time warning in `wallet::actor`).
+    ///
+    /// **Transparent can never make this true**, which is why the warning it gates does not fire
+    /// for a transparent-enabled wallet: a `ReceiverSet` is shielded-only by construction
+    /// ([`ReceiverSet::new`] rejects [`Receiver::Transparent`] outright), and zecd hands its
+    /// transparent receivers out as *bare* t-addresses rather than inside a unified address, so a
+    /// transparent receive is recorded under exactly the string that was handed out. The
+    /// divergence needs two *shielded* receivers in one address, which today means
+    /// `sapling, orchard`.
+    pub fn is_multi_receiver(&self) -> bool {
+        self.pools.len() > 1
+    }
+
     /// Whether every pool in `self` is also present in `other`.
     pub fn is_subset_of(&self, other: &ReceiverSet) -> bool {
         self.pools.iter().all(|p| other.contains(*p))
@@ -331,6 +346,20 @@ mod tests {
             Receiver::from_config_str(" Orchard ").unwrap(),
             Receiver::Orchard
         );
+    }
+
+    /// The invariant the spawn-time multi-receiver warning leans on: transparent is not a
+    /// `ReceiverSet` member, so enabling transparent receiving can never make a wallet's
+    /// addresses multi-receiver. Only two shielded receivers can.
+    #[test]
+    fn transparent_can_never_make_a_receiver_set_multi_receiver() {
+        assert!(ReceiverSet::new([Receiver::Transparent]).is_err());
+        assert!(ReceiverSet::new([Receiver::Orchard, Receiver::Transparent]).is_err());
+        assert!(!ReceiverSet::single(Receiver::Orchard).is_multi_receiver());
+        assert!(!ReceiverSet::single(Receiver::Sapling).is_multi_receiver());
+        assert!(ReceiverSet::new([Receiver::Sapling, Receiver::Orchard])
+            .unwrap()
+            .is_multi_receiver());
     }
 
     #[test]

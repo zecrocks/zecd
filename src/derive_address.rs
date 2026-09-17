@@ -28,6 +28,27 @@
 //! child index `j`. What this command deliberately cannot reproduce is `getnewaddress`'s *next*
 //! shielded address: those diversifier indexes are clock-derived, so
 //! only an explicit index is deterministic - which is what an offline caller wants anyway.
+//!
+//! **Deriving an address is not issuing one, and for transparent addresses that difference can
+//! cost money.** This command writes nothing: no `addresses` row, no exposure, no matcher
+//! refresh. For a **shielded** address that is harmless - a note is found by trial-decrypting
+//! every output against the account's viewing key, so an index the wallet never recorded is
+//! credited exactly like one it did. For a **transparent** address it is not: zecd discovers
+//! transparent receives by matching each block's outputs against a set of *exposed* addresses
+//! plus a bounded lookahead (see the transparent design notes), so a payment to a derived index
+//! outside that window is not credited until something exposes the index and the wallet rescans.
+//! [`warn_if_daemon_would_not_watch`] reports the cases this command can see - transparent
+//! receiving switched off, a receiver the wallet does not enable, an index at or past the
+//! recovery horizon - but it reads the *configured* wallet, not a running daemon, so it cannot
+//! tell where the live frontier actually sits.
+//!
+//! So the ordering that matters: **`getnewaddress` (or `z_getaddressforaccount` for an explicit
+//! index) is the way to hand an address out**, because those go through the daemon, record the
+//! row, expose the index and refresh the matcher. Reach for this command when there is no daemon
+//! to ask - pre-provisioning, air-gapping, pointing a miner at a wallet that does not exist yet,
+//! or verifying a `keys.toml` - and for transparent deposits set `[pools]
+//! transparent_initial_scan` to your issuance high-water mark first, so the range you derive from
+//! is pre-exposed before any scanning happens.
 
 use std::path::{Path, PathBuf};
 

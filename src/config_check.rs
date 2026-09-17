@@ -532,6 +532,24 @@ fn check_paths(config: &AppConfig, findings: &mut Vec<Finding>) {
                 )));
             }
         }
+
+        // A multi-receiver default means the address `getnewaddress` hands out is not the string
+        // history reports, since only the receiver an output paid reaches the chain and zecd
+        // keeps no recipient-side record. The actor warns at spawn; here it is worth catching
+        // before a deployment builds reconciliation on the wrong assumption. Transparent cannot
+        // trip this - see `ReceiverSet::is_multi_receiver`.
+        if wallet.default_receivers.is_multi_receiver() {
+            findings.push(Finding::warning(format!(
+                "wallet '{name}': default_receivers = [{}] hands out multi-receiver Unified \
+                 Addresses, which transaction history does not report - listtransactions, \
+                 gettransaction, listsinceblock and z_listtransactions name the single receiver \
+                 each output actually paid, because only that receiver reaches the chain and \
+                 zecd is stateless. Match a payment by deconstructing the issued address into \
+                 its receivers, or with getreceivedbyaddress, which accepts any encoding of an \
+                 address the wallet owns",
+                wallet.default_receivers.display_names()
+            )));
+        }
     }
     if initialized == 0 && !config.wallets.is_empty() {
         findings.push(Finding::warning(format!(
@@ -701,6 +719,65 @@ mod tests {
             .filter(|f| f.level == Level::Warning)
             .map(|f| f.message.as_str())
             .collect()
+    }
+
+    /// A multi-receiver `default_receivers` is warned about, a single-receiver one is silent,
+    /// and **enabling transparent receiving never trips it**. The divergence the warning names
+    /// needs two *shielded* receivers in one address; transparent receivers are handed out as
+    /// bare t-addresses, so for them the address issued is the receiver paid and history matches
+    /// what the operator gave out. Pinned here because the whole point of the warning is that
+    /// this class of surprise should be said before a deployment reconciles against it.
+    #[test]
+    fn a_multi_receiver_default_is_warned_about_but_transparent_alone_is_not() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = format!("network = \"regtest\"\ndatadir = {:?}\n", dir.path());
+
+        let multi = inspect(&resolve(
+            &format!(
+                "{base}[pools]\nenabled = [\"sapling\", \"orchard\"]\n\
+                 default_receivers = [\"sapling\", \"orchard\"]\n"
+            ),
+            dir.path(),
+        ));
+        assert!(
+            errors(&multi).is_empty(),
+            "a multi-receiver wallet is a supported deployment, never an error: {:?}",
+            errors(&multi)
+        );
+        let warned: Vec<&str> = warnings(&multi)
+            .into_iter()
+            .filter(|w| w.contains("default_receivers"))
+            .collect();
+        assert_eq!(
+            warned.len(),
+            1,
+            "exactly one finding must name the setting: {:?}",
+            warnings(&multi)
+        );
+        assert!(
+            warned[0].contains("listtransactions") && warned[0].contains("getreceivedbyaddress"),
+            "the warning must name what diverges and how to match a payment anyway: {}",
+            warned[0]
+        );
+
+        // Silent cases: the default (no [pools] at all), an explicit single shielded receiver,
+        // and a transparent-enabled wallet - transparent is not a receiver-set member, so it
+        // cannot make a wallet's addresses multi-receiver.
+        for body in [
+            "",
+            "[pools]\nenabled = [\"orchard\"]\ndefault_receivers = [\"orchard\"]\n",
+            "[pools]\ntransparent = true\ntransparent_default = true\n",
+            "[pools]\nenabled = [\"sapling\", \"orchard\"]\ndefault_receivers = [\"orchard\"]\n",
+        ] {
+            let quiet = inspect(&resolve(&format!("{base}{body}"), dir.path()));
+            assert!(
+                !warnings(&quiet)
+                    .iter()
+                    .any(|w| w.contains("default_receivers")),
+                "config {body:?} must not warn about receiver divergence: {:?}",
+                warnings(&quiet)
+            );
+        }
     }
 
     /// `[sync] fetch_memos = false` is warned about, and only then. The setting is legitimate

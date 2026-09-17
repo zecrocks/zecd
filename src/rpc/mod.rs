@@ -86,6 +86,7 @@ pub const ALL_METHODS: &[&str] = &[
     "z_waitforoperation",
     // Wallet - address derivation (zcashd-style)
     "z_getaddressforaccount",
+    "z_listunifiedreceivers",
 ];
 
 /// Whether `name` is an RPC method zecd implements (see [`ALL_METHODS`]).
@@ -173,6 +174,7 @@ const MAX_POSITIONAL_ARGS: &[(&str, usize)] = &[
     ("z_waitforoperation", 2),
     // Wallet - address derivation (zcashd-style)
     ("z_getaddressforaccount", 3),
+    ("z_listunifiedreceivers", 1),
 ];
 
 /// Which coins a method serves.
@@ -268,6 +270,7 @@ const METHOD_COINS: &[(&str, MethodCoins)] = &[
     ("z_waitforoperation", MethodCoins::Only(ZCASH_ONLY)),
     // Wallet - address derivation (zcashd-style)
     ("z_getaddressforaccount", MethodCoins::Only(ZCASH_ONLY)),
+    ("z_listunifiedreceivers", MethodCoins::Only(ZCASH_ONLY)),
 ];
 
 /// The coins serving `method`, or `None` when the method is unknown.
@@ -457,6 +460,9 @@ async fn dispatch_zecd(
         "z_getaddressforaccount" => {
             wallet_methods::z_getaddressforaccount(state, wallet, req).await
         }
+        "z_listunifiedreceivers" => {
+            blocking(|| wallet_methods::z_listunifiedreceivers(state, wallet, req))
+        }
 
         other => Err(RpcError::method_not_found(other)),
     }
@@ -573,7 +579,7 @@ mod tests {
             .iter()
             .filter(|(_, c)| *c != super::MethodCoins::All)
             .count();
-        assert_eq!(zcash_only, 10, "the Zcash-only surface is ten methods");
+        assert_eq!(zcash_only, 11, "the Zcash-only surface is eleven methods");
     }
 
     #[test]

@@ -235,16 +235,31 @@ fn regtest_wallet_lifecycle() {
     assert!(read::unmined_raw_txs(engine_dir, 1)
         .expect("unmined_raw_txs")
         .is_empty());
-    // received_tx_records runs in both the unfiltered and address-filtered shapes.
+    // received_tx_records runs in all three of its shapes: unfiltered, filtered by a candidate
+    // set, and filtered by an empty one (the address-owns-no-recorded-row case, whose `IN ()`
+    // would not be valid SQL and is compiled to a false predicate instead).
     assert!(
         read::received_tx_records(engine_dir, read::AccountScope::Any, None)
             .expect("received_tx_records")
             .is_empty()
     );
+    let candidates = vec![addr.clone()];
     assert!(
-        read::received_tx_records(engine_dir, read::AccountScope::Any, Some(addr.as_str()))
+        read::received_tx_records(engine_dir, read::AccountScope::Any, Some(&candidates))
             .expect("received_tx_records filtered")
             .is_empty()
+    );
+    assert!(
+        read::received_tx_records(engine_dir, read::AccountScope::Any, Some(&[]))
+            .expect("received_tx_records with no candidates")
+            .is_empty()
+    );
+    // The wallet's own address resolves to the `addresses` row recorded for its diversifier
+    // index, which is what `getreceivedbyaddress` filters on.
+    assert_eq!(
+        read::recorded_encodings_of(net, engine_dir, read::AccountScope::Any, &addr),
+        vec![addr.clone()],
+        "the account's own address is recorded at its own diversifier index"
     );
     // The `blocks`-table queries (no public API exposes block time / a reverse hash lookup).
     assert!(read::block_info_at(engine_dir, 1)
@@ -1927,6 +1942,149 @@ fn tx_count_matches_the_view_it_replaces() {
 /// grouping and their aggregate arithmetic - and minting real notes offline would need a chain.
 /// Two transactions are populated so a statement that ignored its `transaction_id` parameter
 /// would return the other one's rows.
+/// The reported per-address bug, reproduced end to end on a real, populated wallet database.
+///
+/// After a from-seed restore or `zecd rescan`, `getreceivedbyaddress` on the wallet's own
+/// `getnewaddress` address answered `0.00000000`, and the same funds were listed under an address
+/// zecd will not derive - one carrying a transparent receiver a shielded-only wallet does not
+/// watch. Balances stayed correct throughout, so only per-address reconciliation could see it.
+///
+/// The cause is upstream and cannot be configured away. Where a diversifier index has no
+/// `addresses` row - every index on a rebuilt database - `zcash_client_sqlite` records an
+/// **all-receivers** encoding of it (`UnifiedAddressRequest::ALLOW_ALL`, in `ensure_address`),
+/// while `getnewaddress` records the `[pools] default_receivers` encoding. The
+/// `(account_id, key_scope, diversifier_index_be)` unique constraint means only one of the two is
+/// ever on disk, and which one depends on who wrote the row first. The fixture below is the
+/// account's own default address row, written by `add_account` with `AllAvailableKeys` - the same
+/// all-receivers shape, and the state a restore leaves behind.
+///
+/// Both halves of the fix are exercised against that database, because they fail differently:
+/// `read::recorded_encodings_of` resolves the issued address to the stored row (the filter
+/// `getreceivedbyaddress` pushes into SQL) and `crate::address::issued_encoding` maps that row
+/// back to the address the wallet hands out (the aggregation key, and what
+/// `listreceivedbyaddress` prints). The old rule is pinned too, so this cannot quietly stop
+/// reproducing the bug.
+///
+/// Determinism note: the index here comes from the account's default address under the committed
+/// test seed, so it is fixed. Do **not** rebuild this on `get_next_available_address` - a
+/// shielded-only request derives a clock-based index, which is past the non-hardened transparent
+/// range and only half the time Sapling-valid, so the two encodings coincide on some runs.
+#[test]
+fn a_rescan_written_address_row_still_answers_for_the_address_the_wallet_issued() {
+    use crate::pools::{Receiver, ReceiverSet};
+
+    let net = network::regtest();
+    let dir = tempfile::tempdir().unwrap();
+    let engine_dir = dir.path();
+    let mut db = open::init_dbs(net, engine_dir).expect("init regtest dbs");
+    db.create_account("primary", &test_seed(), &genesis_birthday(), None)
+        .expect("create regtest account");
+    drop(db);
+
+    let conn = rusqlite::Connection::open(open::data_db_path(engine_dir)).unwrap();
+    let account_id: i64 = conn
+        .query_row("SELECT id FROM accounts LIMIT 1", [], |r| r.get(0))
+        .unwrap();
+    let (address_id, recorded): (i64, String) = conn
+        .query_row("SELECT id, address FROM addresses LIMIT 1", [], |r| {
+            Ok((r.get(0)?, r.get(1)?))
+        })
+        .unwrap();
+    populate_two_transactions(&conn, account_id, address_id);
+    drop(conn);
+
+    // The address a shielded-only wallet hands out at that same diversifier index.
+    let orchard_only = ReceiverSet::single(Receiver::Orchard);
+    let issued = crate::address::issued_encoding(&net, &recorded, &orchard_only)
+        .expect("re-encode the recorded address");
+    assert_ne!(
+        issued, recorded,
+        "the fixture only means anything if the two encodings differ"
+    );
+    // Both are the wallet's own - the recorded one by exact match, the issued one by
+    // viewing-key attribution - so neither is turned away with `-4` before the lookup runs.
+    assert!(read::is_mine(
+        net,
+        engine_dir,
+        read::AccountScope::Any,
+        &issued
+    ));
+    assert!(read::is_mine(
+        net,
+        engine_dir,
+        read::AccountScope::Any,
+        &recorded
+    ));
+
+    // The behaviour being replaced, stated so this test shows its own point: filtering by the
+    // issued string itself - whole-address equality, the old rule - selects nothing at all, even
+    // though the wallet owns the address and its outputs are right there.
+    assert!(
+        read::received_tx_records(
+            engine_dir,
+            read::AccountScope::Any,
+            Some(std::slice::from_ref(&issued))
+        )
+        .expect("received_tx_records by the issued string alone")
+        .is_empty(),
+        "whole-address equality is exactly what failed here; if this ever matches, the fixture \
+         has stopped reproducing the bug and the assertions below prove nothing"
+    );
+
+    // Half one: the issued address resolves to the recorded row, and that filter reaches the rows.
+    let candidates = read::recorded_encodings_of(net, engine_dir, read::AccountScope::Any, &issued);
+    assert_eq!(candidates, vec![recorded.clone()]);
+    let found = read::received_tx_records(engine_dir, read::AccountScope::Any, Some(&candidates))
+        .expect("received_tx_records by the resolved candidates");
+    assert!(
+        !found.is_empty(),
+        "the resolved filter must reach the rows recorded under the other encoding"
+    );
+    let direct = read::received_tx_records(
+        engine_dir,
+        read::AccountScope::Any,
+        Some(std::slice::from_ref(&recorded)),
+    )
+    .expect("received_tx_records by the recorded string");
+    assert_eq!(
+        found.len(),
+        direct.len(),
+        "resolving an encoding must not change which rows are selected"
+    );
+    // Symmetric: a caller holding the recorded spelling - one read back out of history - finds
+    // the same row, so feeding a reported address back in works either way round.
+    assert_eq!(
+        read::recorded_encodings_of(net, engine_dir, read::AccountScope::Any, &recorded),
+        vec![recorded.clone()],
+    );
+
+    // Half two: that row reports as the address the wallet issues, so the aggregation key and
+    // the caller's query agree on one spelling.
+    assert_eq!(
+        crate::address::issued_encoding(&net, &recorded, &orchard_only).as_deref(),
+        Some(issued.as_str()),
+        "the recorded row must report as the address the wallet issues"
+    );
+
+    // A foreign address resolves to nothing, so the filter stays a filter. (`recorded_encodings_of`
+    // returns no candidates; the RPC adds the queried string itself, which matches no row here.)
+    let foreign = "uregtest1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqq";
+    assert!(
+        read::recorded_encodings_of(net, engine_dir, read::AccountScope::Any, foreign).is_empty(),
+        "an address no account owns has no recorded diversifier sibling"
+    );
+    assert!(
+        read::received_tx_records(
+            engine_dir,
+            read::AccountScope::Any,
+            Some(&[foreign.to_string()])
+        )
+        .expect("received_tx_records for a foreign address")
+        .is_empty(),
+        "a foreign address must still select no rows"
+    );
+}
+
 fn populate_two_transactions(conn: &rusqlite::Connection, account_id: i64, address_id: i64) {
     for (id_tx, tag) in [(1i64, 0xa1u8), (2, 0xb2)] {
         conn.execute(

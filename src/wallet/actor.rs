@@ -1156,6 +1156,32 @@ async fn spawn_inner(
             );
         }
     }
+    if cfg.default_receivers.is_multi_receiver() {
+        // One line at spawn for the same reason as the memo-less case below: an operator reading
+        // history that does not contain the address they handed out should know it is the design,
+        // not a fault. Only fires when `getnewaddress` hands out a multi-receiver Unified Address
+        // by default; a single-receiver default cannot diverge, since the address issued and the
+        // receiver paid are then the same string. **Transparent receiving never trips this** -
+        // see `ReceiverSet::is_multi_receiver`: transparent receivers are handed out bare, so the
+        // address issued *is* the receiver paid. An `address_type` override can still build a
+        // multi-receiver address on any wallet whose `enabled` set allows one, so the message
+        // names that case rather than claiming the default is the only way in.
+        warn!(
+            "[pools] default_receivers = [{}] hands out multi-receiver Unified Addresses, and \
+             transaction history will NOT report them: listtransactions, gettransaction, \
+             listsinceblock and z_listtransactions name the single receiver each output actually \
+             paid (a single-receiver Unified Address for orchard, a bare zs address for sapling), \
+             incoming and outgoing alike. Only the receiver that was paid reaches the chain - \
+             which envelope the payer used does not - and zecd is stateless, so it keeps no \
+             recipient-side record of the address it issued and cannot echo one back. To match a \
+             payment to an address you handed out, deconstruct that address into its per-pool \
+             receivers and compare, or call getreceivedbyaddress, which accepts any encoding of \
+             an address this wallet owns. listreceivedbyaddress is unaffected and still \
+             enumerates addresses as getnewaddress hands them out. The same applies to any \
+             address issued with a multi-receiver address_type override.",
+            cfg.default_receivers.display_names()
+        );
+    }
     if !cfg.fetch_memos {
         // One line at spawn so an operator reading a memo-less history knows it is configured,
         // not broken - and knows the way back (the skipped requests stay queued, so re-enabling

@@ -413,6 +413,15 @@ pub struct TxOutputRecord {
     pub recipient_key_scope: Option<i64>,
     /// The output's ZIP-302 memo bytes, when the wallet decrypted/stored one.
     pub memo: Option<Vec<u8>>,
+    /// The ZIP 32 diversifier index of the wallet address this output was received on, read
+    /// from the `addresses` row the note links to - so it costs no cryptography and is the same
+    /// on the authoring instance and after a from-seed restore (the scanner recovers the index
+    /// from the note itself). `None` for a pure send (the recipient's index is theirs, not ours)
+    /// and for a received output with no linked address row. The index is the stateless
+    /// identity of an address: every encoding of one address shares it, so a consumer that
+    /// stored the index at issuance (`z_getaddressforaccount` returns it) matches receipts by
+    /// integer with no address parsing at all.
+    pub diversifier_index: Option<u128>,
 }
 
 impl TxOutputRecord {
@@ -576,7 +585,12 @@ fn tx_unexpired_sql(alias: &str) -> String {
 /// received at) - so that it answers identically. Two deliberate deviations, neither
 /// observable: the four-arm union of `v_received_outputs` is `UNION ALL` here rather than
 /// `UNION`, since each arm carries a distinct pool literal and a primary key so no two rows can
-/// collide; and only the columns [`TxOutputRecord`] reads are selected. **If a librustzcash
+/// collide; and only the columns [`TxOutputRecord`] reads are selected. One column is selected
+/// that the view computes but does **not** expose: `diversifier_index_be`, which the view's
+/// received arm joins from `addresses` and then drops at its outer `SELECT`. It is carried
+/// through here because it is the stateless identity of the receiving address (see
+/// [`TxOutputRecord::diversifier_index`]); the differential test compares only the columns
+/// both statements share. **If a librustzcash
 /// bump changes that view, this must change with it** - which is what
 /// `regtest_tests::load_outputs_sql_matches_the_view_it_replaces` exists to catch: it runs both
 /// against a populated database and requires identical rows.
@@ -625,7 +639,8 @@ unioned AS (
            ro.value AS value,
            ro.is_change AS is_change,
            ro.memo AS memo,
-           a.key_scope AS recipient_key_scope
+           a.key_scope AS recipient_key_scope,
+           a.diversifier_index_be AS diversifier_index_be
     FROM ro
     LEFT JOIN addresses a ON a.id = ro.address_id
     LEFT JOIN sent_notes ON sent_notes.id = ro.sent_note_id
@@ -641,7 +656,8 @@ unioned AS (
            sent_notes.value AS value,
            0 AS is_change,
            sent_notes.memo AS memo,
-           NULL AS recipient_key_scope
+           NULL AS recipient_key_scope,
+           NULL AS diversifier_index_be
     FROM sent_notes
     LEFT JOIN ro ON ro.sent_note_id = sent_notes.id
     LEFT JOIN accounts from_account ON from_account.id = sent_notes.from_account_id
@@ -658,12 +674,22 @@ SELECT output_pool,
        MAX(value) AS value,
        MAX(is_change) AS is_change,
        MAX(recipient_key_scope) AS recipient_key_scope,
-       MAX(memo) AS memo
+       MAX(memo) AS memo,
+       MAX(diversifier_index_be) AS diversifier_index_be
 FROM unioned
 GROUP BY output_pool, output_index
 HAVING (:scope_account IS NULL OR MAX(to_account_uuid) = :scope_account
         OR MAX(from_account_uuid) = :scope_account)
 ORDER BY output_pool ASC, output_index ASC";
+
+/// Decode the `addresses.diversifier_index_be` column: `zcash_client_sqlite` stores the 11-byte
+/// ZIP 32 index big-endian so it sorts, i.e. the little-endian representation reversed. Anything
+/// but 11 bytes is not an index this wallet wrote and is reported as absent rather than guessed.
+fn decode_diversifier_index_be(be: &[u8]) -> Option<u128> {
+    let mut le: [u8; 11] = be.try_into().ok()?;
+    le.reverse();
+    Some(u128::from(DiversifierIndex::from(le)))
+}
 
 /// Outputs come back ordered by `(output_pool, output_index)` - see [`LOAD_OUTPUTS_SQL`],
 /// which also explains why the transaction is named by its `transactions.id_tx` row id rather
@@ -698,6 +724,9 @@ fn load_outputs(
                 is_change: row.get("is_change")?,
                 recipient_key_scope: row.get::<_, Option<i64>>("recipient_key_scope")?,
                 memo: if omit_memos { None } else { row.get("memo")? },
+                diversifier_index: row
+                    .get::<_, Option<Vec<u8>>>("diversifier_index_be")?
+                    .and_then(|be| decode_diversifier_index_be(&be)),
             })
         },
     )?;
@@ -961,18 +990,43 @@ pub fn list_transactions(engine_dir: &Path, scope: AccountScope) -> anyhow::Resu
 /// `expired_unmined`, and each output's `to_account`/`to_address`/`value`/`is_change`), so the
 /// existing - and tested - `received_by_address` logic produces identical output.
 ///
-/// `address_filter` (display encoding) is pushed into SQL for `getreceivedbyaddress`, which
-/// asks about a single address: only its outputs are loaded. It is compared against
-/// `v_tx_outputs.to_address` as given - a received transparent output is stored under its bare
-/// t-address (see [`load_outputs`]), so a t-address filter matches the stored rows directly.
+/// `address_filter` is pushed into SQL for `getreceivedbyaddress`, which asks about a single
+/// address: only its outputs are loaded. It is a *set* of candidate encodings rather than the
+/// one string the caller typed, because the recorded encoding of an address is not a stable
+/// identity - see [`recorded_encodings_of`], which is what builds this set. Each candidate is
+/// compared against `v_tx_outputs.to_address` as given, so a bare t-address matches the rows a
+/// transparent receive is stored under (see [`load_outputs`]) while a unified address also
+/// matches whichever sibling encoding of its diversifier index the wallet happens to hold.
+///
+/// An empty slice is not the same as `None`: `None` loads the whole history (the unfiltered
+/// `listreceivedbyaddress`), while an empty set is a filter nothing can satisfy, which is the
+/// right answer for an address the wallet owns but has no `addresses` row for - it can have
+/// received nothing.
 pub fn received_tx_records(
     engine_dir: &Path,
     scope: AccountScope,
-    address_filter: Option<&str>,
+    address_filter: Option<&[String]>,
 ) -> anyhow::Result<Vec<TxRecord>> {
     let conn = open_conn(engine_dir)?;
     let account = scope_by_uuid("v.account_uuid");
-    // Order by the same `sort_height` (oldest-first) as `list_transactions`, so the per-address
+    // The candidate list is at most a handful of strings (one recorded row per in-scope account
+    // and key scope), so it is inlined as a bound-parameter list rather than a temporary table.
+    let address_clause = match address_filter {
+        None => "1".to_string(),
+        Some(candidates) => {
+            let holes = (0..candidates.len())
+                .map(|i| format!(":addr{i}"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            // An empty candidate set must match nothing, and `IN ()` is not valid SQL.
+            if holes.is_empty() {
+                "0".to_string()
+            } else {
+                format!("o.to_address IN ({holes})")
+            }
+        }
+    };
+    // Ordered by the same `sort_height` (oldest-first) as `list_transactions`, so the per-address
     // `txids` list `listreceivedbyaddress` emits is in the identical order it was before this
     // flat path replaced the full N+1 load.
     let mut stmt = conn.prepare(&format!(
@@ -981,7 +1035,7 @@ pub fn received_tx_records(
                 o.recipient_key_scope, v.tx_index
          FROM v_transactions v
          JOIN v_tx_outputs o ON o.txid = v.txid
-         WHERE (:addr IS NULL OR o.to_address = :addr)
+         WHERE {address_clause}
            AND {account}
          ORDER BY COALESCE(
                 v.mined_height,
@@ -989,8 +1043,20 @@ pub fn received_tx_records(
             ) ASC NULLS LAST,
             v.txid ASC, o.output_pool ASC, o.output_index ASC"
     ))?;
+    let scope_param = scope.param();
+    let mut params: Vec<(String, &dyn rusqlite::ToSql)> = vec![(
+        ":scope_account".to_string(),
+        &scope_param as &dyn rusqlite::ToSql,
+    )];
+    let held = address_filter.unwrap_or(&[]);
+    for (i, candidate) in held.iter().enumerate() {
+        params.push((format!(":addr{i}"), candidate as &dyn rusqlite::ToSql));
+    }
     let rows = stmt.query_map(
-        named_params! { ":addr": address_filter, ":scope_account": scope.param() },
+        &*params
+            .iter()
+            .map(|(k, v)| (k.as_str(), *v))
+            .collect::<Vec<_>>(),
         |row| {
             Ok((
                 row.get::<_, Vec<u8>>(0)?,
@@ -1011,6 +1077,8 @@ pub fn received_tx_records(
                     is_change: row.get(5)?,
                     recipient_key_scope: row.get::<_, Option<i64>>(8)?,
                     memo: None,
+                    // Not carried by `v_tx_outputs`, and the aggregation keys by address anyway.
+                    diversifier_index: None,
                 },
             ))
         },
@@ -1927,6 +1995,111 @@ pub fn classify_unified_receivers(
         }
     }
     UaReceivers::Foreign
+}
+
+/// Recover the diversifier index (and scope) at which this wallet derived `ua`'s shielded
+/// receivers, or `None` if no in-scope account owns them. Pure crypto against the account's
+/// viewing key - one FF1 diversifier decrypt per receiver, never an index search.
+///
+/// Both receivers of a wallet-derived UA share one index, so the first that resolves settles it;
+/// a UA whose receivers disagree is a hand-spliced address that [`classify_unified_receivers`]
+/// rejects before any caller reaches this.
+pub fn diversifier_index_of(
+    network: ZNetwork,
+    engine_dir: &Path,
+    scope: AccountScope,
+    addr: &str,
+) -> Option<(DiversifierIndex, Scope)> {
+    let decoded = crate::address::decode_on_network(&network, addr)?;
+    let db = open_read(network, engine_dir).ok()?;
+    for account in scoped_account_ids(&db, scope).ok()? {
+        let Ok(Some(acct)) = db.get_account(account) else {
+            continue;
+        };
+        let Some(ufvk) = acct.ufvk() else {
+            continue;
+        };
+        let found = match &decoded {
+            Address::Unified(ua) => ua
+                .orchard()
+                .and_then(|o| {
+                    ufvk.orchard()
+                        .and_then(|fvk| orchard_receiver_index(fvk, o))
+                })
+                .or_else(|| {
+                    ua.sapling()
+                        .and_then(|p| ufvk.sapling().and_then(|dfvk| dfvk.decrypt_diversifier(p)))
+                }),
+            Address::Sapling(pa) => ufvk.sapling().and_then(|dfvk| dfvk.decrypt_diversifier(pa)),
+            // A transparent address is its own identity in the received-by aggregations (a
+            // t-address receive is recorded under the bare t-address that was paid), so it has
+            // no unified sibling to look up.
+            Address::Transparent(_) | Address::Tex(_) => None,
+        };
+        if found.is_some() {
+            return found;
+        }
+    }
+    None
+}
+
+/// The `addresses` rows this wallet has recorded at the same diversifier index as `addr` - every
+/// encoding under which a receipt at that index could have been stored.
+///
+/// This is what lets `getreceivedbyaddress` answer for an address the wallet owns but recorded
+/// under a *different* encoding of the same index. The recorded string is not a stable identity:
+/// `getnewaddress` writes the `[pools] default_receivers` encoding, while the block scan, meeting
+/// an index with no row yet, writes `zcash_client_sqlite`'s all-receivers one (see
+/// [`crate::address::issued_encoding`]). Since a from-seed restore or `zecd rescan` rebuilds the
+/// table from the scan alone, which of the two is on disk is not something a caller can know.
+///
+/// The index is recovered cryptographically and the lookup is a point read on the
+/// `(account_id, key_scope, diversifier_index_be)` unique index, so this costs one indexed row
+/// per in-scope account rather than a walk of the address list. Returns an empty vector for an
+/// address no in-scope account owns, and for a bare transparent address (its own identity).
+pub fn recorded_encodings_of(
+    network: ZNetwork,
+    engine_dir: &Path,
+    scope: AccountScope,
+    addr: &str,
+) -> Vec<String> {
+    let Some((index, key_scope)) = diversifier_index_of(network, engine_dir, scope, addr) else {
+        return Vec::new();
+    };
+    // The column stores the index big-endian so it sorts; `zcash_client_sqlite` writes it as the
+    // 11-byte little-endian representation reversed.
+    let mut index_be = *index.as_bytes();
+    index_be.reverse();
+    let scope_code = match key_scope {
+        Scope::External => 0,
+        Scope::Internal => 1,
+    };
+    let Ok(conn) = open_conn(engine_dir) else {
+        return Vec::new();
+    };
+    let account = scope_by_id("a.account_id");
+    let Ok(mut stmt) = conn.prepare(&format!(
+        "SELECT a.address
+         FROM addresses a
+         WHERE a.diversifier_index_be = :index_be
+           AND a.key_scope = :key_scope
+           AND a.address IS NOT NULL
+           AND {account}"
+    )) else {
+        return Vec::new();
+    };
+    let rows = stmt.query_map(
+        named_params! {
+            ":index_be": &index_be[..],
+            ":key_scope": scope_code,
+            ":scope_account": scope.param(),
+        },
+        |row| row.get::<_, String>(0),
+    );
+    let Ok(rows) = rows else {
+        return Vec::new();
+    };
+    rows.filter_map(Result::ok).collect()
 }
 
 /// Where a transparent address the wallet owns sits in its BIP 44 derivation - the answer to

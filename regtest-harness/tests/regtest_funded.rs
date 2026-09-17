@@ -1687,6 +1687,73 @@ async fn regtest_funded_orchard_receive() {
          time waitforsync reports synced: {txs}"
     );
 
+    // History names the receive by the receiver that was actually paid - the same string the
+    // funder's own send entry carries, and the same one the live wallet reported before this
+    // restore. The recorded `addresses` row here says otherwise: rebuilt from the block scan, it
+    // holds librustzcash's all-receivers encoding of that diversifier index. Printing that is
+    // what the fix exists to stop, so assert both halves - the address is the one the wallet
+    // issues, and it carries no receiver a shielded-only wallet does not watch.
+    let restored_receive = txs
+        .as_array()
+        .expect("array")
+        .iter()
+        .find(|t| t["category"] == "receive" && t["memoStr"].as_str() == Some(RECEIVE_MEMO))
+        .expect("the restored wallet's funding receive");
+    assert_eq!(
+        restored_receive["address"].as_str(),
+        Some(zecd_ua.as_str()),
+        "a restored wallet's history must name the receive as its live self did ({zecd_ua}), not \
+         by whichever encoding the block scan recorded: {restored_receive}"
+    );
+    let restored_receive_info = watch_only
+        .call("validateaddress", json!([restored_receive["address"]]))
+        .await
+        .expect("validateaddress on the restored receive address");
+    assert_eq!(
+        restored_receive_info["receiver_types"],
+        json!(["orchard"]),
+        "history offered an address this shielded-only wallet does not issue: \
+         {restored_receive_info}"
+    );
+
+    // The stateless identity behind all of that is the diversifier index, and it must line up
+    // three ways across the restore: the receive entry reports it, getaddressinfo on the issued
+    // address reads the same value back, and the live wallet that issued the address agrees.
+    // The restored wallet computed its index from the note alone (its `addresses` table was
+    // rebuilt by the scan), so this is the guard that a site keying its ledger on the index
+    // at issuance keeps matching after a from-seed restore.
+    let restored_index = restored_receive["diversifier_index"]
+        .as_u64()
+        .expect("a received entry carries its diversifier index");
+    let restored_info = watch_only
+        .call("getaddressinfo", json!([zecd_ua]))
+        .await
+        .expect("getaddressinfo on the restored wallet");
+    assert_eq!(
+        restored_info["diversifier_index"].as_u64(),
+        Some(restored_index),
+        "getaddressinfo must read back the index the receive entry reports: {restored_info}"
+    );
+    let live_info = zecd
+        .call("getaddressinfo", json!([zecd_ua]))
+        .await
+        .expect("getaddressinfo on the live wallet");
+    assert_eq!(
+        live_info["diversifier_index"].as_u64(),
+        Some(restored_index),
+        "the live wallet and its restore must agree on the address's index: {live_info}"
+    );
+    // And the address takes apart into exactly the string history reports for it.
+    let parts = watch_only
+        .call("z_listunifiedreceivers", json!([zecd_ua]))
+        .await
+        .expect("z_listunifiedreceivers on the restored wallet");
+    assert_eq!(
+        parts,
+        json!({ "orchard": zecd_ua }),
+        "an orchard-only address takes apart into itself under `orchard`"
+    );
+
     // What was just rediscovered from nothing but a viewing key + the chain is an IRONWOOD note.
     // This is the from-scratch recovery path for the pool mainnet/testnet are on: the scan had to
     // trial-decrypt an Orchard-V3 note out of the compact blocks, record it in `ironwood_received_notes`,
@@ -1703,6 +1770,64 @@ async fn regtest_funded_orchard_receive() {
         watch_lu.iter().any(|u| u["pool"] == "ironwood"),
         "the viewing-key-only rescan rediscovers the receive as an ironwood note: {watch_lu:?}"
     );
+
+    // The restored wallet must answer for the address the ORIGINAL wallet handed out. This is
+    // the guard for the per-address reporting bug: the funded wallet got `zecd_ua` from
+    // `getnewaddress`, which recorded that exact encoding in its `addresses` table, but this
+    // wallet was rebuilt from a viewing key and the chain alone - so every one of its address
+    // rows was written by the block scan, which records `UnifiedAddressRequest::ALLOW_ALL`
+    // (transparent + Sapling + Orchard) rather than the Orchard-only encoding zecd issues.
+    //
+    // Under whole-string matching that divergence was silent and total: `getreceivedbyaddress`
+    // returned 0.00000000 for the wallet's own address while the same funds were listed under a
+    // UA the wallet would never derive - one carrying a transparent receiver a shielded-only
+    // wallet does not watch. A payment processor reconciling per address sees every address at
+    // zero, with wallet-level balances still correct, so nothing else in this file would notice.
+    //
+    // Both directions are asserted, because the fix has two halves that fail differently: the
+    // total (the diversifier-index lookup behind the SQL filter) and the reported address (the
+    // re-encoding). Note the balance is deliberately not used as a proxy - it stays right in
+    // exactly the broken case.
+    let restored_recv = watch_only
+        .call("getreceivedbyaddress", json!([zecd_ua]))
+        .await
+        .expect("getreceivedbyaddress on the restored wallet");
+    assert_eq!(
+        restored_recv.as_f64(),
+        Some(1.0),
+        "a restored wallet must credit the funding receive to the address its live self handed \
+         out ({zecd_ua}), not to whichever encoding the block scan recorded: {restored_recv}"
+    );
+    let restored_lra = watch_only
+        .call("listreceivedbyaddress", json!([1, false]))
+        .await
+        .expect("listreceivedbyaddress on the restored wallet");
+    let restored_lra = restored_lra.as_array().expect("array");
+    assert!(
+        restored_lra.iter().any(|e| {
+            e["address"] == json!(zecd_ua.as_str())
+                && e["txids"].as_array().is_some_and(|t| !t.is_empty())
+        }),
+        "a restored wallet must report its receipts under the address it issues ({zecd_ua}): \
+         {restored_lra:?}"
+    );
+    // ...and must not report them under any other spelling of the same funds. Every address it
+    // lists has to be one this wallet would hand out, which for a shielded-only wallet means no
+    // transparent receiver - the shape that would send a payer's funds somewhere nothing is
+    // watching if an operator ever copied it out of here and gave it to a customer.
+    for entry in restored_lra {
+        let listed = entry["address"].as_str().expect("address string");
+        let info = watch_only
+            .call("validateaddress", json!([listed]))
+            .await
+            .expect("validateaddress on a listed address");
+        assert_eq!(
+            info["receiver_types"],
+            json!(["orchard"]),
+            "listreceivedbyaddress offered {listed}, which this shielded-only wallet does not \
+             issue: {info}"
+        );
+    }
 
     // The enhancement backlog is an observable signal, not just an internal step: once the drain
     // completes, /status must report `pending_enhancements: 0` and the connection back to `ready`
