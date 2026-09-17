@@ -5,6 +5,107 @@ All notable changes to zecd are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com), and this
 project adheres to [Semantic Versioning](https://semver.org).
 
+## [0.8.0-rc3] - 2026-09-17
+
+Mostly a performance candidate, plus one correctness fix worth reading if you reconcile
+payments per address. No configuration key or default from rc2 moved, and the new `[sync]`
+keys all default to the behaviour you already have; the response shapes gain fields and one
+method, all additive.
+
+The headline is that **a full node is no longer the slowest way to sync zecd**. On a
+238,000-block testnet restore against a node on loopback, a from-seed scan went from 803 s
+to 152 s, where a lightwalletd across the internet had served the same wallet in 214 s. The
+memo drain that follows the scan improved on the same order: a 7,546-request backlog went
+from 1303 s to 194 s at the shipped default, and a case that previously did not converge at
+all now does.
+
+Every number below is the same wallet on the same host, and each change was measured on its
+own. A deployment that syncs from a light backend gains less, though not nothing.
+
+### Added
+- **`[sync] writer_cache_mib`** (default 256), the SQLite page cache for the wallet's writer
+  connection. It was on SQLite's 2 MiB default while the read connections were already at 32,
+  and the writer is the one doing the work: 178 s to 152 s. It is a ceiling rather than an
+  allocation and durability does not depend on it, but SQLite keeps a cache once it has grown
+  for the life of the connection, and there is one writer per configured wallet and per fleet
+  shard. `config check` warns when the value times the writer connections passes 2 GiB.
+- **`[sync] enhance_concurrency`** (default 16), how many memo fetches the drain has in flight
+  at once. Also the number of stores between two points where the wallet actor services queued
+  commands, since the stores still run one at a time on the single writer.
+- **`z_listunifiedreceivers`**, taking a unified address apart into per-receiver strings in
+  zcashd's shape and vocabulary. By construction these are the strings history reports for
+  outputs paid to that address. Pure and key-free, so it works on an address you are about to
+  pay as well as one you own.
+- **`diversifier_index` on received history entries and on `getaddressinfo`** for any of the
+  wallet's own addresses. It is the stateless identity every encoding of an address shares, and
+  it survives a restore because the scanner recovers it from the note. Read from the row the
+  note already links to, so it costs no cryptography per entry. Sends never carry it; the
+  recipient's index is theirs. Together with the method above, this is the read-back half of
+  `z_getaddressforaccount`: issue with it, store the integer, and every later receipt resolves
+  to it regardless of which encoding of the address is in play.
+- **`/status` reports where sync time goes.** Each batch logs a `batch complete` line with its
+  phase split, accumulated as `sync_totals`; the memo drain publishes its own totals, split
+  between reading the request table, waiting on the upstream, and applying transactions.
+
+### Changed
+- **A full node's block stream keeps 32 blocks in flight.** A node serves a compact block in
+  two dependent round trips and has no range request to batch them into, and the stream issued
+  them one block at a time: 476,000 sequential round trips for that restore. The pairs for
+  different blocks are independent, so they now overlap, with delivery still in height order
+  for the scanner and an error still ending the range at the block that hit it. 803 s to 249 s.
+- **The block cache is in memory.** A batch lived entirely inside one scan call, so writing one
+  file per block plus a metadata index bought nothing and cost about 30,000 syscalls per
+  10,000-block batch; cleanup alone was 10 s of a 220 s scan. It also carried a class of
+  file-versus-metadata inconsistency on the reorg path that no longer has anywhere to occur.
+  An existing data directory migrates and `zecd rescan` removes the old `blocks/` and
+  `blockmeta.sqlite`.
+- **The next range downloads while the current one scans**, where the loop used to alternate
+  between the network and this host's CPU with each idle for the other's turn. 249 s to 184 s
+  on a full node, about 8% on lightwalletd. Shielded-only wallets only: the transparent matcher
+  checks blocks against address and outpoint sets that a receive in the current batch can
+  extend.
+- **The memo drain fetches concurrently, reads its request table once per pass, and commits
+  once per pass.** Fetching one transaction at a time capped throughput at 1/latency, about
+  five requests a second against a remote server. Choosing what to service and publishing
+  status each read and de-duplicated every queued request, charged once per pass however few it
+  serviced, which is what made a large backlog quadratic: 394 s deciding what to fetch against
+  189 s fetching. And each stored transaction was its own commit. A pass now either records
+  everything it fetched or records none of it and is retried whole.
+- **Calls to a full node are capped at 64 in flight.** Concurrency helps a light backend and
+  hurts a node, where every fetch is its own HTTP/1.1 call, the client opens a connection per
+  concurrent request, and the server refuses a burst rather than queueing it. `config check`
+  warns above 64 either way.
+- **Incoming history names the receiver an output actually paid**, in both directions, so a
+  payer and a payee print the same string for one output and history no longer depends on
+  `[pools] default_receivers`. Byte-identical under the default Orchard-only configuration;
+  visible only on a wallet configured with several default receivers, which now also warns once
+  at startup and from `config check` that the address it hands out is not the string history
+  will report.
+- **`[sync] batch_size` still defaults to 10,000.** 2k/10k/25k/50k measured 294/226/198/207 s,
+  but two batches are now resident at once and mainnet's densest ranges make that hundreds of
+  megabytes at 25k. `config check` warns above 50,000.
+
+### Security
+- **rustls updated past RUSTSEC-2026-0285.** A patch release under the same license terms.
+
+### Fixed
+- **Per-address reads returned zero after a from-seed restore or `zecd rescan`.**
+  `getreceivedbyaddress` answered `0.00000000` for the wallet's own `getnewaddress` address,
+  and `listreceivedbyaddress` and `z_listtransactions` reported those funds under an address
+  zecd will not derive - one carrying a transparent receiver a shielded-only wallet does not
+  watch. Balances stayed correct throughout, so only per-address reconciliation could see it.
+  The cause is that which encoding of a diversifier index a payer used never reaches the chain,
+  so the wallet picks one, and the pick depended on whether `getnewaddress` or the block scanner
+  wrote the row first; a restore rebuilds that table from the scan alone and so switched every
+  index to the scanner's spelling. Matching is now by diversifier index rather than by the
+  recorded string, so any encoding of an index the wallet owns answers with that index's
+  receipts. A spliced address is still rejected, and a bare transparent address is still its own
+  key.
+- Regtest only, with no effect on a running daemon: a harness helper returned as soon as it saw
+  a transaction confirmed, which could be one block before the wallet had caught up, so a
+  following phase read `confirmations` twice a second apart and saw them differ. It now waits
+  for the wallet to reach the node's tip.
+
 ## [0.8.0-rc2] - 2026-09-10
 
 The second 0.8.0 candidate. Its headline is a dependency change with no surface of its own: the
@@ -767,6 +868,7 @@ Zcash, backed entirely by librustzcash and running as a light client.
 ### Security
 - Pre-release audit hardening; refuse to start on mainnet with the placeholder RPC password; enforce a 12-character passphrase minimum.
 
+[0.8.0-rc3]: https://github.com/zecrocks/zecd/compare/v0.8.0-rc2...v0.8.0-rc3
 [0.8.0-rc2]: https://github.com/zecrocks/zecd/compare/v0.8.0-rc1...v0.8.0-rc2
 [0.8.0-rc1]: https://github.com/zecrocks/zecd/compare/v0.7.0...v0.8.0-rc1
 [0.7.0]: https://github.com/zecrocks/zecd/compare/v0.6.3...v0.7.0
