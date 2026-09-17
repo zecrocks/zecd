@@ -648,6 +648,7 @@ mod tests {
             fetch_memos: true,
             batch_size: crate::sync::engine::DEFAULT_BATCH_SIZE,
             writer_cache_mib: crate::wallet::open::DEFAULT_WRITER_CACHE_MIB,
+            enhance_concurrency: crate::config::DEFAULT_ENHANCE_CONCURRENCY,
             reconnect_base: std::time::Duration::from_secs(1),
             reconnect_max: std::time::Duration::from_secs(2),
             confirmations_policy: Default::default(),
@@ -787,6 +788,8 @@ pub struct ShardTemplate {
     /// Each shard's writer page-cache ceiling (`[sync] writer_cache_mib`); a shard is one
     /// more writer connection, so the daemon-wide memory figure counts it.
     pub writer_cache_mib: u32,
+    /// Transaction fetches in flight per enhancement pass (`[sync] enhance_concurrency`).
+    pub enhance_concurrency: usize,
     pub reconnect_base: std::time::Duration,
     pub reconnect_max: std::time::Duration,
     pub confirmations_policy: zcash_client_backend::data_api::wallet::ConfirmationsPolicy,
@@ -1100,6 +1103,7 @@ impl ShardTemplate {
             fetch_memos: self.fetch_memos,
             batch_size: self.batch_size,
             writer_cache_mib: self.writer_cache_mib,
+            enhance_concurrency: self.enhance_concurrency,
             reconnect_base: self.reconnect_base,
             reconnect_max: self.reconnect_max,
             age_identity: None,

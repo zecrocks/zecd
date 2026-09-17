@@ -226,12 +226,28 @@ impl CallError {
     }
 }
 
-/// A cheaply-clonable zebrad JSON-RPC client (hyper pools the underlying connections).
+/// How many JSON-RPC calls a [`ZebraClient`] and its clones keep in flight at once.
+///
+/// Every call is its own HTTP/1.1 request, and hyper's pool opens a connection per concurrent
+/// request, so without a bound the concurrency of every caller adds up at the node: the block
+/// pump's [`BLOCK_FETCH_CONCURRENCY`], the enhancement drain's `[sync] enhance_concurrency`,
+/// the tip and mempool pollers. Measured on a local Zakura node, a drain at 256 concurrent
+/// fetches ran *slower* than the sequential one it replaced, where the same setting against a
+/// lightwalletd (one HTTP/2 connection, multiplexed) was the fastest. A node's JSON-RPC server
+/// has a connection limit of its own (zebra's is 100 by default), and a burst past it is
+/// refused, not queued. So the cap lives here, where every path shares it: comfortably above
+/// the pump's window, below the node's limit. The semaphore is fair, so a tip refresh queued
+/// behind a full pump waits one call's worth, not the pump's.
+const MAX_INFLIGHT_CALLS: usize = 64;
+
+/// A cheaply-clonable zebrad JSON-RPC client (hyper pools the underlying connections). Every
+/// clone shares one in-flight budget ([`MAX_INFLIGHT_CALLS`]).
 #[derive(Clone)]
 pub struct ZebraClient {
     http: HyperClient<crate::socks::MaybeSocksConnector, Full<Bytes>>,
     url: hyper::Uri,
     auth_header: Option<String>,
+    inflight: std::sync::Arc<tokio::sync::Semaphore>,
 }
 
 /// Policy for the plaintext zebra connection's cleartext-credential gate. The zebra RPC is
@@ -388,10 +404,18 @@ impl ZebraClient {
                 .build(crate::socks::MaybeSocksConnector::new(proxy)),
             url,
             auth_header,
+            inflight: std::sync::Arc::new(tokio::sync::Semaphore::new(MAX_INFLIGHT_CALLS)),
         })
     }
 
     async fn call(&self, method: &str, params: Value) -> Result<Value, CallError> {
+        // Held for the whole round trip. The semaphore is never closed, so acquiring cannot
+        // fail.
+        let _inflight = self
+            .inflight
+            .acquire()
+            .await
+            .expect("the in-flight semaphore is never closed");
         let body = json!({ "jsonrpc": "2.0", "id": "zecd", "method": method, "params": params });
         let mut req = hyper::Request::builder()
             .method(hyper::Method::POST)
@@ -1456,6 +1480,9 @@ mod tests {
         /// Extra latency for a `getblock verbosity=0` reply, keyed like `raw_blocks`. Slept
         /// *after* the state lock is released, so slow blocks do not serialize the others.
         block_delay: HashMap<String, Duration>,
+        /// Requests currently being served, and the most ever served at once.
+        inflight: usize,
+        max_inflight: usize,
         treestate: Value,
         subtrees: Value,
         mempool: Vec<String>,
@@ -1486,6 +1513,8 @@ mod tests {
                 raw_blocks: HashMap::new(),
                 verbose_blocks: HashMap::new(),
                 block_delay: HashMap::new(),
+                inflight: 0,
+                max_inflight: 0,
                 treestate: Value::Null,
                 subtrees: Value::Null,
                 mempool: Vec::new(),
@@ -1511,6 +1540,8 @@ mod tests {
         // the edition-2021 `Send` analysis only sees the guard's scope end at the block.
         let (response, delay) = {
             let mut fake = state.lock().unwrap();
+            fake.inflight += 1;
+            fake.max_inflight = fake.max_inflight.max(fake.inflight);
             fake.seen_auth.push(
                 headers
                     .get(axum::http::header::AUTHORIZATION)
@@ -1601,6 +1632,7 @@ mod tests {
         if let Some(delay) = delay {
             tokio::time::sleep(delay).await;
         }
+        state.lock().unwrap().inflight -= 1;
         response
     }
 
@@ -2402,6 +2434,39 @@ mod tests {
         assert!(
             elapsed < sequential / 2,
             "fetches overlapped: {elapsed:?} against {sequential:?} served sequentially"
+        );
+    }
+
+    /// Every clone of the client shares one in-flight budget, so however many callers issue
+    /// calls at once - the block pump, a drain at `enhance_concurrency` 256, the pollers - the
+    /// node sees at most `MAX_INFLIGHT_CALLS` at a time. Measured on a local node, an unbounded
+    /// drain ran slower than the sequential one; a node's own connection limit refuses a burst
+    /// past it rather than queueing.
+    #[tokio::test]
+    async fn concurrent_calls_are_capped_at_the_in_flight_limit() {
+        const CALLS: usize = 3 * MAX_INFLIGHT_CALLS + 8;
+        let fake = Arc::new(Mutex::new(Fake::new()));
+        {
+            let mut f = fake.lock().unwrap();
+            f.raw_blocks.insert("5".into(), "00".into());
+            // Long enough that the first wave is all in flight before any of it completes.
+            f.block_delay.insert("5".into(), Duration::from_millis(300));
+        }
+        let src = source_for(Arc::clone(&fake)).await;
+
+        let calls = (0..CALLS).map(|_| {
+            let client = src.client.clone();
+            async move { client.block_raw("5").await }
+        });
+        for result in futures_util::future::join_all(calls).await {
+            result.expect("every call completes");
+        }
+
+        let max_inflight = fake.lock().unwrap().max_inflight;
+        assert_eq!(
+            max_inflight, MAX_INFLIGHT_CALLS,
+            "the node saw exactly the cap at peak: neither more (the cap held) nor fewer (the \
+             calls were really concurrent)"
         );
     }
 

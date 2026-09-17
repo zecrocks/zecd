@@ -170,6 +170,11 @@ pub fn render(config: &AppConfig) -> String {
     kv(&mut s, "fetch_memos", config.sync.fetch_memos);
     kv(&mut s, "batch_size", config.sync.batch_size);
     kv(&mut s, "writer_cache_mib", config.sync.writer_cache_mib);
+    kv(
+        &mut s,
+        "enhance_concurrency",
+        config.sync.enhance_concurrency,
+    );
 
     table(&mut s, "spend");
     kv(

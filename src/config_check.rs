@@ -256,6 +256,10 @@ const BATCH_SIZE_MEMORY_WARN: u32 = 50_000;
 /// saying so: 2 GiB. Past that the ceiling is the kind of number a memory-capped container
 /// is sized against, and a cache that has grown is kept for the connection's lifetime.
 const WRITER_CACHE_TOTAL_WARN_MIB: u64 = 2048;
+/// The `[sync] enhance_concurrency` above which a warning is worth it: past the measured knee
+/// (64 in flight took 136 s where 256 took 105 s on a rack-local lightwalletd), and enough
+/// concurrent streams that a public lightwalletd may throttle the client.
+const ENHANCE_CONCURRENCY_WARN: usize = 64;
 
 /// `[sync]`: settings with a consequence an operator should meet before deploying rather than
 /// after.
@@ -266,6 +270,16 @@ const WRITER_CACHE_TOTAL_WARN_MIB: u64 = 2048;
 /// attached none), and a batch's memory only shows on the densest ranges, so name the
 /// consequence where an operator is already reading findings.
 fn check_sync(config: &AppConfig, findings: &mut Vec<Finding>) {
+    if config.sync.enhance_concurrency > ENHANCE_CONCURRENCY_WARN {
+        findings.push(Finding::warning(format!(
+            "[sync] enhance_concurrency = {}: this many transaction fetches go to the upstream \
+             at once during the enhancement drain. The gain flattens past 64 (measured: 64 in \
+             flight 136 s, 256 in flight 105 s on the same drain), and a public lightwalletd \
+             may throttle a client opening that many streams; a zebra upstream caps them at its \
+             own in-flight limit regardless",
+            config.sync.enhance_concurrency
+        )));
+    }
     if config.sync.batch_size > BATCH_SIZE_MEMORY_WARN {
         findings.push(Finding::warning(format!(
             "[sync] batch_size = {}: a batch lives in memory while it scans, and the next one \
@@ -743,6 +757,50 @@ mod tests {
                 .any(|w| w.contains("4 writer connections") && w.contains("4096 MiB")),
             "the warning counts the wallets: {:?}",
             warnings(&many_wallets)
+        );
+    }
+
+    /// The two `[sync]` sizes are warned about only past their measured knees: the defaults
+    /// and the server-class settings (25000 blocks, 64 fetches) are silent.
+    #[test]
+    fn oversized_sync_batch_and_concurrency_are_warned_about() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = format!("network = \"regtest\"\ndatadir = {:?}\n", dir.path());
+
+        let big = inspect(&resolve(
+            &format!("{base}[sync]\nbatch_size = 100000\nenhance_concurrency = 256\n"),
+            dir.path(),
+        ));
+        assert!(
+            errors(&big).is_empty(),
+            "sizes are never errors: {:?}",
+            errors(&big)
+        );
+        assert!(
+            warnings(&big)
+                .iter()
+                .any(|w| w.contains("batch_size = 100000")),
+            "the batch warning names the value: {:?}",
+            warnings(&big)
+        );
+        assert!(
+            warnings(&big)
+                .iter()
+                .any(|w| w.contains("enhance_concurrency = 256")),
+            "the concurrency warning names the value: {:?}",
+            warnings(&big)
+        );
+
+        let server_class = inspect(&resolve(
+            &format!("{base}[sync]\nbatch_size = 25000\nenhance_concurrency = 64\n"),
+            dir.path(),
+        ));
+        assert!(
+            !warnings(&server_class)
+                .iter()
+                .any(|w| w.contains("batch_size") || w.contains("enhance_concurrency")),
+            "the measured sweet spots do not warn: {:?}",
+            warnings(&server_class)
         );
     }
 

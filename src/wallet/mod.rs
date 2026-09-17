@@ -124,6 +124,43 @@ impl SyncTotals {
     }
 }
 
+/// Everything the enhancement drain has spent since this actor started.
+///
+/// The drain is the half of a restore that runs after the block scan reports done, and on a
+/// wallet with real history it is the larger half. It is bounded by upstream round trips and by
+/// the single writer, not by this host's cores, so its cost cannot be read off [`SyncTotals`] -
+/// it needs its own counters.
+#[derive(Clone, Copy, Debug, Default)]
+#[non_exhaustive]
+pub struct EnhanceTotals {
+    /// Drain passes run (each services at most `[sync] enhance_concurrency` requests).
+    pub passes: u64,
+    /// Requests serviced across every pass.
+    pub serviced: u64,
+    /// Wall clock reading and de-duplicating the request table to decide what a pass services,
+    /// in milliseconds. A fixed cost per pass, so it grows relative to the useful work as the
+    /// number of requests serviced per pass falls.
+    pub requests_ms: u64,
+    /// Wall clock waiting on the upstream for the pass's concurrent fetches, in milliseconds -
+    /// roughly one round trip per pass, not per request.
+    pub upstream_ms: u64,
+    /// Wall clock applying the fetched transactions to the wallet database, in milliseconds:
+    /// trial decryption plus the writes, on the single writer, so nothing overlaps it.
+    pub apply_ms: u64,
+}
+
+impl EnhanceTotals {
+    /// Mean milliseconds of upstream wait plus database apply per serviced request, or `0.0`
+    /// before anything is serviced.
+    pub fn per_request_ms(&self) -> f64 {
+        if self.serviced > 0 {
+            (self.upstream_ms + self.apply_ms) as f64 / self.serviced as f64
+        } else {
+            0.0
+        }
+    }
+}
+
 /// A snapshot of sync state, published by the actor and read by blockchain/wallet RPCs.
 #[derive(Clone, Debug, Default)]
 #[non_exhaustive]
@@ -187,6 +224,8 @@ pub struct SyncStatus {
     pub enhanced_through: Option<u32>,
     /// Cumulative block-scan cost by phase since this actor started. See [`SyncTotals`].
     pub sync_totals: SyncTotals,
+    /// Cumulative enhancement-drain cost since this actor started. See [`EnhanceTotals`].
+    pub enhance_totals: EnhanceTotals,
     /// True when the wallet is passphrase-encrypted (Bitcoin Core's `HasEncryptionKeys()`).
     /// Drives whether `getwalletinfo` reports `unlocked_until` and how the passphrase RPCs behave.
     pub encrypted: bool,

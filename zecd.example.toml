@@ -419,6 +419,18 @@ rebroadcast_secs = 60
 # writer_cache_mib times the number of wallets and shards; `config check` warns past 2 GiB.
 # Durability does not depend on it, and raising it past the wallet's database size buys nothing.
 # writer_cache_mib = 256
+#
+# enhance_concurrency (default 16) - how many transaction fetches the enhancement drain (the memo
+# backfill that runs after the block scan) keeps in flight at once, which is also how many
+# requests one drain pass services. One at a time the drain is bound by the upstream's round trip
+# however fast the host: measured on a 7,546-request drain against a rack-local lightwalletd,
+# 1 in flight took 1303s, 16 took 194s, 64 took 136s, 256 took 105s. The gain flattens past 64,
+# and a public lightwalletd may throttle a client opening that many streams (config check warns
+# above 64). A zebra upstream caps its JSON-RPC calls at 64 in flight whatever this is set to.
+# Only the fetches are concurrent: the results are stored one after another on the wallet's
+# single writer, so this is also how many stores run before the actor next services a queued
+# command (a send, getnewaddress) - the same 16-store window as before at the default.
+# enhance_concurrency = 16
 
 [spend]
 # The wallet-wide confirmations policy (ZIP 315 defaults, like Zallet): how deep an output

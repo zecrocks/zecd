@@ -203,6 +203,17 @@ fn snapshot(state: &AppState) -> Snapshot {
                     "transparent_ms": st.sync_totals.transparent_ms,
                     "total_ms": st.sync_totals.total_ms(),
                 },
+                // The drain that runs after the scan, reported apart: it is bound by upstream
+                // round trips and the single writer, so its cost does not move with this
+                // host's cores the way the scan's does.
+                "enhance_totals": {
+                    "passes": st.enhance_totals.passes,
+                    "serviced": st.enhance_totals.serviced,
+                    "requests_ms": st.enhance_totals.requests_ms,
+                    "upstream_ms": st.enhance_totals.upstream_ms,
+                    "apply_ms": st.enhance_totals.apply_ms,
+                    "per_request_ms": st.enhance_totals.per_request_ms(),
+                },
                 "encrypted": st.encrypted,
                 "locked": locked,
                 "ready": w_ready,

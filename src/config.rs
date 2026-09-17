@@ -863,7 +863,31 @@ pub struct SyncConfig {
     /// past 2 GiB. Lower it on a small host or a large fleet; raising it past the wallet's
     /// database size buys nothing. Durability does not depend on it.
     pub writer_cache_mib: u32,
+    /// How many transaction fetches the enhancement drain keeps in flight at once, which is
+    /// also how many requests one drain pass services. Default [`DEFAULT_ENHANCE_CONCURRENCY`]
+    /// (16).
+    ///
+    /// The drain that follows the block scan is one upstream round trip per transaction, and
+    /// serviced one at a time its throughput is `1 / latency` however fast the host or the
+    /// link - about 5 requests a second against a remote lightwalletd, against a backlog that
+    /// on a busy wallet is tens of thousands. The requests are independent, so they go
+    /// upstream together, this many at a time, and the pass's results are applied under one
+    /// database transaction. Measured on a 7,546-request drain against a rack-local
+    /// lightwalletd: 1 in flight took 1303 s, 16 took 194 s, 64 took 136 s, 256 took 105 s.
+    /// Against a full node each fetch is its own JSON-RPC call, and the zebra client caps those
+    /// at its own in-flight limit whatever this is set to. `config check` warns above 64: a
+    /// public lightwalletd may throttle a client that opens that many streams at once.
+    ///
+    /// Only the fetches are concurrent. The results are applied on the wallet's single writer,
+    /// one after another, so this is also how many stores the actor performs before it next
+    /// services a queued command - the pass-sized window in which a send or `getnewaddress`
+    /// waits. At the default it is the same 16-store window the sequential drain had; at 256
+    /// on a wallet whose stores have grown to hundreds of milliseconds each it is a minute.
+    pub enhance_concurrency: usize,
 }
+
+/// The default `[sync] enhance_concurrency`.
+pub const DEFAULT_ENHANCE_CONCURRENCY: usize = 16;
 
 /// `[spend]` - the wallet-wide confirmations policy (ZIP 315 defaults, like Zallet's
 /// `trusted_confirmations`/`untrusted_confirmations`): how deep an output must be before
@@ -1508,6 +1532,8 @@ struct SyncFile {
     batch_size: Option<u32>,
     /// See [`SyncConfig::writer_cache_mib`].
     writer_cache_mib: Option<u32>,
+    /// See [`SyncConfig::enhance_concurrency`].
+    enhance_concurrency: Option<usize>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -2284,6 +2310,7 @@ impl AppConfig {
             fetch_memos: None,
             batch_size: None,
             writer_cache_mib: None,
+            enhance_concurrency: None,
         });
         let sync = SyncConfig {
             // Clamp to >= 1s so a misconfigured `interval_secs = 0` can't make the actor busy-poll
@@ -2301,6 +2328,11 @@ impl AppConfig {
             writer_cache_mib: sync_file
                 .writer_cache_mib
                 .unwrap_or(crate::wallet::open::DEFAULT_WRITER_CACHE_MIB)
+                .max(1),
+            // Zero would stall the drain outright.
+            enhance_concurrency: sync_file
+                .enhance_concurrency
+                .unwrap_or(DEFAULT_ENHANCE_CONCURRENCY)
                 .max(1),
         };
 
