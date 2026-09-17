@@ -148,8 +148,8 @@ pub fn fleet_path_conflict(
 }
 
 /// Where the wallet-storage engine's own files live: `<wallet dir>/zec/lrz` for Zcash, holding
-/// everything librustzcash owns - `data.sqlite`, `blockmeta.sqlite`, `blocks/`
-/// ([`Coin::engine_dir`]).
+/// everything librustzcash owns - `data.sqlite`, plus the `blockmeta.sqlite` and `blocks/` an
+/// older zecd's on-disk block cache left behind ([`Coin::engine_dir`]).
 ///
 /// Nothing outside these functions and [`crate::migrate`] should join a coin or engine
 /// directory name onto a path: callers take a wallet directory from [`WalletEntry::dir`] and an
@@ -837,6 +837,32 @@ pub struct SyncConfig {
     /// back on drains the backlog and backfills the memos with no rescan. NB a deployment whose
     /// shielded deposit flow identifies depositors *by memo* must keep it on.
     pub fetch_memos: bool,
+    /// How many blocks one download-and-scan batch covers. Default
+    /// [`DEFAULT_BATCH_SIZE`](crate::sync::engine::DEFAULT_BATCH_SIZE) (10,000).
+    ///
+    /// Each batch pays a fixed cost - one tree-state round trip, one scan-range query, one
+    /// `put_blocks` database transaction - so a bigger batch amortizes it over more blocks.
+    /// Measured on a 238k-block testnet restore: 2,000-block batches scanned in 294 s, 10,000 in
+    /// 226 s, 25,000 in 198 s, 50,000 in 207 s - the curve flattens past 25,000 and the memory
+    /// held per batch keeps growing. The batch lives in memory (`sync::memcache`), and one more
+    /// is fetched ahead while it scans, so two batches of compact blocks are resident at once;
+    /// on mainnet's densest ranges that is hundreds of megabytes at 25,000. The default stays
+    /// at 10,000 for that reason; a server with memory to spare sets 25,000. Also bounds how far
+    /// a reorg rewind will grow ([`REORG_MAX_MARGIN`](crate::sync::engine::REORG_MAX_MARGIN)).
+    pub batch_size: u32,
+    /// The SQLite page-cache ceiling of each wallet's writer connection, in MiB. Default
+    /// [`DEFAULT_WRITER_CACHE_MIB`](crate::wallet::open::DEFAULT_WRITER_CACHE_MIB) (256).
+    ///
+    /// The writer is the connection the sync loop scans through, and SQLite's own default of
+    /// 2 MiB made it re-read the note-commitment tree pages from the operating system on
+    /// nearly every block; 256 MiB took a deep testnet restore's scan from 178 s to 152 s. It
+    /// is a ceiling, not an allocation - a small wallet never reaches it - but a cache that has
+    /// grown is kept for the connection's lifetime, and every writer has its own: one per
+    /// configured wallet and one per fleet shard. So the daemon-wide figure to size against is
+    /// this value times the number of wallets and shards, which `config check` warns about
+    /// past 2 GiB. Lower it on a small host or a large fleet; raising it past the wallet's
+    /// database size buys nothing. Durability does not depend on it.
+    pub writer_cache_mib: u32,
 }
 
 /// `[spend]` - the wallet-wide confirmations policy (ZIP 315 defaults, like Zallet's
@@ -1478,6 +1504,10 @@ struct SyncFile {
     rebroadcast_secs: Option<u64>,
     /// See [`SyncConfig::fetch_memos`].
     fetch_memos: Option<bool>,
+    /// See [`SyncConfig::batch_size`].
+    batch_size: Option<u32>,
+    /// See [`SyncConfig::writer_cache_mib`].
+    writer_cache_mib: Option<u32>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -2252,6 +2282,8 @@ impl AppConfig {
             interval_secs: None,
             rebroadcast_secs: None,
             fetch_memos: None,
+            batch_size: None,
+            writer_cache_mib: None,
         });
         let sync = SyncConfig {
             // Clamp to >= 1s so a misconfigured `interval_secs = 0` can't make the actor busy-poll
@@ -2259,6 +2291,17 @@ impl AppConfig {
             interval_secs: sync_file.interval_secs.unwrap_or(20).max(1),
             rebroadcast_secs: sync_file.rebroadcast_secs.unwrap_or(60).max(1),
             fetch_memos: sync_file.fetch_memos.unwrap_or(true),
+            // A zero-block batch would make the scan loop spin without advancing.
+            batch_size: sync_file
+                .batch_size
+                .unwrap_or(crate::sync::engine::DEFAULT_BATCH_SIZE)
+                .max(1),
+            // SQLite treats a zero cache as "no cache"; clamp so a typo cannot make every
+            // page read a syscall.
+            writer_cache_mib: sync_file
+                .writer_cache_mib
+                .unwrap_or(crate::wallet::open::DEFAULT_WRITER_CACHE_MIB)
+                .max(1),
         };
 
         let spend_file = file.spend.unwrap_or_default();
@@ -3675,6 +3718,29 @@ mod tests {
         let cli = Cli::parse_from(["zecd", "--conf", conf.to_str().unwrap()]);
         let cfg = AppConfig::resolve(&cli).unwrap();
         assert_eq!(cfg.sync.interval_secs, 20);
+    }
+
+    /// `[sync] writer_cache_mib` defaults to the measured 256 MiB, parses an override, and
+    /// clamps zero to one - SQLite would take a zero cache literally.
+    #[cfg(feature = "cli")]
+    #[test]
+    fn writer_cache_mib_defaults_parses_and_clamps() {
+        use clap::Parser as _;
+        let dir = tempfile::tempdir().unwrap();
+        let conf = dir.path().join("zecd.toml");
+        for (body, expected) in [
+            (
+                "[sync]\ninterval_secs = 20\n",
+                crate::wallet::open::DEFAULT_WRITER_CACHE_MIB,
+            ),
+            ("[sync]\nwriter_cache_mib = 64\n", 64),
+            ("[sync]\nwriter_cache_mib = 0\n", 1),
+        ] {
+            std::fs::write(&conf, body).unwrap();
+            let cli = Cli::parse_from(["zecd", "--conf", conf.to_str().unwrap()]);
+            let cfg = AppConfig::resolve(&cli).unwrap();
+            assert_eq!(cfg.sync.writer_cache_mib, expected, "config body: {body:?}");
+        }
     }
 
     /// `[sync] fetch_memos` defaults on (memos are part of the standard history surface) and

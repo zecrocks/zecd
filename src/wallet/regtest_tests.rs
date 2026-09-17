@@ -1063,6 +1063,8 @@ fn offline_actor_cfg(
         sync_interval: Duration::from_secs(60),
         rebroadcast_interval: Duration::from_secs(60),
         fetch_memos: true,
+        batch_size: crate::sync::engine::DEFAULT_BATCH_SIZE,
+        writer_cache_mib: crate::wallet::open::DEFAULT_WRITER_CACHE_MIB,
         reconnect_base: Duration::from_secs(30),
         reconnect_max: Duration::from_secs(60),
         age_identity: None,

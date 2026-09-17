@@ -52,7 +52,7 @@ Funds are recoverable from **the mnemonic alone**. Everything else is convenienc
 | `identity.txt` (age identity) | `[keys] age_identity`, default `<datadir>/identity.txt` | Decrypts `keys.toml`. **This is spend authority** - store the backup separately from `keys.toml` backups. |
 | Birthday height | inside `keys.toml`; also worth recording with the mnemonic | Makes a from-seed restore fast. Any height at/before the wallet's first transaction works. |
 
-The SQLite databases (`data.sqlite`, `blocks/`) are caches derived from the chain; they do not
+The SQLite database (`data.sqlite`) is a cache derived from the chain; it does not
 need backup. zecd is **stateless** - it keeps no off-chain data the seed can't rebuild (there is
 no label store), so the whole data directory is disposable: with the mnemonic (and birthday) you
 can recreate everything via `zecd init --restore`.
@@ -86,7 +86,7 @@ A running wallet's data directory holds the daemon-level files (`zecd.toml`, `.l
   zecd.toml  .lock  .cookie  identity.txt
   default/
     keys.toml
-    zec/lrz/    data.sqlite  blockmeta.sqlite  blocks/
+    zec/lrz/    data.sqlite
   fleet/                                  # experimental fleet only
     zec/
       wallets.d/  <name>.toml
@@ -108,14 +108,15 @@ false, an error once it is true).
 | `<dir>/keys.toml` | **Secret** - encrypted seed + birthday/network. Shared by every coin the wallet serves, which is why it sits above the per-coin directories. | Yes - mount as a Secret (relocate with `keys_file` / `ZECD_KEYS_FILE`). |
 | `identity.txt` | **Secret** - decrypts the seed (spend authority). | Yes, if auto-unlocking - mount as a Secret (`ZECD_AGE_IDENTITY`). |
 | `<dir>/zec/lrz/data.sqlite` (+ `-wal`/`-shm`) | Wallet state: the account plus scan progress, balances, and tx history. A **cache** - rebuilt from `keys.toml` + a rescan when absent (see bootstrap below). | No (disposable). |
-| `<dir>/zec/lrz/blocks/` | **Cache** - downloaded compact blocks. **Never ship this** - it can grow large and is fully re-derivable. | No. |
+| `<dir>/zec/lrz/blocks/`, `blockmeta.sqlite` | **Legacy cache** - the on-disk compact-block cache of a zecd before the batch being scanned lived in memory. Dead weight if present; `zecd rescan` removes it. | No. |
 | `<datadir>/.cookie` | Ephemeral RPC cookie, minted at startup and removed on clean shutdown. | No. |
 | `<datadir>/fleet/zec/wallets.d/` | **Secret**, and only with the experimental `[fleet] enabled = true` - one manifest per watched wallet, each holding a viewing key held nowhere else. Written at runtime by `createwallet`. See the note above. | Yes - back up continuously. |
 | `<datadir>/fleet/zec/shards/` | **Cache** - the shard databases (each under a `shard-NNNN/lrz/`), rebuilt from the sibling `wallets.d/` plus the chain. Experimental fleet only. | No (disposable). |
 
 For a cloud deployment: put `keys.toml` (and `identity.txt`, if used) in a read-only Secret
-and point `ZECD_KEYS_FILE` / `ZECD_AGE_IDENTITY` at the mount. `blocks/` is always disposable -
-excluding it from any image/volume snapshot is the single biggest space win.
+and point `ZECD_KEYS_FILE` / `ZECD_AGE_IDENTITY` at the mount. The batch of compact blocks
+being scanned lives in memory, so nothing under the engine directory but `data.sqlite` is ever
+worth a snapshot.
 
 > **Upgrading from a data directory without `zec/lrz/`.** Older zecd kept the databases at the
 > wallet root (`<datadir>/default/data.sqlite`). The first `zecd run` (or `zecd init` / `zecd
@@ -158,7 +159,7 @@ on the custody model:
   `zecd init --ufvk` against an empty datadir.
 
 To opt out (fail fast on an empty datadir instead of rebuilding), set `bootstrap_from_keys =
-false`. Either way `blocks/` is always discardable.
+false`.
 
 ### Secret inputs without baking them into the config
 
@@ -322,7 +323,8 @@ zecd diagnoses the two known causes and says so in the log:
   # start the daemon again
   ```
 
-  `rescan` deletes only the wallet database and block cache; `keys.toml` (seed, network,
+  `rescan` deletes only the wallet database (and a legacy on-disk block cache, if one is
+  present); `keys.toml` (seed, network,
   birthday, UFVK pin) is kept, so the next start rebuilds the account from the seed and rescans
   from the wallet birthday - all funds and history are re-derived from the chain (zecd persists
   nothing a from-seed restore couldn't rebuild). Budget the same sync time as a server restore;

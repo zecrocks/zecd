@@ -400,6 +400,25 @@ rebroadcast_secs = 60
 # queued in the wallet DB, so setting it back to true backfills the memos. Keep it true if
 # depositors are identified BY MEMO.
 # fetch_memos = true
+#
+# batch_size (default 10000) - blocks per download-and-scan batch. Each batch pays a fixed cost
+# (one tree-state round trip, one scan-range query, one wallet-database transaction), so a bigger
+# batch amortizes it: on a 238k-block testnet restore 25000 scanned about 12% faster than 10000,
+# and 50000 gained nothing more. The batch lives in memory while it scans and the next one is
+# fetched alongside it, so two batches of compact blocks are resident at once - hundreds of
+# megabytes at 25000 on mainnet's densest ranges, which is why the default is 10000. A server
+# with memory to spare sets 25000.
+# batch_size = 10000
+#
+# writer_cache_mib (default 256) - the SQLite page-cache ceiling, in MiB, of each wallet's writer
+# connection (the one the sync loop scans through). SQLite's own default of 2 MiB made the scan
+# re-read the note-commitment tree from the operating system on nearly every block; 256 took a
+# deep restore's scan from 178 s to 152 s. It is a ceiling, not an allocation - a small wallet
+# never reaches it - but a cache that has grown is kept for the connection's lifetime, and every
+# configured wallet and every fleet shard has its own writer. Size a memory-capped host for
+# writer_cache_mib times the number of wallets and shards; `config check` warns past 2 GiB.
+# Durability does not depend on it, and raising it past the wallet's database size buys nothing.
+# writer_cache_mib = 256
 
 [spend]
 # The wallet-wide confirmations policy (ZIP 315 defaults, like Zallet): how deep an output

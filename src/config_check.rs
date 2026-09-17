@@ -246,14 +246,63 @@ pub fn check(config: &AppConfig) -> CheckOutcome {
     }
 }
 
-/// `[sync]`: the one setting here with a consequence an operator should meet before deploying
-/// rather than after.
+/// The `[sync] batch_size` above which the memory two resident batches take (the one scanning
+/// and the one fetched ahead) is worth a warning: on mainnet's densest ranges a batch this
+/// size is hundreds of megabytes of compact blocks.
+const BATCH_SIZE_MEMORY_WARN: u32 = 50_000;
+
+/// The daemon-wide writer page-cache ceiling (`[sync] writer_cache_mib` times the writer
+/// connections: one per configured wallet, one per fleet shard) above which it is worth
+/// saying so: 2 GiB. Past that the ceiling is the kind of number a memory-capped container
+/// is sized against, and a cache that has grown is kept for the connection's lifetime.
+const WRITER_CACHE_TOTAL_WARN_MIB: u64 = 2048;
+
+/// `[sync]`: settings with a consequence an operator should meet before deploying rather than
+/// after.
 ///
-/// A warning, never an error - a memo-less wallet is a legitimate and supported deployment, and
-/// the setting is reversible without a rescan. But it is silent in operation (a history with no
-/// memos looks exactly like a history whose senders attached none), so name the consequence
-/// where an operator is already reading findings.
+/// Warnings, never errors - a memo-less wallet is a legitimate and supported deployment (and
+/// reversible without a rescan), and a large batch is a server-class choice. But `fetch_memos`
+/// is silent in operation (a history with no memos looks exactly like a history whose senders
+/// attached none), and a batch's memory only shows on the densest ranges, so name the
+/// consequence where an operator is already reading findings.
 fn check_sync(config: &AppConfig, findings: &mut Vec<Finding>) {
+    if config.sync.batch_size > BATCH_SIZE_MEMORY_WARN {
+        findings.push(Finding::warning(format!(
+            "[sync] batch_size = {}: a batch lives in memory while it scans, and the next one \
+             is fetched alongside it, so two batches of compact blocks are resident at once - \
+             on mainnet's densest ranges hundreds of megabytes at this size. The measured \
+             sweet spot is 25000; the scan gains nothing past it",
+            config.sync.batch_size
+        )));
+    }
+    // One writer connection per configured wallet, plus one per fleet shard that already
+    // exists (a fleet adds shards at runtime, so this is the floor, not the total).
+    let shards = if config.fleet.enabled {
+        crate::fleet::existing_shard_dirs(&config.fleet.dir).len()
+    } else {
+        0
+    };
+    let writers = config.wallets.len() + shards;
+    let ceiling_mib = u64::from(config.sync.writer_cache_mib) * writers as u64;
+    if ceiling_mib > WRITER_CACHE_TOTAL_WARN_MIB {
+        let fleet_note = if config.fleet.enabled {
+            " ({shards} existing fleet shards counted; every shard the fleet adds at runtime \
+             raises it by the same amount)"
+        } else {
+            ""
+        };
+        findings.push(Finding::warning(format!(
+            "[sync] writer_cache_mib = {}: with {} writer connection{} that is a {} MiB \
+             page-cache ceiling for the daemon{}. It is a ceiling, not an allocation, but a \
+             cache that has grown is kept for the process lifetime, so a memory-capped host \
+             should be sized for it or set a lower value",
+            config.sync.writer_cache_mib,
+            writers,
+            if writers == 1 { "" } else { "s" },
+            ceiling_mib,
+            fleet_note.replace("{shards}", &shards.to_string()),
+        )));
+    }
     if !config.sync.fetch_memos {
         findings.push(Finding::warning(
             "[sync] fetch_memos = false: this wallet never fetches the full data of a \
@@ -644,6 +693,59 @@ mod tests {
     /// and reversible, so it is never an error - but it is silent in operation (a history with
     /// no memos is indistinguishable from one whose senders attached none), which is exactly
     /// the class of thing this command exists to say out loud before a deployment, not after.
+    /// The writer page cache is warned about by its daemon-wide ceiling - the value times the
+    /// writer connections - never by the value alone: the default on one wallet is silent, the
+    /// same value across enough wallets is not, and a large value on one wallet is.
+    #[test]
+    fn writer_cache_ceiling_is_warned_about_past_two_gib() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = format!("network = \"regtest\"\ndatadir = {:?}\n", dir.path());
+        let mentions_cache = |findings: &[Finding]| {
+            warnings(findings)
+                .iter()
+                .any(|w| w.contains("writer_cache_mib"))
+        };
+
+        let default_one_wallet = inspect(&resolve(&base, dir.path()));
+        assert!(
+            !mentions_cache(&default_one_wallet),
+            "the default on one wallet is silent: {:?}",
+            warnings(&default_one_wallet)
+        );
+
+        let large_one_wallet = inspect(&resolve(
+            &format!("{base}[sync]\nwriter_cache_mib = 4096\n"),
+            dir.path(),
+        ));
+        assert!(
+            errors(&large_one_wallet).is_empty(),
+            "the cache size is never an error: {:?}",
+            errors(&large_one_wallet)
+        );
+        assert!(
+            warnings(&large_one_wallet)
+                .iter()
+                .any(|w| w.contains("writer_cache_mib = 4096") && w.contains("4096 MiB")),
+            "one 4 GiB writer is named with its ceiling: {:?}",
+            warnings(&large_one_wallet)
+        );
+
+        // Four wallets (the implicit `default` plus three more) at 1 GiB each: no single value
+        // is alarming, the product is.
+        let mut many = format!("{base}[sync]\nwriter_cache_mib = 1024\n");
+        for name in ["a", "b", "c"] {
+            many.push_str(&format!("[wallets.{name}]\n"));
+        }
+        let many_wallets = inspect(&resolve(&many, dir.path()));
+        assert!(
+            warnings(&many_wallets)
+                .iter()
+                .any(|w| w.contains("4 writer connections") && w.contains("4096 MiB")),
+            "the warning counts the wallets: {:?}",
+            warnings(&many_wallets)
+        );
+    }
+
     #[test]
     fn fetch_memos_off_is_warned_about_and_on_is_silent() {
         let dir = tempfile::tempdir().unwrap();

@@ -2302,8 +2302,9 @@ impl Zecd {
     }
 
     /// Wallet `name`'s Zcash **engine** directory: `<datadir>/<name>/zec/lrz`, holding
-    /// everything librustzcash owns - `data.sqlite`, `blockmeta.sqlite`, `blocks/`. This, not
-    /// [`Zecd::wallet_dir`], is where a test tampering with the wallet database looks.
+    /// everything librustzcash owns - `data.sqlite` (and, from an older zecd, the on-disk block
+    /// cache's `blockmeta.sqlite` and `blocks/`). This, not [`Zecd::wallet_dir`], is where a
+    /// test tampering with the wallet database looks.
     pub fn engine_dir(&self, name: &str) -> PathBuf {
         self.wallet_dir(name).join("zec").join("lrz")
     }

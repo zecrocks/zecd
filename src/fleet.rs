@@ -646,6 +646,8 @@ mod tests {
             sync_interval: std::time::Duration::from_secs(60),
             rebroadcast_interval: std::time::Duration::from_secs(60),
             fetch_memos: true,
+            batch_size: crate::sync::engine::DEFAULT_BATCH_SIZE,
+            writer_cache_mib: crate::wallet::open::DEFAULT_WRITER_CACHE_MIB,
             reconnect_base: std::time::Duration::from_secs(1),
             reconnect_max: std::time::Duration::from_secs(2),
             confirmations_policy: Default::default(),
@@ -780,6 +782,11 @@ pub struct ShardTemplate {
     /// Daemon-global `[sync] fetch_memos`: shard members are watch-only wallets like any other,
     /// so they honour the same memo-retrieval opt-out.
     pub fetch_memos: bool,
+    /// Blocks per download-and-scan batch (`[sync] batch_size`).
+    pub batch_size: u32,
+    /// Each shard's writer page-cache ceiling (`[sync] writer_cache_mib`); a shard is one
+    /// more writer connection, so the daemon-wide memory figure counts it.
+    pub writer_cache_mib: u32,
     pub reconnect_base: std::time::Duration,
     pub reconnect_max: std::time::Duration,
     pub confirmations_policy: zcash_client_backend::data_api::wallet::ConfirmationsPolicy,
@@ -1091,6 +1098,8 @@ impl ShardTemplate {
             sync_interval: self.sync_interval,
             rebroadcast_interval: self.rebroadcast_interval,
             fetch_memos: self.fetch_memos,
+            batch_size: self.batch_size,
+            writer_cache_mib: self.writer_cache_mib,
             reconnect_base: self.reconnect_base,
             reconnect_max: self.reconnect_max,
             age_identity: None,

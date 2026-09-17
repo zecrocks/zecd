@@ -37,7 +37,7 @@ use zcash_client_backend::wallet::{
     OvkPolicy, Recipient, TransparentAddressSource, WalletTransparentOutput,
 };
 use zcash_client_sqlite::error::SqliteClientError;
-use zcash_client_sqlite::{AccountUuid, FsBlockDb};
+use zcash_client_sqlite::AccountUuid;
 use zcash_keys::address::Address;
 use zcash_keys::keys::UnifiedFullViewingKey;
 use zcash_primitives::transaction::builder::{BuildConfig, Builder, BundlePadding};
@@ -721,6 +721,10 @@ pub struct ActorConfig {
     /// on by default). Off skips only `Enhancement` requests - transaction-status tracking and
     /// the transparent address checks still run. See [`request_in_scope`].
     pub fetch_memos: bool,
+    /// Blocks per download-and-scan batch (`[sync] batch_size`).
+    pub batch_size: u32,
+    /// The writer connection's SQLite page-cache ceiling in MiB (`[sync] writer_cache_mib`).
+    pub writer_cache_mib: u32,
     /// Reconnect backoff base/max delays.
     pub reconnect_base: Duration,
     pub reconnect_max: Duration,
@@ -914,7 +918,6 @@ struct WalletActor {
     /// the seed is available and an upstream is connected. `None` once an account exists.
     pending_bootstrap: Option<(BlockHeight, BootstrapKey)>,
     db_data: WriteDb,
-    db_cache: FsBlockDb,
     client: Option<HubSource>,
     /// Whether the current connection has emitted its "connected ... chain tip N" log line.
     /// Set once per connection (on the first successful tip refresh, when the tip is known)
@@ -997,6 +1000,15 @@ struct WalletActor {
     /// [`engine::REORG_BASE_MARGIN`], doubles while consecutive batches keep hitting a reorg, and
     /// resets on the first clean batch - see [`engine::next_reorg_margin`].
     reorg_margin: u32,
+    /// How many blocks one batch covers (`[sync] batch_size`).
+    batch_size: u32,
+    /// A download of the *next* range, running while the current one scans. See
+    /// [`engine::Prefetched`]. Only ever started for a wallet without transparent receiving -
+    /// see `sync_step`. Dropping it aborts the download.
+    prefetch: Option<engine::PrefetchTask>,
+    /// Cumulative block-scan cost by phase since this actor started, published on
+    /// [`SyncStatus`] and logged per batch. See [`crate::wallet::SyncTotals`].
+    sync_totals: crate::wallet::SyncTotals,
     /// Sync is stopped for this wallet because a failure that **cannot** succeed on retry was
     /// hit: an [`engine::UnrecoverableReorg`], where no truncation target below the conflict
     /// exists, so the conflicting block can never be removed and every batch re-hits it. The rest
@@ -1088,10 +1100,13 @@ async fn spawn_inner(
 
     // Apply the configured external transparent gap limit only for transparent-enabled wallets, so
     // shielded-only wallets keep librustzcash's default and are completely unaffected.
-    let db_data = open::init_dbs_with_gap_limit(
+    let db_data = open::init_dbs_with(
         cfg.network,
         &cfg.engine_dir,
-        cfg.transparent_enabled.then_some(cfg.transparent_gap_limit),
+        &open::WriterOptions {
+            external_gap_limit: cfg.transparent_enabled.then_some(cfg.transparent_gap_limit),
+            cache_mib: cfg.writer_cache_mib,
+        },
     )?;
     if cfg.transparent_enabled {
         // (The "transparent receiving enabled" info line - including the effective recovery
@@ -1137,7 +1152,6 @@ async fn spawn_inner(
              checks still run. Re-enable fetch_memos to backfill the skipped data later."
         );
     }
-    let db_cache = open::open_fsblockdb(&cfg.engine_dir)?;
     // A shard has no `keys.toml`; stand in the values its wallets imply (watch-only, never
     // encrypted, birthday at the earliest member's so the scan covers all of them).
     let st = if is_shard {
@@ -1458,7 +1472,6 @@ async fn spawn_inner(
         shard_import_errors: Arc::new(BTreeMap::new()),
         pending_bootstrap,
         db_data,
-        db_cache,
         client: None,
         connected_logged: false,
         prover,
@@ -1486,6 +1499,9 @@ async fn spawn_inner(
         last_sync_error: None,
         sync_error_streak: 0,
         reorg_margin: engine::REORG_BASE_MARGIN,
+        batch_size: cfg.batch_size,
+        prefetch: None,
+        sync_totals: crate::wallet::SyncTotals::default(),
         sync_halted: false,
         force_sync: false,
         enhance_satisfied: std::collections::BTreeSet::new(),
@@ -3696,9 +3712,31 @@ impl WalletActor {
             }
         }
 
-        let outcome = {
-            let transparent = self.transparent_scripts.as_ref();
-            let unspent = self.transparent_unspent.as_ref();
+        // Collect whatever the previous batch started fetching. Joined here rather than polled
+        // so the ordering stays simple: at most one prefetch is ever in flight, and this batch
+        // either uses it or drops it.
+        let prefetched = match self.prefetch.take() {
+            Some(task) => task.finish().await,
+            None => None,
+        };
+        // Whether this batch may fetch the next range while it scans. A transparent wallet
+        // never does: the matcher checks each downloaded block against the address and
+        // outpoint sets as they stand, and a receive this batch records can extend both before
+        // the next batch scans - a detached download would have matched against stale sets.
+        // Gated on the configuration rather than on the sets having been built, so the very
+        // first batch (before they exist) cannot start one either.
+        let hub = Arc::clone(&self.hub);
+        let spawn_prefetch = move |range: zcash_client_backend::data_api::scanning::ScanRange| {
+            let hub = Arc::clone(&hub);
+            engine::PrefetchTask::spawn(async move {
+                let mut source = hub.acquire().await?;
+                engine::prefetch_range(&mut source, range).await
+            })
+        };
+        let prefetch: Option<engine::PrefetchSpawner<'_>> =
+            (!self.transparent_enabled).then_some(&spawn_prefetch);
+
+        let mut outcome = {
             let client = self
                 .client
                 .as_mut()
@@ -3706,15 +3744,44 @@ impl WalletActor {
             engine::sync_one_batch(
                 client,
                 &self.network,
-                &self.engine_dir,
-                &mut self.db_cache,
                 &mut self.db_data,
-                transparent,
-                unspent,
-                self.reorg_margin,
+                engine::BatchParams {
+                    transparent: self.transparent_scripts.as_ref(),
+                    unspent: self.transparent_unspent.as_ref(),
+                    reorg_margin: self.reorg_margin,
+                    batch_size: self.batch_size,
+                    prefetched,
+                    prefetch,
+                },
             )
             .await?
         };
+        // The batch started this while it was scanning; hold it for the next one.
+        self.prefetch = outcome.next_prefetch.take();
+        if outcome.worked {
+            // Where this batch's wall clock went. The two phases bill to different resources -
+            // the download to the upstream and the network, the scan to this host's CPU and
+            // wallet database - and they alternate, so a batch that is slow for one reason
+            // looks exactly like one slow for the other in a wall-clock-only log. One line per
+            // batch (a full mainnet restore emits a few hundred), so INFO.
+            let t = &outcome.timings;
+            self.sync_totals.add(t);
+            info!(
+                blocks = t.shape.blocks,
+                download_ms = t.download.as_millis() as u64,
+                tree_state_ms = t.tree_state.as_millis() as u64,
+                scan_ms = t.scan.as_millis() as u64,
+                transparent_ms = t.transparent.as_millis() as u64,
+                total_ms = t.total().as_millis() as u64,
+                blocks_per_sec = format_args!("{:.0}", t.blocks_per_sec()),
+                prefetch_hit = t.prefetch_hit,
+                bytes = t.shape.bytes,
+                txs = t.shape.txs,
+                sapling_outputs = t.shape.sapling_outputs,
+                orchard_actions = t.shape.orchard_actions,
+                "batch complete"
+            );
+        }
         // A recorded receive may have extended the transparent gap (exposing new indices), so
         // rebuild the address set before the next pass to cover them.
         if outcome.transparent_recorded > 0 {
@@ -4342,6 +4409,7 @@ impl WalletActor {
             scanning,
             pending_enhancements,
             enhanced_through,
+            sync_totals: self.sync_totals,
             encrypted: self.encrypted,
             accounts: self.published_accounts(),
             import_errors: Arc::clone(&self.shard_import_errors),

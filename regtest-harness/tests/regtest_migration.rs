@@ -10,8 +10,8 @@
 //! Why funded rather than a bare start/stop: if the move simply failed to happen, the daemon
 //! would find no database at the new path and rebuild an empty one from `keys.toml`, then
 //! rescan - which on a *fundless* wallet is indistinguishable from success. What only a funded
-//! wallet can show is that the migration preserved the *data* - balance, transaction history, a
-//! received memo, and the compact-block cache - and that it did so without a rescan.
+//! wallet can show is that the migration preserved the *data* - balance, transaction history and
+//! a received memo - and that it did so without a rescan.
 //!
 //! Three properties, in order:
 //!
@@ -51,14 +51,14 @@ async fn tip(zebrad: &Zebrad) -> u64 {
         .expect("getblockcount height")
 }
 
-/// The durable contents of an engine directory: both databases and the compact-block cache
-/// directory. Everything a "move the wallet database and forget the rest" implementation could
-/// silently drop.
+/// The durable contents of an engine directory: the wallet database, plus the on-disk
+/// block cache (`blockmeta.sqlite`, `blocks/`) a zecd from before the in-memory cache left
+/// behind - everything a "move the wallet database and forget the rest" implementation could
+/// silently drop. This build writes only `data.sqlite`; the legacy pair is planted below, since
+/// the migration exists for data directories an older zecd produced.
 ///
 /// Deliberately not the raw directory listing: SQLite's `-wal`/`-shm` sidecars come and go
-/// across a clean shutdown, so comparing those would test the journal, not the migration. Nor
-/// the *contents* of `blocks/` - the scanner deletes each batch's compact blocks as it applies
-/// them, so a caught-up wallet's cache is legitimately empty.
+/// across a clean shutdown, so comparing those would test the journal, not the migration.
 fn durable_contents(engine_dir: &Path) -> Vec<String> {
     ["data.sqlite", "blockmeta.sqlite", "blocks"]
         .iter()
@@ -187,11 +187,10 @@ async fn regtest_data_directory_layout_migration() {
 
     let wallet = zecd.wallet_dir("default");
     let engine = zecd.engine_dir("default");
-    let contents_before = durable_contents(&engine);
     assert_eq!(
-        contents_before,
-        vec!["data.sqlite", "blockmeta.sqlite", "blocks"],
-        "a scanned engine directory holds all three before the move"
+        durable_contents(&engine),
+        vec!["data.sqlite"],
+        "a scanned engine directory holds the wallet database and nothing else"
     );
 
     // ---- 2. Put the databases back at the wallet root, as an older zecd left them ----
@@ -199,6 +198,18 @@ async fn regtest_data_directory_layout_migration() {
     zecd.stop_keeping_datadir().await.expect("stop zecd");
     move_dir_contents(&engine, &wallet);
     std::fs::remove_dir_all(wallet.join("zec")).expect("remove the now-empty coin directory");
+    // An older zecd also kept its on-disk block cache beside the database. Plant one, so the
+    // move is asserted over everything a pre-migration layout can hold, not just the file this
+    // build happens to write.
+    std::fs::write(
+        wallet.join("blockmeta.sqlite"),
+        b"legacy block-cache metadata",
+    )
+    .expect("plant the legacy metadata database");
+    std::fs::create_dir_all(wallet.join("blocks")).expect("plant the legacy block directory");
+    std::fs::write(wallet.join("blocks").join("1-aa.compact"), b"legacy block")
+        .expect("plant a legacy cached block");
+    let contents_before = vec!["data.sqlite", "blockmeta.sqlite", "blocks"];
     assert!(
         wallet.join("keys.toml").is_file(),
         "keys.toml was already at the wallet root and stays there in both layouts"

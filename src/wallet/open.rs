@@ -6,17 +6,14 @@ use std::path::{Path, PathBuf};
 use rand::rand_core::UnwrapErr;
 use rand::rngs::SysRng;
 
-use zcash_client_sqlite::chain::init::init_blockmeta_db;
-use zcash_client_sqlite::chain::BlockMeta;
 use zcash_client_sqlite::util::SystemClock;
 use zcash_client_sqlite::wallet::init::init_wallet_db;
-use zcash_client_sqlite::{FsBlockDb, WalletDb};
+use zcash_client_sqlite::WalletDb;
 use zcash_keys::keys::transparent::gap_limits::GapLimits;
 
 use crate::network::ZNetwork;
 
 const DATA_DB: &str = "data.sqlite";
-const BLOCKS_FOLDER: &str = "blocks";
 
 /// A read/write wallet handle (uses a real clock + OS RNG, required for writes). The OS RNG is
 /// fallible in `rand_core 0.10` (`SysRng: TryRng`), while `WalletDb` wants an infallible `Rng`;
@@ -27,10 +24,6 @@ pub type ReadDb = WalletDb<rusqlite::Connection, ZNetwork, (), ()>;
 
 pub fn data_db_path(engine_dir: &Path) -> PathBuf {
     engine_dir.join(DATA_DB)
-}
-
-pub fn block_path(engine_dir: &Path, meta: &BlockMeta) -> PathBuf {
-    meta.block_file_path(&engine_dir.join(BLOCKS_FOLDER))
 }
 
 /// Open the wallet DB for writing (sync, sends, address generation).
@@ -57,15 +50,21 @@ pub fn open_write(network: ZNetwork, engine_dir: &Path) -> anyhow::Result<WriteD
 
 /// Apply the write-path PRAGMAs (and the array vtab module `WalletDb` requires) to a
 /// freshly-opened writer connection. Split out so it is unit-testable against a temp DB.
-fn configure_writer_conn(conn: &rusqlite::Connection) -> rusqlite::Result<()> {
+fn configure_writer_conn(conn: &rusqlite::Connection, cache_mib: u32) -> rusqlite::Result<()> {
     // `WalletDb::from_connection` requires the array vtab module that `for_path` loads itself.
     rusqlite::vtab::array::load_module(conn)?;
+    // SQLite reads a negative `cache_size` as a KiB budget rather than a page count.
+    let cache_kib = i64::from(cache_mib.max(1)) * 1024;
     // WAL is a persistent per-database setting (also established at init in `enable_wal`), but
     // reassert it on this exact connection so the NORMAL+WAL corruption-safety pairing is
     // guaranteed together: `synchronous = NORMAL` is *not* corruption-safe under a rollback
     // journal. `journal_mode=WAL` returns the resulting mode as a row, which `execute_batch`
-    // discards.
-    conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL;")
+    // discards. `cache_size` is per-connection like `synchronous`, so it belongs here too -
+    // see [`DEFAULT_WRITER_CACHE_MIB`].
+    conn.execute_batch(&format!(
+        "PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL; \
+         PRAGMA cache_size=-{cache_kib};"
+    ))
 }
 
 /// librustzcash's default transparent gap limits for the internal (change) and ephemeral (TEX)
@@ -84,10 +83,69 @@ pub fn open_write_with_gap_limit(
     engine_dir: &Path,
     external_gap_limit: Option<u32>,
 ) -> anyhow::Result<WriteDb> {
+    open_write_with(
+        network,
+        engine_dir,
+        &WriterOptions {
+            external_gap_limit,
+            ..WriterOptions::default()
+        },
+    )
+}
+
+/// Default for [`WriterOptions::cache_mib`] and `[sync] writer_cache_mib`: 256 MiB.
+///
+/// SQLite's default page cache is 2 MiB, sized for databases far smaller than a wallet's. A
+/// single busy testnet wallet's database reached 50 MiB scanning from a deep birthday, and it
+/// grows with history, so at the default nearly every write of a scanned block or a recovered
+/// transaction read its pages back from the operating system first - the note-commitment tree
+/// pages above all, which every scanned block touches. Measured on that wallet, this alone
+/// took the block scan from 178 s to 152 s. The read connections already ran at 32 MiB
+/// (`read.rs`); the writer, which does the work, was the one left at the default.
+///
+/// What it costs, and why it is a knob rather than a constant. It is a *ceiling*, not an
+/// allocation: SQLite grows the cache page by page to what the workload touches, so a small
+/// wallet never approaches it. But a cache that has grown is *kept* for the life of the
+/// connection - the writer's is the actor's lifetime - so a wallet whose database is larger
+/// than the ceiling sits at the ceiling from its first deep scan on, and every writer
+/// connection has its own: one per configured wallet and one per fleet shard. Durability is
+/// untouched either way (`journal_mode`/`synchronous` are what govern that, and a transaction
+/// larger than the cache spills to the WAL as it always did); the only trade is memory, which
+/// is why `config check` warns when the daemon-wide ceiling gets large.
+pub const DEFAULT_WRITER_CACHE_MIB: u32 = 256;
+
+/// How the writer connection is opened, beyond the network and the directory.
+#[derive(Debug, Clone)]
+pub struct WriterOptions {
+    /// Override for the **external** transparent gap limit; `None` keeps librustzcash's
+    /// default. See [`open_write_with_gap_limit`].
+    pub external_gap_limit: Option<u32>,
+    /// The connection's SQLite page cache ceiling, in MiB (`[sync] writer_cache_mib`). See
+    /// [`DEFAULT_WRITER_CACHE_MIB`].
+    pub cache_mib: u32,
+}
+
+impl Default for WriterOptions {
+    fn default() -> Self {
+        Self {
+            external_gap_limit: None,
+            cache_mib: DEFAULT_WRITER_CACHE_MIB,
+        }
+    }
+}
+
+/// Open the wallet DB for writing with explicit [`WriterOptions`]. The actor comes through
+/// here so the configured page cache reaches the connection it will hold; the thinner wrappers
+/// above take the defaults.
+pub fn open_write_with(
+    network: ZNetwork,
+    engine_dir: &Path,
+    options: &WriterOptions,
+) -> anyhow::Result<WriteDb> {
     let conn = rusqlite::Connection::open(data_db_path(engine_dir))?;
-    configure_writer_conn(&conn)?;
+    configure_writer_conn(&conn, options.cache_mib)?;
     let db = WalletDb::from_connection(conn, network, SystemClock, UnwrapErr(SysRng));
-    Ok(match external_gap_limit {
+    Ok(match options.external_gap_limit {
         Some(n) => db.with_gap_limits(GapLimits::new(
             n,
             DEFAULT_INTERNAL_GAP,
@@ -107,12 +165,12 @@ pub fn open_read(network: ZNetwork, engine_dir: &Path) -> anyhow::Result<ReadDb>
     )?)
 }
 
-/// Open the compact-block cache.
-pub fn open_fsblockdb(engine_dir: &Path) -> anyhow::Result<FsBlockDb> {
-    FsBlockDb::for_path(engine_dir).map_err(|e| anyhow::anyhow!("opening block-cache db: {e}"))
-}
-
-/// Initialize both the wallet DB and the block-cache DB (idempotent migrations).
+/// Initialize the wallet DB (idempotent migrations).
+///
+/// There is no block-cache database to initialize: the batch being scanned lives in memory
+/// (`sync::memcache`), so the engine directory holds `data.sqlite` and nothing else. An older
+/// zecd's `blockmeta.sqlite` and `blocks/` are left alone if present - they are dead weight, and
+/// `zecd rescan` removes them with the rest (`migrate::ENGINE_ARTIFACTS`).
 pub fn init_dbs(network: ZNetwork, engine_dir: &Path) -> anyhow::Result<WriteDb> {
     init_dbs_with_gap_limit(network, engine_dir, None)
 }
@@ -126,12 +184,26 @@ pub fn init_dbs_with_gap_limit(
     engine_dir: &Path,
     external_gap_limit: Option<u32>,
 ) -> anyhow::Result<WriteDb> {
+    init_dbs_with(
+        network,
+        engine_dir,
+        &WriterOptions {
+            external_gap_limit,
+            ..WriterOptions::default()
+        },
+    )
+}
+
+/// As [`init_dbs`], with explicit [`WriterOptions`] - the actor's entry point, since the page
+/// cache it configures belongs on the connection the actor will hold for its lifetime.
+pub fn init_dbs_with(
+    network: ZNetwork,
+    engine_dir: &Path,
+    options: &WriterOptions,
+) -> anyhow::Result<WriteDb> {
     std::fs::create_dir_all(engine_dir)?;
     enable_wal(engine_dir)?;
-    let mut db_cache = open_fsblockdb(engine_dir)?;
-    let mut db_data = open_write_with_gap_limit(network, engine_dir, external_gap_limit)?;
-    init_blockmeta_db(&mut db_cache)
-        .map_err(|e| anyhow::anyhow!("initializing block-cache db: {e}"))?;
+    let mut db_data = open_write_with(network, engine_dir, options)?;
     init_wallet_db(&mut db_data, None)?;
     Ok(db_data)
 }
@@ -514,7 +586,7 @@ mod tests {
     fn writer_connection_uses_wal_and_normal_synchronous() {
         let dir = tempfile::tempdir().unwrap();
         let conn = rusqlite::Connection::open(dir.path().join(DATA_DB)).unwrap();
-        configure_writer_conn(&conn).unwrap();
+        configure_writer_conn(&conn, 64).unwrap();
 
         let mode: String = conn
             .query_row("PRAGMA journal_mode;", [], |r| r.get(0))
@@ -526,5 +598,17 @@ mod tests {
             .query_row("PRAGMA synchronous;", [], |r| r.get(0))
             .unwrap();
         assert_eq!(synchronous, 1, "writer must run synchronous=NORMAL");
+
+        // A negative cache_size is a KiB budget; the default (-2000) is far too small for a
+        // wallet database, so the writer carries the configured ceiling (64 MiB here, to show
+        // the value is the caller's rather than a constant).
+        let cache_size: i64 = conn
+            .query_row("PRAGMA cache_size;", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            cache_size,
+            -(64 * 1024),
+            "writer page cache is the configured MiB"
+        );
     }
 }

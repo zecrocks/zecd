@@ -186,6 +186,23 @@ fn snapshot(state: &AppState) -> Snapshot {
                 "scanning": st.scanning,
                 "pending_enhancements": st.pending_enhancements,
                 "enhanced_through": st.enhanced_through,
+                // Where the block scan's wall clock went, cumulatively. The per-batch
+                // `batch complete` log line carries the same split one range at a time;
+                // this is the running total, so a slow restore is attributable to the
+                // upstream (download) or to this host (scan) from one read.
+                "sync_totals": {
+                    "batches": st.sync_totals.batches,
+                    "blocks": st.sync_totals.blocks,
+                    "bytes": st.sync_totals.bytes,
+                    "txs": st.sync_totals.txs,
+                    "sapling_outputs": st.sync_totals.sapling_outputs,
+                    "orchard_actions": st.sync_totals.orchard_actions,
+                    "download_ms": st.sync_totals.download_ms,
+                    "tree_state_ms": st.sync_totals.tree_state_ms,
+                    "scan_ms": st.sync_totals.scan_ms,
+                    "transparent_ms": st.sync_totals.transparent_ms,
+                    "total_ms": st.sync_totals.total_ms(),
+                },
                 "encrypted": st.encrypted,
                 "locked": locked,
                 "ready": w_ready,

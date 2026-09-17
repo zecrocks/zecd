@@ -77,6 +77,53 @@ impl ConnState {
     }
 }
 
+/// Everything the block scan has spent since this actor started, split by phase.
+///
+/// The per-batch `batch complete` log line is the fine-grained view; this is the running total,
+/// so "the restore took an hour - doing what?" is answerable from one `/status` read rather than
+/// by summing several hundred log lines. Never cleared: it covers the process lifetime.
+#[derive(Clone, Copy, Debug, Default)]
+#[non_exhaustive]
+pub struct SyncTotals {
+    /// Batches that downloaded and scanned a range.
+    pub batches: u64,
+    pub blocks: u64,
+    /// Compact-block bytes as served.
+    pub bytes: u64,
+    pub txs: u64,
+    pub sapling_outputs: u64,
+    pub orchard_actions: u64,
+    /// Streaming blocks (or taking a prefetched range), in milliseconds.
+    pub download_ms: u64,
+    /// The per-batch tree-state round trip.
+    pub tree_state_ms: u64,
+    /// `scan_cached_blocks`: trial decryption, tree insertion, and the database write.
+    pub scan_ms: u64,
+    /// Recording block-scan-matched transparent receives and spends.
+    pub transparent_ms: u64,
+}
+
+impl SyncTotals {
+    /// Fold one batch's timings in.
+    pub fn add(&mut self, t: &crate::sync::engine::BatchTimings) {
+        self.batches += 1;
+        self.blocks += u64::from(t.shape.blocks);
+        self.bytes += t.shape.bytes;
+        self.txs += t.shape.txs;
+        self.sapling_outputs += t.shape.sapling_outputs;
+        self.orchard_actions += t.shape.orchard_actions;
+        self.download_ms += t.download.as_millis() as u64;
+        self.tree_state_ms += t.tree_state.as_millis() as u64;
+        self.scan_ms += t.scan.as_millis() as u64;
+        self.transparent_ms += t.transparent.as_millis() as u64;
+    }
+
+    /// Wall clock across every phase, in milliseconds.
+    pub fn total_ms(&self) -> u64 {
+        self.download_ms + self.tree_state_ms + self.scan_ms + self.transparent_ms
+    }
+}
+
 /// A snapshot of sync state, published by the actor and read by blockchain/wallet RPCs.
 #[derive(Clone, Debug, Default)]
 #[non_exhaustive]
@@ -138,6 +185,8 @@ pub struct SyncStatus {
     /// to be fetched - all cases where a consumer should hold its cursor still rather than
     /// advance it. Surfaced on `/status`, `getwalletinfo.scanning`, and `waitforsync`.
     pub enhanced_through: Option<u32>,
+    /// Cumulative block-scan cost by phase since this actor started. See [`SyncTotals`].
+    pub sync_totals: SyncTotals,
     /// True when the wallet is passphrase-encrypted (Bitcoin Core's `HasEncryptionKeys()`).
     /// Drives whether `getwalletinfo` reports `unlocked_until` and how the passphrase RPCs behave.
     pub encrypted: bool,

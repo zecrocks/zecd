@@ -365,6 +365,8 @@ mod tests {
                 interval_secs: 20,
                 rebroadcast_secs: 60,
                 fetch_memos: true,
+                batch_size: crate::sync::engine::DEFAULT_BATCH_SIZE,
+                writer_cache_mib: crate::wallet::open::DEFAULT_WRITER_CACHE_MIB,
             },
             spend: crate::config::SpendConfig::default(),
             pools: crate::config::PoolsConfig::default(),

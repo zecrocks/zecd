@@ -24,25 +24,20 @@
 //! wedges.
 
 use std::collections::{HashMap, HashSet};
-use std::path::Path;
+use std::future::Future;
 
-use anyhow::anyhow;
 use orchard::tree::MerkleHashOrchard;
 use prost::Message;
-use tokio::fs::File;
-use tokio::io::AsyncWriteExt;
 use tracing::{info, warn};
 use zcash_client_backend::data_api::wallet::decrypt_and_store_transaction;
 use zcash_client_backend::data_api::{
-    chain::{
-        error::Error as ChainError, scan_cached_blocks, BlockSource, ChainState, CommitmentTreeRoot,
-    },
+    chain::{error::Error as ChainError, scan_cached_blocks, ChainState, CommitmentTreeRoot},
     scanning::{ScanPriority, ScanRange},
     WalletCommitmentTrees, WalletRead, WalletWrite,
 };
 use zcash_client_backend::wallet::WalletTransparentOutput;
 use zcash_client_sqlite::error::SqliteClientError;
-use zcash_client_sqlite::{chain::BlockMeta, AccountUuid, FsBlockDb, FsBlockDbError};
+use zcash_client_sqlite::AccountUuid;
 use zcash_primitives::merkle_tree::HashSer;
 use zcash_protocol::consensus::BlockHeight;
 use zcash_protocol::value::Zatoshis;
@@ -52,9 +47,13 @@ use zip32::DiversifierIndex;
 
 use crate::chain::ChainSource;
 use crate::network::ZNetwork;
-use crate::wallet::open::{block_path, WriteDb};
+use crate::sync::memcache::MemBlockCache;
+use crate::wallet::open::WriteDb;
 
-const BATCH_SIZE: u32 = 10_000;
+/// The default blocks per download-and-scan batch, and the value `[sync] batch_size`
+/// overrides. Kept as a named constant because [`REORG_MAX_MARGIN`] is defined in terms of it:
+/// a rewind never usefully goes further back than one batch would re-scan.
+pub const DEFAULT_BATCH_SIZE: u32 = 10_000;
 
 /// How often (at most) to log progress while recording a batch's matched transparent receives.
 /// Normally the whole loop is milliseconds and never logs; each recorded receive re-derives the
@@ -306,17 +305,38 @@ pub fn owned_transparent_output(
 }
 
 /// How many consecutive *zero-progress* reconnects [`download_blocks`] tolerates after a
-/// client-side h2 load shed before giving up on the range. Any attempt that writes at least
+/// client-side h2 load shed before giving up on the range. Any attempt that receives at least
 /// one block resets the count, so a download that keeps making progress keeps resuming, and
 /// only a range that cannot advance at all surfaces the error.
 const MAX_STALLED_STREAM_RESTARTS: u32 = 3;
 
+/// The shielded work a downloaded range carries, counted while it streams in. The download
+/// already walks every transaction to count its outputs, so this costs nothing, and it is
+/// what turns a per-batch wall clock into something an operator can read: a range of
+/// near-empty blocks and a range carrying a transaction burst differ by an order of magnitude
+/// per block, and only the shape says which one a slow batch was.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct RangeShape {
+    /// Blocks received.
+    pub blocks: u32,
+    /// Compact-block bytes as served (the encoded size held in the cache).
+    pub bytes: u64,
+    /// Transactions in the range.
+    pub txs: u64,
+    /// Sapling outputs in the range.
+    pub sapling_outputs: u64,
+    /// Orchard actions in the range (Ironwood actions included: the compact representation
+    /// carries them in the same per-transaction action list).
+    pub orchard_actions: u64,
+}
+
 /// The progress one [`download_blocks`] call accumulates across however many streaming
 /// attempts it takes. Carried between attempts so a reconnect resumes rather than restarts:
-/// every block in `block_meta` is already on disk, and the transparent matching state must
-/// not be replayed for it.
+/// every block in `blocks` is already held, and the transparent matching state must not be
+/// replayed for it.
 struct DownloadProgress {
-    block_meta: Vec<BlockMeta>,
+    blocks: MemBlockCache,
+    shape: RangeShape,
     received: Vec<MatchedTransparentReceive>,
     spent: Vec<MatchedTransparentSpend>,
     /// The outpoints to watch for spends, seeded from what the wallet already holds and then
@@ -324,7 +344,7 @@ struct DownloadProgress {
     /// the same batch is not in the database yet (receives are recorded only after the whole
     /// range scans), so without carrying it here a receive and its spend inside one batch
     /// would leave the spend undetected until some later batch happened to re-cover the block,
-    /// which never happens, because the scan is forward-only. At BATCH_SIZE = 10_000 blocks
+    /// which never happens, because the scan is forward-only. At the default 10,000-block batch
     /// that is not an edge case: it is every from-seed restore of a wallet whose transparent
     /// history fits in one batch. It is carried across streaming attempts for the same reason
     /// it is carried across blocks: a resumed download must not lose the earlier blocks' state.
@@ -334,14 +354,14 @@ struct DownloadProgress {
 /// Where a load-shed reconnect should resume, or `None` once the range has failed
 /// [`MAX_STALLED_STREAM_RESTARTS`] consecutive times without advancing.
 ///
-/// `made_progress` is whether the attempt that just failed wrote at least one block;
-/// `last_written` is the highest block now on disk, and `resume_from` the height the failed
-/// attempt started at (the answer when it wrote nothing at all). Resuming one past the last
-/// block written is what keeps the retry cheap: the load shed killed the connection, not the
-/// blocks already on disk.
+/// `made_progress` is whether the attempt that just failed received at least one block;
+/// `last_received` is the highest block now held, and `resume_from` the height the failed
+/// attempt started at (the answer when it received nothing at all). Resuming one past the last
+/// block held is what keeps the retry cheap: the load shed killed the connection, not the
+/// blocks already in hand.
 fn plan_load_shed_resume(
     made_progress: bool,
-    last_written: Option<BlockHeight>,
+    last_received: Option<BlockHeight>,
     resume_from: BlockHeight,
     stalled_restarts: &mut u32,
 ) -> Option<BlockHeight> {
@@ -353,26 +373,32 @@ fn plan_load_shed_resume(
             return None;
         }
     }
-    Some(last_written.map_or(resume_from, |h| h + 1))
+    Some(last_received.map_or(resume_from, |h| h + 1))
+}
+
+/// What one [`download_blocks`] call produced: the range's blocks, what the transparent
+/// matcher found in them, and the shape of the work they carry.
+pub struct DownloadedRange {
+    /// The blocks, in the cache the scan reads them from.
+    pub blocks: MemBlockCache,
+    /// See [`RangeShape`].
+    pub shape: RangeShape,
+    received: Vec<MatchedTransparentReceive>,
+    spent: Vec<MatchedTransparentSpend>,
 }
 
 async fn download_blocks<C: ChainSource>(
     client: &mut C,
-    engine_dir: &Path,
-    db_cache: &mut FsBlockDb,
     scan_range: &ScanRange,
     transparent: Option<&HashSet<TransparentAddress>>,
     unspent: Option<&UnspentOutpoints>,
-) -> anyhow::Result<(
-    Vec<BlockMeta>,
-    Vec<MatchedTransparentReceive>,
-    Vec<MatchedTransparentSpend>,
-)> {
+) -> anyhow::Result<DownloadedRange> {
     info!(range = %scan_range, "fetching compact blocks");
     let range_end = scan_range.block_range().end - 1;
     let mut next = scan_range.block_range().start;
     let mut progress = DownloadProgress {
-        block_meta: vec![],
+        blocks: MemBlockCache::new(),
+        shape: RangeShape::default(),
         received: vec![],
         spent: vec![],
         watch: unspent.cloned(),
@@ -380,20 +406,11 @@ async fn download_blocks<C: ChainSource>(
     let mut stalled_restarts = 0u32;
 
     while next <= range_end {
-        let before = progress.block_meta.len();
-        match download_range_once(
-            client,
-            engine_dir,
-            next,
-            range_end,
-            transparent,
-            &mut progress,
-        )
-        .await
-        {
+        let before = progress.blocks.len();
+        match download_range_once(client, next, range_end, transparent, &mut progress).await {
             Ok(()) => break,
             // h2's client-side load shed (see `chain::is_h2_load_shed`) kills the connection,
-            // not the progress: every block file already written stays written, and the next
+            // not the progress: every block already received stays held, and the next
             // `compact_block_range` reconnects transparently onto a fresh connection with a
             // full frame budget. Eager draining alone cannot rule this out, because the
             // budget is charged as h2's connection task parses frames off the socket - a
@@ -402,11 +419,14 @@ async fn download_blocks<C: ChainSource>(
             // not have instead of failing the whole batch back to the actor, which would
             // restart the range from the same height and hit the same wall.
             Err(e) if crate::chain::is_h2_load_shed(&e) => {
-                let made_progress = progress.block_meta.len() > before;
-                let last_written = progress.block_meta.last().map(|m| m.height);
-                let Some(resume_at) =
-                    plan_load_shed_resume(made_progress, last_written, next, &mut stalled_restarts)
-                else {
+                let made_progress = progress.blocks.len() > before;
+                let last_received = progress.blocks.last_height();
+                let Some(resume_at) = plan_load_shed_resume(
+                    made_progress,
+                    last_received,
+                    next,
+                    &mut stalled_restarts,
+                ) else {
                     return Err(e.context(
                         "block download made no progress across repeated h2 load-shed reconnects",
                     ));
@@ -421,18 +441,21 @@ async fn download_blocks<C: ChainSource>(
         }
     }
 
-    db_cache
-        .write_block_metadata(&progress.block_meta)
-        .map_err(|e| anyhow!("{e:?}"))?;
-    Ok((progress.block_meta, progress.received, progress.spent))
+    progress.shape.blocks = progress.blocks.len() as u32;
+    progress.shape.bytes = progress.blocks.byte_len();
+    Ok(DownloadedRange {
+        blocks: progress.blocks,
+        shape: progress.shape,
+        received: progress.received,
+        spent: progress.spent,
+    })
 }
 
 /// One streaming attempt of [`download_blocks`]: fetch `[next, range_end]` and fold each block
-/// into `progress`, writing its cache file as it goes. On a stream error everything appended
-/// so far is already on disk, so the caller can resume after the last entry.
+/// into `progress`. On a stream error everything appended so far is already held, so the
+/// caller can resume after the last entry.
 async fn download_range_once<C: ChainSource>(
     client: &mut C,
-    engine_dir: &Path,
     next: BlockHeight,
     range_end: BlockHeight,
     transparent: Option<&HashSet<TransparentAddress>>,
@@ -452,19 +475,11 @@ async fn download_range_once<C: ChainSource>(
             transparent_inputs = t_ins.len(),
             "downloaded block"
         );
-        let (sapling_outputs_count, orchard_actions_count) = block
-            .vtx
-            .iter()
-            .map(|tx| (tx.outputs.len() as u32, tx.actions.len() as u32))
-            .fold((0, 0), |(acc_s, acc_o), (s, o)| (acc_s + s, acc_o + o));
-
-        let meta = BlockMeta {
-            height: block.height(),
-            block_hash: block.hash(),
-            block_time: block.time,
-            sapling_outputs_count,
-            orchard_actions_count,
-        };
+        for tx in &block.vtx {
+            progress.shape.sapling_outputs += tx.outputs.len() as u64;
+            progress.shape.orchard_actions += tx.actions.len() as u64;
+        }
+        progress.shape.txs += block.vtx.len() as u64;
 
         // Match this block's transparent outputs against the wallet's exposed addresses. This is
         // O(outputs-in-block) with a hash-set membership test per output, independent of how many
@@ -517,10 +532,8 @@ async fn download_range_once<C: ChainSource>(
             }
         }
 
-        let encoded = block.encode_to_vec();
-        let mut block_file = File::create(block_path(engine_dir, &meta)).await?;
-        block_file.write_all(&encoded).await?;
-        progress.block_meta.push(meta);
+        let height = block.height();
+        progress.blocks.push(height, block.encode_to_vec());
     }
     Ok(())
 }
@@ -533,28 +546,119 @@ async fn download_chain_state<C: ChainSource>(
     Ok(tree_state.to_chain_state()?)
 }
 
-/// Remove a just-scanned batch's cached compact-block files *and* their `compactblocks_meta`
-/// rows, keeping the on-disk cache and the metadata table consistent.
+/// One batch downloaded ahead of the scan that will consume it.
 ///
-/// Dropping only the files (as this used to) left the metadata rows behind for every scanned
-/// height forever: on a long-lived node `compactblocks_meta` then grew without bound, and -
-/// worse - a later reorg's `with_blocks` pass would try to open those now-fileless rows and
-/// fail with `NotFound` before the rewind's `truncate_to_height` could run, so the intended
-/// in-place reorg recovery never completed. Because sync processes one batch per call
-/// (download -> scan -> delete before the next), truncating to just below the batch's lowest
-/// height removes exactly this batch's rows, so the table never accumulates.
-fn delete_cached_blocks(engine_dir: &Path, db_cache: &mut FsBlockDb, block_meta: Vec<BlockMeta>) {
-    let lowest = block_meta.iter().map(|m| m.height).min();
-    for meta in &block_meta {
-        if let Err(e) = std::fs::remove_file(block_path(engine_dir, meta)) {
-            warn!("Failed to remove cached block {:?}: {}", meta, e);
+/// The sync loop alternates a download, which waits on the upstream and the network, with a
+/// scan, which is this host's CPU and its wallet database - and neither overlapped the other,
+/// so each sat idle for the whole of the other's turn. Against a lightwalletd the download is a
+/// small share of a batch; against a full node, which has no compact-block range request and is
+/// asked block by block, it was over a third (measured: 249 s to 184 s for the same restore
+/// once the next range was fetched while the current one scanned).
+///
+/// The prefetch is speculative - it guesses that the scan will leave the following range next
+/// in line ([`next_range_guess`]) - so it carries the range it fetched, and a guess that does
+/// not match what `suggest_scan_ranges` asks for next is simply dropped. That is what makes it
+/// safe across a reorg: a rewind changes the next range, the guess misses, and the batch
+/// downloads normally.
+pub struct Prefetched {
+    /// The range these blocks cover.
+    pub range: ScanRange,
+    /// The blocks, and the shape of what was fetched.
+    pub downloaded: DownloadedRange,
+}
+
+/// Fetch one range for the prefetch. Shielded-only by construction: the transparent matcher
+/// needs the actor's address and outpoint sets, which change as batches record receives, so a
+/// detached task must not match against a snapshot of them. The actor only spawns a prefetch
+/// for a wallet without transparent receiving.
+pub async fn prefetch_range<C: ChainSource>(
+    client: &mut C,
+    range: ScanRange,
+) -> anyhow::Result<Prefetched> {
+    let downloaded = download_blocks(client, &range, None, None).await?;
+    // A short range is not an error - the upstream may simply not have the blocks yet - but it
+    // is not usable either, because the scan expects the whole range it asked for.
+    if downloaded.blocks.len() != range.len() {
+        anyhow::bail!(
+            "prefetch of {range} received {} block(s), expected {}",
+            downloaded.blocks.len(),
+            range.len()
+        );
+    }
+    Ok(Prefetched { range, downloaded })
+}
+
+/// A prefetch in flight. Dropping it aborts the download: an actor that stops syncing (a
+/// shutdown, a halt) must not leave a detached task streaming a range nobody will scan.
+pub struct PrefetchTask(Option<tokio::task::JoinHandle<anyhow::Result<Prefetched>>>);
+
+impl PrefetchTask {
+    /// Run `download` on a detached task.
+    pub fn spawn<F>(download: F) -> Self
+    where
+        F: Future<Output = anyhow::Result<Prefetched>> + Send + 'static,
+    {
+        Self(Some(tokio::spawn(download)))
+    }
+
+    /// Wait for the download. A failed or cancelled prefetch is not an error - the batch
+    /// downloads its range normally, and the upstream's own failure surfaces there - so it is
+    /// logged at DEBUG and reported as no prefetch.
+    pub async fn finish(mut self) -> Option<Prefetched> {
+        let handle = self.0.take()?;
+        match handle.await {
+            Ok(Ok(prefetched)) => Some(prefetched),
+            Ok(Err(e)) => {
+                tracing::debug!("prefetch failed, downloading the range directly: {e:#}");
+                None
+            }
+            Err(e) => {
+                tracing::debug!("prefetch task did not finish: {e}");
+                None
+            }
         }
     }
-    if let Some(lowest) = lowest {
-        let truncate_to = BlockHeight::from(u32::from(lowest).saturating_sub(1));
-        if let Err(e) = db_cache.truncate_to_height(truncate_to) {
-            warn!("Failed to truncate block cache metadata to {truncate_to}: {e:?}");
+}
+
+impl Drop for PrefetchTask {
+    fn drop(&mut self) {
+        if let Some(handle) = &self.0 {
+            handle.abort();
         }
+    }
+}
+
+/// How [`sync_one_batch`] starts the next range's download: a closure that spawns the fetch on
+/// a fresh upstream handle. The engine is generic over the chain source and holds no handle of
+/// its own to spawn with, so the caller (the actor, which holds the shared connection) supplies
+/// the spawn.
+pub type PrefetchSpawner<'a> = &'a (dyn Fn(ScanRange) -> PrefetchTask + Sync);
+
+/// The range the next batch will take, computed from the ranges as they stand *before* the
+/// current batch is scanned - which is what lets the fetch start while the scan runs.
+///
+/// The next batch's selection is the one [`sync_one_batch`] makes, and the only thing the scan
+/// changes about it is retiring the range now being scanned. So: take what is left of the
+/// highest-priority range after the current batch, and chunk it the same way. A guess made
+/// this way is right whenever the scan retires its range and leaves the priorities alone,
+/// which is the ordinary case; anything else - a reorg, a new tip-priority range - makes it
+/// miss, and a miss costs only the fetch it wasted.
+///
+/// `None` when the current batch finishes the range in hand, and when it is a `Verify`: those
+/// are small, they come first, and what follows one depends on what the verification finds.
+pub fn next_range_guess(
+    scan_ranges: &[ScanRange],
+    scanning: &ScanRange,
+    batch_size: u32,
+) -> Option<ScanRange> {
+    let first = scan_ranges.first()?;
+    if first.priority() == ScanPriority::Verify {
+        return None;
+    }
+    let (_, rest) = first.split_at(scanning.block_range().end)?;
+    match rest.split_at(rest.block_range().start + batch_size) {
+        Some((next, _)) => Some(next),
+        None => Some(rest),
     }
 }
 
@@ -665,7 +769,7 @@ pub const REORG_BASE_MARGIN: u32 = 10;
 /// The largest rewind margin the doubling in [`next_reorg_margin`] will reach. One batch is the
 /// natural ceiling - rewinding further than a batch would scan back is all cost and no benefit -
 /// and it also bounds how much work a mistakenly-grown margin can throw away.
-pub const REORG_MAX_MARGIN: u32 = BATCH_SIZE;
+pub const REORG_MAX_MARGIN: u32 = DEFAULT_BATCH_SIZE;
 
 /// The margin to use after a scan pass, given the one just used and whether that pass hit a
 /// reorg.
@@ -690,11 +794,13 @@ pub fn next_reorg_margin(current: u32, reorged: bool) -> u32 {
 }
 
 /// Scan a downloaded range; handle continuity (reorg) errors by rewinding. See [`ScanOutcome`].
-#[allow(clippy::too_many_arguments)]
+///
+/// On a reorg the range's blocks are simply not applied: they live only in `blocks`, which the
+/// caller drops with the batch, so there is nothing on disk to clean up and no cache index to
+/// keep consistent with the rewind.
 fn scan_blocks(
     params: &ZNetwork,
-    engine_dir: &Path,
-    db_cache: &mut FsBlockDb,
+    blocks: &MemBlockCache,
     db_data: &mut WriteDb,
     initial_chain_state: &ChainState,
     scan_range: &ScanRange,
@@ -703,7 +809,7 @@ fn scan_blocks(
     info!(range = %scan_range, "scanning blocks");
     let scan_result = scan_cached_blocks(
         params,
-        db_cache,
+        blocks,
         db_data,
         scan_range.block_range().start,
         initial_chain_state,
@@ -723,57 +829,9 @@ fn scan_blocks(
             // NB: truncation requires a note-commitment-tree checkpoint, and per-block
             // checkpoints exist only for scanned blocks that carried shielded outputs
             // (virtually all real blocks). `perform_rewind` falls back to the nearest
-            // valid checkpoint when the requested height has none; the cache is then
-            // truncated to the height actually rewound to.
+            // valid checkpoint when the requested height has none.
             let base = err.at_height().saturating_sub(REORG_BASE_MARGIN);
-            let rewind_height = perform_rewind(db_data, err.at_height(), requested, base)?;
-            // Delete the now-stale cached block files above the rewind height. A metadata row
-            // whose backing file is already gone (rows left behind by an older zecd that removed
-            // files but not their `compactblocks_meta` rows) must not abort this: `with_blocks`
-            // opens each row's file *before* handing it to the closure, so a `NotFound` there
-            // would propagate and skip the `truncate_to_height` below - leaving the metadata
-            // un-truncated and the in-place reorg recovery broken (the node could then only
-            // recover by dropping the client and redownloading). Treat a missing file as
-            // already-cleaned and fall through to the truncate, which drops every stale row in a
-            // single statement regardless of how far `with_blocks` got.
-            let cleanup = db_cache.with_blocks(Some(rewind_height + 1), None, |block| {
-                let meta = BlockMeta {
-                    height: block.height(),
-                    block_hash: block.hash(),
-                    block_time: block.time,
-                    sapling_outputs_count: 0,
-                    orchard_actions_count: 0,
-                };
-                match std::fs::remove_file(block_path(engine_dir, &meta)) {
-                    Ok(()) => Ok(()),
-                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-                    Err(e) => Err(ChainError::<(), _>::BlockSource(FsBlockDbError::Fs(e))),
-                }
-            });
-            match cleanup {
-                Ok(()) => {}
-                // The metadata rows above the rewind height were already removed (per-batch
-                // cleanup keeps files and rows consistent), so `with_blocks` can't find its
-                // `rewind_height + 1` starting row. Nothing left to delete on disk; the
-                // in-flight batch's own files are removed by `delete_cached_blocks` back in
-                // `sync_one_batch`. Fall through to truncate any remaining stale rows.
-                Err(ChainError::BlockSource(FsBlockDbError::CacheMiss(_))) => {}
-                // A metadata row whose backing file is already gone (rows left behind by an
-                // older zecd that removed files but not their `compactblocks_meta` rows). Treat
-                // it as already-cleaned; the truncate below drops the stale row.
-                Err(ChainError::BlockSource(FsBlockDbError::Fs(e)))
-                    if e.kind() == std::io::ErrorKind::NotFound =>
-                {
-                    warn!(
-                        "Stale block-cache metadata row had no backing file during \
-                         reorg cleanup; truncating it"
-                    );
-                }
-                Err(e) => return Err(anyhow!("{:?}", e)),
-            }
-            db_cache
-                .truncate_to_height(rewind_height)
-                .map_err(|e| anyhow!("{:?}", e))?;
+            perform_rewind(db_data, err.at_height(), requested, base)?;
             Ok(ScanOutcome {
                 ranges_changed: true,
                 reorged: true,
@@ -797,6 +855,50 @@ fn scan_blocks(
     }
 }
 
+/// Where the wall clock went inside one [`sync_one_batch`] call, plus the shape of the work
+/// that consumed it.
+///
+/// The sync loop's two phases bill to entirely different resources - the download to the
+/// upstream and the network, the scan to this host's CPU and its wallet database - and a
+/// single "batch took N seconds" line cannot tell them apart, so an operator watching a slow
+/// restore could not tell whether to blame their upstream or their hardware, and neither could
+/// a benchmark. This carries the split out to the caller, which logs it per batch and
+/// accumulates it on [`crate::wallet::SyncTotals`].
+#[derive(Debug, Default, Clone, Copy)]
+pub struct BatchTimings {
+    /// Streaming the compact blocks into the cache, or taking a prefetched range.
+    pub download: std::time::Duration,
+    /// The `tree_state` round trip for the block below the range.
+    pub tree_state: std::time::Duration,
+    /// `scan_cached_blocks`: trial decryption, note-commitment tree insertion, and the
+    /// database write, which this level cannot separate.
+    pub scan: std::time::Duration,
+    /// Recording transparent receives and spends matched during the download.
+    pub transparent: std::time::Duration,
+    /// Whether this batch's blocks had already been fetched while the previous one scanned,
+    /// so `download` is the cost of taking them rather than of fetching them.
+    pub prefetch_hit: bool,
+    /// The work the range carried.
+    pub shape: RangeShape,
+}
+
+impl BatchTimings {
+    /// Everything [`sync_one_batch`] spent on the batch, whether or not the range applied.
+    pub fn total(&self) -> std::time::Duration {
+        self.download + self.tree_state + self.scan + self.transparent
+    }
+
+    /// Blocks per second over the whole batch, or `0.0` for an empty/instant batch.
+    pub fn blocks_per_sec(&self) -> f64 {
+        let secs = self.total().as_secs_f64();
+        if secs > 0.0 {
+            f64::from(self.shape.blocks) / secs
+        } else {
+            0.0
+        }
+    }
+}
+
 /// Outcome of one sync batch: whether a batch was scanned (so the caller should call again), and
 /// how many transparent receives were recorded from the block scan (so the actor can refresh its
 /// exposed-address set - a recorded receive may have extended the transparent gap).
@@ -810,26 +912,43 @@ pub struct BatchOutcome {
     /// Spends of the wallet's own transparent outputs discovered by matching this batch's
     /// transparent inputs against its unspent outpoints.
     pub transparent_spends_recorded: usize,
+    /// Where this batch's wall clock went. Zero on the no-work path.
+    pub timings: BatchTimings,
+    /// A download of the range the next batch is expected to take, started before this
+    /// batch's scan so it overlaps it. `None` when there was nothing to guess at, when the
+    /// caller supplied no spawner, or when a reorg invalidated the guess. See [`Prefetched`].
+    pub next_prefetch: Option<PrefetchTask>,
+}
+
+/// What [`sync_one_batch`] needs beyond the client and the wallet database.
+pub struct BatchParams<'a> {
+    /// The wallet's transparent receive matcher when transparent receiving is enabled (`None`
+    /// for shielded-only wallets, which skips transparent extraction entirely). When present,
+    /// each scanned block's transparent outputs are matched against it and recorded as receives
+    /// via `put_received_transparent_utxo` after the shielded scan succeeds; a match on a
+    /// gap-lookahead address records its `addresses` row first ([`record_lookahead_address`]).
+    pub transparent: Option<&'a TransparentMatcher>,
+    /// The wallet's unspent transparent outpoints, matched against each block's inputs.
+    pub unspent: Option<&'a UnspentOutpoints>,
+    /// How far below a continuity break to rewind (see [`next_reorg_margin`]).
+    pub reorg_margin: u32,
+    /// Blocks per batch (`[sync] batch_size`).
+    pub batch_size: u32,
+    /// A download of the range this batch is expected to take, started by the previous one.
+    /// Used only if it covers exactly the range this batch selects.
+    pub prefetched: Option<Prefetched>,
+    /// How to start the next range's download while this batch scans; `None` runs the loop
+    /// the plain way, one phase at a time.
+    pub prefetch: Option<PrefetchSpawner<'a>>,
 }
 
 /// Process at most one batch of work. `worked` is `true` if a batch was scanned (caller should
 /// call again), `false` if there are no pending scan ranges (wallet is caught up).
-///
-/// `transparent` is the wallet's transparent receive matcher when transparent receiving is
-/// enabled (`None` for shielded-only wallets, which skips transparent extraction entirely). When
-/// present, each scanned block's transparent outputs are matched against it and recorded as
-/// receives via `put_received_transparent_utxo` after the shielded scan succeeds; a match on a
-/// gap-lookahead address records its `addresses` row first ([`record_lookahead_address`]).
-#[allow(clippy::too_many_arguments)]
 pub async fn sync_one_batch<C: ChainSource>(
     client: &mut C,
     params: &ZNetwork,
-    engine_dir: &Path,
-    db_cache: &mut FsBlockDb,
     db_data: &mut WriteDb,
-    transparent: Option<&TransparentMatcher>,
-    unspent: Option<&UnspentOutpoints>,
-    reorg_margin: u32,
+    batch: BatchParams<'_>,
 ) -> anyhow::Result<BatchOutcome> {
     let scan_ranges = db_data.suggest_scan_ranges()?;
     tracing::debug!(
@@ -852,61 +971,95 @@ pub async fn sync_one_batch<C: ChainSource>(
             reorged: false,
             transparent_recorded: 0,
             transparent_spends_recorded: 0,
+            timings: BatchTimings::default(),
+            next_prefetch: None,
         });
     };
 
     // A `Verify` range is always returned first and is small; scan it whole. Otherwise scan
-    // the first BATCH_SIZE-block chunk of the highest-priority range.
+    // the first `batch_size`-block chunk of the highest-priority range.
     let scan_range = if first.priority() == ScanPriority::Verify {
         first.clone()
     } else {
-        match first.split_at(first.block_range().start + BATCH_SIZE) {
+        match first.split_at(first.block_range().start + batch.batch_size) {
             Some((cur, _next)) => cur,
             None => first.clone(),
         }
     };
 
-    let (block_meta, received, spent) = download_blocks(
-        client,
-        engine_dir,
-        db_cache,
-        &scan_range,
-        transparent.map(|m| &m.all),
-        unspent,
-    )
-    .await?;
+    let mut timings = BatchTimings::default();
 
-    // Fetch the prior block's chain state and scan. Anything that fails here must still clean up
-    // the just-downloaded cache files, so the result is captured and the delete runs regardless.
+    // Was the range downloaded ahead of time, while the previous batch was scanning? Only if
+    // the guess matches exactly: a rewind, a priority change or a re-planned range all make it
+    // miss, and a miss costs nothing but the fetch it wasted.
+    let t_download = std::time::Instant::now();
+    let downloaded = match batch.prefetched.filter(|p| p.range == scan_range) {
+        Some(prefetched) => {
+            info!(range = %scan_range, "taking prefetched compact blocks");
+            timings.prefetch_hit = true;
+            prefetched.downloaded
+        }
+        None => {
+            download_blocks(
+                client,
+                &scan_range,
+                batch.transparent.map(|m| &m.all),
+                batch.unspent,
+            )
+            .await?
+        }
+    };
+    timings.download = t_download.elapsed();
+    timings.shape = downloaded.shape;
+    let DownloadedRange {
+        blocks,
+        received,
+        spent,
+        ..
+    } = downloaded;
+
+    // Start fetching the next range now, so the upstream works while this host scans. It has
+    // to happen *here*, between the download and the scan: spawned after the scan it would
+    // have nothing to overlap with. (That is exactly the mistake the first version of this
+    // made - every phase timing improved and the wall clock did not move.)
+    let mut next_prefetch = batch
+        .prefetch
+        .and_then(|spawn| next_range_guess(&scan_ranges, &scan_range, batch.batch_size).map(spawn));
+
+    // Fetch the prior block's chain state and scan.
+    let mut tree_state_elapsed = std::time::Duration::ZERO;
     let result = async {
         // Never request the tree state below height 1: lightwalletd treats BlockId height 0 as
         // "unspecified" and rejects it, and there's no pre-genesis tree state. On a genesis-
         // adjacent range (fresh regtest) `start - 1` would be 0; clamp to 1 (mirrors init.rs).
         let start = u32::from(scan_range.block_range().start);
         let prior_height = BlockHeight::from(start.saturating_sub(1).max(1));
+        let t_tree = std::time::Instant::now();
         let chain_state = download_chain_state(client, prior_height).await?;
+        tree_state_elapsed = t_tree.elapsed();
 
         // `scan_cached_blocks` is CPU-bound; keep the async runtime healthy.
+        let t_scan = std::time::Instant::now();
         let outcome = tokio::task::block_in_place(|| {
             scan_blocks(
                 params,
-                engine_dir,
-                db_cache,
+                &blocks,
                 db_data,
                 &chain_state,
                 &scan_range,
-                reorg_margin,
+                batch.reorg_margin,
             )
         })?;
+        timings.scan = t_scan.elapsed();
         Ok::<ScanOutcome, anyhow::Error>(outcome)
     }
     .await;
-
-    // Remove the downloaded compact blocks (files and their metadata rows) whether the scan
-    // succeeded or failed, so a transient error (or a reorg-shifted range) cannot strand cache
-    // files on disk or leave stale `compactblocks_meta` rows behind.
-    delete_cached_blocks(engine_dir, db_cache, block_meta);
+    timings.tree_state = tree_state_elapsed;
+    // The batch's blocks are done with, whether or not the scan applied them.
+    drop(blocks);
     let outcome = result?;
+
+    let t_transparent = std::time::Instant::now();
 
     // Record the transparent receives matched during download - but only when the range was
     // actually applied. On a reorg the wallet rewound instead of scanning these blocks, so the
@@ -923,7 +1076,7 @@ pub async fn sync_one_batch<C: ChainSource>(
             let output = &matched.output;
             // A gap-lookahead match has no `addresses` row yet; record (and thereby expose) it
             // first, or the receive below would be rejected as `AddressNotRecognized`.
-            if let Some(matcher) = transparent {
+            if let Some(matcher) = batch.transparent {
                 if let Some(index) = matcher.lookahead_index(output.recipient_address()) {
                     if let Err(e) = record_lookahead_address(db_data, matcher.account, index) {
                         warn!(
@@ -1029,13 +1182,22 @@ pub async fn sync_one_batch<C: ChainSource>(
                 ),
             }
         }
+    } else {
+        // A reorg invalidates the guess: the rewind changes what comes next, so drop the fetch
+        // (which aborts it) rather than let the next batch test it against a range it can no
+        // longer want.
+        next_prefetch = None;
     }
+
+    timings.transparent = t_transparent.elapsed();
 
     Ok(BatchOutcome {
         worked: true,
         reorged: outcome.reorged,
         transparent_recorded,
         transparent_spends_recorded,
+        timings,
+        next_prefetch,
     })
 }
 
@@ -1198,17 +1360,14 @@ mod tests {
 
     /// Fabricate a compact block carrying exactly one Orchard action (so, like virtually
     /// every real block, it leaves a note-commitment-tree checkpoint the wallet can rewind
-    /// to), write its file into the cache directory, and record its metadata in the cache
-    /// DB - exactly what `download_blocks` does with a lightwalletd stream.
-    fn write_block(
-        engine_dir: &Path,
-        db_cache: &mut FsBlockDb,
+    /// to).
+    fn compact_block(
         height: u32,
         hash: [u8; 32],
         prev: [u8; 32],
         cmx: [u8; 32],
         orchard_tree_size: u32,
-    ) -> BlockMeta {
+    ) -> pb::CompactBlock {
         let action = pb::CompactOrchardAction {
             nullifier: cmx_bytes(0xEE, height).to_vec(),
             cmx: cmx.to_vec(),
@@ -1222,7 +1381,7 @@ mod tests {
             actions: vec![action],
             ..Default::default()
         };
-        let cb = pb::CompactBlock {
+        pb::CompactBlock {
             height: u64::from(height),
             hash: hash.to_vec(),
             prev_hash: prev.to_vec(),
@@ -1235,20 +1394,45 @@ mod tests {
                 // Fabricated-chain test helper: no ironwood notes in these synthetic blocks.
                 ironwood_commitment_tree_size: 0,
             }),
-        };
-        let meta = BlockMeta {
-            height: BlockHeight::from_u32(height),
-            block_hash: BlockHash(hash),
-            block_time: cb.time,
-            sapling_outputs_count: 0,
-            orchard_actions_count: 1,
-        };
-        std::fs::write(block_path(engine_dir, &meta), cb.encode_to_vec())
-            .expect("write compact block file");
-        db_cache
-            .write_block_metadata(&[meta])
-            .expect("record block metadata");
-        meta
+        }
+    }
+
+    /// One fabricated block in the cache the scan reads from - exactly what `download_blocks`
+    /// produces from a one-block upstream stream.
+    fn cached_block(
+        height: u32,
+        hash: [u8; 32],
+        prev: [u8; 32],
+        cmx: [u8; 32],
+        orchard_tree_size: u32,
+    ) -> MemBlockCache {
+        let mut cache = MemBlockCache::new();
+        cache.push(
+            BlockHeight::from_u32(height),
+            compact_block(height, hash, prev, cmx, orchard_tree_size).encode_to_vec(),
+        );
+        cache
+    }
+
+    /// One batch of consecutive fabricated blocks `from..=to`, hashed with `hash_tag` and
+    /// carrying commitments tagged `cmx_tag`, linking from `prev`.
+    fn cached_chain(
+        hash_tag: u8,
+        cmx_tag: u8,
+        from: u32,
+        to: u32,
+        mut prev: [u8; 32],
+    ) -> MemBlockCache {
+        let mut cache = MemBlockCache::new();
+        for h in from..=to {
+            let hash = fake_hash(hash_tag, h);
+            cache.push(
+                BlockHeight::from_u32(h),
+                compact_block(h, hash, prev, cmx_bytes(cmx_tag, h), h).encode_to_vec(),
+            );
+            prev = hash;
+        }
+        cache
     }
 
     fn chain_state(height: u32, hash: [u8; 32], orchard: &OrchardFrontier) -> ChainState {
@@ -1277,6 +1461,59 @@ mod tests {
             .map(|m| u32::from(m.block_height()))
     }
 
+    /// A wallet born at genesis with an empty prior chain state, so scanning can start at
+    /// height 1 (mirrors the offline regtest lifecycle test), with chain A (`1..=blocks`, one
+    /// Orchard commitment each) scanned a block at a time while tracking the growing tree
+    /// frontier (the server-side tree state a real upstream would report for each prior
+    /// block). Returns the wallet, the frontier after the whole chain, and the frontier after
+    /// block 1 (the state a rewind to 1 resumes from).
+    fn scanned_chain_a(
+        wd: &std::path::Path,
+        blocks: u32,
+    ) -> (WriteDb, OrchardFrontier, OrchardFrontier) {
+        let net = crate::network::regtest();
+        let mut db_data = crate::wallet::open::init_dbs(net, wd).expect("init dbs");
+
+        let genesis = fake_hash(0xAA, 0);
+        let birthday = AccountBirthday::from_parts(
+            ChainState::empty(BlockHeight::from_u32(0), BlockHash(genesis)),
+            None,
+        );
+        db_data
+            .create_account("t", &SecretVec::new(vec![1u8; 64]), &birthday, None)
+            .expect("create account");
+        db_data
+            .update_chain_tip(BlockHeight::from_u32(blocks))
+            .expect("set tip");
+
+        let mut frontier = OrchardFrontier::empty();
+        let mut frontier_at_1 = OrchardFrontier::empty();
+        let mut prev = genesis;
+        for h in 1..=blocks {
+            let from = chain_state(h - 1, prev, &frontier);
+            let hash = fake_hash(0xA1, h);
+            let cmx = cmx_bytes(0x0A, h);
+            scan_blocks(
+                &net,
+                &cached_block(h, hash, prev, cmx, h),
+                &mut db_data,
+                &from,
+                &range(h, h + 1),
+                REORG_BASE_MARGIN,
+            )
+            .expect("scan chain A block");
+            assert!(frontier.append(MerkleHashOrchard::from_cmx(
+                &ExtractedNoteCommitment::from_bytes(&cmx).unwrap()
+            )));
+            if h == 1 {
+                frontier_at_1 = frontier.clone();
+            }
+            prev = hash;
+        }
+        assert_eq!(max_scanned(&db_data), Some(blocks), "chain A fully scanned");
+        (db_data, frontier, frontier_at_1)
+    }
+
     /// The rewind margin decides how far one reorg round trip walks back, and doubling it is
     /// what turns a deep rollback from a linear walk into a logarithmic one. Drive the same
     /// continuity-error branch with two margins and require the wallet to land where each says.
@@ -1289,65 +1526,16 @@ mod tests {
         for (margin, expected_tip) in [(REORG_BASE_MARGIN, 51u32), (40, 21)] {
             let net = crate::network::regtest();
             let dir = tempfile::tempdir().unwrap();
-            let wd = dir.path();
-            let mut db_data = crate::wallet::open::init_dbs(net, wd).expect("init dbs");
-            let mut db_cache = crate::wallet::open::open_fsblockdb(wd).expect("open cache");
-            std::fs::create_dir_all(wd.join("blocks")).expect("blocks dir");
-
-            let genesis = fake_hash(0xAA, 0);
-            let birthday = AccountBirthday::from_parts(
-                ChainState::empty(BlockHeight::from_u32(0), BlockHash(genesis)),
-                None,
-            );
-            db_data
-                .create_account("t", &SecretVec::new(vec![1u8; 64]), &birthday, None)
-                .expect("create account");
-            db_data
-                .update_chain_tip(BlockHeight::from_u32(60))
-                .expect("set tip");
-
             // A chain long enough that a 40-block rewind still lands well above the birthday,
             // so what is under test is the margin rather than the wallet running out of
             // rewindable history.
-            let mut frontier = OrchardFrontier::empty();
-            let mut prev = genesis;
-            for h in 1..=60u32 {
-                let from = chain_state(h - 1, prev, &frontier);
-                let hash = fake_hash(0xA1, h);
-                let cmx = cmx_bytes(0x0A, h);
-                write_block(wd, &mut db_cache, h, hash, prev, cmx, h);
-                scan_blocks(
-                    &net,
-                    wd,
-                    &mut db_cache,
-                    &mut db_data,
-                    &from,
-                    &range(h, h + 1),
-                    REORG_BASE_MARGIN,
-                )
-                .expect("scan block");
-                assert!(frontier.append(MerkleHashOrchard::from_cmx(
-                    &ExtractedNoteCommitment::from_bytes(&cmx).unwrap()
-                )));
-                prev = hash;
-            }
-            assert_eq!(max_scanned(&db_data), Some(60), "chain fully scanned");
+            let (mut db_data, frontier, _) = scanned_chain_a(dir.path(), 60);
 
             // Block 61 arrives claiming a different block 60 as its parent.
             let alien_60 = fake_hash(0xB1, 60);
-            write_block(
-                wd,
-                &mut db_cache,
-                61,
-                fake_hash(0xB1, 61),
-                alien_60,
-                cmx_bytes(0x0B, 61),
-                61,
-            );
             let outcome = scan_blocks(
                 &net,
-                wd,
-                &mut db_cache,
+                &cached_block(61, fake_hash(0xB1, 61), alien_60, cmx_bytes(0x0B, 61), 61),
                 &mut db_data,
                 &chain_state(60, alien_60, &frontier),
                 &range(61, 62),
@@ -1406,82 +1594,27 @@ mod tests {
         assert_eq!(m, REORG_MAX_MARGIN);
     }
 
-    /// Drive `scan_blocks`\' continuity-error branch - the only code in zecd that handles
+    /// Drive `scan_blocks`' continuity-error branch - the only code in zecd that handles
     /// reorgs - end to end and offline: scan a fabricated chain, present a block whose
-    /// `prev_hash` contradicts the wallet\'s stored tip (what a post-reorg lightwalletd
-    /// serves), and verify the rewind (wallet truncated, cache truncated, stale block files
-    /// deleted), then that the replacement chain scans cleanly past the old tip.
+    /// `prev_hash` contradicts the wallet's stored tip (what a post-reorg upstream serves),
+    /// verify the rewind, then that the replacement chain - served as one batch, the way the
+    /// sync loop would download it - scans cleanly past the old tip.
+    ///
+    /// The batch that hit the reorg is simply dropped: it only ever lived in memory, so there
+    /// is no cache to truncate and no stale block file to delete. (The file-cache era had three
+    /// more tests here for exactly that bookkeeping; the memory cache has none to get wrong.)
     #[test]
-    fn reorg_rewinds_wallet_cache_and_files() {
+    fn reorg_rewinds_the_wallet_and_the_replacement_chain_scans() {
         let net = crate::network::regtest();
         let dir = tempfile::tempdir().unwrap();
-        let wd = dir.path();
-        let mut db_data = crate::wallet::open::init_dbs(net, wd).expect("init dbs");
-        let mut db_cache = crate::wallet::open::open_fsblockdb(wd).expect("open cache");
-        std::fs::create_dir_all(wd.join("blocks")).expect("blocks dir");
+        let (mut db_data, _, frontier_at_1) = scanned_chain_a(dir.path(), 10);
 
-        // An account born at genesis with an empty prior chain state, so scanning can start
-        // at height 1 (mirrors the offline regtest lifecycle test).
-        let genesis = fake_hash(0xAA, 0);
-        let birthday = AccountBirthday::from_parts(
-            ChainState::empty(BlockHeight::from_u32(0), BlockHash(genesis)),
-            None,
-        );
-        db_data
-            .create_account("t", &SecretVec::new(vec![1u8; 64]), &birthday, None)
-            .expect("create account");
-        db_data
-            .update_chain_tip(BlockHeight::from_u32(10))
-            .expect("set tip");
-
-        // Chain A: blocks 1..=10, one Orchard commitment each, scanned a block at a time
-        // while tracking the growing tree frontier (the server-side tree state a real
-        // lightwalletd would report for each prior block).
-        let mut frontier = OrchardFrontier::empty();
-        let mut frontier_at_1 = OrchardFrontier::empty();
-        let mut prev = genesis;
-        let mut metas_a = Vec::new();
-        for h in 1..=10u32 {
-            let from = chain_state(h - 1, prev, &frontier);
-            let hash = fake_hash(0xA1, h);
-            let cmx = cmx_bytes(0x0A, h);
-            metas_a.push(write_block(wd, &mut db_cache, h, hash, prev, cmx, h));
-            scan_blocks(
-                &net,
-                wd,
-                &mut db_cache,
-                &mut db_data,
-                &from,
-                &range(h, h + 1),
-                REORG_BASE_MARGIN,
-            )
-            .expect("scan chain A block");
-            assert!(frontier.append(MerkleHashOrchard::from_cmx(
-                &ExtractedNoteCommitment::from_bytes(&cmx).unwrap()
-            )));
-            if h == 1 {
-                frontier_at_1 = frontier.clone();
-            }
-            prev = hash;
-        }
-        assert_eq!(max_scanned(&db_data), Some(10), "chain A fully scanned");
-
-        // The reorg: lightwalletd now serves a block 11 whose prev_hash is a *different*
-        // block 10 (the replacement fork\'s), contradicting the wallet\'s stored chain-A tip.
+        // The reorg: the upstream now serves a block 11 whose prev_hash is a *different*
+        // block 10 (the replacement fork's), contradicting the wallet's stored chain-A tip.
         let alien_10 = fake_hash(0xB1, 10);
-        write_block(
-            wd,
-            &mut db_cache,
-            11,
-            fake_hash(0xB1, 11),
-            alien_10,
-            cmx_bytes(0x0B, 11),
-            11,
-        );
         let outcome = scan_blocks(
             &net,
-            wd,
-            &mut db_cache,
+            &cached_block(11, fake_hash(0xB1, 11), alien_10, cmx_bytes(0x0B, 11), 11),
             &mut db_data,
             // The continuity check fires before any tree work, so the (unknowable) post-
             // reorg server tree state never comes into play; empty stands in for it.
@@ -1494,46 +1627,26 @@ mod tests {
             outcome.reorged,
             "a continuity break is reported as a reorg (rewound, range not applied)"
         );
+        assert!(
+            outcome.ranges_changed,
+            "a rewind reports that the scan ranges changed"
+        );
 
-        // The rewind: continuity broke at 11, so the wallet rewound to 11 - 10 = 1...
+        // The rewind: continuity broke at 11, so the wallet rewound to 11 - 10 = 1.
         assert_eq!(
             max_scanned(&db_data),
             Some(1),
             "wallet truncated to the rewind height"
         );
-        // ...the block cache is truncated to match...
-        assert_eq!(
-            db_cache.get_max_cached_height().expect("max cached height"),
-            Some(BlockHeight::from_u32(1)),
-            "cache truncated to the rewind height"
-        );
-        // ...and the now-stale cached block files above it are deleted from disk.
-        assert!(
-            block_path(wd, &metas_a[0]).exists(),
-            "block 1\'s file survives"
-        );
-        for m in &metas_a[1..] {
-            assert!(
-                !block_path(wd, m).exists(),
-                "stale chain-A file above the rewind height was deleted: {m:?}"
-            );
-        }
 
         // The replacement chain B (2..=12, linking from the surviving block 1) scans
         // cleanly: the wallet recovers past its old tip with no manual intervention.
-        let mut prev = fake_hash(0xA1, 1);
-        for h in 2..=12u32 {
-            let hash = fake_hash(0xB1, h);
-            write_block(wd, &mut db_cache, h, hash, prev, cmx_bytes(0x0B, h), h);
-            prev = hash;
-        }
         db_data
             .update_chain_tip(BlockHeight::from_u32(12))
             .expect("advance tip");
         scan_blocks(
             &net,
-            wd,
-            &mut db_cache,
+            &cached_chain(0xB1, 0x0B, 2, 12, fake_hash(0xA1, 1)),
             &mut db_data,
             &chain_state(1, fake_hash(0xA1, 1), &frontier_at_1),
             &range(2, 13),
@@ -1549,48 +1662,8 @@ mod tests {
 
     /// Scan a short chain so the standard 10-block rewind margin lands below the wallet's
     /// first scanned block, then exercise `perform_rewind`'s shallow retry directly.
-    fn short_chain_wallet(wd: &Path, blocks: u32) -> WriteDb {
-        let net = crate::network::regtest();
-        let mut db_data = crate::wallet::open::init_dbs(net, wd).expect("init dbs");
-        let mut db_cache = crate::wallet::open::open_fsblockdb(wd).expect("open cache");
-        std::fs::create_dir_all(wd.join("blocks")).expect("blocks dir");
-
-        let genesis = fake_hash(0xAA, 0);
-        let birthday = AccountBirthday::from_parts(
-            ChainState::empty(BlockHeight::from_u32(0), BlockHash(genesis)),
-            None,
-        );
-        db_data
-            .create_account("t", &SecretVec::new(vec![1u8; 64]), &birthday, None)
-            .expect("create account");
-        db_data
-            .update_chain_tip(BlockHeight::from_u32(blocks))
-            .expect("set tip");
-
-        let mut frontier = OrchardFrontier::empty();
-        let mut prev = genesis;
-        for h in 1..=blocks {
-            let from = chain_state(h - 1, prev, &frontier);
-            let hash = fake_hash(0xA1, h);
-            let cmx = cmx_bytes(0x0A, h);
-            write_block(wd, &mut db_cache, h, hash, prev, cmx, h);
-            scan_blocks(
-                &net,
-                wd,
-                &mut db_cache,
-                &mut db_data,
-                &from,
-                &range(h, h + 1),
-                REORG_BASE_MARGIN,
-            )
-            .expect("scan block");
-            assert!(frontier.append(MerkleHashOrchard::from_cmx(
-                &ExtractedNoteCommitment::from_bytes(&cmx).unwrap()
-            )));
-            prev = hash;
-        }
-        assert_eq!(max_scanned(&db_data), Some(blocks));
-        db_data
+    fn short_chain_wallet(wd: &std::path::Path, blocks: u32) -> WriteDb {
+        scanned_chain_a(wd, blocks).0
     }
 
     /// A reorg within 10 blocks of the wallet's entire scanned history: the requested rewind
@@ -1602,8 +1675,7 @@ mod tests {
     #[test]
     fn rewind_falls_back_to_shallow_checkpoint() {
         let dir = tempfile::tempdir().unwrap();
-        let wd = dir.path();
-        let mut db_data = short_chain_wallet(wd, 5);
+        let mut db_data = short_chain_wallet(dir.path(), 5);
 
         let rewound = perform_rewind(
             &mut db_data,
@@ -1630,8 +1702,7 @@ mod tests {
     #[test]
     fn rewind_reports_unrecoverable_reorg() {
         let dir = tempfile::tempdir().unwrap();
-        let wd = dir.path();
-        let mut db_data = short_chain_wallet(wd, 1);
+        let mut db_data = short_chain_wallet(dir.path(), 1);
 
         let err = perform_rewind(
             &mut db_data,
@@ -1662,8 +1733,7 @@ mod tests {
     #[test]
     fn safe_rewind_height_can_name_the_refused_height() {
         let dir = tempfile::tempdir().unwrap();
-        let wd = dir.path();
-        let mut db_data = short_chain_wallet(wd, 1);
+        let mut db_data = short_chain_wallet(dir.path(), 1);
 
         match db_data.truncate_to_height(BlockHeight::from_u32(0)) {
             Err(SqliteClientError::RequestedRewindInvalid {
@@ -1682,280 +1752,45 @@ mod tests {
         }
     }
 
-    /// `delete_cached_blocks` must drop the batch's `compactblocks_meta` rows along with the
-    /// files. Dropping only the files (the pre-fix behaviour) left a metadata row for every
-    /// scanned height behind forever, so a caught-up node's cache metadata grew without bound
-    /// (finding 3.4).
-    #[test]
-    fn delete_cached_blocks_removes_metadata_rows() {
-        let dir = tempfile::tempdir().unwrap();
-        let wd = dir.path();
-        // `init_dbs` also runs `init_blockmeta_db`, creating the `compactblocks_meta` table.
-        let _db_data =
-            crate::wallet::open::init_dbs(crate::network::regtest(), wd).expect("init dbs");
-        let mut db_cache = crate::wallet::open::open_fsblockdb(wd).expect("open cache");
-        std::fs::create_dir_all(wd.join("blocks")).expect("blocks dir");
-
-        // Simulate one downloaded+scanned batch: files on disk + matching metadata rows.
-        let mut prev = fake_hash(0xAA, 0);
-        let mut metas = Vec::new();
-        for h in 1..=5u32 {
-            let hash = fake_hash(0xA1, h);
-            metas.push(write_block(
-                wd,
-                &mut db_cache,
-                h,
-                hash,
-                prev,
-                cmx_bytes(0x0A, h),
-                h,
-            ));
-            prev = hash;
-        }
-        assert_eq!(
-            db_cache.get_max_cached_height().expect("max cached"),
-            Some(BlockHeight::from_u32(5)),
-            "batch metadata present before cleanup"
-        );
-
-        delete_cached_blocks(wd, &mut db_cache, metas.clone());
-
-        assert_eq!(
-            db_cache.get_max_cached_height().expect("max cached"),
-            None,
-            "metadata rows removed together with the files (no unbounded growth)"
-        );
-        for m in &metas {
-            assert!(
-                db_cache.find_block(m.height).expect("find_block").is_none(),
-                "metadata row for {:?} gone",
-                m.height
-            );
-            assert!(!block_path(wd, m).exists(), "file for {:?} gone", m.height);
-        }
+    fn tip_range(start: u32, end: u32) -> ScanRange {
+        ScanRange::from_parts(
+            BlockHeight::from_u32(start)..BlockHeight::from_u32(end),
+            ScanPriority::ChainTip,
+        )
     }
 
-    /// The finding's core regression: after normal multi-batch forward sync - where each
-    /// batch's cache files (and now its metadata rows) are removed once scanned - a naturally
-    /// occurring reorg must still recover *in place*. Before the fix the retained, now-fileless
-    /// metadata rows made the rewind's `with_blocks` pass fail with `NotFound` before
-    /// `truncate_to_height` ran, so recovery broke and `compactblocks_meta` was never truncated.
+    /// The guess is what the next batch will select, worked out from the ranges as they are
+    /// *before* the current one is scanned - which is what lets the fetch start early enough
+    /// to overlap the scan. A guess is only useful if it is exactly right, since a mismatch is
+    /// discarded, so it must chunk the remainder the way `sync_one_batch` chunks a range.
     #[test]
-    fn reorg_recovers_after_per_batch_cache_deletion() {
-        let net = crate::network::regtest();
-        let dir = tempfile::tempdir().unwrap();
-        let wd = dir.path();
-        let mut db_data = crate::wallet::open::init_dbs(net, wd).expect("init dbs");
-        let mut db_cache = crate::wallet::open::open_fsblockdb(wd).expect("open cache");
-        std::fs::create_dir_all(wd.join("blocks")).expect("blocks dir");
+    fn next_range_guess_is_the_next_batch_selection() {
+        let first = tip_range(100, 100_000);
+        let scanning = tip_range(100, 25_100);
+        let guess = next_range_guess(std::slice::from_ref(&first), &scanning, 25_000)
+            .expect("more range remains");
+        assert_eq!(guess, tip_range(25_100, 50_100));
 
-        let genesis = fake_hash(0xAA, 0);
-        let birthday = AccountBirthday::from_parts(
-            ChainState::empty(BlockHeight::from_u32(0), BlockHash(genesis)),
-            None,
-        );
-        db_data
-            .create_account("t", &SecretVec::new(vec![1u8; 64]), &birthday, None)
-            .expect("create account");
-        db_data
-            .update_chain_tip(BlockHeight::from_u32(10))
-            .expect("set tip");
-
-        // Forward-sync chain A one block at a time, deleting each batch's cache after scanning
-        // it (exactly what `sync_one_batch` does) so no block file survives on disk.
-        let mut frontier = OrchardFrontier::empty();
-        let mut frontier_at_1 = OrchardFrontier::empty();
-        let mut prev = genesis;
-        for h in 1..=10u32 {
-            let from = chain_state(h - 1, prev, &frontier);
-            let hash = fake_hash(0xA1, h);
-            let cmx = cmx_bytes(0x0A, h);
-            let meta = write_block(wd, &mut db_cache, h, hash, prev, cmx, h);
-            scan_blocks(
-                &net,
-                wd,
-                &mut db_cache,
-                &mut db_data,
-                &from,
-                &range(h, h + 1),
-                REORG_BASE_MARGIN,
-            )
-            .expect("scan chain A block");
-            delete_cached_blocks(wd, &mut db_cache, vec![meta]);
-            assert!(frontier.append(MerkleHashOrchard::from_cmx(
-                &ExtractedNoteCommitment::from_bytes(&cmx).unwrap()
-            )));
-            if h == 1 {
-                frontier_at_1 = frontier.clone();
-            }
-            prev = hash;
-        }
-        assert_eq!(max_scanned(&db_data), Some(10), "chain A fully scanned");
-        assert_eq!(
-            db_cache.get_max_cached_height().expect("max cached"),
-            None,
-            "block cache metadata does not accumulate across batches"
-        );
-
-        // The reorg: a replacement block 11 whose prev_hash is a *different* block 10.
-        let alien_10 = fake_hash(0xB1, 10);
-        let meta_11 = write_block(
-            wd,
-            &mut db_cache,
-            11,
-            fake_hash(0xB1, 11),
-            alien_10,
-            cmx_bytes(0x0B, 11),
-            11,
-        );
-        let worked = scan_blocks(
-            &net,
-            wd,
-            &mut db_cache,
-            &mut db_data,
-            &ChainState::empty(BlockHeight::from_u32(10), BlockHash(alien_10)),
-            &range(11, 12),
-            REORG_BASE_MARGIN,
-        )
-        .expect("reorg recovery must succeed even though prior batch files are gone");
-        assert!(
-            worked.ranges_changed,
-            "a rewind reports that the scan ranges changed"
-        );
-        delete_cached_blocks(wd, &mut db_cache, vec![meta_11]);
-
-        // Rewound to 11 - 10 = 1, and the cache metadata was truncated to match (empty, since
-        // block 1's file+row were already removed by its own batch).
-        assert_eq!(
-            max_scanned(&db_data),
-            Some(1),
-            "wallet truncated to the rewind height"
-        );
-        assert_eq!(
-            db_cache.get_max_cached_height().expect("max cached"),
-            None,
-            "cache metadata truncated, not left stale"
-        );
-
-        // The replacement chain B (2..=12, linking from the surviving block 1) scans cleanly.
-        let mut prev = fake_hash(0xA1, 1);
-        for h in 2..=12u32 {
-            let hash = fake_hash(0xB1, h);
-            write_block(wd, &mut db_cache, h, hash, prev, cmx_bytes(0x0B, h), h);
-            prev = hash;
-        }
-        db_data
-            .update_chain_tip(BlockHeight::from_u32(12))
-            .expect("advance tip");
-        scan_blocks(
-            &net,
-            wd,
-            &mut db_cache,
-            &mut db_data,
-            &chain_state(1, fake_hash(0xA1, 1), &frontier_at_1),
-            &range(2, 13),
-            REORG_BASE_MARGIN,
-        )
-        .expect("scan the replacement chain");
-        assert_eq!(
-            max_scanned(&db_data),
-            Some(12),
-            "recovered past the old tip"
-        );
+        // The last chunk of a range is shorter than a full batch, and is guessed whole.
+        let first = tip_range(100, 30_000);
+        let guess = next_range_guess(std::slice::from_ref(&first), &scanning, 25_000)
+            .expect("a short tail remains");
+        assert_eq!(guess, tip_range(25_100, 30_000));
     }
 
-    /// Backwards-compatibility for a node upgraded in place: an older zecd left
-    /// `compactblocks_meta` rows whose backing files were already deleted. A reorg must still
-    /// recover - the rewind treats the missing files as already-cleaned and truncates the stale
-    /// rows - instead of failing on `NotFound` before `truncate_to_height` runs.
+    /// Nothing to fetch ahead: no ranges, the current batch finishing the range in hand, or a
+    /// pending `Verify` range (small, first, and what follows it depends on what it finds).
     #[test]
-    fn reorg_tolerates_orphaned_metadata_rows() {
-        let net = crate::network::regtest();
-        let dir = tempfile::tempdir().unwrap();
-        let wd = dir.path();
-        let mut db_data = crate::wallet::open::init_dbs(net, wd).expect("init dbs");
-        let mut db_cache = crate::wallet::open::open_fsblockdb(wd).expect("open cache");
-        std::fs::create_dir_all(wd.join("blocks")).expect("blocks dir");
+    fn no_guess_when_nothing_follows_the_current_batch() {
+        let whole = tip_range(100, 1_100);
+        assert!(next_range_guess(&[], &whole, 25_000).is_none());
+        assert!(next_range_guess(std::slice::from_ref(&whole), &whole, 25_000).is_none());
 
-        let genesis = fake_hash(0xAA, 0);
-        let birthday = AccountBirthday::from_parts(
-            ChainState::empty(BlockHeight::from_u32(0), BlockHash(genesis)),
-            None,
+        let verify = ScanRange::from_parts(
+            BlockHeight::from_u32(100)..BlockHeight::from_u32(110),
+            ScanPriority::Verify,
         );
-        db_data
-            .create_account("t", &SecretVec::new(vec![1u8; 64]), &birthday, None)
-            .expect("create account");
-        db_data
-            .update_chain_tip(BlockHeight::from_u32(10))
-            .expect("set tip");
-
-        // Scan chain A 1..=10, then simulate the OLD buggy cleanup: keep every metadata row but
-        // delete the files for heights 2..=10 (the drift the finding is about).
-        let mut frontier = OrchardFrontier::empty();
-        let mut prev = genesis;
-        let mut metas = Vec::new();
-        for h in 1..=10u32 {
-            let from = chain_state(h - 1, prev, &frontier);
-            let hash = fake_hash(0xA1, h);
-            let cmx = cmx_bytes(0x0A, h);
-            metas.push(write_block(wd, &mut db_cache, h, hash, prev, cmx, h));
-            scan_blocks(
-                &net,
-                wd,
-                &mut db_cache,
-                &mut db_data,
-                &from,
-                &range(h, h + 1),
-                REORG_BASE_MARGIN,
-            )
-            .expect("scan chain A block");
-            assert!(frontier.append(MerkleHashOrchard::from_cmx(
-                &ExtractedNoteCommitment::from_bytes(&cmx).unwrap()
-            )));
-            prev = hash;
-        }
-        for m in &metas[1..] {
-            std::fs::remove_file(block_path(wd, m)).expect("remove stale cache file");
-        }
-        assert_eq!(
-            db_cache.get_max_cached_height().expect("max cached"),
-            Some(BlockHeight::from_u32(10)),
-            "orphaned metadata rows retained, reproducing the drift"
-        );
-
-        // The reorg now drives the rewind over the orphaned rows: it must tolerate the missing
-        // files and still truncate the metadata rather than erroring.
-        let alien_10 = fake_hash(0xB1, 10);
-        write_block(
-            wd,
-            &mut db_cache,
-            11,
-            fake_hash(0xB1, 11),
-            alien_10,
-            cmx_bytes(0x0B, 11),
-            11,
-        );
-        scan_blocks(
-            &net,
-            wd,
-            &mut db_cache,
-            &mut db_data,
-            &ChainState::empty(BlockHeight::from_u32(10), BlockHash(alien_10)),
-            &range(11, 12),
-            REORG_BASE_MARGIN,
-        )
-        .expect("reorg recovery tolerates orphaned metadata rows");
-
-        assert_eq!(
-            max_scanned(&db_data),
-            Some(1),
-            "wallet truncated to the rewind height"
-        );
-        assert_eq!(
-            db_cache.get_max_cached_height().expect("max cached"),
-            Some(BlockHeight::from_u32(1)),
-            "stale metadata truncated to the rewind height (no longer growing without bound)"
-        );
+        assert!(next_range_guess(std::slice::from_ref(&verify), &verify, 25_000).is_none());
     }
 
     /// The load-shed retry resumes one past the last block actually written, so a reconnect
