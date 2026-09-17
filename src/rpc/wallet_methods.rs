@@ -754,22 +754,28 @@ fn push_memo_fields(entry: &mut Value, memo: Option<&[u8]>) {
     }
 }
 
-/// The address to display for one output. For an outgoing external recipient (`to_account` is
-/// `None`) we reduce the recorded recipient to the single on-chain receiver actually paid in
-/// this output's pool (`address::single_receiver_for_pool`), so history is identical on the
-/// instance that authored the send and after a restore-from-seed - where only the paid
-/// receiver, never the full UA the caller typed, is recoverable from chain. (This is the
-/// history-display half of zecd's stateless design: the cached recipient UA is off-chain state.)
-/// Received and self-transfer outputs (`to_account` is `Some`) keep their recorded address (the
-/// wallet's own, already single-receiver under the default Orchard-only `default_receivers`).
+/// The address to display for one output: the single on-chain receiver actually paid in this
+/// output's pool (`address::single_receiver_for_pool`).
+///
+/// One rule in both directions, so a payer and a payee looking at the same output print the
+/// same string. The chain carries a receiver, not the envelope it was wrapped in, so this is
+/// also the only spelling recoverable after a restore-from-seed - which is the history half of
+/// zecd's stateless design, the cached recipient address being off-chain state.
+///
+/// Incoming outputs used to keep their recorded address instead. That was correct only while
+/// the recorded address was the wallet's own issued one: the block scanner writes an
+/// all-receivers encoding when it meets a note at a diversifier index with no `addresses` row,
+/// which is every index after a from-seed restore or `zecd rescan`, so history then named an
+/// address this wallet will not derive - one carrying a transparent receiver a shielded-only
+/// wallet does not watch. Under the default Orchard-only `default_receivers` the two rules
+/// produce identical strings; they differ only on a wallet configured for several receivers,
+/// where naming the receiver paid is the honest answer and the recorded envelope was a guess.
 fn display_address(network: &crate::network::ZNetwork, out: &read::TxOutputRecord) -> String {
     let Some(addr) = out.to_address.as_deref() else {
         return String::new();
     };
-    if out.to_account.is_none() {
-        if let Some(single) = crate::address::single_receiver_for_pool(network, addr, out.pool) {
-            return single;
-        }
+    if let Some(single) = crate::address::single_receiver_for_pool(network, addr, out.pool) {
+        return single;
     }
     addr.to_string()
 }
@@ -3207,6 +3213,68 @@ mod tests {
             recipient_key_scope: Some(read::EXTERNAL_KEY_SCOPE),
             ..out(true, true, value, Some(addr), true)
         }
+    }
+
+    /// A payer and a payee looking at one output print the same address.
+    ///
+    /// The regression this guards: the block scanner records an all-receivers encoding when it
+    /// meets a note at a diversifier index with no `addresses` row, which is every index after a
+    /// from-seed restore. Keeping that recorded string for incoming outputs made history name an
+    /// address a shielded-only wallet will not derive, and made the two sides of one payment
+    /// print differently. Both directions now reduce to the receiver actually paid.
+    #[test]
+    fn a_payer_and_a_payee_print_the_same_address_for_one_output() {
+        use zcash_keys::keys::{UnifiedAddressRequest, UnifiedSpendingKey};
+
+        let net = crate::network::ZNetwork::Test;
+        let mnemonic = <bip0039::Mnemonic<bip0039::English>>::from_phrase(
+            "mechanic vehicle helmet decide plug gorilla frost dial october \
+             midnight culture idea mountain fame park social drip bid doctor scatter glance defy \
+             moment stage",
+        )
+        .unwrap();
+        let ufvk = UnifiedSpendingKey::from_seed(
+            &net,
+            &mnemonic.to_seed(""),
+            zip32::AccountId::try_from(0u32).unwrap(),
+        )
+        .unwrap()
+        .to_unified_full_viewing_key();
+        // Two spellings of one diversifier index: the all-receivers encoding a restored wallet
+        // records, and the bare Orchard receiver that is what actually reaches the chain.
+        let all_receivers = ufvk
+            .address(
+                zip32::DiversifierIndex::from(0u32),
+                UnifiedAddressRequest::ALLOW_ALL,
+            )
+            .unwrap()
+            .encode(&net);
+        let paid_receiver = crate::address::single_receiver_for_pool(&net, &all_receivers, 3)
+            .expect("the Orchard receiver of an own address");
+        assert_ne!(
+            all_receivers, paid_receiver,
+            "the fixture must carry more than the receiver paid, or it guards nothing"
+        );
+
+        // The payee's row, recorded under whichever encoding was on disk when the note landed.
+        let received = TxOutputRecord {
+            to_account: Some(uuid::Uuid::new_v4()),
+            from_account: None,
+            ..out(false, true, 1, Some(&all_receivers), false)
+        };
+        // The payer's row, recorded under the address they typed.
+        let sent = out(true, false, 1, Some(&all_receivers), false);
+
+        let payee = display_address(&net, &received);
+        assert_eq!(
+            payee,
+            display_address(&net, &sent),
+            "one output, one string"
+        );
+        assert_eq!(
+            payee, paid_receiver,
+            "history names the receiver paid, not the envelope it was recorded in"
+        );
     }
 
     /// ZIP-302 text memo bytes (a 512-byte field whose UTF-8 prefix decodes to `s`).
