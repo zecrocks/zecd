@@ -5,6 +5,40 @@ All notable changes to zecd are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com), and this
 project adheres to [Semantic Versioning](https://semver.org).
 
+## [0.7.3] - 2026-09-18
+
+Two fixes and a dependency update, no new features, no configuration key or response shape
+moved. A drop-in upgrade from 0.7.2.
+
+Take it if you reconcile payments per address, or if your CI runs `cargo deny`. Wallet
+balances were never affected by either fix below.
+
+### Security
+- **rustls updated past RUSTSEC-2026-0285**, which reaches zecd through the wallet crates'
+  gRPC stack. `cargo deny check advisories` fails on 0.7.2 as shipped. A patch release under
+  the same license terms, carrying rustls-webpki with it.
+
+### Fixed
+- **Per-address reads returned zero after a from-seed restore or `zecd rescan`.**
+  `getreceivedbyaddress` answered `0.00000000` for the wallet's own `getnewaddress` address,
+  and `listreceivedbyaddress` reported those funds under a different address. Balances stayed
+  correct throughout, so only per-address reconciliation could see it. Which encoding of a
+  diversifier index a payer used never reaches the chain, so the wallet picks one, and the pick
+  depended on whether `getnewaddress` or the block scanner wrote the `addresses` row first: the
+  scanner records an all-receivers encoding, and a restore rebuilds that table from the scan
+  alone. String equality then matched nothing. Matching is now by diversifier index, so any
+  encoding of an index the wallet owns answers with that index's receipts. A spliced address is
+  still rejected, and a bare transparent address is still its own key.
+- **Incoming history named the address a receipt was recorded under, rather than the receiver
+  that was actually paid.** After a restore that recorded address is the scanner's
+  all-receivers encoding, so `listtransactions`, `listsinceblock`, `z_listtransactions` and
+  `gettransaction` named an address zecd will not derive - one carrying a transparent receiver
+  a shielded-only wallet does not watch. Outgoing outputs already reduced to the receiver paid,
+  because that is all a restore can recover; incoming ones now follow the same rule, so a payer
+  and a payee looking at one output print the same string. **This is byte-identical under the
+  default Orchard-only `[pools] default_receivers`**, and differs only on a wallet configured
+  for several receivers.
+
 ## [0.7.2] - 2026-09-09
 
 One fix, no new features, no configuration or response shape moved. A drop-in upgrade from 0.7.1.
@@ -622,6 +656,7 @@ Zcash, backed entirely by librustzcash and running as a light client.
 ### Security
 - Pre-release audit hardening; refuse to start on mainnet with the placeholder RPC password; enforce a 12-character passphrase minimum.
 
+[0.7.3]: https://github.com/zecrocks/zecd/compare/v0.7.2...v0.7.3
 [0.7.2]: https://github.com/zecrocks/zecd/compare/v0.7.1...v0.7.2
 [0.7.1]: https://github.com/zecrocks/zecd/compare/v0.7.0...v0.7.1
 [0.7.0]: https://github.com/zecrocks/zecd/compare/v0.6.3...v0.7.0
