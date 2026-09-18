@@ -1194,6 +1194,30 @@ pub(crate) fn z_listtransactions(
     Ok(Value::Array(entries))
 }
 
+/// The key `received_by_address` files an address under: the encoding this wallet issues at that
+/// address's diversifier index, so a caller's query and the wallet's stored outputs are compared
+/// in one spelling. Falls back to the string as given for anything with no unified encoding of
+/// its own - a bare transparent address, which is its own key.
+fn received_address_key(handle: &crate::wallet::WalletHandle, addr: &str) -> String {
+    crate::address::issued_encoding(&handle.network, addr, &handle.default_receivers)
+        .unwrap_or_else(|| addr.to_string())
+}
+
+/// The `to_address` strings a receipt at `addr`'s diversifier index could be stored under, for
+/// the SQL filter. That is every encoding the wallet has recorded at that index, plus `addr`
+/// itself - which is what covers a bare transparent address (no diversifier sibling to find) and
+/// an address whose row the wallet holds under exactly the queried spelling.
+///
+/// **Never empty**, so the filter cannot degenerate into "match nothing" for an address the
+/// caller legitimately owns; an index with no receipts simply aggregates to zero.
+fn received_address_candidates(handle: &crate::wallet::WalletHandle, addr: &str) -> Vec<String> {
+    let mut candidates = read::recorded_encodings_of(handle.network, &handle.engine_dir, addr);
+    if !candidates.iter().any(|c| c == addr) {
+        candidates.push(addr.to_string());
+    }
+    candidates
+}
+
 /// Coinbase maturity depth as the aggregations compare it (confirmation counts are `i64` here).
 /// The value itself is [`read::COINBASE_MATURITY`], the single source shared with the
 /// balance/listunspent SQL; consensus forbids spending a transparent coinbase output below it,
@@ -1213,6 +1237,8 @@ const COINBASE_MATURITY: i64 = read::COINBASE_MATURITY as i64;
 /// `immature_balance`), so counting it as received would overstate income that a chain reorg
 /// can still revoke. Shielded coinbase notes (ZIP-213) carry no maturity rule and always count.
 fn received_by_address(
+    network: &crate::network::ZNetwork,
+    receivers: &crate::pools::ReceiverSet,
     txs: &[read::TxRecord],
     st: &SyncStatus,
     minconf: i64,
@@ -1235,7 +1261,13 @@ fn received_by_address(
             let Some(addr) = &out.to_address else {
                 continue;
             };
-            let e = map.entry(addr.clone()).or_insert((0, i64::MAX, Vec::new()));
+            // Key on one canonical spelling of the diversifier index rather than on whichever
+            // encoding happened to be recorded, so a restored wallet's receipts land under the
+            // address it actually issues. A non-unified address (a bare t-address) is its own
+            // identity and re-encodes to nothing, so it keeps its recorded string.
+            let key = crate::address::issued_encoding(network, addr, receivers)
+                .unwrap_or_else(|| addr.clone());
+            let e = map.entry(key).or_insert((0, i64::MAX, Vec::new()));
             e.0 += out.value.max(0) as u64;
             e.1 = e.1.min(conf);
             e.2.push(tx.txid_hex.clone());
@@ -1282,13 +1314,28 @@ pub(crate) fn getreceivedbyaddress(
         return Err(RpcError::wallet("Address not found in wallet"));
     }
     let st = handle.status();
-    // Push the single-address filter into SQL (sublinear) rather than scanning the whole
-    // history; the aggregation then sees only this address's outputs.
-    let txs = read::received_tx_records(&handle.engine_dir, Some(addr))?;
-    let total = received_by_address(&txs, &st, minconf, include_immature_coinbase)
-        .remove(addr)
-        .map(|(amt, _, _)| amt)
-        .unwrap_or(0);
+    // Match by diversifier index, not by the string the caller typed. The recorded spelling of
+    // an own address is not stable - `getnewaddress` writes the `default_receivers` encoding
+    // while the block scanner, meeting a note at an index with no `addresses` row, writes an
+    // all-receivers one - so a from-seed restore or `zecd rescan` leaves every receipt filed
+    // under a spelling the live wallet never returns. Every recorded encoding of this address's
+    // index is pushed into SQL, so the filter still names strings actually on disk.
+    let candidates = received_address_candidates(handle, addr);
+    let txs = read::received_tx_records(&handle.engine_dir, Some(&candidates))?;
+    // ...and the aggregation is keyed on one canonical spelling of the index, so the lookup
+    // below cannot miss for the same reason the filter could not.
+    let key = received_address_key(handle, addr);
+    let total = received_by_address(
+        &handle.network,
+        &handle.default_receivers,
+        &txs,
+        &st,
+        minconf,
+        include_immature_coinbase,
+    )
+    .remove(&key)
+    .map(|(amt, _, _)| amt)
+    .unwrap_or(0);
     Ok(zats_to_value(total))
 }
 
@@ -1314,19 +1361,41 @@ pub(crate) fn listreceivedbyaddress(
     let include_immature_coinbase = req.param(4).and_then(|v| v.as_bool()).unwrap_or(false);
     let handle = state.registry.get(wallet)?;
     let st = handle.status();
-    let txs = read::received_tx_records(&handle.engine_dir, address_filter.as_deref())?;
-    let mut received = received_by_address(&txs, &st, minconf, include_immature_coinbase);
+    // Same index-keyed matching as `getreceivedbyaddress`; an unfiltered call passes `None` and
+    // aggregates everything.
+    let filter_candidates = address_filter
+        .as_deref()
+        .map(|f| received_address_candidates(handle, f));
+    let txs = read::received_tx_records(&handle.engine_dir, filter_candidates.as_deref())?;
+    let mut received = received_by_address(
+        &handle.network,
+        &handle.default_receivers,
+        &txs,
+        &st,
+        minconf,
+        include_immature_coinbase,
+    );
+    // The filter is compared against the same canonical spelling the aggregation keys on.
+    let filter_key = address_filter
+        .as_deref()
+        .map(|f| received_address_key(handle, f));
 
     // The address universe: everything that received (already restricted by the pushed-down
     // filter), plus (with include_empty) every address the wallet has ever generated.
     let mut addrs: BTreeSet<String> = received.keys().cloned().collect();
     if include_empty {
-        addrs.extend(read::all_addresses(handle.network, &handle.engine_dir));
+        // In the issued spelling too, so the two halves cannot list one diversifier index twice
+        // under two encodings, and every address listed is one `getreceivedbyaddress` answers for.
+        addrs.extend(
+            read::all_addresses(handle.network, &handle.engine_dir)
+                .iter()
+                .map(|a| received_address_key(handle, a)),
+        );
     }
 
     let mut out = Vec::new();
     for addr in addrs {
-        if address_filter.as_deref().is_some_and(|f| f != addr) {
+        if filter_key.as_deref().is_some_and(|f| f != addr) {
             continue;
         }
         let (amount, conf, txids) = received.remove(&addr).unwrap_or((0, 0, Vec::new()));
@@ -2910,6 +2979,39 @@ mod tests {
         h
     }
 
+    /// A bare transparent address must survive the diversifier-index matching that
+    /// `getreceivedbyaddress` and `listreceivedbyaddress` push into SQL.
+    ///
+    /// It has no unified sibling, so `recorded_encodings_of` finds nothing for it, and an empty
+    /// candidate list compiles to `IN ()` - which the query builder turns into a match-nothing
+    /// filter. That reported `0.00000000` for a funded t-address: the exact answer the
+    /// index-keyed matching exists to stop giving. `received_address_candidates` therefore always
+    /// includes the address as given.
+    #[test]
+    fn a_bare_transparent_address_is_never_filtered_to_nothing() {
+        let handle = handle_with_pools(true, crate::pools::ReceiverSet::single(Receiver::Orchard));
+        // `for_test` carries no database, so `recorded_encodings_of` finds no rows - which is
+        // also what it finds for a real t-address, since a t-address has no diversifier index.
+        let candidates = received_address_candidates(&handle, TEST_T_ADDRESS);
+        assert!(
+            candidates.iter().any(|c| c == TEST_T_ADDRESS),
+            "the queried address must always be among the candidates, got {candidates:?}"
+        );
+        assert!(
+            !candidates.is_empty(),
+            "an empty candidate list becomes a match-nothing SQL filter"
+        );
+        // And it is its own aggregation key, so the lookup after the query cannot miss either.
+        assert_eq!(
+            received_address_key(&handle, TEST_T_ADDRESS),
+            TEST_T_ADDRESS,
+            "a transparent address has no unified re-encoding and stays itself"
+        );
+    }
+
+    /// A valid testnet P2PKH address, for the transparent-path tests above.
+    const TEST_T_ADDRESS: &str = "tmGqwWtL7RsbxikDSN26gsbicxVr2xJNe86";
+
     /// `z_getaddressforaccount`'s `receiver_types`: `p2pkh` (zcashd's transparent token) selects
     /// a bare transparent address on a transparent-enabled wallet, and is refused everywhere it
     /// cannot be honoured.
@@ -4140,14 +4242,31 @@ mod tests {
                 vec![out(true, true, 11, Some("a"), true)],
             ), // change: skipped
         ];
-        let m = received_by_address(&txs, &st, 1, false);
+        let m = received_by_address(
+            &crate::network::ZNetwork::Test,
+            &crate::pools::ReceiverSet::single(crate::pools::Receiver::Orchard),
+            &txs,
+            &st,
+            1,
+            false,
+        );
         let (amt, conf, txids) = m.get("a").cloned().unwrap();
         assert_eq!(amt, 150);
         assert_eq!(conf, 1); // confirmations of the most recent counted tx
         assert_eq!(txids.len(), 2);
         // minconf 0 picks up the unmined receive but still never the expired/change outputs.
         assert_eq!(
-            received_by_address(&txs, &st, 0, false).get("a").unwrap().0,
+            received_by_address(
+                &crate::network::ZNetwork::Test,
+                &crate::pools::ReceiverSet::single(crate::pools::Receiver::Orchard),
+                &txs,
+                &st,
+                0,
+                false
+            )
+            .get("a")
+            .unwrap()
+            .0,
             157
         );
     }
@@ -4178,19 +4297,49 @@ mod tests {
             tx(Some(90), false, None, vec![t_out(5, "a")]),
         ];
         assert_eq!(
-            received_by_address(&txs, &st, 1, false).get("a").unwrap().0,
+            received_by_address(
+                &crate::network::ZNetwork::Test,
+                &crate::pools::ReceiverSet::single(crate::pools::Receiver::Orchard),
+                &txs,
+                &st,
+                1,
+                false
+            )
+            .get("a")
+            .unwrap()
+            .0,
             42
         );
         // include_immature_coinbase counts the immature transparent coinbase too.
         assert_eq!(
-            received_by_address(&txs, &st, 1, true).get("a").unwrap().0,
+            received_by_address(
+                &crate::network::ZNetwork::Test,
+                &crate::pools::ReceiverSet::single(crate::pools::Receiver::Orchard),
+                &txs,
+                &st,
+                1,
+                true
+            )
+            .get("a")
+            .unwrap()
+            .0,
             142
         );
         // minconf still applies on top of the maturity override: at minconf 60 only the
         // 100-conf coinbase survives (both height-50 txs sit at 51 conf, the ordinary receive
         // at 11).
         assert_eq!(
-            received_by_address(&txs, &st, 60, true).get("a").unwrap().0,
+            received_by_address(
+                &crate::network::ZNetwork::Test,
+                &crate::pools::ReceiverSet::single(crate::pools::Receiver::Orchard),
+                &txs,
+                &st,
+                60,
+                true
+            )
+            .get("a")
+            .unwrap()
+            .0,
             30
         );
     }

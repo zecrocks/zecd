@@ -13,6 +13,7 @@ use zcash_transparent::address::TransparentAddress;
 
 use crate::coin::Coin;
 use crate::error::RpcError;
+use crate::pools::{Receiver, ReceiverSet};
 
 /// Parse an address string into a network-agnostic [`ZcashAddress`] (for use as a payment
 /// recipient). Returns a Bitcoin-Core `RPC_INVALID_ADDRESS_OR_KEY` (-5) on failure.
@@ -66,6 +67,67 @@ pub fn receiver_types_of(addr: &Address) -> Vec<&'static str> {
         types.push("orchard");
     }
     types
+}
+
+/// Re-encode one of the wallet's **own** unified addresses to carry exactly the receivers this
+/// wallet issues by default (`[pools] default_receivers`): a canonical name for the diversifier
+/// index behind it, for the received-by aggregations.
+///
+/// **Not for transaction history** - that reduces every output, incoming and outgoing alike, to
+/// the receiver actually paid ([`single_receiver_for_pool`]), which is an on-chain fact and so
+/// cannot move when a config key does. This is the right answer only where the question is
+/// "which of my addresses" rather than "what did this output pay":
+/// `getreceivedbyaddress`/`listreceivedbyaddress`, which report one row per address and would
+/// otherwise split an index across a row per pool. Its config-dependence is acceptable there
+/// because that listing enumerates the wallet's *current* addresses.
+///
+/// The problem it solves: which *encoding* of a diversifier index a payer used never reaches the
+/// chain, so a wallet cannot recover it. When the block scan meets a note at an index it has no
+/// `addresses` row for - every index on a from-seed restore or after `zecd rescan` -
+/// `zcash_client_sqlite`'s `ensure_address` derives one with `UnifiedAddressRequest::ALLOW_ALL`
+/// and records *that*, a UA carrying transparent, Sapling and Orchard receivers. zecd issues no
+/// such address: `getnewaddress` builds from `default_receivers`, and a transparent receiver is
+/// only ever handed out bare. So the recorded string depends on whether `getnewaddress` or the
+/// scanner wrote the row first, which made a restored wallet report its receipts under an
+/// address the live wallet never returned - and, on a shielded-only wallet, under one carrying a
+/// transparent receiver nothing watches.
+///
+/// Every receiver of a wallet-derived UA sits at one diversifier index, so selecting the subset
+/// named by `receivers` yields exactly the address `ufvk.address(index, receivers)` would derive:
+/// the same key at the same index produces the same receivers. That makes this a pure
+/// receiver-subset operation needing no key material and no derivation, and it is idempotent -
+/// an address already carrying exactly `receivers` re-encodes to itself.
+///
+/// Returns `None`, and the caller keeps the recorded string, when the address is not unified
+/// (a bare transparent or Sapling address is its own identity) or when it carries none of
+/// `receivers` at all, leaving nothing a unified address could be built from.
+pub fn issued_encoding<P: Parameters>(
+    params: &P,
+    s: &str,
+    receivers: &ReceiverSet,
+) -> Option<String> {
+    let Address::Unified(ua) = decode_on_network(params, s)? else {
+        return None;
+    };
+    // Written out per receiver rather than through a shared closure: the two receiver types are
+    // distinct, so one generic helper would have to be a macro to no benefit.
+    //
+    // This **intersects** rather than requires - a configured receiver the address does not carry
+    // is left out, not treated as a failure. That matters because `ALLOW_ALL` allows rather than
+    // requires, so at a diversifier index where the Sapling receiver is invalid the recorded
+    // address lacks it while a wallet configured for `sapling, orchard` still asks for it.
+    // Requiring would abandon the re-encoding there and hand back the recorded string, which is
+    // the one shape this function exists to stop reporting: it carries a transparent receiver.
+    // Intersecting keeps the narrower shielded address, which is both safe and an address the
+    // wallet can receive at. Widening never happens either way - a receiver absent from the
+    // input cannot be derived without the viewing key, so a narrower address re-encodes to
+    // itself.
+    let keep = |r: Receiver| receivers.contains(r);
+    let orchard = ua.orchard().filter(|_| keep(Receiver::Orchard)).copied();
+    let sapling = ua.sapling().filter(|_| keep(Receiver::Sapling)).copied();
+    // The transparent receiver is dropped unconditionally: a `ReceiverSet` is shielded-only, and
+    // zecd hands its transparent receivers out bare rather than inside a unified address.
+    UnifiedAddress::from_receivers(orchard, sapling, None).map(|ua| ua.encode(params))
 }
 
 /// Reduce a recipient address to the single on-chain receiver a given pool's output actually
@@ -226,6 +288,79 @@ mod tests {
         assert_eq!(spk.len(), 46);
         assert!(spk.starts_with("a914"));
         assert!(spk.ends_with("87"));
+    }
+
+    /// The guarantee the whole re-encoding rests on: dropping the receivers a wallet does not
+    /// issue from the scanner's all-receivers address yields **exactly** the address the wallet
+    /// would derive at that diversifier index. If it did not, `getreceivedbyaddress` would
+    /// canonicalize a query and a stored output to two different strings and report zero.
+    ///
+    /// Checked against real key derivation rather than a fixture pair, and over several indices,
+    /// because the claim is about ZIP 32 (one key at one index produces one set of receivers),
+    /// not about one address.
+    #[test]
+    fn dropping_receivers_reproduces_what_the_wallet_derives_at_that_index() {
+        use crate::pools::{Receiver, ReceiverSet};
+        use zcash_keys::keys::UnifiedAddressRequest;
+
+        let net = crate::network::ZNetwork::Test;
+        // The committed testnet development mnemonic (valueless TAZ only), as a fixed key source.
+        let mnemonic = <bip0039::Mnemonic<bip0039::English>>::from_phrase(
+            "mechanic vehicle helmet decide plug gorilla frost dial october \
+             midnight culture idea mountain fame park social drip bid doctor scatter glance defy \
+             moment stage",
+        )
+        .unwrap();
+        let ufvk = zcash_keys::keys::UnifiedSpendingKey::from_seed(
+            &net,
+            &mnemonic.to_seed(""),
+            zip32::AccountId::try_from(0u32).unwrap(),
+        )
+        .unwrap()
+        .to_unified_full_viewing_key();
+        let orchard_only = ReceiverSet::single(Receiver::Orchard);
+        let both = ReceiverSet::new([Receiver::Sapling, Receiver::Orchard]).unwrap();
+
+        for index in [0u32, 1, 7, 1000, 70_000] {
+            let j = zip32::DiversifierIndex::from(index);
+            // What `zcash_client_sqlite::wallet::orchard::ensure_address` records when the block
+            // scan meets a note at an index with no `addresses` row.
+            let Ok(scanned) = ufvk.address(j, UnifiedAddressRequest::ALLOW_ALL) else {
+                continue; // not every index is valid for every receiver
+            };
+            let scanned = scanned.encode(&net);
+
+            for receivers in [&orchard_only, &both] {
+                let Ok(issued) = ufvk.address(j, receivers.to_unified_address_request()) else {
+                    // This index is not valid for every configured receiver, so the wallet never
+                    // issues an address here and `ALLOW_ALL` omitted that receiver too. The
+                    // re-encoding intersects, so it still strips the transparent receiver rather
+                    // than giving up and handing back the recorded string.
+                    let narrowed = issued_encoding(&net, &scanned, receivers)
+                        .expect("an intersection still yields a shielded address");
+                    let decoded = decode_on_network(&net, &narrowed).expect("decode");
+                    assert!(
+                        !receiver_types_of(&decoded).contains(&"transparent"),
+                        "index {index} re-encoded to something transparent-bearing: {narrowed}"
+                    );
+                    continue;
+                };
+                let issued = issued.encode(&net);
+                assert_eq!(
+                    issued_encoding(&net, &scanned, receivers).as_deref(),
+                    Some(issued.as_str()),
+                    "index {index}, receivers {}",
+                    receivers.display_names()
+                );
+                // Idempotent: what the wallet issued re-encodes to itself, so a live wallet's
+                // recorded addresses pass through this untouched.
+                assert_eq!(
+                    issued_encoding(&net, &issued, receivers).as_deref(),
+                    Some(issued.as_str()),
+                    "idempotence at index {index}"
+                );
+            }
+        }
     }
 
     #[test]

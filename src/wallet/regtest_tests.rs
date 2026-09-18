@@ -220,9 +220,11 @@ fn regtest_wallet_lifecycle() {
     assert!(read::received_tx_records(engine_dir, None)
         .expect("received_tx_records")
         .is_empty());
-    assert!(read::received_tx_records(engine_dir, Some(addr.as_str()))
-        .expect("received_tx_records filtered")
-        .is_empty());
+    assert!(
+        read::received_tx_records(engine_dir, Some(std::slice::from_ref(&addr)))
+            .expect("received_tx_records filtered")
+            .is_empty()
+    );
     // The `blocks`-table queries (no public API exposes block time / a reverse hash lookup).
     assert!(read::block_info_at(engine_dir, 1)
         .expect("block_info_at")

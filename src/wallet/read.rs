@@ -545,6 +545,102 @@ pub fn list_transactions(engine_dir: &Path) -> anyhow::Result<Vec<TxRecord>> {
     query_transactions(engine_dir, &TxQuery::default())
 }
 
+/// Recover the diversifier index (and scope) at which this wallet derived `ua`'s shielded
+/// receivers, or `None` if no in-scope account owns them. Pure crypto against the account's
+/// viewing key - one FF1 diversifier decrypt per receiver, never an index search.
+///
+/// Both receivers of a wallet-derived UA share one index, so the first that resolves settles it;
+/// a UA whose receivers disagree is a hand-spliced address that [`classify_unified_receivers`]
+/// rejects before any caller reaches this.
+pub fn diversifier_index_of(
+    network: ZNetwork,
+    engine_dir: &Path,
+    addr: &str,
+) -> Option<(DiversifierIndex, Scope)> {
+    let decoded = crate::address::decode_on_network(&network, addr)?;
+    let db = open_read(network, engine_dir).ok()?;
+    for account in db.get_account_ids().ok()? {
+        let Ok(Some(acct)) = db.get_account(account) else {
+            continue;
+        };
+        let Some(ufvk) = acct.ufvk() else {
+            continue;
+        };
+        let found = match &decoded {
+            Address::Unified(ua) => ua
+                .orchard()
+                .and_then(|o| {
+                    ufvk.orchard()
+                        .and_then(|fvk| orchard_receiver_index(fvk, o))
+                })
+                .or_else(|| {
+                    ua.sapling()
+                        .and_then(|p| ufvk.sapling().and_then(|dfvk| dfvk.decrypt_diversifier(p)))
+                }),
+            Address::Sapling(pa) => ufvk.sapling().and_then(|dfvk| dfvk.decrypt_diversifier(pa)),
+            // A transparent address is its own identity in the received-by aggregations (a
+            // t-address receive is recorded under the bare t-address that was paid), so it has
+            // no unified sibling to look up.
+            Address::Transparent(_) | Address::Tex(_) => None,
+        };
+        if found.is_some() {
+            return found;
+        }
+    }
+    None
+}
+
+/// The `addresses` rows this wallet has recorded at the same diversifier index as `addr` - every
+/// encoding under which a receipt at that index could have been stored.
+///
+/// This is what lets `getreceivedbyaddress` answer for an address the wallet owns but recorded
+/// under a *different* encoding of the same index. The recorded string is not a stable identity:
+/// `getnewaddress` writes the `[pools] default_receivers` encoding, while the block scan, meeting
+/// an index with no row yet, writes `zcash_client_sqlite`'s all-receivers one (see
+/// [`crate::address::issued_encoding`]). Since a from-seed restore or `zecd rescan` rebuilds the
+/// table from the scan alone, which of the two is on disk is not something a caller can know.
+///
+/// The index is recovered cryptographically and the lookup is a point read on the
+/// `(account_id, key_scope, diversifier_index_be)` unique index, so this costs one indexed row
+/// per account rather than a walk of the address list. Returns an empty vector for an
+/// address the wallet does not own, and for a bare transparent address (its own identity).
+pub fn recorded_encodings_of(network: ZNetwork, engine_dir: &Path, addr: &str) -> Vec<String> {
+    let Some((index, key_scope)) = diversifier_index_of(network, engine_dir, addr) else {
+        return Vec::new();
+    };
+    // The column stores the index big-endian so it sorts; `zcash_client_sqlite` writes it as the
+    // 11-byte little-endian representation reversed.
+    let mut index_be = *index.as_bytes();
+    index_be.reverse();
+    let scope_code = match key_scope {
+        Scope::External => 0,
+        Scope::Internal => 1,
+    };
+    let Ok(conn) = open_conn(engine_dir) else {
+        return Vec::new();
+    };
+    let Ok(mut stmt) = conn.prepare(
+        "SELECT a.address
+         FROM addresses a
+         WHERE a.diversifier_index_be = :index_be
+           AND a.key_scope = :key_scope
+           AND a.address IS NOT NULL",
+    ) else {
+        return Vec::new();
+    };
+    let rows = stmt.query_map(
+        named_params! {
+            ":index_be": &index_be[..],
+            ":key_scope": scope_code,
+        },
+        |row| row.get::<_, String>(0),
+    );
+    let Ok(rows) = rows else {
+        return Vec::new();
+    };
+    rows.filter_map(Result::ok).collect()
+}
+
 /// A lightweight data source for the received-by aggregations
 /// (`getreceivedbyaddress`/`listreceivedbyaddress`),
 /// avoiding [`list_transactions`]'s N+1 [`load_outputs`] and its per-tx memo/raw/block-hash
@@ -559,51 +655,80 @@ pub fn list_transactions(engine_dir: &Path) -> anyhow::Result<Vec<TxRecord>> {
 /// t-address (see [`load_outputs`]), so a t-address filter matches the stored rows directly.
 pub fn received_tx_records(
     engine_dir: &Path,
-    address_filter: Option<&str>,
+    address_filter: Option<&[String]>,
 ) -> anyhow::Result<Vec<TxRecord>> {
     let conn = open_conn(engine_dir)?;
+    // The candidate list is at most a handful of strings (one recorded row per key scope), so it
+    // is inlined as a bound-parameter list rather than a temporary table.
+    let address_clause = match address_filter {
+        None => "1".to_string(),
+        Some(candidates) => {
+            let holes = (0..candidates.len())
+                .map(|i| format!(":addr{i}"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            // An empty candidate set must match nothing, and `IN ()` is not valid SQL.
+            if holes.is_empty() {
+                "0".to_string()
+            } else {
+                format!("o.to_address IN ({holes})")
+            }
+        }
+    };
     // Order by the same `sort_height` (oldest-first) as `list_transactions`, so the per-address
     // `txids` list `listreceivedbyaddress` emits is in the identical order it was before this
     // flat path replaced the full N+1 load - including the `txid` and `(pool, output_index)`
     // tiebreaks (see [`query_transactions`]'s ordering contract). The grouping below preserves
     // first-seen txid order, so a fully ordered query is what makes the emitted `txids` list
     // deterministic across calls rather than merely height-sorted.
-    let mut stmt = conn.prepare(
+    let mut stmt = conn.prepare(&format!(
         "SELECT v.txid, v.mined_height, v.expired_unmined,
                 o.to_address, o.value, o.is_change, o.to_account_uuid, o.output_pool,
                 o.recipient_key_scope, v.tx_index
          FROM v_transactions v
          JOIN v_tx_outputs o ON o.txid = v.txid
-         WHERE (:addr IS NULL OR o.to_address = :addr)
+         WHERE {address_clause}
          ORDER BY COALESCE(
                 v.mined_height,
                 CASE WHEN v.expiry_height == 0 THEN NULL ELSE v.expiry_height END
             ) ASC NULLS LAST,
-            v.txid ASC, o.output_pool ASC, o.output_index ASC",
+            v.txid ASC, o.output_pool ASC, o.output_index ASC"
+    ))?;
+    let held = address_filter.unwrap_or(&[]);
+    let params: Vec<(String, &dyn rusqlite::ToSql)> = held
+        .iter()
+        .enumerate()
+        .map(|(i, candidate)| (format!(":addr{i}"), candidate as &dyn rusqlite::ToSql))
+        .collect();
+    let rows = stmt.query_map(
+        &*params
+            .iter()
+            .map(|(k, v)| (k.as_str(), *v))
+            .collect::<Vec<_>>(),
+        |row| {
+            Ok((
+                row.get::<_, Vec<u8>>(0)?,
+                row.get::<_, Option<u32>>(1)?,
+                row.get::<_, bool>(2)?,
+                // `tx_index` identifies a coinbase tx (block index 0), which the aggregation needs
+                // for the transparent coinbase-maturity exclusion.
+                row.get::<_, Option<u32>>(9)?,
+                TxOutputRecord {
+                    // `output_index`/`from_account`/`memo` are unused by the aggregation; `pool`
+                    // is carried through so the record is the same shape [`load_outputs`] produces.
+                    pool: row.get(7)?,
+                    output_index: 0,
+                    from_account: None,
+                    to_account: row.get::<_, Option<Uuid>>(6)?,
+                    to_address: row.get(3)?,
+                    value: row.get(4)?,
+                    is_change: row.get(5)?,
+                    recipient_key_scope: row.get::<_, Option<i64>>(8)?,
+                    memo: None,
+                },
+            ))
+        },
     )?;
-    let rows = stmt.query_map(named_params! { ":addr": address_filter }, |row| {
-        Ok((
-            row.get::<_, Vec<u8>>(0)?,
-            row.get::<_, Option<u32>>(1)?,
-            row.get::<_, bool>(2)?,
-            // `tx_index` identifies a coinbase tx (block index 0), which the aggregation needs
-            // for the transparent coinbase-maturity exclusion.
-            row.get::<_, Option<u32>>(9)?,
-            TxOutputRecord {
-                // `output_index`/`from_account`/`memo` are unused by the aggregation; `pool`
-                // is carried through so the record is the same shape [`load_outputs`] produces.
-                pool: row.get(7)?,
-                output_index: 0,
-                from_account: None,
-                to_account: row.get::<_, Option<Uuid>>(6)?,
-                to_address: row.get(3)?,
-                value: row.get(4)?,
-                is_change: row.get(5)?,
-                recipient_key_scope: row.get::<_, Option<i64>>(8)?,
-                memo: None,
-            },
-        ))
-    })?;
     // Group outputs back under their transaction, preserving first-seen txid order.
     let mut order: Vec<Vec<u8>> = Vec::new();
     let mut by_txid: HashMap<Vec<u8>, TxRecord> = HashMap::new();
