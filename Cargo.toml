@@ -326,3 +326,6 @@ tower = { version = "0.5", features = ["util"] }
 # backported, without which `age`'s `fl!` macro expansions (and therefore the reproducible Docker
 # builds) were a per-build coin flip. `age` 0.12 depends on `i18n-embed-fl` 0.10, which carries
 # that fix upstream, so the vendored copy and the patch entry are gone.
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(zcash_unstable, values("nu7", "zfuture"))'] }
