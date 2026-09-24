@@ -149,6 +149,21 @@ impl ProvingKeyCache {
             ironwood_pk,
         }
     }
+
+    /// The cached proving key for `version`, or `None` where this cache holds none: the
+    /// `PostNu6_3` key on a chain that never activates NU6.3, and the insecure pre-NU6.2
+    /// circuit, which no send may prove with.
+    fn pk_for(
+        &self,
+        version: orchard::circuit::OrchardCircuitVersion,
+    ) -> Option<&orchard::circuit::ProvingKey> {
+        use orchard::circuit::OrchardCircuitVersion as V;
+        match version {
+            V::FixedPostNu6_2 => Some(&self.orchard_pk),
+            V::PostNu6_3 => self.ironwood_pk.as_ref(),
+            V::InsecurePreNu6_2 => None,
+        }
+    }
 }
 
 /// The handle the daemon and every actor hold: a [`ProvingKeyCache`] that is **built in the
@@ -4396,7 +4411,15 @@ impl WalletActor {
         request: TransactionRequest,
         policy: ConfirmationsPolicy,
         privacy: SendPrivacy,
-    ) -> Result<(pczt::Pczt, SendShape, Duration), RpcError> {
+    ) -> Result<
+        (
+            pczt::Pczt,
+            Option<orchard::circuit::OrchardCircuitVersion>,
+            SendShape,
+            Duration,
+        ),
+        RpcError,
+    > {
         let account_id = self.require_account()?;
         let net = self.network;
         let change_pool = self.enabled_pools.change_pool();
@@ -4445,6 +4468,10 @@ impl WalletActor {
             }
             enforce_orchard_action_limit(&proposal, orchard_action_limit)?;
             let shape = proposal_shape(&proposal);
+            let orchard_circuit = orchard_circuit_for_branch(BranchId::for_height(
+                &net,
+                BlockHeight::from(proposal.min_target_height()),
+            ));
             let pczt = create_pczt_from_proposal::<_, _, Infallible, _, Infallible, _>(
                 db,
                 &net,
@@ -4462,7 +4489,7 @@ impl WalletActor {
             .map_err(|e| {
                 enrich_insufficient_funds(db, &engine_dir, policy, classify_pczt_err(e))
             })?;
-            Ok((pczt, shape, start.elapsed()))
+            Ok((pczt, orchard_circuit, shape, start.elapsed()))
         })
     }
 
@@ -4614,7 +4641,8 @@ impl WalletActor {
         // Cached-Orchard PCZT path: phase A (select+build) -> phase B (prove+sign) -> phase C
         // (store), all on the actor. Each phase is timed so the send-latency log shows where the
         // cost lands on a large, note-fragmented wallet.
-        let (pczt, shape, build) = self.build_proposal_and_pczt(request, policy, privacy)?;
+        let (pczt, orchard_circuit, shape, build) =
+            self.build_proposal_and_pczt(request, policy, privacy)?;
         // Awaits the background keygen if this is the first send of a young daemon; a no-op once
         // it has finished. Only sends wait - reads and sync never touch the key.
         let keys = self
@@ -4629,7 +4657,7 @@ impl WalletActor {
         let (txid, raw, prove, store): (TxId, Vec<u8>, Duration, Duration) =
             tokio::task::block_in_place(move || -> Result<_, RpcError> {
                 let p0 = Instant::now();
-                let signed = prove_sign_pczt(pczt, &usk, &prover, &keys)?;
+                let signed = prove_sign_pczt(pczt, orchard_circuit, &usk, &prover, &keys)?;
                 let prove = p0.elapsed();
                 let s0 = Instant::now();
                 let txid = store_pczt(db, signed, trust_own)?;
@@ -4836,13 +4864,14 @@ impl WalletActor {
             }
         };
         let policy = confirmations.unwrap_or(self.confirmations_policy);
-        let (pczt, shape, build) = match self.build_proposal_and_pczt(request, policy, privacy) {
-            Ok(v) => v,
-            Err(e) => {
-                let _ = reply.send(Err(e));
-                return;
-            }
-        };
+        let (pczt, orchard_circuit, shape, build) =
+            match self.build_proposal_and_pczt(request, policy, privacy) {
+                Ok(v) => v,
+                Err(e) => {
+                    let _ = reply.send(Err(e));
+                    return;
+                }
+            };
 
         let prover = self.prover.clone();
         // As on the inline path, this awaits the background keygen only on a young daemon's
@@ -4872,7 +4901,7 @@ impl WalletActor {
             // Isolate a proving panic: a completion MUST always be sent, or the pipeline would
             // wedge with `send_in_flight` stuck true.
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                prove_sign_pczt(pczt, &usk, &prover, &keys)
+                prove_sign_pczt(pczt, orchard_circuit, &usk, &prover, &keys)
             }))
             .unwrap_or_else(|_| {
                 error!("send proof panicked off-actor; the actor continues");
@@ -6521,6 +6550,7 @@ fn request_pays_transparent_output(net: &ZNetwork, request: &TransactionRequest)
 /// [`store_pczt`] for phase C.
 fn prove_sign_pczt(
     pczt: pczt::Pczt,
+    orchard_circuit: Option<orchard::circuit::OrchardCircuitVersion>,
     usk: &zcash_keys::keys::UnifiedSpendingKey,
     sapling_prover: &LocalTxProver,
     keys: &ProvingKeyCache,
@@ -6528,12 +6558,22 @@ fn prove_sign_pczt(
     use pczt::roles::prover::Prover;
     use pczt::roles::signer::{Error as SignerError, Signer};
 
-    // Proofs. Every zecd send spends Orchard notes (Orchard proof always required); a Sapling
+    // Proofs. The Orchard-pool bundle is proved under the circuit its protocol version names,
+    // which is `PostNu6_3` from NU6.3 on (see `orchard_circuit_for_branch`): legacy Orchard
+    // notes spent there with the `FixedPostNu6_2` key fail with `InvalidInstances`. A Sapling
     // output proof is only needed when a recipient is a Sapling address.
     let prover = Prover::new(pczt);
     let prover = if prover.requires_orchard_proof() {
+        let pk = orchard_circuit
+            .and_then(|version| keys.pk_for(version))
+            .ok_or_else(|| {
+                RpcError::wallet(format!(
+                    "Orchard proof required but no proving key is cached for its circuit \
+                     ({orchard_circuit:?})"
+                ))
+            })?;
         prover
-            .create_orchard_proof(&keys.orchard_pk)
+            .create_orchard_proof(pk)
             .map_err(|e| RpcError::wallet(format!("Orchard proof generation failed: {e:?}")))?
     } else {
         prover
@@ -7012,8 +7052,40 @@ fn coinbase_hint(zats: u64) -> String {
     format!("{zats} zatoshis are mature coinbase, spendable only via z_shieldcoinbase")
 }
 
+/// The circuit that proves the **Orchard-pool** bundle of a transaction built against
+/// `branch`, or `None` before NU5 (no Orchard protocol).
+///
+/// Not always the `FixedPostNu6_2` circuit: from NU6.3 the Orchard pool is on protocol V3,
+/// whose bundles must disable cross-address transfers (consensus-mandated), and only the
+/// `PostNu6_3` circuit constrains that flag. So a post-NU6.3 send that spends legacy Orchard
+/// notes proves its Orchard bundle with the same key as its Ironwood bundle; the
+/// `FixedPostNu6_2` key is refused there with `InvalidInstances`. This is the rule the fused
+/// builder applies too, deriving the circuit from the branch rather than from the pool.
+fn orchard_circuit_for_branch(branch: BranchId) -> Option<orchard::circuit::OrchardCircuitVersion> {
+    bundle_version_for_branch(branch, orchard::ValuePool::Orchard).map(|v| v.circuit_version())
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn orchard_bundles_prove_under_the_circuit_their_branch_names() {
+        use super::orchard_circuit_for_branch;
+        use orchard::circuit::OrchardCircuitVersion as V;
+        use zcash_protocol::consensus::BranchId;
+        // NU6.3 moved the Orchard pool to protocol V3, which mandates the cross-address
+        // restriction only the post-NU6.3 circuit enforces. Proving legacy Orchard notes there
+        // with the NU6.2 key is what failed with `InvalidInstances`.
+        assert_eq!(
+            orchard_circuit_for_branch(BranchId::Nu6_3),
+            Some(V::PostNu6_3)
+        );
+        assert_eq!(
+            orchard_circuit_for_branch(BranchId::Nu6_2),
+            Some(V::FixedPostNu6_2)
+        );
+        assert_eq!(orchard_circuit_for_branch(BranchId::Canopy), None);
+    }
+
     use super::gap_slots_remaining;
     use super::horizon_slots_remaining;
     use super::preexpose_progress_stats;
