@@ -187,6 +187,34 @@ impl ProvingKeyCache {
             ironwood_vk: ironwood_pk.map(|pk| pk.verifying_key()),
         }
     }
+
+    /// The cached proving key for `version`, or `None` where this cache holds none: the
+    /// `PostNu6_3` key on a chain that never activates NU6.3, and the insecure pre-NU6.2
+    /// circuit, which no send may prove with.
+    fn pk_for(
+        &self,
+        version: orchard::circuit::OrchardCircuitVersion,
+    ) -> Option<&'static orchard::circuit::ProvingKey> {
+        use orchard::circuit::OrchardCircuitVersion as V;
+        match version {
+            V::FixedPostNu6_2 => Some(self.orchard_pk),
+            V::PostNu6_3 => self.ironwood_pk,
+            V::InsecurePreNu6_2 => None,
+        }
+    }
+
+    /// The cached verifying key for `version`; see [`Self::pk_for`].
+    fn vk_for(
+        &self,
+        version: orchard::circuit::OrchardCircuitVersion,
+    ) -> Option<&orchard::circuit::VerifyingKey> {
+        use orchard::circuit::OrchardCircuitVersion as V;
+        match version {
+            V::FixedPostNu6_2 => Some(&self.orchard_vk),
+            V::PostNu6_3 => self.ironwood_vk.as_ref(),
+            V::InsecurePreNu6_2 => None,
+        }
+    }
 }
 
 /// The handle the daemon and every actor hold: a [`ProvingKeyCache`] that is **built in the
@@ -288,6 +316,9 @@ struct SendCompletion {
     /// The signed PCZT ready to extract+store, or the error that aborted phase A/B (proposal,
     /// PCZT build, proving, signing, or a caught panic in the proof job).
     result: Result<pczt::Pczt, RpcError>,
+    /// The circuit the send's Orchard-pool bundle was proved under, which picks the extract
+    /// step's verifying key (see [`orchard_circuit_for_branch`]).
+    orchard_circuit: Option<orchard::circuit::OrchardCircuitVersion>,
     /// The confirmations policy this send used, to enrich a `-6` if storing surfaces one.
     policy: ConfirmationsPolicy,
     /// The send's shape (input/action counts), carried through for the latency log line.
@@ -5408,7 +5439,15 @@ impl WalletActor {
         policy: ConfirmationsPolicy,
         privacy: SendPrivacy,
         spend_policy: &SpendPolicy,
-    ) -> Result<(pczt::Pczt, SendShape, Duration), RpcError> {
+    ) -> Result<
+        (
+            pczt::Pczt,
+            Option<orchard::circuit::OrchardCircuitVersion>,
+            SendShape,
+            Duration,
+        ),
+        RpcError,
+    > {
         // The PCZT prove+sign step has no transparent signing pass, so this path must never be
         // handed a policy that could select a transparent input. `do_send` routes transparent
         // sources to the fused path; this is the backstop that says so in code.
@@ -5480,6 +5519,7 @@ impl WalletActor {
             )?;
             enforce_max_tx_bytes(&proposal, proposal_branch(&net, &proposal), max_tx_bytes)?;
             let shape = proposal_shape(&proposal, proposal_branch(&net, &proposal));
+            let orchard_circuit = orchard_circuit_for_branch(proposal_branch(&net, &proposal));
             let pczt = create_pczt_from_proposal::<_, _, Infallible, _, Infallible, _>(
                 db,
                 &net,
@@ -5497,7 +5537,7 @@ impl WalletActor {
             .map_err(|e| {
                 enrich_insufficient_funds(db, &engine_dir, scope, policy, classify_pczt_err(e))
             })?;
-            Ok((pczt, shape, start.elapsed()))
+            Ok((pczt, orchard_circuit, shape, start.elapsed()))
         })
     }
 
@@ -5649,7 +5689,7 @@ impl WalletActor {
         // Cached-Orchard PCZT path: phase A (select+build) -> phase B (prove+sign) -> phase C
         // (store), all on the actor. Each phase is timed so the send-latency log shows where the
         // cost lands on a large, note-fragmented wallet.
-        let (pczt, shape, build) = self.build_proposal_and_pczt(
+        let (pczt, orchard_circuit, shape, build) = self.build_proposal_and_pczt(
             request,
             policy,
             privacy,
@@ -5669,10 +5709,10 @@ impl WalletActor {
         let (txid, raw, prove, store): (TxId, Vec<u8>, Duration, Duration) =
             tokio::task::block_in_place(move || -> Result<_, RpcError> {
                 let p0 = Instant::now();
-                let signed = prove_sign_pczt(pczt, &usk, &prover, &keys)?;
+                let signed = prove_sign_pczt(pczt, orchard_circuit, &usk, &prover, &keys)?;
                 let prove = p0.elapsed();
                 let s0 = Instant::now();
-                let txid = store_pczt(db, signed, &keys, trust_own)?;
+                let txid = store_pczt(db, signed, orchard_circuit, &keys, trust_own)?;
                 let raw = read_raw_tx(db, txid)?;
                 Ok((txid, raw, prove, s0.elapsed()))
             })?;
@@ -5907,7 +5947,7 @@ impl WalletActor {
             }
         };
         let policy = confirmations.unwrap_or(self.confirmations_policy);
-        let (pczt, shape, build) = match self.build_proposal_and_pczt(
+        let (pczt, orchard_circuit, shape, build) = match self.build_proposal_and_pczt(
             request,
             policy,
             privacy,
@@ -5954,7 +5994,7 @@ impl WalletActor {
             // Isolate a proving panic: a completion MUST always be sent, or the pipeline would
             // wedge with `send_in_flight` stuck true.
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                prove_sign_pczt(pczt, &usk, &prover, &keys)
+                prove_sign_pczt(pczt, orchard_circuit, &usk, &prover, &keys)
             }))
             .unwrap_or_else(|_| {
                 error!("send proof panicked off-actor; the actor continues");
@@ -5962,6 +6002,7 @@ impl WalletActor {
             });
             let _ = done_tx.blocking_send(SendCompletion {
                 result,
+                orchard_circuit,
                 policy,
                 shape,
                 build_elapsed: build,
@@ -5991,6 +6032,7 @@ impl WalletActor {
         self.send_in_flight = false;
         let SendCompletion {
             result,
+            orchard_circuit,
             policy,
             shape,
             build_elapsed,
@@ -6000,8 +6042,15 @@ impl WalletActor {
         let outcome = match result {
             Err(e) => Err(e),
             Ok(signed) => {
-                self.store_and_broadcast(signed, policy, shape, build_elapsed, prove_elapsed)
-                    .await
+                self.store_and_broadcast(
+                    signed,
+                    orchard_circuit,
+                    policy,
+                    shape,
+                    build_elapsed,
+                    prove_elapsed,
+                )
+                .await
             }
         };
         let _ = reply.send(outcome);
@@ -6013,6 +6062,7 @@ impl WalletActor {
     async fn store_and_broadcast(
         &mut self,
         signed: pczt::Pczt,
+        orchard_circuit: Option<orchard::circuit::OrchardCircuitVersion>,
         policy: ConfirmationsPolicy,
         shape: SendShape,
         build: Duration,
@@ -6032,7 +6082,7 @@ impl WalletActor {
         let (txid, raw, store): (TxId, Vec<u8>, Duration) =
             tokio::task::block_in_place(move || -> Result<_, RpcError> {
                 let s0 = Instant::now();
-                let txid = store_pczt(db, signed, &keys, trust_own)?;
+                let txid = store_pczt(db, signed, orchard_circuit, &keys, trust_own)?;
                 let raw = read_raw_tx(db, txid)?;
                 Ok((txid, raw, s0.elapsed()))
             })?;
@@ -7776,6 +7826,7 @@ fn request_pays_transparent_output(net: &ZNetwork, request: &TransactionRequest)
 /// [`store_pczt`] for phase C.
 fn prove_sign_pczt(
     pczt: pczt::Pczt,
+    orchard_circuit: Option<orchard::circuit::OrchardCircuitVersion>,
     usk: &zcash_keys::keys::UnifiedSpendingKey,
     sapling_prover: &LocalTxProver,
     keys: &ProvingKeyCache,
@@ -7783,12 +7834,22 @@ fn prove_sign_pczt(
     use pczt::roles::prover::Prover;
     use pczt::roles::signer::{Error as SignerError, Signer};
 
-    // Proofs. Every zecd send spends Orchard notes (Orchard proof always required); a Sapling
+    // Proofs. The Orchard-pool bundle is proved under the circuit its protocol version names,
+    // which is `PostNu6_3` from NU6.3 on (see `orchard_circuit_for_branch`): legacy Orchard
+    // notes spent there with the `FixedPostNu6_2` key fail with `InvalidInstances`. A Sapling
     // output proof is only needed when a recipient is a Sapling address.
     let prover = Prover::new(pczt);
     let prover = if prover.requires_orchard_proof() {
+        let pk = orchard_circuit
+            .and_then(|version| keys.pk_for(version))
+            .ok_or_else(|| {
+                RpcError::wallet(format!(
+                    "Orchard proof required but no proving key is cached for its circuit \
+                     ({orchard_circuit:?})"
+                ))
+            })?;
         prover
-            .create_orchard_proof(keys.orchard_pk)
+            .create_orchard_proof(pk)
             .map_err(|e| RpcError::wallet(format!("Orchard proof generation failed: {e:?}")))?
     } else {
         prover
@@ -7906,6 +7967,7 @@ fn prove_sign_pczt(
 fn store_pczt(
     db: &mut WriteDb,
     pczt: pczt::Pczt,
+    orchard_circuit: Option<orchard::circuit::OrchardCircuitVersion>,
     keys: &ProvingKeyCache,
     trust_own: bool,
 ) -> Result<TxId, RpcError> {
@@ -7919,7 +7981,8 @@ fn store_pczt(
     let has_orchard = !pczt.orchard().actions().is_empty();
     let has_ironwood = !pczt.ironwood().actions().is_empty();
     let orchard_vk = match (has_orchard, has_ironwood) {
-        (true, false) => Some(&keys.orchard_vk),
+        // The Orchard-only case verifies under its own circuit: `PostNu6_3` after NU6.3.
+        (true, false) => orchard_circuit.and_then(|version| keys.vk_for(version)),
         (false, true) => keys.ironwood_vk.as_ref(),
         _ => None,
     };
@@ -8243,6 +8306,19 @@ fn proposal_branch<FeeRuleT, NoteRef>(
     BranchId::for_height(net, BlockHeight::from(proposal.min_target_height()))
 }
 
+/// The circuit that proves and verifies the **Orchard-pool** bundle of a transaction built
+/// against `branch`, or `None` before NU5 (no Orchard protocol).
+///
+/// Not always the `FixedPostNu6_2` circuit: from NU6.3 the Orchard pool is on protocol V3,
+/// whose bundles must disable cross-address transfers (consensus-mandated), and only the
+/// `PostNu6_3` circuit constrains that flag. So a post-NU6.3 send that spends legacy Orchard
+/// notes proves its Orchard bundle with the same key as its Ironwood bundle; the
+/// `FixedPostNu6_2` key is refused there with `InvalidInstances`. This is the rule the fused
+/// builder applies too, deriving the circuit from the branch rather than from the pool.
+fn orchard_circuit_for_branch(branch: BranchId) -> Option<orchard::circuit::OrchardCircuitVersion> {
+    bundle_version_for_branch(branch, orchard::ValuePool::Orchard).map(|v| v.circuit_version())
+}
+
 /// Enforce `[spend] max_tx_bytes` on a built proposal: no step may serialize to more than
 /// `max_bytes`. `0` disables the ceiling.
 ///
@@ -8389,6 +8465,25 @@ fn coinbase_hint(zats: u64) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn orchard_bundles_prove_under_the_circuit_their_branch_names() {
+        use super::orchard_circuit_for_branch;
+        use orchard::circuit::OrchardCircuitVersion as V;
+        use zcash_protocol::consensus::BranchId;
+        // NU6.3 moved the Orchard pool to protocol V3, which mandates the cross-address
+        // restriction only the post-NU6.3 circuit enforces. Proving legacy Orchard notes there
+        // with the NU6.2 key is what failed with `InvalidInstances`.
+        assert_eq!(
+            orchard_circuit_for_branch(BranchId::Nu6_3),
+            Some(V::PostNu6_3)
+        );
+        assert_eq!(
+            orchard_circuit_for_branch(BranchId::Nu6_2),
+            Some(V::FixedPostNu6_2)
+        );
+        assert_eq!(orchard_circuit_for_branch(BranchId::Canopy), None);
+    }
+
     use super::gap_slots_remaining;
     use super::horizon_slots_remaining;
     use super::preexpose_progress_stats;

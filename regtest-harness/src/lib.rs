@@ -1471,11 +1471,27 @@ impl Drop for Funder {
 /// harmless - `z_shieldcoinbase` filters immature coinbase itself, so accruing more never breaks
 /// the shield.
 pub async fn start_funded_chain_live(node_bin: &Path) -> Result<(Zebrad, Funder)> {
+    start_funded_chain_live_at(node_bin, NU6_3_ACTIVATION_HEIGHT).await
+}
+
+/// [`start_funded_chain_live`] on a chain that activates NU6.3 at `nu6_3_height` instead of
+/// [`NU6_3_ACTIVATION_HEIGHT`].
+///
+/// With a height past the bring-up (which ends near block 140), the funder's shielded coinbase is
+/// a **legacy Orchard** note rather than an ironwood one, and so is anything it pays before the
+/// chain reaches that height: the only way to hold Orchard-pool value when NU6.3 activates, which
+/// every wallet funded before mainnet's activation does. zecd and the funder must be given the
+/// same height through `ZECD_REGTEST_NU63_HEIGHT`, or their consensus diverges from the node's.
+/// Always a live bring-up: the chain snapshot is built at the standard height.
+pub async fn start_funded_chain_live_at(
+    node_bin: &Path,
+    nu6_3_height: u32,
+) -> Result<(Zebrad, Funder)> {
     // Mine to index 0: exposed at account creation, so the funder's wallet will credit these
     // coinbases without ever issuing the address. (Its first *issued* address is index 1.)
     let miner_taddr = derive_funder_transparent_address(0)
         .context("derive the funder's miner address offline")?;
-    let zebrad = Zebrad::start_with_miner(node_bin, &miner_taddr)
+    let zebrad = Zebrad::start_inner(node_bin, &miner_taddr, nu6_3_height)
         .await
         .context("start the regtest node mining to the funder")?;
     zebrad
