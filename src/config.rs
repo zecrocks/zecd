@@ -1604,7 +1604,7 @@ pub struct ConfigOverrides {
     pub testnet: bool,
     /// Use regtest (overrides config `network`).
     pub regtest: bool,
-    /// Network: "main", "test", or "regtest".
+    /// Network: "main", "test", "regtest", or experimental "nu7-fork-testnet" when enabled.
     pub network: Option<String>,
     /// RPC bind address.
     pub rpc_bind: Option<String>,
@@ -1679,7 +1679,7 @@ pub struct Cli {
     #[arg(long, global = true)]
     pub regtest: bool,
 
-    /// Network: "main", "test", or "regtest".
+    /// Network: "main", "test", "regtest", or experimental "nu7-fork-testnet" when enabled.
     #[arg(long, global = true, value_name = "NET")]
     pub network: Option<String>,
 
@@ -2257,6 +2257,8 @@ impl AppConfig {
             port: cli.rpc_port.or(rpc_file.port).unwrap_or(match network {
                 ZNetwork::Main => defaults.rpc_port_main,
                 ZNetwork::Test | ZNetwork::Regtest(_) => defaults.rpc_port_test,
+                #[cfg(zcash_unstable = "nu7")]
+                ZNetwork::Nu7ForkTestnet => defaults.rpc_port_test,
             }),
             user: cli.rpc_user.clone().or(rpc_file.user),
             password: cli

@@ -9,6 +9,15 @@ can use Zcash with little or no changes.
 
 Documentation for zecd is available on the project website: [zecd.org](https://zecd.org)
 
+### Experimental Zakura NU7 testnet
+
+To build a wallet for the [public Zakura NU7 fork](https://nu7.valargroup.dev/), run
+`scripts/build-nu7-fork.sh /path/to/fresh-build-directory`. The script pins
+`zcash_protocol` to [librustzcash PR #3047](https://github.com/zcash/librustzcash/pull/3047)
+and enables the NU7 code in Zakura Common. The resulting binary accepts
+`--network nu7-fork-testnet`; point `--server zebra://HOST:PORT` at a node on that fork.
+Keep its data directory separate from ordinary testnet wallets.
+
 ### Key Features
 
 - Stateless: all funds are recoverable from a seed phrase.

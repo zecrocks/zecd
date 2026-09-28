@@ -806,6 +806,8 @@ pub fn resolve(server: &str, network: ZNetwork) -> anyhow::Result<Server> {
         let port = match network {
             ZNetwork::Main => ZEBRA_RPC_PORT_MAIN,
             ZNetwork::Test | ZNetwork::Regtest(_) => ZEBRA_RPC_PORT_TEST,
+            #[cfg(zcash_unstable = "nu7")]
+            ZNetwork::Nu7ForkTestnet => ZEBRA_RPC_PORT_TEST,
         };
         return Ok(Server::new(
             Cow::Borrowed("127.0.0.1"),
@@ -818,6 +820,10 @@ pub fn resolve(server: &str, network: ZNetwork) -> anyhow::Result<Server> {
         let (host, port) = match network {
             ZNetwork::Main => ZEC_ROCKS_MAINNET,
             ZNetwork::Test => ZEC_ROCKS_TESTNET,
+            #[cfg(zcash_unstable = "nu7")]
+            ZNetwork::Nu7ForkTestnet => {
+                return Err(anyhow!("the NU7 fork requires its own full node backend"))
+            }
             ZNetwork::Regtest(_) => {
                 return Err(anyhow!(
                     "the 'zecrocks' preset serves mainnet and testnet only (regtest needs a \

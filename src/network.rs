@@ -21,6 +21,9 @@ pub enum ZNetwork {
     Main,
     /// The public testnet.
     Test,
+    /// The public Zakura NU7 fork of Testnet, activated at height 4,382,859.
+    #[cfg(zcash_unstable = "nu7")]
+    Nu7ForkTestnet,
     /// A local regtest chain; activation heights are carried by the inner [`LocalNetwork`].
     Regtest(LocalNetwork),
 }
@@ -32,6 +35,8 @@ impl ZNetwork {
         match self {
             ZNetwork::Main => "main",
             ZNetwork::Test => "test",
+            #[cfg(zcash_unstable = "nu7")]
+            ZNetwork::Nu7ForkTestnet => "nu7-fork-testnet",
             ZNetwork::Regtest(_) => "regtest",
         }
     }
@@ -41,6 +46,8 @@ impl ZNetwork {
         match s.trim() {
             "main" | "mainnet" => Ok(ZNetwork::Main),
             "test" | "testnet" => Ok(ZNetwork::Test),
+            #[cfg(zcash_unstable = "nu7")]
+            "nu7-fork-testnet" => Ok(ZNetwork::Nu7ForkTestnet),
             "regtest" => Ok(regtest()),
             other => Err(anyhow!("unsupported network: {other}")),
         }
@@ -58,6 +65,8 @@ impl Parameters for ZNetwork {
         match self {
             ZNetwork::Main => MAIN_NETWORK.network_type(),
             ZNetwork::Test => TEST_NETWORK.network_type(),
+            #[cfg(zcash_unstable = "nu7")]
+            ZNetwork::Nu7ForkTestnet => TEST_NETWORK.network_type(),
             ZNetwork::Regtest(local) => local.network_type(),
         }
     }
@@ -66,6 +75,11 @@ impl Parameters for ZNetwork {
         match self {
             ZNetwork::Main => MAIN_NETWORK.activation_height(nu),
             ZNetwork::Test => TEST_NETWORK.activation_height(nu),
+            #[cfg(zcash_unstable = "nu7")]
+            ZNetwork::Nu7ForkTestnet => match nu {
+                NetworkUpgrade::Nu7 => Some(BlockHeight::from_u32(4_382_859)),
+                _ => TEST_NETWORK.activation_height(nu),
+            },
             ZNetwork::Regtest(local) => local.activation_height(nu),
         }
     }
@@ -166,5 +180,24 @@ mod tests {
         assert_eq!(net.network_type(), NetworkType::Regtest);
         // NU5 (Orchard) active at height 1.
         assert!(net.is_nu_active(NetworkUpgrade::Nu5, BlockHeight::from_u32(1)));
+    }
+
+    #[cfg(zcash_unstable = "nu7")]
+    #[test]
+    fn nu7_fork_uses_testnet_addresses_and_the_live_branch_id() {
+        use zcash_protocol::consensus::BranchId;
+
+        let net = ZNetwork::parse("nu7-fork-testnet").unwrap();
+        assert_eq!(net, ZNetwork::Nu7ForkTestnet);
+        assert_eq!(net.network_type(), NetworkType::Test);
+        assert_eq!(
+            net.activation_height(NetworkUpgrade::Nu7),
+            Some(BlockHeight::from_u32(4_382_859))
+        );
+        assert_eq!(
+            BranchId::for_height(&net, BlockHeight::from_u32(4_382_859)),
+            BranchId::Nu7
+        );
+        assert_eq!(u32::from(BranchId::Nu7), 0x7719_0ad9);
     }
 }
