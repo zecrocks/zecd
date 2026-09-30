@@ -5,6 +5,27 @@ All notable changes to zecd are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com), and this
 project adheres to [Semantic Versioning](https://semver.org).
 
+## [0.7.4] - 2026-09-30
+
+One fix, no new features, no configuration key or response shape moved. A drop-in upgrade from
+0.7.3.
+
+Take it if any wallet you run holds Orchard-pool notes: on 0.7.3 it cannot spend them. That
+covers notes received before NU6.3 activated (mainnet block 3,428,143) and change that older
+software still creates in the Orchard pool after it.
+
+### Fixed
+- **Spending an Orchard-pool note after NU6.3 failed.** Any send that spent a legacy Orchard
+  note, however recently the note was received, failed with `Orchard proof generation failed:
+  Prover(ProofFailed(InvalidInstances))` and broadcast nothing. From NU6.3 the Orchard pool is on
+  protocol V3, whose bundles must disable cross-address transfers, and only the post-NU6.3
+  circuit constrains that flag; the PCZT send path proved the Orchard bundle with the NU6.2 key
+  regardless. It now proves under the circuit the transaction's consensus branch names, as the
+  fused builder already did, so sends that go through it (Sapling spends, transparent sources,
+  `z_shieldcoinbase`, `z_mergetoaddress`) were never affected. A new regtest funds a wallet
+  before activation and spends after it; nothing in the tier held an Orchard-pool note across
+  activation before.
+
 ## [0.7.3] - 2026-09-18
 
 Two fixes and a dependency update, no new features, no configuration key or response shape
@@ -656,6 +677,7 @@ Zcash, backed entirely by librustzcash and running as a light client.
 ### Security
 - Pre-release audit hardening; refuse to start on mainnet with the placeholder RPC password; enforce a 12-character passphrase minimum.
 
+[0.7.4]: https://github.com/zecrocks/zecd/compare/v0.7.3...v0.7.4
 [0.7.3]: https://github.com/zecrocks/zecd/compare/v0.7.2...v0.7.3
 [0.7.2]: https://github.com/zecrocks/zecd/compare/v0.7.1...v0.7.2
 [0.7.1]: https://github.com/zecrocks/zecd/compare/v0.7.0...v0.7.1
