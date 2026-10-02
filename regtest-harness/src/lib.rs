@@ -500,11 +500,19 @@ fn zebrad_toml(
     // reject an unknown activation-height entry at startup.
     let nu6_3_line = format!("\"NU6.3\" = {nu6_3_height}\n");
     let mempool_section = mempool_policy_section(node);
+    // zakurad runs a second, QUIC P2P stack on every network but mainnet, bound to a fixed
+    // `0.0.0.0:8234`. From zakura 1.5.0 a taken port fails startup, so concurrent harness nodes
+    // kill each other. Nothing here peers over that stack, so turn it off, as zakura already does
+    // on mainnet. zebrad rejects the key, so only zakura gets it.
+    let p2p_stack_line = match node {
+        RegtestNode::Zebra => "",
+        RegtestNode::Zakura => "p2p_stack = \"legacy\"\n",
+    };
     format!(
         r#"[network]
 network = "Regtest"
 listen_addr = "127.0.0.1:{net_port}"
-
+{p2p_stack_line}
 [network.testnet_parameters]
 disable_pow = true
 
