@@ -5,6 +5,33 @@ All notable changes to zecd are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com), and this
 project adheres to [Semantic Versioning](https://semver.org).
 
+## [0.9.0-rc1] - 2026-10-02
+
+NU7 support, which needed the Zakura Common 2.x crates. No configuration key, RPC or response
+shape changed.
+
+Take it if you run zecd on testnet: NU7 activates there at block 4,465,026, and from that block
+0.8.1 builds transactions that upgraded nodes reject. Mainnet has no NU7 height yet.
+
+**Read before deploying.** The wallet database gains two migrations on first start, which 0.8.1
+does not know. Copy the data directory first if you might need to go back.
+
+### Added
+- **NU7.** From testnet block 4,465,026, transactions commit to the NU7 consensus branch id
+  (`0x77190AD9`) and stay on the V6 format NU6.3 introduced. NU7 is compiled in and activated by
+  height, as NU6.3 was. On regtest it is opt-in through `ZECD_REGTEST_NU7_HEIGHT`, which must be
+  above `ZECD_REGTEST_NU63_HEIGHT`.
+
+### Changed
+- **Zakura Common 2.2.** The cryptography and protocol crates move from 1.0.0 to 2.2, and
+  `zcash_protocol`, `zcash_address`, `zcash_transparent` and `zip321` are now `zakura-*` forks
+  as well. The wallet layer moves to `zakura-client-backend`/`zakura-client-sqlite` 0.1.0-rc7
+  and `zakura-pczt` 0.1.0-rc4. The minimum Rust version stays 1.91.
+- **The enhancement drain reads the wallet layer's split work queues.** rc7 hands out status
+  lookups, payload fetches and transparent-history searches separately. zecd merges them and
+  services them as before, so the backlog count, `/readyz` and `[sync] fetch_memos` behave as
+  they did.
+
 ## [0.8.1] - 2026-09-27
 
 One fix, no new features, no configuration key or response shape moved. A drop-in upgrade from
@@ -994,6 +1021,7 @@ Zcash, backed entirely by librustzcash and running as a light client.
 ### Security
 - Pre-release audit hardening; refuse to start on mainnet with the placeholder RPC password; enforce a 12-character passphrase minimum.
 
+[0.9.0-rc1]: https://github.com/zecrocks/zecd/compare/v0.8.1...v0.9.0-rc1
 [0.8.1]: https://github.com/zecrocks/zecd/compare/v0.8.0...v0.8.1
 [0.8.0]: https://github.com/zecrocks/zecd/compare/v0.7.0...v0.8.0
 [0.8.0-rc3]: https://github.com/zecrocks/zecd/compare/v0.8.0-rc2...v0.8.0-rc3
