@@ -74,9 +74,6 @@ impl Parameters for ZNetwork {
 /// A regtest network matching the chain the regtest harness runs: NU5 (Orchard) and NU6 active
 /// from height 1, then NU6.1/NU6.2 a few blocks in (their activation block needs ZIP-271 lockbox
 /// disbursements, so they can't start at genesis). Orchard is active for the entire chain.
-// `zcash_unstable` is a librustzcash RUSTFLAGS cfg (nu7/zfuture). We don't set it, but the
-// gated fields are kept so this literal stays valid if someone builds with those NUs enabled.
-#[allow(unexpected_cfgs)]
 pub fn regtest() -> ZNetwork {
     let h = Some(BlockHeight::from_u32(1));
     // NU6.1/NU6.2 activate a few blocks in, not at genesis: NU6.1's activation block must carry
@@ -97,17 +94,23 @@ pub fn regtest() -> ZNetwork {
     // A *set but unparseable* value is fatal rather than silently ignored: falling back to "no
     // NU6.3" would leave zecd committing transactions to the wrong consensus branch id, which
     // surfaces far away as an opaque zebra rejection at broadcast time.
-    let nu63 = match std::env::var("ZECD_REGTEST_NU63_HEIGHT") {
-        Ok(s) => Some(BlockHeight::from_u32(
-            s.trim().parse::<u32>().unwrap_or_else(|_| {
-                panic!(
-                    "ZECD_REGTEST_NU63_HEIGHT must be a block height (got {s:?}); \
-                     unset it to build a regtest chain without NU6.3"
-                )
-            }),
-        )),
-        Err(_) => None,
-    };
+    let nu63 = regtest_height_from_env("ZECD_REGTEST_NU63_HEIGHT", "NU6.3");
+    // NU7, from `ZECD_REGTEST_NU7_HEIGHT`, on the same terms as NU6.3 above: compiled
+    // unconditionally (the protocol crate exposes it without the old `zcash_unstable = "nu7"`
+    // flag), activated on regtest only when asked. Unset - the harness default - keeps the
+    // regtest chain at NU6.3, which is also all the pinned funder release understands. Upgrades
+    // activate in order, so NU7 needs NU6.3 scheduled strictly below it; anything else would
+    // describe a chain no node runs, and zecd would build transactions against it anyway.
+    let nu7 = regtest_height_from_env("ZECD_REGTEST_NU7_HEIGHT", "NU7");
+    if let Some(nu7) = nu7 {
+        match nu63 {
+            Some(nu63) if nu63 < nu7 => {}
+            _ => panic!(
+                "ZECD_REGTEST_NU7_HEIGHT ({nu7}) needs ZECD_REGTEST_NU63_HEIGHT set to a lower \
+                 height (got {nu63:?}): network upgrades activate in order"
+            ),
+        }
+    }
     ZNetwork::Regtest(LocalNetwork {
         overwinter: h,
         sapling: h,
@@ -119,16 +122,29 @@ pub fn regtest() -> ZNetwork {
         nu6_1: nu62,
         nu6_2: nu62,
         nu6_3: nu63,
-        #[cfg(zcash_unstable = "nu7")]
-        nu7: nu62,
-        #[cfg(zcash_unstable = "zfuture")]
-        z_future: nu62,
+        nu7,
     })
+}
+
+/// A regtest activation height from the environment: `None` when `var` is unset, and a panic
+/// naming `var` when it is set to anything but a block height (see the NU6.3 comment in
+/// [`regtest`] for why that is fatal rather than ignored).
+fn regtest_height_from_env(var: &str, upgrade: &str) -> Option<BlockHeight> {
+    let s = std::env::var(var).ok()?;
+    Some(BlockHeight::from_u32(
+        s.trim().parse::<u32>().unwrap_or_else(|_| {
+            panic!(
+                "{var} must be a block height (got {s:?}); unset it to build a regtest chain \
+                 without {upgrade}"
+            )
+        }),
+    ))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use zcash_protocol::consensus::BranchId;
 
     #[test]
     fn names_and_parse_roundtrip() {
@@ -157,6 +173,39 @@ mod tests {
                 net.name()
             );
         }
+    }
+
+    /// NU7 is scheduled on testnet and nowhere else. The testnet height is what lets zecd
+    /// build transactions past activation there: `BranchId::for_height` picks the NU7 branch id
+    /// from it, and a build that lacked it would keep committing to NU6.3 and be rejected by
+    /// every upgraded node. Mainnet is unscheduled, and the moment that changes this test is
+    /// the reminder to say so in the docs and the release notes.
+    #[test]
+    fn nu7_is_scheduled_on_testnet_only() {
+        let testnet = ZNetwork::Test
+            .activation_height(NetworkUpgrade::Nu7)
+            .expect("the pinned protocol schedules NU7 on testnet");
+        assert_eq!(testnet, BlockHeight::from_u32(4_465_026));
+        assert!(
+            ZNetwork::Test
+                .activation_height(NetworkUpgrade::Nu6_3)
+                .is_some_and(|nu63| nu63 < testnet),
+            "NU7 must activate after NU6.3"
+        );
+        assert_eq!(
+            BranchId::for_height(&ZNetwork::Test, testnet),
+            BranchId::Nu7,
+            "transactions built at the activation height commit to the NU7 branch id"
+        );
+        assert_eq!(
+            BranchId::for_height(&ZNetwork::Test, testnet - 1),
+            BranchId::Nu6_3,
+        );
+        assert_eq!(
+            ZNetwork::Main.activation_height(NetworkUpgrade::Nu7),
+            None,
+            "the pinned protocol now schedules NU7 on mainnet - update the docs and notes"
+        );
     }
 
     #[test]

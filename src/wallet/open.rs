@@ -6,6 +6,8 @@ use std::path::{Path, PathBuf};
 use rand::rand_core::UnwrapErr;
 use rand::rngs::SysRng;
 
+use zcash_client_backend::data_api::enhance_pir::EnhancementMode;
+use zcash_client_backend::data_api::status::TransactionStatusMode;
 use zcash_client_sqlite::util::SystemClock;
 use zcash_client_sqlite::wallet::init::init_wallet_db;
 use zcash_client_sqlite::WalletDb;
@@ -144,7 +146,8 @@ pub fn open_write_with(
 ) -> anyhow::Result<WriteDb> {
     let conn = rusqlite::Connection::open(data_db_path(engine_dir))?;
     configure_writer_conn(&conn, options.cache_mib)?;
-    let db = WalletDb::from_connection(conn, network, SystemClock, UnwrapErr(SysRng));
+    let mut db = WalletDb::from_connection(conn, network, SystemClock, UnwrapErr(SysRng));
+    configure_request_routing(&mut db);
     Ok(match options.external_gap_limit {
         Some(n) => db.with_gap_limits(GapLimits::new(
             n,
@@ -153,6 +156,22 @@ pub fn open_write_with(
         )),
         None => db,
     })
+}
+
+/// Select how the wallet's outstanding transaction work is routed: every status lookup and
+/// every payload fetch goes to the configured upstream by txid.
+///
+/// The wallet layer (since `zakura-client-sqlite` 0.1.0-rc7) refuses to enumerate status or
+/// payload work until a handle has chosen these, and the choice is not persisted, so it is made
+/// on every writer handle as it opens. `Public` and `Standard` are what zecd has always done: it
+/// fetches by txid from its own zebrad or lightwalletd, the one chain source an operator has
+/// already decided to trust with the wallet's traffic. The private alternatives (`Private`
+/// status, `PrivateIronwood` enhancement) route pure-Ironwood transactions to an Enhance PIR
+/// server instead; zecd has no PIR client, so selecting them would only leave that work queued
+/// forever. Read handles (`open_read`) never enumerate work, so they are left unconfigured.
+fn configure_request_routing(db: &mut WriteDb) {
+    db.set_status_mode(TransactionStatusMode::Public);
+    db.set_enhancement_mode(EnhancementMode::Standard);
 }
 
 /// Open the wallet DB read-only (balances, history); short-lived per request.

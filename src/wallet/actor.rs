@@ -439,9 +439,74 @@ type FetchedTransaction = Option<(Transaction, Option<BlockHeight>)>;
 /// and false for a `GetStatus` (record its chain status only). The original request rides
 /// along so a serviced one can be marked satisfied.
 struct TxidRequest<'a> {
-    req: &'a TransactionDataRequest,
+    req: &'a EnhanceRequest,
     txid: TxId,
     enhance: bool,
+}
+
+/// One unit of outstanding transaction work, in the shape the drain services it.
+///
+/// The wallet layer used to hand all three kinds back from one read
+/// (`WalletRead::transaction_data_requests`). Since `zakura-client-backend` 0.1.0-rc7 they come
+/// from three: status observation from `TransactionStatusRead::transaction_status_work`, payload
+/// retrieval from `EnhancePirRead::transaction_enhancement_work`, and transparent history from
+/// `transaction_data_requests`, which now returns only that. zecd services all three the same
+/// way it always did, so [`enhance_requests`] merges them back into this one list and the drain,
+/// the backlog count and the `fetch_memos` cut keep a single type to reason about.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum EnhanceRequest {
+    /// Observe a transaction's chain status (mined, unmined, unknown) without storing it.
+    GetStatus(TxId),
+    /// Fetch the full transaction and decrypt-and-store it (memos, outgoing records, fee).
+    Enhancement(TxId),
+    /// Search a transparent address's history for spends of the wallet's UTXOs or for
+    /// ephemeral (ZIP-320) activity.
+    TransactionsInvolvingAddress(TransactionsInvolvingAddress),
+}
+
+impl From<TransactionDataRequest> for EnhanceRequest {
+    fn from(req: TransactionDataRequest) -> Self {
+        // Deliberately exhaustive: `transaction_data_requests` grows a variant only under a
+        // feature zecd does not enable (`spend-index`), and if that ever changes this must stop
+        // compiling rather than drop the new work silently.
+        match req {
+            TransactionDataRequest::TransactionsInvolvingAddress(r) => {
+                EnhanceRequest::TransactionsInvolvingAddress(r)
+            }
+        }
+    }
+}
+
+/// Every unit of outstanding transaction work, merged from the wallet layer's three sources
+/// (see [`EnhanceRequest`]).
+///
+/// Only the public route is mapped. The writer handle is configured for public status and
+/// standard enhancement (`open::configure_request_routing`), under which the wallet layer
+/// never routes work privately; a private item would be a transaction whose id must not reach
+/// a server, so if one appeared it is left alone rather than fetched by id.
+fn enhance_requests(
+    db: &crate::wallet::open::WriteDb,
+) -> Result<Vec<EnhanceRequest>, zcash_client_sqlite::error::SqliteClientError> {
+    use zcash_client_backend::data_api::enhance_pir::{EnhancePirRead, TransactionEnhancementWork};
+    use zcash_client_backend::data_api::status::{TransactionStatusRead, TransactionStatusWork};
+
+    let mut out = Vec::new();
+    for work in db.transaction_status_work()? {
+        if let TransactionStatusWork::Public(r) = work {
+            out.push(EnhanceRequest::GetStatus(r.txid()));
+        }
+    }
+    for work in db.transaction_enhancement_work()? {
+        if let TransactionEnhancementWork::Public(r) = work {
+            out.push(EnhanceRequest::Enhancement(r.txid()));
+        }
+    }
+    out.extend(
+        db.transaction_data_requests()?
+            .into_iter()
+            .map(EnhanceRequest::from),
+    );
+    Ok(out)
 }
 
 /// How often to emit an enhancement-drain progress heartbeat (throttled by wall time, like the
@@ -489,21 +554,21 @@ fn enhanced_through(fully_scanned: u32, lowest_pending: Option<u32>) -> u32 {
     }
 }
 
-/// Whether a [`TransactionDataRequest`] is one zecd can actually service (and therefore one that
+/// Whether an [`EnhanceRequest`] is one zecd can actually service (and therefore one that
 /// counts toward the enhancement backlog). All three variants drain: `GetStatus`/`Enhancement` via
 /// `fetch_full_tx`, and `TransactionsInvolvingAddress` via the transparent address-index query
 /// (`fetch_transparent_tx_evidence` + `notify_address_checked`), which converges once the address is
 /// recorded as checked, so it doesn't pin the backlog above zero.
-fn is_serviceable_request(req: &TransactionDataRequest) -> bool {
+fn is_serviceable_request(req: &EnhanceRequest) -> bool {
     matches!(
         req,
-        TransactionDataRequest::GetStatus(_)
-            | TransactionDataRequest::Enhancement(_)
-            | TransactionDataRequest::TransactionsInvolvingAddress(_)
+        EnhanceRequest::GetStatus(_)
+            | EnhanceRequest::Enhancement(_)
+            | EnhanceRequest::TransactionsInvolvingAddress(_)
     )
 }
 
-/// Whether a [`TransactionDataRequest`] is in scope for this wallet's enhancement drain:
+/// Whether an [`EnhanceRequest`] is in scope for this wallet's enhancement drain:
 /// serviceable ([`is_serviceable_request`]) and not excluded by policy.
 ///
 /// The one policy exclusion is an `Enhancement` request under `[sync] fetch_memos = false`, and
@@ -535,13 +600,13 @@ fn is_serviceable_request(req: &TransactionDataRequest) -> bool {
 /// the knob reversible - flipping `fetch_memos` back on picks the backlog up and backfills the
 /// memos, no rescan needed.
 fn request_in_scope(
-    req: &TransactionDataRequest,
+    req: &EnhanceRequest,
     fetch_memos: bool,
     spending: &std::collections::BTreeSet<TxId>,
 ) -> bool {
     is_serviceable_request(req)
         && match req {
-            TransactionDataRequest::Enhancement(txid) => fetch_memos || spending.contains(txid),
+            EnhanceRequest::Enhancement(txid) => fetch_memos || spending.contains(txid),
             _ => true,
         }
 }
@@ -565,11 +630,11 @@ fn request_in_scope(
 /// redundant upstream query. TODO(upstream): add the missing
 /// `tro.output_index = ssq.output_index` join predicate in librustzcash.
 fn outstanding_requests(
-    requests: Vec<TransactionDataRequest>,
-    satisfied: &std::collections::BTreeSet<TransactionDataRequest>,
+    requests: Vec<EnhanceRequest>,
+    satisfied: &std::collections::BTreeSet<EnhanceRequest>,
     fetch_memos: bool,
     spending: &std::collections::BTreeSet<TxId>,
-) -> Vec<TransactionDataRequest> {
+) -> Vec<EnhanceRequest> {
     let mut seen = std::collections::BTreeSet::new();
     requests
         .into_iter()
@@ -1077,7 +1142,7 @@ struct WalletActor {
     /// re-fetched at most once per drain instead of spinning the batch loop. Cleared whenever a
     /// sync batch does work (new blocks may add or re-satisfy requests). Entries removed from the
     /// DB by librustzcash on success simply never reappear.
-    enhance_satisfied: std::collections::BTreeSet<TransactionDataRequest>,
+    enhance_satisfied: std::collections::BTreeSet<EnhanceRequest>,
     /// Heartbeat throttle for the current enhancement drain (see [`ENHANCE_LOG_INTERVAL`]).
     /// `None` when no drain is in progress; transient and per-drain, reset whenever the drain
     /// completes or a sync batch does work (which clears `enhance_satisfied`, the
@@ -2875,7 +2940,7 @@ impl WalletActor {
     /// update - a consumer waits for the backlog to come down instead, which is the same thing
     /// it would do anyway. The count itself is always exact; only the watermark degrades.
     fn enhancement_backlog(&self) -> (u64, Option<u32>) {
-        let reqs = match self.db_data.transaction_data_requests() {
+        let reqs = match enhance_requests(&self.db_data) {
             Ok(reqs) => reqs,
             Err(e) => {
                 // Best-effort for the count (observability), but the watermark must fail
@@ -2901,7 +2966,7 @@ impl WalletActor {
     /// pass already read rather than reading the table a second time.
     fn summarize_backlog<'a>(
         &self,
-        pending: impl ExactSizeIterator<Item = &'a TransactionDataRequest>,
+        pending: impl ExactSizeIterator<Item = &'a EnhanceRequest>,
     ) -> (u64, Option<u32>) {
         let count = pending.len() as u64;
         if count == 0 {
@@ -2920,21 +2985,20 @@ impl WalletActor {
         (count, lowest)
     }
 
-    /// The block height a pending [`TransactionDataRequest`] refers to, or `None` when it refers
+    /// The block height a pending [`EnhanceRequest`] refers to, or `None` when it refers
     /// to no mined height (an unmined transaction, which no height watermark can be below).
     ///
     /// `Enhancement`/`GetStatus` name a transaction, so the height is that transaction's;
     /// `TransactionsInvolvingAddress` names a range, so it is the range's start.
-    fn enhancement_request_height(&self, req: &TransactionDataRequest) -> Option<u32> {
+    fn enhancement_request_height(&self, req: &EnhanceRequest) -> Option<u32> {
         match req {
-            TransactionDataRequest::GetStatus(txid) | TransactionDataRequest::Enhancement(txid) => {
-                self.db_data
-                    .get_tx_height(*txid)
-                    .ok()
-                    .flatten()
-                    .map(u32::from)
-            }
-            TransactionDataRequest::TransactionsInvolvingAddress(addr_req) => {
+            EnhanceRequest::GetStatus(txid) | EnhanceRequest::Enhancement(txid) => self
+                .db_data
+                .get_tx_height(*txid)
+                .ok()
+                .flatten()
+                .map(u32::from),
+            EnhanceRequest::TransactionsInvolvingAddress(addr_req) => {
                 Some(u32::from(addr_req.block_range_start()))
             } // Deliberately no catch-all arm: a new upstream request variant must stop this
               // compiling, so its height contribution is decided here rather than defaulting to
@@ -3047,7 +3111,7 @@ impl WalletActor {
         }
         let chain_tip = BlockHeight::from_u32(tip);
         let t_requests = Instant::now();
-        let requests = match self.db_data.transaction_data_requests() {
+        let requests = match enhance_requests(&self.db_data) {
             Ok(r) => r,
             Err(e) => {
                 warn!("reading transaction data requests: {e}");
@@ -3079,21 +3143,20 @@ impl WalletActor {
         // with the others; an address search keeps the sequential path.
         let pass = &pending[..pending.len().min(self.enhance_concurrency.max(1))];
         let mut txid_reqs: Vec<TxidRequest<'_>> = Vec::new();
-        let mut address_reqs: Vec<(&TransactionDataRequest, &TransactionsInvolvingAddress)> =
-            Vec::new();
+        let mut address_reqs: Vec<(&EnhanceRequest, &TransactionsInvolvingAddress)> = Vec::new();
         for req in pass {
             match req {
-                TransactionDataRequest::GetStatus(txid) => txid_reqs.push(TxidRequest {
+                EnhanceRequest::GetStatus(txid) => txid_reqs.push(TxidRequest {
                     req,
                     txid: *txid,
                     enhance: false,
                 }),
-                TransactionDataRequest::Enhancement(txid) => txid_reqs.push(TxidRequest {
+                EnhanceRequest::Enhancement(txid) => txid_reqs.push(TxidRequest {
                     req,
                     txid: *txid,
                     enhance: true,
                 }),
-                TransactionDataRequest::TransactionsInvolvingAddress(addr) => {
+                EnhanceRequest::TransactionsInvolvingAddress(addr) => {
                     address_reqs.push((req, addr))
                 }
             }
@@ -3218,7 +3281,7 @@ impl WalletActor {
         // only a fresh read can see; publishing zero over them would flip readiness to synced
         // and `waitforsync` to done with work still queued, for a whole idle interval, since the
         // loop stops driving the drain on a `false` return. So that case reads the table again.
-        let remaining: Vec<&TransactionDataRequest> = pending
+        let remaining: Vec<&EnhanceRequest> = pending
             .iter()
             .filter(|r| !self.enhance_satisfied.contains(*r))
             .collect();
@@ -3297,10 +3360,11 @@ impl WalletActor {
                         (true, Some((tx, mined))) => {
                             decrypt_and_store_transaction(&network, wdb, tx, *mined)?;
                         }
-                        (true, None) => wdb.set_transaction_status(
-                            req.txid,
-                            TransactionStatus::TxidNotRecognized,
-                        )?,
+                        // The upstream answered and does not know the transaction: retire
+                        // the payload request. Status is a separate obligation now, so this
+                        // no longer goes through `set_transaction_status`, which since rc7
+                        // updates status only and would leave the fetch queued forever.
+                        (true, None) => wdb.notify_transaction_enhancement_not_found(req.txid)?,
                         (false, found) => {
                             let status = match found {
                                 None => TransactionStatus::TxidNotRecognized,
@@ -3449,7 +3513,7 @@ impl WalletActor {
         // `block_range_end - 1`, so rebuild the request over the range actually checked
         // (`notify_address_checked` reads only the address and the heights, and the
         // extended claim is truthful - the query above covered the whole range).
-        let TransactionDataRequest::TransactionsInvolvingAddress(checked) =
+        let EnhanceRequest::TransactionsInvolvingAddress(checked) =
             TransactionDataRequest::transactions_involving_address(
                 addr_req.address(),
                 addr_req.block_range_start(),
@@ -3458,6 +3522,7 @@ impl WalletActor {
                 addr_req.tx_status_filter().clone(),
                 addr_req.output_status_filter().clone(),
             )
+            .into()
         else {
             unreachable!("transactions_involving_address builds that variant");
         };
@@ -9389,7 +9454,7 @@ mod tests {
     /// never report ready.
     #[test]
     fn serviceable_request_classification() {
-        use super::is_serviceable_request;
+        use super::{is_serviceable_request, EnhanceRequest};
         use zcash_client_backend::data_api::{
             OutputStatusFilter, TransactionDataRequest, TransactionStatusFilter,
         };
@@ -9398,21 +9463,20 @@ mod tests {
         use zcash_transparent::address::TransparentAddress;
 
         let txid = TxId::from_bytes([7u8; 32]);
-        assert!(is_serviceable_request(
-            &TransactionDataRequest::Enhancement(txid)
-        ));
-        assert!(is_serviceable_request(&TransactionDataRequest::GetStatus(
-            txid
-        )));
+        assert!(is_serviceable_request(&EnhanceRequest::Enhancement(txid)));
+        assert!(is_serviceable_request(&EnhanceRequest::GetStatus(txid)));
         assert!(
-            is_serviceable_request(&TransactionDataRequest::transactions_involving_address(
-                TransparentAddress::PublicKeyHash([9u8; 20]),
-                BlockHeight::from_u32(1),
-                Some(BlockHeight::from_u32(100)),
-                None,
-                TransactionStatusFilter::All,
-                OutputStatusFilter::All,
-            )),
+            is_serviceable_request(
+                &TransactionDataRequest::transactions_involving_address(
+                    TransparentAddress::PublicKeyHash([9u8; 20]),
+                    BlockHeight::from_u32(1),
+                    Some(BlockHeight::from_u32(100)),
+                    None,
+                    TransactionStatusFilter::All,
+                    OutputStatusFilter::All,
+                )
+                .into()
+            ),
             "the transparent address-index query drains, so it counts toward the backlog"
         );
     }
@@ -9432,7 +9496,7 @@ mod tests {
     /// default wallet's behaviour cannot depend on it.
     #[test]
     fn fetch_memos_off_skips_only_receive_side_enhancement_requests() {
-        use super::request_in_scope;
+        use super::{request_in_scope, EnhanceRequest};
         use zcash_client_backend::data_api::{
             OutputStatusFilter, TransactionDataRequest, TransactionStatusFilter,
         };
@@ -9444,17 +9508,18 @@ mod tests {
         let spending = std::collections::BTreeSet::from([spent]);
         let none: std::collections::BTreeSet<TxId> = std::collections::BTreeSet::new();
 
-        let recv_enhancement = TransactionDataRequest::Enhancement(received);
-        let spend_enhancement = TransactionDataRequest::Enhancement(spent);
-        let status = TransactionDataRequest::GetStatus(received);
-        let tia = TransactionDataRequest::transactions_involving_address(
+        let recv_enhancement = EnhanceRequest::Enhancement(received);
+        let spend_enhancement = EnhanceRequest::Enhancement(spent);
+        let status = EnhanceRequest::GetStatus(received);
+        let tia: EnhanceRequest = TransactionDataRequest::transactions_involving_address(
             TransparentAddress::PublicKeyHash([0u8; 20]),
             zcash_protocol::consensus::BlockHeight::from_u32(100),
             None,
             None,
             TransactionStatusFilter::All,
             OutputStatusFilter::All,
-        );
+        )
+        .into();
 
         // fetch_memos on: everything serviceable is in scope, and the spend set is not even
         // consulted (pass the empty one, which would exclude both enhancements if it were).
@@ -9495,13 +9560,12 @@ mod tests {
     /// repeatedly within one batch.
     #[test]
     fn outstanding_requests_dedup_and_satisfied_filter() {
-        use super::outstanding_requests;
-        use zcash_client_backend::data_api::TransactionDataRequest;
+        use super::{outstanding_requests, EnhanceRequest};
         use zcash_protocol::TxId;
 
-        let a = TransactionDataRequest::Enhancement(TxId::from_bytes([1u8; 32]));
-        let b = TransactionDataRequest::GetStatus(TxId::from_bytes([2u8; 32]));
-        let c = TransactionDataRequest::Enhancement(TxId::from_bytes([3u8; 32]));
+        let a = EnhanceRequest::Enhancement(TxId::from_bytes([1u8; 32]));
+        let b = EnhanceRequest::GetStatus(TxId::from_bytes([2u8; 32]));
+        let c = EnhanceRequest::Enhancement(TxId::from_bytes([3u8; 32]));
 
         // The upstream shape: the same request repeated many times, interleaved with others.
         let raw = vec![
@@ -9543,14 +9607,12 @@ mod tests {
     /// correct and cheap either way).
     #[test]
     fn upstream_spend_search_duplication_is_collapsed_by_outstanding_requests() {
-        use super::outstanding_requests;
+        use super::{outstanding_requests, EnhanceRequest};
         use bip0039::{English, Mnemonic};
         use secrecy::SecretVec;
         use zcash_client_backend::data_api::chain::ChainState;
         use zcash_client_backend::data_api::wallet::decrypt_and_store_transaction;
-        use zcash_client_backend::data_api::{
-            AccountBirthday, TransactionDataRequest, WalletRead, WalletWrite,
-        };
+        use zcash_client_backend::data_api::{AccountBirthday, WalletRead, WalletWrite};
         use zcash_primitives::block::BlockHash;
         use zcash_primitives::transaction::{TransactionData, TxVersion};
         use zcash_protocol::consensus::{BlockHeight, BranchId};
@@ -9629,10 +9691,15 @@ mod tests {
         // Count only the spend-search requests for the K paid addresses: the read also holds
         // TransactionsInvolvingAddress rows for the ZIP-320 *ephemeral* address checks (one per
         // ephemeral gap address), which are a different, non-duplicated population.
-        let reqs = db.transaction_data_requests().expect("read requests");
+        let reqs: Vec<EnhanceRequest> = db
+            .transaction_data_requests()
+            .expect("read requests")
+            .into_iter()
+            .map(EnhanceRequest::from)
+            .collect();
         let ours: std::collections::BTreeSet<_> = addrs.iter().copied().collect();
-        let is_our_spend_search = |r: &TransactionDataRequest| match r {
-            TransactionDataRequest::TransactionsInvolvingAddress(a) => ours.contains(&a.address()),
+        let is_our_spend_search = |r: &EnhanceRequest| match r {
+            EnhanceRequest::TransactionsInvolvingAddress(a) => ours.contains(&a.address()),
             _ => false,
         };
         let raw = reqs.iter().filter(|r| is_our_spend_search(r)).count();

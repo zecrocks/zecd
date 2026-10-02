@@ -5187,7 +5187,7 @@ MIT License
 ================================================================================
 
 Used by:
-  - zakura-client-backend 0.1.0-rc4
+  - zakura-client-backend 0.1.0-rc7
 
 MIT License
 
@@ -5618,7 +5618,6 @@ Used by:
   - blake2b_simd 1.0.5
   - blake2s_simd 1.0.5
   - cookie-factory 0.3.3
-  - equihash 0.3.0
   - fluent-langneg 0.13.1
   - intl_pluralrules 7.0.2
   - io_tee 0.1.1
@@ -5629,8 +5628,9 @@ Used by:
   - tonic-prost-build 0.14.6
   - tonic-prost 0.14.6
   - type-map 0.5.1
-  - zakura-client-sqlite 0.1.0-rc4
-  - zakura-pczt 0.1.0-rc2
+  - zakura-client-sqlite 0.1.0-rc7
+  - zakura-pczt 0.1.0-rc4
+  - zakura-pir-enhance-types 0.0.1-rc0
 
 MIT License
 
@@ -6349,8 +6349,38 @@ MIT License
 ================================================================================
 
 Used by:
-  - zcash_transparent 0.10.0
-  - zip321 0.9.0
+  - zakura-equihash 2.2.0
+
+The MIT License (MIT)
+
+Copyright (c) 2017-2021 The Electric Coin Company
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in
+all copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+THE SOFTWARE.
+
+
+================================================================================
+MIT License
+================================================================================
+
+Used by:
+  - zakura-transparent 2.2.0
+  - zakura-zip321 2.2.0
 
 The MIT License (MIT)
 
@@ -6479,7 +6509,7 @@ MIT License
 
 Used by:
   - f4jumble 0.1.1
-  - zcash_address 0.13.0
+  - zakura-address 2.2.0
   - zcash_encoding 0.4.0
   - zcash_note_encryption 0.4.2
 
@@ -6541,7 +6571,7 @@ MIT License
 ================================================================================
 
 Used by:
-  - zcash_protocol 0.10.6
+  - zakura-protocol 2.2.0
 
 The MIT License (MIT)
 
@@ -6631,23 +6661,23 @@ MIT License
 ================================================================================
 
 Used by:
-  - zakura-bellman 1.2.0
-  - zakura-bls12-381 1.0.0
-  - zakura-halo2-gadgets 1.0.0
-  - zakura-halo2-legacy-pdqsort 1.2.0
-  - zakura-halo2-poseidon 1.0.0
-  - zakura-halo2-proofs 1.0.0
-  - zakura-jubjub 1.0.0
-  - zakura-keys 1.0.0
-  - zakura-orchard 1.0.0
-  - zakura-pairing 1.2.0
-  - zakura-pasta-curves 1.0.0
-  - zakura-primitives 1.0.0
-  - zakura-proofs 1.0.0
-  - zakura-reddsa 1.0.0
-  - zakura-redjubjub 1.0.0
-  - zakura-sapling-crypto 1.0.0
-  - zakura-sinsemilla 1.0.0
+  - zakura-bellman 2.2.0
+  - zakura-bls12-381 2.2.0
+  - zakura-halo2-gadgets 2.2.0
+  - zakura-halo2-legacy-pdqsort 2.2.0
+  - zakura-halo2-poseidon 2.2.0
+  - zakura-halo2-proofs 2.2.0
+  - zakura-jubjub 2.2.0
+  - zakura-keys 2.2.0
+  - zakura-orchard 2.2.0
+  - zakura-pairing 2.2.0
+  - zakura-pasta-curves 2.2.0
+  - zakura-primitives 2.2.0
+  - zakura-proofs 2.2.0
+  - zakura-reddsa 2.2.0
+  - zakura-redjubjub 2.2.0
+  - zakura-sapling-crypto 2.2.0
+  - zakura-sinsemilla 2.2.0
 
 The MIT License (MIT)
 

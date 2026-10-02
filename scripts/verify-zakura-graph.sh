@@ -11,8 +11,9 @@
 #
 #   - any crates.io original of a crate Zakura Common forks is in the graph (an edge escaped
 #     the rename - a dependency pulled `orchard` from crates.io), or
-#   - any `zakura-*` package resolves to more than one version (the wallet layer pins the
-#     crypto family with `=`, so a second version means a conflicting requirement crept in).
+#   - any `zakura-*` package resolves to more than one version (the family releases in
+#     lockstep and its types cross every crate boundary, so a second version means a
+#     conflicting requirement crept in and two incompatible type families are linked).
 #
 # The forbidden list is the crates.io name of every member of zakura-core/common plus the
 # wallet-layer crates zakura-core/wallet-libraries forks. Extend it if Zakura Common grows.
@@ -33,11 +34,13 @@ import sys
 from collections import defaultdict
 
 FORBIDDEN = {
-    # zakura-core/common (the proving/protocol stack).
+    # zakura-core/common (the proving/protocol stack). From the 2.x family it also forks
+    # the protocol-level crates the 1.x family still took from crates.io.
     "orchard", "sapling-crypto", "zcash_primitives", "zcash_keys", "zcash_proofs",
     "halo2_proofs", "halo2_gadgets", "halo2_poseidon", "halo2_legacy_pdqsort",
     "pasta_curves", "sinsemilla", "reddsa", "redjubjub", "bellman", "bls12_381",
-    "jubjub", "pairing",
+    "jubjub", "pairing", "equihash",
+    "zcash_protocol", "zcash_address", "zcash_transparent", "zip321",
     # zakura-core/wallet-libraries (the wallet layer).
     "zcash_client_backend", "zcash_client_sqlite", "pczt",
 }
