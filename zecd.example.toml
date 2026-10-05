@@ -91,6 +91,18 @@ connect_timeout_secs = 10
 # Reconnect backoff (seconds): start at base, double up to max, with full jitter.
 reconnect_base_secs = 1
 reconnect_max_secs = 60
+# Which hosts count as local for a plaintext connection. The zebra:// connection is plain HTTP,
+# so zecd sends its RPC credentials only to a local host, and an http:// lightwalletd (which
+# would expose the addresses and txids this wallet asks about) is only dialled toward one.
+# Loopback and `localhost` always count. With this on (the default) so do private and
+# non-routable ranges - 10/8, 172.16/12, 192.168/16, link-local, 100.64/10, fc00::/7, fe80::/10
+# - the usual Docker/LAN setup. Set false for loopback only. Any other hostname never counts
+# (zecd does no DNS lookup here), so name a LAN upstream by IP address.
+# rfc1918_is_local = true
+# Allow those plaintext connections to ANY host, public ones included. Only for a hop secured
+# out of band (SSH or WireGuard tunnel, private overlay). An unauthenticated zebra connection
+# never needs it.
+# allow_remote_cleartext = false
 # lightwalletd TLS mode: "auto" (default - locality heuristic), "yes", or "no". An explicit
 # https:// or http:// scheme on `server` wins over this. zebra:// endpoints ignore it
 # (always plaintext HTTP, local-only by policy).
@@ -162,6 +174,11 @@ password = "change-me"
 # file authenticates with it - no shared secret to configure, regenerated each startup
 # (how bitcoin-cli auths to a local node by default).
 # cookiefile = "./data/.cookie"
+#
+# Requests served at once. One more gets HTTP 503 with "Work queue depth exceeded", as with
+# Bitcoin Core's -rpcworkqueue, rather than queueing without bound. Raise it for a client that
+# keeps many long calls (waitfornewblock, waitforblockheight) open concurrently.
+# work_queue = 100
 #
 # RPC method safelist. By default (this key absent or empty) every method below is served.
 # Uncomment `allowed_methods` and keep ONLY the methods you want reachable: any method not on
@@ -270,7 +287,7 @@ bootstrap_from_keys = true
 [pools]
 # Shielded RECEIVERS this wallet's addresses may carry. zecd is shielded-only; the receivers are
 # "sapling" and "orchard". These are the GLOBAL defaults; any [wallets.<name>] section can
-# override `pools`/`default_receivers` independently.
+# override `pools`/`default_receivers` independently, and likewise each `transparent*` key below.
 #
 # Both keys below name receivers, not value pools, which is why this list is shorter than the set
 # of pools zecd reports funds in. The section is called [pools] because a receiver and the pool
@@ -583,6 +600,15 @@ port = 9233
 readiness = "synced"
 # Only consulted in "synced" and "scanned" modes:
 max_scan_lag = 4
+
+[log]
+# Default tracing filter: a level ("error", "warn", "info", "debug", "trace") or a
+# comma-separated directive list such as "info,zecd::sync=debug". RUST_LOG overrides it.
+# Logs go to stderr.
+level = "info"
+# "text" for people, "json" for log aggregation (one object per line). Anything else is
+# refused at startup.
+format = "text"
 
 # ---------------------------------------------------------------------------
 # [fleet] - EXPERIMENTAL. Monitoring many watch-only wallets in one daemon.
