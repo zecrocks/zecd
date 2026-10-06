@@ -13,6 +13,7 @@
 - [Addresses & shielded pools](guide/addresses.md)
 - [Transparent support](guide/transparent.md)
 - [Watch-only wallets](guide/watch-only.md)
+- [Fleet: many watch-only wallets](guide/fleet.md)
 - [Deployment](guide/deployment.md)
 - [Operations runbook](guide/operations.md)
 

@@ -45,6 +45,9 @@ upstream interface and the persistence invariant separately.
                        zebrad JSON-RPC (zebra://host:port) or lightwalletd
 ```
 
+A [fleet](../guide/fleet.md) shard is one more actor of the same kind: one database holding
+many watch-only accounts, scanned in one pass.
+
 ## The single-writer actor
 
 `zcash_client_sqlite::WalletDb` is `Send` but not `Sync`, and wallet writes (note selection,
@@ -223,6 +226,7 @@ the daemon runs.
 | `wallet/read.rs` | read-only queries over short-lived WAL connections |
 | `wallet/open.rs`, `store.rs`, `keys.rs`, `binding.rs` | DB open/init + WAL, `keys.toml`, seed custody, account-to-keys binding |
 | `chain/` | the `ChainSource` trait, `ZebraSource`, the light-mode source, and `hub.rs`, the shared upstream connection (see [Chain backends](zebra-backend.md)) |
+| `wallet/shard.rs`, `fleet.rs` | fleet scan domains and manifests (see [Fleet](../guide/fleet.md)) |
 | `sync/engine.rs`, `sync/memcache.rs` | one-batch-per-call scan driver, reorg recovery; the in-memory batch |
 | `operations.rs` | the async-operation registry behind [`z_sendmany`](../rpc/async-operations.md) |
 | `health.rs` | `/healthz`, `/readyz`, `/status` on a separate port |

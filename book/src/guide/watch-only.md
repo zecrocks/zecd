@@ -124,6 +124,11 @@ question of which key signs. Two enforcement points:
    watch-only flag, a second spender is **fatal for the whole daemon**. zecd will not silently
    pick which one is "the" spender; the error names both offending wallets.
 
+Each watch-only wallet configured this way is a full stack of its own: a database, an actor
+and a scan. For a large number of them, an experimental [fleet](fleet.md) (since 0.8.0) shares
+one database and one scan per shard of wallets, and adds them at runtime with `createwallet`
+instead of a config edit and a restart.
+
 To resolve a violation, convert one spending wallet to watch-only (`zecd export-ufvk` +
 `zecd init --ufvk` into a fresh datadir, then delete the spending datadir) or remove it from
 the configuration.

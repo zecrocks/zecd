@@ -1,6 +1,6 @@
 # Method index: zecd vs bitcoind vs zcashd
 
-Every RPC method zecd dispatches (54 methods as of 0.8.0, the `ALL_METHODS` table in
+Every RPC method zecd dispatches (58 methods as of 0.8.0, the `ALL_METHODS` table in
 `src/rpc/mod.rs`),
 compared against Bitcoin Core master and zcashd. Each method name links to its full reference
 entry.
@@ -66,7 +66,11 @@ is covered in [Conventions & wire format](index.md).
 | [listunspent](wallet-history.md#listunspent) | ✓ | same name, differs (transparent UTXOs; `z_listunspent` for notes) | One entry per unspent note; synthesized `txid`/`vout`; `address` empty for change; transparent entries carry zcashd's `generated` flag and immature coinbase is omitted |
 | [getreceivedbyaddress](wallet-balances.md#getreceivedbyaddress) | ✓ | same name, differs (transparent; `z_listreceivedbyaddress` for shielded) | Totals over diversified receiving addresses; change never counted |
 | [listreceivedbyaddress](wallet-balances.md#listreceivedbyaddress) | ✓ | same name, differs (transparent) | `listreceivedbyaddress 0 true` enumerates every generated address; each entry's `label` is `""` |
-| [listwallets](wallet-addresses.md#listwallets) | ✓ | n/a (single wallet) | Names from `[wallets.<name>]` config |
+| [listwallets](wallet-addresses.md#listwallets) | ✓ | n/a (single wallet) | Names from `[wallets.<name>]` config, plus loaded fleet wallets |
+| [listwalletdir](wallet-addresses.md#listwalletdir) | ✓ | n/a | Configured wallets plus fleet manifests; a `warnings` extension names unreadable manifests. New in 0.8.0 |
+| [createwallet](wallet-addresses.md#createwallet) | ✓ | n/a | Fleet only, experimental: a watch-only wallet from a `ufvk` and `birthday` in the options object; spending-wallet flags refused. New in 0.8.0 |
+| [loadwallet](wallet-addresses.md#loadwallet) | ✓ | n/a | Fleet only, experimental: serve a provisioned fleet wallet. New in 0.8.0 |
+| [unloadwallet](wallet-addresses.md#unloadwallet) | ✓ | n/a | Fleet only, experimental: stop serving a fleet wallet; deletes nothing, and the shard keeps scanning it. New in 0.8.0 |
 | **Wallet: writes** | | | |
 | [getnewaddress](wallet-addresses.md#getnewaddress) | ✓ | same name, differs (deprecated, transparent-only; `z_getaddressforaccount` for UAs) | Fresh diversified UA; a `label` arg is rejected `-8`; `address_type` selects receivers within the enabled pools |
 | [sendtoaddress](sending.md#sendtoaddress) | ✓ | same name, differs (transparent-only) | Synchronous shielded send returning a txid; ZIP-317 fee; `subtractfeefromamount`/`fee_rate` answer `-8`; extra trailing `memo` param |

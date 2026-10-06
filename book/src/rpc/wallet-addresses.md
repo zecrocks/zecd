@@ -330,6 +330,8 @@ and full transaction data), not just during the block scan.
   `null` means "not currently determinable", which a consumer must read as **hold the cursor**,
   never as "everything is enhanced". [`waitforsync`](blockchain.md#waitforsync) blocks until the
   backlog is empty and returns the same fields.
+- `import_error` (extension, 0.8.0): present only when a [fleet](../guide/fleet.md) wallet's
+  import failed; see [`waitforsync`](blockchain.md#waitforsync).
 - `fetch_memos` (extension, 0.8.0): present, as `false`, only when `[sync] fetch_memos = false`.
   `enhanced_through` is then `null`, since it promises that memos at or below it are readable.
 - `descriptors`: always `false`.
@@ -378,8 +380,9 @@ listwallets
 ```
 
 Returns the names of all loaded wallets: every `[wallets.<name>]` in the config (plus the
-default wallet). Target a specific wallet with the `/wallet/<name>` URL path, as in Bitcoin
-Core; see [Conventions & wire format](index.md).
+default wallet) and, with a [fleet](../guide/fleet.md) enabled, every loaded fleet wallet.
+Target a specific wallet with the `/wallet/<name>` URL path, as in Bitcoin Core; see
+[Conventions & wire format](index.md).
 
 **Result**
 
@@ -387,11 +390,149 @@ Core; see [Conventions & wire format](index.md).
 ["default", "watch1"]
 ```
 
-**vs Bitcoin Core**: identical shape. zecd has no `createwallet`/`loadwallet`/
-`unloadwallet`: the wallet set is fixed by configuration at startup, and at most one loaded
-wallet may hold spending keys.
+**vs Bitcoin Core**: identical shape. Configured wallets are fixed at startup; only fleet
+wallets can be created, loaded and unloaded at runtime (below). At most one loaded wallet may
+hold spending keys.
 
 **vs zcashd**: no equivalent (zcashd is single-wallet).
+
+## Fleet wallet management
+
+*New in 0.8.0, experimental.* The four methods below manage [fleet](../guide/fleet.md) wallets:
+watch-only, shielded-only wallets defined by a viewing key, sharing shard databases.
+`createwallet` and `loadwallet` refuse with `-4` unless `[fleet] enabled = true`, and these
+methods may change in a patch release while the fleet is experimental.
+
+They follow Bitcoin Core's dialect where a Zcash wallet allows it. The difference is forced:
+Core creates a wallet that generates its own keys, while a monitored Zcash wallet is defined by
+the viewing key it is given, so `createwallet` requires one.
+
+## createwallet
+
+```
+createwallet "wallet_name" ( disable_private_keys blank passphrase avoid_reuse descriptors load_on_startup external_signer {"ufvk":..,"birthday":..} )
+```
+
+Onboard a view wallet without restarting the daemon. It writes the wallet's manifest, places it
+in a shard (opening a new one when none has room), and serves it immediately at
+`/wallet/<name>`. Its account is imported on the shard's next connected pass; until then its
+balances and history are empty and `waitforsync` reports `imported: false`.
+
+**Parameters**
+
+| # | Name | Type | Default | Description |
+|---|------|------|---------|-------------|
+| 1 | wallet_name | string | required | ASCII letters, digits, `-`, `_` and `.`. Must not name a loaded wallet. |
+| 2 | disable_private_keys | bool | `true` | Only `true` (or omitted) is accepted: a fleet wallet is watch-only. |
+| 3 | blank | | | Accepted and ignored. |
+| 4 | passphrase | null | | Must be omitted or `null`: a fleet wallet holds no spending material. |
+| 5 | avoid_reuse | | | Accepted and ignored. |
+| 6 | descriptors | | | Accepted and ignored. |
+| 7 | load_on_startup | | | Accepted and ignored: the manifest is the startup list. |
+| 8 | external_signer | null | | Must be omitted or `null`. |
+| 9 | options | object | required | `{"ufvk": "uview1...", "birthday": <height>}`. Both required. |
+
+**Result**
+
+```json
+{
+  "name": "acct-00417",
+  "warning": "the wallet is loaded; its balance and history are empty until the shard scans from its birthday"
+}
+```
+
+**Errors**
+
+| Code | When |
+|------|------|
+| -8 | name missing; `disable_private_keys` false; a `passphrase` or `external_signer`; `ufvk` or `birthday` missing from the options; a birthday that is not a block height; a name that is not addressable as `/wallet/<name>`; a viewing key that does not decode for this network |
+| -4 | the fleet is not enabled; a wallet of that name is already loaded; placing or starting the wallet failed |
+
+**vs Bitcoin Core**: same name, result shape and positional flags, plus the options object
+carrying the viewing key and birthday. Every flag that would ask for a spending wallet is
+refused.
+
+## loadwallet
+
+```
+loadwallet "wallet_name"
+```
+
+Serve a fleet wallet that is provisioned but not loaded: one whose manifest was added while the
+daemon ran, or one `unloadwallet` dropped. A reloaded wallet's history is intact, since its
+account never left its shard.
+
+**Result**
+
+```json
+{ "name": "acct-00417", "warning": "" }
+```
+
+**Errors**
+
+| Code | When |
+|------|------|
+| -8 | name missing; the name or the manifest's viewing key is invalid |
+| -4 | the fleet is not enabled; the manifest directory cannot be read; a wallet of that name is already loaded |
+| -18 | no readable manifest of that name (`listwalletdir` reports unreadable ones) |
+
+## unloadwallet
+
+```
+unloadwallet ( "wallet_name" load_on_startup )
+```
+
+Stop serving a fleet wallet. **Nothing is deleted**: the manifest and the account stay, and the
+shard keeps scanning for the wallet, so unloading frees no scanning work and a restart or
+`loadwallet` serves it again. To retire a wallet for good, delete its manifest and rebuild its
+shard.
+
+The wallet is named by the argument or by the `/wallet/<name>` endpoint. The arguments are
+validated before the wallet is resolved.
+
+**Result**
+
+```json
+{
+  "name": "acct-00417",
+  "warning": "the wallet is no longer served; its account stays in its shard and is still scanned, so unloading frees no scanning work, and a restart or loadwallet serves this wallet again"
+}
+```
+
+**Errors**
+
+| Code | When |
+|------|------|
+| -3 | `wallet_name` is not a string, or `load_on_startup` is not a boolean |
+| -8 | no wallet named by either the argument or the endpoint; the two name different wallets; `load_on_startup` is `false` (the manifest is the startup list, and unloading keeps it, so delete the manifest instead) |
+| -4 | the wallet is a configured `[wallets.<name>]` entry, which stays loaded for the daemon's lifetime |
+| -18 | no loaded wallet of that name |
+
+**vs Bitcoin Core**: same shape and the same refusal when the endpoint and the argument
+disagree. `load_on_startup = false` is refused rather than silently ignored, since ignoring it
+would bring the wallet back at the next restart.
+
+## listwalletdir
+
+```
+listwalletdir
+```
+
+The wallets available on disk, loaded or not: the configured wallets plus every readable fleet
+manifest, sorted. Works with the fleet disabled, listing configured wallets only.
+
+**Result**
+
+```json
+{
+  "wallets": [{ "name": "acct-00417" }, { "name": "default" }],
+  "warnings": ["/var/lib/zecd/fleet/zec/wallets.d/acct-00999.toml: <reason>"]
+}
+```
+
+`warnings` (zecd extension) names each manifest that could not be read, which is how an
+operator learns that a file they wrote is not being served. It is absent when there are none,
+so a healthy fleet gets Bitcoin Core's exact shape.
 
 ## walletpassphrase
 

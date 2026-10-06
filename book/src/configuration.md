@@ -92,7 +92,17 @@ watch-only replica of the same seed. Existing configurations resolve exactly as 
 wallet with no overrides emits no backend keys from `config show`.
 
 At most one loaded wallet may hold spending keys; any number of watch-only (UFVK) wallets
-may run alongside it; see [Watch-only wallets](guide/watch-only.md).
+may run alongside it; see [Watch-only wallets](guide/watch-only.md). For thousands of
+watch-only wallets, see [Fleet](guide/fleet.md).
+
+## `[fleet]`
+
+*New in 0.8.0, experimental, off by default.* Monitoring many watch-only wallets in one daemon,
+sharing shard databases. The keys are described with the feature in
+[Fleet](guide/fleet.md#enabling-it): `enabled` (`false`), `manifest_dir`
+(`<datadir>/fleet/zec/wallets.d`), `dir` (`<datadir>/fleet/zec/shards`), `shard_size` (`128`)
+and `cohort_depth` (`10000`). They may change in a patch release while the fleet is
+experimental. `fleet` is a reserved wallet name.
 
 ## `[backend]`
 
@@ -325,7 +335,9 @@ stall restores, a bare RPC password on a non-loopback bind. Since 0.8.0 they als
 - an `orchard_action_limit` that `max_tx_bytes` will always bind first, and a
   `shutdown_drain_secs` longer than common supervisors' stop timeouts;
 - a `proxy` combined with a loopback upstream, which the proxy would read as its own loopback;
-- `default_receivers` with several receivers, whose addresses history will not report verbatim.
+- `default_receivers` with several receivers, whose addresses history will not report verbatim;
+- fleet manifests present while `[fleet] enabled` is false, a wallet directory overlapping the
+  fleet's, and the fleet's experimental status when it is on (see [Fleet](guide/fleet.md)).
 
 `--strict` fails on warnings too; `-q` reports through the exit code alone.
 

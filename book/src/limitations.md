@@ -56,7 +56,8 @@ above 1000 and logs an error above 10000). See [transparent support](guide/trans
 
 ## One account per wallet
 
-Each wallet surfaces exactly one ZIP-32 account (the first in its database);
+Each wallet surfaces exactly one ZIP-32 account (the first in its database, or for a
+[fleet](guide/fleet.md) wallet its own account in a shared shard database);
 multi-account-per-seed is not exposed, and Bitcoin Core's legacy string-account API is not
 implemented. Workaround: use multiwallet. Each `[wallets.<name>]` entry is an independent
 seed, database, and directory, addressed bitcoind-style at `POST /wallet/<name>` (see

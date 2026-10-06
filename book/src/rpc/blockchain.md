@@ -331,7 +331,8 @@ already beginning rather than one that is up to `[sync] interval_secs` away.
   "chain_tip": 2913004,
   "synced": true,
   "pending_enhancements": 0,
-  "enhanced_through": 2913000
+  "enhanced_through": 2913000,
+  "imported": true
 }
 ```
 
@@ -341,7 +342,13 @@ already beginning rather than one that is up to `[sync] interval_secs` away.
   opening its own connection to ask. `height` alone cannot express progress, because what it
   is being measured against is exactly this. `null` until the first tip is known, before the
   first successful connect.
-- `synced`: the predicate the call waits on.
+- `synced`: the predicate the call waits on. Never true while `imported` is false.
+- `imported` (0.8.0): whether the wallet's own account exists in its database yet. Always
+  `true` for a conventional wallet by the time it can be read; `false` for a
+  [fleet](../guide/fleet.md) wallet that has been onboarded but not yet imported, whose reads
+  are legitimately empty.
+- `import_error` (0.8.0): present only when a fleet wallet's import failed. The failure is
+  terminal, so the call returns at once rather than waiting out its timeout.
 - `pending_enhancements`: distinct outstanding transaction-data requests still to drain.
 - `enhanced_through`: the height below which history is complete. `null` means "not currently
   determinable", which a consumer must read as **hold the cursor**, never as "everything is

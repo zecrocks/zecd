@@ -14,6 +14,7 @@ Funds are recoverable from the mnemonic alone. Everything else is convenience.
 | Birthday height | inside `keys.toml`; also record it with the mnemonic | Makes a from-seed restore fast. Any height at or before the wallet's first transaction works. |
 | `keys.toml` | `<wallet dir>/keys.toml`, or wherever `keys_file` points | The age-encrypted mnemonic plus network and birthday. Useless without the identity; pair the two for a full server restore. This is the file you ship as a Secret. |
 | `identity.txt` (age identity) | `[keys] age_identity`, default `<datadir>/identity.txt` | Decrypts `keys.toml`. This is spend authority. Store its backup separately from `keys.toml` backups. |
+| Fleet manifests (only with a [fleet](fleet.md)) | `[fleet] manifest_dir`, default `<datadir>/fleet/zec/wallets.d/` | The viewing keys and birthdays of every fleet wallet. They exist nowhere else, and `createwallet` writes them at runtime, so back the directory up continuously. |
 
 Do not back up `data.sqlite` (since 0.7.0 it lives under `<wallet dir>/zec/lrz/`; see
 [wallet data layout](#wallet-data-layout)). It is a cache derived from the chain: zecd is
@@ -32,6 +33,8 @@ Per wallet directory `<dir>`:
 | `identity.txt` | Secret: decrypts the seed (spend authority) | Yes, if auto-unlocking. Mount as a Secret (`ZECD_AGE_IDENTITY`). |
 | `<dir>/zec/lrz/data.sqlite` (+ `-wal`/`-shm`) | Cache: account, scan progress, balances, history. Rebuilt from `keys.toml` plus a rescan. | No. |
 | `<dir>/zec/lrz/blocks/`, `blockmeta.sqlite` | Legacy cache: the on-disk compact-block cache of releases before 0.8.0, which hold the batch being scanned in memory. Dead weight if present; `zecd rescan` removes it. | No. |
+| `<datadir>/fleet/zec/wallets.d/` | Fleet manifests (viewing keys), written at runtime by `createwallet` | Yes, if running a fleet. Not a cache. |
+| `<datadir>/fleet/zec/shards/` | Fleet shard databases. Rebuilt from the manifests plus a rescan. | No. |
 | `<datadir>/.cookie` | Ephemeral RPC cookie, minted at startup, removed on clean shutdown | No. |
 
 Keep secrets out of the TOML (which typically lives in a ConfigMap):

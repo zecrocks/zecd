@@ -81,7 +81,8 @@ default, private/LAN ranges are allowed).
   remains the recommendation. See [Chain backends](design/zebra-backend.md).
 - **One spending wallet, any number of watch-only wallets.** At most one loaded wallet holds
   spending keys; watch-only replicas are built from an exported Unified Full Viewing Key and
-  addressed bitcoind-style at `/wallet/<name>`. See
+  addressed bitcoind-style at `/wallet/<name>`. Since 0.8.0 an experimental
+  [fleet](guide/fleet.md) monitors large numbers of watch-only wallets in shared databases. See
   [Watch-only wallets](guide/watch-only.md).
 - **Reproducible builds.** The release pipeline produces bit-for-bit reproducible static
   binaries (a full-source-bootstrapped StageX image on amd64, a fully pinned Alpine build on
