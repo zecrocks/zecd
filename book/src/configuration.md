@@ -509,6 +509,7 @@ what an offline caller wants anyway.
 | `ZECD_MNEMONIC` | `init --restore` | The seed phrase for a non-interactive restore. Takes precedence over `--mnemonic-file` and stdin. |
 | `ZECD_WALLET_PASSPHRASE` | `init --encrypt` | The at-rest passphrase for a non-interactive encrypted init; otherwise prompted twice on stdin. |
 | `ZECD_REGTEST_NU63_HEIGHT` | daemon (regtest only) | Activate NU6.3 (Ironwood) at this regtest height. Unset, the regtest chain never activates it. |
+| `ZECD_REGTEST_NU7_HEIGHT` | daemon (regtest only) | Activate NU7 at this regtest height (0.9.0-rc1 and later). Must be above `ZECD_REGTEST_NU63_HEIGHT`, or zecd refuses to start. |
 | `ZECD_ALLOW_CORE_DUMPS` | daemon + subcommands | Set to exactly `1` to opt out of the core-dump/ptrace hardening (`RLIMIT_CORE=0` + `PR_SET_DUMPABLE=0`) for crash debugging. Any other value, including `0` or empty, keeps hardening on. The seed `mlock` is unaffected. |
 | `RUST_LOG` | daemon + subcommands | Standard tracing filter; overrides `[log] level` when set. |
 

@@ -47,6 +47,8 @@ Three things to change before trusting the stack with real funds:
 - **Pin Zebra.** The compose file pins `zfnd/zebra:6.3.0` for both networks, which activates
   Ironwood (NU6.3) at the network's activation height (see Zebra's source and release notes). The
   tag is an example. Pin to a release you have verified; Zebra's flags can vary between versions.
+  On testnet, past NU7's activation (block 4,465,026) both the node and zecd must support NU7;
+  see [NU7](../quickstart.md#nu7).
   (Zebra tags have no `v` prefix.)
 - **Set a real RPC password.** The shipped configs use `password = "CHANGE-ME"`. On
   mainnet zecd refuses to start while the `[rpc]` password is still that placeholder

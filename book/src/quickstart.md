@@ -56,8 +56,8 @@ Always use `--release`: a debug build takes more than 20 seconds to prove a sing
 send. The same applies to `cargo install`, which builds in release mode by default.
 
 **Release candidates are opt-in.** `cargo install zecd` resolves to the newest *stable* release,
-so a pre-release has to be asked for by name (`cargo install zecd --version 0.7.0-rc5`). The
-same holds for a dependency: a `zecd = "0.7"` requirement will not pick up a `-rc`.
+so a pre-release has to be asked for by name (`cargo install zecd --version 0.9.0-rc1`). The
+same holds for a dependency: a `zecd = "0.8"` requirement will not pick up a `-rc`.
 
 ## Check the node is reachable
 
@@ -236,6 +236,23 @@ Because ironwood is a distinct value pool rather than a flavour of Orchard, an i
 or ironwood-to-Orchard send is a turnstile crossing that reveals its amount on chain, and
 `FullPrivacy` rejects it. See the [privacy policy ladder](design/privacy.md).
 
+
+## NU7
+
+NU7 activates on **testnet at block 4,465,026**. Mainnet has no NU7 height yet.
+
+Support for it is in **0.9.0-rc1**, a release candidate. From that block, transactions commit
+to the NU7 consensus branch id and keep the V6 format NU6.3 introduced. 0.8.1 and older build
+transactions that upgraded testnet nodes reject, so a testnet deployment needs 0.9.0-rc1 (or
+later) before that height, and a node that activates NU7 there. Like NU6.3, it is compiled in
+and activated by height; there is no flag. Mainnet deployments can stay on 0.8.1.
+
+The 0.9.0-rc1 wallet database cannot be reopened by 0.8.1, so copy the data directory before
+upgrading if you might go back. See [Upgrades](guide/operations.md#upgrades).
+
+Regtest opts in with `ZECD_REGTEST_NU7_HEIGHT`, which must be above
+`ZECD_REGTEST_NU63_HEIGHT` (zecd refuses to start otherwise: network upgrades activate in
+order).
 ## Where to go next
 
 - [Configuration](configuration.md): every TOML section and key, CLI flags, environment

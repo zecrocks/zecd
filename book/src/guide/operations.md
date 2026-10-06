@@ -32,7 +32,7 @@ Per wallet directory `<dir>`:
 | `<dir>/keys.toml` | Secret: encrypted seed + birthday/network | Yes. Mount as a Secret; relocate with `keys_file` / `ZECD_KEYS_FILE`. |
 | `identity.txt` | Secret: decrypts the seed (spend authority) | Yes, if auto-unlocking. Mount as a Secret (`ZECD_AGE_IDENTITY`). |
 | `<dir>/zec/lrz/data.sqlite` (+ `-wal`/`-shm`) | Cache: account, scan progress, balances, history. Rebuilt from `keys.toml` plus a rescan. | No. |
-| `<dir>/zec/lrz/blocks/`, `blockmeta.sqlite` | Legacy cache: the on-disk compact-block cache of releases before 0.8.0, which hold the batch being scanned in memory. Dead weight if present; `zecd rescan` removes it. | No. |
+| `<dir>/zec/lrz/blocks/`, `blockmeta.sqlite` | Legacy cache: the on-disk compact-block cache releases before 0.8.0 kept. Since 0.8.0 the batch being scanned is held in memory. Dead weight if present; `zecd rescan` removes it. | No. |
 | `<datadir>/fleet/zec/wallets.d/` | Fleet manifests (viewing keys), written at runtime by `createwallet` | Yes, if running a fleet. Not a cache. |
 | `<datadir>/fleet/zec/shards/` | Fleet shard databases. Rebuilt from the manifests plus a rescan. | No. |
 | `<datadir>/.cookie` | Ephemeral RPC cookie, minted at startup, removed on clean shutdown | No. |
@@ -478,7 +478,8 @@ If sends are still slow after upgrading, the cause is elsewhere: check that the 
    its credentials re-added.)
 
 3. Stop with SIGINT or SIGTERM (both are graceful: in-flight requests finish, new ones get
-   503). The `stop` RPC is regtest-only, so a stray RPC call cannot take down a production
+   503, and since 0.8.0 the wallet finishes sends it had already accepted; see
+   [shutdown](#shutdown-and-in-flight-sends)). The `stop` RPC is regtest-only, so a stray RPC call cannot take down a production
    daemon.
 4. Replace the binary or pull the new image.
 5. Start. Wallet DB migrations run automatically at open; the first start after a large
@@ -490,6 +491,25 @@ a per-coin subdirectory. It is automatic and needs no configuration change, but 
 than a silent rebuild, and any backup script or volume mount that names `<wallet>/data.sqlite`
 by hand needs its path updated. Step 1's `config check` reports a pending move as a warning, so
 the dry run tells you it is coming.
+
+**Upgrading onto 0.8.0**, three things change under an existing deployment:
+
+- Building from source needs Rust 1.91 (0.7.x needed 1.88). Binary and package users are
+  unaffected.
+- The block cache is in memory, so 0.7.x's `blocks/` and `blockmeta.sqlite` are left behind
+  unused; `zecd rescan` removes them, or delete them with the daemon stopped.
+- `[spend] orchard_action_limit` now counts a two-bundle send as the prover does, so a wallet
+  holding pre-NU6.3 Orchard notes can have a send refused that 0.7.x accepted. Raise the cap
+  and send SIGHUP, or consolidate with `z_mergetoaddress`.
+
+Every 0.7.0 configuration key and response shape still resolves as it did, and every new key
+defaults to the previous behaviour.
+
+**Upgrading onto 0.9.0-rc1** (a release candidate, needed on testnet past NU7; see
+[NU7](../quickstart.md#nu7)): the wallet database gains two migrations on first start that
+0.8.1 does not know, so a database 0.9.0-rc1 has opened cannot be reopened by 0.8.1. **Copy the
+data directory first** if you might need to go back. No configuration key, RPC or response
+shape changes.
 
 Downgrades across DB migrations are not supported. If you need a rollback path, stop the
 daemon and snapshot the datadir first. The worst case of a lost datadir is a from-seed
