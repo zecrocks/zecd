@@ -99,7 +99,7 @@ default, private/LAN ranges are allowed).
 - **Not zcashd-RPC-compatible.** zecd is intentionally not a zcashd clone: it does not
   implement zcashd's `z_*` surface except a small chosen subset (`z_sendmany` plus the
   operation-tracking trio, `z_shieldcoinbase`, `z_mergetoaddress`, `z_listtransactions`,
-  `z_getaddressforaccount`). Migrating an integration is a concept mapping, not a drop-in; see
+  `z_getaddressforaccount`, `z_validateaddress`, `z_listunifiedreceivers`). Migrating an integration is a concept mapping, not a drop-in; see
   [Migrating from zcashd](migrating-from-zcashd.md).
 - **No P2P.** zecd never speaks the Zcash peer-to-peer protocol; Zebra is its only upstream,
   and `getpeerinfo` reports at most that one connection.

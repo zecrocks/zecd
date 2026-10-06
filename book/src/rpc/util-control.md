@@ -59,6 +59,101 @@ Ownership is not reported here; use [`getaddressinfo`](wallet-addresses.md) for 
 **vs Bitcoin Core**: same base shape, including the `error`/`error_locations` fields on invalid input. Core additionally emits `witness_version`/`witness_program` for segwit addresses (never applicable here) and populates `scriptPubKey` for every valid address (zecd leaves it empty for shielded). `isvalid_orchard`, `receiver_types`, and `receivers_consistent` are zecd extensions.
 
 **vs zcashd**: zcashd splits validation in two: its `validateaddress` accepts only transparent addresses (and mixes in wallet fields like `ismine`/`iswatchonly`), while `z_validateaddress` handles shielded and Unified Addresses with an `address_type` field and per-pool key material. zecd's single `validateaddress` covers every kind, so a valid UA gets `isvalid: true`.
+Since 0.8.0 zecd also implements [`z_validateaddress`](#z_validateaddress), for zcashd-lineage
+tooling that asks it whether an address is the wallet's own.
+
+## z_validateaddress
+
+```
+z_validateaddress "address"
+```
+
+*New in 0.8.0.* Validate an address of any kind and report whether it is this wallet's own.
+It exists for `ismine`: zcashd-lineage tooling uses `z_validateaddress` to decide whether an
+address belongs to the wallet before a self-send or a consolidation, and `validateaddress`
+deliberately carries no ownership signal.
+
+**Parameters**
+
+| # | Name | Type | Default | Description |
+|---|------|------|---------|-------------|
+| 1 | address | string | required | Any address: transparent, Sapling, Unified or TEX. |
+
+**Result** (valid Unified Address)
+
+```json
+{
+  "isvalid": true,
+  "address": "u1...",
+  "address_type": "unified",
+  "ismine": true,
+  "receivers": ["orchard"]
+}
+```
+
+- `address_type`: `p2pkh`, `p2sh`, `sapling`, `unified` or `tex`.
+- `ismine`: whether the routed wallet owns the address. The wallet is resolved strictly, so
+  `false` always means "not this wallet's", never "no wallet to ask".
+- `receivers`: Unified Addresses only, in zcashd's vocabulary (`p2pkh`, `sapling`, `orchard`).
+- An address that does not decode on this network is `{"isvalid": false}` and nothing else.
+
+**Errors**
+
+| Code | When |
+|------|------|
+| -1 | address argument missing |
+| -3 | address argument present but not a string |
+| -18 | the routed wallet does not exist |
+
+**vs zcashd**: zcashd's `z_validateaddress` accepts only shielded and Unified Addresses and
+returns per-pool key material for a Sapling address. zecd accepts
+every kind, since answering "invalid" about an address the wallet will pay would be worse than
+the divergence, names which in `address_type`, and does not return key material.
+
+## z_listunifiedreceivers
+
+```
+z_listunifiedreceivers "unified_address"
+```
+
+*New in 0.8.0.* Take a Unified Address apart into its receivers, each encoded on its own, in
+zcashd's shape. History names every output by the single receiver it paid, so a consumer that
+handed out a multi-receiver address needs exactly these strings to match a history entry back
+to it. Key-free: any valid Unified Address on this network is accepted, owned or not.
+
+**Parameters**
+
+| # | Name | Type | Default | Description |
+|---|------|------|---------|-------------|
+| 1 | unified_address | string | required | A Unified Address. |
+
+**Result**
+
+```json
+{
+  "p2pkh": "t1...",
+  "sapling": "zs1...",
+  "orchard": "u1..."
+}
+```
+
+One field per receiver present (`p2pkh`, `p2sh`, `sapling`, `orchard`). Orchard has no bare
+encoding, so its receiver comes back as a single-receiver Unified Address, which is also how
+history reports an Orchard or Ironwood output.
+
+**Errors**
+
+| Code | When |
+|------|------|
+| -1 | address argument missing |
+| -3 | address argument present but not a string |
+| -5 | not a valid address on this network |
+| -8 | a valid address that is not a Unified Address (a bare address is already its one receiver) |
+| -18 | the routed wallet does not exist |
+
+To match receipts to an address you issued without comparing strings at all, use
+`diversifier_index`, which [received history entries](wallet-history.md) and
+[`getaddressinfo`](wallet-addresses.md#getaddressinfo) carry.
 
 ## signmessage
 

@@ -244,6 +244,14 @@ On a bare t-address this wallet owns, three more fields report where it came fro
 All three are absent for shielded addresses (a diversifier index is not a BIP 44 path) and
 for transparent addresses this wallet does not own.
 
+**`diversifier_index`** (*new in 0.8.0*) is present on any address this wallet owns: the
+shielded diversifier index for a Unified or Sapling address, or the BIP 44 child index for a
+bare transparent one (the same number as `address_index`; ZIP 32 reuses it), so a caller need
+not branch on the kind. It is the index [received history entries](wallet-history.md#shared-conventions)
+report, and the one `z_getaddressforaccount` takes, so storing it at issuance lets every later
+receipt be matched by integer rather than by address string. A shielded index can reach 2^88,
+so parse it as an arbitrary-precision integer.
+
 **Errors**
 
 | Code | When |
@@ -254,7 +262,8 @@ for transparent addresses this wallet does not own.
 **vs Bitcoin Core**: same core fields and the same `-5` on an undecodable address, plus
 Core's `hdkeypath`/`ischange` on own transparent addresses. zecd still emits a subset
 overall: no `desc`/`parent_desc`, no pubkey fields, no `timestamp`.
-`isvalid_orchard`/`receiver_types`/`receivers_consistent`/`address_index` are additions.
+`isvalid_orchard`/`receiver_types`/`receivers_consistent`/`address_index`/`diversifier_index`
+are additions.
 
 **vs zcashd**: no equivalent; zcashd has only `validateaddress`/`z_validateaddress`, with
 no ownership attribution for Unified Addresses in this shape.
@@ -321,6 +330,8 @@ and full transaction data), not just during the block scan.
   `null` means "not currently determinable", which a consumer must read as **hold the cursor**,
   never as "everything is enhanced". [`waitforsync`](blockchain.md#waitforsync) blocks until the
   backlog is empty and returns the same fields.
+- `fetch_memos` (extension, 0.8.0): present, as `false`, only when `[sync] fetch_memos = false`.
+  `enhanced_through` is then `null`, since it promises that memos at or below it are readable.
 - `descriptors`: always `false`.
 - `unlocked_until`: present only for passphrase-encrypted wallets; the unix time the wallet
   auto-relocks, or `0` while locked. Absent on unencrypted and watch-only wallets.

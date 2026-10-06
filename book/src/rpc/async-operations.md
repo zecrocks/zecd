@@ -72,6 +72,8 @@ Send to one or more recipients asynchronously. Returns an opid immediately; the 
 | a unified or Sapling address of this wallet | the account's shielded notes |
 | a bare transparent address of this wallet | that address's non-coinbase UTXOs only |
 | `ANY_TADDR` | any of the account's non-coinbase transparent UTXOs |
+| `ANY_SAPLING` | the account's Sapling notes only (*new in 0.8.0*) |
+| `ANY_ORCHARD` | the account's Orchard and Ironwood notes only (*new in 0.8.0*; a zecd extension, since zcashd's wildcards predate Orchard) |
 
 A transparent source requires privacy policy `AllowRevealedSenders` or weaker, since spending
 transparent inputs reveals the sender's addresses and amounts; see the
@@ -94,7 +96,7 @@ notes.
 
 | # | Name | Type | Default | Description |
 |---|------|------|---------|-------------|
-| 1 | fromaddress | string | required | One of this wallet's own addresses (unified, Sapling, or bare transparent), or `ANY_TADDR`. Selects the funding source per the table above. A foreign, undecodable, or hand-spliced address is `-5`. |
+| 1 | fromaddress | string | required | One of this wallet's own addresses (unified, Sapling, or bare transparent), `ANY_TADDR`, `ANY_SAPLING`, or `ANY_ORCHARD`. Selects the funding source per the table above. A foreign, undecodable, or hand-spliced address is `-5`; `ANY_SPROUT` is `-8`. |
 | 2 | amounts | array | required | Non-empty array of `{"address":.., "amount":.., "memo":..}` objects. `amount` is decimal ZEC, 8 places; zero is allowed (the memo-only pattern, shielded recipients only). `memo` is an optional hex-encoded ZIP-302 memo, at most 512 bytes, shielded recipients only. Unknown keys and duplicate recipient addresses are `-8`. |
 | 3 | minconf | number | wallet policy | Only spend notes with at least this many confirmations, overriding both bounds of the wallet's confirmations policy symmetrically for this send. Omitted or `null` uses the configured ZIP-315 policy (3 trusted / 10 untrusted). Values below 1 are served as 1; a non-number is `-3`. |
 | 4 | fee | null | null | Must be omitted or `null`. Fees are always ZIP-317, computed by the wallet; any explicit value (including 0) is `-8`. |
@@ -125,7 +127,10 @@ treated it as `AllowRevealedRecipients`.
 Only argument validation fails synchronously. Everything downstream, including `-6`
 insufficient funds, a locked wallet, the `-4` "Private keys are disabled" refusal on a
 [watch-only wallet](../guide/watch-only.md), proving failures, and broadcast rejection,
-surfaces later in the operation's `error` object, never as an error on this call.
+surfaces later in the operation's `error` object, never as an error on this call. So do the
+two size bounds checked when the transaction is planned: a send over `[spend]
+orchard_action_limit` or `[spend] max_tx_bytes` fails the operation with `-8`, naming the bound
+it hit, before anything is proved.
 
 **Errors** (synchronous)
 
@@ -134,7 +139,7 @@ surfaces later in the operation's `error` object, never as an error on this call
 | -1 | `fromaddress` missing or null |
 | -3 | `fromaddress`, `minconf`, or a `memo` field is the wrong JSON type |
 | -5 | `fromaddress` undecodable, not this wallet's, or a Unified Address with inconsistently spliced receivers |
-| -8 | `amounts` missing or not an array; empty `amounts`; unknown key or missing `address`/`amount` in an entry; duplicate recipient; non-hex or over-512-byte memo; memo on a transparent recipient; explicit `fee`; unknown `privacyPolicy`; transparent recipient under `FullPrivacy`/`AllowRevealedAmounts` |
+| -8 | `ANY_SPROUT`; `amounts` missing or not an array; empty `amounts`; unknown key or missing `address`/`amount` in an entry; duplicate recipient; non-hex or over-512-byte memo; memo on a transparent recipient; explicit `fee`; unknown `privacyPolicy`; transparent recipient under `FullPrivacy`/`AllowRevealedAmounts` |
 | -4 | transparent `fromaddress`/`ANY_TADDR` under a policy below `AllowRevealedSenders`; transparent source with an all-transparent recipient set below `AllowFullyTransparent`; the wallet already has 16 unfinished operations (back-pressure); or the payment set is not a valid transaction request |
 
 **vs Bitcoin Core**: no equivalent; Core has no asynchronous RPC model. The synchronous
@@ -343,8 +348,8 @@ operation to finish before starting the next (sends serialize per wallet regardl
 | 1 | fromaddresses | array of string | required | Non-empty; see the source table above. A missing argument is `-1`; a non-array is `-8`. |
 | 2 | toaddress | string | required | Any address, own or foreign, transparent or shielded. A [TEX](../guide/addresses.md) destination is `-8`: paying one is a two-transaction ZIP-320 proposal, and zecd rejects multi-transaction proposals everywhere. |
 | 3 | fee | null | null | Must be omitted or `null`. Fees are ZIP-317, computed by the wallet; any explicit value is `-8`. |
-| 4 | transparent_limit | number | 50 | Maximum UTXOs to merge. `0` means as many as fit under the block-space cap. Accepted and ignored for a shielded source, as in zcashd. |
-| 5 | shielded_limit | number | 200 | Maximum notes to merge. `0` means no caller limit by count; Orchard-family selections are additionally clamped by [`[spend] orchard_action_limit`](../configuration.md#spend). Accepted and ignored for a transparent source. |
+| 4 | transparent_limit | number | 50 | Maximum UTXOs to merge. `0` means as many as fit under the block-space cap and [`[spend] max_tx_bytes`](../configuration.md#spend). Accepted and ignored for a shielded source, as in zcashd. |
+| 5 | shielded_limit | number | 200 | Maximum notes to merge. `0` means no caller limit by count; Selections are additionally clamped by [`[spend] orchard_action_limit`](../configuration.md#spend) and, since 0.8.0, by `[spend] max_tx_bytes`: a merge selects as many notes as fit under both rather than failing, and reports what it left in the `remaining*` fields. Accepted and ignored for a transparent source. |
 | 6 | memo | string (hex) | omitted | ZIP-302 memo on the output. Shielded destinations only; with a transparent `toaddress` it is `-8`. |
 | 7 | privacyPolicy | string | wallet policy | Per-call override of `[spend] privacy_policy`, same names as [`z_sendmany`](#z_sendmany). |
 

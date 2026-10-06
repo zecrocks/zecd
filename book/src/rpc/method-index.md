@@ -1,6 +1,6 @@
 # Method index: zecd vs bitcoind vs zcashd
 
-Every RPC method zecd dispatches (52 methods as of 0.7.0, the `ALL_METHODS` table in
+Every RPC method zecd dispatches (54 methods as of 0.8.0, the `ALL_METHODS` table in
 `src/rpc/mod.rs`),
 compared against Bitcoin Core master and zcashd. Each method name links to its full reference
 entry.
@@ -44,6 +44,8 @@ is covered in [Conventions & wire format](index.md).
 | [waitforsync](blockchain.md#waitforsync) | n/a | n/a | **zecd extension** (0.7.0). Blocks until the scan *and* the enhancement backlog are done; reports `chain_tip`, `pending_enhancements` and `enhanced_through`; timing out is not an error |
 | **Utility** | | | |
 | [validateaddress](util-control.md#validateaddress) | ✓ | same name, differs (transparent-only; shielded via `z_validateaddress`) | Validates every Zcash address kind; adds `isvalid_orchard` and `receiver_types` extension fields |
+| [z_validateaddress](util-control.md#z_validateaddress) | n/a | same name, differs (shielded and unified only, with key material) | Every address kind, with `address_type`, `ismine`, and `receivers` for a UA; no key material. New in 0.8.0 |
+| [z_listunifiedreceivers](util-control.md#z_listunifiedreceivers) | n/a | ✓ | A UA split into per-receiver strings, the strings history reports. Key-free. New in 0.8.0 |
 | [settxfee](util-control.md#settxfee) | *removed* | same name, differs (functional in zcashd) | Always `-8`: fees are ZIP-317, never client-settable |
 | [estimatesmartfee](util-control.md#estimatesmartfee) | ✓ | n/a | Inert stub: conventional ZIP-317 rate (0.00001) plus a `blocks` echo |
 | [estimatefee](util-control.md#estimatefee) | *removed* | n/a (removed in zcashd 5.6.0) | Same stub rate, kept for old clients |
@@ -56,7 +58,7 @@ is covered in [Conventions & wire format](index.md).
 | [getbalances](wallet-balances.md#getbalances) | ✓ | n/a (`z_getbalanceforaccount`, `z_gettotalbalance`) | `mine.trusted/untrusted_pending/immature` plus a `mine.coinbase` extension (mature transparent coinbase, a subset of `trusted`) and `lastprocessedblock`; no `watchonly` object |
 | [getunconfirmedbalance](wallet-balances.md#getunconfirmedbalance) | *removed* | same name, differs (transparent-only) | Incoming funds below the confirmations policy, including 0-conf via the mempool stream |
 | [getwalletinfo](wallet-addresses.md#getwalletinfo) | ✓ | ✓ | bitcoind shape; `scanning` progress, `unlocked_until` when encrypted, `private_keys_enabled:false` when watch-only |
-| [getaddressinfo](wallet-addresses.md#getaddressinfo) | ✓ | n/a (`validateaddress` / `z_validateaddress`) | `ismine` is cryptographic (viewing-key attribution); `labels` always `[]`; `iswatchonly` always false, as in Core master |
+| [getaddressinfo](wallet-addresses.md#getaddressinfo) | ✓ | n/a (`validateaddress` / `z_validateaddress`) | `ismine` is cryptographic (viewing-key attribution); `diversifier_index` on own addresses; `labels` always `[]`; `iswatchonly` always false, as in Core master |
 | [listtransactions](wallet-history.md#listtransactions) | ✓ | same name, differs (transparent history only) | Core categories and fields; adds `memo`/`memoStr`; outgoing `address` is the single receiver actually paid |
 | [z_listtransactions](wallet-history.md#z_listtransactions) | n/a | n/a (no equivalent; `listtransactions` is transparent-only) | zcashd-style per-output history vocabulary (no `account` arg) |
 | [listsinceblock](wallet-history.md#listsinceblock) | ✓ | same name, differs (transparent history only) | Cursor pattern; `removed` always `[]`; a malformed cursor answers `-5`, a reorged-away cursor re-lists from the earliest scanned block |

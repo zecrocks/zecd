@@ -6,7 +6,7 @@ The crate is published on [crates.io](https://crates.io/crates/zecd).
 
 ```toml
 [dependencies]
-zecd = { version = "0.7", default-features = false }
+zecd = { version = "0.8", default-features = false }
 ```
 
 `default-features = false` drops the two feature gates below, so neither axum nor clap enters
@@ -48,6 +48,11 @@ Bitcoin Core error codes an HTTP client would get. A worked example ships as
 Resolve configuration without clap via `config::AppConfig::resolve_overrides` and
 `config::ConfigOverrides`.
 
+`Node::reload_config` (*new in 0.8.0*) applies a freshly resolved configuration to a running
+node: what the binary's SIGHUP handler does. Only `[spend] orchard_action_limit` and
+`[spend] max_tx_bytes` take effect; the returned `config::ReloadReport` lists every other
+changed key as needing a restart, for the caller to log.
+
 ## The typed client
 
 `typed::Client` is one Rust method per RPC, borrowed from a node with `node::Node::wallet` and
@@ -75,6 +80,11 @@ It accepts **duplicate recipients**, which the RPC refuses by default for zcashd
 address can be paid by several memo-carrying payments in a single transaction. Over the wire
 the same thing is available behind
 [`[rpc] allow_duplicate_shielded_recipients`](configuration.md#rpc).
+
+`SendOptions` carries the in-process spelling of `z_sendmany`'s arguments: `minconf`,
+`privacy`, and `source`, a `wallet::SendSource` that names the funding source as
+`fromaddress` does (shielded notes, one shielded pool family, or transparent UTXOs). Its
+default is the plain "pay this request from shielded notes" call.
 
 `zip321` and `TxId` are re-exported from the crate root, so requests are built against exactly
 the versions zecd links rather than against a second copy that happens to have the same
@@ -110,9 +120,19 @@ that made [`listtransactions` paging](rpc/wallet-history.md) stable, and for the
 height alone is not injective, so a page boundary landing inside a same-height tie was
 previously resolved arbitrarily.
 
-These functions take an `engine_dir` path. Compute it with `config::engine_dir` or
+Since 0.8.0 these functions take an `engine_dir` path **and an account scope**:
+`query_transactions(engine_dir, scope, &query)`. One database can hold several accounts (a
+fleet shard does), so every read that reports a wallet's own money, history or addresses names
+the account it means. For a loaded wallet, get both from `Node::wallet_location`, which
+returns a `node::WalletLocation` with `engine_dir`, `account` (an `AccountUuid`, or `None`
+before the account exists) and `scope` (a `wallet::read::AccountScope`). It is the only
+supported route to a fleet member's files, and the scope is reported rather than left to be
+derived because the two `None` cases scope differently. An unknown wallet is `-18`.
+
+Without a node, compute the directory with `config::engine_dir` or
 `config::WalletEntry::engine_dir` and **never by joining the components yourself**, since the
-layout is per-coin and per-engine (see [wallet data layout](guide/operations.md#wallet-data-layout)).
+layout is per-coin and per-engine (see [wallet data layout](guide/operations.md#wallet-data-layout)),
+and pass `AccountScope::Any`, which is exact for a database holding one account.
 
 ## Chain queries before a wallet exists
 
@@ -125,8 +145,9 @@ start.
 pinning a birthday alongside a seed it generated itself records exactly what `init` would have.
 
 Both take a `chain::ChainSource` the caller supplies, which is what makes them usable over a
-transport zecd does not configure: dial a `tonic::Channel` through a SOCKS5 proxy yourself and
-wrap it with `chain::lwd::LwdSource::connect`.
+transport zecd does not configure: dial a `tonic::Channel` yourself and wrap it with
+`chain::lwd::LwdSource::connect`. (A node itself proxies through `[backend] proxy` since
+0.8.0.)
 
 `chain_probe::probe` is the same thing the [`zecd chain-info`](configuration.md#subcommands)
 subcommand prints, and the only supported way to reach the chain without a wallet at all.

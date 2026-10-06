@@ -69,6 +69,12 @@ Which backend you run changes the rest of this hop:
   lightwalletd it means the server learns each funded address's full history range in one
   query. **A wallet whose address set is sensitive should run its own node**, which is the
   standing recommendation for transparent-enabled wallets on other grounds too.
+- **Through a SOCKS5 proxy (0.8.0 and later).** `[backend] proxy` hides the wallet host's
+  network address from the backend and from the path to it, and the proxy resolves the
+  destination, so no DNS query leaves the machine. It does not change what the backend learns
+  from the queries themselves. A TLS lightwalletd session stays end to end through the proxy; a
+  zebra JSON-RPC session is plaintext on the proxy's hop to the node. See
+  [chain backends](../design/zebra-backend.md#through-a-socks5-proxy-tor).
 
 **zecd to disk.** The datadir holds the encrypted seed, the wallet DB, and the RPC cookie.
 Filesystem permissions are the boundary; zecd sets 0600 on the cookie and the identity file

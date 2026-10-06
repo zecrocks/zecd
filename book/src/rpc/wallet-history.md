@@ -44,6 +44,17 @@ These apply to every method on this page.
   after a restore-from-seed. Since 0.8.0 received entries follow the same rule, so a payer
   and a payee print the same string for one output (byte-identical to the issued address
   under the default Orchard-only receivers). See [statelessness](../design/statelessness.md).
+- **`diversifier_index`** (*new in 0.8.0*, zecd extension) is on `receive` entries in
+  `listtransactions`, `listsinceblock`, `z_listtransactions` and `gettransaction.details`:
+  the index of the wallet's own address the output landed on. Every encoding of an address
+  shares it, and the scanner recovers it from the note, so it is identical after a from-seed
+  restore. Store the index at issuance (`z_getaddressforaccount` returns it,
+  [`getaddressinfo`](wallet-addresses.md#getaddressinfo) reads it back) and match receipts by
+  integer. Send entries, including the send half of a self-transfer, never carry it: a
+  recipient's index is theirs. A shielded index can reach 2^88, so parse it as an
+  arbitrary-precision integer.
+- **With `[sync] fetch_memos = false`** (*0.8.0*), `memo` and `memoStr` are omitted
+  everywhere, not only where a fetch was skipped. See [configuration](../configuration.md#sync).
 - **`label` is always `""`** and `walletconflicts` always `[]`: zecd keeps no address labels
   and tracks no conflict set. `bip125-replaceable` is always `"no"` (Zcash has no RBF).
 - Amounts are bare JSON numbers in decimal ZEC, 8 places.

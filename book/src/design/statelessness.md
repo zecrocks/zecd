@@ -101,6 +101,14 @@ why first-seen is the deliberate exception rather than a violation. The rule for
 development is the same: a transient in-memory cache is fine, but persisting anything the seed
 cannot rebuild breaks the invariant and needs an explicit design decision.
 
+One persisted marker was such a decision. Since 0.8.0 (and 0.7.1) zecd marks each transaction
+it authors as trusted when it stores it, so a payment to the wallet's own address waits the
+trusted confirmation depth rather than the untrusted one. A from-seed restore does not
+re-derive the marker, so a restored wallet is briefly *more* conservative than the instance
+that sent, never less safe. `[spend] trust_own_transactions = false` turns the marker off, for
+deployments that need an authoring instance and a restore to report identical balances at
+every depth.
+
 ## Recovery breadth: shielded vs transparent
 
 Shielded funds are **unconditionally** recoverable from the seed. Detection is note

@@ -117,7 +117,9 @@ before trusting balances.
 These signals stay busy until the wallet can serve full history, not just until the block
 scan reaches the tip. Compact blocks carry no memos, so after the scan catches up a
 per-transaction enhancement pass fetches each transaction's full data from Zebra to backfill
-memos; on a from-birthday restore that backlog can take hours after `scan_progress` hits 1.0.
+memos; on a from-birthday restore that backlog can run long after `scan_progress` hits 1.0.
+Since 0.8.0 the drain fetches concurrently (`[sync] enhance_concurrency`), and a deployment
+that never reads memos can skip it with `[sync] fetch_memos = false`.
 The backlog is surfaced as `pending_enhancements` on `GET /status` (a count of *distinct*
 outstanding requests since 0.6.4; earlier releases counted duplicates and reported figures
 several times higher on wallets with reused transparent addresses), `scanning` and

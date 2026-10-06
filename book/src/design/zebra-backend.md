@@ -140,6 +140,31 @@ upstream appears as the single "peer", with `conn_state` as an extension field),
 server's `/status`, and the `/readyz` failure reason. See
 [operations](../guide/operations.md).
 
+## Through a SOCKS5 proxy (Tor)
+
+*New in 0.8.0.* `[backend] proxy = "socks5://host:port"` (or `--proxy`) routes every
+connection zecd makes through one SOCKS5 proxy, most usefully a local Tor daemon. It covers
+both backends, and it is daemon-wide: wallets cannot override it.
+
+- **The proxy resolves the destination.** zecd hands it a `host:port` string, never a resolved
+  address, so no DNS query leaves the machine and a `.onion` upstream works.
+- **TLS is layered over the proxied stream**, with certificate verification still pinned to the
+  destination hostname, so the proxy carries lightwalletd traffic it cannot read. A `zebra://`
+  connection is plaintext HTTP, and stays plaintext on the proxy's hop to the node; zecd logs a
+  warning for any non-loopback zebra endpoint either way.
+- **No proxy authentication.** A user or password in the URL is refused rather than ignored.
+  Restrict the proxy by source address instead; a loopback listener is the usual arrangement.
+- **A loopback upstream names the proxy's loopback**, not this machine's. `config check` warns
+  about that combination.
+- The cleartext-credential gate below still applies to the destination: `[zebra]` credentials
+  toward a `.onion` or other non-local host need `allow_remote_cleartext`.
+
+```toml
+[backend]
+server = "https://lwd.example.onion:443"   # or zebra://<host>.onion:8234
+proxy = "socks5://127.0.0.1:9050"          # Tor's default SOCKS port
+```
+
 ## Local-only by design: the cleartext-credential gate
 
 The hop to Zebra is plaintext HTTP. That is fine for the intended topology (same host, same

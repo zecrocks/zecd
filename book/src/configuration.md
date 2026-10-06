@@ -107,7 +107,8 @@ deployment model, the trade-off between the two, and the cleartext-credential ga
 | `connect_timeout_secs` | integer | `10` | Per-attempt dial timeout (seconds); clamped to at least 1. |
 | `reconnect_base_secs` | integer | `1` | Reconnect backoff base delay (seconds); clamped to at least 1. Backoff is exponential with full jitter. |
 | `reconnect_max_secs` | integer | `60` | Reconnect backoff cap (seconds); clamped to at least `reconnect_base_secs`. |
-| `rfc1918_is_local` | bool | `true` | Treat private / non-globally-routable addresses (RFC1918, link-local, CGNAT, IPv6 ULA/link-local) as "local" for the cleartext-credential gate (the Docker/LAN norm). Set `false` for a strict loopback-only posture. |
+| `proxy` | string | unset | **New in 0.8.0.** Route every outbound connection through a SOCKS5 proxy, most usefully Tor: `"socks5://host:port"` (`socks5h://` is accepted as the same thing). It covers both upstream kinds, so nothing zecd dials bypasses it. The proxy resolves the destination, so no DNS leaves this host and a `.onion` upstream works; lightwalletd TLS runs over the proxied connection unchanged, still verified against the destination hostname. Proxy authentication is not supported (a user or password in the URL is refused), so restrict the proxy by source address. The port is required. A malformed value fails startup. Daemon-wide: wallets cannot override it. Overridden by `--proxy`. See [Chain backends](design/zebra-backend.md#through-a-socks5-proxy-tor). |
+| `rfc1918_is_local` | bool | `true` | Treat private / non-globally-routable addresses (RFC1918, link-local, CGNAT, IPv6 ULA/link-local) as "local" for the cleartext-credential gate (the Docker/LAN norm). Set `false` for a strict loopback-only posture. Only IP literals and `localhost` are classified (zecd does no DNS lookup here), so name a LAN upstream by IP address. |
 | `allow_remote_cleartext` | bool | `false` | Escape hatch: allow `[zebra]` credentials to travel in plaintext to a globally-routable host, and a plaintext light-mode connection to one. Only set this when the hop is secured out-of-band (SSH/WireGuard tunnel, private overlay). |
 
 The remaining keys apply only when `server` names a **lightwalletd** endpoint (0.6.x and later);
@@ -188,6 +189,10 @@ per wallet in `[wallets.<name>]`. See [Addresses & shielded pools](guide/address
 |-----|------|---------|-------------|
 | `interval_secs` | integer | `20` | How often to poll Zebra for new blocks (seconds); clamped to at least 1. |
 | `rebroadcast_secs` | integer | `60` | How often (at most) to re-broadcast the wallet's own transactions that are unmined and unexpired (seconds); clamped to at least 1. |
+| `fetch_memos` | bool | `true` | **New in 0.8.0.** Whether to recover memos. Compact blocks carry no memos, so recovering them costs one upstream transaction fetch and trial decrypt per received transaction: on a from-seed restore, the drain that holds `/readyz` at 503 after the block scan reaches the tip. `false` skips those fetches for transactions the wallet did not spend in; its own sends are still fetched, so their recipients, amounts and fees stay complete. Balances, receives, status tracking, transparent spend checks and 0-conf visibility are unaffected. With it off, `memo`/`memoStr` are omitted from history, `enhanced_through` is `null`, and `getwalletinfo` reports `fetch_memos: false`. Reversible without a rescan: the skipped requests stay queued, so turning it back on backfills the memos. Keep it on if depositors are identified by memo. |
+| `batch_size` | integer | `10000` | **New in 0.8.0.** Blocks per download-and-scan batch; clamped to at least 1. A batch is held in memory, and the next one downloads while it scans, so two are resident at once: hundreds of megabytes at 25,000 on mainnet's densest ranges. 25,000 scanned about 12% faster than 10,000 on a 238k-block testnet restore, and larger gained nothing. `config check` warns above 50,000. |
+| `writer_cache_mib` | integer | `256` | **New in 0.8.0.** SQLite page-cache ceiling (MiB) of each wallet's writer connection, the one the sync loop scans through; clamped to at least 1. A ceiling, not an allocation, but a cache that has grown is kept for the life of the connection, and every configured wallet and every fleet shard has its own writer. `config check` warns when the value times the writer count passes 2 GiB. Durability does not depend on it. |
+| `enhance_concurrency` | integer | `16` | **New in 0.8.0.** How many transaction fetches the memo drain keeps in flight, which is also how many requests one drain pass services and how many stores run before queued commands are serviced again. Clamped to at least 1. On a 7,546-request drain against a nearby lightwalletd, 1 in flight took 1303 s and 16 took 194 s; the gain flattens past 64, and `config check` warns above it. Calls to a zebra upstream are capped at 64 in flight whatever this is set to. |
 
 ## `[spend]`
 
@@ -196,10 +201,13 @@ Send policy: confirmations, privacy, and the proving pipeline. See
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
+| `trust_own_transactions` | bool | `true` | **New in 0.8.0 (and 0.7.1).** Mark each transaction this wallet authors as trusted when it is stored, so a self-send's payment output waits `trusted_confirmations` rather than `untrusted_confirmations`. `false` keeps zecd from persisting the marker at all, so classification derives only from data a from-seed restore re-derives and an authoring instance and a restore of the same seed report identical balances at every depth, at the cost of self-sends waiting the untrusted depth. Applies to new sends; existing markers stay until a rescan. |
 | `trusted_confirmations` | integer | `3` | Confirmations before the wallet's *own* outputs are spendable (ZIP 315 default): change, and since 0.8.0 every output of a transaction this wallet authored, so a payment to its own address waits this depth too (see `trust_own_transactions`). Clamped to at least 1. |
 | `untrusted_confirmations` | integer | `10` | Confirmations before third-party outputs are spendable (ZIP 315 default). Must be at least `trusted_confirmations` (validated at startup). Anchors balances and spend proposals; `getbalance`'s explicit `minconf` overrides per call. |
 | `privacy_policy` | string | `"AllowRevealedRecipients"` | What sends may reveal on-chain: `"FullPrivacy"`, `"AllowRevealedAmounts"`, `"AllowRevealedRecipients"`, `"AllowRevealedSenders"` (permits funding a send from transparent UTXOs, with shielded change), or `"AllowFullyTransparent"`. `z_sendmany`'s per-call `privacyPolicy` overrides it. Note `"AllowRevealedSenders"` was a synonym for `"AllowRevealedRecipients"` before 0.6.1 and is now a rung of its own. |
 | `orchard_action_limit` | integer | `50` | Cap on the Orchard-family actions a single send may build; bounds memory/proving cost and yields a clean `-8` for oversized sends. `0` disables the cap. Counted per bundle and summed, as the builder proves them: a post-NU6.3 send that spends legacy Orchard notes into Ironwood outputs builds two bundles, so its count is the Orchard bundle's actions plus the Ironwood bundle's (before 0.8.0 one `max(inputs, outputs)` was taken across both, which let such a send prove up to twice the cap). Reloadable on SIGHUP since 0.8.0. |
+| `max_tx_bytes` | integer | `250000` | **New in 0.8.0.** Largest transaction, in bytes, a send may build; `0` disables it. Refused with `-8` when the transaction is planned, before proving. This is a relay bound, not a consensus one: consensus allows a transaction up to a 2 MB block, but nodes do not forward one past their mempool policy (zakura's default is exactly 250000), and such a transaction is not rejected so much as never mined. It bounds bytes where `orchard_action_limit` bounds actions; a post-NU6.3 send carrying both an Orchard and an Ironwood bundle reaches it sooner than its action count suggests. `z_mergetoaddress` selects under it rather than refusing. Raise it only if every node between the wallet and a miner raises its policy to match. Reloadable on SIGHUP. |
+| `shutdown_drain_secs` | integer | `60` | **New in 0.8.0.** How long the wallet actor spends finishing sends it has already accepted (a `z_sendmany` returns its opid before proving) when it is asked to stop; `0` drops them, as before. Set it below your supervisor's stop timeout, which is what actually bounds it (`docker stop` 10 s, Kubernetes 30 s, systemd 90 s); `config check` warns above 90. See [shutdown](guide/operations.md#shutdown-and-in-flight-sends). |
 | `target_note_count` | integer | `4` | How many change notes a send tries to leave behind, so the next send has several notes to spend in turn rather than serializing on one note's confirmation depth. Must be at least 1; `0` was previously a panic waiting for the first send. |
 | `min_split_output_value` | integer (zatoshis) | `10000000` (0.1 ZEC) | Floor below which change is *not* split into `target_note_count` notes. The floor applies to the wallet's balance rather than to a network, so a deployment built on small balances was receiving one change note where it wanted several. Both keys default to what was hard-coded before 0.7.0, and both are validated when the configuration loads. |
 | `cache_proving_key` | bool | `true` | Warm the Orchard proving keys on a background task at startup (so it does not delay the listeners) and prove sends through the PCZT path. Since 0.8.0 the keys are cached process-wide either way, so `false` gives up only the warm-up (the first send builds the key inline), the cached verifying key at the store step, and `pipeline_proving`. The warm-up is skipped when no loaded wallet can spend. Both paths produce identical transactions. |
@@ -222,7 +230,7 @@ Unauthenticated liveness/readiness probes on a separate port; see the
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
-| `level` | string | `"info"` | Default tracing filter; overridden entirely by `RUST_LOG` when set. |
+| `level` | string | `"info"` | Default tracing filter: a level (`"error"` through `"trace"`) or a comma-separated directive list such as `"info,zecd::sync=debug"`. Overridden entirely by `RUST_LOG` when set. |
 | `format` | string | `"text"` | `"text"` (human-readable) or `"json"` (structured, for log aggregation). Logs go to stderr. **Validated since 0.7.0**: anything else used to be silently treated as text, so a typo like `jsonl` produced text logs with no complaint. It is now refused at startup, and `zecd config check` reports the same refusal. |
 
 ## CLI flags
@@ -241,6 +249,7 @@ Flags use Bitcoin-Core-style names and always win over the corresponding TOML ke
 | `--rpcuser <USER>` | `[rpc] user` | RPC username. |
 | `--rpcpassword <PASS>` | `[rpc] password` / `password_file` | RPC password; also readable from `ZECD_RPC_PASSWORD`. Passing it on the command line triggers a startup warning: argv is world-readable via `ps` / `/proc/<pid>/cmdline`. Prefer the environment variable or `password_file`. |
 | `--rpcauth <USER:SALT$HASH>` | accumulates with `[rpc] auth` | Additional rpcauth credential; may be repeated. |
+| `--proxy <SOCKS5_URL>` | `[backend] proxy` | Route every outbound connection through a SOCKS5 proxy. |
 | `--server <SERVER>` | `[backend] server` | Chain upstream, in the same token grammar as `[backend] server`: `zebra`, `zebra://host:port`, or a lightwalletd endpoint. |
 | `--age-identity <FILE>` | `[keys] age_identity` | age identity file; also readable from `ZECD_AGE_IDENTITY`. |
 | `--keys-file <FILE>` | `[keys] keys_file` | Default wallet's `keys.toml` path; also readable from `ZECD_KEYS_FILE`. An explicit `[wallets.<name>] keys_file` still wins. |
@@ -274,6 +283,20 @@ no config file yet.
 | `example-config` | `-o, --output-file <FILE>`, `--force` | Print the annotated example config, then exit. Goes to stdout by default (`-o -` is the same), so it can be redirected or piped. With `-o <FILE>` it writes there instead and refuses to overwrite an existing file unless `--force`; the "wrote example config to ..." confirmation goes to stderr, so stdout carries config text and nothing else in every mode. The output is the shipped `zecd.example.toml`, byte for byte. Needs no datadir or config. |
 | `run` | | Run the JSON-RPC daemon (the default when no subcommand is given). |
 
+### Reloading on SIGHUP
+
+Since 0.8.0 a running daemon re-reads its configuration on SIGHUP and applies two keys:
+`[spend] orchard_action_limit` and `[spend] max_tx_bytes`. Both bound what one send may build,
+and a wallet whose notes have fragmented can fail every payout until the cap moves, so
+restarting a live payment wallet to change a number would be the wrong cost. Every other
+changed key is logged as needing a restart rather than silently ignored or half-applied.
+There is deliberately no RPC for this: the caps bound what a single call can make the daemon
+prove, so raising them takes access to the process.
+
+```sh
+systemctl kill -s HUP zecd        # or: kill -HUP <pid>, docker kill -s HUP <container>
+```
+
 ### Validating a config
 
 `zecd config check --conf FILE` answers "would this build accept this config?" without
@@ -295,8 +318,16 @@ Two properties are structural rather than promised:
 
 Errors mean "the daemon would refuse, or would start and never sync". Warnings cover the
 legal-but-risky shapes: an uninitialized wallet, a `transparent_gap_limit` wide enough to
-stall restores, a bare RPC password on a non-loopback bind. `--strict` fails on warnings too;
-`-q` reports through the exit code alone.
+stall restores, a bare RPC password on a non-loopback bind. Since 0.8.0 they also cover:
+
+- `[sync] batch_size` above 50,000, `enhance_concurrency` above 64, and a `writer_cache_mib`
+  whose total across writer connections passes 2 GiB;
+- an `orchard_action_limit` that `max_tx_bytes` will always bind first, and a
+  `shutdown_drain_secs` longer than common supervisors' stop timeouts;
+- a `proxy` combined with a loopback upstream, which the proxy would read as its own loopback;
+- `default_receivers` with several receivers, whose addresses history will not report verbatim.
+
+`--strict` fails on warnings too; `-q` reports through the exit code alone.
 
 A missing config file is an **error** here, unlike at startup where a missing file falls back
 to defaults: checking a file that is not there is a typo, and silently validating the defaults
@@ -465,6 +496,7 @@ what an offline caller wants anyway.
 | `ZECD_AGE_IDENTITY` | daemon + `init` | age identity file path; equivalent to `--age-identity`. |
 | `ZECD_MNEMONIC` | `init --restore` | The seed phrase for a non-interactive restore. Takes precedence over `--mnemonic-file` and stdin. |
 | `ZECD_WALLET_PASSPHRASE` | `init --encrypt` | The at-rest passphrase for a non-interactive encrypted init; otherwise prompted twice on stdin. |
+| `ZECD_REGTEST_NU63_HEIGHT` | daemon (regtest only) | Activate NU6.3 (Ironwood) at this regtest height. Unset, the regtest chain never activates it. |
 | `ZECD_ALLOW_CORE_DUMPS` | daemon + subcommands | Set to exactly `1` to opt out of the core-dump/ptrace hardening (`RLIMIT_CORE=0` + `PR_SET_DUMPABLE=0`) for crash debugging. Any other value, including `0` or empty, keeps hardening on. The seed `mlock` is unaffected. |
 | `RUST_LOG` | daemon + subcommands | Standard tracing filter; overrides `[log] level` when set. |
 

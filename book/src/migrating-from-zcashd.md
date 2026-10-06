@@ -58,7 +58,8 @@ return method-not-found (`-32601`, HTTP 404).
 | `z_getnewaddress` *(deprecated in zcashd)* | `getnewaddress` | Returns a fresh diversified UA (Orchard receiver by default; funds arriving there are Ironwood notes post-NU6.3). A `label` argument is rejected `-8`; the second arg is an `address_type` receiver override |
 | `getnewaddress` *(deprecated in zcashd; returns a t-addr)* | `getnewaddress "" "transparent"` | Only with `[pools] transparent = true`; returns a bare `t1...` address. See [Transparent support](guide/transparent.md) |
 | `z_listaddresses` *(deprecated)*, `listaddresses` | `listreceivedbyaddress 0 true` | `include_empty=true` enumerates every address the wallet has generated, with received totals |
-| `z_listunifiedreceivers` | not supported | Decode the UA client-side with any ZIP-316 library; zecd keeps no recipient-side UA bookkeeping |
+| `z_validateaddress` | `z_validateaddress` | Supported since 0.8.0 with `ismine`. Accepts every address kind and names it in `address_type`; returns no key material |
+| `z_listunifiedreceivers` | `z_listunifiedreceivers` | Supported since 0.8.0, in zcashd's shape. To match receipts to an issued address, `diversifier_index` on history entries is usually simpler |
 
 ### Balances
 

@@ -161,7 +161,19 @@ zecd serves unauthenticated probes on a separate port (default 9233) when `[heal
 |---|---|
 | `GET /healthz` | Liveness. `200 ok` while the process runs. |
 | `GET /readyz` | Readiness, 200/503, gated by `[health] readiness`. |
-| `GET /status` | JSON snapshot: per-wallet sync state, active upstream endpoint, `conn_state` (`down` \| `syncing` \| `ready`), `pending_enhancements`, `locked`. |
+| `GET /status` | JSON snapshot: per-wallet sync state, active upstream endpoint, `conn_state` (`down` \| `syncing` \| `ready`), `pending_enhancements`, `locked`, and since 0.8.0 `sync_totals` and `enhance_totals`. |
+
+**Where sync time goes** (since 0.8.0). `/status` carries two cumulative per-wallet objects, so
+a slow restore can be attributed to the upstream or to this host from one read:
+
+- `sync_totals`, for the block scan: `batches`, `blocks`, `bytes`, `txs`, `sapling_outputs`,
+  `orchard_actions`, and the time split `download_ms`, `tree_state_ms`, `scan_ms`,
+  `transparent_ms`, `total_ms`. Each batch also logs a `batch complete` line with the same
+  split for that range.
+- `enhance_totals`, for the memo drain that follows: `passes`, `serviced`, and `requests_ms`
+  (reading the request table), `upstream_ms` (waiting on fetches), `apply_ms` (storing the
+  results), `per_request_ms`. The drain is bound by upstream round trips and the single
+  writer, so it does not scale with this host's cores the way the scan does.
 
 Readiness modes, strictest first:
 
@@ -306,6 +318,19 @@ on the old behaviour:
   number and delay. An alert that counted reconnect WARNs will now fire once per outage rather
   than continuously, which is the intent.
 
+Two more moved in 0.8.0:
+
+- **A slow successful RPC logs at INFO.** A call that takes 2 seconds or more logs `rpc ok
+  (slow)` at INFO, where every success used to be DEBUG only. Seconds on a read means a wallet
+  has outgrown a query, and this makes it visible at the default level.
+- **Method-not-found dropped from INFO to DEBUG.** A client whose dialect fallback polls a
+  method zecd does not serve would otherwise write one INFO line per poll. Every other error
+  code stays at INFO.
+
+Each send's `send complete` line also carries `tx_bytes`, the built transaction's size, beside
+`est_tx_bytes`, the estimate `[spend] max_tx_bytes` was checked against, and warns when the
+estimate came in under the real size.
+
 New TRACE events exist for one-per-downloaded-block and one-per-serviced-transaction-data
 request. They are off unless asked for, and are verbose enough that you want a narrow filter.
 
@@ -340,6 +365,27 @@ See [Sending](../rpc/sending.md) for the RPC surface; this is the operational co
   balance awaiting confirmations, so "retry after the next block" is distinguishable from
   "the wallet needs funding".
 
+## Shutdown and in-flight sends
+
+*New in 0.8.0.* `z_sendmany` returns an opid immediately and proves on a background task. A
+stop signal arriving in that window used to discard the send: nothing had been broadcast, so no
+funds were at risk, but the record of whether it happened was lost.
+
+On shutdown the wallet now finishes the sends it has already accepted, bounded by `[spend]
+shutdown_drain_secs` (default 60). Set it **below your supervisor's stop timeout**, because that
+is what actually bounds it:
+
+| Supervisor | Default grace period | Setting to raise |
+|---|---|---|
+| `docker stop` | 10 s | `--time`, or compose's `stop_grace_period` |
+| Kubernetes | 30 s | `terminationGracePeriodSeconds` |
+| systemd | 90 s | `TimeoutStopSec` |
+
+Killed mid-drain, nothing is corrupted: a send that had not been stored is lost, as before the
+drain existed. `zecd config check` warns when the value exceeds every common default, and `0`
+disables the drain. Operation status objects are in memory and do not survive a restart either
+way, so reconcile by txid (`gettransaction`), not by opid.
+
 ## Reorgs
 
 zecd follows reorgs automatically: the scanner detects the fork, rewinds, and rescans the
@@ -347,7 +393,8 @@ replacement chain. Transactions in reorged-away blocks revert to unconfirmed
 (`confirmations: 0`) until re-mined; confirmation thresholds keep doing their job. One
 operator-visible consequence: a `listsinceblock` cursor pointing at a reorged-away block
 returns `-5 Block not found` (zecd keeps no stale-header history to walk back through, unlike
-bitcoind). Treat `-5` as "cursor invalid": re-baseline with a parameterless `listsinceblock`,
+bitcoind). A deep reorg is walked back in a few rounds: the rewind margin doubles while reorgs
+keep coming (since 0.8.0). Treat `-5` as "cursor invalid": re-baseline with a parameterless `listsinceblock`,
 dedupe by txid, and store the fresh `lastblock`. See
 [Wallet: history & unspent](../rpc/wallet-history.md).
 
