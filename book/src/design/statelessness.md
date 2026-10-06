@@ -94,7 +94,7 @@ so none break the invariant:
 |---|---|---|
 | Tx first-seen times | Wall-clock stamp when the mempool stream first stores a pending tx (`wallet::FirstSeen`), surfaced as `time`/`timereceived` until a block time supersedes it | Rebuilt as the mempool stream re-observes still-pending txs; a mined tx uses its block time. A foreign unmined tx not yet re-observed reports `time` 0 until then |
 | Async-operation registry | `z_sendmany` operation IDs and results ([async operations](../rpc/async-operations.md)) | Lost, matching zcashd's behavior; broadcast transactions are unaffected |
-| Orchard proving key | `ProvingKeyCache`, built once on a background task at startup and shared across wallets | Rebuilt at startup (a pure performance cache) |
+| Orchard proving key | `ProvingKeyCache`, built once on a background task at startup and shared across wallets (not warmed when no loaded wallet can spend; it then builds on the first send) | Rebuilt at startup (a pure performance cache) |
 
 An unmined transaction has no block time yet; that is expected, not an off-chain gap, which is
 why first-seen is the deliberate exception rather than a violation. The rule for future
@@ -130,11 +130,13 @@ Rather than show history that silently changes shape after a restore, zecd's his
 every **outgoing** output's address to that single paid receiver
 (`address::single_receiver_for_pool`): a bare `t`/`zs` address, or a single-receiver UA for
 Orchard (which has no standalone encoding). The reduction is idempotent, so a bare or
-single-receiver recipient displays as itself, and it applies only to outgoing outputs; received
-and self-transfer entries keep your own recorded address. The result is history that is
+single-receiver recipient displays as itself. Since 0.8.0 it applies to incoming outputs as
+well, so payer and payee print the same string for one output. The result is history that is
 identical on the authoring instance and after a restore, where zcashd echoes the
 stored UA on the authoring instance and degrades to the single receiver after a restore.
 
-The trade-off: to match a payment back to a multi-receiver UA you issued, deconstruct that UA
-into its per-pool receivers and compare against the displayed receiver. zecd keeps no
-recipient-side mapping itself, consistent with everything above.
+The trade-off: a multi-receiver UA you issued does not appear verbatim in history. Match by
+`diversifier_index` instead, which received entries and `getaddressinfo` carry: it is the
+identity every encoding of an address shares, and the scanner recovers it from the note, so it
+survives a restore. `z_listunifiedreceivers` splits a UA into the receiver strings history
+reports. zecd keeps no recipient-side mapping itself, consistent with everything above.

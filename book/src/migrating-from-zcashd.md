@@ -35,7 +35,7 @@ and where it intentionally diverges) is in [Compatibility boundary](compatibilit
 | zcashd | zecd |
 |---|---|
 | **Validator + wallet in one process**: zcashd validates the chain, indexes it, speaks P2P, and serves the wallet | **Wallet server over a separate node**: zecd is wallet-only and talks JSON-RPC to a self-hosted [Zebra](design/zebra-backend.md) node (`zebra://host:port`, local-only plaintext), or since 0.6.0 to a lightwalletd server. No P2P, no mining or chain-index RPC |
-| **Many address kinds**: transparent `t1…`, Sprout, Sapling `zs…`, plus ZIP-316 unified accounts (`z_getnewaccount` + `z_getaddressforaccount`) | **One account per wallet, diversified Unified Addresses**: every `getnewaddress` returns a fresh diversified UA of the wallet's single account (Orchard receiver by default). All addresses derive from the seed; see [Addresses & shielded pools](guide/addresses.md) |
+| **Many address kinds**: transparent `t1...`, Sprout, Sapling `zs...`, plus ZIP-316 unified accounts (`z_getnewaccount` + `z_getaddressforaccount`) | **One account per wallet, diversified Unified Addresses**: every `getnewaddress` returns a fresh diversified UA of the wallet's single account (Orchard receiver by default). All addresses derive from the seed; see [Addresses & shielded pools](guide/addresses.md) |
 | **Sprout + Sapling + transparent pools** | **Ironwood by default** (received at the Orchard receiver, so `[pools]` still names `orchard`); Sapling is opt-in via `[pools]`, transparent receive/spend is opt-in via `[pools] transparent` ([Transparent support](guide/transparent.md)). **No Sprout support at all**: move any Sprout funds with zcashd itself before decommissioning it |
 | **Fee arguments**: `z_sendmany`/`z_mergetoaddress`/`z_shieldcoinbase` accept an explicit `fee` (default `null` = ZIP-317); `settxfee` works | **ZIP-317 only, never client-settable**: the wallet computes the fee at build time. An explicit numeric `fee` on `z_sendmany`/`z_shieldcoinbase`/`z_mergetoaddress` is rejected `-8` (`null` is fine); `settxfee` always returns `-8`; `subtractfeefromamount`/`fee_rate` on sends are `-8` |
 | **Zcash's error numbering** (Zcash `rpc/protocol.h`), e.g. `-18` = `RPC_WALLET_BACKUP_REQUIRED` | **Bitcoin Core's numbering** (Core `rpc/protocol.h`), e.g. `-18` = `RPC_WALLET_NOT_FOUND` (unknown `/wallet/<name>`). This is the one numeric collision zecd actually emits, and only from multiwallet routing, which zcashd lacks; tooling that hard-codes Zcash's numbering should know. The money-path codes (`-4`/`-5`/`-6`/`-8`/`-13` through `-17`/`-20`/`-26`) are identical across zcashd, Core, and zecd. See [Conventions & wire format](rpc/index.md) |
@@ -56,7 +56,7 @@ return method-not-found (`-32601`, HTTP 404).
 | `z_getnewaccount` | not supported | zecd is one account per wallet, created at `zecd init`. Need more accounts → more wallets (`[wallets.<name>]`, one spending wallet max) |
 | `z_getaddressforaccount` | `z_getaddressforaccount` | Same shape; `account` must be `0`. Receiver types are shielded-only (`orchard`/`sapling`); `p2pkh` is `-8`. Optional `diversifier_index` re-derives idempotently |
 | `z_getnewaddress` *(deprecated in zcashd)* | `getnewaddress` | Returns a fresh diversified UA (Orchard receiver by default; funds arriving there are Ironwood notes post-NU6.3). A `label` argument is rejected `-8`; the second arg is an `address_type` receiver override |
-| `getnewaddress` *(deprecated in zcashd; returns a t-addr)* | `getnewaddress "" "transparent"` | Only with `[pools] transparent = true`; returns a bare `t1…` address. See [Transparent support](guide/transparent.md) |
+| `getnewaddress` *(deprecated in zcashd; returns a t-addr)* | `getnewaddress "" "transparent"` | Only with `[pools] transparent = true`; returns a bare `t1...` address. See [Transparent support](guide/transparent.md) |
 | `z_listaddresses` *(deprecated)*, `listaddresses` | `listreceivedbyaddress 0 true` | `include_empty=true` enumerates every address the wallet has generated, with received totals |
 | `z_listunifiedreceivers` | not supported | Decode the UA client-side with any ZIP-316 library; zecd keeps no recipient-side UA bookkeeping |
 
@@ -76,7 +76,7 @@ return method-not-found (`-32601`, HTTP 404).
 | zcashd | zecd | Notes |
 |---|---|---|
 | `listtransactions` | `listtransactions` | Core shape plus `memo`/`memoStr`; `label` fields always `""` |
-| `z_viewtransaction` | `gettransaction` / `z_listtransactions` | `gettransaction` is the Core shape extended with memo fields; `z_listtransactions` carries zcashd's per-output vocabulary (`pool`, `amountZat`, `outindex`, …) |
+| `z_viewtransaction` | `gettransaction` / `z_listtransactions` | `gettransaction` is the Core shape extended with memo fields; `z_listtransactions` carries zcashd's per-output vocabulary (`pool`, `amountZat`, `outindex`, ...) |
 | `z_listreceivedbyaddress` | `listreceivedbyaddress` / `z_listtransactions` | Core totals per address, or per-output entries with memos |
 | `z_listunspent` | `listunspent` | One entry per unspent note with synthesized `(txid, vout)`; `address` empty for change |
 | `listsinceblock` | `listsinceblock` | Cursor semantics; `removed` always `[]` |
@@ -125,7 +125,7 @@ guarantees hold only for addresses derived from its own seed.
      http://127.0.0.1:8232/
    ```
 
-   The result is a Unified Address (`u1…`).
+   The result is a Unified Address (`u1...`).
 3. On zcashd, send everything to that UA with `z_sendmany`. Note zcashd's default
    `privacyPolicy` is `LegacyCompat`, which treats any transaction involving a UA as
    `FullPrivacy`, so spending zcashd's **transparent** funds to zecd's UA fails under the
@@ -149,7 +149,7 @@ Two seed-related cautions:
 ## Operational differences
 
 - **You run two processes, not one.** zecd needs a self-hosted Zebra node reachable over
-  local/private JSON-RPC (`zebra://…`; plaintext HTTP guarded by a cleartext-credential gate).
+  local/private JSON-RPC (`zebra://...`; plaintext HTTP guarded by a cleartext-credential gate).
   Everything zecd believes about the chain comes from that node. See
   [Chain backends](design/zebra-backend.md) and [Deployment](guide/deployment.md).
 - **Light-client sync.** zecd derives compact blocks from the node and trial-decrypts them; it

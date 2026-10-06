@@ -15,9 +15,8 @@ Funds are recoverable from the mnemonic alone. Everything else is convenience.
 | `keys.toml` | `<wallet dir>/keys.toml`, or wherever `keys_file` points | The age-encrypted mnemonic plus network and birthday. Useless without the identity; pair the two for a full server restore. This is the file you ship as a Secret. |
 | `identity.txt` (age identity) | `[keys] age_identity`, default `<datadir>/identity.txt` | Decrypts `keys.toml`. This is spend authority. Store its backup separately from `keys.toml` backups. |
 
-Do not back up `data.sqlite` or `blocks/` (since 0.7.0 both live under
-`<wallet dir>/zec/lrz/`; see [wallet data layout](#wallet-data-layout)). They are caches
-derived from the chain: zecd is
+Do not back up `data.sqlite` (since 0.7.0 it lives under `<wallet dir>/zec/lrz/`; see
+[wallet data layout](#wallet-data-layout)). It is a cache derived from the chain: zecd is
 [stateless](../design/statelessness.md), so with the mnemonic (and birthday) the whole data
 directory can be recreated. Shielded funds are unconditionally recoverable from seed;
 transparent funds only within the gap-limit / initial-scan window (see
@@ -32,8 +31,7 @@ Per wallet directory `<dir>`:
 | `<dir>/keys.toml` | Secret: encrypted seed + birthday/network | Yes. Mount as a Secret; relocate with `keys_file` / `ZECD_KEYS_FILE`. |
 | `identity.txt` | Secret: decrypts the seed (spend authority) | Yes, if auto-unlocking. Mount as a Secret (`ZECD_AGE_IDENTITY`). |
 | `<dir>/zec/lrz/data.sqlite` (+ `-wal`/`-shm`) | Cache: account, scan progress, balances, history. Rebuilt from `keys.toml` plus a rescan. | No. |
-| `<dir>/zec/lrz/blockmeta.sqlite` (+ sidecars) | Cache: block metadata. | No. |
-| `<dir>/zec/lrz/blocks/` | Cache: downloaded compact blocks. Can grow large; fully re-derivable. | No. Exclude from every snapshot. |
+| `<dir>/zec/lrz/blocks/`, `blockmeta.sqlite` | Legacy cache: the on-disk compact-block cache of releases before 0.8.0, which hold the batch being scanned in memory. Dead weight if present; `zecd rescan` removes it. | No. |
 | `<datadir>/.cookie` | Ephemeral RPC cookie, minted at startup, removed on clean shutdown | No. |
 
 Keep secrets out of the TOML (which typically lives in a ConfigMap):
@@ -53,11 +51,11 @@ Since 0.7.0 a wallet directory nests its derived state one coin and one engine d
 ```text
 <datadir>/<wallet>/keys.toml                                    <- the seed. Stays at the root.
 <datadir>/<wallet>/zec/lrz/data.sqlite
-<datadir>/<wallet>/zec/lrz/blockmeta.sqlite
-<datadir>/<wallet>/zec/lrz/blocks/
 ```
 
-Before 0.7.0 all of these sat flat in the wallet directory together.
+Before 0.7.0 these sat flat in the wallet directory, together with an on-disk block cache
+(`blockmeta.sqlite`, `blocks/`). Since 0.8.0 the block cache is in memory, so 0.7.x leaves
+those two in `zec/lrz/` and nothing reads them; `zecd rescan` deletes them.
 
 The split follows what can be rebuilt from what. `keys.toml` wraps a BIP-39 seed that serves
 every coin and that nothing on any chain can reconstruct, so it stays at the top. Everything
@@ -192,7 +190,9 @@ A 503 body carries a `reason`. Route alerts on it:
 **"Scanned to tip" is not "ready".** Compact blocks carry no memos, so after the block scan
 catches up, an enhancement pass fetches each transaction's full data from Zebra and decrypts
 it to backfill memos. On a from-birthday restore of a busy wallet that is one fetch + decrypt
-per transaction, potentially hours of work after `scan_progress` hits `1.0`. While the
+per transaction, which can take a long time after `scan_progress` hits `1.0` (since 0.8.0 it
+runs `[sync] enhance_concurrency` fetches at once; a deployment that never reads memos can skip
+it with `[sync] fetch_memos = false`). While the
 backlog drains, `conn_state` stays `syncing`, `getwalletinfo.scanning` and
 `getblockchaininfo.initialblockdownload` stay truthy, and `"synced"` readiness holds 503 with
 `reason="enhancing"`. Watch `/status` `pending_enhancements`; if it drains slowly, check that
@@ -244,8 +244,10 @@ For load visibility, `getrpcinfo` returns `active_commands`: one entry per execu
 with `method` and `duration` (microseconds).
 
 Logs: set `[log] format = "json"` for aggregation (Loki/CloudWatch/Elastic). Every RPC call
-logs `method`, `wallet`, `elapsed_ms` (`debug` on success; errors log at `info` and add
-`code`/`message`). Sync and connection lifecycle events log at `info`; connection failures at
+logs `method`, `wallet`, `elapsed_ms`: `debug` on success, except a call taking 2 s or more,
+which logs `rpc ok (slow)` at `info` (since 0.8.0); errors log at `info` and add
+`code`/`message`, except method-not-found (`-32601`), which logs at `debug` so a client probing
+an absent method does not write one line per poll. Sync and connection lifecycle events log at `info`; connection failures at
 `warn`.
 
 Suggested alerts:
@@ -255,7 +257,7 @@ Suggested alerts:
 - Sustained HTTP 503 from the RPC port (work queue exhausted).
 - Daemon restarts.
 
-The health server starts after wallets load, so cover prover init at boot with a
+The health server starts after wallets load, so cover startup at boot with a
 `startupProbe` / `initialDelaySeconds`. The port is unauthenticated by design and exposes
 sync status only; keep it off the public internet anyway.
 

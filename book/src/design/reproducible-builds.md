@@ -33,7 +33,9 @@ The primary image is a multi-stage build on [StageX](https://stagex.tools) base 
   the committed `Cargo.lock` (`cargo fetch --locked`, `cargo install --frozen`).
 - The runtime stage is a bare `scratch` image: the static `zecd` binary, empty
   `/var/lib/zecd` and `/tmp` skeleton dirs, user `10001:10001`, a CA bundle at
-  `/etc/ssl/certs/ca-certificates.crt` with `SSL_CERT_FILE` pointed at it, and nothing else.
+  `/etc/ssl/certs/ca-certificates.crt` with `SSL_CERT_FILE` pointed at it, and the license
+  texts (`LICENSE-MIT`, `LICENSE-APACHE`, `THIRD-PARTY-LICENSES.txt`) under
+  `/usr/share/doc/zecd/`, since the binary statically links its dependencies. Nothing else.
   The bundle is there for [light mode](zebra-backend.md), which dials lightwalletd over TLS and
   trusts the OS store by default (`tls_roots = "native"`); a full-node deployment never reads
   it, since that connection is plaintext HTTP to a local node. It comes from a digest-pinned
@@ -47,12 +49,11 @@ The primary image is a multi-stage build on [StageX](https://stagex.tools) base 
   CI). mimalloc restores glibc-level performance; the `-secure` variant (MI_SECURE: guard
   pages, canary free-lists) adds back the heap-exploitation mitigations that replacing
   `malloc-ng` would otherwise drop, for under 4% on the proving path. Native glibc dev
-  builds leave the feature off. Measurements are in
-  `benchmarks/orchard-libc-bench/FINDINGS.md`.
+  builds leave the feature off.
 
 `.dockerignore` is an allowlist (`Cargo.toml`, `Cargo.lock`, `rust-toolchain.toml`, `src`,
-`vendor`), so the build context, and therefore the build inputs, are exactly the files the
-build needs.
+`zecd.example.toml`, and the three license files), so the build context, and therefore the
+build inputs, are exactly the files the build needs.
 
 ### The export stage
 
@@ -85,8 +86,8 @@ and entrypoint) from the musl-native `rust:alpine` official image, with everythi
 
 The result is deterministic and independently rebuildable bit-for-bit. What it is **not** is
 StageX-grade trust: the compiler and base image are upstream binary artifacts (a Docker
-official image plus Alpine packages), not bootstrapped from source. Released arm64 images
-carry `-arm64` suffixed tags on GHCR.
+official image plus Alpine packages), not bootstrapped from source. Released images are one
+multi-arch manifest on GHCR, so the same tag pulls the amd64 or the arm64 build.
 
 Maintenance caveat: Alpine garbage-collects superseded package versions from its CDN, so the
 apk pins go stale. When the arm64 build starts failing with "package not found", the base
@@ -122,28 +123,29 @@ beside `zecd_<version>_amd64.deb` - rather than the Rust target triple, so one r
 listing spells each architecture exactly one way. Through 0.5.2 the tarballs used triples
 and each artifact carried its own `.sha256` sidecar.
 
-Separate `docker` and `docker-arm64` jobs in the same workflow push the GHCR images (the
-amd64 push uses `rewrite-timestamp=true` and forced compression so the pushed layers are
-deterministic too, and attaches SBOM and provenance attestations). The workflow also has a
+Separate `docker` and `docker-arm64` jobs in the same workflow push each architecture's image
+by digest (the amd64 push uses `rewrite-timestamp=true` and forced compression so the pushed
+layers are deterministic too, and attaches SBOM and provenance attestations), and a `manifest`
+job combines the two digests into one multi-arch manifest tagged `<version>` and
+`<major>.<minor>`, with no per-architecture suffix. A `crates-io` job checks that
+`Cargo.toml` names the tagged version and publishes the crate. The workflow also has a
 `workflow_dispatch` trigger with a `version` input for dry-running the packaging without a
 tag; manual runs skip the GHCR push unless `push_images` is set and always produce a draft
 release.
 
-## The vendored `i18n-embed-fl` patch
+## No patched dependencies
 
-Reproducibility was validated empirically with clean double-builds, which surfaced one
+Reproducibility was validated empirically with clean double-builds, which once surfaced a
 nondeterministic dependency: the `fl!` localization proc-macro in `i18n-embed-fl` 0.9 (pulled
 in by `age`, which encrypts the wallet mnemonic; see [key custody](../security/key-custody.md))
-emits fluent message arguments in std `HashMap` iteration order. That order is randomly
-seeded per rustc process, so one reachable call site in `age`'s error formatting flipped its
-argument order (about 26 bytes of `.text`) on a per-build coin flip.
+emitted fluent message arguments in randomly seeded `HashMap` order, so one call site flipped
+its argument order on a per-build coin flip. Through 0.7.x the repo vendored a fixed 0.9.4 as
+its one `[patch.crates-io]` entry. Since 0.8.0 `age` 0.12 depends on `i18n-embed-fl` 0.10,
+which carries the fix, and `Cargo.toml` has no patch entries and no git dependencies.
 
-The fix landed upstream in `i18n-embed-fl` 0.10 (kellpossible/cargo-i18n#151), but `age` (up
-to 0.11.3, the latest) requires `0.9`, which cargo cannot bump across semver. So the repo
-vendors the released 0.9.4 with that fix backported at `vendor/i18n-embed-fl`, applied via
-the repo's only `[patch.crates-io]` entry in `Cargo.toml`. All librustzcash crates stay on
-released crates.io versions; this is the single patched dependency, and it is removed once an
-`age` release depends on `i18n-embed-fl` 0.10+.
+Every dependency comes from crates.io, but not all are stable releases: the Zakura Common
+wallet layer (`zakura-client-backend`, `zakura-client-sqlite`, `zakura-pczt`) is published at
+release-candidate versions. `Cargo.lock` pins them exactly like any other dependency.
 
 ## Verifying a release
 

@@ -62,6 +62,13 @@ note-commitment-tree sizes from its `trees` field, fetched **by the parsed block
 height, so a reorg between the two calls cannot pair one chain's raw bytes with another chain's
 tree sizes.
 
+The two calls for one block depend on each other, but the pairs for different blocks do not, so
+since 0.8.0 the stream keeps 32 blocks in flight and still delivers them to the scanner in
+height order; an error ends the range at the block that hit it. Every call to the node, from
+any path (block stream, memo drain, tip and mempool pollers), shares one budget of 64 in-flight
+calls: each is its own HTTP/1.1 request, and a node's JSON-RPC server refuses a burst past its
+connection limit rather than queueing it.
+
 Genesis is never requested: `zcash_primitives` cannot parse the genesis block (no coinbase
 height), so scan ranges never include height 0 and tree-state requests clamp to height 1 or
 above.
@@ -81,7 +88,7 @@ librustzcash's `TreeState::to_chain_state` and `AccountBirthday::from_treestate`
 ### Mempool
 
 Zebra has no push stream, so `ZebraSource` synthesizes lightwalletd's `GetMempoolStream`
-semantics with a poller: every 2 seconds it re-reads `getrawmempool`, fetches each unseen txid
+semantics with a poller, one per upstream since 0.8.0 (see [connection model](#connection-model)): every 2 seconds it re-reads `getrawmempool`, fetches each unseen txid
 via `getrawtransaction` (deduplicating across polls), and yields the raw bytes. The stream
 records the best block hash at subscription time and **closes itself when `getbestblockhash`
 changes**. That close is load-bearing: it is the wallet actor's "sync now" signal, so a new block
@@ -107,7 +114,12 @@ RPC ports). Any explicit `zebra://host:port` or bare `host:port` works. `[zebra]
 node's RPC credentials: a cookie file (re-read on every connect, since zebrad regenerates it at
 startup) wins over `rpc_user`/`rpc_password`; nothing set means no auth.
 
-Each wallet actor dials the endpoint itself. The dial (client construction plus one
+Since 0.8.0 one connection serves every wallet that resolves to the same endpoint
+(`src/chain/hub.rs`). The hub owns the dial, the mempool subscription, the subtree roots, a
+short-lived cache of the chain tip, and an LRU of fetched transactions, and hands each wallet
+actor a handle onto them; before 0.8.0 each actor dialled the endpoint itself, so N wallets
+meant N connections and N mempool pollers against one node. Compact block ranges pass through
+uncached, because a cache keyed by height is not safe across a reorg. The dial (client construction plus one
 `getblockchaininfo` round trip) is bounded by `connect_timeout_secs` (default 10). A dead
 upstream is retried with exponential backoff and full jitter (`src/backoff.rs`): the wait is
 uniform in `[0, min(base * 2^attempt, max)]`, with `reconnect_base_secs` (default 1) and
@@ -116,8 +128,9 @@ carries a hard 30-second deadline and a 64 MiB response-size cap, so a node that
 hangs (or floods) cannot stall the sync engine.
 
 The error contract separates transport from application outcomes. An `Err` from any
-`ChainSource` method is transport-class: the actor drops the client and the next operation
-reconnects. Outcomes the node itself decided ride in `Ok`: a rejected broadcast comes back as a
+`ChainSource` method is transport-class: it invalidates that connection generation and the
+next operation reconnects. Several actors reacting to one outage produce one re-dial, not one
+each. Outcomes the node itself decided ride in `Ok`: a rejected broadcast comes back as a
 non-zero `BroadcastOutcome` (surfaced to RPC callers as `-26`), and an unknown txid on
 `fetch_tx` is `Ok(None)` (Zebra's `-5` reply), neither of which kills the connection.
 
@@ -195,7 +208,7 @@ The token decides the mode:
 | `http://host:port` | light | Any lightwalletd, no TLS. Refused toward a public host unless `allow_remote_cleartext`. |
 | `host:port` | light | TLS decided by locality: plaintext toward loopback/private, TLS toward public. |
 
-### One upstream per wallet
+### Per-wallet upstream overrides
 
 *New in 0.7.0.* `[backend]` used to be daemon-global, so every wallet in a process dialled the
 same upstream. A wallet's own `[wallets.<name>]` section can now override the keys that describe
@@ -204,6 +217,7 @@ same upstream. A wallet's own `[wallets.<name>]` section can now override the ke
 `assume_transparent_in_compact_blocks`.
 
 Fallback is field by field, so a wallet overriding only `server` keeps every global TLS setting.
+Wallets that resolve to the same endpoint share one connection.
 
 ```toml
 [backend]

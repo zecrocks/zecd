@@ -41,8 +41,9 @@ These apply to every method on this page.
   the caller typed. A multi-receiver UA is sender-side metadata that never reaches the chain,
   so history reduces each outgoing output to the paid receiver (a bare `t`/`zs` address, or a
   single-receiver UA for Orchard). This makes history identical on the authoring instance and
-  after a restore-from-seed. Received and self-transfer entries keep the wallet's own
-  recorded address. See [statelessness](../design/statelessness.md).
+  after a restore-from-seed. Since 0.8.0 received entries follow the same rule, so a payer
+  and a payee print the same string for one output (byte-identical to the issued address
+  under the default Orchard-only receivers). See [statelessness](../design/statelessness.md).
 - **`label` is always `""`** and `walletconflicts` always `[]`: zecd keeps no address labels
   and tracks no conflict set. `bip125-replaceable` is always `"no"` (Zcash has no RBF).
 - Amounts are bare JSON numbers in decimal ZEC, 8 places.
@@ -428,7 +429,7 @@ enabled pools) plus, for transparent-enabled wallets, every unspent transparent 
   [`z_shieldcoinbase`](async-operations.md#z_shieldcoinbase); the ordinary send paths never
   select it. See [Transparent support](../guide/transparent.md).
 - `safe` is `true` for confirmed outputs and for unconfirmed outputs whose creating
-  transaction the wallet itself authored (its own change); a foreign output surfaced at
+  transaction the wallet itself authored (its own change or self-send); a foreign output surfaced at
   0-conf by the mempool stream is `safe: false`. `include_unsafe: false` hides those.
 - `spendable` and `solvable` are always `true`. They are nominal: whether a send can actually
   select an output is governed by the wallet's confirmations policy (`[spend]`

@@ -17,8 +17,9 @@ getbalance ( "*" minconf include_watchonly avoid_reuse )
 ```
 
 Returns the wallet's spendable balance. With no `minconf`, spendability follows the wallet's
-configured confirmations policy (ZIP-315 defaults: 3 confirmations for trusted notes such as
-your own change, 10 for third-party receipts; `[spend] trusted_confirmations` /
+configured confirmations policy (ZIP-315 defaults: 3 confirmations for trusted notes, meaning
+your own change and every output of a transaction the wallet authored, 10 for third-party
+receipts; `[spend] trusted_confirmations` /
 `untrusted_confirmations` in the [configuration](../configuration.md)). The no-argument result
 therefore always equals what a send can actually spend, and agrees with the `-6` insufficient
 funds accounting on the send methods.
@@ -151,11 +152,12 @@ Returns the total received by one of the wallet's own addresses, summed over tra
 with at least `minconf` confirmations. Internal change is not counted; a payment to one of
 the wallet's own external addresses is.
 
-Matching is whole-string equality on the address, not receiver-level: round-tripping the
-exact value `getnewaddress` returned always works and sums receipts across all of that UA's
-receivers (they share one diversifier index). A different UA that merely shares a receiver,
-or a re-encoding with a different receiver subset, is a different string and contributes
-nothing. A spliced UA (this wallet's receivers combined across diversifier indices, or mixed
+Matching is by diversifier index (since 0.8.0; 0.7.3 on the 0.7 line). Any encoding of an
+index the wallet owns answers with that index's receipts: the exact value `getnewaddress`
+returned, a re-encoding with a different receiver subset, or a single receiver of it. Before,
+matching was whole-string, and after a from-seed restore or `zecd rescan` the wallet's own
+`getnewaddress` address could answer `0.00000000` while the balance was correct. A bare
+transparent address is still its own key. A spliced UA (this wallet's receivers combined across diversifier indices, or mixed
 with a stranger's) is rejected with `-5` rather than silently treated as foreign.
 
 **Parameters**

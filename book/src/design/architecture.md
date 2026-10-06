@@ -1,8 +1,9 @@
 # Architecture
 
-How zecd is put together: a per-wallet single-writer actor that owns the wallet database, a
-read path that bypasses it, a sync engine sliced into batches so the actor stays responsive,
-and the background loops (enhancement, mempool, rebroadcast) that hang off the sync loop.
+How zecd is put together: a single-writer actor per wallet database, a read path that
+bypasses it, a sync engine sliced into batches so the actor stays responsive, the background
+loops (enhancement, mempool, rebroadcast) that hang off the sync loop, and one shared upstream
+connection per endpoint that every actor talks through.
 The [Zebra backend](zebra-backend.md) and [statelessness](statelessness.md) pages cover the
 upstream interface and the persistence invariant separately.
 
@@ -33,9 +34,15 @@ upstream interface and the persistence invariant separately.
            same DB    |  mempool / rebroadcast /    |
            file       |  sends (prove + broadcast)  |
                       +------+----------------------+
-                             |  ChainSource (AnySource -> ZebraSource)
+                             |  HubSource (a ChainSource)
                              v
-                       zebrad JSON-RPC (zebra://host:port)
+                      +------+----------------------+
+                      | ChainHub (one per endpoint) |
+                      |  shared by every actor      |
+                      +------+----------------------+
+                             |  AnySource -> ZebraSource / light source
+                             v
+                       zebrad JSON-RPC (zebra://host:port) or lightwalletd
 ```
 
 ## The single-writer actor
@@ -75,8 +82,11 @@ mempool stream.
 ## The sync engine
 
 `src/sync/engine.rs` is the compact-block scan loop, ported from zcash-devtool and refactored
-into a one-batch-per-call driver: `sync_one_batch` downloads and scans up to 10,000 compact
-blocks, then returns to the actor loop so queued commands run between batches. A monolithic
+into a one-batch-per-call driver: `sync_one_batch` downloads and scans up to `[sync]
+batch_size` compact blocks (default 10,000), then returns to the actor loop so queued commands
+run between batches. Since 0.8.0 the batch is held in memory (`sync/memcache.rs`) rather than
+written one file per block, and for shielded-only wallets the next range downloads while the
+current one scans. A monolithic
 run-until-caught-up loop (librustzcash ships one behind its `sync` feature) would hold the
 writer for the whole initial sync; it also leaves the `RequestedRewindInvalid` reorg case
 unhandled, which is why zecd keeps its own driver.
@@ -84,7 +94,9 @@ unhandled, which is why zecd keeps its own driver.
 Reorg detection is librustzcash's (a continuity error from `scan_cached_blocks`); recovery is
 caller-side by upstream design. zecd's `perform_rewind` truncates below the conflict and
 retries at a shallower height when the requested rewind is invalid, so young wallets survive
-reorgs near their birthday. Compact blocks themselves are derived from full zebrad blocks; see
+reorgs near their birthday. Since 0.8.0 the rewind margin starts at 10 blocks and doubles for
+each consecutive reorg, up to one batch, so a deep rollback is walked back in a few rounds
+rather than dozens; it returns to 10 after the first clean batch. Compact blocks themselves are derived from full zebrad blocks; see
 [the Zebra backend](zebra-backend.md). For transparent-enabled wallets the same pass matches
 each scanned block's transparent outputs against the wallet's exposed-address set; see
 [transparent support](../guide/transparent.md).
@@ -99,9 +111,12 @@ wallet's own outgoing memos. Without it, any transaction the wallet only ever sa
 block (every receive during initial sync or a restore) would never show its memo.
 
 On a from-birthday restore the backlog is one upstream fetch per transaction: potentially tens
-of thousands of requests, hours of work after the block scan already reached the tip. So
-`enhance_step` is bounded like the scan: at most 16 requests per call (`ENHANCE_BATCH`), with
-commands serviced and the shrinking backlog republished between batches. The count rides on
+of thousands of requests after the block scan already reached the tip. So `enhance_step` is
+bounded like the scan: one pass per call, `[sync] enhance_concurrency` requests (default 16),
+with commands serviced and the shrinking backlog republished between passes. Since 0.8.0 a
+pass fetches its requests concurrently, reads the request table once, and commits once, so a
+pass records everything it fetched or none of it. `[sync] fetch_memos = false` skips the memo
+fetches entirely (see [configuration](../configuration.md#sync)). The count rides on
 `SyncStatus.pending_enhancements` and is an observable readiness signal: while it is non-zero
 the wallet reports `getwalletinfo.scanning: true`, `/readyz` returns 503 with
 `reason: "enhancing"` in synced mode, and `/status` shows the number. "Scanned to tip" is not
@@ -118,8 +133,9 @@ state on a wallet holding many transparent UTXOs, not only during a restore, whi
 
 ## Mempool poller (0-conf)
 
-Once caught up, the actor subscribes to the upstream mempool stream: a 2-second
-`getrawmempool` poller that closes itself when `getbestblockhash` changes, which doubles as
+Once caught up, the actor subscribes to the upstream mempool stream. Since 0.8.0 there is one
+stream per upstream, owned by the chain hub and fanned out to every actor, rather than one per
+wallet: a 2-second `getrawmempool` poller that closes itself when `getbestblockhash` changes, which doubles as
 the "new block, sync now" signal. Every mempool transaction is processed twice over: it is
 trial-decrypted against the wallet's keys (`decrypt_and_store_transaction` is a no-op for
 unrelated transactions), and its transparent outputs are matched against the exposed-address
@@ -157,10 +173,12 @@ a no-op; best-effort (an unreachable upstream falls back to the last-scanned hei
 
 **Cached Orchard proving key.** With `[spend] cache_proving_key` (on by default), sends run
 through the PCZT roles with an `orchard::circuit::ProvingKey` shared by `Arc` across all
-actors. The fused librustzcash path (flag off) rebuilds the proving key inline on every
-transaction, about 4.5 s of key generation single-threaded (on the order of 1 s on a fast
-multicore node). Proving runs under `tokio::task::block_in_place`, so it does not stall the
-async runtime, but it does hold the actor.
+actors. Since 0.8.0 the Zakura Common crates also cache the keys process-wide on the fused
+path (flag off), so neither path rebuilds a key per transaction; the flag now chooses only
+whether the keys are warmed at startup and whether `pipeline_proving` can engage. Key
+generation takes well under a second, and is skipped at startup when no loaded wallet can
+spend. Proving runs under `tokio::task::block_in_place`, so it does not stall the async
+runtime, but it does hold the actor.
 
 Since 0.6.0 the key is built **off the startup critical path**. `daemon::run` kicks off the
 build and carries straight on to spawn wallet actors and bind the listeners; the first send
@@ -204,8 +222,8 @@ the daemon runs.
 | `wallet/actor.rs` | the single-writer actor: sync/enhance/mempool/rebroadcast loops, sends, proving |
 | `wallet/read.rs` | read-only queries over short-lived WAL connections |
 | `wallet/open.rs`, `store.rs`, `keys.rs`, `binding.rs` | DB open/init + WAL, `keys.toml`, seed custody, account-to-keys binding |
-| `chain/` | the `ChainSource` trait and `ZebraSource` (see [Zebra backend](zebra-backend.md)) |
-| `sync/engine.rs` | one-batch-per-call scan driver, reorg recovery, block-cache cleanup |
+| `chain/` | the `ChainSource` trait, `ZebraSource`, the light-mode source, and `hub.rs`, the shared upstream connection (see [Chain backends](zebra-backend.md)) |
+| `sync/engine.rs`, `sync/memcache.rs` | one-batch-per-call scan driver, reorg recovery; the in-memory batch |
 | `operations.rs` | the async-operation registry behind [`z_sendmany`](../rpc/async-operations.md) |
 | `health.rs` | `/healthz`, `/readyz`, `/status` on a separate port |
 | `error.rs`, `amount.rs`, `address.rs` | Bitcoin Core error codes + HTTP mapping; exact fixed-point amounts; address parsing |

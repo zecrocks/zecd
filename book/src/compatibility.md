@@ -35,8 +35,8 @@ An incoming mempool payment is visible immediately: `getunconfirmedbalance`,
 `listtransactions`, and `listunspent` with `minconf=0` all show it at 0 confirmations, fed by
 zecd's `getrawmempool` poller. But a received note must mine and reach the confirmation
 minimum before it is spendable. The default policy is [ZIP
-315](https://zips.z.cash/zip-0315)'s: 3 confirmations for the wallet's own change, 10 for
-third-party payments (roughly 12.5 minutes at 75-second blocks). `[spend]
+315](https://zips.z.cash/zip-0315)'s: 3 confirmations for the wallet's own change and
+for every output of a transaction it authored, 10 for third-party payments (roughly 12.5 minutes at 75-second blocks). `[spend]
 trusted_confirmations` / `untrusted_confirmations` tune it wallet-wide (see
 [configuration](configuration.md)).
 

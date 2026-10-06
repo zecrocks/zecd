@@ -131,10 +131,13 @@ report an outgoing recipient as that single paid receiver:
 - a bare `t...` or `zs...` address for a transparent or Sapling payment, or
 - a single-receiver UA for an Orchard payment (Orchard has no standalone encoding).
 
-The reduction is idempotent (a bare or single-receiver address reports as itself) and applies
-only to outgoing outputs; received and self-transfer entries show your own recorded address.
+The reduction is idempotent (a bare or single-receiver address reports as itself). Since 0.8.0
+it applies to incoming outputs too, so a payer and a payee print the same string for one
+output. Under the default Orchard-only `default_receivers` that is the same string
+`getnewaddress` handed out; a wallet configured for several receivers sees the single receiver
+paid instead, and zecd warns about that configuration at startup and in `config check`.
 This is the stateless counterpart of zcashd's persisted recipient mapping, which echoes
 the typed UA on the authoring instance but degrades to the single receiver after a restore
-anyway. To match a payment back to a multi-receiver UA you issued, deconstruct that UA into its
-per-pool receivers client-side and compare against the reported receiver; zecd keeps no
-recipient-side bookkeeping. See also the [history RPCs](../rpc/wallet-history.md).
+anyway. To match a receipt back to an address you issued, use the integer rather than the
+string: received entries carry `diversifier_index`, which every encoding of that address
+shares, and `z_listunifiedreceivers` splits a UA into the receiver strings history reports. See also the [history RPCs](../rpc/wallet-history.md).

@@ -90,8 +90,12 @@ account's shielded notes, with the one legacy exception below. Spending transpar
 shielding them, is [`z_sendmany`](async-operations.md#z_sendmany)'s `fromaddress`.
 
 **Action limit.** `[spend] orchard_action_limit` (default 50, 0 disables) caps the Orchard
-actions of a single send to bound its memory and proving cost. A proposal that exceeds it
-returns `-8` naming whether inputs or outputs overflowed.
+actions of a single send to bound its memory and proving cost. The count is per bundle and
+summed, as the builder proves them: since NU6.3 a send that spends legacy Orchard notes into
+Ironwood outputs builds two bundles, so it can be refused with far fewer recipients than the
+cap. A proposal that exceeds it returns `-8` naming the count, and the two bundles when there
+are two. Consolidate with [`z_mergetoaddress`](async-operations.md#z_mergetoaddress), or raise
+the cap and send SIGHUP, which reloads it without a restart (since 0.8.0).
 
 **Common errors** (both methods; verified in the handlers and `src/error.rs`):
 

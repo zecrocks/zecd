@@ -50,10 +50,20 @@ transactions.
 
 ## Regtest end-to-end harness
 
-`regtest-harness/` (a separate crate) brings up a real regtest zebrad and drives the compiled
+`regtest-harness/` (a separate crate) brings up a real regtest node and drives the compiled
 `zecd` binary over JSON-RPC. The Regtest E2E workflow runs the standard tier on every PR and
-push to main; a weekly schedule reruns everything against both the pinned Zebra image and
-`zfnd/zebra:latest` as an upstream canary.
+push to main as a matrix of node and upstream:
+
+| Leg | Node | zecd's upstream | Tests |
+|---|---|---|---|
+| `zebra, zecd` | zebrad | the node's JSON-RPC (`zebra://`) | the full list below |
+| `zakura, zecd` | zakurad | the node's JSON-RPC (`zebra://`) | the full list below |
+| `zebra, zecd-lwd` | zebrad | a lightwalletd in front of it | `regtest_lwd` plus the funded, transparent, shielding and merge binaries rerun in light mode |
+
+Each node runs a pinned image on PRs and pushes; the weekly schedule runs every leg against
+both the pinned image and `latest` as an upstream canary. Funding comes from a pinned
+released zecd. The same workflow runs `tests/embedded_regtest.rs`, the
+[library](library.md) end to end through `Node::call`.
 
 **Standard tier** (always runs):
 
@@ -65,27 +75,35 @@ push to main; a weekly schedule reruns everything against both the pinned Zebra 
   through confirmation, a two-output `sendmany`, manual `sendrawtransaction`, outage and expiry
   sends with the health endpoints checked through the outage, the encryption state machine, the
   busy-server burst, and finally `conformance.py` against the live daemon.
-- `regtest_e2e.rs`, `regtest_binding.rs`, `regtest_proving_cache.rs`, `regtest_sapling.rs`,
-  `regtest_hang.rs`: the base receive/spend/confirm cycle against the `zebra://` upstream,
-  account-to-keys binding, both proving paths, a two-pool (Sapling + Orchard) wallet including
-  a tri-pool mixed-recipient `sendmany`, and recovery from an upstream that hangs without dying
-  (SIGSTOP).
+- `regtest_e2e.rs`, `regtest_binding.rs`, `regtest_sapling.rs`, `regtest_hang.rs`: the base
+  receive/spend/confirm cycle, account-to-keys binding, a two-pool (Sapling + Orchard) wallet
+  including a tri-pool mixed-recipient `sendmany`, and recovery from an upstream that hangs
+  without dying (SIGSTOP).
+- `regtest_migration.rs` (the 0.7.0 data-directory layout migration on a funded wallet),
+  `regtest_ironwood.rs` (NU6.3 pool structure), and `regtest_orchard_v2_spend.rs` (a note
+  received in the Orchard pool before NU6.3 activates and spent after it).
 - The transparent binaries (see [Transparent addresses](guide/transparent.md)):
   `regtest_transparent.rs` (0-conf and confirmed t-address receive),
   `regtest_transparent_t2t.rs` (fully-transparent spend under `AllowFullyTransparent`, change
-  stays transparent, default policy still refuses with `-6`),
-  `regtest_transparent_sendmany_t2t.rs` (the same spend driven through `sendmany`, two
-  transparent recipients in one tx), `regtest_transparent_gap.rs` (gap-limit and
-  `transparent_initial_scan` recovery semantics on a from-seed restore),
-  `regtest_transparent_preexpose_responsive.rs` (read RPCs stay responsive during a deep
-  initial-scan pre-exposure), and `regtest_transparent_recovery_window.rs` (beyond-gap issuance
-  policy: warn-only vs fail-closed `-4`).
+  stays transparent, default policy still refuses with `-6`), `regtest_transparent_gap.rs`
+  (gap-limit and `transparent_initial_scan` recovery semantics on a from-seed restore),
+  `regtest_transparent_offline_restore.rs` (a restore that never saw a receive and its spend
+  live recovers both), `regtest_transparent_preexpose_responsive.rs` (read RPCs stay
+  responsive during a deep initial-scan pre-exposure), and
+  `regtest_transparent_recovery_window.rs` (beyond-gap issuance policy: warn-only vs
+  fail-closed `-4`).
+- `regtest_shielding.rs` (`z_sendmany` `fromaddress` coin control and the t->z shielding send),
+  `regtest_mergetoaddress.rs` (consolidating a fragmented wallet), `regtest_coinbase.rs`
+  (spending transparent and shielded coinbase), and `regtest_fleet.rs` (many view wallets in
+  shards, each seeing only its own funds, history and addresses, across a restart).
 
 **Extended tier** (`ZECD_REGTEST_EXTENDED=1`; weekly and on workflow dispatch, skipped in
 seconds on PRs): a live reorg (zecd rewinds and follows the replacement chain), multiwallet
 (`/wallet/<name>` routing, the removed label methods, one spending wallet alongside watch-only
-replicas), watch-only UFVK wallets, and graceful `stop` plus `init --restore --birthday` (same
-first address, no phantom funds).
+replicas), watch-only UFVK wallets, graceful `stop` plus `init --restore --birthday` (same
+first address, no phantom funds), the larger `z_mergetoaddress` cases, and on the light-mode
+leg `regtest_multibackend.rs` (one daemon with a zebra-backed spending wallet beside a
+lightwalletd-backed watch-only replica).
 
 **Stress tier** (`ZECD_REGTEST_STRESS=1`; monthly cron or manual dispatch only): builds a large
 note-fragmented wallet (default 256 notes) and asserts background sync stays live during a long

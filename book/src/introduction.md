@@ -4,7 +4,8 @@ zecd is a shielded-first Zcash wallet server that speaks Bitcoin Core's JSON-RPC
 
 ## What zecd is
 
-zecd is a wallet daemon for Zcash built on [librustzcash](https://github.com/zcash/librustzcash):
+zecd is a wallet daemon for Zcash built on [librustzcash](https://github.com/zcash/librustzcash)
+(since 0.8.0, the Zakura Common forks of it, published on crates.io as `zakura-*`):
 shielded-first (Ironwood by default, at the wallet's Orchard receiver, with opt-in Sapling
 receivers and opt-in transparent t-address support), exposed through **bitcoind's RPC dialect**:
 the same method names, response shapes, JSON-RPC 1.0 envelope, HTTP Basic/cookie auth, and error
@@ -90,7 +91,7 @@ default, private/LAN ranges are allowed).
   [ZIP 317](https://zips.z.cash/zip-0317) formula and are never client-settable (explicit fee
   parameters are rejected with `-8`). Spendability follows
   [ZIP 315](https://zips.z.cash/zip-0315)'s defaults (3 confirmations for the wallet's own
-  change, 10 for third-party payments), configurable via `[spend]`. See
+  change and transactions, 10 for third-party payments), configurable via `[spend]`. See
   [Sending](rpc/sending.md).
 
 ## What zecd is not

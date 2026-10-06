@@ -44,7 +44,8 @@ cargo install zecd                  # from crates.io
 
 The [release tarballs and `.deb` packages](guide/deployment.md) are prebuilt, reproducible
 static binaries for amd64 and arm64, and the [Docker stack](#docker-compose-quickstart) below
-brings up zecd and Zebra together. To build from source:
+brings up zecd and Zebra together. Building from source (including `cargo install`) needs
+Rust 1.91 or later since 0.8.0:
 
 ```sh
 git clone https://github.com/zecrocks/zecd && cd zecd
@@ -222,7 +223,7 @@ after that point holds ironwood notes. Regtest opts in via the `ZECD_REGTEST_NU6
 environment variable.
 
 Running it needs an ironwood-capable node; Zebra activates Ironwood at the network's activation
-height, and the compose stack pins `zfnd/zebra:6.2.2`.
+height, and the compose stack pins `zfnd/zebra:6.3.0`.
 
 Ironwood notes are received at **ordinary Orchard addresses**. Upstream models them as Orchard
 "V3" notes that reuse Orchard's keys, addresses, and note cryptography, so there is no ironwood

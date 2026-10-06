@@ -44,7 +44,7 @@ docker compose -f docker-compose.yml -f docker-compose.mainnet.yml up -d
 
 Three things to change before trusting the stack with real funds:
 
-- **Pin Zebra.** The compose file pins `zfnd/zebra:6.0.0` for both networks; Zebra 6.0.0 activates
+- **Pin Zebra.** The compose file pins `zfnd/zebra:6.3.0` for both networks, which activates
   Ironwood (NU6.3) at the network's activation height (see Zebra's source and release notes). The
   tag is an example. Pin to a release you have verified; Zebra's flags can vary between versions.
   (Zebra tags have no `v` prefix.)
@@ -78,8 +78,8 @@ Two Dockerfiles produce interchangeable images:
   static-musl Alpine build (`rust:alpine`, base image pinned by digest, toolchain pinned
   to exact apk versions, Rust pinned via `RUSTUP_TOOLCHAIN`). Same output shape and the
   same runtime contract, and still bit-for-bit reproducible, but the toolchain is upstream
-  binaries rather than StageX's full-source bootstrap. Released images carry `-arm64`
-  suffixed tags.
+  binaries rather than StageX's full-source bootstrap. Both are published as one multi-arch
+  image, so the same tag pulls the right architecture.
 
 How the reproducibility works (and what to verify) is covered in
 [reproducible builds](../design/reproducible-builds.md).
@@ -95,7 +95,7 @@ Both images honor the same contract, so they are drop-in interchangeable:
 | User | `10001:10001` (unprivileged, non-root) |
 | Workdir / datadir | `/var/lib/zecd` (writable by the runtime user) |
 | Exposed ports | `8232`, `18232` (JSON-RPC mainnet/testnet), `9233` (health) |
-| Base | `scratch`: no CA bundle (the Zebra upstream is plaintext-local, no outbound TLS) |
+| Base | `scratch`, plus a CA bundle at `/etc/ssl/certs/ca-certificates.crt` (`SSL_CERT_FILE`) for a TLS lightwalletd upstream, and the license texts under `/usr/share/doc/zecd/` |
 
 The image also ships a world-writable `/tmp` for SQLite's temporary files. Because the
 runtime is `scratch`, there is no shell: debugging happens through the RPC and health
@@ -122,7 +122,7 @@ Dockerfile's `export` stage (so published binaries inherit the reproducible imag
 pipeline) and attaches, per architecture (`amd64` and `arm64`, both static musl builds):
 
 - `zecd-<version>-linux-<amd64|arm64>.tar.gz`: the binary plus `README.md`,
-  `CHANGELOG.md`, both license files, and `zecd.example.toml`. The tar is reproducible
+  `CHANGELOG.md`, both license files, `THIRD-PARTY-LICENSES.txt`, and `zecd.example.toml`. The tar is reproducible
   (sorted entries, fixed mtime, root-owned, `gzip -n`).
 - `zecd_<version>_<amd64|arm64>.deb`: a reproducible Debian package
   (`scripts/build-deb.sh`: fixed mtimes, `--root-owner-group`, `SOURCE_DATE_EPOCH`
@@ -154,7 +154,8 @@ The `.deb` installs:
   `zecd --datadir /var/lib/zecd` as the `zecd` user with systemd hardening
   (`NoNewPrivileges`, `ProtectSystem=strict`, `PrivateTmp`, writable only in
   `/var/lib/zecd`)
-- `/usr/share/doc/zecd/`: `zecd.example.toml`, `README.md`, copyright, changelog
+- `/usr/share/doc/zecd/`: `zecd.example.toml`, `README.md`, `THIRD-PARTY-LICENSES.txt`,
+  copyright, changelog
 
 The postinst script creates the `zecd` system user/group and `/var/lib/zecd` (mode 0750).
 No config file is installed under `/etc`; put your config at `/var/lib/zecd/zecd.toml` (the
@@ -165,9 +166,9 @@ sudo -u zecd zecd init --datadir /var/lib/zecd    # one-time wallet creation
 sudo systemctl enable --now zecd
 ```
 
-The same workflow's `docker` jobs push the GHCR images: amd64 under bare semver tags
-(`<major>.<minor>.<patch>` and `<major>.<minor>`), arm64 under the same tags with an
-`-arm64` suffix. A manual `workflow_dispatch` run can dry-run the packaging without a tag;
+The same workflow pushes the GHCR image as one multi-arch manifest (amd64 and arm64) under
+bare semver tags (`<major>.<minor>.<patch>` and `<major>.<minor>`), with no
+per-architecture suffix. A manual `workflow_dispatch` run can dry-run the packaging without a tag;
 image pushes are opt-in for those runs.
 
 ## Ports
@@ -203,7 +204,8 @@ What `/readyz` means is a deployment choice, `[health] readiness`:
 
 - `"synced"` (default): ready only once every wallet is connected, within `max_scan_lag`
   blocks of the tip (default 4), and its transaction-enhancement backlog has drained.
-  Strict: a from-birthday restore stays not-ready for hours (`reason` distinguishes
+  Strict: a from-birthday restore stays not-ready until the memo backfill finishes, which on
+  a large wallet takes a long time (`reason` distinguishes
   `syncing` from `enhancing`). Use it when clients must not see stale balances or
   incomplete history.
 - `"scanned"` (new in 0.6.4): connected and within `max_scan_lag` of the tip, without the
@@ -248,7 +250,7 @@ readinessProbe:
 > task, so the daemon spawns its wallet actors and binds the health and RPC listeners
 > immediately; `/healthz` answers within the first moments of process life. Through 0.5.2 the
 > keygen ran *before* the listeners bound - seconds of CPU on a fast machine and considerably
-> more on a small VPS - during which the process was unreachable and not syncing, and startup
+> more on a small VPS at the time - during which the process was unreachable and not syncing, and startup
 > probes had to be sized around it. If you widened `failureThreshold` or
 > `initialDelaySeconds` for that reason, you can tighten it back.
 >
@@ -269,6 +271,6 @@ measured as about a 10% cost per shielded send on bare metal and several times w
 syscall-expensive sandboxes (gVisor, nested virtualization, some CI). The `-secure`
 variant adds heap hardening (guard pages, canary free-lists) for under 4% on the proving
 path, recovering mitigations that replacing musl's hardened allocator would otherwise
-drop. Mechanism and A/B numbers are in `benchmarks/orchard-libc-bench/FINDINGS.md`. Native
+drop. Native
 glibc builds (from source, outside the images) do not need the feature; glibc's allocator
 already scales.

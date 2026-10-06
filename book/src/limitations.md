@@ -98,7 +98,8 @@ the safelist also returns `-32601`, so probing cannot tell a disabled method fro
 
 ## PostgreSQL wallet backend is blocked upstream
 
-The wallet store is SQLite only (`zcash_client_sqlite`). The one structural coupling blocking
+The wallet store is SQLite only (`zcash_client_sqlite`, published as `zakura-client-sqlite`
+since 0.8.0). The one structural coupling blocking
 an alternative backend is in reorg recovery: `perform_rewind` in `src/sync/engine.rs` must
 match the concrete `SqliteClientError::RequestedRewindInvalid` error to retry a truncation at
 a shallower bound, because `zcash_client_backend`'s `WalletWrite` trait has no portable
