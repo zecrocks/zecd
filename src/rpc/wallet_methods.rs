@@ -2312,6 +2312,26 @@ fn param_engaged(v: &Value) -> bool {
     }
 }
 
+/// The one shielded pool family a wallet-owned source address can hold notes in, or `None` when
+/// it carries receivers for both (or neither). This is what an explicit `fromaddress` funds a
+/// send from: the account's notes in the pools that address could have received - the same
+/// restriction `ANY_SAPLING` / `ANY_ORCHARD` express by wildcard. Notes stay account-scoped
+/// within a pool (any diversified address's notes in it qualify), so this is pool-level, not
+/// per-address, coin control.
+fn shielded_family_of(
+    addr: &zcash_keys::address::Address,
+) -> Option<crate::wallet::ShieldedFamily> {
+    use zcash_protocol::PoolType;
+    match (
+        addr.can_receive_as(PoolType::SAPLING),
+        addr.can_receive_as(PoolType::ORCHARD),
+    ) {
+        (true, false) => Some(crate::wallet::ShieldedFamily::Sapling),
+        (false, true) => Some(crate::wallet::ShieldedFamily::Orchard),
+        _ => None,
+    }
+}
+
 fn build_payment(
     coin: Coin,
     network: &crate::network::ZNetwork,
@@ -2597,7 +2617,8 @@ fn parse_opid_filter(req: &RpcRequest, i: usize) -> Result<Option<Vec<OperationI
 /// transaction is proposed, proved, and broadcast on a background task whose status/result are
 /// fetched with `z_getoperationstatus`/`z_getoperationresult`. `fromaddress` must be one of this
 /// wallet's own addresses or a wildcard, and selects the funding source: a shielded/unified
-/// address spends the account's shielded notes, `ANY_SAPLING` and `ANY_ORCHARD` spend one
+/// address spends the account's notes in the pools that address can hold (see
+/// [`shielded_family_of`]), `ANY_SAPLING` and `ANY_ORCHARD` spend one
 /// shielded pool family only (the same wildcards `z_mergetoaddress` takes, with `ANY_ORCHARD`
 /// covering Ironwood since post-NU6.3 an Orchard receiver holds those notes), and a t-address or
 /// `ANY_TADDR` spends the wallet's transparent UTXOs - requiring privacyPolicy
@@ -2615,8 +2636,8 @@ pub(crate) fn z_sendmany(
     // fromaddress (arg 0): the send's funding source (input-side coin control, zcashd
     // semantics). `ANY_TADDR` selects any of the wallet's transparent UTXOs; a wallet-owned
     // t-address selects only that address's UTXOs; a shielded/unified address selects the
-    // account's shielded notes (per-address shielded coin control is not supported - notes are
-    // account-scoped, so the address only names the account). Anything else is validated as
+    // account's notes in the pools that address can hold (pool-level coin control - notes are
+    // account-scoped within a pool, so not per-address). Anything else is validated as
     // wallet-owned, mirroring Zallet's `get_account_for_address`.
     let fromaddress = req.require_str(0, "z_sendmany requires a fromaddress")?;
     let source = if fromaddress == "ANY_TADDR" {
@@ -2660,7 +2681,15 @@ pub(crate) fn z_sendmany(
         }
         match decoded {
             zcash_keys::address::Address::Transparent(t) => SendSource::Transparent(Some(t)),
-            _ => SendSource::Shielded,
+            // A shielded or unified address restricts the send to the pools its receivers can
+            // hold: a bare Sapling address (or a Sapling-only UA) spends Sapling notes only, an
+            // Orchard-only UA the Orchard family only. Without this, `z_sendmany zs1...` could
+            // spend the account's Orchard and Ironwood notes - a source the caller never named.
+            // A UA's transparent receiver never makes transparent UTXOs a source.
+            ref other => match shielded_family_of(other) {
+                Some(family) => SendSource::ShieldedFamily(family),
+                None => SendSource::Shielded,
+            },
         }
     };
 
@@ -3037,7 +3066,9 @@ pub(crate) async fn z_mergetoaddress(
     let mut any_taddr = false;
     let mut any_sapling = false;
     let mut any_orchard = false;
-    let mut own_shielded = false;
+    // The pool families the named own shielded/UA addresses can hold notes in.
+    let mut own_sapling = false;
+    let mut own_orchard = false;
     let mut taddrs: Vec<zcash_transparent::address::TransparentAddress> = Vec::new();
     for v in entries {
         let s = v.as_str().ok_or_else(|| {
@@ -3085,11 +3116,19 @@ pub(crate) async fn z_mergetoaddress(
                 }
                 match decoded {
                     zcash_keys::address::Address::Transparent(t) => taddrs.push(t),
-                    _ => own_shielded = true,
+                    ref other => match shielded_family_of(other) {
+                        Some(crate::wallet::ShieldedFamily::Sapling) => own_sapling = true,
+                        Some(crate::wallet::ShieldedFamily::Orchard) => own_orchard = true,
+                        None => {
+                            own_sapling = true;
+                            own_orchard = true;
+                        }
+                    },
                 }
             }
         }
     }
+    let own_shielded = own_sapling || own_orchard;
     let has_transparent_source = any_taddr || !taddrs.is_empty();
     let has_shielded_source = any_sapling || any_orchard || own_shielded;
     if has_transparent_source && has_shielded_source {
@@ -3115,15 +3154,21 @@ pub(crate) async fn z_mergetoaddress(
         crate::wallet::MergeSource::Transparent(if any_taddr { None } else { Some(taddrs) })
     } else {
         use zcash_protocol::ShieldedPool;
-        // A wallet-owned shielded/UA address names the account (notes are account-scoped, so
-        // per-address shielded coin control does not exist - same caveat as `z_sendmany`'s
-        // `fromaddress`): merge across every pool the account can hold.
+        // A wallet-owned shielded/UA address merges the account's notes in the pools that
+        // address can hold (notes are account-scoped within a pool, so this is pool-level, not
+        // per-address, coin control - the same rule as `z_sendmany`'s `fromaddress`): a bare
+        // Sapling address merges Sapling notes only, an Orchard-only UA the Orchard family only,
+        // and the union across several named addresses.
         let pools = if own_shielded {
-            vec![
-                ShieldedPool::Sapling,
-                ShieldedPool::Orchard,
-                ShieldedPool::Ironwood,
-            ]
+            let mut pools = Vec::new();
+            if own_sapling {
+                pools.push(ShieldedPool::Sapling);
+            }
+            if own_orchard {
+                pools.push(ShieldedPool::Orchard);
+                pools.push(ShieldedPool::Ironwood);
+            }
+            pools
         } else {
             let mut pools = Vec::new();
             if any_sapling {
@@ -3988,6 +4033,68 @@ mod tests {
             recipient_key_scope: Some(read::EXTERNAL_KEY_SCOPE),
             ..out(true, true, value, Some(addr), true)
         }
+    }
+
+    /// An explicit shielded `fromaddress` funds a send from the pool families its receivers can
+    /// hold, and nothing else: a bare Sapling address or a Sapling-only UA is the Sapling family,
+    /// an Orchard-only UA the Orchard family (Ironwood included), and a UA carrying both - with or
+    /// without a transparent receiver, which never makes UTXOs a source - stays unrestricted.
+    #[test]
+    fn an_explicit_shielded_source_is_restricted_to_its_receivers_pools() {
+        use crate::wallet::ShieldedFamily;
+        use zcash_keys::keys::UnifiedAddressRequest;
+
+        let net = crate::network::ZNetwork::Test;
+        let mnemonic = <bip0039::Mnemonic<bip0039::English>>::from_phrase(
+            "mechanic vehicle helmet decide plug gorilla frost dial october \
+             midnight culture idea mountain fame park social drip bid doctor scatter glance defy \
+             moment stage",
+        )
+        .unwrap();
+        let ufvk = zcash_keys::keys::UnifiedSpendingKey::from_seed(
+            &net,
+            &mnemonic.to_seed(""),
+            zip32::AccountId::try_from(0u32).unwrap(),
+        )
+        .unwrap()
+        .to_unified_full_viewing_key();
+        // Index 0 carries a valid Sapling receiver for this phrase (its default address index).
+        let all = ufvk
+            .address(
+                zip32::DiversifierIndex::from(0u32),
+                UnifiedAddressRequest::ALLOW_ALL,
+            )
+            .unwrap()
+            .encode(&net);
+        let only = |r: Receiver| {
+            crate::address::issued_encoding(&net, &all, &ReceiverSet::single(r)).unwrap()
+        };
+        let both = crate::address::issued_encoding(
+            &net,
+            &all,
+            &ReceiverSet::new(vec![Receiver::Sapling, Receiver::Orchard]).unwrap(),
+        )
+        .unwrap();
+        let bare_sapling = crate::address::single_receiver_for_pool(&net, &all, 2).unwrap();
+        let family = |s: &str| {
+            shielded_family_of(&crate::address::decode_on_network(&net, s).expect("decodes"))
+        };
+
+        assert_eq!(family(&bare_sapling), Some(ShieldedFamily::Sapling));
+        assert_eq!(
+            family(&only(Receiver::Sapling)),
+            Some(ShieldedFamily::Sapling)
+        );
+        assert_eq!(
+            family(&only(Receiver::Orchard)),
+            Some(ShieldedFamily::Orchard)
+        );
+        assert_eq!(family(&both), None, "both families: the whole account");
+        assert_eq!(
+            family(&all),
+            None,
+            "a transparent receiver beside both shielded ones changes nothing"
+        );
     }
 
     /// The property that makes one display rule right for both directions: a payer and a payee
