@@ -67,6 +67,12 @@ pub struct TransparentUtxo {
     /// `put_received_transparent_utxo` alone, a coinbase UTXO would be silently misclassified as
     /// non-coinbase (spendable while immature, invisible to `z_shieldcoinbase`).
     pub coinbase_tx: Option<std::sync::Arc<zcash_primitives::transaction::Transaction>>,
+    /// Whether this output belongs to its block's coinbase transaction. Always set when
+    /// `coinbase_tx` is; set **without** it by the lightwalletd backend, whose compact
+    /// transaction carries the block position (`CompactTx.index == 0`) but not the transaction
+    /// itself. The sync engine then fetches the coinbase transaction once, for an output that
+    /// pays the wallet, so the same `tx_index = 0` gets recorded on both backends.
+    pub coinbase: bool,
 }
 
 /// A transparent **input** seen by the block scan: the outpoint it consumes, plus the transaction

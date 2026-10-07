@@ -532,6 +532,9 @@ fn block_transparent_outputs(block: &CompactBlock) -> Vec<TransparentUtxo> {
             continue;
         };
         let txid = TxId::from_bytes(txid_bytes);
+        // `CompactTx.index` is the transaction's position in its block, and position 0 is the
+        // coinbase by consensus.
+        let coinbase = tx.index == 0;
         for (index, out) in tx.vout.iter().enumerate() {
             outputs.push(TransparentUtxo {
                 txid,
@@ -539,12 +542,14 @@ fn block_transparent_outputs(block: &CompactBlock) -> Vec<TransparentUtxo> {
                 value_zat: out.value,
                 script: out.script_pub_key.clone(),
                 height,
-                // A compact tx is not the full transaction, so the coinbase tagging the zebra
-                // block scan does (storing the parsed coinbase tx alongside a matched output)
-                // has no source here; a coinbase receive found via a versioned-protocol block
-                // scan is recorded without its maturity marker until the enhancement pass
-                // stores the full transaction.
+                // A compact tx is not the full transaction, so there is nothing to attach here.
+                // The flag below is enough: for a coinbase output that pays the wallet, the
+                // sync engine fetches the transaction and stores it, which is what records
+                // `tx_index = 0` and with it the 100-block maturity rule. Nothing else would -
+                // `put_received_transparent_utxo` queues no retrieval for the transaction, so a
+                // coinbase receive recorded bare stays classified as spendable while immature.
                 coinbase_tx: None,
+                coinbase,
             });
         }
     }
@@ -672,6 +677,37 @@ mod tests {
         assert_eq!(outs[0].height, Some(1234));
         assert_eq!(outs[1].index, 1, "vout index is positional");
         assert_eq!(outs[1].value_zat, 7000);
+    }
+
+    /// The coinbase is the transaction at block position 0, which `CompactTx.index` carries.
+    /// The harvest flags its outputs (and only its outputs) so the sync engine can fetch and
+    /// store the full transaction for one that pays the wallet - the step that records
+    /// `tx_index = 0` and with it the maturity rule. Without the flag a light-mode coinbase
+    /// receive was spendable while immature.
+    #[test]
+    fn block_transparent_outputs_flag_the_coinbase() {
+        let tx = |index: u64, byte: u8| CompactTx {
+            index,
+            txid: vec![byte; 32],
+            vout: vec![TxOut {
+                value: 625_000_000,
+                script_pub_key: vec![0xAA],
+            }],
+            ..Default::default()
+        };
+        let block = CompactBlock {
+            height: 500,
+            vtx: vec![tx(0, 0x01), tx(3, 0x02)],
+            ..Default::default()
+        };
+        let outs = block_transparent_outputs(&block);
+        assert_eq!(outs.len(), 2);
+        assert!(outs[0].coinbase, "position 0 is the coinbase");
+        assert!(!outs[1].coinbase, "any other position is not");
+        assert!(
+            outs.iter().all(|o| o.coinbase_tx.is_none()),
+            "a compact tx is not the full transaction; the engine fetches it"
+        );
     }
 
     /// A compact block whose serialized size is predictable, so the buffer-bound test can do

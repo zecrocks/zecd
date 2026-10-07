@@ -228,6 +228,9 @@ pub fn record_lookahead_address(
 pub struct MatchedTransparentReceive {
     pub output: WalletTransparentOutput<AccountUuid>,
     pub coinbase_tx: Option<std::sync::Arc<zcash_primitives::transaction::Transaction>>,
+    /// The output is a coinbase output even when `coinbase_tx` is `None` (the lightwalletd
+    /// backend), in which case the transaction is fetched before it is stored.
+    pub coinbase: bool,
 }
 
 /// Parse a fetched raw transaction and store it, marking any of the wallet's transparent outputs
@@ -503,6 +506,7 @@ async fn download_range_once<C: ChainSource>(
                     progress.received.push(MatchedTransparentReceive {
                         output,
                         coinbase_tx: u.coinbase_tx,
+                        coinbase: u.coinbase,
                     });
                 }
             }
@@ -1132,6 +1136,33 @@ pub async fn sync_one_batch<C: ChainSource>(
                             "storing coinbase tx {} for a matched receive failed: {e}",
                             tx.txid()
                         );
+                    }
+                }
+            } else if matched.coinbase {
+                // The lightwalletd backend knows the output is coinbase but has only the compact
+                // transaction, so fetch the full one - once per coinbase tx, and only for one
+                // that pays the wallet, which makes this as rare as the wallet mining.
+                let txid = *output.outpoint().txid();
+                let Some(height) = output.mined_height().map(u32::from) else {
+                    continue;
+                };
+                if coinbase_stored.insert(txid) {
+                    match client.fetch_tx(txid).await {
+                        Ok(Some(fetched)) => {
+                            let stored = tokio::task::block_in_place(|| {
+                                store_fetched_tx(params, db_data, &fetched, height)
+                            });
+                            if let Err(e) = stored {
+                                warn!(
+                                    "storing coinbase tx {txid} for a matched receive failed: {e}"
+                                );
+                            }
+                        }
+                        Ok(None) => warn!(
+                            "upstream does not know coinbase tx {txid}; its receive is recorded \
+                             without the coinbase marker until the block is rescanned"
+                        ),
+                        Err(e) => warn!("fetching coinbase tx {txid} failed: {e}"),
                     }
                 }
             }
