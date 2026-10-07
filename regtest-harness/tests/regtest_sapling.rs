@@ -456,6 +456,32 @@ async fn regtest_sapling_and_orchard_balances() {
         "the FullPrivacy turnstile send reached the failed state"
     );
 
+    // 8a'. An explicit shielded `fromaddress` funds the send from the pools *that address* can
+    //      hold. `sapling_ua` is this wallet's own Sapling-only UA, so a 1.5-ZEC send from it can
+    //      draw only on the 1-ZEC Sapling note and must fail with insufficient funds - not quietly
+    //      fall back to the 2-ZEC Orchard note, as it did while any own shielded address named
+    //      the whole account.
+    let opid = zecd
+        .call(
+            "z_sendmany",
+            json!([sapling_ua, [{ "address": funder.unified_address().to_string(), "amount": 1.5 }]]),
+        )
+        .await
+        .expect("z_sendmany from the Sapling-only UA returns an opid");
+    let waited = zecd
+        .call("z_waitforoperation", json!([opid, 120]))
+        .await
+        .expect("z_waitforoperation on the Sapling-sourced send");
+    assert_eq!(
+        waited["status"], "failed",
+        "a Sapling-only source cannot spend the Orchard note: {waited}"
+    );
+    assert_eq!(
+        waited["error"]["code"],
+        json!(-6),
+        "a shortfall in the source's pool is insufficient funds, not a top-up: {waited}"
+    );
+
     // 8b. A 1.5-ZEC spend under the default policy succeeds, funded from the 2-ZEC Orchard group.
     //     Paying the funder's unified address (which has an Orchard receiver) keeps the payment in
     //     the Orchard pool - no turnstile - with the ~0.5-ZEC change landing back in Orchard (the

@@ -348,10 +348,11 @@ pub enum SendSource {
     /// The default: naming no source is what every send that has no `fromaddress` does.
     #[default]
     Unspecified,
-    /// An explicitly shielded source (`z_sendmany` from a UA / shielded address): the account's
-    /// shielded notes only - never transparent UTXOs, whatever the policy. Per-address shielded
-    /// coin control is not supported (notes are account-scoped): the account is the source, and
-    /// the address only names it.
+    /// An explicitly shielded source naming **both** pool families (`z_sendmany` from a UA with
+    /// Sapling and Orchard receivers): the account's shielded notes only - never transparent
+    /// UTXOs, whatever the policy. An address that can hold only one family resolves to
+    /// [`SendSource::ShieldedFamily`] instead, so it never spends the other. Notes are
+    /// account-scoped within a pool, so this is pool-level rather than per-address coin control.
     Shielded,
     /// Fund the send from one shielded pool family only (`z_sendmany`'s `ANY_SAPLING` /
     /// `ANY_ORCHARD`), rather than from whatever the account holds.
