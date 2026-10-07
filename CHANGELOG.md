@@ -5,6 +5,40 @@ All notable changes to zecd are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com), and this
 project adheres to [Semantic Versioning](https://semver.org).
 
+## [0.8.2] - 2026-10-07
+
+Five fixes, no new features. A drop-in upgrade from 0.8.1 with one exception: a node whose RPC
+password is empty, or that has an `[rpc] auth` line minted for the empty password, now refuses
+to start. Set a password before upgrading.
+
+### Security
+- **An empty RPC password was a working login.** An empty `[rpc]` password, typically a
+  `password_file` that exists but was never filled in, made `user:` a valid login with spend
+  authority, and because a password counted as set, no cookie was written either. An
+  `[rpc] auth` line minted for the empty password admitted the same login. The daemon and
+  `zecd config check` now refuse both, and `zecd rpcauth <user> ""` refuses to mint such a line.
+- **An explicit shielded `fromaddress` could spend from pools it cannot hold.** `z_sendmany`
+  treated any wallet-owned shielded or unified `fromaddress` as the whole account, so a send
+  from a Sapling address could spend Orchard and Ironwood notes. An explicit source now funds
+  only the pools its receivers can hold: a Sapling address or Sapling-only UA spends Sapling, an
+  Orchard-only UA spends Orchard and Ironwood, and a UA with both keeps every shielded pool. A
+  shortfall returns `-6` rather than drawing on another pool. `z_mergetoaddress` follows the
+  same rule.
+
+### Fixed
+- **Retrying a send to a TEX address paid twice.** A TEX recipient produces a two-step
+  proposal. Some sends built and stored both transactions before failing with
+  "multi-transaction proposals are not supported", and the rebroadcast loop then broadcast
+  them anyway. Every send RPC now rejects a TEX recipient with `-8` before building, and any
+  proposal of more than one step is refused before anything is stored.
+- **Verbose `getrawtransaction` showed no shielded outputs for post-NU6.3 sends.** Only the
+  `orchard` section was rendered, while payment and change ride the Ironwood bundle. v6
+  transactions now carry an `ironwood` section in the same shape as `orchard`.
+- **Light mode recorded coinbase outputs as ordinary receives.** With transparent enabled, a
+  light-mode wallet that mined to itself could spend immature coinbase, and
+  `z_shieldcoinbase` could not see it. The lightwalletd backend now marks coinbase outputs
+  and stores the coinbase transaction, as the zebra backend does.
+
 ## [0.8.1] - 2026-09-27
 
 One fix, no new features, no configuration key or response shape moved. A drop-in upgrade from
@@ -994,6 +1028,7 @@ Zcash, backed entirely by librustzcash and running as a light client.
 ### Security
 - Pre-release audit hardening; refuse to start on mainnet with the placeholder RPC password; enforce a 12-character passphrase minimum.
 
+[0.8.2]: https://github.com/zecrocks/zecd/compare/v0.8.1...v0.8.2
 [0.8.1]: https://github.com/zecrocks/zecd/compare/v0.8.0...v0.8.1
 [0.8.0]: https://github.com/zecrocks/zecd/compare/v0.7.0...v0.8.0
 [0.8.0-rc3]: https://github.com/zecrocks/zecd/compare/v0.8.0-rc2...v0.8.0-rc3
