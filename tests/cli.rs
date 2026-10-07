@@ -907,6 +907,50 @@ fn config_check_rejects_an_unknown_key_and_names_it() {
     assert!(out.stdout.is_empty(), "stdout: {}", stdout_of(&out));
 }
 
+/// An `[rpc] password_file` that exists but is empty (an unpopulated Secret) would make
+/// `user:` a working login and suppress the cookie, so `config check` - and with it the daemon,
+/// through the same `auth::check_config` - refuses it and names the knobs to look at.
+#[test]
+fn config_check_refuses_an_empty_rpc_password_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let pw = dir.path().join("rpc.pw");
+    std::fs::write(&pw, "\n").unwrap();
+    let conf = dir.path().join("zecd.toml");
+    std::fs::write(
+        &conf,
+        format!(
+            "[rpc]\nuser = \"u\"\npassword_file = \"{}\"\n",
+            pw.display()
+        ),
+    )
+    .unwrap();
+
+    let out = config_check(&conf, &[]);
+    assert_eq!(out.status.code(), Some(1), "stderr: {}", stderr_of(&out));
+    let stderr = stderr_of(&out);
+    assert!(stderr.contains("password is empty"), "{stderr}");
+    assert!(stderr.contains("password_file"), "{stderr}");
+}
+
+/// `zecd rpcauth <user> ""` would mint a line the daemon refuses, so it refuses up front.
+#[test]
+fn rpcauth_refuses_an_empty_password() {
+    let out = run_with_timeout(
+        {
+            let mut c = zecd();
+            c.args(["rpcauth", "alice", ""]);
+            c
+        },
+        Duration::from_secs(10),
+    );
+    assert!(!out.status.success());
+    assert!(
+        stderr_of(&out).contains("empty password"),
+        "stderr: {}",
+        stderr_of(&out)
+    );
+}
+
 /// `[keys] allow_multiple_spending_wallets` is the library-only option, so the binary must
 /// report it as an error - `config check` answers "would *this daemon* run this config", and
 /// this daemon refuses. The finding has to explain itself, since a config that is perfectly

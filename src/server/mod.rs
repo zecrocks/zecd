@@ -447,7 +447,9 @@ mod tests {
     /// request through the router. Covers passwords with characters that could break Basic-auth
     /// parsing or hashing - including `:` (the Basic-auth field separator), `$` (the salt/hash
     /// delimiter in the entry), quotes/backslashes, whitespace, and non-ASCII - to prove the
-    /// generator and the auth gate agree on every byte.
+    /// generator and the auth gate agree on every byte. (The empty password is not here: an
+    /// `[rpc] auth` line accepting it is refused at startup - see
+    /// `auth::tests::credentials_accepting_the_empty_password_are_refused`.)
     #[tokio::test]
     async fn generated_rpcauth_authenticates_over_http() {
         for password in [
@@ -455,7 +457,6 @@ mod tests {
             "has spaces and \"quotes\" and \\back\\slashes",
             "ünïcödë - 🔐",
             "trailing=padding==",
-            "",
         ] {
             let (entry, _) = crate::server::auth::generate_rpcauth("operator", Some(password));
             let rpc = RpcConfig {
