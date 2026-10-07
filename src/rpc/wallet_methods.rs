@@ -2322,6 +2322,17 @@ fn build_payment(
     allow_zero: bool,
 ) -> Result<Payment, RpcError> {
     let zaddr = crate::address::parse_recipient_on_network(coin, network, addr)?;
+    let decoded = crate::address::decode_on_network(network, addr);
+    // A TEX (ZIP 320) recipient can only be paid by a two-transaction proposal (an ephemeral
+    // transparent hop), and zecd sends exactly one transaction per call. Refuse it here, by
+    // address, so the caller gets a clear `-8` instead of a refusal from deep in the actor -
+    // which still backstops this, on the proposal, before anything is built
+    // (`enforce_single_step`).
+    if matches!(decoded, Some(zcash_keys::address::Address::Tex(_))) {
+        return Err(RpcError::invalid_parameter(format!(
+            "Invalid parameter, TEX addresses are not supported as a recipient: {addr}"
+        )));
+    }
     // A recipient with no shielded receiver (a transparent-only address) forces a transparent
     // output, revealing both the amount and the recipient on-chain - so every policy short of
     // `AllowRevealedRecipients` rejects it up front. Notably `AllowRevealedAmounts` opts into
@@ -2331,8 +2342,9 @@ fn build_payment(
     // applies only to `FullPrivacy` and can only be judged once the proposal's input pool is
     // known, so it is enforced on the built proposal in the actor's `do_send`.
     if !privacy.allows_transparent_recipient() {
-        let receives_shielded = crate::address::decode_on_network(network, addr)
-            .is_some_and(|a| crate::address::has_shielded_receiver(&a));
+        let receives_shielded = decoded
+            .as_ref()
+            .is_some_and(crate::address::has_shielded_receiver);
         if !receives_shielded {
             return Err(RpcError::invalid_parameter(format!(
                 "Privacy policy {} rejects {addr}: it has no shielded receiver, so paying it \
@@ -4210,6 +4222,40 @@ mod tests {
         )
         .is_ok());
         assert!(build_payment(Coin::Zcash, &net, revealed, ua, &json!(0), None, true).is_ok());
+
+        // A TEX recipient is a -8 under every policy - paying one needs a two-transaction
+        // ZIP-320 proposal - while the bare t-address carrying the same key hash still builds
+        // wherever transparent recipients are allowed.
+        use zcash_keys::encoding::AddressCodec as _;
+        let tex = zcash_keys::address::Address::Tex([7u8; 20]).encode(&net);
+        let taddr =
+            zcash_transparent::address::TransparentAddress::PublicKeyHash([7u8; 20]).encode(&net);
+        for policy in [
+            SendPrivacy::FullPrivacy,
+            SendPrivacy::AllowRevealedAmounts,
+            SendPrivacy::AllowRevealedRecipients,
+            SendPrivacy::AllowRevealedSenders,
+            SendPrivacy::AllowFullyTransparent,
+        ] {
+            let e = build_payment(Coin::Zcash, &net, policy, &tex, &json!(0.1), None, false)
+                .unwrap_err();
+            assert_eq!(
+                e.code,
+                crate::error::codes::RPC_INVALID_PARAMETER,
+                "{policy:?}"
+            );
+            assert!(e.message.contains("TEX"), "{}", e.message);
+        }
+        assert!(build_payment(
+            Coin::Zcash,
+            &net,
+            revealed,
+            &taddr,
+            &json!(0.1),
+            None,
+            false
+        )
+        .is_ok());
 
         // verbose: bare txid by default, {txid, fee_reason} object when set, -3 on junk.
         assert!(!verbose_param(None).unwrap());
