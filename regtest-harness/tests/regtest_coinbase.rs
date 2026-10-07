@@ -48,7 +48,7 @@ use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
 use zecd_regtest_harness::{
-    derive_address_offline, pick_port, resolve_node_bin, Zebrad, Zecd, ZecdConfig,
+    attach_backend, derive_address_offline, pick_port, resolve_node_bin, Zebrad, Zecd, ZecdConfig,
     SEED_MINER_ADDRESS,
 };
 
@@ -219,6 +219,14 @@ async fn regtest_transparent_coinbase_shield_and_spend() {
     cfg.privacy_policy = Some("AllowFullyTransparent".to_string());
     cfg.restore_mnemonic = Some(COINBASE_MNEMONIC.to_string());
     cfg.birthday = Some(BIRTHDAY);
+    // On the zecd-lwd leg the wallet runs in light mode. That is the leg that matters for the
+    // maturity ladder: lightwalletd's compact transaction carries no coinbase transaction, so
+    // the coinbase marker (`tx_index = 0`) is recorded only because the sync engine fetches the
+    // transaction for a coinbase output that pays the wallet. Without that, step 4's
+    // immature-coinbase assertions fail there.
+    let _zecd_lwd = attach_backend(&mut cfg, zebrad.rpc_port)
+        .await
+        .expect("attach the selected backend");
     let zecd = Zecd::start(&cfg).await.expect("start zecd");
     // A read RPC, so it needs no readiness - which the wallet cannot report yet, see below.
     assert_eq!(
@@ -647,6 +655,11 @@ async fn regtest_shielded_coinbase_receive_and_spend() {
     let mut cfg = ZecdConfig::new(zebrad.rpc_port, pick_port().expect("pick zecd rpc port"));
     cfg.restore_mnemonic = Some(COINBASE_MNEMONIC.to_string());
     cfg.birthday = Some(BIRTHDAY);
+    // Light mode on the zecd-lwd leg: the shielded coinbase outputs then arrive as compact-block
+    // actions from lightwalletd rather than from a converted full block.
+    let _zecd_lwd = attach_backend(&mut cfg, zebrad.rpc_port)
+        .await
+        .expect("attach the selected backend");
     let zecd = Zecd::start(&cfg).await.expect("start zecd");
 
     // 4. A few more shielded coinbases, then a confirmations tail - which also pays zecd. The

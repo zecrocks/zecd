@@ -1100,6 +1100,7 @@ fn block_transparent_outputs(block: &Block, height: u32) -> Vec<crate::chain::Tr
                 script: txout.script_pubkey().0 .0.clone(),
                 height: Some(height),
                 coinbase_tx: coinbase_tx.clone(),
+                coinbase: coinbase_tx.is_some(),
             });
         }
     }
