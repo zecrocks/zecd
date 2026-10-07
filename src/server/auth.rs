@@ -53,6 +53,17 @@ pub fn generate_rpcauth(username: &str, password: Option<&str>) -> (String, Opti
 /// password to keep when one is generated. No daemon, config, or external script needed.
 #[cfg(feature = "cli")]
 pub fn run_rpcauth(args: &crate::config::RpcauthArgs) -> anyhow::Result<()> {
+    // The daemon refuses an `[rpc] auth` line that accepts the empty password, so don't mint one.
+    if args
+        .password
+        .as_ref()
+        .is_some_and(|p| p.expose().is_empty())
+    {
+        return Err(anyhow!(
+            "refusing to generate an rpcauth line for an empty password; omit the password to \
+             have one generated"
+        ));
+    }
     let (line, generated) =
         generate_rpcauth(&args.username, args.password.as_ref().map(Password::expose));
 
@@ -143,12 +154,43 @@ fn parse_auth_entries(rpc: &RpcConfig) -> anyhow::Result<Vec<(String, PasswordHa
         .collect()
 }
 
+/// Refuse a configured credential that the empty password satisfies.
+///
+/// Two shapes reach it. A bare `[rpc] password` that is empty - most often a `password_file`
+/// that exists but was never populated (an unfilled Kubernetes Secret, a `touch`ed file) -
+/// would make `user:` a working login with spend authority, and because a password *is* set it
+/// also suppresses the cookie, so nothing about the daemon looks wrong. And an `[rpc] auth`
+/// (`rpcauth`) line minted for an empty password admits the same login for its user. Both are
+/// refused rather than read as "unset": an operator who configured a password meant to have
+/// one, and falling back to the cookie would leave every client failing with a bare 401 and no
+/// hint why.
+fn reject_empty_passwords(
+    rpc: &RpcConfig,
+    entries: &[(String, PasswordHash)],
+) -> anyhow::Result<()> {
+    if rpc.password.as_ref().is_some_and(|p| p.expose().is_empty()) {
+        return Err(anyhow!(
+            "the RPC password is empty (check [rpc] password_file, [rpc] password, \
+             --rpcpassword and ZECD_RPC_PASSWORD); an empty password would let anyone log in \
+             as the RPC user"
+        ));
+    }
+    if let Some((user, _)) = entries.iter().find(|(_, hash)| hash.check_ct("").into()) {
+        return Err(anyhow!(
+            "the [rpc] auth entry for user {user} accepts an empty password; regenerate it \
+             with `zecd rpcauth {user}`"
+        ));
+    }
+    Ok(())
+}
+
 /// Reach [`Authenticator::from_config`]'s verdict *without* its side effect of minting and
 /// writing a cookie file. For `zecd config check`, which must never touch the datadir of a
 /// deployment it is only inspecting - a fresh cookie there would invalidate the credential a
 /// running daemon handed out.
 pub fn check_config(rpc: &RpcConfig) -> anyhow::Result<()> {
-    parse_auth_entries(rpc)?;
+    let entries = parse_auth_entries(rpc)?;
+    reject_empty_passwords(rpc, &entries)?;
     if (rpc.user.is_some() && rpc.password.is_some()) || rpc.cookiefile.is_some() {
         return Ok(());
     }
@@ -165,6 +207,7 @@ impl Authenticator {
     /// does whenever `rpcpassword` is empty.
     pub fn from_config(rpc: &RpcConfig) -> anyhow::Result<Authenticator> {
         let mut users = parse_auth_entries(rpc)?;
+        reject_empty_passwords(rpc, &users)?;
 
         if let (Some(user), Some(password)) = (&rpc.user, &rpc.password) {
             users.push((user.clone(), PasswordHash::from_bare(password.expose())));
@@ -402,6 +445,54 @@ mod tests {
             ..rpc
         };
         assert!(Authenticator::from_config(&bad).is_err());
+    }
+
+    /// A credential the empty password satisfies is refused by both the daemon's path and
+    /// `config check`'s, and the refusal names what to fix; a non-empty one still builds.
+    #[test]
+    fn credentials_accepting_the_empty_password_are_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = crate::config::RpcConfig {
+            bind: "127.0.0.1".parse().unwrap(),
+            port: 1,
+            user: Some("alice".to_string()),
+            password: Some(crate::secret::Password::new("")),
+            auth: vec![],
+            cookiefile: Some(dir.path().join(".cookie")),
+            work_queue: 16,
+            allowed_methods: vec![],
+            allow_duplicate_shielded_recipients: false,
+        };
+        // An empty bare password (an unpopulated password_file reads as exactly this).
+        let e = check_config(&base).unwrap_err().to_string();
+        assert!(e.contains("password is empty"), "{e}");
+        assert!(Authenticator::from_config(&base).is_err());
+        assert!(
+            !dir.path().join(".cookie").exists(),
+            "a refused config writes no cookie"
+        );
+
+        // An rpcauth line minted for the empty password.
+        let (line, _) = generate_rpcauth("bob", Some(""));
+        let empty_hash = crate::config::RpcConfig {
+            user: None,
+            password: None,
+            auth: vec![line],
+            ..base.clone()
+        };
+        let e = check_config(&empty_hash).unwrap_err().to_string();
+        assert!(e.contains("user bob accepts an empty password"), "{e}");
+        assert!(Authenticator::from_config(&empty_hash).is_err());
+
+        // The same shapes with a real password are fine.
+        let (line, _) = generate_rpcauth("bob", Some("hunter2"));
+        let good = crate::config::RpcConfig {
+            password: Some(crate::secret::Password::new("secret")),
+            auth: vec![line],
+            ..base
+        };
+        assert!(check_config(&good).is_ok());
+        assert!(Authenticator::from_config(&good).is_ok());
     }
 
     #[cfg(unix)]
