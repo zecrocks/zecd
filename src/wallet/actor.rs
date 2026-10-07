@@ -5509,6 +5509,7 @@ impl WalletActor {
             .map_err(|e| {
                 enrich_insufficient_funds(db, &engine_dir, scope, policy, classify_err(e))
             })?;
+            enforce_single_step(&proposal)?;
             if privacy == SendPrivacy::FullPrivacy {
                 enforce_full_privacy(&proposal)?;
             }
@@ -5795,6 +5796,7 @@ impl WalletActor {
                 .map_err(|e| {
                     enrich_insufficient_funds(db, &engine_dir, scope, policy, classify_err(e))
                 })?;
+                enforce_single_step(&proposal)?;
                 if privacy == SendPrivacy::FullPrivacy {
                     enforce_full_privacy(&proposal)?;
                 }
@@ -6530,6 +6532,7 @@ impl WalletActor {
             tokio::task::block_in_place(move || -> Result<_, RpcError> {
                 // The `Infallible` turbofish parameters pin the phantom input-selection and
                 // change-strategy error types (this proposal was built without either).
+                enforce_single_step(&proposal)?;
                 let txids = create_proposed_transactions::<_, _, Infallible, _, Infallible, _>(
                     db,
                     &net,
@@ -7187,6 +7190,7 @@ impl WalletActor {
                 let prover: &LocalTxProver = &prover;
                 let db = &mut self.db_data;
                 tokio::task::block_in_place(move || -> Result<_, RpcError> {
+                    enforce_single_step(&proposal)?;
                     let txids = create_proposed_transactions::<_, _, Infallible, _, Infallible, _>(
                         db,
                         &net,
@@ -7214,6 +7218,7 @@ impl WalletActor {
                 let prover: &LocalTxProver = &prover;
                 let db = &mut self.db_data;
                 tokio::task::block_in_place(move || -> Result<_, RpcError> {
+                    enforce_single_step(&proposal)?;
                     let txids = create_proposed_transactions::<_, _, Infallible, _, Infallible, _>(
                         db,
                         &net,
@@ -8343,6 +8348,27 @@ fn enforce_max_tx_bytes<FeeRuleT, NoteRef>(
                 "This send would build a transaction of about {bytes} bytes, over the current                  limit of {max_bytes}, which exists because a node will not relay a transaction                  larger than its own mempool policy - such a transaction is proved at full cost                  and then never mined. Send to fewer recipients, or consolidate first with                  z_mergetoaddress ([\"ANY_ORCHARD\"], your own address, repeatedly until                  remainingNotes is 0), which spends fewer, larger notes. Or raise [spend]                  max_tx_bytes (0 disables the ceiling) and send SIGHUP to reload it without                  restarting - but only if every node between this wallet and a miner accepts                  the larger size."
             )));
         }
+    }
+    Ok(())
+}
+
+/// Refuse a proposal of more than one step before anything is built from it. zecd broadcasts
+/// exactly one transaction per send, but a multi-step proposal (ZIP 320: paying a TEX address
+/// goes through an ephemeral transparent hop) builds one transaction per step, and
+/// `create_proposed_transactions` **stores every step it builds** - inputs marked spent, raw
+/// bytes queued - before returning. Checking the returned txid count afterwards therefore came
+/// too late: the send reported an error while the rebroadcast loop picked both stored
+/// transactions up and sent them anyway, so a caller who retried paid twice. This runs on the
+/// proposal, where refusing still costs nothing.
+fn enforce_single_step<FeeRuleT, NoteRef>(
+    proposal: &Proposal<FeeRuleT, NoteRef>,
+) -> Result<(), RpcError> {
+    let steps = proposal.steps().len();
+    if steps > 1 {
+        return Err(RpcError::wallet(format!(
+            "multi-transaction proposals are not supported (this send would need {steps} \
+             transactions)"
+        )));
     }
     Ok(())
 }
