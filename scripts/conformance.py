@@ -931,6 +931,13 @@ def main() -> int:
         ck("verbose txid echoes", v.get("txid") == t["txid"])
         ck("verbose hex matches", v.get("hex") == raw)
         ck("verbose vin/vout are lists", isinstance(v.get("vin"), list) and isinstance(v.get("vout"), list))
+        # Shielded bundles render by version, as zcashd's TxToJSON: `orchard` from v5, and
+        # `ironwood` (Orchard-shaped) from v6 - every wallet tx on a NU6.3-active chain.
+        if v.get("version", 0) >= 5:
+            ck("v5+ verbose has orchard", isinstance(v.get("orchard"), dict))
+        if v.get("version", 0) >= 6:
+            ck("v6 verbose has ironwood",
+               isinstance(v.get("ironwood"), dict) and isinstance(v["ironwood"].get("actions"), list))
 
     # z_listtransactions is a zecd EXTENSION (no such method in zcashd) with zcashd's z_*
     # vocabulary, so it is checked for self-consistency, not held to a bitcoind shape.

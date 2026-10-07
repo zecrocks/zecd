@@ -308,6 +308,30 @@ async fn regtest_ironwood_receive_and_orchard_send() {
         tokio::time::sleep(Duration::from_secs(2)).await;
     }
 
+    // 9b. zecd's own decoder shows that send's Ironwood bundle. Its payment and change both ride
+    //     it, so a decoder that rendered only `orchard` (as zecd's did) showed a v6 send with no
+    //     shielded outputs at all. Every wallet tx is stored with raw bytes, so this is answered
+    //     from the wallet, not the node.
+    let decoded = zecd
+        .call("getrawtransaction", json!([send_txid, 1]))
+        .await
+        .expect("verbose getrawtransaction of the ironwood send");
+    assert!(
+        decoded["version"].as_u64().unwrap_or(0) >= 6,
+        "a post-NU6.3 send is a v6 transaction: {decoded}"
+    );
+    let ironwood_actions = decoded["ironwood"]["actions"]
+        .as_array()
+        .map_or(0, Vec::len);
+    assert!(
+        ironwood_actions >= 2,
+        "the decoded send carries its payment and change in the ironwood bundle: {decoded}"
+    );
+    assert!(
+        decoded["ironwood"]["anchor"].is_string() && decoded["ironwood"]["proof"].is_string(),
+        "the ironwood bundle renders with the orchard shape: {decoded}"
+    );
+
     // 10. Anchor-retention regression guard (librustzcash#2554). On a post-NU6.3 chain, whenever the
     //     scanner processes a batch whose starting `from_state` height (or a checkpoint height within
     //     it) is a multiple of `ANCHOR_RETENTION_INTERVAL` (288), the ironwood shardtree retains that

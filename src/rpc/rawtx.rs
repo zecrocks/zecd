@@ -260,6 +260,13 @@ fn tx_json(
     if version.has_orchard() {
         obj.insert("orchard".into(), orchard_json(tx.orchard_bundle()));
     }
+    // Ironwood (NU6.3) actions are Orchard-shaped, so the same encoder renders them under their
+    // own key - present (possibly empty) for every v6 transaction, as `orchard` is for v5+.
+    // Without it a post-NU6.3 send, whose payment and change ride the Ironwood bundle, decoded
+    // with no shielded outputs at all.
+    if version.has_ironwood() {
+        obj.insert("ironwood".into(), orchard_json(tx.ironwood_bundle()));
+    }
 
     obj
 }
@@ -522,6 +529,39 @@ mod tests {
     /// one P2PKH input, one 1.0-coin P2PKH output.
     const V1_TX_HEX: &str = "0100000001a15d57094aa7a21a28cb20b59aab8fc7d1149a3bdbcddba9c622e4f5f6a99ece010000006c493046022100f93bb0e7d8db7bd46e40132d1f8242026e045f03a0efe71bbb8e3f475e970d790221009337cd7f1f929f00cc6ff01f03729b069a7c21b59b1736ddfee5db5946c5da8c0121033b9b137ee87d5a812d6f506efdd37f0affa7ffc310711c06c7f3e097c9447c52ffffffff0100e1f505000000001976a9140389035a9225b3839e2bbf32d826a1e222031fd888ac00000000";
 
+    /// A v6 (NU6.3) transaction renders an `ironwood` section beside `orchard`, with the same
+    /// Orchard shape - empty here, since this fixture carries no bundles at all; the populated
+    /// case is a real send, asserted live in `regtest_ironwood`.
+    #[test]
+    fn v6_tx_json_has_ironwood_section() {
+        use zcash_primitives::transaction::{Authorized, TransactionData};
+        use zcash_protocol::consensus::BlockHeight;
+
+        let tx = TransactionData::<Authorized>::from_parts_v6(
+            BranchId::Nu6_3,
+            0,
+            BlockHeight::from_u32(4_200_000),
+            None,
+            None,
+            None,
+            None,
+        )
+        .freeze()
+        .expect("an empty v6 transaction freezes");
+        let mut data = Vec::new();
+        tx.write(&mut data).expect("serialize");
+        let obj = tx_json(&ZNetwork::Test, &tx, data.len());
+
+        assert_eq!(obj["version"], json!(6));
+        let ironwood = obj.get("ironwood").expect("v6 renders an ironwood section");
+        assert_eq!(ironwood["actions"], json!([]));
+        assert_eq!(ironwood["valueBalanceZat"], json!(0));
+        assert_eq!(
+            ironwood, &obj["orchard"],
+            "the ironwood section has the orchard shape"
+        );
+    }
+
     #[test]
     fn v1_tx_json_shape() {
         let data = hex::decode(V1_TX_HEX).unwrap();
@@ -537,6 +577,7 @@ mod tests {
         assert!(obj.get("expiryheight").is_none());
         assert!(obj.get("valueBalance").is_none());
         assert!(obj.get("orchard").is_none());
+        assert!(obj.get("ironwood").is_none());
 
         let vin = obj["vin"].as_array().unwrap();
         assert_eq!(vin.len(), 1);
