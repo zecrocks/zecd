@@ -872,6 +872,10 @@ pub struct ActorConfig {
     /// trust_own_transactions`, default on) - see [`mark_own_tx_trusted`]. Off = persist no
     /// trust marker, so a restore classifies identically to the authoring instance.
     pub trust_own_transactions: bool,
+    /// The most blocks a send may scan to catch up before it is built (`[spend]
+    /// max_send_catchup_blocks`, default 100; `0` = unbounded). See
+    /// [`WalletActor::sync_to_tip_for_send`].
+    pub max_send_catchup_blocks: u32,
     /// Shielded pools this wallet receives into and spends from (change pool selection).
     pub enabled_pools: ReceiverSet,
     /// Receivers included by default in this wallet's Unified Addresses.
@@ -1051,6 +1055,9 @@ struct WalletActor {
     /// `[spend] trust_own_transactions`: mark wallet-authored transactions trusted at store
     /// time (see [`mark_own_tx_trusted`]). Off = the full-statelessness posture.
     trust_own_transactions: bool,
+    /// `[spend] max_send_catchup_blocks`: past this much lag a send fails fast with `-10`
+    /// rather than scanning the gap on the actor. See [`Self::sync_to_tip_for_send`].
+    max_send_catchup_blocks: u32,
     /// `[spend] shutdown_drain_secs`: how long to finish already-accepted sends once shutdown is
     /// signalled. See [`Self::finish_accepted_sends`].
     shutdown_drain: Duration,
@@ -1616,6 +1623,7 @@ async fn spawn_inner(
         pipeline_proving: cfg.pipeline_proving,
         shutdown_drain: cfg.shutdown_drain,
         trust_own_transactions: cfg.trust_own_transactions,
+        max_send_catchup_blocks: cfg.max_send_catchup_blocks,
         send_in_flight: false,
         send_queue: VecDeque::new(),
         send_done_tx,
@@ -5437,18 +5445,32 @@ impl WalletActor {
     /// the tip captured by `refresh_tip` (it isn't re-bumped mid-loop), so newly-mined blocks
     /// can't make it spin; it terminates once that tip is scanned.
     ///
-    /// Best-effort throughout: an unreachable upstream or a sync error logs and falls back to
+    /// Best-effort on transport: an unreachable upstream or a sync error logs and falls back to
     /// the last-scanned tip (the send then rides the usual commit/rebroadcast path, and would
-    /// fail at broadcast anyway if the upstream is truly gone), so this must never hard-fail the
-    /// spend.
-    async fn sync_to_tip_for_send(&mut self) {
+    /// fail at broadcast anyway if the upstream is truly gone).
+    ///
+    /// **Bounded on lag.** The catch-up is cheap only because the sync loop normally leaves a
+    /// block or two to do. On a wallet still restoring it is the whole remaining scan - minutes
+    /// to hours on the single-writer actor, with the caller waiting and every other send queued
+    /// behind it. So once the tip is known, a lag beyond `[spend] max_send_catchup_blocks`
+    /// refuses the send with `-10` (Core's "still downloading" code) naming the gap, and the
+    /// caller retries after `waitforsync`. A halted wallet (see `sync_halted`) refuses too: its
+    /// scan cannot advance, so a send would be built against a chain view the wallet already
+    /// knows is wrong.
+    async fn sync_to_tip_for_send(&mut self) -> Result<(), RpcError> {
+        if self.sync_halted {
+            return Err(RpcError::wallet(
+                "sync is halted for this wallet, so a send cannot be built against the current \
+                 chain; run `zecd rescan` to rebuild it",
+            ));
+        }
         if self.client.is_none() {
             if let Err(e) = self.connect().await {
                 warn!(
                     "could not reach upstream to sync before sending ({e}); building \
                      against the last-scanned height"
                 );
-                return;
+                return Ok(());
             }
         }
         // Record zebra's real tip (and extend the scan queue up to it).
@@ -5456,7 +5478,29 @@ impl WalletActor {
             // A failed refresh means the client is likely stale; drop it so the broadcast
             // path reconnects cleanly, and build against the last-scanned tip.
             self.mark_disconnected(format!("tip refresh before send failed ({e})"));
-            return;
+            return Ok(());
+        }
+        if let Some(tip) = self.tip_height {
+            let scanned = tokio::task::block_in_place(|| {
+                self.db_data
+                    .block_fully_scanned()
+                    .ok()
+                    .flatten()
+                    .map(|meta| u32::from(meta.block_height()))
+            });
+            if let Some(lag) = send_catchup_exceeded(tip, scanned, self.max_send_catchup_blocks) {
+                return Err(RpcError::new(
+                    codes::RPC_CLIENT_IN_INITIAL_DOWNLOAD,
+                    format!(
+                        "Wallet is still syncing: it has scanned to height {} of {tip} ({lag} \
+                         blocks behind), more than [spend] max_send_catchup_blocks = {} allows \
+                         a send to catch up. Retry once `waitforsync` reports the wallet \
+                         caught up.",
+                        scanned.map_or_else(|| "none".to_string(), |h| h.to_string()),
+                        self.max_send_catchup_blocks,
+                    ),
+                ));
+            }
         }
         // Scan up to that tip so the spend anchor lands in a fully-scanned range. Bounded: the
         // target is the tip just captured, so the loop ends when the wallet reaches it.
@@ -5470,6 +5514,7 @@ impl WalletActor {
                 }
             }
         }
+        Ok(())
     }
 
     /// Whether sends on this wallet *may* use the cached-Orchard PCZT path (so prove and store are
@@ -5695,7 +5740,7 @@ impl WalletActor {
         // load and produce an already-expired tx that zebra rejects with -25. This scans up to
         // the tip (not just bumps the pointer) so the spend anchor also lands in a fully-scanned
         // range; normally a no-op because the sync loop keeps the wallet caught up.
-        self.sync_to_tip_for_send().await;
+        self.sync_to_tip_for_send().await?;
 
         let account_id = self.require_account(None)?;
         let account_index = self.account_index.ok_or_else(private_keys_disabled)?;
@@ -5994,7 +6039,10 @@ impl WalletActor {
         // no-op when the sync loop already has the wallet caught up. Runs here (not in
         // `begin_or_queue_send`) so a send queued behind an in-flight proof re-syncs when it
         // actually starts, keeping its tip fresh.
-        self.sync_to_tip_for_send().await;
+        if let Err(e) = self.sync_to_tip_for_send().await {
+            let _ = reply.send(Err(e));
+            return;
+        }
 
         let account_index = match self.account_index.ok_or_else(private_keys_disabled) {
             Ok(i) => i,
@@ -6442,7 +6490,7 @@ impl WalletActor {
 
         // Same tip catch-up as a send: the proposal's target height (and thus the eventual tx's
         // expiry) must come from the real chain tip, not a lagging scanned height.
-        self.sync_to_tip_for_send().await;
+        self.sync_to_tip_for_send().await?;
 
         let account_id = self.require_account(None)?;
         let net = self.network;
@@ -6676,7 +6724,7 @@ impl WalletActor {
 
         // Same tip catch-up as a send: the plan's target height (and thus the eventual tx's
         // expiry) must come from the real chain tip, not a lagging scanned height.
-        self.sync_to_tip_for_send().await;
+        self.sync_to_tip_for_send().await?;
 
         let account_id = self.require_account(None)?;
         let net = self.network;
@@ -8438,6 +8486,18 @@ fn enforce_single_step<FeeRuleT, NoteRef>(
     Ok(())
 }
 
+/// How far a send's pre-build catch-up would have to scan, if that is more than `limit`
+/// (`[spend] max_send_catchup_blocks`; `0` = unbounded). `scanned` is the wallet's fully
+/// scanned height, `None` before it has scanned anything - which counts as the whole chain
+/// behind, since such a wallet holds nothing a send could spend yet.
+fn send_catchup_exceeded(tip: u32, scanned: Option<u32>, limit: u32) -> Option<u32> {
+    if limit == 0 {
+        return None;
+    }
+    let lag = tip.saturating_sub(scanned.unwrap_or(0));
+    (lag > limit).then_some(lag)
+}
+
 /// Classify a librustzcash spend/proposal error into a Bitcoin-Core RPC code. Insufficient
 /// funds maps to -6; everything else to the generic wallet error -4. Client-facing messages
 /// use `Display` (not `Debug`) so internal note/proposal structure isn't leaked.
@@ -8777,6 +8837,23 @@ mod tests {
     /// whose default address lands at an index >= gap_limit reported a *fresh restore* as beyond
     /// its own horizon (`restorable: false`) - the intermittent `regtest_transparent_gap` CI
     /// failure (frontiers 5/6/10 with gap 3, one per fresh per-run mnemonic).
+    #[test]
+    fn send_catchup_bound_refuses_only_past_the_limit() {
+        use super::send_catchup_exceeded;
+        // A live wallet a block or two behind catches up inline.
+        assert_eq!(send_catchup_exceeded(1_000, Some(998), 100), None);
+        // Exactly at the limit is still allowed; one past it is refused, naming the lag.
+        assert_eq!(send_catchup_exceeded(1_100, Some(1_000), 100), None);
+        assert_eq!(send_catchup_exceeded(1_101, Some(1_000), 100), Some(101));
+        // A wallet that has scanned nothing counts the whole chain as behind.
+        assert_eq!(send_catchup_exceeded(5_000, None, 100), Some(5_000));
+        assert_eq!(send_catchup_exceeded(50, None, 100), None);
+        // A scanned height above the recorded tip (a tip that went backwards) is no lag.
+        assert_eq!(send_catchup_exceeded(1_000, Some(1_005), 100), None);
+        // 0 removes the bound.
+        assert_eq!(send_catchup_exceeded(3_000_000, None, 0), None);
+    }
+
     #[test]
     fn recovery_horizon_is_anchored_at_the_restore_floor() {
         use super::recovery_horizon_for;

@@ -985,6 +985,18 @@ pub struct SpendConfig {
     /// guarantee it buys is silently gone, so raise the supervisor's timeout or lower this.
     /// `0` disables the drain and restores the old drop-on-shutdown behaviour.
     pub shutdown_drain_secs: u64,
+    /// How many blocks a send may scan to catch the wallet up to the chain tip before it is
+    /// built. `0` removes the bound. Default [`DEFAULT_MAX_SEND_CATCHUP_BLOCKS`].
+    ///
+    /// A send first scans up to the upstream's tip, because the spend anchor and expiry both
+    /// derive from the wallet's chain tip (see `actor::WalletActor::sync_to_tip_for_send`).
+    /// That is a few blocks normally, but on a wallet still restoring it is the whole remaining
+    /// scan, run on the single-writer actor while the caller waits - minutes to hours, with
+    /// every other send queued behind it. Past this many blocks the send fails at once with
+    /// Bitcoin Core's `-10` ("still syncing") instead, naming the lag, and the caller retries
+    /// once `waitforsync` says the wallet has caught up. Balance and history reads are never
+    /// gated: they already report what the wallet has scanned.
+    pub max_send_catchup_blocks: u32,
 }
 
 impl Default for SpendConfig {
@@ -1001,6 +1013,7 @@ impl Default for SpendConfig {
             target_note_count: DEFAULT_TARGET_NOTE_COUNT,
             min_split_output_value: DEFAULT_MIN_SPLIT_OUTPUT_VALUE,
             shutdown_drain_secs: DEFAULT_SHUTDOWN_DRAIN_SECS,
+            max_send_catchup_blocks: DEFAULT_MAX_SEND_CATCHUP_BLOCKS,
         }
     }
 }
@@ -1238,6 +1251,11 @@ pub const DEFAULT_MIN_SPLIT_OUTPUT_VALUE: u64 = 10_000_000;
 /// field) and below systemd's 90 s default stop timeout - but above `docker stop`'s 10 s and
 /// Kubernetes' 30 s, which is why it is configurable at all.
 pub const DEFAULT_SHUTDOWN_DRAIN_SECS: u64 = 60;
+
+/// Default `[spend] max_send_catchup_blocks`: the most blocks a send scans before building.
+/// Matches Zallet's `sync.lock_threshold`. A live wallet lags its upstream by a block or two,
+/// so this only binds on a wallet that is genuinely still syncing.
+pub const DEFAULT_MAX_SEND_CATCHUP_BLOCKS: u32 = 100;
 
 /// `[spend] privacy_policy` - Zallet/zcashd's privacy-policy idea (zcash/zcash#6240) reduced to
 /// the leaks a zecd send can actually cause: whether a send may cross between shielded pools
@@ -1550,6 +1568,7 @@ struct SpendFile {
     target_note_count: Option<usize>,
     min_split_output_value: Option<u64>,
     shutdown_drain_secs: Option<u64>,
+    max_send_catchup_blocks: Option<u32>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -2362,6 +2381,9 @@ impl AppConfig {
             shutdown_drain_secs: spend_file
                 .shutdown_drain_secs
                 .unwrap_or(DEFAULT_SHUTDOWN_DRAIN_SECS),
+            max_send_catchup_blocks: spend_file
+                .max_send_catchup_blocks
+                .unwrap_or(DEFAULT_MAX_SEND_CATCHUP_BLOCKS),
         };
         // Fail at startup, not on the first balance/send call.
         spend.confirmations_policy()?;
@@ -3196,6 +3218,32 @@ mod tests {
             "a non-reloadable key in the reloadable key's own section must still be named: \
              {report:?}"
         );
+    }
+
+    /// `[spend] max_send_catchup_blocks` defaults to Zallet's lock threshold, parses, and
+    /// accepts the unbounding `0`.
+    #[test]
+    fn max_send_catchup_blocks_parses_and_defaults() {
+        assert_eq!(
+            SpendConfig::default().max_send_catchup_blocks,
+            DEFAULT_MAX_SEND_CATCHUP_BLOCKS
+        );
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("zecd.toml");
+        for (value, expected) in [("0", 0), ("2500", 2500)] {
+            std::fs::write(
+                &path,
+                format!("[spend]\nmax_send_catchup_blocks = {value}\n"),
+            )
+            .expect("write config");
+            let config = AppConfig::resolve_overrides(&ConfigOverrides {
+                regtest: true,
+                conf: Some(path.clone()),
+                ..Default::default()
+            })
+            .expect("resolve");
+            assert_eq!(config.spend.max_send_catchup_blocks, expected);
+        }
     }
 
     /// `[spend] shutdown_drain_secs` bounds how long a stopping wallet finishes sends it already

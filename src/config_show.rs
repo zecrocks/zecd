@@ -218,6 +218,11 @@ pub fn render(config: &AppConfig) -> String {
         "shutdown_drain_secs",
         config.spend.shutdown_drain_secs,
     );
+    kv(
+        &mut s,
+        "max_send_catchup_blocks",
+        config.spend.max_send_catchup_blocks,
+    );
 
     table(&mut s, "pools");
     pools_keys(&mut s, &config.pools);

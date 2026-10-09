@@ -34,6 +34,11 @@ pub mod codes {
     pub const RPC_VERIFY_ALREADY_IN_UTXO_SET: i32 = -27;
     pub const RPC_METHOD_DEPRECATED: i32 = -32;
 
+    // The one code zecd takes from Core's P2P client block: Core returns it while the node is
+    // still downloading initial blocks, and zecd returns it from a send while the wallet is
+    // still scanning further behind the tip than `[spend] max_send_catchup_blocks` allows.
+    pub const RPC_CLIENT_IN_INITIAL_DOWNLOAD: i32 = -10;
+
     // Wallet errors. NB: these are Bitcoin Core's `protocol.h` numbers; `-11` (invalid label)
     // and `-18` (wallet not found) differ in *meaning* from zcashd's `protocol.h` (where they are
     // "accounts unsupported" / "backup required"). The collision is harmless - those codes belong

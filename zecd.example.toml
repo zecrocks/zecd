@@ -569,6 +569,12 @@ pipeline_proving = false
 # the guarantee is silently gone - so raise the supervisor's timeout to match, or lower this.
 # 0 disables the drain (sends in flight are dropped on stop, as before it existed).
 shutdown_drain_secs = 60
+# A send first scans the wallet up to the chain tip (the spend anchor and expiry derive from it).
+# On a live wallet that is a block or two; on one still restoring it is the whole remaining scan,
+# run while the caller waits and every other send queues behind it. Past this many blocks of lag
+# a send fails at once with -10 ("still syncing") instead - retry once `waitforsync` reports the
+# wallet caught up. Balance and history reads are never gated. 0 removes the bound.
+max_send_catchup_blocks = 100
 
 [health]
 # Unauthenticated liveness/readiness probes on a separate port (for Kubernetes/load balancers).

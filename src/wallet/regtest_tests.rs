@@ -1095,6 +1095,7 @@ fn offline_actor_cfg(
         pipeline_proving: false,
         shutdown_drain: std::time::Duration::from_secs(crate::config::DEFAULT_SHUTDOWN_DRAIN_SECS),
         trust_own_transactions: true,
+        max_send_catchup_blocks: crate::config::DEFAULT_MAX_SEND_CATCHUP_BLOCKS,
         enabled_pools: crate::pools::ReceiverSet::single(crate::pools::Receiver::Orchard),
         default_receivers: crate::pools::ReceiverSet::single(crate::pools::Receiver::Orchard),
         transparent_enabled: false,

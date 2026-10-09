@@ -282,6 +282,7 @@ impl PreparedNode {
                 pipeline_proving: config.spend.pipeline_proving,
                 shutdown_drain: Duration::from_secs(config.spend.shutdown_drain_secs),
                 trust_own_transactions: config.spend.trust_own_transactions,
+                max_send_catchup_blocks: config.spend.max_send_catchup_blocks,
                 enabled_pools: entry.pools.clone(),
                 default_receivers: entry.default_receivers.clone(),
                 transparent_enabled: entry.transparent_enabled,
@@ -539,6 +540,8 @@ async fn spawn_fleet(
             shutdown_drain: Duration::ZERO,
             // Never consulted either: the trust marker is written at send-store time.
             trust_own_transactions: false,
+            // Never consulted: a shard actor accepts no sends.
+            max_send_catchup_blocks: 0,
             enabled_pools: config.pools.enabled.clone(),
             default_receivers: config.pools.default_receivers.clone(),
             // Shielded-only: the transparent matcher keeps per-account gap windows, pre-exposure

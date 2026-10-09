@@ -1122,6 +1122,8 @@ impl ShardTemplate {
             shutdown_drain: std::time::Duration::ZERO,
             // Never consulted either: the trust marker is written at send-store time.
             trust_own_transactions: false,
+            // Never consulted: a shard actor accepts no sends.
+            max_send_catchup_blocks: 0,
             enabled_pools: self.enabled_pools.clone(),
             default_receivers: self.default_receivers.clone(),
             // Shielded-only - see `crate::wallet::shard`.
