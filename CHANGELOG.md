@@ -5,6 +5,53 @@ All notable changes to zecd are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com), and this
 project adheres to [Semantic Versioning](https://semver.org).
 
+## [0.9.0-rc2] - 2026-10-12
+
+Six fixes over rc1, and one new configuration key. Five of the fixes also shipped in 0.8.2.
+
+**Read before deploying.** A node whose RPC password is empty, or that has an `[rpc] auth` line
+minted for the empty password, now refuses to start; set a password first. And a send made while
+the wallet is more than 100 blocks behind the tip now fails at once with `-10` instead of waiting
+for the scan.
+
+### Added
+- **`[spend] max_send_catchup_blocks`** (default 100, `0` = unbounded). Every send first scans
+  the wallet up to the chain tip, and on a wallet still restoring that was the whole remaining
+  scan, run while the caller waited and every other send queued behind it. Past this lag a send,
+  `z_shieldcoinbase` or `z_mergetoaddress` fails at once with `-10`, naming the scanned height and
+  the tip; retry once `waitforsync` reports the wallet caught up. Balance and history reads are
+  not gated. A wallet whose sync has halted now refuses sends.
+
+### Security
+- **An empty RPC password was a working login.** An empty `[rpc]` password, typically a
+  `password_file` that exists but was never filled in, made `user:` a valid login with spend
+  authority, and because a password counted as set, no cookie was written either. An
+  `[rpc] auth` line minted for the empty password admitted the same login. The daemon and
+  `zecd config check` now refuse both, and `zecd rpcauth <user> ""` refuses to mint such a line.
+- **An explicit shielded `fromaddress` could spend from pools it cannot hold.** `z_sendmany`
+  treated any wallet-owned shielded or unified `fromaddress` as the whole account, so a send
+  from a Sapling address could spend Orchard and Ironwood notes. An explicit source now funds
+  only the pools its receivers can hold: a Sapling address or Sapling-only UA spends Sapling, an
+  Orchard-only UA spends Orchard and Ironwood, and a UA with both keeps every shielded pool. A
+  shortfall returns `-6` rather than drawing on another pool. `z_mergetoaddress` follows the
+  same rule.
+
+### Fixed
+- **Retrying a send to a TEX address paid twice.** A TEX recipient produces a two-step
+  proposal. Some sends built and stored both transactions before failing with
+  "multi-transaction proposals are not supported", and the rebroadcast loop then broadcast
+  them anyway. Every send RPC now rejects a TEX recipient with `-8` before building, and any
+  proposal of more than one step is refused before anything is stored.
+- **Verbose `getrawtransaction` showed no shielded outputs for post-NU6.3 sends.** Only the
+  `orchard` section was rendered, while payment and change ride the Ironwood bundle. v6
+  transactions now carry an `ironwood` section in the same shape as `orchard`.
+- **Light mode recorded coinbase outputs as ordinary receives.** With transparent enabled, a
+  light-mode wallet that mined to itself could spend immature coinbase, and
+  `z_shieldcoinbase` could not see it. The lightwalletd backend now marks coinbase outputs
+  and stores the coinbase transaction, as the zebra backend does.
+- **`zecd example-config` omitted several keys.** `[backend] rfc1918_is_local` and
+  `allow_remote_cleartext`, `[rpc] work_queue` and the `[log]` section are now documented in it.
+
 ## [0.9.0-rc1] - 2026-10-02
 
 NU7 support, which needed the Zakura Common 2.x crates. No configuration key, RPC or response
@@ -1021,6 +1068,7 @@ Zcash, backed entirely by librustzcash and running as a light client.
 ### Security
 - Pre-release audit hardening; refuse to start on mainnet with the placeholder RPC password; enforce a 12-character passphrase minimum.
 
+[0.9.0-rc2]: https://github.com/zecrocks/zecd/compare/v0.9.0-rc1...v0.9.0-rc2
 [0.9.0-rc1]: https://github.com/zecrocks/zecd/compare/v0.8.1...v0.9.0-rc1
 [0.8.1]: https://github.com/zecrocks/zecd/compare/v0.8.0...v0.8.1
 [0.8.0]: https://github.com/zecrocks/zecd/compare/v0.7.0...v0.8.0
