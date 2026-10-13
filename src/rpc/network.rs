@@ -34,12 +34,15 @@ fn version_number() -> u64 {
 /// `getnetworkinfo` - daemon version/identity in Bitcoin Core's shape; `connections` counts
 /// the single chain upstream (1 when connected, 0 otherwise). That upstream is a local zebrad in
 /// the default full mode, a lightwalletd in light mode; nothing here depends on which.
+/// `protocolversion` is the ZIP 204 version of the newest upgrade this build schedules on the
+/// daemon's network (`ZNetwork::protocol_version`), so it moves with the consensus rules the
+/// build actually follows rather than staying at whatever a release once hard-coded.
 pub(crate) fn getnetworkinfo(state: &AppState) -> Result<Value, RpcError> {
     let up = connected(state);
     Ok(json!({
         "version": version_number(),
         "subversion": format!("/zecd:{}/", env!("CARGO_PKG_VERSION")),
-        "protocolversion": 170100,
+        "protocolversion": state.config.network.protocol_version(),
         "localservices": "0000000000000000",
         "localservicesnames": [],
         "localrelay": false,

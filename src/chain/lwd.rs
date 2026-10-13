@@ -16,9 +16,11 @@
 //!    refresh, offline-window sweep, `ChainSource::get_address_utxos`) is deleted; shielded-only
 //!    wallets, the default, still run against any server.
 //!
-//! Note no released lightwalletd populates `lightwalletProtocolVersion`, so the probe reports
-//! *incapable* for every real server - `[backend] assume_transparent_in_compact_blocks` is the
-//! operator's out-of-band assertion, and is what the regtest harness sets in lwd mode.
+//! lightwalletd 0.5.0 through 0.5.3 serve the versioned protocol but leave
+//! `lightwalletProtocolVersion` empty, so the probe reports them *incapable*;
+//! `[backend] assume_transparent_in_compact_blocks` is the operator's out-of-band assertion for
+//! those. v0.5.4 is the first release that advertises the field, and the regtest harness runs it
+//! through the probe with no assertion.
 
 use std::sync::Arc;
 
@@ -62,9 +64,9 @@ impl LwdSource {
             .get_lightd_info(service::Empty {})
             .await?
             .into_inner();
-        // Legacy servers predate the field and report "". So does every released lightwalletd
-        // to date - the reference implementation never populates it - which is why the operator
-        // can assert the capability out of band ([backend]
+        // Legacy servers predate the field and report "". So do lightwalletd 0.5.0-0.5.3, which
+        // serve the data without advertising it (v0.5.4 is the first that does) - which is why
+        // the operator can assert the capability out of band ([backend]
         // assume_transparent_in_compact_blocks).
         let advertised = !info.lightwallet_protocol_version.is_empty();
         let pool_types_capable = advertised || assume_capable;

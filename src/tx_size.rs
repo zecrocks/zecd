@@ -243,6 +243,73 @@ pub fn max_transparent_inputs(max_bytes: usize, alongside: TxShape) -> usize {
     })
 }
 
+// ===================== ZIP 218 shielded budget =====================
+
+/// The per-block shielded budget [ZIP 218] imposes from NU7: Orchard actions, Ironwood actions
+/// and Sapling spends plus outputs together may not exceed this in one block (each Sprout
+/// JoinSplit would count two, but zecd builds none and NU7 permits none).
+///
+/// It is a *block* rule, but a transaction over it can never be mined, and zebra refuses one at
+/// the mempool before verifying its proofs - so it is a hard per-transaction ceiling too. Unlike
+/// `[spend] max_tx_bytes` and `orchard_action_limit` it is consensus: no knob raises it. Both
+/// of those bind first at their defaults (`orchard_action_limit` at 50 actions, the 250 KB byte
+/// ceiling at about 78); this is the backstop for a deployment that disables both.
+///
+/// [ZIP 218]: https://zips.z.cash/zip-0218
+pub const ZIP218_SHIELDED_BUDGET: usize = 330;
+
+/// ZIP 218's separate per-block cap on Sapling spends plus outputs, inside the shared
+/// [`ZIP218_SHIELDED_BUDGET`].
+pub const ZIP218_SAPLING_LIMIT: usize = 300;
+
+/// The Sapling builder pads a present bundle to at least this many outputs (`BundleType::
+/// DEFAULT`), and the padding outputs are real descriptions the budget counts.
+const SAPLING_MIN_OUTPUTS: usize = 2;
+
+/// Whether ZIP 218's shielded budget binds a transaction built at consensus branch `branch`.
+///
+/// Matched by name because `NetworkUpgrade` has no ordering to ask "NU7 or later" with: **a
+/// network upgrade after NU7 must be added here**, or transactions built under it lose the
+/// ceiling.
+pub fn zip218_budget_applies(branch: BranchId) -> bool {
+    matches!(branch, BranchId::Nu7)
+}
+
+/// Where a shape breaks ZIP 218's shielded budget, if it does: the cost counted and the cap it
+/// exceeds, with what was counted.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Zip218Overflow {
+    pub cost: usize,
+    pub cap: usize,
+    /// `"Sapling spends and outputs"`, or `"shielded actions, spends and outputs"` for the
+    /// shared budget.
+    pub what: &'static str,
+}
+
+/// Check `shape` against ZIP 218's shielded budget, ignoring branch (the caller gates on
+/// [`zip218_budget_applies`]). Sapling outputs are counted after the builder's padding, so a
+/// shape at the cap is not refused on the strength of a count the builder would then raise.
+pub fn zip218_overflow(shape: TxShape) -> Option<Zip218Overflow> {
+    let sapling = if shape.sapling_spends + shape.sapling_outputs > 0 {
+        shape.sapling_spends + shape.sapling_outputs.max(SAPLING_MIN_OUTPUTS)
+    } else {
+        0
+    };
+    if sapling > ZIP218_SAPLING_LIMIT {
+        return Some(Zip218Overflow {
+            cost: sapling,
+            cap: ZIP218_SAPLING_LIMIT,
+            what: "Sapling spends and outputs",
+        });
+    }
+    let cost = shape.orchard_family_actions() + sapling;
+    (cost > ZIP218_SHIELDED_BUDGET).then_some(Zip218Overflow {
+        cost,
+        cap: ZIP218_SHIELDED_BUDGET,
+        what: "shielded actions, spends and outputs",
+    })
+}
+
 /// The largest `n` for which `set(shape, n)` still estimates within `max_bytes`, or
 /// `usize::MAX` when `max_bytes` is 0 (the ceiling disabled) so a caller can `min` with it
 /// unconditionally.
@@ -485,5 +552,68 @@ mod tests {
         assert_eq!(compact_size_bytes(253), 3);
         assert_eq!(compact_size_bytes(0xFFFF), 3);
         assert_eq!(compact_size_bytes(0x1_0000), 5);
+    }
+
+    /// ZIP 218's two caps: the shared 330 across every shielded pool, and Sapling's own 300
+    /// inside it. Counted per bundle, so two bundles that each fit can still overflow together.
+    #[test]
+    fn the_zip218_budget_is_shared_across_pools() {
+        let ironwood = |n| TxShape {
+            ironwood_actions: n,
+            ..TxShape::default()
+        };
+        assert_eq!(zip218_overflow(ironwood(ZIP218_SHIELDED_BUDGET)), None);
+        assert_eq!(
+            zip218_overflow(ironwood(ZIP218_SHIELDED_BUDGET + 1)),
+            Some(Zip218Overflow {
+                cost: 331,
+                cap: 330,
+                what: "shielded actions, spends and outputs"
+            })
+        );
+        // Legacy Orchard spends into Ironwood outputs: two bundles, one budget.
+        let split = TxShape {
+            orchard_actions: 200,
+            ironwood_actions: 131,
+            ..TxShape::default()
+        };
+        assert_eq!(zip218_overflow(split).map(|o| o.cost), Some(331));
+        // Sapling counts toward the shared budget too.
+        let mixed = TxShape {
+            ironwood_actions: 100,
+            sapling_spends: 229,
+            sapling_outputs: 2,
+            ..TxShape::default()
+        };
+        assert_eq!(zip218_overflow(mixed).map(|o| o.cost), Some(331));
+        // Sapling's own cap binds first on a Sapling-only transaction.
+        let sapling = |spends| TxShape {
+            sapling_spends: spends,
+            sapling_outputs: 1,
+            ..TxShape::default()
+        };
+        assert_eq!(
+            zip218_overflow(sapling(298)),
+            None,
+            "1 output pads to 2: 300"
+        );
+        assert_eq!(
+            zip218_overflow(sapling(299)).map(|o| (o.cost, o.cap)),
+            Some((301, ZIP218_SAPLING_LIMIT))
+        );
+        // Transparent parts are outside the budget.
+        let transparent = TxShape {
+            transparent_inputs: 5_000,
+            ..TxShape::default()
+        };
+        assert_eq!(zip218_overflow(transparent), None);
+    }
+
+    /// The budget is an NU7 rule and nothing earlier is bound by it.
+    #[test]
+    fn the_zip218_budget_starts_at_nu7() {
+        assert!(zip218_budget_applies(BranchId::Nu7));
+        assert!(!zip218_budget_applies(BranchId::Nu6_3));
+        assert!(!zip218_budget_applies(BranchId::Nu5));
     }
 }

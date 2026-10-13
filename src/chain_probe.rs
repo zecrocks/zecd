@@ -17,7 +17,7 @@ use anyhow::Context;
 use zcash_client_backend::data_api::AccountBirthday;
 use zcash_protocol::consensus::BlockHeight;
 
-use crate::chain::{ChainSource, UnsupportedUpgrade};
+use crate::chain::{ChainSource, UnsupportedKind, UnsupportedUpgrade};
 use crate::config::AppConfig;
 use crate::network::ZNetwork;
 
@@ -43,8 +43,9 @@ pub struct ChainInfo {
     pub suggested_birthday: u32,
     /// Consensus branch ID in force at the tip, when the upstream reports one.
     pub tip_branch_id: Option<u32>,
-    /// Network upgrades the upstream knows of that this build does not - the outdated-build
-    /// signal. Empty is the healthy case.
+    /// Network upgrades the upstream follows that this build cannot - an unrecognized branch,
+    /// or a known one this build schedules at a different height. The outdated-build signal;
+    /// empty is the healthy case.
     pub unsupported_upgrades: Vec<UnsupportedUpgrade>,
     /// How long the dial plus both queries took.
     pub elapsed: Duration,
@@ -174,17 +175,24 @@ pub async fn probe(config: &AppConfig, server_override: Option<&str>) -> anyhow:
         h.reverse();
         hex::encode(h)
     });
+    let network_matches = crate::wallet::actor::chain_name_is_main(&info.chain_name)
+        .map(|upstream_is_main| upstream_is_main == matches!(config.network, ZNetwork::Main));
+    let mut unsupported_upgrades = crate::chain::unsupported_upgrades(&info, &config.network);
+    if network_matches == Some(false) {
+        // Comparing another chain's schedule against this network's flags every upgrade; the
+        // wrong-chain refusal is the finding, and the heights would only bury it.
+        unsupported_upgrades.retain(|u| u.kind == UnsupportedKind::UnknownBranch);
+    }
     Ok(ChainInfo {
         server: server.describe(),
         network: config.network,
-        network_matches: crate::wallet::actor::chain_name_is_main(&info.chain_name)
-            .map(|upstream_is_main| upstream_is_main == matches!(config.network, ZNetwork::Main)),
+        network_matches,
         chain_name: info.chain_name.clone(),
         tip_height,
         tip_hash,
         suggested_birthday: crate::init::fresh_wallet_birthday(tip_height),
         tip_branch_id: info.tip_branch_id,
-        unsupported_upgrades: crate::chain::unsupported_upgrades(&info),
+        unsupported_upgrades,
         elapsed,
     })
 }
@@ -233,16 +241,27 @@ pub async fn run(config: &AppConfig, args: &crate::config::ChainInfoArgs) -> any
     }
     if !info.unsupported_upgrades.is_empty() {
         for u in &info.unsupported_upgrades {
+            let at = match u.activation_height {
+                Some(h) => format!(" at height {h}"),
+                None => String::new(),
+            };
+            let verdict = match u.kind {
+                UnsupportedKind::UnknownBranch => "that this zecd build does not know".to_string(),
+                UnsupportedKind::ActivationHeightMismatch { expected: Some(h) } => format!(
+                    "that this zecd build schedules at height {h}; transactions built across \
+                     the difference would be rejected"
+                ),
+                UnsupportedKind::ActivationHeightMismatch { expected: None } => {
+                    "that this zecd build has not scheduled on this network; transactions \
+                     built after it activates would be rejected"
+                        .to_string()
+                }
+            };
             eprintln!(
-                "{}: upstream reports network upgrade {} (branch id {:08x}){} that this zecd \
-                 build does not know",
+                "{}: upstream reports network upgrade {} (branch id {:08x}){at} {verdict}",
                 if u.active { "error" } else { "warning" },
                 u.name,
                 u.branch_id,
-                match u.activation_height {
-                    Some(h) => format!(" at height {h}"),
-                    None => String::new(),
-                },
             );
         }
         if info.unsupported_upgrades.iter().any(|u| u.active) {
@@ -272,12 +291,22 @@ fn json_report(info: &ChainInfo) -> serde_json::Value {
         "unsupported_upgrades": info
             .unsupported_upgrades
             .iter()
-            .map(|u| serde_json::json!({
-                "name": u.name,
-                "branch_id": format!("{:08x}", u.branch_id),
-                "activation_height": u.activation_height,
-                "active": u.active,
-            }))
+            .map(|u| {
+                let (kind, expected) = match u.kind {
+                    UnsupportedKind::UnknownBranch => ("unknown_branch", None),
+                    UnsupportedKind::ActivationHeightMismatch { expected } => {
+                        ("activation_height_mismatch", expected)
+                    }
+                };
+                serde_json::json!({
+                    "name": u.name,
+                    "branch_id": format!("{:08x}", u.branch_id),
+                    "activation_height": u.activation_height,
+                    "active": u.active,
+                    "kind": kind,
+                    "expected_activation_height": expected,
+                })
+            })
             .collect::<Vec<_>>(),
         "usable": info.is_usable(),
         "elapsed_ms": info.elapsed.as_millis(),
@@ -310,6 +339,7 @@ mod tests {
             name: "future".into(),
             activation_height: Some(5),
             active,
+            kind: UnsupportedKind::UnknownBranch,
         }
     }
 

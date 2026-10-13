@@ -138,9 +138,10 @@ reconnect_max_secs = 60
 # Assert that the upstream lightwalletd serves transparent (and ironwood) data inside compact
 # blocks. zecd normally decides this from GetLightdInfo.lightwalletProtocolVersion, and refuses
 # to run a transparent-enabled wallet against a server that does not serve the data - otherwise
-# transparent receives would simply never appear. But no released lightwalletd populates that
-# field yet, so even a 0.5.x server that does serve the data reports "incapable" and is refused.
-# Set this to true to assert the capability yourself. Off by default: asserting it wrongly
+# transparent receives would simply never appear. lightwalletd 0.5.0-0.5.3 serve the data but
+# leave that field empty, so they report "incapable" and are refused; v0.5.4 and later advertise
+# it and need nothing here. Against 0.5.0-0.5.3, set this to true to assert the capability
+# yourself. Off by default: asserting it wrongly
 # reintroduces exactly the silent-loss failure the check exists to prevent. Shielded-only
 # wallets (the default) never need it, and a "zebra://" upstream ignores it.
 # assume_transparent_in_compact_blocks = false

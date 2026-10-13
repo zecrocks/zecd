@@ -18,7 +18,7 @@ use std::future::Future;
 
 use zcash_client_backend::proto::compact_formats::CompactBlock;
 use zcash_client_backend::proto::service;
-use zcash_protocol::consensus::{BlockHeight, BranchId};
+use zcash_protocol::consensus::{BlockHeight, BranchId, Parameters};
 use zcash_protocol::{ShieldedPool, TxId};
 
 /// The chain tip as reported by the upstream. `hash` is in internal byte order (reverse of
@@ -153,58 +153,115 @@ pub enum UpgradeStatus {
     Other,
 }
 
-/// A network upgrade the upstream chain follows (or is about to follow) whose consensus branch
-/// ID this zecd build does not recognize - the "this zecd is outdated" signal. When the NU6.3
-/// (ironwood) upgrade activated, builds that predated it kept fetching post-activation blocks
-/// they could not apply and looped on the same sync error forever with no explanation; this is
-/// the datum that lets the actor say *why* instead.
+/// A network upgrade the upstream chain follows (or is about to follow) that this zecd build
+/// cannot follow correctly - the "this zecd is outdated" signal. When the NU6.3 (ironwood)
+/// upgrade activated, builds that predated it kept fetching post-activation blocks they could
+/// not apply and looped on the same sync error forever with no explanation; this is the datum
+/// that lets the actor say *why* instead. [`UnsupportedUpgrade::kind`] says which of the two
+/// ways a build can be outdated applies.
 #[derive(Clone, Debug)]
 pub struct UnsupportedUpgrade {
     pub branch_id: u32,
     /// Upstream-reported name, or `"unknown upgrade"` when only a bare branch ID was seen.
     pub name: String,
+    /// The activation height the upstream reports.
     pub activation_height: Option<u32>,
     /// Whether the upgrade is already in force at the upstream tip (as opposed to pending at a
     /// future height).
     pub active: bool,
+    pub kind: UnsupportedKind,
 }
 
-/// The network upgrades the upstream reports that this build's librustzcash does not recognize
-/// (its [`BranchId`] enumeration is the complete set of consensus rules this build can scan
-/// under). Only `active`/`pending` entries count - a disabled upgrade will never rule the
-/// chain. The `consensus` branch IDs are a belt over the upgrades map: an unrecognized branch
-/// ruling the tip (or the very next block) is reported as an active unsupported upgrade even
-/// if the upgrades map omitted it.
-pub fn unsupported_upgrades(info: &ServerInfo) -> Vec<UnsupportedUpgrade> {
+/// The way a build is outdated for one [`UnsupportedUpgrade`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum UnsupportedKind {
+    /// This build's [`BranchId`] does not recognize the branch at all, so blocks past the
+    /// activation cannot be scanned.
+    UnknownBranch,
+    /// The branch is known, but this build activates it at `expected` (`None`: not scheduled
+    /// on this network at all) rather than the height the upstream reports. Scanning is
+    /// unaffected - the blocks parse - but every transaction built from the upstream's
+    /// activation height on commits to the wrong consensus branch id and is rejected. This is
+    /// the shape of a network upgrade whose height was set after the build was released: NU7
+    /// shipped with a testnet height and no mainnet height, so a zecd of that vintage knows
+    /// the branch and would have stayed silent until its first post-activation send failed.
+    ActivationHeightMismatch { expected: Option<u32> },
+}
+
+/// The network upgrades the upstream reports that this build cannot follow on `params`'s
+/// network. Two checks, one per [`UnsupportedKind`]:
+///
+/// * a branch ID this build's librustzcash does not recognize (its [`BranchId`] enumeration is
+///   the complete set of consensus rules this build can scan under); and
+/// * a recognized branch whose upstream-reported activation height differs from the one this
+///   build would use. Only entries that report a height are compared - an upstream that omits
+///   it says nothing about the schedule, and zebra lists no upgrade until it has a height.
+///
+/// Only `active`/`pending` entries count - a disabled upgrade will never rule the chain. The
+/// `consensus` branch IDs are a belt over the upgrades map: an unrecognized branch ruling the
+/// tip (or the very next block) is reported as an active unsupported upgrade even if the
+/// upgrades map omitted it, and a mismatched entry whose branch rules the tip or next block is
+/// promoted to active.
+///
+/// `params` must be the network the upstream was verified to serve; against any other network
+/// the height comparison reports every upgrade.
+pub fn unsupported_upgrades<P: Parameters>(
+    info: &ServerInfo,
+    params: &P,
+) -> Vec<UnsupportedUpgrade> {
     let known = |id: u32| BranchId::try_from(id).is_ok();
+    let in_play =
+        |u: &&UpgradeInfo| matches!(u.status, UpgradeStatus::Active | UpgradeStatus::Pending);
     let mut out: Vec<UnsupportedUpgrade> = info
         .upgrades
         .iter()
-        .filter(|u| matches!(u.status, UpgradeStatus::Active | UpgradeStatus::Pending))
+        .filter(in_play)
         .filter(|u| !known(u.branch_id))
         .map(|u| UnsupportedUpgrade {
             branch_id: u.branch_id,
             name: u.name.clone(),
             activation_height: u.activation_height,
             active: u.status == UpgradeStatus::Active,
+            kind: UnsupportedKind::UnknownBranch,
         })
         .collect();
+    for u in info.upgrades.iter().filter(in_play) {
+        let Some(nu) = BranchId::try_from(u.branch_id)
+            .ok()
+            .and_then(|b| b.network_upgrade())
+        else {
+            continue;
+        };
+        let Some(theirs) = u.activation_height else {
+            continue;
+        };
+        let ours = params.activation_height(nu).map(u32::from);
+        if ours != Some(theirs) {
+            out.push(UnsupportedUpgrade {
+                branch_id: u.branch_id,
+                name: u.name.clone(),
+                activation_height: Some(theirs),
+                active: u.status == UpgradeStatus::Active,
+                kind: UnsupportedKind::ActivationHeightMismatch { expected: ours },
+            });
+        }
+    }
     for id in [info.tip_branch_id, info.next_block_branch_id]
         .into_iter()
         .flatten()
     {
-        if !known(id) {
-            match out.iter_mut().find(|u| u.branch_id == id) {
-                // The chain is already (or imminently) governed by these rules; a map entry
-                // still marked pending is promoted so callers treat it with active severity.
-                Some(u) => u.active = true,
-                None => out.push(UnsupportedUpgrade {
-                    branch_id: id,
-                    name: "unknown upgrade".to_string(),
-                    activation_height: None,
-                    active: true,
-                }),
-            }
+        match out.iter_mut().find(|u| u.branch_id == id) {
+            // The chain is already (or imminently) governed by these rules; a map entry
+            // still marked pending is promoted so callers treat it with active severity.
+            Some(u) => u.active = true,
+            None if !known(id) => out.push(UnsupportedUpgrade {
+                branch_id: id,
+                name: "unknown upgrade".to_string(),
+                activation_height: None,
+                active: true,
+                kind: UnsupportedKind::UnknownBranch,
+            }),
+            None => {}
         }
     }
     out
@@ -552,6 +609,8 @@ impl Drop for AbortOnDrop {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::network::ZNetwork;
+    use zcash_protocol::consensus::NetworkUpgrade;
 
     fn info(upgrades: Vec<UpgradeInfo>, tip: Option<u32>, next: Option<u32>) -> ServerInfo {
         ServerInfo {
@@ -589,14 +648,14 @@ mod tests {
             Some(KNOWN_NU6),
             Some(KNOWN_NU6),
         );
-        assert!(unsupported_upgrades(&i).is_empty());
+        assert!(unsupported_upgrades(&i, &ZNetwork::Main).is_empty());
     }
 
     /// An upstream that doesn't report upgrades at all (empty map, no consensus IDs) disables
     /// the detection rather than erroring or guessing.
     #[test]
     fn absent_upgrade_data_reports_nothing() {
-        assert!(unsupported_upgrades(&info(vec![], None, None)).is_empty());
+        assert!(unsupported_upgrades(&info(vec![], None, None), &ZNetwork::Main).is_empty());
     }
 
     /// The core outdated-build case: the upstream lists an upgrade whose branch ID this build's
@@ -615,7 +674,7 @@ mod tests {
             None,
             None,
         );
-        let got = unsupported_upgrades(&i);
+        let got = unsupported_upgrades(&i, &ZNetwork::Main);
         assert_eq!(got.len(), 2, "active + pending unknown, never disabled");
         assert!(got[0].active && got[0].branch_id == FUTURE);
         assert_eq!(got[0].name, "NU-Future");
@@ -628,7 +687,7 @@ mod tests {
     #[test]
     fn unknown_tip_branch_is_reported_without_a_map_entry() {
         let i = info(vec![], Some(FUTURE), Some(FUTURE));
-        let got = unsupported_upgrades(&i);
+        let got = unsupported_upgrades(&i, &ZNetwork::Main);
         assert_eq!(got.len(), 1, "one entry, not one per consensus field");
         assert!(got[0].active);
         assert_eq!(got[0].branch_id, FUTURE);
@@ -650,10 +709,110 @@ mod tests {
             Some(KNOWN_NU6),
             Some(FUTURE),
         );
-        let got = unsupported_upgrades(&i);
+        let got = unsupported_upgrades(&i, &ZNetwork::Main);
         assert_eq!(got.len(), 1);
         assert!(got[0].active, "imminent activation is active severity");
         assert_eq!(got[0].name, "NU-Future", "the map entry's name is kept");
+    }
+
+    const NU7: u32 = 0x7719_0ad9;
+
+    /// The case the height check exists for: a node that has scheduled NU7 on mainnet, talking
+    /// to a build whose protocol crate has not. The branch ID is known, so the unknown-branch
+    /// check is silent - yet every send from that height on would commit to the NU6.3 branch.
+    #[test]
+    fn a_known_upgrade_this_build_has_not_scheduled_is_reported() {
+        assert_eq!(
+            u32::from(BranchId::Nu7),
+            NU7,
+            "fixture tracks the real branch ID"
+        );
+        assert_eq!(
+            ZNetwork::Main.activation_height(NetworkUpgrade::Nu7),
+            None,
+            "this test pins the build that predates a mainnet NU7 height"
+        );
+        let i = info(
+            vec![
+                upgrade(KNOWN_NU6, "NU6", 2_726_400, UpgradeStatus::Active),
+                upgrade(NU7, "NU7", 3_600_000, UpgradeStatus::Pending),
+            ],
+            Some(KNOWN_NU6),
+            Some(KNOWN_NU6),
+        );
+        let got = unsupported_upgrades(&i, &ZNetwork::Main);
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].branch_id, NU7);
+        assert_eq!(got[0].activation_height, Some(3_600_000));
+        assert!(!got[0].active, "pending: the advance warning");
+        assert_eq!(
+            got[0].kind,
+            UnsupportedKind::ActivationHeightMismatch { expected: None }
+        );
+
+        // Once the next block follows the NU7 branch, the same entry is active severity.
+        let i = ServerInfo {
+            next_block_branch_id: Some(NU7),
+            ..i
+        };
+        let got = unsupported_upgrades(&i, &ZNetwork::Main);
+        assert_eq!(got.len(), 1);
+        assert!(got[0].active);
+    }
+
+    /// A known upgrade the upstream schedules at a different height from this build is the same
+    /// failure (transactions on one side of the boundary commit to the wrong branch), and the
+    /// report carries this build's height so an operator can see the disagreement.
+    #[test]
+    fn a_known_upgrade_at_a_different_height_is_reported_with_both_heights() {
+        let i = info(
+            vec![upgrade(KNOWN_NU6, "NU6", 2_726_401, UpgradeStatus::Active)],
+            None,
+            None,
+        );
+        let got = unsupported_upgrades(&i, &ZNetwork::Main);
+        assert_eq!(got.len(), 1);
+        assert!(got[0].active);
+        assert_eq!(got[0].activation_height, Some(2_726_401));
+        assert_eq!(
+            got[0].kind,
+            UnsupportedKind::ActivationHeightMismatch {
+                expected: Some(2_726_400)
+            }
+        );
+    }
+
+    /// The live testnet schedule (NU6.3 and NU7 both in force) agrees with this build, and an
+    /// entry that reports no height is never compared - silence about the schedule is not a
+    /// disagreement with it.
+    #[test]
+    fn the_testnet_schedule_agrees_and_heightless_entries_are_skipped() {
+        let nu63 = ZNetwork::Test
+            .activation_height(NetworkUpgrade::Nu6_3)
+            .expect("testnet schedules NU6.3");
+        let i = info(
+            vec![
+                upgrade(
+                    u32::from(BranchId::Nu6_3),
+                    "NU6.3",
+                    u32::from(nu63),
+                    UpgradeStatus::Active,
+                ),
+                upgrade(NU7, "NU7", 4_465_026, UpgradeStatus::Active),
+            ],
+            Some(NU7),
+            Some(NU7),
+        );
+        assert!(unsupported_upgrades(&i, &ZNetwork::Test).is_empty());
+
+        let heightless = UpgradeInfo {
+            branch_id: NU7,
+            name: "NU7".to_string(),
+            activation_height: None,
+            status: UpgradeStatus::Pending,
+        };
+        let i = info(vec![heightless], None, None);
+        assert!(unsupported_upgrades(&i, &ZNetwork::Main).is_empty());
     }
 
     /// h2's load-shed reason survives only in the **`Debug`** rendering of a source deep in

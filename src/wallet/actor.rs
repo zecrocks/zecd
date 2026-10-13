@@ -29,8 +29,8 @@ use zcash_client_backend::data_api::{
     WalletWrite,
 };
 use zcash_client_backend::fees::{
-    standard::MultiOutputChangeStrategy, DustOutputPolicy, SplitPolicy, StandardFeeRule,
-    TransactionBalance,
+    canonical_crossing_fee, standard::MultiOutputChangeStrategy, DustOutputPolicy, SplitPolicy,
+    StandardFeeRule, TransactionBalance,
 };
 use zcash_client_backend::proposal::{Proposal, ShieldedInputs};
 use zcash_client_backend::proto::service;
@@ -41,7 +41,9 @@ use zcash_client_sqlite::error::SqliteClientError;
 use zcash_client_sqlite::AccountUuid;
 use zcash_keys::address::Address;
 use zcash_keys::keys::UnifiedFullViewingKey;
-use zcash_primitives::transaction::builder::{BuildConfig, Builder, BundlePadding};
+use zcash_primitives::transaction::builder::{
+    BuildConfig, Builder, BundlePadding, DEFAULT_TX_EXPIRY_DELTA,
+};
 use zcash_primitives::transaction::components::orchard::bundle_version_for_branch;
 use zcash_primitives::transaction::fees::zip317::FeeRule as Zip317FeeRule;
 use zcash_primitives::transaction::fees::{transparent as transparent_fees, FeeRule as _};
@@ -58,7 +60,8 @@ use zip321::TransactionRequest;
 use crate::backoff::Backoff;
 use crate::chain::{
     hub::{ChainHub, HubSource},
-    BroadcastOutcome, ChainSource, MempoolStream, ServerInfo, TxEvidence, UnsupportedUpgrade,
+    BroadcastOutcome, ChainSource, MempoolStream, ServerInfo, TxEvidence, UnsupportedKind,
+    UnsupportedUpgrade,
 };
 use crate::config::SendPrivacy;
 use crate::error::{codes, ErrorDetails, InsufficientFunds, RpcError};
@@ -378,7 +381,10 @@ fn sync_failure_is_terminal(e: &anyhow::Error) -> bool {
 /// be actively harmful. Within that class:
 ///  * an unsupported network upgrade already ruling the chain explains the failure outright
 ///    (the scan is hitting post-activation blocks this build cannot parse), so it is named
-///    immediately - this is the "old zecd after NU6.3 activated" loop; and
+///    immediately - this is the "old zecd after NU6.3 activated" loop. Only an unrecognized
+///    branch qualifies: a known branch scheduled at a different height
+///    ([`UnsupportedKind::ActivationHeightMismatch`]) breaks sends, not scanning, so it cannot
+///    explain a scan failure; and
 ///  * otherwise, once the same error has repeated [`PERSISTENT_SYNC_ERROR_THRESHOLD`] times,
 ///    the wallet database itself is the prime suspect (e.g. a shardtree `Insert(Conflict)`
 ///    that no restart or version upgrade clears), and the guidance points at the
@@ -396,7 +402,7 @@ fn sync_failure_hint(
     if !apply_side {
         return None;
     }
-    if let Some(u) = upgrade {
+    if let Some(u) = upgrade.filter(|u| u.kind == UnsupportedKind::UnknownBranch) {
         let height = u
             .activation_height
             .map(|h| format!(", activated at height {h}"))
@@ -1095,12 +1101,13 @@ struct WalletActor {
     /// For an encrypted wallet that's currently unlocked: when the seed auto-relocks. Re-running
     /// `walletpassphrase` overwrites it (resetting the timer); `walletlock` clears it.
     unlock_until: Option<Instant>,
-    /// Network upgrades the connected upstream reports whose consensus branch IDs this build
-    /// does not recognize (captured at each connect from `getblockchaininfo`; see
-    /// [`crate::chain::unsupported_upgrades`]). An *active* entry means the chain is already
-    /// governed by rules this build can't scan under - the cause behind an otherwise-mysterious
-    /// stuck sync loop - and a *pending* one is the advance warning to update zecd before
-    /// activation. Drives the connect-time announcements and the sync-error attribution.
+    /// Network upgrades the connected upstream reports that this build cannot follow - an
+    /// unrecognized consensus branch, or a known one scheduled at a different height (captured
+    /// at each connect from `getblockchaininfo`; see [`crate::chain::unsupported_upgrades`]).
+    /// An *active* unrecognized entry means the chain is already governed by rules this build
+    /// can't scan under - the cause behind an otherwise-mysterious stuck sync loop - and a
+    /// *pending* one is the advance warning to update zecd before activation. Drives the
+    /// connect-time announcements and the sync-error attribution.
     unsupported_upgrades: Vec<UnsupportedUpgrade>,
     /// The display text of the most recent sync error, and how many consecutive sync passes
     /// have failed with exactly it. Reset on any successful pass. A growing streak of the
@@ -1895,6 +1902,12 @@ fn build_signed_transparent_tx(
             ironwood_padding: BundlePadding::DEFAULT,
         },
     );
+    // ZIP 218's post-NU7 expiry delta (see `tx_expiry_delta`); before NU7 the builder's own
+    // `target + 40` already is the rule, so it is left untouched there.
+    let target = BlockHeight::from(target_height);
+    if net.is_nu_active(NetworkUpgrade::Nu7, target) {
+        builder = builder.with_expiry_height(target + tx_expiry_delta(&net, target));
+    }
 
     // Add and key each transparent input. The signing key is derived from the USK transparent
     // component at the input address's recorded `(scope, index)`; the builder matches each
@@ -2799,21 +2812,44 @@ impl WalletActor {
                 .activation_height
                 .map(|h| h.to_string())
                 .unwrap_or_else(|| "unknown".to_string());
-            if u.active {
-                error!(
+            match (u.kind, u.active) {
+                (UnsupportedKind::UnknownBranch, true) => error!(
                     "the upstream chain has activated network upgrade '{name}' (consensus \
                      branch 0x{:08x}, activation height {height}) which this zecd build does \
                      not support: block scanning cannot proceed past the activation. \
                      {UPGRADE_GUIDANCE}",
                     u.branch_id
-                );
-            } else {
-                warn!(
+                ),
+                (UnsupportedKind::UnknownBranch, false) => warn!(
                     "the upstream reports network upgrade '{name}' (consensus branch \
                      0x{:08x}) activating at height {height}, which this zecd build does not \
                      support: syncing will stop there. {UPGRADE_GUIDANCE}",
                     u.branch_id
-                );
+                ),
+                (UnsupportedKind::ActivationHeightMismatch { expected }, active) => {
+                    let ours = match expected {
+                        Some(h) => format!("schedules it at height {h}"),
+                        None => "has no activation height for it on this network".to_string(),
+                    };
+                    if active {
+                        error!(
+                            "the upstream chain activated network upgrade '{name}' (consensus \
+                             branch 0x{:08x}) at height {height}, but this zecd build {ours}: \
+                             transactions it builds commit to the wrong consensus branch and \
+                             the network rejects them. Scanning is unaffected. \
+                             {UPGRADE_GUIDANCE}",
+                            u.branch_id
+                        )
+                    } else {
+                        warn!(
+                            "the upstream reports network upgrade '{name}' (consensus branch \
+                             0x{:08x}) activating at height {height}, but this zecd build \
+                             {ours}: transactions built from that height on will commit to the \
+                             wrong consensus branch and be rejected. {UPGRADE_GUIDANCE}",
+                            u.branch_id
+                        )
+                    }
+                }
             }
         }
     }
@@ -2835,10 +2871,11 @@ impl WalletActor {
         // activation height is at/below the tip we've seen (the status is a snapshot from
         // connect time and can go stale across the boundary).
         let upgrade = self.unsupported_upgrades.iter().find(|u| {
-            u.active
-                || u.activation_height
-                    .zip(self.tip_height)
-                    .is_some_and(|(h, tip)| h <= tip)
+            u.kind == UnsupportedKind::UnknownBranch
+                && (u.active
+                    || u.activation_height
+                        .zip(self.tip_height)
+                        .is_some_and(|(h, tip)| h <= tip))
         });
         let apply_side = e.downcast_ref::<engine::WalletApplyError>().is_some();
         match sync_failure_hint(apply_side, self.sync_error_streak, &self.name, upgrade) {
@@ -2884,7 +2921,8 @@ impl WalletActor {
                 // announce any gap once per connection (a persistent apply failure reconnects
                 // on the paced retry, so an active gap stays visible in the log alongside each
                 // "sync error" it causes).
-                self.unsupported_upgrades = crate::chain::unsupported_upgrades(&info);
+                self.unsupported_upgrades =
+                    crate::chain::unsupported_upgrades(&info, &self.network);
                 self.log_unsupported_upgrades();
             }
         }
@@ -5629,6 +5667,7 @@ impl WalletActor {
                 orchard_action_limit,
             )?;
             enforce_max_tx_bytes(&proposal, proposal_branch(&net, &proposal), max_tx_bytes)?;
+            enforce_zip218_budget(&proposal, proposal_branch(&net, &proposal))?;
             let shape = proposal_shape(&proposal, proposal_branch(&net, &proposal));
             let orchard_circuit = orchard_circuit_for_branch(proposal_branch(&net, &proposal));
             let pczt = create_pczt_from_proposal::<_, _, Infallible, _, Infallible, _>(
@@ -5637,9 +5676,9 @@ impl WalletActor {
                 account_id,
                 OvkPolicy::Sender,
                 &proposal,
-                // `None` lets librustzcash derive the expiry from the proposal's target height,
-                // matching the fused build path (and the pre-#2412 behaviour).
-                None,
+                // ZIP 218's post-NU7 expiry delta; `None` before NU7 and for a ZIP 318
+                // canonical crossing, where the builder's own expiry is the right one.
+                send_expiry_override(&*db, &net, &proposal),
                 // Selects the padding of the Orchard bundle only; the Ironwood bundle's is
                 // derived from the proposal. The Orchard bundle is always padded to the default
                 // action floor, which is what the change strategy above costed against.
@@ -5916,6 +5955,7 @@ impl WalletActor {
                     orchard_action_limit,
                 )?;
                 enforce_max_tx_bytes(&proposal, proposal_branch(&net, &proposal), max_tx_bytes)?;
+                enforce_zip218_budget(&proposal, proposal_branch(&net, &proposal))?;
                 let shape = proposal_shape(&proposal, proposal_branch(&net, &proposal));
                 let build = start.elapsed();
                 let p0 = Instant::now();
@@ -5927,9 +5967,8 @@ impl WalletActor {
                     &SpendingKeys::from_unified_spending_key(usk),
                     OvkPolicy::Sender,
                     &proposal,
-                    // `None` keeps the builder-derived expiry from the proposal's target
-                    // height, matching the PCZT path.
-                    None,
+                    // Same expiry rule as the PCZT path (see `send_expiry_override`).
+                    send_expiry_override(&*db, &net, &proposal),
                 )
                 .map_err(|e| {
                     enrich_insufficient_funds(db, &engine_dir, scope, policy, classify_err(e))
@@ -6602,6 +6641,7 @@ impl WalletActor {
             proposal_branch(&net, &proposal),
             self.spend_limits.max_tx_bytes(),
         )?;
+        enforce_zip218_budget(&proposal, proposal_branch(&net, &proposal))?;
 
         let (shielding_utxos, shielding_value) = {
             let inputs = proposal.steps().head.transparent_inputs();
@@ -6654,9 +6694,8 @@ impl WalletActor {
                     &SpendingKeys::from_unified_spending_key(usk),
                     OvkPolicy::Sender,
                     &proposal,
-                    // `None` keeps the builder-derived expiry from the proposal's target
-                    // height, matching the fused send path.
-                    None,
+                    // Same expiry rule as every send path (see `send_expiry_override`).
+                    send_expiry_override(&*db, &net, &proposal),
                 )
                 .map_err(|e| {
                     let s = e.to_string();
@@ -6964,6 +7003,7 @@ impl WalletActor {
                         proposal_branch(&net, &proposal),
                         max_tx_bytes,
                     )?;
+                    enforce_zip218_budget(&proposal, proposal_branch(&net, &proposal))?;
                     MergeWork::UtxoProposal(proposal)
                 };
 
@@ -7040,10 +7080,23 @@ impl WalletActor {
                 let sapling_bytes_cap = tx_size::max_sapling_spends(max_tx_bytes, merge_dest_shape);
                 let fits_size_ceiling =
                     orchard_family_n <= family_bytes_cap && sapling_n <= sapling_bytes_cap;
+                // And ZIP 218's shielded budget, from NU7: a selection over it builds a
+                // transaction no node will mine. Truncated to like the byte ceiling, for the
+                // same reason. The delegated path is taken only with room for the destination
+                // output and a second bundle's spare action, so it certainly fits; the manual
+                // path below counts exactly.
+                let zip218_applies = tx_size::zip218_budget_applies(BranchId::for_height(
+                    &net,
+                    BlockHeight::from(target_height),
+                ));
+                let fits_zip218 = !zip218_applies
+                    || (sapling_n + orchard_family_n + 2 <= tx_size::ZIP218_SHIELDED_BUDGET
+                        && sapling_n + 2 <= tx_size::ZIP218_SAPLING_LIMIT);
 
                 if sapling_n + orchard_family_n <= limit
                     && family_fits_action_limit
                     && fits_size_ceiling
+                    && fits_zip218
                 {
                     // No limit binds: delegate the whole proposal (selection, fee, pool
                     // routing, TEX rejection) to librustzcash's send-max primitive.
@@ -7085,6 +7138,7 @@ impl WalletActor {
                         proposal_branch(&net, &proposal),
                         max_tx_bytes,
                     )?;
+                    enforce_zip218_budget(&proposal, proposal_branch(&net, &proposal))?;
                     Ok(MergePlan {
                         work: MergeWork::NoteProposal(proposal),
                         merging_utxos: 0,
@@ -7106,6 +7160,12 @@ impl WalletActor {
                         limit.min(orchard_action_limit).min(family_bytes_cap)
                     } else {
                         limit.min(family_bytes_cap)
+                    };
+                    // An upper bound only: the loop below shrinks to the exact budget.
+                    let cap = match (zip218_applies, family_is_sapling) {
+                        (false, _) => cap,
+                        (true, true) => cap.min(tx_size::ZIP218_SAPLING_LIMIT),
+                        (true, false) => cap.min(tx_size::ZIP218_SHIELDED_BUDGET),
                     };
                     // A ceiling too small for even one note is a configuration error, not an
                     // empty selection: truncating to zero would surface as "insufficient
@@ -7155,7 +7215,9 @@ impl WalletActor {
                     // So the loop asks `merge_action_counts` - the same function the fee is
                     // priced from, and the counts the builder is configured with - and drops the
                     // largest note until it fits. Bounded by the selection length, and normally
-                    // zero iterations: it bites only on a mixed-pool wallet at the cap.
+                    // zero iterations: it bites only on a mixed-pool wallet at the cap. From NU7
+                    // the same counts are held to ZIP 218's shielded budget, which a selection
+                    // clamped to exactly the budget overruns by its destination output.
                     let (sapling_spends, sapling_out, orchard_act, ironwood_act) = loop {
                         let sapling_spends = fam
                             .iter()
@@ -7177,9 +7239,18 @@ impl WalletActor {
                             orchard_spends,
                             ironwood_spends,
                         )?;
-                        if orchard_action_limit == 0
-                            || orchard_act + ironwood_act <= orchard_action_limit
-                        {
+                        let within_action_limit = orchard_action_limit == 0
+                            || orchard_act + ironwood_act <= orchard_action_limit;
+                        let within_zip218 = !zip218_applies
+                            || tx_size::zip218_overflow(tx_size::TxShape {
+                                orchard_actions: orchard_act,
+                                ironwood_actions: ironwood_act,
+                                sapling_spends,
+                                sapling_outputs: sapling_out,
+                                ..Default::default()
+                            })
+                            .is_none();
+                        if within_action_limit && within_zip218 {
                             break (sapling_spends, sapling_out, orchard_act, ironwood_act);
                         }
                         // One note that still does not fit means the cap cannot express any
@@ -7267,6 +7338,7 @@ impl WalletActor {
                         proposal_branch(&net, &proposal),
                         max_tx_bytes,
                     )?;
+                    enforce_zip218_budget(&proposal, proposal_branch(&net, &proposal))?;
 
                     Ok(MergePlan {
                         work: MergeWork::NoteProposal(proposal),
@@ -7312,7 +7384,7 @@ impl WalletActor {
                         &SpendingKeys::from_unified_spending_key(usk),
                         OvkPolicy::Sender,
                         &proposal,
-                        None,
+                        send_expiry_override(&*db, &net, &proposal),
                     )
                     .map_err(classify_merge_execute_err)?;
                     if txids.len() > 1 {
@@ -7340,7 +7412,7 @@ impl WalletActor {
                         &SpendingKeys::from_unified_spending_key(usk),
                         OvkPolicy::Sender,
                         &proposal,
-                        None,
+                        send_expiry_override(&*db, &net, &proposal),
                     )
                     .map_err(classify_merge_execute_err)?;
                     if txids.len() > 1 {
@@ -8415,6 +8487,58 @@ fn orchard_action_overflow(
     })
 }
 
+/// The transaction expiry delta ZIP 218 recommends after NU7: 120 blocks, which keeps a
+/// transaction's validity window at the ~50 minutes the 40-block delta gave at 75-second blocks.
+/// The wallet stack's builder still applies its fixed 40-block `DEFAULT_TX_EXPIRY_DELTA` at
+/// every height (about 17 minutes once NU7's 25-second blocks are in force, short enough that a
+/// slow prove plus a busy mempool expires a send before it mines), so zecd supplies the expiry
+/// itself from NU7 on.
+pub(crate) const POST_NU7_TX_EXPIRY_DELTA: u32 = 120;
+
+/// The expiry delta, in blocks, for a transaction targeting `target` on `net`: the builder's
+/// own 40 before NU7, [`POST_NU7_TX_EXPIRY_DELTA`] from it. The one definition every send path
+/// shares, so "40 before, 120 after" cannot mean two things.
+fn tx_expiry_delta(net: &ZNetwork, target: BlockHeight) -> u32 {
+    if net.is_nu_active(NetworkUpgrade::Nu7, target) {
+        POST_NU7_TX_EXPIRY_DELTA
+    } else {
+        DEFAULT_TX_EXPIRY_DELTA
+    }
+}
+
+/// The `expiry_height` override to hand `create_proposed_transactions` /
+/// `create_pczt_from_proposal` for `proposal`.
+///
+/// `None` - the builder's own expiry - in two cases. Before NU7, where it is already the
+/// recommended `target + 40`, which keeps every pre-NU7 transaction byte-for-byte what it was.
+/// And for a ZIP 318 canonical crossing, which carries the rolling expiry every crossing in its
+/// period shares: the wallet layer refuses an explicit expiry on one
+/// (`ExpiryHeightConflictsWithCanonicalCrossing`) because a per-transaction expiry is exactly
+/// what would single it out. The crossing test is the wallet layer's own (`Step::
+/// is_canonical_crossing` against the wallet's pool-migration parameters and the standard fee),
+/// mirrored here because the override has to be decided before the call that would refuse it.
+fn send_expiry_override<DbT: WalletRead, FeeRuleT, NoteRef>(
+    db: &DbT,
+    net: &ZNetwork,
+    proposal: &Proposal<FeeRuleT, NoteRef>,
+) -> Option<BlockHeight> {
+    let target = BlockHeight::from(proposal.min_target_height());
+    if !net.is_nu_active(NetworkUpgrade::Nu7, target) {
+        return None;
+    }
+    let canonical_crossing = canonical_crossing_fee(net, target).is_ok_and(|fee| {
+        let params = db.pool_migration_params();
+        proposal
+            .steps()
+            .iter()
+            .any(|step| step.is_canonical_crossing(&params, fee))
+    });
+    if canonical_crossing {
+        return None;
+    }
+    Some(target + tx_expiry_delta(net, target))
+}
+
 /// The consensus branch a proposal will be built against: its target height decides the
 /// transaction version, and with it how many actions each Orchard-protocol bundle needs.
 fn proposal_branch<FeeRuleT, NoteRef>(
@@ -8458,7 +8582,56 @@ fn enforce_max_tx_bytes<FeeRuleT, NoteRef>(
         let bytes = tx_size::estimate_bytes(tx_size::step_shape(step, branch));
         if bytes > max_bytes {
             return Err(RpcError::invalid_parameter(format!(
-                "This send would build a transaction of about {bytes} bytes, over the current                  limit of {max_bytes}, which exists because a node will not relay a transaction                  larger than its own mempool policy - such a transaction is proved at full cost                  and then never mined. Send to fewer recipients, or consolidate first with                  z_mergetoaddress ([\"ANY_ORCHARD\"], your own address, repeatedly until                  remainingNotes is 0), which spends fewer, larger notes. Or raise [spend]                  max_tx_bytes (0 disables the ceiling) and send SIGHUP to reload it without                  restarting - but only if every node between this wallet and a miner accepts                  the larger size."
+                "This send would build a transaction of about {bytes} bytes, over the current \
+                 limit of {max_bytes}, which exists because a node will not relay a transaction \
+                 larger than its own mempool policy - such a transaction is proved at full cost \
+                 and then never mined. Send to fewer recipients, or consolidate first with \
+                 z_mergetoaddress ([\"ANY_ORCHARD\"], your own address, repeatedly until \
+                 remainingNotes is 0), which spends fewer, larger notes. Or raise [spend] \
+                 max_tx_bytes (0 disables the ceiling) and send SIGHUP to reload it without \
+                 restarting - but only if every node between this wallet and a miner accepts \
+                 the larger size."
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Enforce ZIP 218's shielded budget on a built proposal, from NU7 on: no step may carry more
+/// Orchard-family actions plus Sapling spends and outputs than one block may hold
+/// ([`tx_size::ZIP218_SHIELDED_BUDGET`]), nor more Sapling descriptions than its own cap
+/// ([`tx_size::ZIP218_SAPLING_LIMIT`]).
+///
+/// The third bound beside [`enforce_orchard_action_limit`] and [`enforce_max_tx_bytes`], and
+/// the only consensus one: a transaction over it can never be mined, and zebra refuses it at
+/// the mempool before checking its proofs, so proving one wastes the whole build. At their
+/// defaults the other two bind long before it; this is what stops a wallet that has disabled
+/// both (`0`) from building, say, a 400-note `z_mergetoaddress` nobody will mine.
+fn enforce_zip218_budget<FeeRuleT, NoteRef>(
+    proposal: &Proposal<FeeRuleT, NoteRef>,
+    branch: BranchId,
+) -> Result<(), RpcError> {
+    if !tx_size::zip218_budget_applies(branch) {
+        return Ok(());
+    }
+    for step in proposal.steps() {
+        let shape = tx_size::step_shape(step, branch);
+        if let Some(over) = tx_size::zip218_overflow(shape) {
+            let split = if shape.orchard_actions > 0 && shape.ironwood_actions > 0 {
+                format!(
+                    " It carries two shielded bundles, counted together: {} Orchard actions \
+                     spending legacy notes, and {} Ironwood actions.",
+                    shape.orchard_actions, shape.ironwood_actions
+                )
+            } else {
+                String::new()
+            };
+            return Err(RpcError::invalid_parameter(format!(
+                "This transaction would carry {} {}, over the {} that ZIP 218 allows in a whole \
+                 block from NU7 on, so no node would mine it.{split} This is a consensus rule, \
+                 not a setting. Send to fewer recipients, or consolidate first with \
+                 z_mergetoaddress, which sizes each round to fit.",
+                over.cost, over.what, over.cap
             )));
         }
     }
@@ -9084,6 +9257,38 @@ mod tests {
         );
     }
 
+    /// ZIP 218's expiry rule as zecd applies it: the builder's own 40 blocks up to the last
+    /// pre-NU7 block, 120 from activation. Pinned on testnet, the one network that schedules
+    /// NU7 in this build, and on mainnet, where it must stay 40 until a mainnet height ships
+    /// (`network::tests::nu7_is_scheduled_on_testnet_only` is the tripwire for that). The
+    /// override's other half - leaving a ZIP 318 canonical crossing on its rolling expiry -
+    /// needs a real proposal, so it is covered only where a chain activates NU7.
+    #[test]
+    fn the_expiry_delta_triples_at_nu7() {
+        use super::{tx_expiry_delta, POST_NU7_TX_EXPIRY_DELTA};
+        use crate::network::ZNetwork;
+        use zcash_primitives::transaction::builder::DEFAULT_TX_EXPIRY_DELTA;
+        use zcash_protocol::consensus::{BlockHeight, NetworkUpgrade, Parameters as _};
+
+        let nu7 = ZNetwork::Test
+            .activation_height(NetworkUpgrade::Nu7)
+            .expect("testnet schedules NU7");
+        assert_eq!(DEFAULT_TX_EXPIRY_DELTA, 40);
+        assert_eq!(POST_NU7_TX_EXPIRY_DELTA, 3 * DEFAULT_TX_EXPIRY_DELTA);
+        assert_eq!(
+            tx_expiry_delta(&ZNetwork::Test, nu7 - 1),
+            DEFAULT_TX_EXPIRY_DELTA
+        );
+        assert_eq!(
+            tx_expiry_delta(&ZNetwork::Test, nu7),
+            POST_NU7_TX_EXPIRY_DELTA
+        );
+        assert_eq!(
+            tx_expiry_delta(&ZNetwork::Main, BlockHeight::from_u32(10_000_000)),
+            DEFAULT_TX_EXPIRY_DELTA
+        );
+    }
+
     /// The merge's destination-pool resolution mirrors librustzcash's
     /// `resolve_shielded_destination`: Orchard receivers take precedence and land in Ironwood
     /// once NU6.3 is active (else Orchard); Sapling-only recipients land in Sapling. Getting
@@ -9403,13 +9608,14 @@ mod tests {
     #[test]
     fn sync_failure_hint_attributes_only_diagnosable_failures() {
         use super::{sync_failure_hint, PERSISTENT_SYNC_ERROR_THRESHOLD};
-        use crate::chain::UnsupportedUpgrade;
+        use crate::chain::{UnsupportedKind, UnsupportedUpgrade};
 
         let upgrade = UnsupportedUpgrade {
             branch_id: 0xdead_beef,
             name: "NU-Future".to_string(),
             activation_height: Some(4_100_000),
             active: true,
+            kind: UnsupportedKind::UnknownBranch,
         };
 
         // Transport-class failures: no hint, no matter the streak or upgrade state.
@@ -9428,6 +9634,17 @@ mod tests {
         assert!(hint.contains("4100000"), "{hint}");
         assert!(hint.contains("latest zecd release"), "{hint}");
         assert!(hint.contains("forum.zcashcommunity.com"), "{hint}");
+
+        // A known branch scheduled at a different height breaks sends, not scanning, so it is
+        // never offered as the cause of a scan failure - the database ladder applies instead.
+        let misscheduled = UnsupportedUpgrade {
+            kind: UnsupportedKind::ActivationHeightMismatch { expected: None },
+            ..upgrade.clone()
+        };
+        assert_eq!(
+            sync_failure_hint(true, 1, "default", Some(&misscheduled)),
+            None
+        );
 
         // Apply-side, no upgrade: quiet below the persistence threshold (a one-off apply error
         // can be a reorg racing the batch)...

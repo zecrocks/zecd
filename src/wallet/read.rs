@@ -543,7 +543,10 @@ fn txid_internal(display_hex: &str) -> Option<Vec<u8>> {
 /// with `getbalance` - including the `min_observed_height + DEFAULT_TX_EXPIRY_DELTA` staleness
 /// branch (a tx with unknown expiry is treated as unexpired only while recently observed). The
 /// caller must bind `:target_height` to the next-to-be-mined height (chain tip + 1). Keep this in
-/// sync with upstream on every `zcash_client_sqlite` bump.
+/// sync with upstream on every `zcash_client_sqlite` bump. That includes the 40-block delta past
+/// NU7, where zecd's own sends take a 120-block expiry (`actor::POST_NU7_TX_EXPIRY_DELTA`): the
+/// branch only governs rows whose expiry is *unknown*, and departing from upstream here would make
+/// these listings disagree with the selector and balances that still use 40.
 fn tx_unexpired_sql(alias: &str) -> String {
     format!(
         "{alias}.mined_height < :target_height

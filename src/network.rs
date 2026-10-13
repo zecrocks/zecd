@@ -51,6 +51,55 @@ impl ZNetwork {
     pub fn is_regtest(&self) -> bool {
         matches!(self, ZNetwork::Regtest(_))
     }
+
+    /// The peer protocol version ([ZIP 204]) of the newest network upgrade this build schedules
+    /// on this network - the number `getnetworkinfo.protocolversion` reports.
+    ///
+    /// zecd speaks no P2P, so there is no wire version to report. The useful answer is the one
+    /// a node gives: which consensus rules this build follows. Each upgrade's minimum peer
+    /// version is that statement in the network's own vocabulary, and a node that has not
+    /// reached it is disconnected after activation, so a fixed number goes stale with the next
+    /// upgrade. Deriving it from the schedule means a protocol-crate bump that schedules an
+    /// upgrade moves this value with it.
+    ///
+    /// "Schedules", not "has activated": a build carrying a future activation height already
+    /// follows those rules from that height, which is what a node's advertised version says
+    /// too. The values are zebra's `Version::min_specified_for_upgrade`; testnet and regtest
+    /// share testnet's, and from NU7 on mainnet and testnet are assigned distinct versions.
+    ///
+    /// [ZIP 204]: https://zips.z.cash/zip-0204
+    pub fn protocol_version(&self) -> u32 {
+        use NetworkUpgrade::*;
+        // Newest first; the first one this network schedules decides.
+        const NEWEST_FIRST: [NetworkUpgrade; 11] = [
+            Nu7, Nu6_3, Nu6_2, Nu6_1, Nu6, Nu5, Canopy, Heartwood, Blossom, Sapling, Overwinter,
+        ];
+        let mainnet = matches!(self, ZNetwork::Main);
+        let Some(newest) = NEWEST_FIRST
+            .into_iter()
+            .find(|nu| self.activation_height(*nu).is_some())
+        else {
+            return 170_002;
+        };
+        let (main, test) = match newest {
+            Nu7 => (170_190, 170_180),
+            Nu6_3 => (170_160, 170_160),
+            Nu6_2 => (170_150, 170_150),
+            Nu6_1 => (170_140, 170_130),
+            Nu6 => (170_120, 170_110),
+            Nu5 => (170_100, 170_050),
+            Canopy => (170_013, 170_012),
+            Heartwood => (170_011, 170_010),
+            Blossom => (170_009, 170_008),
+            Sapling => (170_007, 170_007),
+            Overwinter => (170_005, 170_003),
+        };
+        if mainnet {
+            main
+        } else {
+            test
+        }
+    }
 }
 
 impl Parameters for ZNetwork {
@@ -206,6 +255,36 @@ mod tests {
             None,
             "the pinned protocol now schedules NU7 on mainnet - update the docs and notes"
         );
+    }
+
+    /// The reported protocol version follows the newest upgrade this build schedules: NU7 on
+    /// testnet, NU6.3 on mainnet until the protocol crate schedules NU7 there (at which point
+    /// this, like `nu7_is_scheduled_on_testnet_only`, fails and should move to 170190).
+    #[test]
+    fn protocol_version_follows_the_newest_scheduled_upgrade() {
+        assert_eq!(ZNetwork::Test.protocol_version(), 170_180);
+        assert_eq!(ZNetwork::Main.protocol_version(), 170_160);
+
+        let h = |n| Some(BlockHeight::from_u32(n));
+        let local = |nu6_3, nu7| {
+            ZNetwork::Regtest(LocalNetwork {
+                overwinter: h(1),
+                sapling: h(1),
+                blossom: h(1),
+                heartwood: h(1),
+                canopy: h(1),
+                nu5: h(1),
+                nu6: h(1),
+                nu6_1: h(4),
+                nu6_2: h(4),
+                nu6_3,
+                nu7,
+            })
+        };
+        // Regtest takes testnet's numbers, and an upgrade it does not schedule does not count.
+        assert_eq!(local(None, None).protocol_version(), 170_150);
+        assert_eq!(local(h(8), None).protocol_version(), 170_160);
+        assert_eq!(local(h(8), h(12)).protocol_version(), 170_180);
     }
 
     #[test]

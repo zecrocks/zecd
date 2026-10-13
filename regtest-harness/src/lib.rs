@@ -178,6 +178,26 @@ const NU6_2_ACTIVATION_HEIGHT: u32 = 4;
 /// branch id and zebra rejects the tx (loud failure, not silent). Needs zebrad >= 6.2.2, which
 /// accepts the `"NU6.3"` activation-height key.
 pub const NU6_3_ACTIVATION_HEIGHT: u32 = 8;
+
+/// NU7 activation height for the regtest chain, from `ZECD_REGTEST_NU7_HEIGHT` - the same variable
+/// `zecd`'s `network::regtest()` reads, so the node, the wallet under test and the [`Funder`]
+/// (which inherits the environment) agree by construction. Unset, the default and what CI runs,
+/// leaves NU7 off the chain: the pinned funder release predates NU7, so an NU7 leg needs a funder
+/// that understands it first. When setting it, pick a height above [`NU6_3_ACTIVATION_HEIGHT`]
+/// that is a multiple of 3 (ZIP 259 requires every NU7 activation height to be), and add the
+/// variable to the chain-snapshot cache key in `regtest.yml`, which does not otherwise see it.
+/// Needs a node that accepts the `NU7` activation-height key (zebrad >= 7.0.0-rc.0, zakura >= 1.5.0).
+///
+/// A set but unparseable value panics rather than silently dropping NU7, for the reason
+/// `network::regtest()` gives: a schedule disagreement surfaces far away as an opaque rejection.
+pub fn regtest_nu7_height() -> Option<u32> {
+    let s = std::env::var("ZECD_REGTEST_NU7_HEIGHT").ok()?;
+    Some(
+        s.trim().parse().unwrap_or_else(|_| {
+            panic!("ZECD_REGTEST_NU7_HEIGHT must be a block height, got {s:?}")
+        }),
+    )
+}
 /// ZIP-271 one-time lockbox disbursement paid in the NU6.1 activation block's coinbase. A P2SH
 /// regtest address and a token amount (<= the pool accrued by [`NU6_2_ACTIVATION_HEIGHT`]).
 const LOCKBOX_DISBURSEMENT_ADDR: &str = "t27eWDgjFYJGVXmzrXeVjnb5J3uXDM9xH9v";
@@ -290,6 +310,7 @@ impl Zebrad {
                 miner_address,
                 &cache_dir.to_string_lossy(),
                 nu6_3_height,
+                regtest_nu7_height(),
                 RegtestNode::from_env(),
             ),
         )
@@ -322,6 +343,7 @@ impl Zebrad {
                 miner_address,
                 &cache_dir.to_string_lossy(),
                 self.nu6_3_height,
+                regtest_nu7_height(),
                 RegtestNode::from_env(),
             ),
         )
@@ -387,6 +409,7 @@ impl Zebrad {
                 miner_address,
                 &cache_dir.to_string_lossy(),
                 nu6_3_height,
+                regtest_nu7_height(),
                 RegtestNode::from_env(),
             ),
         )
@@ -491,6 +514,7 @@ fn zebrad_toml(
     miner_address: &str,
     cache_dir: &str,
     nu6_3_height: u32,
+    nu7_height: Option<u32>,
     node: RegtestNode,
 ) -> String {
     let nu6_2 = NU6_2_ACTIVATION_HEIGHT;
@@ -499,6 +523,11 @@ fn zebrad_toml(
     // NU6.3 (ironwood) activation. Needs zebrad >= 6.2.2; older releases have no `"NU6.3"` key and
     // reject an unknown activation-height entry at startup.
     let nu6_3_line = format!("\"NU6.3\" = {nu6_3_height}\n");
+    // NU7, only when asked for (see `regtest_nu7_height`). Needs zebrad >= 7.0.0-rc.0 / zakura
+    // >= 1.5.0; an older node rejects the unknown key at startup.
+    let nu7_line = nu7_height
+        .map(|h| format!("NU7 = {h}\n"))
+        .unwrap_or_default();
     let mempool_section = mempool_policy_section(node);
     // zakurad runs a second, QUIC P2P stack on every network but mainnet, bound to a fixed
     // `0.0.0.0:8234`. From zakura 1.5.0 a taken port fails startup, so concurrent harness nodes
@@ -527,7 +556,7 @@ NU5 = 1
 NU6 = 1
 "NU6.1" = {nu6_2}
 "NU6.2" = {nu6_2}
-{nu6_3_line}
+{nu6_3_line}{nu7_line}
 # A deferred (lockbox) funding stream so the pool has something to disburse at NU6.1.
 [[network.testnet_parameters.funding_streams]]
 [network.testnet_parameters.funding_streams.height_range]
@@ -3139,14 +3168,13 @@ fn write_zecd_toml(datadir: &Path, cfg: &ZecdConfig) -> Result<()> {
         Some(grpc_port) => format!("http://127.0.0.1:{grpc_port}"),
         None => format!("zebra://127.0.0.1:{}", cfg.zebra_rpc_port),
     };
-    // In light mode, assert the upstream's transparent-in-compact-blocks capability. The
-    // harness builds lightwalletd from a 0.5.x release, which serves that data - but no
-    // released lightwalletd populates `GetLightdInfo.lightwalletProtocolVersion`, so zecd's
-    // connect-time probe cannot see the capability and would refuse every transparent wallet.
-    let backend_capability = match cfg.lightwalletd_grpc_port {
-        Some(_) => "assume_transparent_in_compact_blocks = true\n",
-        None => "",
-    };
+    // NB no `[backend] assume_transparent_in_compact_blocks` in light mode. The harness builds
+    // lightwalletd from a release that advertises the versioned protocol
+    // (`GetLightdInfo.lightwalletProtocolVersion`, first populated in v0.5.4), so zecd's own
+    // connect-time probe decides - which is the path a real light-mode deployment takes, and the
+    // one the transparent lwd suites never exercised while the harness asserted the capability
+    // out of band. A local `LIGHTWALLETD_BIN` older than 0.5.4 now refuses transparent wallets,
+    // exactly as it would in production.
     // Optional `[spend]` knobs: `cache_proving_key` (no current test - see the field's docs),
     // `privacy_policy` (fully-transparent spend e2e), `pipeline_proving` and
     // `orchard_action_limit` (stress test), `max_tx_bytes` (merge e2e). Emit the section only
@@ -3254,7 +3282,7 @@ server = "{server}"
 connect_timeout_secs = 5
 reconnect_base_secs = 1
 reconnect_max_secs = 2
-{backend_capability}
+
 [rpc]
 bind = "127.0.0.1"
 port = {rpc_port}
@@ -3362,7 +3390,7 @@ mod tests {
         assert!(zakura.ends_with("\n\n"), "{zakura}");
 
         // And it lands in the rendered config as its own top-level table, ahead of `[mining]`.
-        let render = |node| zebrad_toml(1, 2, SEED_MINER_ADDRESS, "/tmp/state", 8, node);
+        let render = |node| zebrad_toml(1, 2, SEED_MINER_ADDRESS, "/tmp/state", 8, None, node);
         let zakura_toml = render(RegtestNode::Zakura);
         let mempool_at = zakura_toml
             .find("\n[mempool]\n")
@@ -3370,6 +3398,32 @@ mod tests {
         let mining_at = zakura_toml.find("\n[mining]\n").expect("[mining] section");
         assert!(mempool_at < mining_at, "{zakura_toml}");
         assert!(!render(RegtestNode::Zebra).contains("[mempool]"));
+    }
+
+    /// NU7 is written into the activation table only when a height is given, directly after
+    /// NU6.3 so the table stays in upgrade order; the default config is unchanged.
+    #[test]
+    fn the_nu7_activation_line_is_written_only_when_asked_for() {
+        let without = zebrad_toml(
+            1,
+            2,
+            SEED_MINER_ADDRESS,
+            "/tmp/state",
+            8,
+            None,
+            RegtestNode::Zebra,
+        );
+        assert!(!without.contains("NU7"), "{without}");
+        let with = zebrad_toml(
+            1,
+            2,
+            SEED_MINER_ADDRESS,
+            "/tmp/state",
+            8,
+            Some(12),
+            RegtestNode::Zebra,
+        );
+        assert!(with.contains("\"NU6.3\" = 8\nNU7 = 12\n"), "{with}");
     }
 
     #[test]

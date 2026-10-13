@@ -33,11 +33,11 @@ on:
   workflow_dispatch:
     inputs:
       zebra-image:
-        description: "zfnd/zebra image tag to test against (e.g. 6.3.0, latest)"
+        description: "zfnd/zebra image tag to test against (e.g. 7.0.0-rc.0, latest)"
         required: false
         default: ""
       zakura-image:
-        description: "zakuracore/zakura image tag to test against (e.g. 1.2.0, latest)"
+        description: "zakuracore/zakura image tag to test against (e.g. 1.6.0, latest)"
         required: false
         default: ""
       stress:
@@ -91,14 +91,20 @@ on:
 # and a manual dispatch can name any tag. Bumping a node = changing its one value here (the harness
 # drives the node purely over JSON-RPC, so nothing else needs to move in lockstep).
 #
+# Both pins are NU7-era releases (zebra 7.0.0-rc.0, zakura 1.6.0) so every PR runs against the
+# config validation and RPC surface the network now requires, even though the regtest chain
+# itself does not activate NU7 (see ZECD_REGTEST_NU7_HEIGHT in regtest-harness/src/lib.rs for
+# why). Move zebra to 7.0.0 when it is final. NB `latest` on the weekly schedule can lag a
+# release candidate: zfnd/zebra:latest still pointed at 6.4.2 when 7.0.0-rc.0 was pinned here.
+#
 # IMPORTANT: no workflow env var may start with `ZEBRA_` or `ZAKURA_` - zebrad/zakurad parse
 # such-prefixed environment variables as config overrides and exit with "unknown field" on ones
 # they don't recognise. (The harness also scrubs both prefixes before spawning the node, as a
 # second line of defence.) NB `ZEBRAD_*`/`ZAKURAD_*` (with the trailing D) are safe - the prefix
 # match requires the underscore right after `ZEBRA`/`ZAKURA`.
 env:
-  ZEBRAD_IMAGE_PINNED: "6.3.0"
-  ZAKURAD_IMAGE_PINNED: "1.2.0"
+  ZEBRAD_IMAGE_PINNED: "7.0.0-rc.0"
+  ZAKURAD_IMAGE_PINNED: "1.6.0"
   # The funding wallet is a *released* zecd, from its own digest-pinned GHCR image. Running a
   # release rather than the build under test keeps the two sides of every funded test independent -
   # a regression on this branch cannot mask itself by being present in both the wallet under test
@@ -126,8 +132,10 @@ env:
   # talks straight to the node. 0.5.0 is the first release serving the versioned lightwallet
   # protocol, which is what carries transparent and Ironwood data in compact blocks; the chain is
   # NU6.3-active throughout, so it also has to parse a V6 transaction, which the old v0.4.19 image
-  # cannot.
-  LIGHTWALLETD_VERSION: "v0.5.3"
+  # cannot. 0.5.4 is the first release that *advertises* that protocol
+  # (`GetLightdInfo.lightwalletProtocolVersion`), which is what lets the harness stop asserting
+  # the capability with `assume_transparent_in_compact_blocks` and run zecd's real probe.
+  LIGHTWALLETD_VERSION: "v0.5.4"
   # The harness --test targets for the standard (zecd) suite. Both node legs (zebra and zakura)
   # run this full list; only the zecd-lwd leg overrides it with its own subset (see the matrix
   # `include` below). Extended/stress tests skip in seconds unless their gate is set.
@@ -419,7 +427,7 @@ jobs:
           ZECD_STRESS_NOTE_COUNT: ${{ inputs.stress-note-count }}
           # The shielded-coinbase e2e needs a zebrad whose block template builds valid shielded
           # coinbase (zebra >= 6.0.0; 5.0.0's Orchard coinbase proof fails its own validation),
-          # and self-skips otherwise. The pinned image (6.3.0) and `latest` both have the
+          # and self-skips otherwise. The pinned image (7.0.0-rc.0) and `latest` both have the
           # capability, so a skip is a failure everywhere except a manual dispatch that names a
           # custom (possibly older) image - guards against the test silently never running. Both
           # node legs run the coinbase suite, and zakura inherits zebra's template code, so the
