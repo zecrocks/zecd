@@ -4499,7 +4499,7 @@ dependencies = [
 
 [[package]]
 name = "zecd"
-version = "0.9.0-rc2"
+version = "0.9.0-rc3"
 dependencies = [
  "age",
  "anyhow",
