@@ -13,9 +13,13 @@
 //!     cargo test --release --test embedded_regtest -- --ignored --nocapture
 //! ```
 //!
-//! The chain deliberately does NOT activate NU6.3 and the test does not set
-//! `ZECD_REGTEST_NU63_HEIGHT`, so the two sides agree pre-NU6.3 (the harness's NU6.3-active
-//! chains cover ironwood; this test is about the embedding seam, not the pool).
+//! The chain activates NU6.3 and NU7 at the heights `ZECD_REGTEST_NU63_HEIGHT` and
+//! `ZECD_REGTEST_NU7_HEIGHT` name - the same variables zecd's `network::regtest()` reads, so
+//! the node and the embedded wallet agree by construction - and refuses to run without the
+//! NU6.3 one. It used to stay pre-NU6.3, but the wallet stack can no longer build an Orchard
+//! bundle before NU6.3 (Zakura Common 3.0 removed proving under the historical circuits), so a
+//! pre-NU6.3 chain cannot complete the funded send below. The workflow sets both, matching the
+//! harness tier.
 
 use std::io::{Read as _, Write as _};
 use std::path::PathBuf;
@@ -38,9 +42,9 @@ midnight culture idea mountain fame park social drip bid doctor scatter glance d
 /// `--test-threads=1` every caller would have to remember to pass.
 static SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
-/// The regtest chain shape zecd's `network::regtest()` expects (the harness's template minus
-/// the NU6.3 activation): NU5/NU6 from genesis, NU6.1/NU6.2 at height 4 with the ZIP-271
-/// lockbox disbursement their activation block requires.
+/// The regtest chain shape zecd's `network::regtest()` expects (the harness's template): NU5/NU6
+/// from genesis, NU6.1/NU6.2 at height 4 with the ZIP-271 lockbox disbursement their activation
+/// block requires, then NU6.3 and NU7 at the heights [`upgrade_heights`] reads.
 /// `miner_address` is where coinbase goes, and may be a unified address (zebra >= 6.0.0 mines
 /// ZIP-213 shielded coinbase). The **lockbox disbursement** address deliberately stays
 /// [`MINER_ADDRESS`] and is not parameterized: zebra parses it as a transparent address while
@@ -48,6 +52,8 @@ static SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 /// `hard-coded address must deserialize: Parse("unexpected payload length")` before the RPC
 /// port ever opens - which presents as a bare connection-refused timeout.
 fn zebrad_toml(net_port: u16, rpc_port: u16, cache_dir: &str, miner_address: &str) -> String {
+    let (nu6_3, nu7) = upgrade_heights();
+    let nu7_line = nu7.map(|h| format!("NU7 = {h}\n")).unwrap_or_default();
     format!(
         r#"[network]
 network = "Regtest"
@@ -61,7 +67,8 @@ NU5 = 1
 NU6 = 1
 "NU6.1" = 4
 "NU6.2" = 4
-
+"NU6.3" = {nu6_3}
+{nu7_line}
 [[network.testnet_parameters.funding_streams]]
 [network.testnet_parameters.funding_streams.height_range]
 start = 1
@@ -87,6 +94,25 @@ listen_addr = "127.0.0.1:{rpc_port}"
 enable_cookie_auth = false
 "#
     )
+}
+
+/// The NU6.3 and NU7 activation heights for the node, from the variables zecd's
+/// `network::regtest()` reads, so the two sides cannot disagree (a mismatch diverges the
+/// consensus branch id and the node rejects every transaction). NU6.3 is required: without it
+/// no shielded send can be built at all.
+fn upgrade_heights() -> (u32, Option<u32>) {
+    let read = |var: &str| {
+        std::env::var(var).ok().map(|v| {
+            v.trim()
+                .parse::<u32>()
+                .unwrap_or_else(|_| panic!("{var} must be a block height, got {v:?}"))
+        })
+    };
+    let nu6_3 = read("ZECD_REGTEST_NU63_HEIGHT").expect(
+        "set ZECD_REGTEST_NU63_HEIGHT (CI uses 8): the wallet stack cannot build a shielded \
+         send before NU6.3",
+    );
+    (nu6_3, read("ZECD_REGTEST_NU7_HEIGHT"))
 }
 
 /// Kills the zebrad child on drop so a failed assertion never leaks a node.

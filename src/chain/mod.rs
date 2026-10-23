@@ -717,33 +717,45 @@ mod tests {
 
     const NU7: u32 = 0x7719_0ad9;
 
-    /// The case the height check exists for: a node that has scheduled NU7 on mainnet, talking
-    /// to a build whose protocol crate has not. The branch ID is known, so the unknown-branch
-    /// check is silent - yet every send from that height on would commit to the NU6.3 branch.
+    /// The case the height check exists for: a node that has scheduled an upgrade this build
+    /// knows by branch ID but has no height for. That was mainnet NU7 until the protocol crate
+    /// scheduled it; the fixture is now a regtest schedule without NU7, the one network where
+    /// this build can still lack the height. The branch ID is known, so the unknown-branch check
+    /// is silent - yet every send from that height on would commit to the previous branch.
     #[test]
     fn a_known_upgrade_this_build_has_not_scheduled_is_reported() {
+        use zcash_protocol::local_consensus::LocalNetwork;
         assert_eq!(
             u32::from(BranchId::Nu7),
             NU7,
             "fixture tracks the real branch ID"
         );
-        assert_eq!(
-            ZNetwork::Main.activation_height(NetworkUpgrade::Nu7),
-            None,
-            "this test pins the build that predates a mainnet NU7 height"
-        );
+        let h = |n| Some(BlockHeight::from_u32(n));
+        let without_nu7 = ZNetwork::Regtest(LocalNetwork {
+            overwinter: h(1),
+            sapling: h(1),
+            blossom: h(1),
+            heartwood: h(1),
+            canopy: h(1),
+            nu5: h(1),
+            nu6: h(1),
+            nu6_1: h(4),
+            nu6_2: h(4),
+            nu6_3: h(8),
+            nu7: None,
+        });
         let i = info(
             vec![
-                upgrade(KNOWN_NU6, "NU6", 2_726_400, UpgradeStatus::Active),
-                upgrade(NU7, "NU7", 3_600_000, UpgradeStatus::Pending),
+                upgrade(KNOWN_NU6, "NU6", 1, UpgradeStatus::Active),
+                upgrade(NU7, "NU7", 300, UpgradeStatus::Pending),
             ],
             Some(KNOWN_NU6),
             Some(KNOWN_NU6),
         );
-        let got = unsupported_upgrades(&i, &ZNetwork::Main);
+        let got = unsupported_upgrades(&i, &without_nu7);
         assert_eq!(got.len(), 1);
         assert_eq!(got[0].branch_id, NU7);
-        assert_eq!(got[0].activation_height, Some(3_600_000));
+        assert_eq!(got[0].activation_height, Some(300));
         assert!(!got[0].active, "pending: the advance warning");
         assert_eq!(
             got[0].kind,
@@ -755,9 +767,33 @@ mod tests {
             next_block_branch_id: Some(NU7),
             ..i
         };
-        let got = unsupported_upgrades(&i, &ZNetwork::Main);
+        let got = unsupported_upgrades(&i, &without_nu7);
         assert_eq!(got.len(), 1);
         assert!(got[0].active);
+    }
+
+    /// The mainnet schedule zebra 7 and zakura 1.7 report - NU7 at ZIP 259's height - agrees
+    /// with this build, pending or active, so a current deployment logs nothing.
+    #[test]
+    fn the_mainnet_nu7_schedule_agrees() {
+        assert_eq!(
+            ZNetwork::Main.activation_height(NetworkUpgrade::Nu7),
+            Some(BlockHeight::from_u32(3_543_405)),
+        );
+        for (status, next) in [
+            (UpgradeStatus::Pending, KNOWN_NU6),
+            (UpgradeStatus::Active, NU7),
+        ] {
+            let i = info(
+                vec![
+                    upgrade(KNOWN_NU6, "NU6", 2_726_400, UpgradeStatus::Active),
+                    upgrade(NU7, "NU7", 3_543_405, status),
+                ],
+                Some(KNOWN_NU6),
+                Some(next),
+            );
+            assert!(unsupported_upgrades(&i, &ZNetwork::Main).is_empty());
+        }
     }
 
     /// A known upgrade the upstream schedules at a different height from this build is the same

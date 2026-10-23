@@ -403,17 +403,18 @@ fn check_backend(config: &AppConfig, findings: &mut Vec<Finding>) {
             continue;
         }
         // The actor refuses to run a transparent-enabled wallet against a lightwalletd that
-        // does not advertise transparent data in compact blocks - and no released lightwalletd
-        // populates the advertisement, so in practice the assertion knob is required. Only a
-        // warning: whether a given server advertises it is a fact about the server, not the
-        // config, and this check never dials.
+        // does not advertise transparent data in compact blocks, which 0.5.0-0.5.3 serve without
+        // advertising (0.5.4 is the first release that does). Only a warning: whether a given
+        // server advertises it is a fact about the server, not the config, and this check never
+        // dials.
         if lightwalletd && !assume_transparent {
             findings.push(Finding::warning(format!(
                 "wallet '{name}' has [pools] transparent = true against a lightwalletd upstream: \
                  the wallet refuses to run unless the server advertises that it serves \
-                 transparent data in compact blocks, and no released lightwalletd populates that \
-                 advertisement yet. Set [backend] assume_transparent_in_compact_blocks = true to \
-                 assert it, or point [backend] server at your own zebra"
+                 transparent data in compact blocks, which lightwalletd 0.5.4 and later do. \
+                 Against 0.5.0-0.5.3, which serve the data without advertising it, set \
+                 [backend] assume_transparent_in_compact_blocks = true to assert it; otherwise \
+                 point [backend] server at your own zebra"
             )));
         }
         if lightwalletd

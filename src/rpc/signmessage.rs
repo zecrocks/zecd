@@ -19,7 +19,7 @@ use std::io::Write as _;
 use base64::Engine as _;
 use secp256k1::{
     ecdsa::{RecoverableSignature, RecoveryId},
-    Message, Secp256k1,
+    Message,
 };
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -60,16 +60,14 @@ pub(crate) fn message_hash(message: &str) -> [u8; 32] {
 /// (header byte `31 + recovery_id`, then the 64-byte compact `r||s`). The signature is
 /// deterministic (RFC 6979), so a given (key, message) always yields the same string.
 pub(crate) fn sign_message_with_key(secret_key: &secp256k1::SecretKey, message: &str) -> String {
-    let hash = message_hash(message);
-    let secp = Secp256k1::new();
-    let msg = Message::from_digest_slice(&hash).expect("message_hash always returns 32 bytes");
+    let msg = Message::from_digest(message_hash(message));
 
-    let recoverable_sig = secp.sign_ecdsa_recoverable(&msg, secret_key);
+    let recoverable_sig = RecoverableSignature::sign_ecdsa_recoverable(msg, secret_key);
     let (recovery_id, sig_bytes) = recoverable_sig.serialize_compact();
 
     // Header byte is 31 + recovery_id for compressed-pubkey signatures.
     // <https://github.com/zcash/zcash/blob/v6.11.0/src/pubkey.cpp#L227>
-    let header = 31 + recovery_id.to_i32() as u8;
+    let header = 31 + recovery_id.to_u8();
     let mut signature = [0u8; 65];
     signature[0] = header;
     signature[1..65].copy_from_slice(&sig_bytes);
@@ -113,19 +111,14 @@ pub(crate) fn verify_message<P: Parameters>(
     }
     let recovery_id = ((header - 27) & 3) as i32;
 
-    let hash = message_hash(message);
-    let secp = Secp256k1::new();
-
-    let Ok(recid) = RecoveryId::from_i32(recovery_id) else {
+    let Ok(recid) = RecoveryId::try_from(recovery_id) else {
         return Ok(false);
     };
     let Ok(recoverable_sig) = RecoverableSignature::from_compact(&sig_bytes[1..65], recid) else {
         return Ok(false);
     };
-    let Ok(msg) = Message::from_digest_slice(&hash) else {
-        return Ok(false);
-    };
-    let Ok(recovered_pubkey) = secp.recover_ecdsa(&msg, &recoverable_sig) else {
+    let msg = Message::from_digest(message_hash(message));
+    let Ok(recovered_pubkey) = recoverable_sig.recover_ecdsa(msg) else {
         return Ok(false);
     };
 
@@ -197,12 +190,11 @@ mod tests {
     /// A random secp256k1 keypair, for the sign→verify round-trips.
     fn test_keypair() -> (secp256k1::SecretKey, secp256k1::PublicKey) {
         use rand::Rng;
-        let secp = Secp256k1::new();
         let mut secret_bytes = [0u8; 32];
         rand::rng().fill_bytes(&mut secret_bytes);
-        let secret_key = secp256k1::SecretKey::from_slice(&secret_bytes)
+        let secret_key = secp256k1::SecretKey::from_secret_bytes(secret_bytes)
             .expect("32 random bytes should be a valid secret key");
-        let public_key = secp256k1::PublicKey::from_secret_key(&secp, &secret_key);
+        let public_key = secp256k1::PublicKey::from_secret_key(&secret_key);
         (secret_key, public_key)
     }
 

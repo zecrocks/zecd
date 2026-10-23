@@ -4,11 +4,17 @@ all-features = true
 [advisories]
 version = 2
 yanked = "deny"
-# No advisory exceptions are currently needed. The last one, RUSTSEC-2026-0173
-# (proc-macro-error2 unmaintained), went away when `age` 0.12 moved to
-# i18n-embed-fl 0.10 - which depends on the maintained proc-macro-error3 fork -
-# and getset 0.1.7 (orchard's build-time dependency) dropped it too.
-ignore = []
+# One exception. The previous one, RUSTSEC-2026-0173 (proc-macro-error2
+# unmaintained), went away when `age` 0.12 moved to i18n-embed-fl 0.10 - which
+# depends on the maintained proc-macro-error3 fork - and getset 0.1.7 (orchard's
+# build-time dependency) dropped it too.
+ignore = [
+    # basic-toml unmaintained. Reached only through i18n-config 0.4.8 (its newest
+    # release), which `age`'s `fl!` proc-macros use to read age's own i18n.toml at
+    # compile time; nothing parses runtime input with it. Drop this once
+    # i18n-config or age moves off it.
+    { id = "RUSTSEC-2026-0374", reason = "build-time only, via age's i18n proc-macros; no maintained release of i18n-config avoids it" },
+]
 
 [licenses]
 version = 2

@@ -29,8 +29,8 @@ use zcash_client_backend::data_api::{
     WalletWrite,
 };
 use zcash_client_backend::fees::{
-    canonical_crossing_fee, standard::MultiOutputChangeStrategy, DustOutputPolicy, SplitPolicy,
-    StandardFeeRule, TransactionBalance,
+    standard::MultiOutputChangeStrategy, DustOutputPolicy, SplitPolicy, StandardFeeRule,
+    TransactionBalance,
 };
 use zcash_client_backend::proposal::{Proposal, ShieldedInputs};
 use zcash_client_backend::proto::service;
@@ -41,9 +41,7 @@ use zcash_client_sqlite::error::SqliteClientError;
 use zcash_client_sqlite::AccountUuid;
 use zcash_keys::address::Address;
 use zcash_keys::keys::UnifiedFullViewingKey;
-use zcash_primitives::transaction::builder::{
-    BuildConfig, Builder, BundlePadding, DEFAULT_TX_EXPIRY_DELTA,
-};
+use zcash_primitives::transaction::builder::{BuildConfig, Builder, BundlePadding};
 use zcash_primitives::transaction::components::orchard::bundle_version_for_branch;
 use zcash_primitives::transaction::fees::zip317::FeeRule as Zip317FeeRule;
 use zcash_primitives::transaction::fees::{transparent as transparent_fees, FeeRule as _};
@@ -94,115 +92,84 @@ type ProposalError = zcash_client_backend::data_api::error::Error<
     zcash_client_sqlite::ReceivedNoteId,
 >;
 
-/// The Orchard (+ Ironwood) proving keys every send proves with, plus their verifying keys,
-/// shared (read-only) across every wallet actor via `Arc`.
+/// The Orchard-family proving key every send proves with, plus its verifying key, shared
+/// (read-only) across every wallet actor via `Arc`.
 ///
-/// The keys themselves live in **the Zakura stack's process-wide cache**
+/// The key itself lives in **the Zakura stack's process-wide cache**
 /// (`zcash_primitives::transaction::builder::cached_orchard_proving_key`, one `OnceLock` per
 /// circuit version): the fork's fused transaction builder reads its key from there on every
-/// `Builder::build`, so holding `&'static` references to the same cells means the PCZT prove
+/// `Builder::build`, so holding a `&'static` reference to the same cell means the PCZT prove
 /// path and the fused path (`create_proposed_transactions`, used by Sapling-spending wallets,
 /// transparent-source sends, `z_shieldcoinbase`, `z_mergetoaddress` and `cache_proving_key =
-/// false`) prove with **one** key set. zecd used to build its own copy, which was the whole
-/// point of this type when the upstream builder regenerated a key per transaction (a
-/// `Params::new` + `keygen_vk` + `keygen_pk`, seconds of work); the fork caches it, reads the
-/// commitment parameters from an embedded artifact instead of regenerating them, and leaves
-/// zecd two jobs: warm the cells in the background at startup rather than on the first send,
-/// and arm the fork's prepared commitment tables (see [`ProvingKeyCache::build`]).
+/// false`) prove with **one** key. zecd used to build its own copy, which was the whole point
+/// of this type when the upstream builder regenerated a key per transaction (a `Params::new` +
+/// `keygen_vk` + `keygen_pk`, seconds of work); the fork caches it, reads the commitment
+/// parameters from an embedded artifact instead of regenerating them, and leaves zecd two jobs:
+/// warm the cell in the background at startup rather than on the first send, and arm the fork's
+/// prepared commitment tables (see [`ProvingKeyCache::build`]).
 ///
-/// The **verifying keys** are cloned out of the proving keys (`ProvingKey::verifying_key` copies
+/// The **verifying key** is cloned out of the proving key (`ProvingKey::verifying_key` copies
 /// key material, no keygen) so [`store_pczt`] can hand the extractor the key it would otherwise
 /// regenerate per bundle on every send (`VerifyingKey::build`, the bulk of the old `store_ms`).
-/// They share the proving keys' `Params`, so the prepared tables serve verification too.
+/// It shares the proving key's `Params`, so the prepared tables serve verification too.
 ///
-/// Two circuit versions exist (orchard `bundle.rs`): a **V2 Orchard** bundle uses `FixedPostNu6_2`,
-/// a **V3 Ironwood** bundle uses `PostNu6_3`, and `Bundle::create_proof` rejects a key whose circuit
-/// version doesn't match the bundle. A post-NU6.3 send from an Orchard-pool wallet carries *both*
-/// bundles (V2 spends of legacy Orchard notes + V3 Ironwood outputs/change), so both proving keys
-/// are needed. NU6.3 is activated on **both mainnet (height 3_428_143) and testnet (4_134_000)**,
-/// so `ironwood_pk` is built on both; it is `None` only where the network carries no NU6.3
-/// activation height at all - in practice a regtest chain started without
-/// `ZECD_REGTEST_NU63_HEIGHT` - where the PostNu6_3 keygen would be ~4.5 s of wasted startup for a
-/// key no send can use.
+/// **One key, not two.** From NU6.3 both shielded Orchard-family bundles - the Orchard pool's
+/// (legacy notes being spent) and the Ironwood pool's - are protocol V3, and every V3 bundle
+/// proves under the `PostNu6_3` circuit (orchard `BundleVersion::circuit_version`). The Zakura
+/// 3.0 family removed proving under the historical circuits altogether (`ProvingKey::build`
+/// and `cached_orchard_proving_key` refuse anything but `PostNu6_3`), and the builder refuses an
+/// Orchard bundle at a target height before NU6.3, so a pre-NU6.3 send - which is all the old
+/// `FixedPostNu6_2` key ever served - cannot be built at all any more. On a regtest chain
+/// started without `ZECD_REGTEST_NU63_HEIGHT` the key is built and never used, which costs a
+/// fraction of a second of background startup.
 pub struct ProvingKeyCache {
-    /// `FixedPostNu6_2` proving key - proves the V2 Orchard bundle. A reference into the
-    /// stack's process-wide cache, shared with the fused builder.
-    orchard_pk: &'static orchard::circuit::ProvingKey,
-    /// `PostNu6_3` proving key - proves the V3 Ironwood bundle. `None` only when the network has
-    /// no NU6.3 activation height at all (so no send produces an Ironwood bundle); mainnet and
-    /// testnet both have one. See [`ProvingKeyCache::build`].
-    ironwood_pk: Option<&'static orchard::circuit::ProvingKey>,
-    /// Verifying key matching `orchard_pk`, for the extract step.
-    orchard_vk: orchard::circuit::VerifyingKey,
-    /// Verifying key matching `ironwood_pk`, for the extract step.
-    ironwood_vk: Option<orchard::circuit::VerifyingKey>,
+    /// The `PostNu6_3` proving key - proves both the Orchard-pool and the Ironwood bundle. A
+    /// reference into the stack's process-wide cache, shared with the fused builder.
+    pk: &'static orchard::circuit::ProvingKey,
+    /// Verifying key matching `pk`, for the extract step.
+    vk: orchard::circuit::VerifyingKey,
 }
 
 impl ProvingKeyCache {
-    /// Build the cached proving keys. Expensive (full key generation); call off the async runtime
-    /// (e.g. under `spawn_blocking`) - [`ProvingKeys::spawn_build`] is the wiring that does.
-    /// `build_ironwood` also builds the `PostNu6_3` proving key for the Ironwood bundle; pass it
-    /// iff the network has a NU6.3 activation height - **true on both mainnet and testnet**, and
-    /// on regtest only when `ZECD_REGTEST_NU63_HEIGHT` is set - so only a NU6.3-less regtest
-    /// chain skips a keygen it can't use.
-    ///
-    /// The two keygens are independent, so they run on **separate threads**: the wall clock is the
-    /// slower of the two rather than their sum (measured on 4 cores: 1.8 s + 2.0 s sequential).
-    /// Each `keygen_pk` is itself rayon-parallel (orchard's `multicore`, on via
-    /// `zcash_primitives`' default features), so on a single-core host the two simply interleave
-    /// and cost what they always did.
-    pub fn build(build_ironwood: bool) -> Self {
+    /// Build the cached proving key. Expensive the first time (key generation); call off the
+    /// async runtime (e.g. under `spawn_blocking`) - [`ProvingKeys::spawn_build`] is the wiring
+    /// that does. Fails only if the stack refuses the post-NU6.3 circuit, which would mean this
+    /// build cannot prove at all.
+    pub fn build() -> Result<Self, String> {
         use orchard::circuit::OrchardCircuitVersion;
         use zcash_primitives::transaction::builder::cached_orchard_proving_key;
         // `cached_orchard_proving_key` is the stack's own `OnceLock` per circuit version: the
         // first caller builds the key (from the embedded k=11 commitment parameters, so no
         // `Params::new` any more), every later caller - this cache, and the fused builder on
-        // every `Builder::build` - gets the same `&'static` key back. Warming both cells here,
-        // in the background at startup, is what keeps the first send from paying the keygen.
-        let (orchard_pk, ironwood_pk) = std::thread::scope(|scope| {
-            let ironwood = build_ironwood.then(|| {
-                scope.spawn(|| cached_orchard_proving_key(OrchardCircuitVersion::PostNu6_3))
-            });
-            let orchard_pk = cached_orchard_proving_key(OrchardCircuitVersion::FixedPostNu6_2);
-            // A keygen panic is not recoverable (it means this build cannot prove at all), so
-            // propagate it to the caller's `spawn_blocking`, which reports it as a failed build.
-            let ironwood_pk = ironwood.map(|h| h.join().expect("Ironwood keygen panicked"));
-            (orchard_pk, ironwood_pk)
-        });
-        // Arm the Zakura fork's prepared fixed-base commitment tables on each key. The prover's
+        // every `Builder::build` - gets the same `&'static` key back. Warming the cell here, in
+        // the background at startup, is what keeps the first send from paying the keygen.
+        let pk = cached_orchard_proving_key(OrchardCircuitVersion::PostNu6_3)
+            .map_err(|e| format!("the post-NU6.3 Orchard circuit was refused: {e:?}"))?;
+        // Arm the Zakura fork's prepared fixed-base commitment tables on the key. The prover's
         // polynomial commitments then evaluate through the preparations on bounded-width rayon
         // pools (up to eight effective threads; halo2 falls back to its usual multiexp on wider
         // ones, so this never slows proving down). It costs hundreds of milliseconds and tens of
-        // MiB per key, once, and is a no-op returning `false` unless orchard was built with its
-        // opt-in `orbits` feature - which `Cargo.toml` enables for exactly this call. Because the
+        // MiB, once, and is a no-op returning `false` unless orchard was built with its opt-in
+        // `orbits` feature - which `Cargo.toml` enables for exactly this call. Because the
         // tables hang off the shared `Params`, the fused path's proofs go through them too.
-        let armed = orchard_pk.prepare_proving();
-        let ironwood_armed = ironwood_pk.map(|pk| pk.prepare_proving());
-        info!(
-            orchard = armed,
-            ironwood = ?ironwood_armed,
-            "prepared Orchard proving-key commitment tables"
-        );
-        ProvingKeyCache {
-            orchard_pk,
-            ironwood_pk,
-            orchard_vk: orchard_pk.verifying_key(),
-            ironwood_vk: ironwood_pk.map(|pk| pk.verifying_key()),
-        }
+        let armed = pk.prepare_proving();
+        info!(armed, "prepared Orchard proving-key commitment tables");
+        Ok(ProvingKeyCache {
+            pk,
+            vk: pk.verifying_key(),
+        })
     }
 
-    /// The cached proving key for `version`, or `None` where this cache holds none: the
-    /// `PostNu6_3` key on a chain that never activates NU6.3, and the insecure pre-NU6.2
-    /// circuit, which no send may prove with.
+    /// The cached proving key for `version`, or `None` for a historical circuit, which no send
+    /// can prove with on this stack.
     fn pk_for(
         &self,
         version: orchard::circuit::OrchardCircuitVersion,
     ) -> Option<&'static orchard::circuit::ProvingKey> {
         use orchard::circuit::OrchardCircuitVersion as V;
         match version {
-            V::FixedPostNu6_2 => Some(self.orchard_pk),
-            V::PostNu6_3 => self.ironwood_pk,
-            V::InsecurePreNu6_2 => None,
+            V::PostNu6_3 => Some(self.pk),
+            V::FixedPostNu6_2 | V::InsecurePreNu6_2 => None,
         }
     }
 
@@ -213,9 +180,8 @@ impl ProvingKeyCache {
     ) -> Option<&orchard::circuit::VerifyingKey> {
         use orchard::circuit::OrchardCircuitVersion as V;
         match version {
-            V::FixedPostNu6_2 => Some(&self.orchard_vk),
-            V::PostNu6_3 => self.ironwood_vk.as_ref(),
-            V::InsecurePreNu6_2 => None,
+            V::PostNu6_3 => Some(&self.vk),
+            V::FixedPostNu6_2 | V::InsecurePreNu6_2 => None,
         }
     }
 }
@@ -223,66 +189,55 @@ impl ProvingKeyCache {
 /// The handle the daemon and every actor hold: a [`ProvingKeyCache`] that is **built in the
 /// background** rather than on the startup critical path.
 ///
-/// Key generation is seconds of CPU (measured on 4 cores, release: 1.8 s for the Orchard key,
-/// 2.0 s for the Ironwood one; several times that single-threaded or on a small VPS). Doing it
-/// before the daemon bound its listeners made zecd unreachable - no `/healthz`, no RPC, no
-/// sync - for that whole window, to serve a key that **only sends need**. So `daemon::run` now
-/// kicks off [`Self::spawn_build`] and carries straight on to spawning actors and binding the
-/// servers; the first send awaits [`Self::get`], which resolves immediately once the background
-/// build has finished (and, on a daemon that never sends, is never awaited at all).
+/// Key generation is CPU work only sends need. Doing it before the daemon bound its listeners
+/// made zecd unreachable - no `/healthz`, no RPC, no sync - for that whole window. So
+/// `daemon::run` kicks off [`Self::spawn_build`] and carries straight on to spawning actors and
+/// binding the servers; the first send awaits [`Self::get`], which resolves immediately once
+/// the background build has finished (and, on a daemon that never sends, is never awaited at
+/// all).
 ///
 /// [`tokio::sync::OnceCell`] gives the needed semantics for free: concurrent callers of
 /// `get_or_try_init` wait for the in-flight initializer instead of starting a second keygen, and
 /// a send arriving before the background task even ran simply drives the build itself.
 pub struct ProvingKeys {
     cell: tokio::sync::OnceCell<Arc<ProvingKeyCache>>,
-    build_ironwood: bool,
 }
 
 impl ProvingKeys {
     /// Create the (empty) handle. Nothing is built until [`Self::spawn_build`] or [`Self::get`].
-    pub fn new(build_ironwood: bool) -> Arc<Self> {
+    pub fn new() -> Arc<Self> {
         Arc::new(ProvingKeys {
             cell: tokio::sync::OnceCell::new(),
-            build_ironwood,
         })
     }
 
-    /// Start building the keys in the background. Returns immediately; the daemon carries on
+    /// Start building the key in the background. Returns immediately; the daemon carries on
     /// binding its listeners while the keygen runs on a blocking thread.
     pub fn spawn_build(self: &Arc<Self>) {
         let keys = Arc::clone(self);
         tokio::spawn(async move {
             let started = Instant::now();
             match keys.get().await {
-                Ok(_) => info!(
-                    "Orchard proving key{} ready in {:?}",
-                    if keys.build_ironwood {
-                        " + Ironwood (PostNu6_3) proving key"
-                    } else {
-                        ""
-                    },
-                    started.elapsed()
-                ),
-                // Only a panic inside the keygen gets here. Sends will retry (and fail the same
-                // way); everything else - sync, reads - keeps working, so this is not fatal.
+                Ok(_) => info!("Orchard proving key ready in {:?}", started.elapsed()),
+                // Sends will retry (and fail the same way); everything else - sync, reads -
+                // keeps working, so this is not fatal.
                 Err(e) => error!("building the Orchard proving key failed: {e}"),
             }
         });
     }
 
-    /// The built keys, awaiting the background build if it is still running.
+    /// The built key, awaiting the background build if it is still running.
     pub async fn get(&self) -> Result<Arc<ProvingKeyCache>, RpcError> {
-        let build_ironwood = self.build_ironwood;
         self.cell
             .get_or_try_init(|| async move {
-                tokio::task::spawn_blocking(move || {
-                    Arc::new(ProvingKeyCache::build(build_ironwood))
-                })
-                .await
-                .map_err(|e| {
-                    RpcError::wallet(format!("building the Orchard proving key failed: {e}"))
-                })
+                tokio::task::spawn_blocking(ProvingKeyCache::build)
+                    .await
+                    .map_err(|e| e.to_string())
+                    .and_then(|built| built)
+                    .map(Arc::new)
+                    .map_err(|e| {
+                        RpcError::wallet(format!("building the Orchard proving key failed: {e}"))
+                    })
             })
             .await
             .cloned()
@@ -622,19 +577,22 @@ fn request_in_scope(
 /// fetch_memos = false`), not yet attempted (`satisfied`), and **deduplicated**, preserving
 /// first-occurrence order.
 ///
-/// The dedup is load-bearing, not cosmetic. `zcash_client_sqlite`'s spend-search generation (the
-/// non-`spend-index` arm of `wallet/transparent.rs::transaction_data_requests`) joins the
-/// per-UTXO `transparent_spend_search_queue` to `transparent_received_outputs` on transaction id
-/// alone - unlike its `spend-index` arm, it never matches `output_index` - so a transaction with
-/// k unspent wallet outputs emits k identical requests per queue row, k^2 in total. On a reused
-/// address funded by fan-out transactions that turns tens of distinct requests into tens of
-/// thousands (field report: 842 UTXOs across 50 transactions -> a 23,968-request spike after one
-/// send, re-emitted on every tip advance). Undeduplicated, that both inflated
-/// `pending_enhancements` (flapping `/readyz` under `readiness = "synced"`) and made
-/// [`WalletActor::enhance_step`] service the same request repeatedly within one batch - the
-/// `enhance_satisfied` filter runs before the batch loop, so in-batch duplicates each cost a
-/// redundant upstream query. TODO(upstream): add the missing
-/// `tro.output_index = ssq.output_index` join predicate in librustzcash.
+/// The dedup is a cheap guard rather than a live fix. Through `zakura-client-sqlite` 0.1.0-rc7
+/// the spend-search generation (the non-`spend-index` arm of
+/// `wallet/transparent.rs::transaction_data_requests`) joined the per-UTXO
+/// `transparent_spend_search_queue` to `transparent_received_outputs` on transaction id alone,
+/// never matching `output_index`, so a transaction with k unspent wallet outputs emitted k
+/// identical requests per queue row, k^2 in total. On a reused address funded by fan-out
+/// transactions that turned tens of distinct requests into tens of thousands (field report: 842
+/// UTXOs across 50 transactions -> a 23,968-request spike after one send, re-emitted on every
+/// tip advance), which both inflated `pending_enhancements` (flapping `/readyz` under
+/// `readiness = "synced"`) and made [`WalletActor::enhance_step`] service the same request
+/// repeatedly within one batch - the `enhance_satisfied` filter runs before the batch loop, so
+/// in-batch duplicates each cost a redundant upstream query. The current wallet layer emits one
+/// request per address (pinned by
+/// `upstream_spend_search_duplication_is_collapsed_by_outstanding_requests`); the dedup stays
+/// because it costs one set insertion per request and a regression upstream would bring the
+/// spike straight back.
 fn outstanding_requests(
     requests: Vec<EnhanceRequest>,
     satisfied: &std::collections::BTreeSet<EnhanceRequest>,
@@ -696,11 +654,11 @@ fn transparent_capability_error(
     (transparent_enabled && !block_scan_covers).then_some(
         "this wallet has transparent receiving enabled ([pools] transparent = true), but the \
          upstream lightwalletd does not advertise that it serves transparent data in compact \
-         blocks. Transparent receives would never be discovered. Note that no released \
-         lightwalletd populates the advertisement yet, so a 0.5.x server that does serve the \
-         data still reports this: set [backend] assume_transparent_in_compact_blocks = true to \
-         assert the capability. Otherwise upgrade the server, point [backend] server at your \
-         own zebra, or disable [pools] transparent",
+         blocks. Transparent receives would never be discovered. lightwalletd 0.5.4 and later \
+         advertise it; 0.5.0-0.5.3 serve the data without saying so, and on those set [backend] \
+         assume_transparent_in_compact_blocks = true to assert the capability. Otherwise \
+         upgrade the server, point [backend] server at your own zebra, or disable [pools] \
+         transparent",
     )
 }
 
@@ -1902,13 +1860,6 @@ fn build_signed_transparent_tx(
             ironwood_padding: BundlePadding::DEFAULT,
         },
     );
-    // ZIP 218's post-NU7 expiry delta (see `tx_expiry_delta`); before NU7 the builder's own
-    // `target + 40` already is the rule, so it is left untouched there.
-    let target = BlockHeight::from(target_height);
-    if net.is_nu_active(NetworkUpgrade::Nu7, target) {
-        builder = builder.with_expiry_height(target + tx_expiry_delta(&net, target));
-    }
-
     // Add and key each transparent input. The signing key is derived from the USK transparent
     // component at the input address's recorded `(scope, index)`; the builder matches each
     // input to its key by public key.
@@ -4862,7 +4813,7 @@ impl WalletActor {
         self.last_rebroadcast = Some(Instant::now());
         // Same caught-up cadence: drop first-seen entries for txs that have since mined.
         self.prune_first_seen();
-        let txs = match read::unmined_raw_txs(&self.engine_dir, tip) {
+        let txs = match read::unmined_raw_txs(self.network, &self.engine_dir, tip) {
             Ok(txs) => txs,
             Err(e) => {
                 warn!("querying unmined txs for rebroadcast: {e}");
@@ -5667,7 +5618,7 @@ impl WalletActor {
                 orchard_action_limit,
             )?;
             enforce_max_tx_bytes(&proposal, proposal_branch(&net, &proposal), max_tx_bytes)?;
-            enforce_zip218_budget(&proposal, proposal_branch(&net, &proposal))?;
+            enforce_zip218_budget(&proposal, &net)?;
             let shape = proposal_shape(&proposal, proposal_branch(&net, &proposal));
             let orchard_circuit = orchard_circuit_for_branch(proposal_branch(&net, &proposal));
             let pczt = create_pczt_from_proposal::<_, _, Infallible, _, Infallible, _>(
@@ -5676,9 +5627,10 @@ impl WalletActor {
                 account_id,
                 OvkPolicy::Sender,
                 &proposal,
-                // ZIP 218's post-NU7 expiry delta; `None` before NU7 and for a ZIP 318
-                // canonical crossing, where the builder's own expiry is the right one.
-                send_expiry_override(&*db, &net, &proposal),
+                // `None` lets the builder derive the expiry from the proposal's target height
+                // (`default_tx_expiry_delta`: 40 blocks before NU7, ZIP 218's 120 from it, or the
+                // rolling expiry of a ZIP 318 canonical crossing), matching the fused build path.
+                None,
                 // Selects the padding of the Orchard bundle only; the Ironwood bundle's is
                 // derived from the proposal. The Orchard bundle is always padded to the default
                 // action floor, which is what the change strategy above costed against.
@@ -5854,6 +5806,7 @@ impl WalletActor {
             .get()
             .await?;
         let prover = self.require_prover()?.clone();
+        let net = self.network;
         let trust_own = self.trust_own_transactions;
         let db = &mut self.db_data;
         let (txid, raw, prove, store): (TxId, Vec<u8>, Duration, Duration) =
@@ -5862,7 +5815,7 @@ impl WalletActor {
                 let signed = prove_sign_pczt(pczt, orchard_circuit, &usk, &prover, &keys)?;
                 let prove = p0.elapsed();
                 let s0 = Instant::now();
-                let txid = store_pczt(db, signed, orchard_circuit, &keys, trust_own)?;
+                let txid = store_pczt(db, &net, signed, orchard_circuit, &keys, trust_own)?;
                 let raw = read_raw_tx(db, txid)?;
                 Ok((txid, raw, prove, s0.elapsed()))
             })?;
@@ -5955,7 +5908,7 @@ impl WalletActor {
                     orchard_action_limit,
                 )?;
                 enforce_max_tx_bytes(&proposal, proposal_branch(&net, &proposal), max_tx_bytes)?;
-                enforce_zip218_budget(&proposal, proposal_branch(&net, &proposal))?;
+                enforce_zip218_budget(&proposal, &net)?;
                 let shape = proposal_shape(&proposal, proposal_branch(&net, &proposal));
                 let build = start.elapsed();
                 let p0 = Instant::now();
@@ -5967,8 +5920,7 @@ impl WalletActor {
                     &SpendingKeys::from_unified_spending_key(usk),
                     OvkPolicy::Sender,
                     &proposal,
-                    // Same expiry rule as the PCZT path (see `send_expiry_override`).
-                    send_expiry_override(&*db, &net, &proposal),
+                    None,
                 )
                 .map_err(|e| {
                     enrich_insufficient_funds(db, &engine_dir, scope, policy, classify_err(e))
@@ -6231,12 +6183,13 @@ impl WalletActor {
             .expect("pipelined sends run only on the cached-key path")
             .get()
             .await?;
+        let net = self.network;
         let db = &mut self.db_data;
         let _ = policy; // store rarely surfaces -6; kept for symmetry with the inline path.
         let (txid, raw, store): (TxId, Vec<u8>, Duration) =
             tokio::task::block_in_place(move || -> Result<_, RpcError> {
                 let s0 = Instant::now();
-                let txid = store_pczt(db, signed, orchard_circuit, &keys, trust_own)?;
+                let txid = store_pczt(db, &net, signed, orchard_circuit, &keys, trust_own)?;
                 let raw = read_raw_tx(db, txid)?;
                 Ok((txid, raw, s0.elapsed()))
             })?;
@@ -6364,6 +6317,7 @@ impl WalletActor {
                     // spendable, so a bare "0 spendable" here would contradict what the caller
                     // just read. Same query as `getbalances.mine.coinbase`.
                     let coinbase = super::read::mature_coinbase_zats(
+                        *db.params(),
                         &engine_dir,
                         scope,
                         u32::from(target_height),
@@ -6410,6 +6364,7 @@ impl WalletActor {
                         // As above: excluded mature coinbase may be exactly what the caller
                         // expected to cover the shortfall, so name it.
                         let coinbase = super::read::mature_coinbase_zats(
+                            *db.params(),
                             &engine_dir,
                             scope,
                             u32::from(target_height),
@@ -6641,7 +6596,7 @@ impl WalletActor {
             proposal_branch(&net, &proposal),
             self.spend_limits.max_tx_bytes(),
         )?;
-        enforce_zip218_budget(&proposal, proposal_branch(&net, &proposal))?;
+        enforce_zip218_budget(&proposal, &net)?;
 
         let (shielding_utxos, shielding_value) = {
             let inputs = proposal.steps().head.transparent_inputs();
@@ -6694,8 +6649,7 @@ impl WalletActor {
                     &SpendingKeys::from_unified_spending_key(usk),
                     OvkPolicy::Sender,
                     &proposal,
-                    // Same expiry rule as every send path (see `send_expiry_override`).
-                    send_expiry_override(&*db, &net, &proposal),
+                    None,
                 )
                 .map_err(|e| {
                     let s = e.to_string();
@@ -7003,7 +6957,7 @@ impl WalletActor {
                         proposal_branch(&net, &proposal),
                         max_tx_bytes,
                     )?;
-                    enforce_zip218_budget(&proposal, proposal_branch(&net, &proposal))?;
+                    enforce_zip218_budget(&proposal, &net)?;
                     MergeWork::UtxoProposal(proposal)
                 };
 
@@ -7085,10 +7039,8 @@ impl WalletActor {
                 // same reason. The delegated path is taken only with room for the destination
                 // output and a second bundle's spare action, so it certainly fits; the manual
                 // path below counts exactly.
-                let zip218_applies = tx_size::zip218_budget_applies(BranchId::for_height(
-                    &net,
-                    BlockHeight::from(target_height),
-                ));
+                let zip218_applies =
+                    tx_size::zip218_budget_applies(&net, BlockHeight::from(target_height));
                 let fits_zip218 = !zip218_applies
                     || (sapling_n + orchard_family_n + 2 <= tx_size::ZIP218_SHIELDED_BUDGET
                         && sapling_n + 2 <= tx_size::ZIP218_SAPLING_LIMIT);
@@ -7138,7 +7090,7 @@ impl WalletActor {
                         proposal_branch(&net, &proposal),
                         max_tx_bytes,
                     )?;
-                    enforce_zip218_budget(&proposal, proposal_branch(&net, &proposal))?;
+                    enforce_zip218_budget(&proposal, &net)?;
                     Ok(MergePlan {
                         work: MergeWork::NoteProposal(proposal),
                         merging_utxos: 0,
@@ -7338,7 +7290,7 @@ impl WalletActor {
                         proposal_branch(&net, &proposal),
                         max_tx_bytes,
                     )?;
-                    enforce_zip218_budget(&proposal, proposal_branch(&net, &proposal))?;
+                    enforce_zip218_budget(&proposal, &net)?;
 
                     Ok(MergePlan {
                         work: MergeWork::NoteProposal(proposal),
@@ -7384,7 +7336,7 @@ impl WalletActor {
                         &SpendingKeys::from_unified_spending_key(usk),
                         OvkPolicy::Sender,
                         &proposal,
-                        send_expiry_override(&*db, &net, &proposal),
+                        None,
                     )
                     .map_err(classify_merge_execute_err)?;
                     if txids.len() > 1 {
@@ -7412,7 +7364,7 @@ impl WalletActor {
                         &SpendingKeys::from_unified_spending_key(usk),
                         OvkPolicy::Sender,
                         &proposal,
-                        send_expiry_override(&*db, &net, &proposal),
+                        None,
                     )
                     .map_err(classify_merge_execute_err)?;
                     if txids.len() > 1 {
@@ -8025,9 +7977,9 @@ fn prove_sign_pczt(
     use pczt::roles::signer::{Error as SignerError, Signer};
 
     // Proofs. The Orchard-pool bundle is proved under the circuit its protocol version names,
-    // which is `PostNu6_3` from NU6.3 on (see `orchard_circuit_for_branch`): legacy Orchard
-    // notes spent there with the `FixedPostNu6_2` key fail with `InvalidInstances`. A Sapling
-    // output proof is only needed when a recipient is a Sapling address.
+    // which is `PostNu6_3` from NU6.3 on (see `orchard_circuit_for_branch`), the same circuit as
+    // the Ironwood bundle's - so one cached key proves both. A Sapling output proof is only
+    // needed when a recipient is a Sapling address.
     let prover = Prover::new(pczt);
     let prover = if prover.requires_orchard_proof() {
         let pk = orchard_circuit
@@ -8045,21 +7997,10 @@ fn prove_sign_pczt(
         prover
     };
     // Ironwood (V6) proof step. A post-NU6.3 transaction carries a separate Ironwood bundle needing
-    // its own proof (mirrors devtool's `pczt/prove.rs`). The Ironwood bundle uses the
-    // **`PostNu6_3`** circuit (orchard `bundle.rs`), so it must be proved with the `PostNu6_3` key -
-    // `Bundle::create_proof` rejects a `FixedPostNu6_2` key here. That key is
-    // `ProvingKeyCache::ironwood_pk`, built at startup whenever the network can activate NU6.3 (so
-    // it is always present when `requires_ironwood_proof()` is true; its absence would mean NU6.3
-    // fired without the cache expecting it, which is a bug worth surfacing).
+    // its own proof (mirrors devtool's `pczt/prove.rs`), under the `PostNu6_3` circuit.
     let prover = if prover.requires_ironwood_proof() {
-        let ironwood_pk = keys.ironwood_pk.ok_or_else(|| {
-            RpcError::wallet(
-                "Ironwood proof required but the PostNu6_3 proving key was not built \
-                 (NU6.3 not expected on this network)",
-            )
-        })?;
         prover
-            .create_ironwood_proof(ironwood_pk)
+            .create_ironwood_proof(keys.pk)
             .map_err(|e| RpcError::wallet(format!("Ironwood proof generation failed: {e:?}")))?
     } else {
         prover
@@ -8136,16 +8077,14 @@ fn prove_sign_pczt(
 /// unconstrained here - it only appears in the error type - so pin it to our `WalletDb`'s note ref,
 /// as `ProposalError` does for the fused path.
 ///
-/// Orchard verifying key: **always `None`**. The extractor verifies *both* the Orchard and the
-/// Ironwood bundles through that one argument, but they use different circuit versions
-/// (`FixedPostNu6_2` vs `PostNu6_3`), so no single key can cover a post-NU6.3 send carrying both -
-/// and passing `None` makes the extractor generate the right verifying key *per bundle* from each
-/// bundle's own version (a `keygen_vk`, cheaper than the proving keygen). zecd used to cache the
-/// `FixedPostNu6_2` key and pass it for the Ironwood-free case, but NU6.3 is live on both public
-/// networks, so every send now carries an Ironwood bundle and that cache went unread while costing
-/// ~1.2 s of every startup. The one path that still hits the on-the-fly `keygen_vk` for an Orchard
-/// V2 bundle is a pre-NU6.3 chain, i.e. a regtest chain started without
-/// `ZECD_REGTEST_NU63_HEIGHT`.
+/// Orchard verifying key: the cached `PostNu6_3` key. The extractor verifies *both* the Orchard
+/// and the Ironwood bundle through that one argument, and from NU6.3 on both are protocol V3,
+/// which proves and verifies under the one `PostNu6_3` circuit - so the cached key serves every
+/// transaction this path can build (the builder refuses an Orchard bundle before NU6.3).
+/// Handed `None` the extractor would run a `VerifyingKey::build` per bundle on every send, which
+/// is what the cache exists to avoid. Before the Zakura 3.0 family a post-NU6.3 send spending
+/// legacy notes carried a V2 Orchard bundle beside the V3 Ironwood one, and that mixed case had
+/// to pass `None`; it no longer exists.
 ///
 /// The Ironwood bundle's own outputs are recorded by the extractor as of `zcash_client_backend
 /// 0.24.0-rc.7`. Through rc.6 it built its `SentTransaction` outputs from the Sapling and Orchard
@@ -8156,28 +8095,25 @@ fn prove_sign_pczt(
 /// transaction here; the pass is gone with the version that made it unnecessary.
 fn store_pczt(
     db: &mut WriteDb,
+    net: &ZNetwork,
     pczt: pczt::Pczt,
     orchard_circuit: Option<orchard::circuit::OrchardCircuitVersion>,
     keys: &ProvingKeyCache,
     trust_own: bool,
 ) -> Result<TxId, RpcError> {
-    // The extractor verifies every shielded bundle before storing, and takes ONE Orchard
-    // verifying key for both the V2 Orchard and the V3 Ironwood bundle; handed `None` it runs a
-    // `VerifyingKey::build` per bundle on every send instead. So pass the cached key whenever the
-    // transaction carries a single bundle version (every send from a wallet holding only one of
-    // the two note kinds - the steady state post-NU6.3), and fall back to `None` only for the
-    // mixed case (legacy V2 spends plus Ironwood outputs in one transaction), where one key
-    // cannot serve both and the extractor's per-bundle keygen is the correct answer.
+    // The extractor verifies every shielded bundle before storing, through ONE Orchard verifying
+    // key for both the Orchard-pool and the Ironwood bundle. Both are `PostNu6_3` on every
+    // transaction this stack can build, so the cached key is right whenever the Orchard-pool
+    // bundle's circuit is the one it was cloned for; anything else falls back to the
+    // extractor's own per-bundle keygen rather than verifying under the wrong key.
     let has_orchard = !pczt.orchard().actions().is_empty();
-    let has_ironwood = !pczt.ironwood().actions().is_empty();
-    let orchard_vk = match (has_orchard, has_ironwood) {
-        // The Orchard-only case verifies under its own circuit: `PostNu6_3` after NU6.3.
-        (true, false) => orchard_circuit.and_then(|version| keys.vk_for(version)),
-        (false, true) => keys.ironwood_vk.as_ref(),
-        _ => None,
+    let orchard_vk = if has_orchard {
+        orchard_circuit.and_then(|version| keys.vk_for(version))
+    } else {
+        Some(&keys.vk)
     };
     let txid = extract_and_store_transaction_from_pczt::<_, zcash_client_sqlite::ReceivedNoteId>(
-        db, pczt, None, orchard_vk,
+        db, net, pczt, None, orchard_vk,
     )
     .map_err(|e| RpcError::wallet(format!("storing transaction failed: {e}")))?;
     mark_own_tx_trusted(db, txid, trust_own);
@@ -8487,58 +8423,6 @@ fn orchard_action_overflow(
     })
 }
 
-/// The transaction expiry delta ZIP 218 recommends after NU7: 120 blocks, which keeps a
-/// transaction's validity window at the ~50 minutes the 40-block delta gave at 75-second blocks.
-/// The wallet stack's builder still applies its fixed 40-block `DEFAULT_TX_EXPIRY_DELTA` at
-/// every height (about 17 minutes once NU7's 25-second blocks are in force, short enough that a
-/// slow prove plus a busy mempool expires a send before it mines), so zecd supplies the expiry
-/// itself from NU7 on.
-pub(crate) const POST_NU7_TX_EXPIRY_DELTA: u32 = 120;
-
-/// The expiry delta, in blocks, for a transaction targeting `target` on `net`: the builder's
-/// own 40 before NU7, [`POST_NU7_TX_EXPIRY_DELTA`] from it. The one definition every send path
-/// shares, so "40 before, 120 after" cannot mean two things.
-fn tx_expiry_delta(net: &ZNetwork, target: BlockHeight) -> u32 {
-    if net.is_nu_active(NetworkUpgrade::Nu7, target) {
-        POST_NU7_TX_EXPIRY_DELTA
-    } else {
-        DEFAULT_TX_EXPIRY_DELTA
-    }
-}
-
-/// The `expiry_height` override to hand `create_proposed_transactions` /
-/// `create_pczt_from_proposal` for `proposal`.
-///
-/// `None` - the builder's own expiry - in two cases. Before NU7, where it is already the
-/// recommended `target + 40`, which keeps every pre-NU7 transaction byte-for-byte what it was.
-/// And for a ZIP 318 canonical crossing, which carries the rolling expiry every crossing in its
-/// period shares: the wallet layer refuses an explicit expiry on one
-/// (`ExpiryHeightConflictsWithCanonicalCrossing`) because a per-transaction expiry is exactly
-/// what would single it out. The crossing test is the wallet layer's own (`Step::
-/// is_canonical_crossing` against the wallet's pool-migration parameters and the standard fee),
-/// mirrored here because the override has to be decided before the call that would refuse it.
-fn send_expiry_override<DbT: WalletRead, FeeRuleT, NoteRef>(
-    db: &DbT,
-    net: &ZNetwork,
-    proposal: &Proposal<FeeRuleT, NoteRef>,
-) -> Option<BlockHeight> {
-    let target = BlockHeight::from(proposal.min_target_height());
-    if !net.is_nu_active(NetworkUpgrade::Nu7, target) {
-        return None;
-    }
-    let canonical_crossing = canonical_crossing_fee(net, target).is_ok_and(|fee| {
-        let params = db.pool_migration_params();
-        proposal
-            .steps()
-            .iter()
-            .any(|step| step.is_canonical_crossing(&params, fee))
-    });
-    if canonical_crossing {
-        return None;
-    }
-    Some(target + tx_expiry_delta(net, target))
-}
-
 /// The consensus branch a proposal will be built against: its target height decides the
 /// transaction version, and with it how many actions each Orchard-protocol bundle needs.
 fn proposal_branch<FeeRuleT, NoteRef>(
@@ -8609,11 +8493,13 @@ fn enforce_max_tx_bytes<FeeRuleT, NoteRef>(
 /// both (`0`) from building, say, a 400-note `z_mergetoaddress` nobody will mine.
 fn enforce_zip218_budget<FeeRuleT, NoteRef>(
     proposal: &Proposal<FeeRuleT, NoteRef>,
-    branch: BranchId,
+    net: &ZNetwork,
 ) -> Result<(), RpcError> {
-    if !tx_size::zip218_budget_applies(branch) {
+    let target = BlockHeight::from(proposal.min_target_height());
+    if !tx_size::zip218_budget_applies(net, target) {
         return Ok(());
     }
+    let branch = BranchId::for_height(net, target);
     for step in proposal.steps() {
         let shape = tx_size::step_shape(step, branch);
         if let Some(over) = tx_size::zip218_overflow(shape) {
@@ -8675,7 +8561,7 @@ fn send_catchup_exceeded(tip: u32, scanned: Option<u32>, limit: u32) -> Option<u
 /// funds maps to -6; everything else to the generic wallet error -4. Client-facing messages
 /// use `Display` (not `Debug`) so internal note/proposal structure isn't leaked.
 fn classify_err(e: ProposalError) -> RpcError {
-    use zcash_client_backend::data_api::error::Error;
+    use zcash_client_backend::data_api::error::{AcceptanceError, Error};
     match &e {
         Error::InsufficientFunds {
             available,
@@ -8690,6 +8576,25 @@ fn classify_err(e: ProposalError) -> RpcError {
             required: Some(u64::from(*required)),
             ..Default::default()
         })),
+        // ZIP 218's block budget, which the wallet layer checks on every proposal it builds
+        // (with the builder's padding) before any input is locked. zecd's own
+        // `enforce_zip218_budget` says the same thing for proposals it hand-builds; this is the
+        // refusal a `propose_*` call returns before zecd ever sees the proposal.
+        Error::Proposal(zcash_client_backend::proposal::ProposalError::ShieldedBudget(reason))
+        | Error::Acceptance(AcceptanceError::ShieldedBudget(reason)) => {
+            RpcError::invalid_parameter(format!(
+                "This transaction would not fit in a block under ZIP 218's shielded budget \
+                 ({reason}), so no node would mine it. This is a consensus rule, not a \
+                 setting. Send to fewer recipients, or consolidate first with \
+                 z_mergetoaddress, which sizes each round to fit."
+            ))
+        }
+        // The chain moved under the send: a network upgrade activated, or the transaction's
+        // expiry passed, between proposing and building. Nothing was stored, so sending again
+        // builds a fresh proposal against the new tip.
+        Error::Acceptance(reason) => RpcError::wallet(format!(
+            "{reason} Nothing was sent; send again to build it against the current chain tip."
+        )),
         // Insufficient-balance conditions can also surface from the change strategy
         // (e.g. `ChangeError::InsufficientFunds`); catch those by message.
         _ => {
@@ -8747,7 +8652,9 @@ fn enrich_insufficient_funds(
     // caller can't diagnose. Same number as `getbalances.mine.coinbase` (both read
     // `mature_coinbase_zats`); best-effort - a failed lookup just leaves the hint off.
     let target_height = u32::from(summary.chain_tip_height()) + 1;
-    let coinbase = super::read::mature_coinbase_zats(engine_dir, scope, target_height).unwrap_or(0);
+    let coinbase =
+        super::read::mature_coinbase_zats(*db.params(), engine_dir, scope, target_height)
+            .unwrap_or(0);
     if incoming == 0 && change == 0 && coinbase == 0 {
         return err;
     }
@@ -8908,9 +8815,9 @@ mod tests {
         // (zebra, or lightwalletd 0.5.0+).
         assert!(transparent_capability_error(true, true).is_none());
         // The one refused combination. The message has to name the fix, because the failure it
-        // replaces - transparent receives silently never appearing - gives no other clue. The
-        // most likely fix is the override: no released lightwalletd advertises the capability,
-        // so a server that *does* serve the data still lands here.
+        // replaces - transparent receives silently never appearing - gives no other clue. For
+        // lightwalletd 0.5.0-0.5.3, which serve the data without advertising it, the fix is the
+        // override, so the message has to name it.
         let why = transparent_capability_error(true, false).expect("must be refused");
         assert!(
             why.contains("assume_transparent_in_compact_blocks"),
@@ -9257,36 +9164,28 @@ mod tests {
         );
     }
 
-    /// ZIP 218's expiry rule as zecd applies it: the builder's own 40 blocks up to the last
-    /// pre-NU7 block, 120 from activation. Pinned on testnet, the one network that schedules
-    /// NU7 in this build, and on mainnet, where it must stay 40 until a mainnet height ships
-    /// (`network::tests::nu7_is_scheduled_on_testnet_only` is the tripwire for that). The
-    /// override's other half - leaving a ZIP 318 canonical crossing on its rolling expiry -
-    /// needs a real proposal, so it is covered only where a chain activates NU7.
+    /// ZIP 218's expiry rule, which every zecd send relies on the builder to apply (no send path
+    /// passes an explicit expiry): 40 blocks up to the last pre-NU7 block, 120 from activation -
+    /// the same ~50 minutes at NU7's 25-second blocks. Pinned on both public networks, since
+    /// both schedule NU7; a regression in the stack's default would silently shorten every
+    /// send's validity window to about 17 minutes, which nothing else here would notice.
     #[test]
-    fn the_expiry_delta_triples_at_nu7() {
-        use super::{tx_expiry_delta, POST_NU7_TX_EXPIRY_DELTA};
+    fn the_builder_expiry_delta_triples_at_nu7() {
         use crate::network::ZNetwork;
-        use zcash_primitives::transaction::builder::DEFAULT_TX_EXPIRY_DELTA;
-        use zcash_protocol::consensus::{BlockHeight, NetworkUpgrade, Parameters as _};
+        use zcash_primitives::transaction::builder::{
+            default_tx_expiry_delta, NU7_DEFAULT_TX_EXPIRY_DELTA, PRE_NU7_DEFAULT_TX_EXPIRY_DELTA,
+        };
+        use zcash_protocol::consensus::{NetworkUpgrade, Parameters as _};
 
-        let nu7 = ZNetwork::Test
-            .activation_height(NetworkUpgrade::Nu7)
-            .expect("testnet schedules NU7");
-        assert_eq!(DEFAULT_TX_EXPIRY_DELTA, 40);
-        assert_eq!(POST_NU7_TX_EXPIRY_DELTA, 3 * DEFAULT_TX_EXPIRY_DELTA);
-        assert_eq!(
-            tx_expiry_delta(&ZNetwork::Test, nu7 - 1),
-            DEFAULT_TX_EXPIRY_DELTA
-        );
-        assert_eq!(
-            tx_expiry_delta(&ZNetwork::Test, nu7),
-            POST_NU7_TX_EXPIRY_DELTA
-        );
-        assert_eq!(
-            tx_expiry_delta(&ZNetwork::Main, BlockHeight::from_u32(10_000_000)),
-            DEFAULT_TX_EXPIRY_DELTA
-        );
+        assert_eq!(PRE_NU7_DEFAULT_TX_EXPIRY_DELTA, 40);
+        assert_eq!(NU7_DEFAULT_TX_EXPIRY_DELTA, 120);
+        for net in [ZNetwork::Main, ZNetwork::Test] {
+            let nu7 = net
+                .activation_height(NetworkUpgrade::Nu7)
+                .expect("both public networks schedule NU7");
+            assert_eq!(default_tx_expiry_delta(&net, nu7 - 1), 40, "{net:?}");
+            assert_eq!(default_tx_expiry_delta(&net, nu7), 120, "{net:?}");
+        }
     }
 
     /// The merge's destination-pool resolution mirrors librustzcash's
@@ -9913,18 +9812,15 @@ mod tests {
         assert_eq!(out, vec![b, c]);
     }
 
-    /// Pin the upstream duplication that makes `outstanding_requests`' dedup load-bearing,
-    /// against a real wallet DB rather than a hand-built request list: storing one transaction
-    /// with k transparent outputs received by the wallet enqueues k spend-search rows, and
-    /// `zcash_client_sqlite`'s `transaction_data_requests` (its non-`spend-index` arm) joins
-    /// each row to every received output of the same transaction - it never matches
-    /// `output_index` - so the read returns k^2 `TransactionsInvolvingAddress` requests, k
-    /// identical ones per address. That is the request-set shape behind the field report's
-    /// 23,968-pending spike from 842 UTXOs (readiness flapping after every send).
-    ///
-    /// If the k^2 assertion starts failing with a *linear* count after a librustzcash bump, the
-    /// upstream join was fixed: update `outstanding_requests`' docs (the dedup itself stays
-    /// correct and cheap either way).
+    /// Pin the shape of the upstream spend-search request set against a real wallet DB rather
+    /// than a hand-built request list: storing one transaction with k transparent outputs
+    /// received by the wallet enqueues k spend-search rows. Through `zakura-client-sqlite`
+    /// 0.1.0-rc7 the read joined each row to every received output of the same transaction, so
+    /// it returned k^2 `TransactionsInvolvingAddress` requests, k identical ones per address -
+    /// the request-set shape behind the field report's 23,968-pending spike from 842 UTXOs.
+    /// rc8 onward returns one per address. If the linear assertion starts failing with k^2
+    /// again, the upstream join regressed: `outstanding_requests` still collapses it, but its
+    /// docs should say the dedup is load-bearing once more.
     #[test]
     fn upstream_spend_search_duplication_is_collapsed_by_outstanding_requests() {
         use super::{outstanding_requests, EnhanceRequest};
@@ -10024,11 +9920,9 @@ mod tests {
         };
         let raw = reqs.iter().filter(|r| is_our_spend_search(r)).count();
         assert_eq!(
-            raw,
-            K * K,
-            "upstream emits k^2 spend-search requests for a k-output tx (k identical per \
-             address); a linear count here means the upstream join was fixed - update \
-             outstanding_requests' docs"
+            raw, K,
+            "upstream emits one spend-search request per address for a k-output tx; k^2 here \
+             means the old duplicating join is back - update outstanding_requests' docs"
         );
 
         let deduped = outstanding_requests(

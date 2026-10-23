@@ -24,7 +24,7 @@
 
 use std::time::{Duration, Instant};
 
-use serde_json::json;
+use serde_json::{json, Value};
 use zecd_regtest_harness::{
     attach_backend, pick_port, resolve_node_bin, start_funded_chain, RegtestNode, Zecd, ZecdConfig,
 };
@@ -467,8 +467,14 @@ async fn regtest_shielding_via_z_sendmany_fromaddress() {
             .await
             .expect("mine a block toward spendable depth");
     }
+    // The deshield's change is the wallet's own note, spendable at `trusted_confirmations` (3)
+    // counted as anchor depth behind the tip - which the wallet layer measures from the tip
+    // itself (ZIP 218), so it reads as spendable from its 4th confirmation, not its 3rd. Mine
+    // that many, and wait until nothing is pending rather than for the first balance below the
+    // old total: while the change is still pending the balance is also below it, and reading it
+    // then reports the change as gone.
     zebrad
-        .generate_blocks(3)
+        .generate_blocks(4)
         .await
         .expect("confirm the deshield");
     let deadline = Instant::now() + SPEND_TIMEOUT;
@@ -482,18 +488,20 @@ async fn regtest_shielding_via_z_sendmany_fromaddress() {
         zecd.wait_until_synced(tip, Duration::from_secs(30))
             .await
             .expect("zecd syncs the deshield");
-        let bal = zecd
-            .call("getbalance", json!([]))
+        let balances = zecd
+            .call("getbalances", json!([]))
             .await
-            .ok()
-            .and_then(|v| v.as_f64())
+            .unwrap_or(Value::Null);
+        let trusted = balances["mine"]["trusted"].as_f64().unwrap_or(f64::MAX);
+        let pending = balances["mine"]["untrusted_pending"]
+            .as_f64()
             .unwrap_or(f64::MAX);
-        if bal < 1.21 {
+        if trusted < 1.21 && pending == 0.0 {
             break;
         }
         assert!(
             Instant::now() < deadline,
-            "the deshield never reflected in the balance: {bal}"
+            "the deshield never settled into the spendable balance: {balances}"
         );
         tokio::time::sleep(Duration::from_millis(500)).await;
     }

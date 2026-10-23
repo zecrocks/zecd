@@ -629,8 +629,42 @@ async fn regtest_shielded_coinbase_receive_and_spend() {
     // 2. zebra mining to that UA, probed by the seed blocks. zebra 5.0.0 accepts the config but
     //    its Orchard coinbase proof fails its own validation ("could not validate orchard
     //    proof"), so a rejected block skips the test unless the env override demands it.
+    //
+    //    zakura >= 1.7.0 builds no Orchard-pool coinbase before NU6.3 at all (its wallet stack
+    //    dropped pre-NU6.3 Orchard coinbase): a unified miner address is paid through its
+    //    transparent receiver there, and refused outright without one. So on that node the chain
+    //    is first mined past NU6.3 to a throwaway transparent address, then the node restarts
+    //    mining to the UA - before zecd exists, so no wallet ever sees the restart. The wallet's
+    //    birthday then follows the tip the node actually restarts at. Every note the test counts
+    //    is an Ironwood coinbase; on a node that still mines pre-NU6.3 Orchard coinbase the set
+    //    straddles activation as before.
+    let mut birthday = BIRTHDAY;
     let zebrad = match Zebrad::start_with_miner(&zebrad_bin, &own_ua).await {
         Ok(z) => z,
+        Err(e) if format!("{e:#}").contains("Ironwood-compatible or transparent receiver") => {
+            eprintln!(
+                "this node mines no Orchard coinbase before NU6.3; mining past activation to a \
+                 transparent address first: {e:#}"
+            );
+            let mut z = Zebrad::start_with_miner(&zebrad_bin, SEED_MINER_ADDRESS)
+                .await
+                .expect("start the node on a transparent miner address");
+            z.generate_blocks(zecd_regtest_harness::NU6_3_ACTIVATION_HEIGHT)
+                .await
+                .expect("mine past NU6.3 to the transparent address");
+            z.restart_with_miner(&own_ua)
+                .await
+                .expect("restart the node mining to zecd's unified address");
+            let restarted_at = u32::try_from(zebra_tip(&z).await).expect("height fits u32");
+            assert!(
+                restarted_at >= zecd_regtest_harness::NU6_3_ACTIVATION_HEIGHT,
+                "the node kept its chain past NU6.3 across the restart (tip {restarted_at})"
+            );
+            // The seed blocks below then sit above the restart tip, and the wallet's birthday
+            // follows them, as it follows the seed blocks on the direct path.
+            birthday = restarted_at + SEED_BLOCKS + 1;
+            z
+        }
         Err(e) => {
             let msg =
                 format!("this zebrad cannot mine to a unified address (shielded coinbase): {e:#}");
@@ -654,7 +688,7 @@ async fn regtest_shielded_coinbase_receive_and_spend() {
     //    and every note the assertions count is mined after startup.
     let mut cfg = ZecdConfig::new(zebrad.rpc_port, pick_port().expect("pick zecd rpc port"));
     cfg.restore_mnemonic = Some(COINBASE_MNEMONIC.to_string());
-    cfg.birthday = Some(BIRTHDAY);
+    cfg.birthday = Some(birthday);
     // Light mode on the zecd-lwd leg: the shielded coinbase outputs then arrive as compact-block
     // actions from lightwalletd rather than from a converted full block.
     let _zecd_lwd = attach_backend(&mut cfg, zebrad.rpc_port)

@@ -12,11 +12,9 @@
 
 services:
   zebra:
-    # Mainnet stays on the stable line while the base file's testnet default runs a 7.0.0 release
-    # candidate for NU7. Move to zebra 7 once it is final and mainnet NU7 is scheduled - and run a
-    # zecd release whose protocol crate carries that same mainnet height (see `zecd chain info`,
-    # which reports a schedule the build disagrees with).
-    image: zfnd/zebra:6.4.2
+    # Same zebra image as the base file: zebra 7 schedules mainnet NU7 at 3,543,405, and a 6.x
+    # node falls off the chain there. Run it with a zecd release whose protocol crate carries the
+    # same height (`zecd chain info` reports a schedule the build disagrees with).
     volumes:
       - ./zebrad.mainnet.toml:/etc/zebra/zebrad.toml:ro
 

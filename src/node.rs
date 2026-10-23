@@ -21,7 +21,6 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use tracing::{error, info, warn};
-use zcash_protocol::consensus::{NetworkUpgrade, Parameters};
 
 use anyhow::Context as _;
 
@@ -140,24 +139,8 @@ impl PreparedNode {
         // Sapling prover.
         let spender_present = any_wallet_can_spend(&config.wallets);
         let orchard_keys = if config.spend.cache_proving_key && spender_present {
-            // Also build the PostNu6_3 (Ironwood) proving key when this network can activate
-            // NU6.3, so post-NU6.3 sends prove the Ironwood bundle from the cache instead of
-            // rebuilding a key per send. NU6.3 is live on mainnet (3_428_143) and testnet
-            // (4_134_000), so both build it; only a regtest chain without
-            // `ZECD_REGTEST_NU63_HEIGHT` skips a keygen no send there could use.
-            let build_ironwood = config
-                .network
-                .activation_height(NetworkUpgrade::Nu6_3)
-                .is_some();
-            info!(
-                "building Orchard proving key{} in the background (cached for all sends)",
-                if build_ironwood {
-                    " + Ironwood (PostNu6_3) proving key"
-                } else {
-                    ""
-                }
-            );
-            let keys = actor::ProvingKeys::new(build_ironwood);
+            info!("building the Orchard proving key in the background (cached for all sends)");
+            let keys = actor::ProvingKeys::new();
             keys.spawn_build();
             Some(keys)
         } else if config.spend.cache_proving_key {
@@ -171,12 +154,7 @@ impl PreparedNode {
                 "no wallet holds spending keys; not warming the Orchard proving keys (they build \
                  on demand if a send ever arrives)"
             );
-            Some(actor::ProvingKeys::new(
-                config
-                    .network
-                    .activation_height(NetworkUpgrade::Nu6_3)
-                    .is_some(),
-            ))
+            Some(actor::ProvingKeys::new())
         } else {
             None
         };

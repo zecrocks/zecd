@@ -8,9 +8,10 @@ use rand::rngs::SysRng;
 
 use zcash_client_backend::data_api::enhance_pir::EnhancementMode;
 use zcash_client_backend::data_api::status::TransactionStatusMode;
+use zcash_client_backend::data_api::transparent_ledger::TransparentLedgerMode;
 use zcash_client_sqlite::util::SystemClock;
 use zcash_client_sqlite::wallet::init::init_wallet_db;
-use zcash_client_sqlite::WalletDb;
+use zcash_client_sqlite::{WalletDb, WalletHandleModes};
 use zcash_keys::keys::transparent::gap_limits::GapLimits;
 
 use crate::network::ZNetwork;
@@ -158,30 +159,35 @@ pub fn open_write_with(
     })
 }
 
-/// Select how the wallet's outstanding transaction work is routed: every status lookup and
-/// every payload fetch goes to the configured upstream by txid.
+/// Select how the wallet's outstanding transaction work is routed: every status lookup, every
+/// payload fetch and every transparent discovery goes to the configured upstream.
 ///
-/// The wallet layer (since `zakura-client-sqlite` 0.1.0-rc7) refuses to enumerate status or
-/// payload work until a handle has chosen these, and the choice is not persisted, so it is made
-/// on every writer handle as it opens. `Public` and `Standard` are what zecd has always done: it
-/// fetches by txid from its own zebrad or lightwalletd, the one chain source an operator has
-/// already decided to trust with the wallet's traffic. The private alternatives (`Private`
-/// status, `PrivateIronwood` enhancement) route pure-Ironwood transactions to an Enhance PIR
-/// server instead; zecd has no PIR client, so selecting them would only leave that work queued
-/// forever. Read handles (`open_read`) never enumerate work, so they are left unconfigured.
-fn configure_request_routing(db: &mut WriteDb) {
-    db.set_status_mode(TransactionStatusMode::Public);
-    db.set_enhancement_mode(EnhancementMode::Standard);
+/// The wallet layer refuses to enumerate status or payload work (since `zakura-client-sqlite`
+/// 0.1.0-rc7) or to answer its transparent-ledger reads (since 0.1.0-rc8) until a handle has
+/// chosen these, and the choice is not persisted, so it is made on every handle as it opens.
+/// `Public`/`Standard`/`Public` are what zecd has always done: it fetches by txid, and discovers
+/// transparent activity, from its own zebrad or lightwalletd, the one chain source an operator
+/// has already decided to trust with the wallet's traffic. The private alternatives route that
+/// work to PIR servers instead; zecd has no PIR client, so selecting them would only leave it
+/// queued forever (and `PrivateRequired` would withdraw spending authority over every
+/// transparent output the wallet's own block scan found). Setting all three through one
+/// `WalletHandleModes` literal means a lane added upstream fails to compile here rather than
+/// silently staying unconfigured, which the wallet layer treats as a refusal.
+fn configure_request_routing<CL, R>(db: &mut WalletDb<rusqlite::Connection, ZNetwork, CL, R>) {
+    db.set_handle_modes(WalletHandleModes {
+        status: TransactionStatusMode::Public,
+        transparent_ledger: TransparentLedgerMode::Public,
+        enhancement: EnhancementMode::Standard,
+    });
 }
 
 /// Open the wallet DB read-only (balances, history); short-lived per request.
 pub fn open_read(network: ZNetwork, engine_dir: &Path) -> anyhow::Result<ReadDb> {
-    Ok(WalletDb::for_path(
-        data_db_path(engine_dir),
-        network,
-        (),
-        (),
-    )?)
+    let mut db = WalletDb::for_path(data_db_path(engine_dir), network, (), ())?;
+    // Balance and history reads consult the transparent ledger policy too (an unconfigured
+    // handle refuses some of them), so read handles are configured exactly like writers.
+    configure_request_routing(&mut db);
+    Ok(db)
 }
 
 /// Initialize the wallet DB (idempotent migrations).

@@ -16,11 +16,13 @@
 
 services:
   zebra:
-    # Pin to a verified release (zebra tags have no 'v' prefix). Testnet activated NU7 at height
-    # 4,465,026, which a 6.x node cannot follow, so the testnet default needs zebra 7. The
-    # mainnet override pins its own stable release until mainnet NU7 is scheduled and 7.0.0 is
-    # final.
-    image: zfnd/zebra:7.0.0-rc.0
+    # Pin to a verified release (zebra tags have no 'v' prefix). Zebra 7 is the first to follow
+    # NU7, which activated on testnet at height 4,465,026 and activates on mainnet at 3,543,405;
+    # a 6.x node falls off the chain at either. Both networks use this pin (the mainnet override
+    # leaves the image alone). 7.0.0 migrates the state database from v28 to v29 on first start,
+    # and going back to 6.x afterwards means a full resync, so back up `state/v28` first if a
+    # rollback matters.
+    image: zfnd/zebra:7.0.0
     restart: unless-stopped
     command: ["zebrad", "-c", "/etc/zebra/zebrad.toml", "start"]
     volumes:

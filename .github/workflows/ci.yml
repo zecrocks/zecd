@@ -176,7 +176,7 @@ jobs:
 
   # Verify the crate still builds at the declared minimum supported Rust version
   # (Cargo.toml `rust-version`). The floor is set by the Zakura Common stack: every
-  # `zakura-*` crate declares rust-version 1.91.
+  # `zakura-*` crate of the 4.0 family declares rust-version 1.97.
   msrv:
     runs-on: ubuntu-latest
     steps:
@@ -185,7 +185,7 @@ jobs:
       - name: Install protobuf compiler
         run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
 
-      - uses: dtolnay/rust-toolchain@1.91
+      - uses: dtolnay/rust-toolchain@1.97
 
       - uses: Swatinem/rust-cache@v2
 

@@ -181,12 +181,13 @@ pub const NU6_3_ACTIVATION_HEIGHT: u32 = 8;
 
 /// NU7 activation height for the regtest chain, from `ZECD_REGTEST_NU7_HEIGHT` - the same variable
 /// `zecd`'s `network::regtest()` reads, so the node, the wallet under test and the [`Funder`]
-/// (which inherits the environment) agree by construction. Unset, the default and what CI runs,
-/// leaves NU7 off the chain: the pinned funder release predates NU7, so an NU7 leg needs a funder
-/// that understands it first. When setting it, pick a height above [`NU6_3_ACTIVATION_HEIGHT`]
-/// that is a multiple of 3 (ZIP 259 requires every NU7 activation height to be), and add the
-/// variable to the chain-snapshot cache key in `regtest.yml`, which does not otherwise see it.
-/// Needs a node that accepts the `NU7` activation-height key (zebrad >= 7.0.0-rc.0, zakura >= 1.5.0).
+/// (which inherits the environment) agree by construction. CI sets it to 12 for the whole tier
+/// (`REGTEST_NU7_HEIGHT` in `regtest.yml`, also part of the chain-snapshot cache key), since NU7
+/// is scheduled on both public networks; that needs a funder release that reads the variable
+/// (0.9.0-rc2 or later). Unset, as in a plain local run, leaves NU7 off the chain. A height must
+/// sit above [`NU6_3_ACTIVATION_HEIGHT`] and be a multiple of 3 (ZIP 259 requires every NU7
+/// activation height to be). Needs a node that accepts the `NU7` activation-height key
+/// (zebrad >= 7.0.0-rc.0, zakura >= 1.5.0).
 ///
 /// A set but unparseable value panics rather than silently dropping NU7, for the reason
 /// `network::regtest()` gives: a schedule disagreement surfaces far away as an opaque rejection.
@@ -333,6 +334,7 @@ impl Zebrad {
     /// Used by the funded e2e to stop minting coinbases to the funder so its existing coinbases
     /// can age past maturity while a throwaway address mines the tail.
     pub async fn restart_with_miner(&mut self, miner_address: &str) -> Result<()> {
+        self.wait_for_tip_backup().await;
         self.stop_gracefully().await;
         let cache_dir = self.state_dir();
         std::fs::write(
@@ -351,6 +353,49 @@ impl Zebrad {
         self.child = spawn_zebrad(&self.bin, &self.config_path)?;
         self.wait_until_rpc_up().await?;
         Ok(())
+    }
+
+    /// Wait until the node's non-finalized state backup holds the current tip, so a restart
+    /// keeps the blocks mined just before it.
+    ///
+    /// On regtest nothing ever finalizes, so every block lives only in the non-finalized state,
+    /// which the node persists by a background task writing one file per block (named by the
+    /// block hash) into `<cache_dir>/non_finalized_state/<network>/`, at most every 5 seconds.
+    /// Stopping before that task catches up loses the blocks it had not written: zakura 1.7.0
+    /// came back at height 0 from a 108-block chain stopped right after mining it. Waiting on the
+    /// tip's own file is the exact condition, so no sleep is needed. A node that keeps no such
+    /// backup never produces the file; after the timeout the restart proceeds as before.
+    async fn wait_for_tip_backup(&self) {
+        let Ok(tip) = self.rpc("getbestblockhash", json!([])).await else {
+            return;
+        };
+        let Some(hash) = tip.as_str().map(str::to_owned) else {
+            return;
+        };
+        // The file name is the hash hex in one byte order or the other depending on the node's
+        // encoding; accept either.
+        let reversed: String = hash
+            .as_bytes()
+            .chunks(2)
+            .rev()
+            .map(|pair| String::from_utf8_lossy(pair).into_owned())
+            .collect();
+        let backup_root = self.state_dir().join("non_finalized_state");
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            let found = std::fs::read_dir(&backup_root)
+                .into_iter()
+                .flatten()
+                .flatten()
+                .any(|net| {
+                    let dir = net.path();
+                    dir.join(&hash).exists() || dir.join(&reversed).exists()
+                });
+            if found || Instant::now() >= deadline {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
     }
 
     /// Stop `zebrad` via the regtest `stop` RPC (which raises SIGINT) and wait for the process
@@ -451,6 +496,15 @@ impl Zebrad {
             // the template endpoint itself rather than just `getblockchaininfo`.
             match zebra_rpc_call(&self.rpc_url(), "getblocktemplate", json!([])).await {
                 Ok(_) => return Ok(()),
+                // The node is up and has looked at the miner address: a refusal to build the
+                // coinbase for it is a property of the address and the height, not of readiness,
+                // and retrying cannot change it. Fail now so a caller can react (see
+                // `regtest_coinbase`'s shielded test) instead of after the whole timeout.
+                Err(e) if format!("{e:#}").contains("could not construct coinbase tx") => {
+                    return Err(
+                        e.context("zebrad refused to build a coinbase for its miner address")
+                    );
+                }
                 Err(e) => last_err = e,
             }
             if Instant::now() >= deadline {

@@ -2,7 +2,7 @@
 name = "zecd"
 version = "0.9.0-rc2"
 edition = "2021"
-rust-version = "1.91"
+rust-version = "1.97"
 license = "MIT OR Apache-2.0"
 publish = true
 description = "A Bitcoin-Core-style JSON-RPC server for shielded and transparent Zcash (Ironwood, Orchard, Sapling, plus opt-in t-addresses), built on the Zakura Common librustzcash stack"
@@ -59,8 +59,9 @@ ripemd = "0.1"
 # `signmessage`/`verifymessage` sign the double-SHA256 message hash with the transparent
 # address's secp256k1 key and recover the signer's pubkey. The `recovery` feature provides the
 # recoverable-ECDSA API (compact 65-byte header+sig, as zcashd/zallet produce). Already in the
-# tree via the zcash crates; matches zallet's pin.
-secp256k1 = { version = "0.29", features = ["recovery"] }
+# tree via the zcash crates, at the version the Zakura 4.0 family uses: the secret key handed to
+# `sign_message_with_key` comes from `zcash_transparent`, so the two must be one crate.
+secp256k1 = { version = "0.33", features = ["recovery"] }
 # rand 0.10 is the generation the Zakura Common stack speaks (`WalletDb`'s RNG parameter and
 # the transaction `Builder` take a `rand_core 0.10` RNG), so zecd's own RNG use follows it.
 # `thread_rng` implies `std`/`std_rng`/`sys_rng`; `rand::rngs::SysRng` (the OS RNG) is what the
@@ -123,30 +124,32 @@ uuid = { version = "1", features = ["v4", "serde"] }
 # - The crypto and protocol family (`zakura-orchard`, `zakura-primitives`, `zakura-keys`,
 #   `zakura-proofs`, `zakura-sapling-crypto`, `zakura-protocol`, `zakura-address`,
 #   `zakura-transparent`, `zakura-zip321`) releases in lockstep and is asked for at one version,
-#   `2.2`, matching the wallet layer (`zakura-client-backend`/`zakura-client-sqlite` 0.1.0-rc7,
-#   `zakura-pczt` 0.1.0-rc4), which requires `^2.0.0` of each. A *second* copy of any member
-#   would be a second, incompatible type family. `2.2` is the floor rather than `2.0` because
-#   `zakura-protocol` 2.2.0 is the release that schedules NU7 on testnet; an older 2.x
-#   compiles and simply never activates it (`network::tests` pins the height).
+#   `4.0`, matching the wallet layer (`zakura-client-backend`/`zakura-client-sqlite`
+#   0.1.0-rc9.3, `zakura-pczt` 0.1.0-rc9), which requires `^4.0.0` of each. A *second* copy of
+#   any member would be a second, incompatible type family. 4.0.0 is the release that schedules
+#   NU7 on mainnet (3,543,405); 2.2.0 had scheduled it on testnet only (`network::tests` pins
+#   both heights).
 # - The crates the forks still take from crates.io (`zcash_encoding`, `zcash_script`, `zip32`,
-#   `nonempty`, `incrementalmerkletree`, `shardtree`) stay on crates.io here too, at
-#   requirements compatible with the forks', so exactly one copy of each enters the graph.
+#   `nonempty`, `incrementalmerkletree`, `shardtree`, `secp256k1`) stay on crates.io here too,
+#   at requirements compatible with the forks', so exactly one copy of each enters the graph.
 #   Their types cross the boundary, so a divergent pin would surface as a type error naming two
 #   identical-looking paths. (The 1.x family took `zcash_protocol`, `zcash_address`,
-#   `zcash_transparent` and `zip321` from crates.io as well; 2.x forks them.)
+#   `zcash_transparent` and `zip321` from crates.io as well; 2.x forks them, and 3.0 forks
+#   `zcash_note_encryption` as `zakura-note-encryption`.)
 #
 # `scripts/verify-zakura-graph.sh` (the CI `zakura-graph` job) proves the resolved graph carries
 # no crates.io original of a forked crate and no duplicate `zakura-*` package.
 #
-# `circuit` exposes `orchard::circuit::{ProvingKey, VerifyingKey}` so we can build the Orchard
-# proving key once at startup and reuse it for every send (the PCZT prove path), instead of
-# librustzcash's fused builder which rebuilds it per transaction.
+# `circuit` exposes `orchard::circuit::{ProvingKey, VerifyingKey}` so we can warm the Orchard
+# proving key once at startup and reuse it for every send (the PCZT prove path); from 4.0 it
+# implies the new `prover` and `verifier` features. `backend-halo2` selects the proving backend,
+# which 4.0 made a default feature, so `default-features = false` has to name it.
 # `orbits` (Zakura-only) enables the fork's prepared fixed-base commitment tables, which
-# `ProvingKeyCache::build` arms once per key via `ProvingKey::prepare_proving()` - the prover
+# `ProvingKeyCache::build` arms once via `ProvingKey::prepare_proving()` - the prover
 # then commits through the prepared tables on bounded-width thread pools. Without the feature
 # that call is a no-op returning `false`.
-orchard = { package = "zakura-orchard", version = "2.2", default-features = false, features = ["circuit", "orbits"] }
-zcash_address = { package = "zakura-address", version = "2.2" }
+orchard = { package = "zakura-orchard", version = "4.0", default-features = false, features = ["circuit", "orbits", "backend-halo2"] }
+zcash_address = { package = "zakura-address", version = "4.0" }
 # `CompactSize` builds the length-prefixed preimage for the `signmessage`/`verifymessage`
 # message hash (magic + message, each CompactSize-prefixed, double-SHA256), byte-identical to
 # zcashd's `rpc/misc.cpp` and zallet. 0.4, matching the rest of the librustzcash stack -
@@ -156,17 +159,17 @@ zcash_encoding = "0.4"
 # and the received-by-address read paths; zecd's own wallets never expose transparent receivers.
 # `pczt` exposes `create_pczt_from_proposal` / `extract_and_store_transaction_from_pczt`, the
 # build/prove/store seam that lets the proving step take a cached Orchard proving key.
-zcash_client_backend = { package = "zakura-client-backend", version = "0.1.0-rc7", features = ["lightwalletd-tonic-tls-webpki-roots", "orchard", "transparent-inputs", "pczt"] }
-zcash_client_sqlite = { package = "zakura-client-sqlite", version = "0.1.0-rc7", features = ["unstable", "orchard", "serde", "transparent-inputs"] }
-zcash_keys = { package = "zakura-keys", version = "2.2", features = ["unstable", "orchard"] }
-zcash_primitives = { package = "zakura-primitives", version = "2.2" }
-zcash_proofs = { package = "zakura-proofs", version = "2.2", features = ["bundled-prover"] }
-zcash_protocol = { package = "zakura-protocol", version = "2.2", features = ["local-consensus"] }
-zcash_transparent = { package = "zakura-transparent", version = "2.2" }
+zcash_client_backend = { package = "zakura-client-backend", version = "0.1.0-rc9.3", features = ["lightwalletd-tonic-tls-webpki-roots", "orchard", "transparent-inputs", "pczt"] }
+zcash_client_sqlite = { package = "zakura-client-sqlite", version = "0.1.0-rc9.3", features = ["unstable", "orchard", "serde", "transparent-inputs"] }
+zcash_keys = { package = "zakura-keys", version = "4.0", features = ["unstable", "orchard"] }
+zcash_primitives = { package = "zakura-primitives", version = "4.0" }
+zcash_proofs = { package = "zakura-proofs", version = "4.0", features = ["bundled-prover"] }
+zcash_protocol = { package = "zakura-protocol", version = "4.0", features = ["local-consensus"] }
+zcash_transparent = { package = "zakura-transparent", version = "4.0" }
 # Script asm rendering + standard-script solver for `getrawtransaction` (already in the
 # tree via zcash_transparent; same crate Zallet uses for this).
-zcash_script = "0.4.5"
-sapling = { package = "zakura-sapling-crypto", version = "2.2" }
+zcash_script = "0.6"
+sapling = { package = "zakura-sapling-crypto", version = "4.0" }
 # `NonEmpty` is the shape librustzcash's proposal API speaks (`ShieldedInputs::from_parts`,
 # `Proposal` steps); needed by the hand-built z_mergetoaddress proposals. Same version the
 # librustzcash workspace pins, so the types unify - which is why this stays at 0.11 rather than
@@ -174,9 +177,9 @@ sapling = { package = "zakura-sapling-crypto", version = "2.2" }
 nonempty = "0.11"
 # PCZT roles (Prover/Signer) for the cached-proving-key send path. The version tracks the
 # `zakura-client-backend` `pczt` feature's own pin.
-pczt = { package = "zakura-pczt", version = "0.1.0-rc4", default-features = false, features = ["prover", "signer", "orchard", "sapling"] }
+pczt = { package = "zakura-pczt", version = "0.1.0-rc9", default-features = false, features = ["prover", "signer", "orchard", "sapling"] }
 zip32 = "0.2"
-zip321 = { package = "zakura-zip321", version = "2.2" }
+zip321 = { package = "zakura-zip321", version = "4.0" }
 libc = "0.2.186"
 # Single-instance guard: an advisory exclusive lock on `<datadir>/.lock` so two zecd processes
 # can't operate on the same data directory at once (mirrors zallet / zcashd). Linux only needs
@@ -224,16 +227,16 @@ mimalloc-secure = ["mimalloc", "mimalloc/secure"]
 # on mainnet at height 3_428_143 and on testnet at 4_134_000 (both carried by `zcash_protocol`), and
 # opt-in on regtest via the `ZECD_REGTEST_NU63_HEIGHT` env var, which CI sets to 8 for the whole
 # regtest tier - so every regtest flow runs NU6.3-active, matching the public networks (the one
-# deliberate exception is `tests/embedded_regtest.rs`, whose chain stays pre-NU6.3). So ironwood
-# is "always built, live on both public networks" with no build flag - a mainnet send past
-# 3_428_143 is an ironwood send. NU7 follows the same model: compiled unconditionally (the 2.x
-# family dropped upstream's `zcash_unstable = "nu7"` cfg gate), activated by height - testnet
-# 4_465_026, mainnet unscheduled - and opt-in on regtest via `ZECD_REGTEST_NU7_HEIGHT`, which
-# the regtest tier leaves unset. Every dependency here is a crates.io release and there are no
-# git pins or `[patch.crates-io]` entries, but not every one is a *stable* release: the Zakura
-# wallet layer (`zakura-client-backend`/`zakura-client-sqlite` 0.1.0-rc7, `zakura-pczt`
-# 0.1.0-rc4) is still on release candidates, and the crypto family moves with it, on a
-# wallet-layer release.
+# regtest tier - so every regtest flow runs NU6.3-active, matching the public networks. So
+# ironwood is "always built, live on both public networks" with no build flag - a mainnet send
+# past 3_428_143 is an ironwood send. NU7 follows the same model: compiled unconditionally (the
+# 2.x family dropped upstream's `zcash_unstable = "nu7"` cfg gate), activated by height - testnet
+# 4_465_026, mainnet 3_543_405 - and on regtest via `ZECD_REGTEST_NU7_HEIGHT`, which CI sets to
+# 12 for the whole tier. Every dependency here is a crates.io release and there are no git pins
+# or `[patch.crates-io]` entries, but not every one is a *stable* release: the Zakura wallet
+# layer (`zakura-client-backend`/`zakura-client-sqlite` 0.1.0-rc9.3, `zakura-pczt` 0.1.0-rc9)
+# is still on release candidates, and the crypto family moves with it, on a wallet-layer
+# release.
 
 [dev-dependencies]
 tempfile = "3"
@@ -275,8 +278,9 @@ tower = { version = "0.5", features = ["util"] }
 # - **Ironwood sends route through the cached-key PCZT path.** The published line BUILDS Ironwood
 #   PCZTs (librustzcash#2543 landed - the old git rev rejected them), so the `ironwood_forces_fused`
 #   gate in `actor.rs` is gone and post-NU6.3 sends no longer pay the fused path's ~4.5 s/send
-#   keygen. `ProvingKeyCache` caches both circuit keys (`FixedPostNu6_2` for the V2 Orchard bundle,
-#   `PostNu6_3` for the V3 Ironwood bundle); see the send-proving-path notes in the project docs.
+#   keygen. `ProvingKeyCache` holds the one `PostNu6_3` key that proves both shielded
+#   Orchard-family bundles (the 3.0 family removed proving under the historical circuits); see the
+#   send-proving-path notes in the project docs.
 # - **The extractor records Ironwood outputs** (since `zcash_client_backend 0.24.0-rc.7`). Through
 #   rc.6, `extract_and_store_transaction_from_pczt` built its `SentTransaction` outputs from the
 #   Sapling and Orchard bundles only, so a post-NU6.3 send's Ironwood payment/change outputs reached

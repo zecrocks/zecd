@@ -30,8 +30,9 @@
 # librustzcash plus the upstream crates they leave in place (versions pinned by the committed
 # Cargo.lock), so the build needs network access to fetch them.
 
-# rust:1.96.0-alpine3.24 (multi-arch index digest; keep RUSTUP_TOOLCHAIN below in lockstep)
-FROM rust:1.96.0-alpine3.24@sha256:f87aa870663e2b57ec8c69de82c7eedf7383bee987eef7612c0359635eaadb41 AS builder
+# rust:1.97.1-alpine3.24 (multi-arch index digest; keep RUSTUP_TOOLCHAIN below in lockstep).
+# Rust 1.97 is the Zakura Common 4.0 family's MSRV.
+FROM rust:1.97.1-alpine3.24@sha256:3c38f3f82c2f3d73da3b38e18d279393a04cb43ddded0e35088a8c3324d40900 AS builder
 
 # musl-native C/C++ toolchain (rusqlite's bundled SQLite is C; zcash_script is C++) + protoc
 # (zcash_client_backend's build script). Versions pinned for reproducibility - see the
@@ -49,7 +50,7 @@ RUN apk add --no-cache \
 
 # Pin the toolchain to the image's preinstalled one; without this, rustup honors
 # rust-toolchain.toml's `channel = "stable"` and downloads whatever stable is today.
-ENV RUSTUP_TOOLCHAIN=1.96.0
+ENV RUSTUP_TOOLCHAIN=1.97.1
 ENV SOURCE_DATE_EPOCH=1
 ENV CARGO_INCREMENTAL=0
 # Resilience against transient crates.io fetch flakes in CI (seen as curl "[16] Error in the
@@ -67,8 +68,10 @@ WORKDIR /usr/src/zecd
 COPY . .
 
 # Build the zecd binary (the aarch64-musl rust-std ships in the base image as the host target).
-# --features mimalloc-secure: like the amd64 musl image, swap in mimalloc - musl's default
-# allocator is ~5-6x slower than glibc under Orchard proving's multi-threaded allocation churn. The `-secure` variant adds heap hardening (guard pages,
+# --features mimalloc-secure: swap in mimalloc (the amd64 StageX image gets the same allocator from
+# its libc instead, and must not take this feature - see Dockerfile) - musl's default
+# allocator is ~5-6x slower than glibc under Orchard proving's multi-threaded allocation churn.
+# The `-secure` variant adds heap hardening (guard pages,
 # canary free-lists) for <4% on the proving path. mimalloc-sys compiles C via the same gcc/cc-rs
 # path that already builds bundled libsqlite3-sys here.
 RUN cargo install --locked --path . --bin zecd --target ${TARGET_ARCH} --features mimalloc-secure --root /usr/local \

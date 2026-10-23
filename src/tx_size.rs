@@ -31,7 +31,10 @@ use zcash_client_backend::proposal::Step;
 use zcash_primitives::transaction::{
     builder::BundlePadding, components::orchard::bundle_version_for_branch,
 };
-use zcash_protocol::{consensus::BranchId, PoolType};
+use zcash_protocol::{
+    consensus::{BlockHeight, BranchId, NetworkUpgrade, Parameters},
+    PoolType,
+};
 
 // ===================== ZIP 225 field widths =====================
 //
@@ -255,24 +258,25 @@ pub fn max_transparent_inputs(max_bytes: usize, alongside: TxShape) -> usize {
 /// of those bind first at their defaults (`orchard_action_limit` at 50 actions, the 250 KB byte
 /// ceiling at about 78); this is the backstop for a deployment that disables both.
 ///
+/// The value is the protocol crate's own constant, so this cannot drift from the rule the
+/// builder enforces (`check_shielded_budget`) and the wallet layer checks every proposal
+/// against (`Proposal::validate_shielded_budget`).
+///
 /// [ZIP 218]: https://zips.z.cash/zip-0218
-pub const ZIP218_SHIELDED_BUDGET: usize = 330;
+pub const ZIP218_SHIELDED_BUDGET: usize = zcash_protocol::consensus::NU7_GLOBAL_SHIELDED_BUDGET;
 
 /// ZIP 218's separate per-block cap on Sapling spends plus outputs, inside the shared
 /// [`ZIP218_SHIELDED_BUDGET`].
-pub const ZIP218_SAPLING_LIMIT: usize = 300;
+pub const ZIP218_SAPLING_LIMIT: usize = zcash_protocol::consensus::NU7_SAPLING_BLOCK_IO_LIMIT;
 
 /// The Sapling builder pads a present bundle to at least this many outputs (`BundleType::
 /// DEFAULT`), and the padding outputs are real descriptions the budget counts.
 const SAPLING_MIN_OUTPUTS: usize = 2;
 
-/// Whether ZIP 218's shielded budget binds a transaction built at consensus branch `branch`.
-///
-/// Matched by name because `NetworkUpgrade` has no ordering to ask "NU7 or later" with: **a
-/// network upgrade after NU7 must be added here**, or transactions built under it lose the
-/// ceiling.
-pub fn zip218_budget_applies(branch: BranchId) -> bool {
-    matches!(branch, BranchId::Nu7)
+/// Whether ZIP 218's shielded budget binds a transaction targeting `height` on `params`: from
+/// NU7's activation on, which also covers every later upgrade.
+pub fn zip218_budget_applies(params: &impl Parameters, height: BlockHeight) -> bool {
+    params.is_nu_active(NetworkUpgrade::Nu7, height)
 }
 
 /// Where a shape breaks ZIP 218's shielded budget, if it does: the cost counted and the cap it
@@ -609,11 +613,19 @@ mod tests {
         assert_eq!(zip218_overflow(transparent), None);
     }
 
-    /// The budget is an NU7 rule and nothing earlier is bound by it.
+    /// The budget is an NU7 rule: nothing before activation is bound by it, everything after
+    /// is, on both public networks.
     #[test]
     fn the_zip218_budget_starts_at_nu7() {
-        assert!(zip218_budget_applies(BranchId::Nu7));
-        assert!(!zip218_budget_applies(BranchId::Nu6_3));
-        assert!(!zip218_budget_applies(BranchId::Nu5));
+        use crate::network::ZNetwork;
+        assert_eq!(ZIP218_SHIELDED_BUDGET, 330);
+        assert_eq!(ZIP218_SAPLING_LIMIT, 300);
+        for net in [ZNetwork::Main, ZNetwork::Test] {
+            let nu7 = net
+                .activation_height(NetworkUpgrade::Nu7)
+                .expect("both public networks schedule NU7");
+            assert!(zip218_budget_applies(&net, nu7), "{net:?}");
+            assert!(!zip218_budget_applies(&net, nu7 - 1), "{net:?}");
+        }
     }
 }

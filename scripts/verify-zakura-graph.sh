@@ -41,6 +41,8 @@ FORBIDDEN = {
     "pasta_curves", "sinsemilla", "reddsa", "redjubjub", "bellman", "bls12_381",
     "jubjub", "pairing", "equihash",
     "zcash_protocol", "zcash_address", "zcash_transparent", "zip321",
+    # From the 3.0 family it forks note encryption too (`zakura-note-encryption`).
+    "zcash_note_encryption",
     # zakura-core/wallet-libraries (the wallet layer).
     "zcash_client_backend", "zcash_client_sqlite", "pczt",
 }

@@ -232,7 +232,7 @@ fn regtest_wallet_lifecycle() {
         read::tx_count(engine_dir, read::AccountScope::Any).expect("tx_count"),
         0
     );
-    assert!(read::unmined_raw_txs(engine_dir, 1)
+    assert!(read::unmined_raw_txs(net, engine_dir, 1)
         .expect("unmined_raw_txs")
         .is_empty());
     // received_tx_records runs in all three of its shapes: unfiltered, filtered by a candidate

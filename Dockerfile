@@ -15,7 +15,9 @@
 # librustzcash plus the upstream crates they leave in place (versions pinned by the committed
 # Cargo.lock), so the build needs network access to fetch them.
 
-FROM stagex/pallet-rust:1.91.1@sha256:4062550919db682ebaeea07661551b5b89b3921e3f3a2b0bc665ddea7f6af1ca AS pallet-rust
+# Rust 1.97 is the Zakura Common 4.0 family's MSRV. The digest is the linux/amd64 manifest
+# within the tag's index, like the other pins here.
+FROM stagex/pallet-rust:1.97.1@sha256:6033fb215dd7c87c885dd7b1c12de42464606dcc0323fc57339318d61f010a30 AS pallet-rust
 # protoc (+ the abseil it links) is needed by zcash_client_backend's build script.
 FROM stagex/user-protobuf:26.1@sha256:b399bb058216a55130d83abcba4e5271d8630fff55abbb02ed40818b0d96ced1 AS protobuf
 FROM stagex/user-abseil-cpp:20240116.2@sha256:183e8aff7b3e8b37ab8e89a20a364a21d99ce506ae624028b92d3bed747d2c06 AS abseil-cpp
@@ -67,12 +69,14 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
         --path . \
         --bin zecd \
         --target ${TARGET_ARCH} \
-        # musl's default allocator is ~5-6x slower than glibc under Orchard proving's
-        # multi-threaded allocation churn; mimalloc closes the gap. The `-secure` variant adds
-        # heap hardening (guard pages, canary free-lists) for <4% on the proving path, recovering
-        # the mitigations dropped by replacing musl's malloc-ng. glibc dev/test builds skip this.
-        # (mimalloc-sys compiles C the same way libsqlite3-sys already does here.)
-        --features mimalloc-secure \
+        # No `--features mimalloc-secure` here, unlike Dockerfile.arm64. musl's own malloc-ng is
+        # ~5-6x slower than glibc under Orchard proving's multi-threaded allocation churn, and
+        # that feature exists to replace it with hardened mimalloc. StageX's musl (from the
+        # 1.97.1 pallet) already does: its libc.a carries `mimalloc-secure.o` as `malloc`, so
+        # `System` is hardened mimalloc with no crate. Linking the crate as well puts a second,
+        # different mimalloc beside it, and `--allow-multiple-definition` (above) merges the two
+        # copies' shared globals (`_mi_heap_main` among them): the binary died with SIGBUS on its
+        # first realloc, before printing `--version`.
     # Skeleton dirs for the scratch runtime, COPY'd below with --chown so the
     # unprivileged runtime user can write its datadirs (and SQLite its temp files).
     && install -d -m 0755 /rootfs/var/lib/zecd \

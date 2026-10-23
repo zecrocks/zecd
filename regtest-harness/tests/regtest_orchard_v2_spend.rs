@@ -45,7 +45,7 @@ async fn tip(zebrad: &zecd_regtest_harness::Zebrad) -> u64 {
 async fn regtest_legacy_orchard_note_spends_after_nu6_3() {
     let Some(zebrad_bin) = resolve_node_bin() else {
         eprintln!(
-            "SKIP: set {} to run the legacy-Orchard spend e2e (see README.md). \
+            "SKIP: set {} to run the legacy-Orchard spend e2e. \
              The harness still compiled.",
             RegtestNode::from_env().bin_env()
         );
@@ -53,6 +53,11 @@ async fn regtest_legacy_orchard_note_spends_after_nu6_3() {
     };
     // Before anything spawns: zecd and the funder read it at startup.
     std::env::set_var("ZECD_REGTEST_NU63_HEIGHT", NU6_3_HEIGHT.to_string());
+    // The tier activates NU7 at 12, below this chain's late NU6.3, which no build accepts
+    // (upgrades activate in order). NU7 has nothing to add to a legacy-Orchard spend, so this
+    // chain leaves it off, and the node config, zecd and the funder all read the same unset
+    // variable.
+    std::env::remove_var("ZECD_REGTEST_NU7_HEIGHT");
 
     let (zebrad, funder) = start_funded_chain_live_at(&zebrad_bin, NU6_3_HEIGHT)
         .await

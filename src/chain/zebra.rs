@@ -203,6 +203,17 @@ fn parse_display_txid(s: &str) -> anyhow::Result<TxId> {
 /// `RPC_MISC_ERROR` ("unspecified error").
 const RPC_ERROR_UNSPECIFIED_CODE: i64 = -1;
 
+/// The most addresses zebra accepts in one `getaddresstxids`/`getaddressutxos` request (zebra
+/// 7's `MAX_REQUEST_ADDRESSES`); a larger batch is refused outright.
+const MAX_REQUEST_ADDRESSES: usize = 10_000;
+
+/// Whether a JSON-RPC refusal is zebra 7's address-query result limit (`-8`, "more than 100000
+/// transactions match; narrow the height range"), the one refusal narrowing the range fixes.
+/// Matched on the advice rather than the number, which zebra may make configurable.
+fn is_address_query_too_large(code: i64, message: &str) -> bool {
+    code == -8 && message.contains("narrow the height range")
+}
+
 /// A JSON-RPC call failure, split along the trait's error contract: `Rpc` is the node
 /// examining the request and refusing it (the connection is healthy); `Transport` is
 /// everything else.
@@ -493,6 +504,54 @@ impl ZebraClient {
             .map_err(|e| e.into_anyhow(method))?;
         serde_json::from_value(result)
             .with_context(|| format!("decoding zebra rpc {method} response"))
+    }
+
+    /// `getaddresstxids` over `[start, end]`, in chain order, however many results that is.
+    ///
+    /// Zebra 7 refuses a query matching more than 100,000 transactions with `-8` ("narrow the
+    /// height range") rather than returning them, where 6.x answered it whole. The spend search
+    /// asks for one address from its funding height to the tip in a single call (see the
+    /// actor's `tia_check_range`), which a busy address can exceed, and a refusal there would
+    /// otherwise be retried unchanged on every enhancement pass. So the range is halved until
+    /// each piece fits, lower half first so the concatenation stays in chain order. A single
+    /// block over the limit cannot be narrowed and fails like any other refusal.
+    async fn address_tx_ids(
+        &self,
+        addresses: &[String],
+        start: u32,
+        end: u32,
+    ) -> anyhow::Result<Vec<String>> {
+        let mut out = Vec::new();
+        // Pending ranges, the next to query on top.
+        let mut pending = vec![(start, end)];
+        while let Some((lo, hi)) = pending.pop() {
+            let params = json!([{ "addresses": addresses, "start": lo, "end": hi }]);
+            tracing::debug!(
+                "getaddresstxids req addrs={} start={lo} end={hi}",
+                addresses.len()
+            );
+            match self.call("getaddresstxids", params).await {
+                Ok(result) => {
+                    let hexes: Vec<String> = serde_json::from_value(result)
+                        .context("decoding zebra rpc getaddresstxids response")?;
+                    tracing::debug!("getaddresstxids resp -> {} txid(s)", hexes.len());
+                    out.extend(hexes);
+                }
+                Err(CallError::Rpc { code, message })
+                    if lo < hi && is_address_query_too_large(code, &message) =>
+                {
+                    let mid = lo + (hi - lo) / 2;
+                    tracing::debug!(
+                        "getaddresstxids over the node's result limit for {lo}..={hi}; \
+                         splitting at {mid}"
+                    );
+                    pending.push((mid + 1, hi));
+                    pending.push((lo, mid));
+                }
+                Err(e) => return Err(e.into_anyhow("getaddresstxids")),
+            }
+        }
+        Ok(out)
     }
 
     async fn blockchain_info(&self) -> anyhow::Result<BlockchainInfo> {
@@ -901,21 +960,13 @@ impl ChainSource for ZebraSource {
         // returns display-hex txids in chain order - txids only, so the evidence is
         // `TxEvidence::Txid` and the caller re-fetches any tx it needs. Valid-but-unseen
         // addresses yield `[]`; an error is transport/application and propagates (dropping the
-        // client).
-        let params = json!([{ "addresses": addresses, "start": start, "end": end }]);
-        tracing::debug!(
-            "getaddresstxids req addrs={} start={start} end={end}",
-            addresses.len()
-        );
-        let hexes: Vec<String> = self
-            .client
-            .call_as("getaddresstxids", params)
-            .await
-            .context("getaddresstxids")?;
-        tracing::debug!("getaddresstxids resp -> {} txid(s)", hexes.len());
-        let mut out = Vec::with_capacity(hexes.len());
-        for h in hexes {
-            out.push(super::TxEvidence::Txid(parse_display_txid(&h)?));
+        // client). The batch is split at zebra's per-request address limit and the range at its
+        // result limit (see `address_tx_ids`), so neither shows through to the caller.
+        let mut out = Vec::new();
+        for batch in addresses.chunks(MAX_REQUEST_ADDRESSES) {
+            for h in self.client.address_tx_ids(batch, start, end).await? {
+                out.push(super::TxEvidence::Txid(parse_display_txid(&h)?));
+            }
         }
         Ok(out)
     }
@@ -1490,6 +1541,13 @@ mod tests {
         raw_txs: HashMap<String, Value>,
         /// `getaddresstxids` responses keyed by transparent address → display-hex txids.
         addr_txids: HashMap<String, Vec<String>>,
+        /// Mined heights for `addr_txids` entries, for range filtering; a txid without one
+        /// matches every range.
+        addr_txid_heights: HashMap<String, u32>,
+        /// When set, `getaddresstxids` refuses a query matching more than this many txids the
+        /// way zebra 7 does, and the ranges it was asked for are recorded in `addr_ranges`.
+        addr_result_cap: Option<usize>,
+        addr_ranges: Vec<(u32, u32)>,
         /// `Err((code, message))` makes `sendrawtransaction` reject.
         send: Result<String, (i64, String)>,
         /// When set, `sendrawtransaction` returns this exact `error` object verbatim,
@@ -1521,6 +1579,9 @@ mod tests {
                 mempool: Vec::new(),
                 raw_txs: HashMap::new(),
                 addr_txids: HashMap::new(),
+                addr_txid_heights: HashMap::new(),
+                addr_result_cap: None,
+                addr_ranges: Vec::new(),
                 send: Ok("00".repeat(32)),
                 send_error_object: None,
                 seen_auth: Vec::new(),
@@ -1610,12 +1671,35 @@ mod tests {
                     // Param is an object `{ "addresses": [...], "start": N, "end": M }`.
                     let arg = &params[0];
                     let addrs = arg["addresses"].as_array().cloned().unwrap_or_default();
+                    let lo = arg["start"].as_u64().unwrap_or(0) as u32;
+                    let hi = arg["end"].as_u64().unwrap_or(u64::from(u32::MAX)) as u32;
                     let txids: Vec<String> = addrs
                         .iter()
                         .filter_map(|a| a.as_str())
                         .flat_map(|a| fake.addr_txids.get(a).cloned().unwrap_or_default())
+                        .filter(|t| {
+                            fake.addr_txid_heights
+                                .get(t)
+                                .is_none_or(|h| (lo..=hi).contains(h))
+                        })
                         .collect();
-                    reply(json!(txids))
+                    match fake.addr_result_cap {
+                        Some(cap) => {
+                            fake.addr_ranges.push((lo, hi));
+                            if txids.len() > cap {
+                                err(
+                                    -8,
+                                    &format!(
+                                        "more than {cap} transactions match; narrow the height \
+                                         range"
+                                    ),
+                                )
+                            } else {
+                                reply(json!(txids))
+                            }
+                        }
+                        None => reply(json!(txids)),
+                    }
                 }
                 "sendrawtransaction" => match (&fake.send_error_object, &fake.send) {
                     (Some(error), _) => Json(json!({
@@ -1747,6 +1831,61 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(both.len(), 2, "batch query unions txids across addresses");
+    }
+
+    /// Zebra 7 refuses an address query matching more than its result limit instead of
+    /// answering it. The source narrows the range until each piece fits and returns the union
+    /// in chain order, so the spend search over a busy address still converges; a single block
+    /// over the limit cannot be narrowed and surfaces as an error.
+    #[tokio::test]
+    async fn an_oversized_address_query_is_split_by_height() {
+        let mut fake = Fake::new();
+        let addr = "t1BusyAddress".to_string();
+        let txids: Vec<String> = (1u32..=10)
+            .map(|h| format!("{h:02x}{}", "00".repeat(31)))
+            .collect();
+        for (h, t) in (1u32..=10).zip(&txids) {
+            fake.addr_txid_heights.insert(t.clone(), h * 10);
+        }
+        fake.addr_txids.insert(addr.clone(), txids.clone());
+        fake.addr_result_cap = Some(3);
+        let fake = Arc::new(Mutex::new(fake));
+        let mut src = source_for(fake.clone()).await;
+
+        let got: Vec<String> = src
+            .transparent_tx_evidence(vec![addr.clone()], 1, 100)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|e| match e {
+                super::super::TxEvidence::Txid(t) => t.to_string(),
+                other => panic!("zebra returns txids, got {other:?}"),
+            })
+            .collect();
+        assert_eq!(got, txids, "every txid, once, in chain order");
+        let ranges = fake.lock().unwrap().addr_ranges.clone();
+        assert_eq!(ranges[0], (1, 100), "the whole range is tried first");
+        assert!(ranges.len() > 1, "and narrowed when refused");
+
+        // Four txids in one block: no narrower range exists, so the refusal stands.
+        let mut fake = Fake::new();
+        let dense: Vec<String> = (1u32..=4)
+            .map(|i| format!("{i:02x}{}", "11".repeat(31)))
+            .collect();
+        for t in &dense {
+            fake.addr_txid_heights.insert(t.clone(), 50);
+        }
+        fake.addr_txids.insert(addr.clone(), dense);
+        fake.addr_result_cap = Some(3);
+        let mut src = source_for(Arc::new(Mutex::new(fake))).await;
+        let err = src
+            .transparent_tx_evidence(vec![addr], 1, 100)
+            .await
+            .expect_err("a single block over the limit cannot be narrowed");
+        assert!(
+            format!("{err:#}").contains("narrow the height range"),
+            "{err:#}"
+        );
     }
 
     #[tokio::test]

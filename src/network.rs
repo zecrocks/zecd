@@ -224,46 +224,38 @@ mod tests {
         }
     }
 
-    /// NU7 is scheduled on testnet and nowhere else. The testnet height is what lets zecd
-    /// build transactions past activation there: `BranchId::for_height` picks the NU7 branch id
+    /// NU7 is scheduled on both public networks, at ZIP 259's heights. The height is what lets
+    /// zecd build transactions past activation: `BranchId::for_height` picks the NU7 branch id
     /// from it, and a build that lacked it would keep committing to NU6.3 and be rejected by
-    /// every upgraded node. Mainnet is unscheduled, and the moment that changes this test is
-    /// the reminder to say so in the docs and the release notes.
+    /// every upgraded node. Mainnet's height arrived with the `zakura-protocol` 4.0.0 family;
+    /// before it, this test pinned mainnet as unscheduled.
     #[test]
-    fn nu7_is_scheduled_on_testnet_only() {
-        let testnet = ZNetwork::Test
-            .activation_height(NetworkUpgrade::Nu7)
-            .expect("the pinned protocol schedules NU7 on testnet");
-        assert_eq!(testnet, BlockHeight::from_u32(4_465_026));
-        assert!(
-            ZNetwork::Test
-                .activation_height(NetworkUpgrade::Nu6_3)
-                .is_some_and(|nu63| nu63 < testnet),
-            "NU7 must activate after NU6.3"
-        );
-        assert_eq!(
-            BranchId::for_height(&ZNetwork::Test, testnet),
-            BranchId::Nu7,
-            "transactions built at the activation height commit to the NU7 branch id"
-        );
-        assert_eq!(
-            BranchId::for_height(&ZNetwork::Test, testnet - 1),
-            BranchId::Nu6_3,
-        );
-        assert_eq!(
-            ZNetwork::Main.activation_height(NetworkUpgrade::Nu7),
-            None,
-            "the pinned protocol now schedules NU7 on mainnet - update the docs and notes"
-        );
+    fn nu7_is_scheduled_on_both_networks() {
+        for (net, height) in [(ZNetwork::Test, 4_465_026), (ZNetwork::Main, 3_543_405)] {
+            let nu7 = net
+                .activation_height(NetworkUpgrade::Nu7)
+                .expect("the pinned protocol schedules NU7");
+            assert_eq!(nu7, BlockHeight::from_u32(height), "{net:?}");
+            assert!(
+                net.activation_height(NetworkUpgrade::Nu6_3)
+                    .is_some_and(|nu63| nu63 < nu7),
+                "NU7 must activate after NU6.3 on {net:?}"
+            );
+            assert_eq!(
+                BranchId::for_height(&net, nu7),
+                BranchId::Nu7,
+                "transactions built at the activation height commit to the NU7 branch id"
+            );
+            assert_eq!(BranchId::for_height(&net, nu7 - 1), BranchId::Nu6_3);
+        }
     }
 
     /// The reported protocol version follows the newest upgrade this build schedules: NU7 on
-    /// testnet, NU6.3 on mainnet until the protocol crate schedules NU7 there (at which point
-    /// this, like `nu7_is_scheduled_on_testnet_only`, fails and should move to 170190).
+    /// both public networks, which ZIP 204 numbers differently (170180 testnet, 170190 mainnet).
     #[test]
     fn protocol_version_follows_the_newest_scheduled_upgrade() {
         assert_eq!(ZNetwork::Test.protocol_version(), 170_180);
-        assert_eq!(ZNetwork::Main.protocol_version(), 170_160);
+        assert_eq!(ZNetwork::Main.protocol_version(), 170_190);
 
         let h = |n| Some(BlockHeight::from_u32(n));
         let local = |nu6_3, nu7| {

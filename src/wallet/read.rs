@@ -13,7 +13,10 @@ use zcash_client_backend::data_api::{Account as _, InputSource, WalletRead};
 use zcash_keys::address::{Address, UnifiedAddress};
 use zcash_keys::encoding::AddressCodec as _;
 use zcash_keys::keys::UnifiedFullViewingKey;
-use zcash_primitives::transaction::builder::DEFAULT_TX_EXPIRY_DELTA;
+use zcash_primitives::transaction::builder::{
+    NU7_DEFAULT_TX_EXPIRY_DELTA, PRE_NU7_DEFAULT_TX_EXPIRY_DELTA,
+};
+use zcash_protocol::consensus::{NetworkUpgrade, Parameters as _};
 use zcash_protocol::{ShieldedPool, TxId};
 use zcash_transparent::keys::TransparentKeyScope;
 use zip32::{DiversifierIndex, Scope};
@@ -255,7 +258,7 @@ pub fn balance(
         // as a clamped fallback (it holds no immature coinbase on the current upstream; the
         // fallback guards against the bucketing shifting again across upstream releases, which
         // it already did once between 0.24.0-rc.1 and 0.24.0-rc.4).
-        let immature_coinbase = immature_coinbase_zats(engine_dir, scope, target_height)?;
+        let immature_coinbase = immature_coinbase_zats(network, engine_dir, scope, target_height)?;
         let from_pending = immature_coinbase.min(info.pending);
         let from_spendable = (immature_coinbase - from_pending).min(info.transparent_spendable);
         info.pending -= from_pending;
@@ -263,8 +266,8 @@ pub fn balance(
         info.immature += from_spendable + from_pending;
         // The mature-coinbase breakout (see the field docs). Clamped to the transparent bucket
         // so it is a subset of `trusted` by construction even if the upstream bucketing shifts.
-        info.mature_coinbase =
-            mature_coinbase_zats(engine_dir, scope, target_height)?.min(info.transparent_spendable);
+        info.mature_coinbase = mature_coinbase_zats(network, engine_dir, scope, target_height)?
+            .min(info.transparent_spendable);
         info.total_spendable = info.orchard_spendable
             + info.sapling_spendable
             + info.transparent_spendable
@@ -278,11 +281,12 @@ pub fn balance(
 /// clause of `zcash_client_sqlite`'s `get_spendable_transparent_outputs` (which the balance
 /// queries lack) so `balance` can reclassify the immature value.
 fn immature_coinbase_zats(
+    network: ZNetwork,
     engine_dir: &Path,
     scope: AccountScope,
     target_height: u32,
 ) -> anyhow::Result<u64> {
-    coinbase_zats(engine_dir, scope, target_height, false)
+    coinbase_zats(network, engine_dir, scope, target_height, false)
 }
 
 /// Unspent, mined, **mature** coinbase value - the other side of the maturity split. Backs
@@ -290,11 +294,12 @@ fn immature_coinbase_zats(
 /// z_shieldcoinbase" hint), so the number a failed send reports is the same one `getbalances`
 /// shows.
 pub fn mature_coinbase_zats(
+    network: ZNetwork,
     engine_dir: &Path,
     scope: AccountScope,
     target_height: u32,
 ) -> anyhow::Result<u64> {
-    coinbase_zats(engine_dir, scope, target_height, true)
+    coinbase_zats(network, engine_dir, scope, target_height, true)
 }
 
 /// Sum unspent, mined coinbase value on the requested side of the [`COINBASE_MATURITY`]
@@ -303,13 +308,14 @@ pub fn mature_coinbase_zats(
 /// and it is suppressed by a spend only while the spending tx is still live (mined or
 /// unexpired), mirroring the `listunspent` query below.
 fn coinbase_zats(
+    network: ZNetwork,
     engine_dir: &Path,
     scope: AccountScope,
     target_height: u32,
     mature: bool,
 ) -> anyhow::Result<u64> {
     let conn = open_conn(engine_dir)?;
-    let unexpired_stx = tx_unexpired_sql("stx");
+    let unexpired_stx = tx_unexpired_sql("stx", &network);
     let maturity_cmp = if mature { ">=" } else { "<" };
     let account = scope_by_id("txo.account_id");
     let sql = format!(
@@ -535,25 +541,33 @@ fn txid_internal(display_hex: &str) -> Option<Vec<u8>> {
 }
 
 /// SQL predicate that the transaction aliased `alias` is *unexpired*, a faithful port of
-/// librustzcash's `zcash_client_sqlite::wallet::common::tx_unexpired_condition` - the canonical
-/// rule that `select_unspent_notes`/`spent_notes_clause` and the balance queries use. We
-/// reproduce it because there is no public API for the unmined/mempool notes and rebroadcast set
-/// the raw queries below supplement; centralizing it (rather than open-coding a simpler expiry
-/// test, as earlier copies did) keeps `listunspent minconf=0` and `unmined_raw_txs` in lockstep
-/// with `getbalance` - including the `min_observed_height + DEFAULT_TX_EXPIRY_DELTA` staleness
-/// branch (a tx with unknown expiry is treated as unexpired only while recently observed). The
+/// librustzcash's `zcash_client_sqlite::wallet::common::tx_unexpired_condition_at` - the
+/// canonical rule that `select_unspent_notes`/`spent_notes_clause` and the balance queries use.
+/// We reproduce it because there is no public API for the unmined/mempool notes and rebroadcast
+/// set the raw queries below supplement; centralizing it (rather than open-coding a simpler
+/// expiry test, as earlier copies did) keeps `listunspent minconf=0` and `unmined_raw_txs` in
+/// lockstep with `getbalance` - including the staleness branch for a tx whose expiry is unknown,
+/// which is treated as unexpired only while within the default expiry delta of the height it
+/// was built for (or first observed at). That delta is height-aware like the builder's
+/// (`default_tx_expiry_delta`): 40 blocks before `network`'s NU7 activation, 120 from it. The
 /// caller must bind `:target_height` to the next-to-be-mined height (chain tip + 1). Keep this in
-/// sync with upstream on every `zcash_client_sqlite` bump. That includes the 40-block delta past
-/// NU7, where zecd's own sends take a 120-block expiry (`actor::POST_NU7_TX_EXPIRY_DELTA`): the
-/// branch only governs rows whose expiry is *unknown*, and departing from upstream here would make
-/// these listings disagree with the selector and balances that still use 40.
-fn tx_unexpired_sql(alias: &str) -> String {
+/// sync with upstream on every `zcash_client_sqlite` bump.
+fn tx_unexpired_sql(alias: &str, network: &ZNetwork) -> String {
+    let observed = format!("COALESCE({alias}.target_height, {alias}.min_observed_height)");
+    let delta = match network.activation_height(NetworkUpgrade::Nu7) {
+        Some(nu7) => format!(
+            "CASE WHEN {observed} >= {} THEN {NU7_DEFAULT_TX_EXPIRY_DELTA} \
+             ELSE {PRE_NU7_DEFAULT_TX_EXPIRY_DELTA} END",
+            u32::from(nu7)
+        ),
+        None => PRE_NU7_DEFAULT_TX_EXPIRY_DELTA.to_string(),
+    };
     format!(
         "{alias}.mined_height < :target_height
          OR {alias}.expiry_height = 0
          OR {alias}.expiry_height >= :target_height
          OR ({alias}.expiry_height IS NULL
-             AND {alias}.min_observed_height + {DEFAULT_TX_EXPIRY_DELTA} >= :target_height)"
+             AND {observed} + {delta} >= :target_height)"
     )
 }
 
@@ -1207,8 +1221,8 @@ pub fn tx_exists(engine_dir: &Path, txid_hex: &str) -> bool {
 /// Unexpired is the shared [`tx_unexpired_sql`] predicate (the same rule the selector uses), so
 /// the rebroadcast set never diverges from what the wallet considers live; `expiry_height >=
 /// tip + 1` is exactly the old `expiry > tip`.
-fn unmined_raw_txs_sql() -> String {
-    let unexpired = tx_unexpired_sql("t");
+fn unmined_raw_txs_sql(network: &ZNetwork) -> String {
+    let unexpired = tx_unexpired_sql("t", network);
     format!(
         "SELECT txid, raw FROM transactions t
          WHERE mined_height IS NULL AND raw IS NOT NULL
@@ -1239,9 +1253,13 @@ fn unmined_raw_txs_sql() -> String {
 /// shielded funds *are* ironwood notes, so the omission meant no send could ever be retried - a
 /// send whose broadcast failed (upstream briefly down) was simply never retransmitted, and sat
 /// unmined until it expired. Pre-NU6.3 the tables are empty, so this reads as a no-op there.
-pub fn unmined_raw_txs(engine_dir: &Path, tip: u32) -> anyhow::Result<Vec<(String, Vec<u8>)>> {
+pub fn unmined_raw_txs(
+    network: ZNetwork,
+    engine_dir: &Path,
+    tip: u32,
+) -> anyhow::Result<Vec<(String, Vec<u8>)>> {
     let conn = open_conn(engine_dir)?;
-    let mut stmt = conn.prepare(&unmined_raw_txs_sql())?;
+    let mut stmt = conn.prepare(&unmined_raw_txs_sql(&network))?;
     let rows = stmt.query_map(named_params! { ":target_height": tip + 1 }, |row| {
         Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, Vec<u8>>(1)?))
     })?;
@@ -1428,14 +1446,13 @@ pub fn list_unspent(
     // Map txid (display hex) -> (mined height, authored-by-us) for confirmations and trust.
     // A negative balance delta means the wallet spent notes in the tx, i.e. it authored it.
     let mut tx_meta: HashMap<String, (Option<u32>, bool)> = HashMap::new();
-    // Map (txid, output index) -> receiving address for the shielded outputs the wallet recorded
-    // one for (change/internal notes have none), plus -> shielded pool code for every shielded
-    // output (2 = Sapling, 3 = Orchard, 4 = ironwood). The pool map is keyed off
-    // `v_tx_outputs.output_pool` (the valar fork's `ironwood_pool_code_views` migration tags
-    // ironwood 4) rather than the note's protocol, so an ironwood (Orchard V3) note - which
-    // librustzcash returns in `ReceivedNotes::ironwood()` (its own accessor) - is labelled ironwood.
-    let mut out_addr: HashMap<(String, u32), String> = HashMap::new();
-    let mut out_pool: HashMap<(String, u32), i64> = HashMap::new();
+    // Map (txid, pool code, output index) -> receiving address for the shielded outputs the
+    // wallet recorded one for (change/internal notes have none). The pool code (2 = Sapling,
+    // 3 = Orchard, 4 = ironwood, `v_tx_outputs.output_pool`) is part of the key because output
+    // indices are per bundle: one transaction can carry Sapling output 1 *and* Ironwood action 1,
+    // and keying on (txid, index) alone handed one note the other's address and pool - whichever
+    // row the view happened to return last (a tri-pool send listed its Sapling note as ironwood).
+    let mut out_addr: HashMap<(String, i64, u32), String> = HashMap::new();
     {
         let conn = open_conn(engine_dir)?;
         let tx_account = scope_by_uuid("account_uuid");
@@ -1469,10 +1486,8 @@ pub fn list_unspent(
         })?;
         for row in rows {
             let (txid, idx, pool, addr) = row?;
-            let txid = txid_display(&txid);
-            out_pool.insert((txid.clone(), idx), pool);
             if let Some(addr) = addr {
-                out_addr.insert((txid, idx), addr);
+                out_addr.insert((txid_display(&txid), pool, idx), addr);
             }
         }
     }
@@ -1501,15 +1516,13 @@ pub fn list_unspent(
             &[],
             LockFilter::Unfiltered,
         )?;
-        // Both `notes.sapling()` and `notes.orchard()` yield `ReceivedNote`s with the same
-        // `txid`/`output_index`/`note_value` surface; collect each into the shared output list.
-        // `default_pool` is the note's protocol pool (2 Sapling / 3 Orchard); the per-output
-        // `out_pool` map overrides it so an ironwood (Orchard V3) note is labelled 4.
-        let mut push = |txid: String, vout: u32, value: u64, default_pool: i64| {
+        // `notes.sapling()`, `notes.orchard()` and `notes.ironwood()` yield `ReceivedNote`s with
+        // the same `txid`/`output_index`/`note_value` surface; collect each into the shared
+        // output list. `pool` is the accessor's own pool (2 Sapling / 3 Orchard / 4 ironwood),
+        // which is authoritative: the note came out of that pool's table.
+        let mut push = |txid: String, vout: u32, value: u64, pool: i64| {
             let (mined_height, trusted) = tx_meta.get(&txid).copied().unwrap_or((None, false));
-            let key = (txid.clone(), vout);
-            let address = out_addr.get(&key).cloned();
-            let pool = out_pool.get(&key).copied().unwrap_or(default_pool);
+            let address = out_addr.get(&(txid.clone(), pool, vout)).cloned();
             out.push(UnspentNote {
                 vout,
                 txid,
@@ -1546,8 +1559,7 @@ pub fn list_unspent(
             );
         }
         // Ironwood notes are Orchard-shaped (`ReceivedNote<_, orchard::note::Note>`) but returned in
-        // their own `ironwood()` accessor; label them pool code 4 (the `out_pool` map overrides this
-        // with the recorded `v_tx_outputs.output_pool` when present, which is also 4).
+        // their own `ironwood()` accessor; label them pool code 4.
         for note in notes.ironwood() {
             let value = note
                 .note_value()
@@ -1572,8 +1584,10 @@ pub fn list_unspent(
     // expired spend releases the note again.
     {
         let conn = open_conn(engine_dir)?;
-        let seen: std::collections::HashSet<(String, u32)> =
-            out.iter().map(|u| (u.txid.clone(), u.vout)).collect();
+        let seen: std::collections::HashSet<(String, i64, u32)> = out
+            .iter()
+            .map(|u| (u.txid.clone(), u.pool, u.vout))
+            .collect();
         let target = u32::from(chain_height) + 1;
         // Per-pool table/column names differ only in three identifiers (note table, spend table,
         // FK column, and the output-index column), so run the same query shape for each pool.
@@ -1610,8 +1624,8 @@ pub fn list_unspent(
         // branch). A note is shown only if its creating tx is unmined and unexpired, and isn't
         // suppressed by a spend whose tx is still live (mined or unexpired) - an expired spend
         // releases the note again.
-        let unexpired_t = tx_unexpired_sql("t");
-        let unexpired_stx = tx_unexpired_sql("stx");
+        let unexpired_t = tx_unexpired_sql("t", &network);
+        let unexpired_stx = tx_unexpired_sql("stx", &network);
         for (note_table, spend_table, fk_col, index_col, default_pool) in &pools {
             let sql = format!(
                 "SELECT t.txid, rn.{index_col}, rn.value
@@ -1637,15 +1651,14 @@ pub fn list_unspent(
             for row in rows {
                 let (txid, vout, value) = row?;
                 let txid = txid_display(&txid);
-                if seen.contains(&(txid.clone(), vout)) {
+                // The note table names the pool, and indices are per bundle, so the pool is part
+                // of both keys (see `out_addr`).
+                let pool = *default_pool;
+                if seen.contains(&(txid.clone(), pool, vout)) {
                     continue;
                 }
                 let (mined_height, trusted) = tx_meta.get(&txid).copied().unwrap_or((None, false));
-                let key = (txid.clone(), vout);
-                let address = out_addr.get(&key).cloned();
-                // An unmined ironwood note may not yet have its v_tx_outputs row, so fall back to
-                // the note table's protocol pool (Orchard); it relabels to ironwood once mined.
-                let pool = out_pool.get(&key).copied().unwrap_or(*default_pool);
+                let address = out_addr.get(&(txid.clone(), pool, vout)).cloned();
                 out.push(UnspentNote {
                     vout,
                     txid,
@@ -1666,8 +1679,8 @@ pub fn list_unspent(
         // is still live (mined or unexpired) - mirroring the shielded suppression above. Real
         // outpoints don't collide with the shielded synthesized ones, so this isn't deduped
         // against `seen`.
-        let unexpired_t = tx_unexpired_sql("t");
-        let unexpired_stx = tx_unexpired_sql("stx");
+        let unexpired_t = tx_unexpired_sql("t", &network);
+        let unexpired_stx = tx_unexpired_sql("stx", &network);
         // Coinbase handling mirrors `zcash_client_sqlite`'s spendability SQL: an output is
         // coinbase iff its tx's recorded block index is 0 (`IFNULL(tx_index, 1)` - unknown
         // defaults to non-coinbase), and an *immature* coinbase output (fewer than
@@ -2424,43 +2437,64 @@ mod tests {
         );
     }
 
-    /// [`super::tx_unexpired_sql`] must reproduce librustzcash's `tx_unexpired_condition` across
-    /// every branch: a mined tx (never "expired"), the never-expires (`expiry_height = 0`) case,
-    /// expiry at/after vs strictly before the target, and the unknown-expiry staleness window
-    /// (`min_observed_height + DEFAULT_TX_EXPIRY_DELTA`). This is the canonical spentness/expiry
+    /// [`super::tx_unexpired_sql`] must reproduce librustzcash's `tx_unexpired_condition_at`
+    /// across every branch: a mined tx (never "expired"), the never-expires (`expiry_height = 0`)
+    /// case, expiry at/after vs strictly before the target, and the unknown-expiry staleness
+    /// window - `COALESCE(target_height, min_observed_height)` plus the default expiry delta *at
+    /// that height*, 40 blocks before NU7 and 120 from it. This is the canonical spentness/expiry
     /// rule that our `listunspent minconf=0` supplement and `unmined_raw_txs` share with the
     /// selector and balances; this test pins the exact semantics (including the staleness branch
     /// our earlier hand-rolled copies dropped) so a `zcash_client_sqlite` bump that changes the
-    /// rule is caught here. Thresholds are derived from `DEFAULT_TX_EXPIRY_DELTA` so the test
-    /// tracks upstream if the constant moves.
+    /// rule is caught here.
     #[test]
     fn tx_unexpired_sql_matches_upstream_branches() {
+        use crate::network::ZNetwork;
+        use zcash_protocol::consensus::{NetworkUpgrade, Parameters as _};
+
         let conn = rusqlite::Connection::open_in_memory().unwrap();
         conn.execute_batch(
             "CREATE TABLE tx(mined_height INTEGER, expiry_height INTEGER,
-                             min_observed_height INTEGER NOT NULL);",
+                             target_height INTEGER, min_observed_height INTEGER NOT NULL);",
         )
         .unwrap();
-        let pred = super::tx_unexpired_sql("tx");
-        let target: i64 = 100;
-        let delta = i64::from(super::DEFAULT_TX_EXPIRY_DELTA);
-        // (mined_height, expiry_height, min_observed_height) -> expected "unexpired".
-        let cases: &[(Option<i64>, Option<i64>, i64, bool)] = &[
-            (Some(50), Some(80), 50, true), // mined (mined < target): never treated as expired
-            (None, Some(0), 50, true),      // expiry 0 => never expires
-            (None, Some(target), 50, true), // expiry == target => unexpired
-            (None, Some(target + 5), 50, true), // expiry > target => unexpired
-            (None, Some(target - 1), 50, false), // expiry < target => expired
-            (None, None, target - delta, true), // unknown expiry, boundary: mo + delta == target
-            (None, None, target - delta + 1, true), // unknown expiry, recently observed
-            (None, None, target - delta - 1, false), // unknown expiry, stale => expired
+        let net = ZNetwork::Test;
+        let pred = super::tx_unexpired_sql("tx", &net);
+        let nu7 = i64::from(u32::from(
+            net.activation_height(NetworkUpgrade::Nu7)
+                .expect("testnet schedules NU7"),
+        ));
+        // (target, mined_height, expiry_height, target_height, min_observed_height) -> expected.
+        type Case = (i64, Option<i64>, Option<i64>, Option<i64>, i64, bool);
+        let t: i64 = 100;
+        let p = nu7 + 1_000;
+        let cases: &[Case] = &[
+            (t, Some(50), Some(80), None, 50, true), // mined (mined < target): never expired
+            (t, None, Some(0), None, 50, true),      // expiry 0 => never expires
+            (t, None, Some(t), None, 50, true),      // expiry == target => unexpired
+            (t, None, Some(t + 5), None, 50, true),  // expiry > target => unexpired
+            (t, None, Some(t - 1), None, 50, false), // expiry < target => expired
+            // Unknown expiry before NU7: a 40-block window from the observation height.
+            (t, None, None, None, t - 40, true),
+            (t, None, None, None, t - 39, true),
+            (t, None, None, None, t - 41, false),
+            // ... measured from the construction target when one is recorded.
+            (t, None, None, Some(t - 40), t - 90, true),
+            (t, None, None, Some(t - 41), t - 10, false),
+            // Unknown expiry from NU7 on: a 120-block window.
+            (p, None, None, None, p - 120, true),
+            (p, None, None, None, p - 121, false),
+            // The delta follows the height the tx was built for, not the current target: one
+            // built just before activation keeps the 40-block window across it.
+            (nu7 + 30, None, None, Some(nu7 - 1), nu7 - 1, true),
+            (nu7 + 40, None, None, Some(nu7 - 1), nu7 - 1, false),
+            (nu7 + 120, None, None, Some(nu7), nu7, true),
         ];
-        for (i, (m, e, mo, expected)) in cases.iter().enumerate() {
+        for (i, (target, m, e, th, mo, expected)) in cases.iter().enumerate() {
             conn.execute("DELETE FROM tx", []).unwrap();
             conn.execute(
-                "INSERT INTO tx(mined_height, expiry_height, min_observed_height)
-                 VALUES (?1, ?2, ?3)",
-                rusqlite::params![m, e, mo],
+                "INSERT INTO tx(mined_height, expiry_height, target_height, min_observed_height)
+                 VALUES (?1, ?2, ?3, ?4)",
+                rusqlite::params![m, e, th, mo],
             )
             .unwrap();
             let got: bool = conn
@@ -2470,7 +2504,10 @@ mod tests {
                     |r| r.get(0),
                 )
                 .unwrap();
-            assert_eq!(got, *expected, "case {i}: ({m:?}, {e:?}, {mo})");
+            assert_eq!(
+                got, *expected,
+                "case {i}: target {target}, ({m:?}, {e:?}, {th:?}, {mo})"
+            );
         }
     }
 
@@ -2491,6 +2528,7 @@ mod tests {
                  mined_height INTEGER,
                  tx_index INTEGER,
                  expiry_height INTEGER,
+                 target_height INTEGER,
                  min_observed_height INTEGER);
              CREATE TABLE transparent_received_outputs(
                  id INTEGER PRIMARY KEY,
@@ -2573,25 +2611,34 @@ mod tests {
         let only_a = AccountScope::Only(AccountUuid::from_uuid(account_a));
         let only_b = AccountScope::Only(AccountUuid::from_uuid(account_b));
         assert_eq!(
-            super::mature_coinbase_zats(dir.path(), only_a, target).unwrap(),
+            super::mature_coinbase_zats(crate::network::regtest(), dir.path(), only_a, target)
+                .unwrap(),
             1_000,
             "mature = the boundary coinbase only (spent one suppressed)"
         );
         assert_eq!(
-            super::immature_coinbase_zats(dir.path(), only_a, target).unwrap(),
+            super::immature_coinbase_zats(crate::network::regtest(), dir.path(), only_a, target)
+                .unwrap(),
             200,
             "immature = the one-short coinbase only"
         );
         // The scope is what keeps a shard's wallets apart: account B's 9M-zat coinbase must not
         // reach account A's total, and vice versa.
         assert_eq!(
-            super::mature_coinbase_zats(dir.path(), only_b, target).unwrap(),
+            super::mature_coinbase_zats(crate::network::regtest(), dir.path(), only_b, target)
+                .unwrap(),
             9_000_000,
             "account B sees its own coinbase and none of A's"
         );
         // Unscoped is the pre-fleet behaviour: everything the database holds.
         assert_eq!(
-            super::mature_coinbase_zats(dir.path(), AccountScope::Any, target).unwrap(),
+            super::mature_coinbase_zats(
+                crate::network::regtest(),
+                dir.path(),
+                AccountScope::Any,
+                target
+            )
+            .unwrap(),
             9_001_000,
             "AccountScope::Any sums every account, as it always did"
         );
@@ -2600,12 +2647,24 @@ mod tests {
         // whole point of the variant - `Any` in a shared database reports 9_001_000 zats under a
         // wallet that owns none of it.
         assert_eq!(
-            super::mature_coinbase_zats(dir.path(), AccountScope::NoAccount, target).unwrap(),
+            super::mature_coinbase_zats(
+                crate::network::regtest(),
+                dir.path(),
+                AccountScope::NoAccount,
+                target
+            )
+            .unwrap(),
             0,
             "AccountScope::NoAccount reports no account's money"
         );
         assert_eq!(
-            super::immature_coinbase_zats(dir.path(), AccountScope::NoAccount, target).unwrap(),
+            super::immature_coinbase_zats(
+                crate::network::regtest(),
+                dir.path(),
+                AccountScope::NoAccount,
+                target
+            )
+            .unwrap(),
             0
         );
     }
@@ -2626,7 +2685,8 @@ mod tests {
         conn.execute_batch(
             "CREATE TABLE transactions (
                  id_tx INTEGER PRIMARY KEY, txid BLOB, raw BLOB,
-                 mined_height INTEGER, expiry_height INTEGER, min_observed_height INTEGER
+                 mined_height INTEGER, expiry_height INTEGER, target_height INTEGER,
+                 min_observed_height INTEGER
              );
              CREATE TABLE sapling_received_note_spends (transaction_id INTEGER);
              CREATE TABLE orchard_received_note_spends (transaction_id INTEGER);
@@ -2639,7 +2699,9 @@ mod tests {
         )
         .unwrap();
 
-        let mut stmt = conn.prepare(&super::unmined_raw_txs_sql()).unwrap();
+        let mut stmt = conn
+            .prepare(&super::unmined_raw_txs_sql(&crate::network::regtest()))
+            .unwrap();
         let rows: Vec<Vec<u8>> = stmt
             .query_map(rusqlite::named_params! { ":target_height": 100u32 }, |r| {
                 r.get::<_, Vec<u8>>(1)
