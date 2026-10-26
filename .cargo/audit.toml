@@ -2,7 +2,7 @@
 # whose deny.toml documents the same advisory exceptions).
 
 [advisories]
-# No advisory exceptions are currently needed: RUSTSEC-2026-0009 (`time` <0.3.47) was
-# dropped when the librustzcash 0.24-rc line removed the `time-core = "=0.1.2"` pin that
-# had held `time` back at 0.3.37.
-ignore = []
+ignore = [
+    "RUSTSEC-2026-0374", # basic-toml unmaintained: build-time only, via age's i18n proc-macros
+    "RUSTSEC-2026-0387", # crypto-bigint 0.5.5: age's P-256 tag recipients, which zecd never uses
+]
