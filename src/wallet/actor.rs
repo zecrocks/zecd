@@ -767,6 +767,26 @@ fn scan_progress_ratio(birthday: u32, fully_scanned: u32, chain_tip: u32) -> f64
     (f64::from(fully_scanned.saturating_sub(birthday)) / f64::from(total)).clamp(0.0, 1.0)
 }
 
+/// The status's `(fully_scanned, scan_progress, scanning)` from the database's fully-scanned
+/// height and the upstream's tip. The scanned height is reported whenever the database has
+/// one - before the first connect too, so `getblockcount` answers a restarted wallet's real
+/// height rather than 0 - while progress and `scanning` need the tip as well: with it unknown
+/// the wallet conservatively reads as still scanning, never caught up.
+fn scan_state(
+    birthday: u32,
+    fully_scanned: Option<u32>,
+    chain_tip: Option<u32>,
+) -> (Option<u32>, f64, bool) {
+    match (fully_scanned, chain_tip) {
+        (Some(scanned), Some(tip)) => (
+            Some(scanned),
+            scan_progress_ratio(birthday, scanned, tip),
+            scanned < tip,
+        ),
+        (scanned, _) => (scanned, 0.0, true),
+    }
+}
+
 /// At bootstrap, warn when the derived scan floor lands more than one note-commitment-tree
 /// shard (2^16 blocks) below the wallet birthday - the symptom of the scan queue flooring at
 /// an in-progress subtree boundary instead of the birthday (the failure `maybe_bootstrap_account`
@@ -1614,11 +1634,25 @@ async fn spawn_inner(
             None => BTreeMap::new(),
         }
     };
+    // The scanned height is the database's from the first publish, not unknown until the
+    // actor connects: `getblockcount` and `getbestblockhash` read the status, and a restarted
+    // wallet answering 0 in that window reads as a wallet that lost its scan.
+    let (fully_scanned, _, _) = scan_state(
+        birthday,
+        db_data
+            .block_fully_scanned()
+            .ok()
+            .flatten()
+            .map(|meta| u32::from(meta.block_height())),
+        None,
+    );
     let (status_tx, status_rx) = watch::channel(SyncStatus {
         encrypted,
         watch_only,
         accounts: Arc::new(seeded_accounts),
         birthday: Some(birthday),
+        fully_scanned,
+        scanning: true,
         unlocked_until: encrypted.then_some(0),
         ..SyncStatus::default()
     });
@@ -4843,17 +4877,8 @@ impl WalletActor {
         // status RPCs (`getwalletinfo.scanning`, `initialblockdownload`, `getpeerinfo.syncing`)
         // reported the scan done hours early, and `pending_enhancements` was measured (one DB
         // read per status update) throughout the scan it was designed to skip.
-        let (fully_scanned, scan_progress, scanning) = match (fully_scanned_height, self.tip_height)
-        {
-            (Some(scanned), Some(tip)) => (
-                Some(scanned),
-                scan_progress_ratio(self.birthday, scanned, tip),
-                scanned < tip,
-            ),
-            // Either height still unknown (no tip yet, or nothing scanned): conservatively
-            // report still scanning rather than claiming a caught-up wallet.
-            _ => (None, 0.0, true),
-        };
+        let (fully_scanned, scan_progress, scanning) =
+            scan_state(self.birthday, fully_scanned_height, self.tip_height);
 
         // The enhancement backlog is the work that remains *after* the block scan reaches the tip
         // (memos, full transparent data - see `enhance_step`). While the block scan is still
@@ -9048,6 +9073,28 @@ mod tests {
         // [0, 1].
         assert_eq!(scan_progress_ratio(1_000, 1_200, 1_100), 1.0);
         assert_eq!(scan_progress_ratio(1_000, 900, 1_100), 0.0);
+    }
+
+    /// The scanned height is published as soon as the database has one, tip or no tip, so a
+    /// restarted wallet's `getblockcount` is its real height before the first connect; without
+    /// the tip it still reads as scanning, never as caught up.
+    #[test]
+    fn scan_state_reports_the_scanned_height_before_the_tip_is_known() {
+        use super::scan_state;
+        assert_eq!(
+            scan_state(1_000, Some(1_149), None),
+            (Some(1_149), 0.0, true)
+        );
+        assert_eq!(scan_state(1_000, None, None), (None, 0.0, true));
+        assert_eq!(scan_state(1_000, None, Some(1_149)), (None, 0.0, true));
+        assert_eq!(
+            scan_state(1_000, Some(1_149), Some(1_149)),
+            (Some(1_149), 1.0, false)
+        );
+        let (scanned, progress, scanning) = scan_state(1_000, Some(1_050), Some(1_100));
+        assert_eq!(scanned, Some(1_050));
+        assert!((progress - 0.5).abs() < 1e-9, "{progress}");
+        assert!(scanning);
     }
 
     #[test]
