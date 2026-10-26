@@ -5,6 +5,51 @@ All notable changes to zecd are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com), and this
 project adheres to [Semantic Versioning](https://semver.org).
 
+## [0.9.0-rc4] - 2026-10-26
+
+Refuses a node that missed NU7, and stops a per-block lookup loop on transparent-heavy wallets.
+
+**Read before deploying.** A node that never adopted an upgrade this build follows is refused once
+the upgrade is in force. A mainnet node still on zebra 6.x is warned about now.
+
+### Added
+- **A node that did not upgrade is refused rather than followed.** The outdated-build check only
+  looked at upgrades the node knows and this build does not. It now also catches an upgrade this
+  build activates that the node never adopted: such a node stays on the old rules at the
+  activation height, and from there its chain is a fork. Before the height zecd warns at connect,
+  read from the node's upgrade map. From the height on the wallet does not scan past the fork:
+  `/readyz` answers 503 with reason `upstream_not_upgraded`, `/status` (`upstream_refusal`) and
+  `getblockchaininfo.warnings` carry the explanation, and the connection is retried until the
+  node is upgraded. In light mode there is no advance warning; the fork is caught at the first
+  block past the height. `zecd chain-info` reports `upstream_not_upgraded`, with `usable: false`
+  and a nonzero exit once it is active.
+- **`getblockchaininfo` reports zcashd's `upgrades` and `consensus` objects** from this build's
+  schedule, identically on both backends. `warnings`, previously always empty, carries the reason
+  when the wallet refuses its upstream.
+
+### Fixed
+- **Transparent spend searches re-ran on every block.** Under `[sync] fetch_memos = true` the
+  wallet queued an address-index lookup for every unspent transparent output each time the tip
+  moved, and counted them in `pending_enhancements`, so its backlog never settled at zero. The
+  block scan already finds those spends on both backends, so the searches are no longer serviced
+  or counted. Ephemeral-address checks still are. 0.8.x behaves the same.
+
+### Known issues
+- **Cold-sync time for a large wallet grows with the chain.** The per-block cost of a
+  from-birthday sync keeps rising over a long history, because a query in the wallet crates lacks
+  an index. 0.8.x behaves the same.
+- **A large wallet's memo backfill can take many hours**, holding `readiness = "synced"` back.
+  Under `fetch_memos = true` every received transaction is fetched once to read its memo, and
+  storing it costs time that grows with the wallet's history: about 379 ms per transaction on a
+  testnet wallet with 111,000 to backfill. 0.8.x behaves the same. A deployment that does not read
+  memos can set `fetch_memos = false`; one that does can use `readiness = "scanned"` and read
+  history up to `getwalletinfo.enhanced_through`.
+
+### Security
+- `RUSTSEC-2026-0387` (`crypto-bigint` 0.5.5) is accepted with a documented exception: it is
+  reached only through `age`'s P-256 tag recipients, which zecd never uses, and no `age` release
+  avoids it yet.
+
 ## [0.9.0-rc3] - 2026-10-23
 
 Mainnet NU7 support, on the Zakura Common 4.0 crates.
@@ -25,7 +70,7 @@ Mainnet NU7 support, on the Zakura Common 4.0 crates.
 - **A warning when the upstream schedules an upgrade at a different height.** The outdated-build
   check compared only consensus branch ids, so it missed an upgrade this build knows but
   schedules elsewhere: mainnet NU7 on an older build. zecd now logs it at connect (an error once
-  it activates), and `zecd chain info` shows both heights. Scanning is unaffected.
+  it activates), and `zecd chain-info` shows both heights. Scanning is unaffected.
 - **ZIP 218's shielded budget is enforced before proving.** From NU7 a transaction may carry at
   most 330 shielded actions, spends and outputs (300 Sapling). A send over it fails with `-8`, and
   `z_mergetoaddress` truncates its selection to fit. At the default `orchard_action_limit` and
@@ -1136,6 +1181,7 @@ Zcash, backed entirely by librustzcash and running as a light client.
 ### Security
 - Pre-release audit hardening; refuse to start on mainnet with the placeholder RPC password; enforce a 12-character passphrase minimum.
 
+[0.9.0-rc4]: https://github.com/zecrocks/zecd/compare/v0.9.0-rc3...v0.9.0-rc4
 [0.9.0-rc3]: https://github.com/zecrocks/zecd/compare/v0.9.0-rc2...v0.9.0-rc3
 [0.9.0-rc2]: https://github.com/zecrocks/zecd/compare/v0.9.0-rc1...v0.9.0-rc2
 [0.9.0-rc1]: https://github.com/zecrocks/zecd/compare/v0.8.1...v0.9.0-rc1
