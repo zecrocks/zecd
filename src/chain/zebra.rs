@@ -666,6 +666,7 @@ fn server_info_from(info: BlockchainInfo) -> ServerInfo {
     };
     ServerInfo {
         chain_name: info.chain,
+        tip_height: Some(info.blocks),
         upgrades,
         tip_branch_id,
         next_block_branch_id,

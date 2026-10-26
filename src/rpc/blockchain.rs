@@ -16,8 +16,9 @@
 
 use std::time::Duration;
 
-use serde_json::{json, Value};
+use serde_json::{json, Map, Value};
 use tokio::time::Instant;
+use zcash_protocol::consensus::{BlockHeight, BranchId, Parameters};
 
 use crate::error::RpcError;
 use crate::server::jsonrpc::RpcRequest;
@@ -41,14 +42,57 @@ fn best_block(
     Ok((st.fully_scanned.unwrap_or(0), st.best_block_hash, None))
 }
 
+/// zcashd's `getblockchaininfo.upgrades` and `.consensus` objects, from **this build's**
+/// schedule on `params` evaluated at `height`.
+///
+/// The schedule reported is zecd's own rather than the upstream's because it is the one zecd
+/// acts on - every transaction it builds commits to `consensus.nextblock` - and because it is
+/// the only one both backends can answer: a zebra upstream reports its own map, a lightwalletd
+/// reports none, and relaying whichever was available made the same RPC answer differently
+/// depending on the backend. When the upstream disagrees, that is what `warnings` is for (and
+/// the actor's refusal, for an upstream that never adopted an upgrade).
+///
+/// `upgrades` is keyed by the branch id in bare lowercase hex, each entry
+/// `{name, activationheight, status}` with `status` `"active"` from the activation height on and
+/// `"pending"` before it. `consensus` is `{chaintip, nextblock}`, the branch ids in force at
+/// `height` and at `height + 1`.
+fn schedule_json<P: Parameters>(params: &P, height: u32) -> (Value, Value) {
+    let mut upgrades = Map::new();
+    for u in crate::network::scheduled_upgrades(params) {
+        upgrades.insert(
+            format!("{:08x}", u.branch_id),
+            json!({
+                "name": u.name,
+                "activationheight": u.activation_height,
+                "status": if height >= u.activation_height { "active" } else { "pending" },
+            }),
+        );
+    }
+    let branch = |h: u32| {
+        format!(
+            "{:08x}",
+            u32::from(BranchId::for_height(params, BlockHeight::from_u32(h)))
+        )
+    };
+    let consensus = json!({
+        "chaintip": branch(height),
+        "nextblock": branch(height.saturating_add(1)),
+    });
+    (Value::Object(upgrades), consensus)
+}
+
 /// `getblockchaininfo` - chain/sync overview; `blocks`/`headers` follow the module-level
 /// height conventions and `initialblockdownload` mirrors the wallet's scanning state.
+/// `upgrades`/`consensus` are zcashd's, from this build's schedule at the known chain tip
+/// (`headers`, the height the next transaction is built on top of - see [`schedule_json`]), and
+/// `warnings` carries the actor's upstream refusal when there is one.
 pub(crate) fn getblockchaininfo(state: &AppState, wallet: Option<&str>) -> Result<Value, RpcError> {
     let w = state.registry.get(wallet)?;
     let st = w.status();
     let (blocks, best_hash, best_time) = best_block(state, wallet)?;
     let headers = st.chain_tip.unwrap_or(blocks);
     let mediantime = read::median_time_past(&w.engine_dir, blocks).ok().flatten();
+    let (upgrades, consensus) = schedule_json(&w.network, headers);
     Ok(json!({
         "chain": w.network.name(),
         "blocks": blocks,
@@ -63,7 +107,9 @@ pub(crate) fn getblockchaininfo(state: &AppState, wallet: Option<&str>) -> Resul
         "initialblockdownload": st.scanning || st.pending_enhancements > 0,
         "size_on_disk": 0,
         "pruned": false,
-        "warnings": ""
+        "upgrades": upgrades,
+        "consensus": consensus,
+        "warnings": st.upstream_refusal.unwrap_or_default()
     }))
 }
 
@@ -457,6 +503,34 @@ pub(crate) async fn waitforsync(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::network::ZNetwork;
+
+    /// The schedule is this build's, so it reads the same whichever backend the wallet uses:
+    /// every upgrade the network schedules, active from its height on, and the consensus pair
+    /// stepping over to the new branch exactly at the boundary.
+    #[test]
+    fn the_reported_schedule_is_this_builds_and_steps_at_activation() {
+        let nu7 = 4_465_026;
+        let nu7_hex = format!("{:08x}", u32::from(BranchId::Nu7));
+        let nu63_hex = format!("{:08x}", u32::from(BranchId::Nu6_3));
+
+        let (upgrades, consensus) = schedule_json(&ZNetwork::Test, nu7 - 1);
+        assert_eq!(
+            upgrades.as_object().map(|m| m.len()),
+            Some(crate::network::scheduled_upgrades(&ZNetwork::Test).len())
+        );
+        assert_eq!(upgrades[&nu7_hex]["name"], "NU7");
+        assert_eq!(upgrades[&nu7_hex]["activationheight"], nu7);
+        assert_eq!(upgrades[&nu7_hex]["status"], "pending");
+        assert_eq!(upgrades[&nu63_hex]["status"], "active");
+        assert_eq!(consensus["chaintip"], nu63_hex.as_str());
+        assert_eq!(consensus["nextblock"], nu7_hex.as_str());
+
+        let (upgrades, consensus) = schedule_json(&ZNetwork::Test, nu7);
+        assert_eq!(upgrades[&nu7_hex]["status"], "active");
+        assert_eq!(consensus["chaintip"], nu7_hex.as_str());
+        assert_eq!(consensus["nextblock"], nu7_hex.as_str());
+    }
 
     #[test]
     fn blockhash_param_errors_match_parse_hash_v() {

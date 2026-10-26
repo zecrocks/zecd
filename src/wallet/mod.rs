@@ -169,6 +169,12 @@ pub struct SyncStatus {
     /// The zebra endpoint, e.g. `"zebra-rpc 127.0.0.1:18234"`.
     pub server: Option<String>,
     pub conn_state: ConnState,
+    /// Why the actor refuses to sync against the upstream it can reach, when it does: today
+    /// only a node that never adopted a network upgrade this build follows (see
+    /// [`crate::chain::UnsupportedKind::UpstreamNotUpgraded`]). `conn_state` is `Down` while
+    /// this is set; it is what tells a stale node apart from a dead one on `/readyz` and in
+    /// `getblockchaininfo.warnings`. Cleared by the next connect that passes.
+    pub upstream_refusal: Option<String>,
     pub chain_tip: Option<u32>,
     pub fully_scanned: Option<u32>,
     /// The wallet's birthday height (from `keys.toml`). Static for the life of the wallet;
@@ -193,10 +199,12 @@ pub struct SyncStatus {
     /// Non-zero only once the block scan is caught up (it's `0` while `scanning`, where it
     /// would be unmeasured anyway). On a from-birthday restore this can be a multi-hour backlog
     /// that drains *after* `scan_progress` hits 1.0 and `scanning` goes false - so a wallet is only
-    /// fully ready to serve history once this reaches `0`. It is not restore-only: the recurring
-    /// transparent spend-search requests re-emit on every tip advance for a wallet holding
-    /// unspent transparent UTXOs, so it transiently rises after sends/new blocks in steady state
-    /// (which is what `readiness = "scanned"` exists for). Surfaced on `/status`, factored into
+    /// fully ready to serve history once this reaches `0`. It is not restore-only: a send or a
+    /// receive queues its own requests, so it transiently rises in steady state (which is what
+    /// `readiness = "scanned"` exists for). The wallet layer's recurring transparent spend
+    /// searches, re-emitted for every unspent UTXO on each tip advance, are **not** counted:
+    /// the block scan finds those spends, so the drain leaves them alone (see
+    /// `actor::request_in_scope`). Surfaced on `/status`, factored into
     /// `synced` readiness, and reflected in `getwalletinfo.scanning`. With `[sync]
     /// fetch_memos = false` the memo-backfill requests are out of scope and never counted here
     /// (skipping them in the drain while counting them would pin this above zero and the wallet

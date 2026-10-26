@@ -102,6 +102,68 @@ impl ZNetwork {
     }
 }
 
+/// Every network upgrade this build knows, oldest first.
+pub const NETWORK_UPGRADES: [NetworkUpgrade; 11] = [
+    NetworkUpgrade::Overwinter,
+    NetworkUpgrade::Sapling,
+    NetworkUpgrade::Blossom,
+    NetworkUpgrade::Heartwood,
+    NetworkUpgrade::Canopy,
+    NetworkUpgrade::Nu5,
+    NetworkUpgrade::Nu6,
+    NetworkUpgrade::Nu6_1,
+    NetworkUpgrade::Nu6_2,
+    NetworkUpgrade::Nu6_3,
+    NetworkUpgrade::Nu7,
+];
+
+/// An upgrade's display name as zcashd and zebra spell it in `getblockchaininfo.upgrades`
+/// (`"NU6.3"`, where the protocol crate's own `Display` says `"Nu6.3"`).
+pub fn upgrade_name(nu: NetworkUpgrade) -> &'static str {
+    match nu {
+        NetworkUpgrade::Overwinter => "Overwinter",
+        NetworkUpgrade::Sapling => "Sapling",
+        NetworkUpgrade::Blossom => "Blossom",
+        NetworkUpgrade::Heartwood => "Heartwood",
+        NetworkUpgrade::Canopy => "Canopy",
+        NetworkUpgrade::Nu5 => "NU5",
+        NetworkUpgrade::Nu6 => "NU6",
+        NetworkUpgrade::Nu6_1 => "NU6.1",
+        NetworkUpgrade::Nu6_2 => "NU6.2",
+        NetworkUpgrade::Nu6_3 => "NU6.3",
+        NetworkUpgrade::Nu7 => "NU7",
+    }
+}
+
+/// One network upgrade this build schedules on a network.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ScheduledUpgrade {
+    pub upgrade: NetworkUpgrade,
+    /// [`upgrade_name`] of the upgrade.
+    pub name: &'static str,
+    /// The consensus branch id the upgrade activates.
+    pub branch_id: u32,
+    pub activation_height: u32,
+}
+
+/// The upgrades `params` schedules, oldest first: this build's own answer to
+/// `getblockchaininfo.upgrades`, and the schedule an upstream is checked against for the
+/// upgrades it has *not* adopted (`chain::unsupported_upgrades`).
+pub fn scheduled_upgrades<P: Parameters>(params: &P) -> Vec<ScheduledUpgrade> {
+    NETWORK_UPGRADES
+        .into_iter()
+        .filter_map(|nu| {
+            let h = params.activation_height(nu)?;
+            Some(ScheduledUpgrade {
+                upgrade: nu,
+                name: upgrade_name(nu),
+                branch_id: u32::from(nu.branch_id()),
+                activation_height: u32::from(h),
+            })
+        })
+        .collect()
+}
+
 impl Parameters for ZNetwork {
     fn network_type(&self) -> NetworkType {
         match self {
@@ -277,6 +339,42 @@ mod tests {
         assert_eq!(local(None, None).protocol_version(), 170_150);
         assert_eq!(local(h(8), None).protocol_version(), 170_160);
         assert_eq!(local(h(8), h(12)).protocol_version(), 170_180);
+    }
+
+    /// The schedule lists what the network activates, oldest first, under the names nodes use,
+    /// and leaves out an upgrade the network does not schedule.
+    #[test]
+    fn scheduled_upgrades_follow_the_network() {
+        let main = scheduled_upgrades(&ZNetwork::Main);
+        assert_eq!(main.first().map(|u| u.name), Some("Overwinter"));
+        let nu7 = main.last().expect("mainnet schedules upgrades");
+        assert_eq!(nu7.name, "NU7");
+        assert_eq!(nu7.branch_id, u32::from(BranchId::Nu7));
+        assert_eq!(nu7.activation_height, 3_543_405);
+        assert!(main
+            .windows(2)
+            .all(|w| w[0].activation_height <= w[1].activation_height));
+
+        let h = |n| Some(BlockHeight::from_u32(n));
+        let without_nu7 = ZNetwork::Regtest(LocalNetwork {
+            overwinter: h(1),
+            sapling: h(1),
+            blossom: h(1),
+            heartwood: h(1),
+            canopy: h(1),
+            nu5: h(1),
+            nu6: h(1),
+            nu6_1: h(4),
+            nu6_2: h(4),
+            nu6_3: h(8),
+            nu7: None,
+        });
+        let names: Vec<_> = scheduled_upgrades(&without_nu7)
+            .into_iter()
+            .map(|u| u.name)
+            .collect();
+        assert_eq!(names.last(), Some(&"NU6.3"));
+        assert!(!names.contains(&"NU7"));
     }
 
     #[test]

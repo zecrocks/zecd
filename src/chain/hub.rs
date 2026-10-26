@@ -272,6 +272,27 @@ impl HubSource {
         }
         result
     }
+
+    /// [`ChainSource::server_info`] past the per-connection cache, replacing the cached copy.
+    ///
+    /// The cache is right for what `server_info` was first used for (the chain name and the
+    /// upgrade schedule do not change under a live connection), but the reply also carries the
+    /// branch ruling the upstream's tip, which does change at an activation height - and a node
+    /// that never adopted an upgrade is visible in light mode only through that branch. So a
+    /// wallet whose tip crosses an activation height asks again, once, through here.
+    pub async fn refresh_server_info(&mut self) -> anyhow::Result<ServerInfo> {
+        self.hub
+            .stats
+            .server_info_fetches
+            .fetch_add(1, Ordering::Relaxed);
+        let result = self.inner.server_info().await;
+        let info = self.checked(result).await?;
+        let mut cache = self.hub.info.lock().await;
+        if cache.generation == self.generation {
+            cache.server_info = Some(info.clone());
+        }
+        Ok(info)
+    }
 }
 
 impl ChainSource for HubSource {
@@ -967,6 +988,15 @@ mod tests {
             .await
             .expect("orchard roots");
         assert_eq!(calls.count("z_getsubtreesbyindex"), 2);
+
+        // A refresh goes upstream regardless, and leaves the fresh reply in the cache.
+        sources[0]
+            .refresh_server_info()
+            .await
+            .expect("refreshed server info");
+        assert_eq!(hub.stats().server_info_fetches.load(Ordering::Relaxed), 2);
+        sources[1].server_info().await.expect("cached server info");
+        assert_eq!(hub.stats().server_info_fetches.load(Ordering::Relaxed), 2);
     }
 
     /// Enhancement fetches one full transaction per wallet transaction, and in a fleet the same

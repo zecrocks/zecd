@@ -152,6 +152,27 @@ def main() -> int:
     ck("chain is main/test/regtest", bci["chain"] in ("main", "test", "regtest"))
     ck("blocks is int", isinstance(bci["blocks"], int))
     ck("bestblockhash 64-hex", isinstance(bci["bestblockhash"], str) and len(bci["bestblockhash"]) == 64)
+    # zcashd's upgrade map and consensus pair, from zecd's own schedule - so a zebra-backed and a
+    # lightwalletd-backed daemon answer identically (this script runs against both).
+    ups = bci.get("upgrades")
+    ck("upgrades is a non-empty object", isinstance(ups, dict) and len(ups) > 0, ups)
+    ck("upgrades keyed by 8-hex branch ids with name/activationheight/status",
+       isinstance(ups, dict) and all(
+           len(k) == 8 and set(v) == {"name", "activationheight", "status"}
+           and v["status"] in ("active", "pending") for k, v in ups.items()), ups)
+    cons = bci.get("consensus")
+    ck("consensus has chaintip/nextblock",
+       isinstance(cons, dict) and set(cons) == {"chaintip", "nextblock"}, cons)
+    if isinstance(ups, dict) and isinstance(cons, dict):
+        tip_branch = ups.get(cons["chaintip"])
+        ck("consensus.chaintip names an active upgrade",
+           tip_branch is not None and tip_branch["status"] == "active", cons)
+        # Regtest activates several upgrades at one height, so compare heights, not keys.
+        newest = max(v["activationheight"] for v in ups.values() if v["status"] == "active")
+        ck("consensus.chaintip is an upgrade from the newest active height",
+           tip_branch is not None and tip_branch["activationheight"] == newest,
+           f"{cons['chaintip']} vs height {newest}")
+    ck("warnings is empty against an up-to-date node", bci["warnings"] == "", bci["warnings"])
 
     print("== blocks/hash consistency ==")
     # The classic poller pattern must hold: getblockhash(getblockcount()) succeeds and

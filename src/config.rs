@@ -417,10 +417,10 @@ pub enum ReadinessMode {
     /// pending. This is the "scanned to tip, memos still landing" state: balances and note
     /// spendability are current (they come from the block scan), but history RPCs may still be
     /// missing memos/full transaction data, which `getwalletinfo.enhanced_through` bounds
-    /// precisely. Exists because the backlog is not restore-only: on a wallet holding many
-    /// transparent UTXOs, every send (and tip advance) re-emits the recurring spend-search
-    /// requests, so gating on an empty backlog makes `/readyz` flap after routine sends -
-    /// pulling a healthy node out of rotation while every balance RPC was answering correctly.
+    /// precisely. Exists because the backlog is not restore-only: every send and receive queues
+    /// its own enhancement, so gating on an empty backlog briefly takes `/readyz` to 503 after
+    /// routine activity - pulling a healthy node out of rotation while every balance RPC was
+    /// answering correctly.
     /// Opt in (`readiness = "scanned"`) for deployments that route balance/send traffic and
     /// clamp history consumption to `enhanced_through`.
     Scanned,

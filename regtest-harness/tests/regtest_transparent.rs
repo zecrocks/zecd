@@ -586,11 +586,12 @@ async fn regtest_transparent_receive_and_autoshield_spend() {
     //     window below.
     //
     //     First widen the UTXO set the way the field wallet's was shaped: one funder transaction
-    //     paying MANY wallet t-addresses at once. A k-output transaction is what arms upstream's
-    //     quadratic spend-search duplication (its request generation joins each queued output to
-    //     every received output of the same tx - see `actor::outstanding_requests`), so this also
-    //     plants a live tripwire: the raw duplicated set for this tx alone is k^2 = 144 requests,
-    //     and the deduplicated count zecd reports stays far below it.
+    //     paying MANY wallet t-addresses at once. Enhancing it queues a spend search per output,
+    //     and the wallet layer re-emits one for every unspent UTXO on each tip advance, so a
+    //     wallet holding many UTXOs paid one lookup per UTXO per block and its backlog never
+    //     settled at zero. zecd now leaves those to the block scan, which already finds the spends
+    //     (`actor::request_in_scope`), so they never reach `pending_enhancements`: the backlog
+    //     sampled below holds only the fan-out's own enhancement, never one entry per UTXO.
     const FAN_OUT: usize = 12;
     let mut fan_addrs = Vec::with_capacity(FAN_OUT);
     for _ in 0..FAN_OUT {
@@ -616,12 +617,12 @@ async fn regtest_transparent_receive_and_autoshield_spend() {
         .expect("zecd scans the fan-out");
 
     // Sample /readyz and /status continuously while the tip advances a few more times (each
-    // advance regenerates the spend-search set and re-runs the drain). Every /readyz sample must
-    // be 200 - that is the whole "scanned" contract. The pending_enhancements bound is a
-    // probabilistic tripwire on top (the deterministic pin for the dedup is
-    // `actor::tests::upstream_spend_search_duplication_is_collapsed_by_outstanding_requests`):
-    // a sample can miss the drain window, but any sample it does catch must show the
-    // deduplicated count (tens), never the raw duplicated one (144+).
+    // advance regenerates the spend-search set). Every /readyz sample must be 200 - that is the
+    // whole "scanned" contract. The pending_enhancements bound is a tripwire on top (the
+    // deterministic pin is
+    // `actor::tests::upstream_spend_searches_are_linear_and_left_to_the_block_scan`): a sample
+    // can miss a drain window, but none may count a request per held UTXO - this wallet now
+    // holds more than FAN_OUT of them.
     let health = format!("http://127.0.0.1:{}", cfg.health_port());
     let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let samples = std::sync::Arc::new(std::sync::Mutex::new(Vec::<(u16, u64)>::new()));
@@ -661,7 +662,7 @@ async fn regtest_transparent_receive_and_autoshield_spend() {
     }
     stop.store(true, std::sync::atomic::Ordering::Relaxed);
     sampler.await.expect("join the readiness sampler");
-    let samples = samples.lock().unwrap();
+    let samples = std::mem::take(&mut *samples.lock().unwrap());
     assert!(
         samples.len() >= 10,
         "the readiness window collected too few samples to mean anything: {}",
@@ -678,10 +679,31 @@ async fn regtest_transparent_receive_and_autoshield_spend() {
     );
     let peak_pending = samples.iter().map(|(_, p)| *p).max().unwrap_or(0);
     assert!(
-        peak_pending < 80,
-        "pending_enhancements reported {peak_pending}, at or above the raw duplicated \
-         request count - the dedup in actor::outstanding_requests has regressed"
+        peak_pending < FAN_OUT as u64,
+        "pending_enhancements reported {peak_pending} with {FAN_OUT}+ unspent transparent UTXOs \
+         held - the recurring spend searches are being counted again (actor::request_in_scope), \
+         which is what kept a transparent-heavy wallet from ever becoming ready"
     );
+    // And the backlog empties outright once caught up, UTXOs still unspent: nothing the wallet
+    // holds re-arms it.
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let pending = reqwest::get(format!("{health}/status"))
+            .await
+            .expect("/status")
+            .json::<serde_json::Value>()
+            .await
+            .expect("/status json")["wallets"]["default"]["pending_enhancements"]
+            .as_u64();
+        if pending == Some(0) {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the enhancement backlog never emptied with transparent UTXOs held: {pending:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
 
     drop(zecd);
     // `zebrad` and `funder` clean up on drop.

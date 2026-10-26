@@ -4,7 +4,7 @@ all-features = true
 [advisories]
 version = 2
 yanked = "deny"
-# One exception. The previous one, RUSTSEC-2026-0173 (proc-macro-error2
+# Two exceptions, both reached only through `age`. An earlier one, RUSTSEC-2026-0173 (proc-macro-error2
 # unmaintained), went away when `age` 0.12 moved to i18n-embed-fl 0.10 - which
 # depends on the maintained proc-macro-error3 fork - and getset 0.1.7 (orchard's
 # build-time dependency) dropped it too.
@@ -14,6 +14,14 @@ ignore = [
     # compile time; nothing parses runtime input with it. Drop this once
     # i18n-config or age moves off it.
     { id = "RUSTSEC-2026-0374", reason = "build-time only, via age's i18n proc-macros; no maintained release of i18n-config avoids it" },
+    # crypto-bigint 0.5.5 has secret-dependent branches in operations meant to be
+    # constant-time; only 0.7.6 is fixed, and elliptic-curve 0.13 pins 0.5. It reaches
+    # the tree only through age 0.12.1 (its newest release) -> p256, which age uses for
+    # its P-256 tag recipients. zecd encrypts keys.toml to X25519 recipients or a
+    # passphrase (scrypt) and decrypts with its own X25519 identity file or that
+    # passphrase, so no secret ever meets P-256 arithmetic. Drop this once age moves
+    # to p256 0.14.
+    { id = "RUSTSEC-2026-0387", reason = "crypto-bigint 0.5 timing leaks: reached only via age's P-256 recipients, which zecd never uses; no age release on a fixed version yet" },
 ]
 
 [licenses]

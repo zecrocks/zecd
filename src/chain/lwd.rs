@@ -216,11 +216,17 @@ impl ChainSource for LwdSource {
             .into_inner();
         Ok(ServerInfo {
             chain_name: info.chain_name,
+            // `blockHeight` and `consensusBranchId` come from one `getblockchaininfo` call on the
+            // lightwalletd side, so the pair is consistent - which is what lets the detector
+            // check the tip's branch against the one this build expects at that height (the
+            // only way light mode can see a node that did not upgrade).
+            tip_height: u32::try_from(info.block_height).ok().filter(|h| *h > 0),
             // `GetLightdInfo` has no upgrades map, so the outdated-build detector's map half
             // has nothing to inspect in light mode. It does report the branch ruling the tip
             // (`consensusBranchId`, bare hex like `getblockchaininfo`'s), which feeds the
             // detector's belt check: an unrecognized branch there still surfaces as an active
-            // unsupported upgrade.
+            // unsupported upgrade, and a branch older than this build expects at the tip
+            // surfaces as an upstream that did not upgrade.
             upgrades: Vec::new(),
             tip_branch_id: u32::from_str_radix(info.consensus_branch_id.trim(), 16).ok(),
             next_block_branch_id: None,

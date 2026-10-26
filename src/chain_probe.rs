@@ -43,17 +43,18 @@ pub struct ChainInfo {
     pub suggested_birthday: u32,
     /// Consensus branch ID in force at the tip, when the upstream reports one.
     pub tip_branch_id: Option<u32>,
-    /// Network upgrades the upstream follows that this build cannot - an unrecognized branch,
-    /// or a known one this build schedules at a different height. The outdated-build signal;
-    /// empty is the healthy case.
+    /// Network upgrades the upstream and this build disagree on - an unrecognized branch, a
+    /// known one this build schedules at a different height, or one this build schedules that
+    /// the upstream node never adopted. Empty is the healthy case.
     pub unsupported_upgrades: Vec<UnsupportedUpgrade>,
     /// How long the dial plus both queries took.
     pub elapsed: Duration,
 }
 
 impl ChainInfo {
-    /// Whether this build understands every upgrade the upstream reports, and is on the right
-    /// chain - i.e. whether a wallet against this endpoint would sync.
+    /// Whether this build and the upstream agree on every upgrade, and the upstream is on the
+    /// right chain - i.e. whether a wallet against this endpoint would sync the network's
+    /// chain. A pending disagreement counts: it is a fork scheduled for a known height.
     pub fn is_usable(&self) -> bool {
         self.network_matches != Some(false) && self.unsupported_upgrades.is_empty()
     }
@@ -256,7 +257,31 @@ pub async fn run(config: &AppConfig, args: &crate::config::ChainInfoArgs) -> any
                      built after it activates would be rejected"
                         .to_string()
                 }
+                UnsupportedKind::UpstreamNotUpgraded => String::new(),
             };
+            if u.kind == UnsupportedKind::UpstreamNotUpgraded {
+                if u.active {
+                    eprintln!(
+                        "error: this zecd build activates network upgrade {} (branch id \
+                         {:08x}){at}, and the upstream node has not adopted it: its chain past \
+                         that height follows the old rules and is a fork the network abandoned. \
+                         {}",
+                        u.name,
+                        u.branch_id,
+                        crate::chain::NODE_UPGRADE_GUIDANCE,
+                    );
+                } else {
+                    eprintln!(
+                        "warning: this zecd build activates network upgrade {} (branch id \
+                         {:08x}){at}, and the upstream node does not know it: the node will \
+                         stay on the old rules and fork off there. {}",
+                        u.name,
+                        u.branch_id,
+                        crate::chain::NODE_UPGRADE_GUIDANCE,
+                    );
+                }
+                continue;
+            }
             eprintln!(
                 "{}: upstream reports network upgrade {} (branch id {:08x}){at} {verdict}",
                 if u.active { "error" } else { "warning" },
@@ -264,7 +289,18 @@ pub async fn run(config: &AppConfig, args: &crate::config::ChainInfoArgs) -> any
                 u.branch_id,
             );
         }
-        if info.unsupported_upgrades.iter().any(|u| u.active) {
+        let active = |kind: fn(&UnsupportedKind) -> bool| {
+            info.unsupported_upgrades
+                .iter()
+                .any(|u| u.active && kind(&u.kind))
+        };
+        if active(|k| *k == UnsupportedKind::UpstreamNotUpgraded) {
+            anyhow::bail!(
+                "the upstream node has not adopted a network upgrade this zecd build follows; \
+                 upgrade the node before syncing a wallet against it"
+            );
+        }
+        if active(|k| *k != UnsupportedKind::UpstreamNotUpgraded) {
             anyhow::bail!(
                 "this zecd build cannot follow the upstream's current consensus rules; update \
                  zecd before syncing a wallet against it"
@@ -296,6 +332,9 @@ fn json_report(info: &ChainInfo) -> serde_json::Value {
                     UnsupportedKind::UnknownBranch => ("unknown_branch", None),
                     UnsupportedKind::ActivationHeightMismatch { expected } => {
                         ("activation_height_mismatch", expected)
+                    }
+                    UnsupportedKind::UpstreamNotUpgraded => {
+                        ("upstream_not_upgraded", u.activation_height)
                     }
                 };
                 serde_json::json!({

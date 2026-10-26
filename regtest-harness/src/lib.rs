@@ -227,6 +227,10 @@ pub struct Zebrad {
     /// NU6.3 (ironwood) activation height. Preserved across `restart_with_miner` so the rebuilt
     /// config keeps the same schedule.
     nu6_3_height: u32,
+    /// NU7 activation height written into the node's config (`None`: the node does not schedule
+    /// NU7). Normally [`regtest_nu7_height`]; [`Zebrad::start_without_nu7`] leaves it out to
+    /// stand up a node that never adopted the upgrade. Preserved across restarts.
+    nu7_height: Option<u32>,
     _dir: tempfile::TempDir,
 }
 
@@ -297,7 +301,24 @@ impl Zebrad {
         Self::start_inner(bin, miner_address, NU6_3_ACTIVATION_HEIGHT).await
     }
 
+    /// Launch `zebrad` with NU7 left out of its activation table, whatever
+    /// `ZECD_REGTEST_NU7_HEIGHT` says: a node that was never upgraded for NU7. Past the height
+    /// the zecd under test activates NU7 at, this node keeps mining on the NU6.3 rules - the
+    /// fork an un-upgraded node follows on a public network.
+    pub async fn start_without_nu7(bin: &Path) -> Result<Zebrad> {
+        Self::start_scheduled(bin, SEED_MINER_ADDRESS, NU6_3_ACTIVATION_HEIGHT, None).await
+    }
+
     async fn start_inner(bin: &Path, miner_address: &str, nu6_3_height: u32) -> Result<Zebrad> {
+        Self::start_scheduled(bin, miner_address, nu6_3_height, regtest_nu7_height()).await
+    }
+
+    async fn start_scheduled(
+        bin: &Path,
+        miner_address: &str,
+        nu6_3_height: u32,
+        nu7_height: Option<u32>,
+    ) -> Result<Zebrad> {
         let dir = tempfile::tempdir().context("create zebrad dir")?;
         let rpc_port = pick_port()?;
         let net_port = pick_port()?;
@@ -311,7 +332,7 @@ impl Zebrad {
                 miner_address,
                 &cache_dir.to_string_lossy(),
                 nu6_3_height,
-                regtest_nu7_height(),
+                nu7_height,
                 RegtestNode::from_env(),
             ),
         )
@@ -324,6 +345,7 @@ impl Zebrad {
             bin: bin.to_path_buf(),
             config_path,
             nu6_3_height,
+            nu7_height,
             _dir: dir,
         };
         zebrad.wait_until_rpc_up().await?;
@@ -345,7 +367,7 @@ impl Zebrad {
                 miner_address,
                 &cache_dir.to_string_lossy(),
                 self.nu6_3_height,
-                regtest_nu7_height(),
+                self.nu7_height,
                 RegtestNode::from_env(),
             ),
         )
@@ -467,6 +489,7 @@ impl Zebrad {
             bin: bin.to_path_buf(),
             config_path,
             nu6_3_height,
+            nu7_height: regtest_nu7_height(),
             _dir: dir,
         };
         zebrad.wait_until_rpc_up().await?;
@@ -2639,6 +2662,31 @@ impl Zecd {
             std::fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?;
         std::fs::write(&path, edit(text)).with_context(|| format!("write {}", path.display()))?;
         Ok(())
+    }
+
+    /// Run `zecd chain-info --json` against this instance's own configuration (same datadir,
+    /// same `zecd.toml`, so the same upstream the daemon dials) and return whether it exited
+    /// zero, with its JSON report. `chain-info` takes no datadir lock, so it runs beside the live
+    /// daemon.
+    pub fn chain_info(&self) -> Result<(bool, Value)> {
+        let out = Command::new(zecd_bin())
+            .args([
+                "--datadir",
+                self._datadir.path().to_str().unwrap(),
+                "--regtest",
+                "chain-info",
+                "--json",
+            ])
+            .output()
+            .context("spawn zecd chain-info")?;
+        let report = serde_json::from_slice(&out.stdout).with_context(|| {
+            format!(
+                "zecd chain-info --json printed no JSON ({}):\n{}",
+                out.status,
+                String::from_utf8_lossy(&out.stderr)
+            )
+        })?;
+        Ok((out.status.success(), report))
     }
 
     /// GET one of the health endpoints (`"/healthz"`, `"/readyz"`, `"/status"`) and return its

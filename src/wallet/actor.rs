@@ -515,11 +515,12 @@ fn enhanced_through(fully_scanned: u32, lowest_pending: Option<u32>) -> u32 {
     }
 }
 
-/// Whether an [`EnhanceRequest`] is one zecd can actually service (and therefore one that
-/// counts toward the enhancement backlog). All three variants drain: `GetStatus`/`Enhancement` via
-/// `fetch_full_tx`, and `TransactionsInvolvingAddress` via the transparent address-index query
-/// (`fetch_transparent_tx_evidence` + `notify_address_checked`), which converges once the address is
-/// recorded as checked, so it doesn't pin the backlog above zero.
+/// Whether an [`EnhanceRequest`] is one zecd can actually service. All three variants drain:
+/// `GetStatus`/`Enhancement` via `fetch_full_tx`, and `TransactionsInvolvingAddress` via the
+/// transparent address-index query (`fetch_transparent_tx_evidence` + `notify_address_checked`),
+/// which converges once the address is recorded as checked, so it doesn't pin the backlog above
+/// zero. Whether a serviceable request is actually drained and counted is
+/// [`request_in_scope`]'s call.
 fn is_serviceable_request(req: &EnhanceRequest) -> bool {
     matches!(
         req,
@@ -549,8 +550,26 @@ fn is_serviceable_request(req: &EnhanceRequest) -> bool {
 ///   `listtransactions` while the balance still moved - so they are always fetched, and every
 ///   RPC but the memo fields stays exact whether the wallet is live or freshly restored.
 ///
-/// `GetStatus` and `TransactionsInvolvingAddress` are never excluded either: status tracking and
-/// the transparent spend/ephemeral checks are correctness, not history detail.
+/// `GetStatus` is never excluded: status tracking is correctness, not history detail.
+///
+/// The other exclusion holds whatever the setting: a `TransactionsInvolvingAddress` **spend
+/// search** ([`is_spend_search`]). The wallet layer queues one for every transparent output a
+/// stored transaction pays the wallet, and re-emits it for every unspent one each time the tip
+/// moves past the height it was last checked at - so a wallet holding many transparent UTXOs
+/// carried a backlog of that size that refilled every block, serviced one address-index query
+/// at a time on the single writer, and its `pending_enhancements` never settled at zero. (The
+/// txid-shaped memo backfill is a separate cost this does not touch - each store is wallet-crate
+/// work that grows with history.) The searches exist to find spends of
+/// UTXOs the wallet holds, and zecd already finds every one of those in the block scan: the
+/// input matcher checks each scanned block's transparent inputs against the wallet's unspent
+/// outpoints (`engine::download_blocks`), and a transparent wallet only ever runs against a
+/// backend whose block scan carries those inputs ([`transparent_capability_error`]). So the
+/// searches are skipped rather than serviced - skipped, not dismissed, like the memo requests
+/// above, so they stay queued in the database. The one spend they would add is of a UTXO first
+/// recorded after the scan had passed the block spending it, which needs an address exposed
+/// after its funding block was scanned: the case whose receive the block scan already misses,
+/// and which a rescan recovers whole. Ephemeral-address (ZIP 320) checks have a different shape
+/// and are still serviced; zecd refuses TEX recipients, so in practice there are none.
 ///
 /// Both the drain ([`WalletActor::enhance_step`]) and the backlog count
 /// ([`WalletActor::enhancement_backlog`], which feeds `SyncStatus.pending_enhancements` and
@@ -568,8 +587,20 @@ fn request_in_scope(
     is_serviceable_request(req)
         && match req {
             EnhanceRequest::Enhancement(txid) => fetch_memos || spending.contains(txid),
-            _ => true,
+            EnhanceRequest::TransactionsInvolvingAddress(r) => !is_spend_search(r),
+            EnhanceRequest::GetStatus(_) => true,
         }
+}
+
+/// Whether an address request is the wallet layer's transparent **spend search** (find where a
+/// held UTXO was spent), as opposed to an ephemeral-address check. The wallet layer tells them
+/// apart only by their filters: a spend search asks for mined transactions with any output
+/// status, an ephemeral check for any transaction with an unspent output
+/// (`zcash_client_sqlite`'s `transaction_data_requests`).
+fn is_spend_search(r: &TransactionsInvolvingAddress) -> bool {
+    use zcash_client_backend::data_api::{OutputStatusFilter, TransactionStatusFilter};
+    matches!(r.tx_status_filter(), TransactionStatusFilter::Mined)
+        && matches!(r.output_status_filter(), OutputStatusFilter::All)
 }
 
 /// Filter one `transaction_data_requests()` read down to the requests actually outstanding in
@@ -589,10 +620,10 @@ fn request_in_scope(
 /// `readiness = "synced"`) and made [`WalletActor::enhance_step`] service the same request
 /// repeatedly within one batch - the `enhance_satisfied` filter runs before the batch loop, so
 /// in-batch duplicates each cost a redundant upstream query. The current wallet layer emits one
-/// request per address (pinned by
-/// `upstream_spend_search_duplication_is_collapsed_by_outstanding_requests`); the dedup stays
-/// because it costs one set insertion per request and a regression upstream would bring the
-/// spike straight back.
+/// request per address, and zecd no longer services spend searches at all (they are out of
+/// [`request_in_scope`]; both pinned by
+/// `upstream_spend_searches_are_linear_and_left_to_the_block_scan`). The dedup stays because it
+/// costs one set insertion per request and covers every other request kind too.
 fn outstanding_requests(
     requests: Vec<EnhanceRequest>,
     satisfied: &std::collections::BTreeSet<EnhanceRequest>,
@@ -634,6 +665,61 @@ fn outstanding_requests(
 fn tia_check_range(block_range_start: u32, chain_tip: u32) -> Option<(u32, u32)> {
     let start = block_range_start.max(1);
     (start <= chain_tip).then_some((start, chain_tip))
+}
+
+/// The finding that makes the upstream unusable, if any: an upgrade this build follows that the
+/// node never adopted ([`UnsupportedKind::UpstreamNotUpgraded`]), once it is in force - reported
+/// active, or with an activation height the wallet's view of the tip has reached (the findings
+/// are a snapshot from the last `server_info`, and the tip moves on without it).
+///
+/// Such a node's chain from that height on is a fork the network left, so scanning it would
+/// report blocks, receives and confirmations that do not exist on the real chain. The actor
+/// refuses it like it refuses a wrong-chain upstream: no scanning, `conn_state` down, and a
+/// paced retry that passes once the node is upgraded. A pending finding only warns - until the
+/// height, the node's chain *is* the network's.
+fn upstream_not_upgraded(
+    upgrades: &[UnsupportedUpgrade],
+    tip: Option<u32>,
+) -> Option<&UnsupportedUpgrade> {
+    upgrades.iter().find(|u| {
+        u.kind == UnsupportedKind::UpstreamNotUpgraded
+            && (u.active
+                || u.activation_height
+                    .zip(tip)
+                    .is_some_and(|(h, tip)| h <= tip))
+    })
+}
+
+/// The refusal text for an [`upstream_not_upgraded`] finding: published on `/status`, in
+/// `getblockchaininfo.warnings`, and logged.
+fn upstream_refusal_message(u: &UnsupportedUpgrade) -> String {
+    let at = u
+        .activation_height
+        .map(|h| format!(" at height {h}"))
+        .unwrap_or_default();
+    format!(
+        "the upstream node has not adopted network upgrade '{}' (consensus branch 0x{:08x}), \
+         which this zecd build activates{at}: past that height the node follows the old rules \
+         on a chain the network abandoned, so this wallet will not sync against it. {}",
+        sanitize_upstream_msg(&u.name),
+        u.branch_id,
+        crate::chain::NODE_UPGRADE_GUIDANCE,
+    )
+}
+
+/// Whether the tip branch the upgrade findings were computed from has gone stale: the chain
+/// has reached an activation height that the last `server_info` reply, taken at `checked_at`,
+/// had not. Light mode sees a node that never adopted an upgrade only through the branch ruling
+/// its tip, which first differs at the activation height itself, and the hub caches the reply
+/// for a connection's life - so this is what asks again, once per crossing, before the block at
+/// that height is scanned.
+fn branch_check_due<P: Parameters>(params: &P, checked_at: Option<u32>, tip: u32) -> bool {
+    let Some(checked) = checked_at else {
+        return false;
+    };
+    crate::network::scheduled_upgrades(params)
+        .iter()
+        .any(|s| checked < s.activation_height && s.activation_height <= tip)
 }
 
 /// Why a connected upstream is unusable for this wallet, if it is: a transparent-enabled wallet
@@ -1067,6 +1153,15 @@ struct WalletActor {
     /// *pending* one is the advance warning to update zecd before activation. Drives the
     /// connect-time announcements and the sync-error attribution.
     unsupported_upgrades: Vec<UnsupportedUpgrade>,
+    /// Why the actor is refusing the upstream it can reach (published as
+    /// [`SyncStatus::upstream_refusal`]): set while an [`UnsupportedKind::UpstreamNotUpgraded`]
+    /// finding is in play, cleared by a connect that passes. See [`upstream_not_upgraded`].
+    upstream_refusal: Option<String>,
+    /// The upstream tip height the upgrade findings were last computed from (the
+    /// `ServerInfo::tip_height` of the reply). The tip branch in that reply goes stale when the
+    /// chain crosses an activation height under a live connection, so crossing one past this
+    /// height re-reads it ([`branch_check_due`]).
+    branch_checked_at: Option<u32>,
     /// The display text of the most recent sync error, and how many consecutive sync passes
     /// have failed with exactly it. Reset on any successful pass. A growing streak of the
     /// *same* apply-side error is the "this will not fix itself" signal that escalates the log
@@ -1606,6 +1701,8 @@ async fn spawn_inner(
         watch_only,
         unlock_until: None,
         unsupported_upgrades: Vec::new(),
+        upstream_refusal: None,
+        branch_checked_at: None,
         last_sync_error: None,
         sync_error_streak: 0,
         reorg_margin: engine::REORG_BASE_MARGIN,
@@ -2777,6 +2874,16 @@ impl WalletActor {
                      support: syncing will stop there. {UPGRADE_GUIDANCE}",
                     u.branch_id
                 ),
+                // The active case is the refusal, logged by `refuse_stale_upstream`.
+                (UnsupportedKind::UpstreamNotUpgraded, true) => {}
+                (UnsupportedKind::UpstreamNotUpgraded, false) => warn!(
+                    "this zecd build activates network upgrade '{name}' (consensus branch \
+                     0x{:08x}) at height {height}, and the upstream node does not know it: the \
+                     node will stay on the old rules and fork off the network there, and this \
+                     wallet will stop syncing against it at that height. {}",
+                    u.branch_id,
+                    crate::chain::NODE_UPGRADE_GUIDANCE,
+                ),
                 (UnsupportedKind::ActivationHeightMismatch { expected }, active) => {
                     let ours = match expected {
                         Some(h) => format!("schedules it at height {h}"),
@@ -2803,6 +2910,19 @@ impl WalletActor {
                 }
             }
         }
+    }
+
+    /// Re-evaluate the [`upstream_not_upgraded`] refusal against the current findings and tip,
+    /// recording the outcome for `/status`. Returns the refusal text when the upstream must be
+    /// refused (logged at ERROR here, so the caller only has to drop the client).
+    fn refuse_stale_upstream(&mut self) -> Option<String> {
+        let refusal = upstream_not_upgraded(&self.unsupported_upgrades, self.tip_height)
+            .map(upstream_refusal_message);
+        if let Some(why) = &refusal {
+            error!("{why}");
+        }
+        self.upstream_refusal = refusal.clone();
+        refusal
     }
 
     /// Record a failed sync pass and build the disconnect reason for it: the raw error, plus
@@ -2874,7 +2994,13 @@ impl WalletActor {
                 // "sync error" it causes).
                 self.unsupported_upgrades =
                     crate::chain::unsupported_upgrades(&info, &self.network);
+                self.branch_checked_at = info.tip_height.or(self.tip_height);
                 self.log_unsupported_upgrades();
+                if let Some(why) = self.refuse_stale_upstream() {
+                    self.client = None;
+                    self.update_status();
+                    return Err(anyhow!(why));
+                }
             }
         }
         // NB: no `update_status()` here. The hazard that originally forbade it is gone (the
@@ -3454,11 +3580,11 @@ impl WalletActor {
     /// `TransactionsInvolvingAddress` discovers transactions that receive or spend funds at
     /// one of the wallet's transparent addresses. librustzcash emits it only to find
     /// *spends* of UTXOs the wallet already holds and to check ephemeral (ZIP-320)
-    /// addresses - ordinary receives, and the spends of receives zecd recorded itself, are
-    /// found by zecd's own block-scan matcher instead (the zebra backend parses each full
-    /// block; a versioned-protocol lightwalletd carries the transparent data in the compact
-    /// blocks). So this is the librustzcash-driven half of transparent discovery, not the
-    /// only path to it. Query the upstream's address index for the requested range,
+    /// addresses - and the spend searches never reach here ([`request_in_scope`] leaves them
+    /// to the block scan), because ordinary receives and every spend of a held UTXO are found
+    /// by zecd's own block-scan matcher (the zebra backend parses each full block; a
+    /// versioned-protocol lightwalletd carries the transparent data in the compact blocks).
+    /// So in practice this services the ephemeral checks. Query the upstream's address index for the requested range,
     /// fetch+store each tx (filling in the transparent outputs), then record the address as
     /// checked up to the range end so librustzcash stops re-requesting it.
     async fn service_address_request(
@@ -3974,6 +4100,25 @@ impl WalletActor {
             fetch_chain_tip(client).await?
         };
         self.tip_height = Some(u32::from(tip));
+        // Crossing an activation height under a live connection stales the tip branch the
+        // findings were computed from; re-read it once so a node that never adopted the
+        // upgrade is caught here rather than after the wallet has scanned its fork.
+        if branch_check_due(&self.network, self.branch_checked_at, u32::from(tip)) {
+            let client = self
+                .client
+                .as_mut()
+                .ok_or_else(|| anyhow!("not connected"))?;
+            let info = client.refresh_server_info().await?;
+            self.unsupported_upgrades = crate::chain::unsupported_upgrades(&info, &self.network);
+            self.branch_checked_at = info.tip_height.or(self.tip_height);
+            self.log_unsupported_upgrades();
+        }
+        if let Some(why) = self.refuse_stale_upstream() {
+            // Every caller drops the client on an error (and paces the reconnect); dropping it
+            // here too keeps a caller that forgot from scanning the fork.
+            self.client = None;
+            return Err(anyhow!(why));
+        }
         // A successful tip refresh is the first proof the connection actually works end to end,
         // so it - not the bare `connect()` - is where the reconnect backoff resets. This keeps
         // the backoff growing across a reachable-but-degraded upstream (connect succeeds, refresh
@@ -4769,6 +4914,7 @@ impl WalletActor {
             connected: self.client.is_some(),
             server: Some(self.hub.server().describe()),
             conn_state,
+            upstream_refusal: self.upstream_refusal.clone(),
             chain_tip: self.tip_height,
             fully_scanned,
             birthday: Some(self.birthday),
@@ -8826,6 +8972,65 @@ mod tests {
         assert!(why.contains("transparent"), "{why}");
     }
 
+    /// A node that never adopted an upgrade is refused once the upgrade is in force - reported
+    /// active, or pending at a height the wallet's tip has since reached - and only warned about
+    /// before that. Other kinds of finding never refuse: they are this build being behind, which
+    /// the sync-failure guidance and the send path deal with.
+    #[test]
+    fn an_upstream_that_did_not_upgrade_is_refused_once_the_upgrade_is_in_force() {
+        use super::{upstream_not_upgraded, upstream_refusal_message};
+        use crate::chain::{UnsupportedKind, UnsupportedUpgrade};
+        let finding = |kind, active| UnsupportedUpgrade {
+            branch_id: 0x7719_0ad9,
+            name: "NU7".to_string(),
+            activation_height: Some(4_465_026),
+            active,
+            kind,
+        };
+        let pending = [finding(UnsupportedKind::UpstreamNotUpgraded, false)];
+        assert!(upstream_not_upgraded(&pending, None).is_none());
+        assert!(upstream_not_upgraded(&pending, Some(4_465_025)).is_none());
+        assert!(
+            upstream_not_upgraded(&pending, Some(4_465_026)).is_some(),
+            "the tip reaching the height puts a pending finding in force"
+        );
+        let active = [finding(UnsupportedKind::UpstreamNotUpgraded, true)];
+        let u = upstream_not_upgraded(&active, None).expect("active is in force");
+        let why = upstream_refusal_message(u);
+        assert!(why.contains("NU7") && why.contains("4465026"), "{why}");
+        assert!(why.contains("zebra 7.0.0"), "names the node fix: {why}");
+
+        for kind in [
+            UnsupportedKind::UnknownBranch,
+            UnsupportedKind::ActivationHeightMismatch { expected: None },
+        ] {
+            assert!(upstream_not_upgraded(&[finding(kind, true)], Some(5_000_000)).is_none());
+        }
+    }
+
+    /// The tip branch is re-read exactly when the chain reaches an activation height the last
+    /// reading predates - once per crossing, never on an ordinary tip advance.
+    #[test]
+    fn the_tip_branch_is_rechecked_once_per_activation_crossing() {
+        use super::branch_check_due;
+        use crate::network::ZNetwork;
+        let nu7 = 4_465_026;
+        let net = ZNetwork::Test;
+        assert!(!branch_check_due(&net, None, nu7));
+        assert!(!branch_check_due(&net, Some(nu7 - 100), nu7 - 1));
+        assert!(branch_check_due(&net, Some(nu7 - 100), nu7));
+        assert!(
+            branch_check_due(&net, Some(nu7 - 1), nu7),
+            "one block short is not checked"
+        );
+        assert!(branch_check_due(&net, Some(nu7 - 100), nu7 + 50));
+        assert!(
+            !branch_check_due(&net, Some(nu7), nu7 + 50),
+            "already checked"
+        );
+        assert!(!branch_check_due(&net, Some(nu7 + 10), nu7 + 50));
+    }
+
     #[test]
     fn scan_progress_ratio_tracks_height_not_note_weight() {
         use super::scan_progress_ratio;
@@ -9708,11 +9913,11 @@ mod tests {
     /// restored wallet's own sends vanish from `listtransactions` while the balance still moved.
     ///
     /// The correctness requests stay in under either flag: `GetStatus` (transaction
-    /// status/expiry tracking) and `TransactionsInvolvingAddress` (transparent spend detection
-    /// and ephemeral ZIP-320 checks) are not history detail, and skipping either would leave
-    /// the wallet's view of the chain wrong rather than merely memo-less. With the default
-    /// (`fetch_memos = true`) every serviceable request is in scope regardless of the set, so a
-    /// default wallet's behaviour cannot depend on it.
+    /// status/expiry tracking) and the ephemeral ZIP-320 address checks are not history detail,
+    /// and skipping either would leave the wallet's view of the chain wrong rather than merely
+    /// memo-less. With the default (`fetch_memos = true`) every serviceable request but a spend
+    /// search is in scope regardless of the set, so a default wallet's behaviour cannot depend
+    /// on it. Spend searches are out under both flags - the block scan finds those spends.
     #[test]
     fn fetch_memos_off_skips_only_receive_side_enhancement_requests() {
         use super::{request_in_scope, EnhanceRequest};
@@ -9730,18 +9935,30 @@ mod tests {
         let recv_enhancement = EnhanceRequest::Enhancement(received);
         let spend_enhancement = EnhanceRequest::Enhancement(spent);
         let status = EnhanceRequest::GetStatus(received);
+        // An ephemeral-address (ZIP 320) check, in the wallet layer's shape for one.
         let tia: EnhanceRequest = TransactionDataRequest::transactions_involving_address(
             TransparentAddress::PublicKeyHash([0u8; 20]),
             zcash_protocol::consensus::BlockHeight::from_u32(100),
             None,
             None,
             TransactionStatusFilter::All,
+            OutputStatusFilter::Unspent,
+        )
+        .into();
+        // A spend search, in the wallet layer's shape for one.
+        let spend_search: EnhanceRequest = TransactionDataRequest::transactions_involving_address(
+            TransparentAddress::PublicKeyHash([0u8; 20]),
+            zcash_protocol::consensus::BlockHeight::from_u32(100),
+            Some(zcash_protocol::consensus::BlockHeight::from_u32(141)),
+            None,
+            TransactionStatusFilter::Mined,
             OutputStatusFilter::All,
         )
         .into();
 
-        // fetch_memos on: everything serviceable is in scope, and the spend set is not even
-        // consulted (pass the empty one, which would exclude both enhancements if it were).
+        // fetch_memos on: everything serviceable but a spend search is in scope, and the spend
+        // set is not even consulted (pass the empty one, which would exclude both enhancements
+        // if it were).
         for req in [&recv_enhancement, &spend_enhancement, &status, &tia] {
             assert!(
                 request_in_scope(req, true, &none),
@@ -9766,8 +9983,16 @@ mod tests {
         );
         assert!(
             request_in_scope(&tia, false, &spending),
-            "TransactionsInvolvingAddress is correctness, not history detail - never excluded"
+            "an ephemeral-address check is correctness, not history detail - never excluded"
         );
+
+        // A spend search is out of scope under either flag: the block scan finds those spends.
+        for fetch_memos in [true, false] {
+            assert!(
+                !request_in_scope(&spend_search, fetch_memos, &spending),
+                "spend searches are left to the block scan (fetch_memos = {fetch_memos})"
+            );
+        }
     }
 
     /// `outstanding_requests` deduplicates the raw `transaction_data_requests()` read and drops
@@ -9814,7 +10039,8 @@ mod tests {
 
     /// Pin the shape of the upstream spend-search request set against a real wallet DB rather
     /// than a hand-built request list: storing one transaction with k transparent outputs
-    /// received by the wallet enqueues k spend-search rows. Through `zakura-client-sqlite`
+    /// received by the wallet enqueues k spend-search rows, and every one of them is a request
+    /// the drain leaves to the block scan (see `request_in_scope`). Through `zakura-client-sqlite`
     /// 0.1.0-rc7 the read joined each row to every received output of the same transaction, so
     /// it returned k^2 `TransactionsInvolvingAddress` requests, k identical ones per address -
     /// the request-set shape behind the field report's 23,968-pending spike from 842 UTXOs.
@@ -9822,7 +10048,7 @@ mod tests {
     /// again, the upstream join regressed: `outstanding_requests` still collapses it, but its
     /// docs should say the dedup is load-bearing once more.
     #[test]
-    fn upstream_spend_search_duplication_is_collapsed_by_outstanding_requests() {
+    fn upstream_spend_searches_are_linear_and_left_to_the_block_scan() {
         use super::{outstanding_requests, EnhanceRequest};
         use bip0039::{English, Mnemonic};
         use secrecy::SecretVec;
@@ -9925,16 +10151,30 @@ mod tests {
              means the old duplicating join is back - update outstanding_requests' docs"
         );
 
-        let deduped = outstanding_requests(
+        // Every one of them has the spend-search shape `is_spend_search` keys on - the pin that
+        // the discriminator matches what the wallet layer actually emits, not a hand-built
+        // request - and none survives into the drain or the backlog count: the block scan's
+        // input matcher is what finds those spends.
+        assert!(reqs
+            .iter()
+            .filter(|r| is_our_spend_search(r))
+            .all(|r| matches!(
+                r,
+                EnhanceRequest::TransactionsInvolvingAddress(a) if super::is_spend_search(a)
+            )));
+        let outstanding = outstanding_requests(
             reqs,
             &std::collections::BTreeSet::new(),
             true,
             &std::collections::BTreeSet::new(),
         );
-        let distinct = deduped.iter().filter(|r| is_our_spend_search(r)).count();
         assert_eq!(
-            distinct, K,
-            "outstanding_requests collapses the duplicates to one request per address"
+            outstanding
+                .iter()
+                .filter(|r| is_our_spend_search(r))
+                .count(),
+            0,
+            "spend searches are left to the block scan, never drained or counted"
         );
     }
 

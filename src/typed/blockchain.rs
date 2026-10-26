@@ -26,7 +26,35 @@ pub struct BlockchainInfo {
     /// transaction-enhancement backlog drained).
     pub initialblockdownload: bool,
     pub pruned: bool,
+    /// zcashd's network-upgrade map, keyed by consensus branch id (bare hex): this build's own
+    /// schedule, identical on both backends.
+    #[serde(default)]
+    pub upgrades: std::collections::BTreeMap<String, NetworkUpgradeInfo>,
+    /// The branch ids in force at the known chain tip and for the next block.
+    #[serde(default)]
+    pub consensus: Option<ConsensusInfo>,
+    /// Empty, or why the wallet refuses its upstream (a node that never adopted a network
+    /// upgrade this build follows).
     pub warnings: String,
+}
+
+/// One `getblockchaininfo.upgrades` entry (`rpc/blockchain.rs::schedule_json`).
+#[non_exhaustive]
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct NetworkUpgradeInfo {
+    /// zcashd's spelling: `"NU6.3"`, `"NU7"`.
+    pub name: String,
+    pub activationheight: u32,
+    /// `"active"` from the activation height on, `"pending"` before it.
+    pub status: String,
+}
+
+/// `getblockchaininfo.consensus` (`rpc/blockchain.rs::schedule_json`): bare-hex branch ids.
+#[non_exhaustive]
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct ConsensusInfo {
+    pub chaintip: String,
+    pub nextblock: String,
 }
 
 /// The `{hash, height}` result of the `waitfor*` family - the wallet's best (fully-scanned)
@@ -239,7 +267,8 @@ mod tests {
         assert!(refused.import_error.unwrap().contains("already"));
     }
 
-    /// Fixture captured from a synced regtest wallet's `getblockchaininfo`.
+    /// Fixture captured from a synced regtest wallet's `getblockchaininfo` (NU7 active at 12),
+    /// `upgrades` trimmed to two entries.
     #[test]
     fn blockchain_info_decodes() {
         let v = serde_json::json!({
@@ -254,12 +283,20 @@ mod tests {
             "initialblockdownload": false,
             "size_on_disk": 0,
             "pruned": false,
+            "upgrades": {
+                "c2d6d0b4": {"name": "NU5", "activationheight": 1, "status": "active"},
+                "77190ad9": {"name": "NU7", "activationheight": 12, "status": "active"},
+            },
+            "consensus": {"chaintip": "77190ad9", "nextblock": "77190ad9"},
             "warnings": "",
         });
         let info: BlockchainInfo = serde_json::from_value(v).unwrap();
         assert_eq!(info.blocks, 120);
         assert_eq!(info.chain, "regtest");
         assert!(!info.initialblockdownload);
+        assert_eq!(info.upgrades["77190ad9"].name, "NU7");
+        assert_eq!(info.upgrades["77190ad9"].activationheight, 12);
+        assert_eq!(info.consensus.unwrap().chaintip, "77190ad9");
     }
 
     /// Fixture: a header mid-chain carries both links; the tip omits `nextblockhash`.
