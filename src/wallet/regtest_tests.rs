@@ -1811,6 +1811,140 @@ fn transaction_record_matches_the_view_it_replaces() {
     }
 }
 
+/// A received transaction a reorg un-mined and the new chain never re-mined: truncation clears
+/// its mined height and leaves the shielded receipt for the rescan to re-observe, which never
+/// happens, and with `fetch_memos = false` nothing fetches the raw transaction, so its expiry
+/// stays unknown for good. `v_transactions.expired_unmined` is NULL for that row, and reading it
+/// as a `bool` failed every history statement - `listtransactions`, `listsinceblock`,
+/// `gettransaction` and the received-by RPCs all answered `-1` on the testnet wallet that hit
+/// it. Each of those paths must read the row, and read it as expired once its default expiry
+/// has passed (`read::expired_unmined_sql!`).
+#[test]
+fn orphaned_receipt_reads_and_expires() {
+    let net = network::regtest();
+    let dir = tempfile::tempdir().unwrap();
+    let engine_dir = dir.path();
+    let mut db = open::init_dbs(net, engine_dir).expect("init regtest dbs");
+    db.create_account("primary", &test_seed(), &genesis_birthday(), None)
+        .expect("create regtest account");
+    drop(db);
+
+    let conn = rusqlite::Connection::open(open::data_db_path(engine_dir)).unwrap();
+    let account_id: i64 = conn
+        .query_row("SELECT id FROM accounts LIMIT 1", [], |r| r.get(0))
+        .unwrap();
+    let address_id: i64 = conn
+        .query_row("SELECT id FROM addresses LIMIT 1", [], |r| r.get(0))
+        .unwrap();
+    let put_block = |height: u32| {
+        conn.execute(
+            "INSERT INTO blocks (height, hash, time, sapling_tree)
+             VALUES (?1, ?2, 1700000000, X'00')",
+            rusqlite::params![height, height.to_le_bytes().to_vec()],
+        )
+        .unwrap();
+    };
+    put_block(100);
+    populate_two_transactions(&conn, account_id, address_id);
+    // Transaction 1 stays mined at 100: the control. Transaction 2 becomes the orphan, first
+    // seen at 90, exactly as truncation leaves it.
+    conn.execute(
+        "UPDATE transactions SET mined_height = NULL, tx_index = NULL, expiry_height = NULL,
+                                 min_observed_height = 90
+         WHERE id_tx = 2",
+        [],
+    )
+    .unwrap();
+    // Transaction 3 is unmined with a known expiry (150), the case the view already handled.
+    conn.execute(
+        "INSERT INTO transactions (id_tx, txid, mined_height, expiry_height, min_observed_height)
+         VALUES (3, ?1, NULL, 150, 95)",
+        rusqlite::params![vec![0xc3u8; 32]],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO orchard_received_notes
+             (transaction_id, action_index, account_id, diversifier, value, rho, rseed, nf,
+              is_change, memo, address_id, recipient_key_scope)
+         VALUES (3, 0, ?1, X'00', 300, X'00', X'00', ?2, 0, NULL, ?3, 0)",
+        rusqlite::params![account_id, vec![0x3cu8; 32], address_id],
+    )
+    .unwrap();
+
+    let view_flag: Option<bool> = conn
+        .query_row(
+            "SELECT expired_unmined FROM v_transactions WHERE txid = ?1",
+            [vec![0xb2u8; 32]],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        view_flag, None,
+        "the view must yield NULL for the orphan, or this fixture no longer reproduces the bug"
+    );
+
+    let (mined, orphan, known) = ("a1".repeat(32), "b2".repeat(32), "c3".repeat(32));
+    // `(orphan, known)` expected `expired_unmined`, read through every statement that reports
+    // it. The mined control is never expired.
+    let check = |tip: u32, want_orphan: bool, want_known: bool| {
+        let want = |txid: &str| match txid {
+            t if t == orphan => want_orphan,
+            t if t == known => want_known,
+            _ => false,
+        };
+
+        let listed = read::list_transactions(engine_dir, read::AccountScope::Any)
+            .unwrap_or_else(|e| panic!("tip {tip}: listtransactions failed: {e:#}"));
+        let paged = read::query_transactions(
+            engine_dir,
+            read::AccountScope::Any,
+            &read::TxQuery {
+                newest_first: true,
+                limit: Some(10),
+                ..Default::default()
+            },
+        )
+        .unwrap_or_else(|e| panic!("tip {tip}: newest-first page failed: {e:#}"));
+        let received = read::received_tx_records(engine_dir, read::AccountScope::Any, None)
+            .unwrap_or_else(|e| panic!("tip {tip}: received_tx_records failed: {e:#}"));
+        for (label, records) in [("list", &listed), ("page", &paged), ("received", &received)] {
+            for txid in [&mined, &orphan, &known] {
+                let rec = records
+                    .iter()
+                    .find(|r| &r.txid_hex == txid)
+                    .unwrap_or_else(|| panic!("tip {tip} {label}: {txid} missing"));
+                assert_eq!(
+                    rec.expired_unmined,
+                    want(txid),
+                    "tip {tip} {label}: expired_unmined of {txid}"
+                );
+            }
+        }
+        for txid in [&mined, &orphan, &known] {
+            let rec = read::get_transaction(net, engine_dir, read::AccountScope::Any, txid, false)
+                .unwrap_or_else(|e| panic!("tip {tip}: gettransaction {txid} failed: {e:#}"))
+                .unwrap_or_else(|| panic!("tip {tip}: gettransaction {txid} found nothing"));
+            assert_eq!(
+                rec.expired_unmined,
+                want(txid),
+                "tip {tip} gettransaction: expired_unmined of {txid}"
+            );
+        }
+    };
+
+    // Inside every window: nothing has expired.
+    check(100, false, false);
+    // The known expiry passes; the orphan's window (first seen at 90, plus the 120-block default
+    // expiry delta) has not.
+    put_block(150);
+    check(150, false, true);
+    put_block(209);
+    check(209, false, true);
+    // The orphan is now past the expiry it would have carried, where the balance stops counting it.
+    put_block(210);
+    check(210, true, true);
+}
+
 /// The `TxRecord`-shaped columns of one transaction row, as a comparable tuple.
 #[allow(clippy::type_complexity)]
 fn tx_row_of(

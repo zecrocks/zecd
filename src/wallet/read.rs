@@ -754,16 +754,55 @@ fn load_outputs(
     Ok(out)
 }
 
+/// `expired_unmined` for the `transactions` row aliased `t`: the transaction is unmined and can
+/// no longer be mined. Every statement here that reports the flag computes it with this, rather
+/// than reading `v_transactions.expired_unmined`, for two reasons.
+///
+/// The view's expression (`mined_height IS NULL AND expiry_height BETWEEN 1 AND <tip>`) is NULL,
+/// not false, when the expiry is unknown, and a NULL failed the whole statement in the `bool`
+/// decode - every history RPC answered `-1`. And the expiry *is* unknown, permanently, for a
+/// received transaction a reorg un-mined and the new chain never re-mined: truncation leaves a
+/// shielded receipt for the rescan to re-observe, which it never does, and under `[sync]
+/// fetch_memos = false` nothing fetches the raw transaction to learn its expiry either (with
+/// memos on, the fetch answers not-found and is retired, leaving the same row).
+///
+/// This is the complement of [`tx_unexpired_sql`] for an unmined transaction, so history calls
+/// a transaction expired exactly when the balance stops counting it: a known expiry at or below
+/// the tip (the view's own rule), or an unknown one whose default expiry delta, counted from the
+/// height it was built for or first seen at, has passed. The delta is NU7's 120 rather than
+/// [`tx_unexpired_sql`]'s height-aware 40-or-120, because that needs the network and these
+/// statements are reached through functions that do not take one. Before NU7 activates that
+/// errs late, never early: nothing reads as expired while the balance still counts it.
+/// `orphan_expiry_delta_is_the_nu7_default` pins the constant. `IFNULL` covers the one remaining
+/// NULL, an empty `blocks` table.
+macro_rules! expired_unmined_sql {
+    () => {
+        "IFNULL(t.mined_height IS NULL AND (
+            t.expiry_height BETWEEN 1 AND (SELECT MAX(height) FROM blocks)
+            OR (t.expiry_height IS NULL
+                AND COALESCE(t.target_height, t.min_observed_height) + 120
+                    <= (SELECT MAX(height) FROM blocks))
+        ), 0)"
+    };
+}
+
+/// The `expired_unmined_sql!` expression, for statements assembled at run time.
+const EXPIRED_UNMINED_SQL: &str = expired_unmined_sql!();
+
 /// The column list shared by [`list_transactions`] and [`get_transaction`]: `v_transactions`
 /// joined with the mining block's hash and the raw `transactions` row's `created` timestamp
 /// (set only for wallet-authored sends; stored as `yyyy-MM-dd HH:mm:ss.fffffffzzz`, which
 /// SQLite's date parser understands).
-const TX_COLS: &str = "v.mined_height, v.txid, v.expiry_height, v.account_balance_delta,
+const TX_COLS: &str = concat!(
+    "v.mined_height, v.txid, v.expiry_height, v.account_balance_delta,
             v.fee_paid, v.block_time,
-            v.expired_unmined, v.tx_index,
+            ",
+    expired_unmined_sql!(),
+    " AS expired_unmined, v.tx_index,
             b.hash AS block_hash,
             t.id_tx AS id_tx,
-            CAST(strftime('%s', t.created) AS INTEGER) AS created_time";
+            CAST(strftime('%s', t.created) AS INTEGER) AS created_time"
+);
 
 /// The matching source clause for [`TX_COLS`].
 const TX_FROM: &str = "FROM v_transactions v
@@ -809,7 +848,8 @@ fn tx_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<(Option<i64>, TxReco
 /// reorg paid that cost on every miss.
 ///
 /// This selects the transaction by its unique `txid` index and reconstructs the two aggregate
-/// columns zecd reads. `expired_unmined` is the view's own expression. `account_balance_delta`
+/// columns zecd reads. `expired_unmined` is [`EXPIRED_UNMINED_SQL`], which agrees with the view
+/// except where the view's is NULL (an orphaned receipt). `account_balance_delta`
 /// is the view's `SUM(notes.value)` over the same `notes` relation: outputs the account
 /// received in this transaction, positive, and outputs of the account spent by it, negative.
 /// The `involved` count is what makes the row exist at all: `v_transactions` only emits a
@@ -824,7 +864,8 @@ fn tx_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<(Option<i64>, TxReco
 ///
 /// Pinned against the view by
 /// `regtest_tests::transaction_record_matches_the_view_it_replaces`.
-pub(crate) const TX_RECORD_SQL: &str = "
+pub(crate) const TX_RECORD_SQL: &str = concat!(
+    "
 WITH notes AS (
     SELECT account_id, value FROM (
         SELECT account_id, value FROM sapling_received_notes WHERE transaction_id = :id_tx
@@ -872,13 +913,15 @@ SELECT t.mined_height AS mined_height,
        b.time AS block_time,
        b.hash AS block_hash,
        CAST(strftime('%s', t.created) AS INTEGER) AS created_time,
-       (t.mined_height IS NULL
-        AND t.expiry_height BETWEEN 1 AND (SELECT MAX(height) FROM blocks)) AS expired_unmined,
+       ",
+    expired_unmined_sql!(),
+    " AS expired_unmined,
        (SELECT COUNT(*) FROM mine) AS involved,
        (SELECT IFNULL(SUM(value), 0) FROM mine) AS account_balance_delta
 FROM transactions t
 LEFT JOIN blocks b ON b.height = t.mined_height
-WHERE t.id_tx = :id_tx";
+WHERE t.id_tx = :id_tx"
+);
 
 /// Filter/pagination for [`query_transactions`], mirroring zcashd's height-range and
 /// count/from arguments. The history/received-by RPCs push their windowing through this so
@@ -1047,10 +1090,11 @@ pub fn received_tx_records(
     // `txids` list `listreceivedbyaddress` emits is in the identical order it was before this
     // flat path replaced the full N+1 load.
     let mut stmt = conn.prepare(&format!(
-        "SELECT v.txid, v.mined_height, v.expired_unmined,
+        "SELECT v.txid, v.mined_height, {EXPIRED_UNMINED_SQL} AS expired_unmined,
                 o.to_address, o.value, o.is_change, o.to_account_uuid, o.output_pool,
                 o.recipient_key_scope, v.tx_index
          FROM v_transactions v
+         JOIN transactions t ON t.txid = v.txid
          JOIN v_tx_outputs o ON o.txid = v.txid
          WHERE {address_clause}
            AND {account}
@@ -2232,7 +2276,10 @@ mod tests {
                  account_uuid BLOB
              );
              CREATE TABLE blocks (height INTEGER, hash BLOB);
-             CREATE TABLE transactions (id_tx INTEGER, txid BLOB, created TEXT);",
+             CREATE TABLE transactions (id_tx INTEGER, txid BLOB, created TEXT,
+                 -- Read by the `expired_unmined` expression in TX_COLS.
+                 mined_height INTEGER, expiry_height INTEGER, target_height INTEGER,
+                 min_observed_height INTEGER);",
         )
         .unwrap();
         conn
@@ -2509,6 +2556,102 @@ mod tests {
                 "case {i}: target {target}, ({m:?}, {e:?}, {th:?}, {mo})"
             );
         }
+    }
+
+    /// [`super::EXPIRED_UNMINED_SQL`] is the complement of [`super::tx_unexpired_sql`] for an
+    /// unmined transaction, so history calls a transaction expired exactly when the balance stops
+    /// counting it. Past NU7 the two agree on every case. Before it the history side uses NU7's
+    /// delta where the balance uses 40, so it may call a transaction expired later than the
+    /// balance does, and never earlier.
+    #[test]
+    fn orphan_expiry_delta_is_the_nu7_default() {
+        use crate::network::ZNetwork;
+        use zcash_protocol::consensus::{NetworkUpgrade, Parameters as _};
+
+        assert!(
+            super::EXPIRED_UNMINED_SQL.contains(&format!(
+                "min_observed_height) + {NU7_DEFAULT_TX_EXPIRY_DELTA}\n"
+            )),
+            "the orphan window must be NU7's default expiry delta"
+        );
+        const { assert!(NU7_DEFAULT_TX_EXPIRY_DELTA >= PRE_NU7_DEFAULT_TX_EXPIRY_DELTA) };
+
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE transactions(mined_height INTEGER, expiry_height INTEGER,
+                                       target_height INTEGER,
+                                       min_observed_height INTEGER NOT NULL);
+             CREATE TABLE blocks(height INTEGER);",
+        )
+        .unwrap();
+        let net = ZNetwork::Test;
+        let unexpired = super::tx_unexpired_sql("t", &net);
+        let nu7 = i64::from(u32::from(
+            net.activation_height(NetworkUpgrade::Nu7)
+                .expect("testnet schedules NU7"),
+        ));
+        let read = |tip: i64, e: Option<i64>, th: Option<i64>, mo: i64| -> (bool, bool) {
+            conn.execute_batch("DELETE FROM transactions; DELETE FROM blocks;")
+                .unwrap();
+            conn.execute("INSERT INTO blocks(height) VALUES (?1)", [tip])
+                .unwrap();
+            conn.execute(
+                "INSERT INTO transactions(mined_height, expiry_height, target_height,
+                                          min_observed_height)
+                 VALUES (NULL, ?1, ?2, ?3)",
+                rusqlite::params![e, th, mo],
+            )
+            .unwrap();
+            // `tx_unexpired_sql` is a `WHERE` predicate: for an unmined row its `mined_height`
+            // term is NULL, so it is TRUE or NULL, and NULL - a filtered-out row - is "expired".
+            conn.query_row(
+                &format!(
+                    "SELECT {}, ({unexpired}) IS NOT 1 FROM transactions t",
+                    super::EXPIRED_UNMINED_SQL
+                ),
+                rusqlite::named_params! { ":target_height": tip + 1 },
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap()
+        };
+        // (tip, expiry_height, target_height, min_observed_height), all unmined.
+        type Case = (i64, Option<i64>, Option<i64>, i64);
+        let p = nu7 + 1_000;
+        let past_nu7: &[Case] = &[
+            (p, Some(0), None, p - 500),     // never expires
+            (p, Some(p + 1), None, p - 10),  // expires at the next block: not yet
+            (p, Some(p), None, p - 10),      // expiry at the tip: expired
+            (p, None, None, p - 119),        // unknown expiry, inside the window
+            (p, None, None, p - 120),        // ... at its edge
+            (p, None, None, p - 121),        // ... past it
+            (p, None, Some(p - 120), p - 5), // measured from the construction target
+            (p, None, Some(p - 119), p - 500),
+        ];
+        for (i, (tip, e, th, mo)) in past_nu7.iter().enumerate() {
+            let (expired, balance_expired) = read(*tip, *e, *th, *mo);
+            assert_eq!(
+                expired, balance_expired,
+                "past NU7 case {i}: tip {tip}, ({e:?}, {th:?}, {mo})"
+            );
+        }
+        let t = nu7 - 1_000;
+        for mo in (t - 130)..=t {
+            let (expired, balance_expired) = read(t, None, None, mo);
+            assert!(
+                !expired || balance_expired,
+                "before NU7, first seen at {mo}, tip {t}: history called it expired first"
+            );
+        }
+        // An empty `blocks` table is not an error.
+        conn.execute("DELETE FROM blocks", []).unwrap();
+        let expired: bool = conn
+            .query_row(
+                &format!("SELECT {} FROM transactions t", super::EXPIRED_UNMINED_SQL),
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(!expired);
     }
 
     /// The immature/mature coinbase split must partition unspent coinbase value exactly at the
