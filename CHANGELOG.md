@@ -5,6 +5,20 @@ All notable changes to zecd are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com), and this
 project adheres to [Semantic Versioning](https://semver.org).
 
+## [0.9.0-rc5] - 2026-10-27
+
+Fixes history RPCs failing after a reorg drops a received transaction.
+
+### Fixed
+- **History RPCs failed after a reorg dropped a received transaction for good.** When a reorg
+  un-mines a received transaction and the new chain never includes it, its expiry stays unknown,
+  and zecd read the resulting NULL `expired_unmined` as a boolean. One such transaction made
+  `listtransactions`, `listsinceblock`, `gettransaction` on it, and
+  `listreceivedbyaddress`/`getreceivedbyaddress` fail with `-1`. 0.8.x behaves the same.
+  Balances were never affected. Such a transaction now reads as unconfirmed until 120 blocks
+  after the height it was first seen at, then as expired (`confirmations: -1`, and
+  `abandoned: true` on any send entry).
+
 ## [0.9.0-rc4] - 2026-10-26
 
 Refuses a node that missed NU7, and stops a per-block lookup loop on transparent-heavy wallets.
@@ -1181,6 +1195,7 @@ Zcash, backed entirely by librustzcash and running as a light client.
 ### Security
 - Pre-release audit hardening; refuse to start on mainnet with the placeholder RPC password; enforce a 12-character passphrase minimum.
 
+[0.9.0-rc5]: https://github.com/zecrocks/zecd/compare/v0.9.0-rc4...v0.9.0-rc5
 [0.9.0-rc4]: https://github.com/zecrocks/zecd/compare/v0.9.0-rc3...v0.9.0-rc4
 [0.9.0-rc3]: https://github.com/zecrocks/zecd/compare/v0.9.0-rc2...v0.9.0-rc3
 [0.9.0-rc2]: https://github.com/zecrocks/zecd/compare/v0.9.0-rc1...v0.9.0-rc2
