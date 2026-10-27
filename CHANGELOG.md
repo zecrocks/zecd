@@ -5,6 +5,125 @@ All notable changes to zecd are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com), and this
 project adheres to [Semantic Versioning](https://semver.org).
 
+## [0.9.0] - 2026-10-27
+
+The 0.9.0 line, released as `0.9.0-rc1` through `0.9.0-rc5`. Everything below is relative to
+0.8.2; the release-candidate sections that follow are kept for history.
+
+NU7 support on mainnet and testnet, on the Zakura Common 4.0 crates.
+
+**Read before deploying.**
+- NU7 activates on mainnet at block 3,543,405 (ZIP 259, expected around 2026-11-05) and has been
+  active on testnet since block 4,465,026. From activation, 0.8.x builds transactions that
+  upgraded nodes reject. Every deployment needs this release, and a node that follows NU7
+  (zebra 7.0.0 or zakura 1.7.0), before then.
+- The wallet database migrates on first start, and 0.8.x cannot open the result. Going back means
+  `zecd rescan` with the older binary. Copy the data directory first if you might need to.
+- A send made while the wallet is more than 100 blocks behind the tip now fails at once with
+  `-10` instead of waiting for the scan.
+- The wallet's own change becomes spendable at its 4th confirmation by default, not its 3rd.
+- A node that never adopted an upgrade this build follows is refused once the upgrade is in
+  force. A mainnet node still on zebra 6.x is warned about now.
+- Building from source requires Rust 1.97; binary and package users are unaffected.
+
+### Added
+- **NU7.** Transactions from the activation block on commit to the NU7 consensus branch id
+  (`0x77190AD9`) and stay on the V6 format NU6.3 introduced. On regtest the height comes from
+  `ZECD_REGTEST_NU7_HEIGHT`, which must be above `ZECD_REGTEST_NU63_HEIGHT`.
+- **`[spend] max_send_catchup_blocks`** (default 100, `0` = unbounded). Every send first scans the
+  wallet up to the chain tip, which on a wallet still restoring was the whole remaining scan, run
+  while the caller waited. Past this lag a send, `z_shieldcoinbase` or `z_mergetoaddress` fails
+  at once with `-10`, naming the scanned height and the tip. Balance and history reads are not
+  gated. A wallet whose sync has halted refuses sends.
+- **A warning when the upstream schedules an upgrade at a different height.** The outdated-build
+  check compared only consensus branch ids, so it missed an upgrade this build knows but
+  schedules elsewhere. zecd now logs it at connect (an error once it activates), and
+  `zecd chain-info` shows both heights. Scanning is unaffected.
+- **A node that did not upgrade is refused rather than followed.** Such a node stays on the old
+  rules at the activation height, and from there its chain is a fork. Before the height zecd
+  warns at connect, read from the node's upgrade map. From the height on the wallet does not
+  scan past the fork: `/readyz` answers 503 with reason `upstream_not_upgraded`, `/status`
+  (`upstream_refusal`) and `getblockchaininfo.warnings` carry the explanation, and the
+  connection is retried until the node is upgraded. In light mode there is no advance warning;
+  the fork is caught at the first block past the height. `zecd chain-info` reports
+  `upstream_not_upgraded`, with `usable: false` and a nonzero exit once it is active.
+- **`getblockchaininfo` reports zcashd's `upgrades` and `consensus` objects** from this build's
+  schedule, identically on both backends. `warnings`, previously always empty, carries the reason
+  when the wallet refuses its upstream.
+- **ZIP 218's shielded budget is enforced before proving.** From NU7 a transaction may carry at
+  most 330 shielded actions, spends and outputs (300 Sapling). A send over it fails with `-8`, and
+  `z_mergetoaddress` truncates its selection to fit. At the default `orchard_action_limit` and
+  `max_tx_bytes` it never binds.
+
+### Changed
+- **Zakura Common 4.0.** The crypto and protocol crates move from 1.0.0 to 4.0, the wallet layer
+  to `zakura-client-backend`/`zakura-client-sqlite` 0.1.0-rc9.3 and `zakura-pczt` 0.1.0-rc9.
+  `zcash_protocol`, `zcash_address`, `zcash_transparent`, `zip321` and `zcash_note_encryption` are
+  now `zakura-*` forks as well.
+- **Transactions built past NU7 expire 120 blocks after their target height** (about 50 minutes
+  at NU7's 25-second blocks, as 40 blocks was before). Pre-NU7 transactions are unchanged.
+- **The wallet's own outputs become spendable one block later.** The spend anchor now sits
+  `trusted_confirmations` blocks behind the tip itself, so change moves from `untrusted_pending`
+  to `trusted` at its 4th confirmation by default. Balance totals are unchanged.
+- **A send the chain moved under fails with `-4`.** If an upgrade activates or the expiry passes
+  between proposing and building, nothing is stored or broadcast, and sending again builds
+  against the new tip.
+- **Pre-NU6.3 shielded sends are no longer possible.** The wallet stack removed proving under the
+  older Orchard circuits, so one cached proving key replaces two. Both public networks are past
+  NU6.3; a regtest chain needs `ZECD_REGTEST_NU63_HEIGHT` to send.
+- **zebra 7's address-index limit is handled.** zebra 7 refuses a `getaddresstxids` query that
+  matches more than 100,000 transactions. zecd halves the height range until each piece fits, and
+  batches addresses at 10,000 per request.
+- **lightwalletd 0.5.4 and later need no capability assertion.** They advertise transparent data
+  in compact blocks, so `[backend] assume_transparent_in_compact_blocks` is needed only for
+  0.5.0-0.5.3.
+- **The deploy example runs zebra 7.0.0 on both networks.** zebra 7 migrates its state database on
+  first start; going back to 6.x needs a full resync.
+- **The amd64 image takes its allocator from StageX's libc** instead of the `mimalloc-secure`
+  feature, which StageX's musl now provides itself. The arm64 image keeps the feature.
+
+### Fixed
+- **`listunspent` could label a Sapling note as Ironwood**, and give it the other note's address,
+  when a transaction had a Sapling output and an Ironwood action at the same index.
+- **`getnetworkinfo.protocolversion` was fixed at 170100** (NU5). It now reports the version of
+  the newest upgrade this build schedules: 170190 on mainnet, 170180 on testnet.
+- **History RPCs failed after a reorg dropped a received transaction for good.** When a reorg
+  un-mines a received transaction and the new chain never includes it, its expiry stays unknown,
+  and zecd read the resulting NULL `expired_unmined` as a boolean. One such transaction made
+  `listtransactions`, `listsinceblock`, `gettransaction` on it, and
+  `listreceivedbyaddress`/`getreceivedbyaddress` fail with `-1`. Balances were never affected.
+  Such a transaction now reads as unconfirmed until 120 blocks after the height it was first
+  seen at, then as expired (`confirmations: -1`, and `abandoned: true` on any send entry).
+- **Transparent spend searches re-ran on every block.** Under `[sync] fetch_memos = true` the
+  wallet queued an address-index lookup for every unspent transparent output each time the tip
+  moved, and counted them in `pending_enhancements`, so its backlog never settled at zero. The
+  block scan already finds those spends on both backends, so the searches are no longer serviced
+  or counted. Ephemeral-address checks still are.
+- The `-8` message for a send over `[spend] max_tx_bytes` no longer contains runs of spaces.
+- **`zecd example-config` omitted several keys.** `[backend] rfc1918_is_local` and
+  `allow_remote_cleartext`, `[rpc] work_queue` and the `[log]` section are now documented in it.
+
+### Security
+- **TLS to a lightwalletd no longer trusts the distrusted emSign intermediates.**
+  `rustls-webpki` 0.103.16 (RUSTSEC-2026-0382) and `webpki-roots` 1.0.10 or later
+  (RUSTSEC-2026-0381). `rustls` 0.23.46 fixes RUSTSEC-2026-0346 to -0349. Full mode, plaintext to
+  a local node, is unaffected.
+- `tokio` 1.53.3 (RUSTSEC-2026-0386).
+- `RUSTSEC-2026-0387` (`crypto-bigint` 0.5.5) is accepted with a documented exception: it is
+  reached only through `age`'s P-256 tag recipients, which zecd never uses, and no `age` release
+  avoids it yet.
+
+### Known issues
+- **Cold-sync time for a large wallet grows with the chain.** The per-block cost of a
+  from-birthday sync keeps rising over a long history, because a query in the wallet crates lacks
+  an index. 0.8.x behaves the same.
+- **A large wallet's memo backfill can take many hours**, holding `readiness = "synced"` back.
+  Under `fetch_memos = true` every received transaction is fetched once to read its memo, and
+  storing it costs time that grows with the wallet's history: about 379 ms per transaction on a
+  testnet wallet with 111,000 to backfill. 0.8.x behaves the same. A deployment that does not read
+  memos can set `fetch_memos = false`; one that does can use `readiness = "scanned"` and read
+  history up to `getwalletinfo.enhanced_through`.
+
 ## [0.9.0-rc5] - 2026-10-27
 
 Fixes history RPCs failing after a reorg drops a received transaction.
@@ -1195,6 +1314,7 @@ Zcash, backed entirely by librustzcash and running as a light client.
 ### Security
 - Pre-release audit hardening; refuse to start on mainnet with the placeholder RPC password; enforce a 12-character passphrase minimum.
 
+[0.9.0]: https://github.com/zecrocks/zecd/compare/v0.8.2...v0.9.0
 [0.9.0-rc5]: https://github.com/zecrocks/zecd/compare/v0.9.0-rc4...v0.9.0-rc5
 [0.9.0-rc4]: https://github.com/zecrocks/zecd/compare/v0.9.0-rc3...v0.9.0-rc4
 [0.9.0-rc3]: https://github.com/zecrocks/zecd/compare/v0.9.0-rc2...v0.9.0-rc3
