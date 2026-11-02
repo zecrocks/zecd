@@ -271,6 +271,45 @@ work-queue 503s; daemon restarts.
   failed and safe to re-send.
 - Rapid back-to-back sends can exhaust spendable notes (`-6`) until change confirms.
 
+## Reading history: transactions someone else helped fund
+
+A transaction can spend the wallet's funds alongside inputs that belong to someone else: a
+payment another wallet assembled that swept up one of this wallet's notes, a coinjoin, a
+payjoin. zecd reports these the way Bitcoin Core does, and Bitcoin Core's model assumes the
+wallet funded the whole transaction. Know what each field means before totalling anything.
+
+- **`listtransactions` / `listsinceblock`**: once the wallet spent anything in a transaction,
+  *every* output except its own change is listed as a `send` for that output's full value,
+  including the outputs the other inputs paid for. Summing `send` entries therefore overstates
+  what the wallet spent, by everything the other parties contributed.
+- **`fee`** is present only when the wallet knows every input's value. With foreign inputs it
+  cannot, so the field is omitted. Absent means *unknown*, not zero.
+- **`gettransaction.amount`** is the wallet's net balance change, excluding the fee when the fee
+  is known (Bitcoin Core's convention). With no `fee` it is the whole change. That is the number
+  to account by.
+
+An example from mainnet: a wallet holding one 0.0097 ZEC note sees a transaction that pays
+97.8815 and 152.128 ZEC to two outside addresses. Most of that ~250 ZEC came from inputs the
+wallet does not own.
+
+| | zecd | Bitcoin Core, same transaction |
+|---|---|---|
+| `listtransactions` entries | two `send`s, −97.8815 and −152.128 | the same |
+| `listtransactions` `fee` | omitted | +249.9998 (all outputs minus the wallet's inputs) |
+| `gettransaction` `amount` | **−0.0097** | −250.0095 |
+| `gettransaction` `fee` | omitted | +249.9998 |
+
+The entries match Bitcoin Core's; the fee and amount do not, and zecd's are the meaningful
+ones. Core computes the fee from the wallet's inputs alone against every output, which for a
+jointly funded transaction is meaningless and has the wrong sign, and then subtracts that "fee"
+from the amount.
+
+**To account correctly**, take each transaction's `gettransaction.amount` (plus its `fee`,
+when present) or the wallet balance from `getbalance` / `getwalletinfo`, not a sum of
+`listtransactions` amounts. To spot a partly funded transaction: it has no `fee`, and its
+`listtransactions` entries (sends negative, receives positive) sum to well below its
+`gettransaction.amount`. For an ordinary send the two agree.
+
 ## Reorgs
 
 zecd follows chain reorgs automatically: the scanner detects the fork via a block-hash

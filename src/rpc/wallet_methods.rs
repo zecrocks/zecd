@@ -1263,6 +1263,11 @@ fn display_address(network: &crate::network::ZNetwork, out: &read::TxOutputRecor
 /// `label_filter` of `Some(l)` keeps only entries whose (always-empty, since zecd is stateless)
 /// label equals `l` - so any non-`""` filter matches nothing. Shared by `listtransactions` and
 /// `listsinceblock`.
+///
+/// Like Bitcoin Core, every output of a transaction the wallet spent in is a `send` at its full
+/// value, even when other parties' inputs funded most of it, so these entries do not sum to
+/// what the wallet spent. `fee` is omitted when an input's value is unknown. docs/OPERATIONS.md
+/// ("Reading history") explains how to account for such transactions.
 fn tx_entries(
     network: &crate::network::ZNetwork,
     tx: &read::TxRecord,
@@ -1346,6 +1351,10 @@ fn wallet_funded_tx(account_balance_delta: i64) -> bool {
 /// librustzcash still attaches a `fee_paid` to it (derived from the public value balance), but
 /// the wallet never paid that fee, so adding it back would over-report the deposit by the fee.
 /// A self-transfer nets to just the fee, so it reports 0.
+///
+/// With no `fee_paid` (typically because another party contributed an input the wallet cannot
+/// value), this is the bare balance delta. Core differs here: it reports
+/// `net - (outputs - wallet_inputs)`, charging the other parties' contribution to this wallet.
 fn gettransaction_amount(account_balance_delta: i64, fee_paid: Option<u64>) -> i64 {
     if wallet_funded_tx(account_balance_delta) {
         account_balance_delta + fee_paid.unwrap_or(0) as i64
