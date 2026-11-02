@@ -125,7 +125,7 @@ uuid = { version = "1", features = ["v4", "serde"] }
 #   `zakura-proofs`, `zakura-sapling-crypto`, `zakura-protocol`, `zakura-address`,
 #   `zakura-transparent`, `zakura-zip321`) releases in lockstep and is asked for at one version,
 #   `4.0`, matching the wallet layer (`zakura-client-backend`/`zakura-client-sqlite`
-#   0.1.0-rc9.3, `zakura-pczt` 0.1.0-rc9), which requires `^4.0.0` of each. A *second* copy of
+#   0.1.0-rc9.6, `zakura-pczt` 0.1.0-rc9), which requires `^4.0.0` of each. A *second* copy of
 #   any member would be a second, incompatible type family. 4.0.0 is the release that schedules
 #   NU7 on mainnet (3,543,405); 2.2.0 had scheduled it on testnet only (`network::tests` pins
 #   both heights).
@@ -159,8 +159,8 @@ zcash_encoding = "0.4"
 # and the received-by-address read paths; zecd's own wallets never expose transparent receivers.
 # `pczt` exposes `create_pczt_from_proposal` / `extract_and_store_transaction_from_pczt`, the
 # build/prove/store seam that lets the proving step take a cached Orchard proving key.
-zcash_client_backend = { package = "zakura-client-backend", version = "0.1.0-rc9.3", features = ["lightwalletd-tonic-tls-webpki-roots", "orchard", "transparent-inputs", "pczt"] }
-zcash_client_sqlite = { package = "zakura-client-sqlite", version = "0.1.0-rc9.3", features = ["unstable", "orchard", "serde", "transparent-inputs"] }
+zcash_client_backend = { package = "zakura-client-backend", version = "0.1.0-rc9.6", features = ["lightwalletd-tonic-tls-webpki-roots", "orchard", "transparent-inputs", "pczt"] }
+zcash_client_sqlite = { package = "zakura-client-sqlite", version = "0.1.0-rc9.6", features = ["unstable", "orchard", "serde", "transparent-inputs"] }
 zcash_keys = { package = "zakura-keys", version = "4.0", features = ["unstable", "orchard"] }
 zcash_primitives = { package = "zakura-primitives", version = "4.0" }
 zcash_proofs = { package = "zakura-proofs", version = "4.0", features = ["bundled-prover"] }
@@ -234,7 +234,7 @@ mimalloc-secure = ["mimalloc", "mimalloc/secure"]
 # 4_465_026, mainnet 3_543_405 - and on regtest via `ZECD_REGTEST_NU7_HEIGHT`, which CI sets to
 # 12 for the whole tier. Every dependency here is a crates.io release and there are no git pins
 # or `[patch.crates-io]` entries, but not every one is a *stable* release: the Zakura wallet
-# layer (`zakura-client-backend`/`zakura-client-sqlite` 0.1.0-rc9.3, `zakura-pczt` 0.1.0-rc9)
+# layer (`zakura-client-backend`/`zakura-client-sqlite` 0.1.0-rc9.6, `zakura-pczt` 0.1.0-rc9)
 # is still on release candidates, and the crypto family moves with it, on a wallet-layer
 # release.
 
