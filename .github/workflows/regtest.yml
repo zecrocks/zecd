@@ -40,7 +40,7 @@ on:
         required: false
         default: ""
       zakura-image:
-        description: "zakuracore/zakura image tag to test against (e.g. 1.7.0, latest)"
+        description: "zakuracore/zakura image tag to test against (e.g. 1.8.0, latest)"
         required: false
         default: ""
       stress:
@@ -94,9 +94,10 @@ on:
 # and a manual dispatch can name any tag. Bumping a node = changing its one value here (the harness
 # drives the node purely over JSON-RPC, so nothing else needs to move in lockstep).
 #
-# Both pins are the releases that schedule NU7 on mainnet (zebra 7.0.0, zakura 1.7.0), and the
-# regtest chain activates NU7 too (REGTEST_NU7_HEIGHT below), so every PR runs against the
-# consensus rules, config validation and RPC surface the network now requires.
+# Both pins follow NU7 on mainnet: zebra 7.0.0 is the release that scheduled it, and zakura 1.8.0
+# is the current release of the line that did (1.7.0; the harness drives either over JSON-RPC
+# alone). The regtest chain activates NU7 too (REGTEST_NU7_HEIGHT below), so every PR runs against
+# the consensus rules, config validation and RPC surface the network now requires.
 #
 # IMPORTANT: no workflow env var may start with `ZEBRA_` or `ZAKURA_` - zebrad/zakurad parse
 # such-prefixed environment variables as config overrides and exit with "unknown field" on ones
@@ -105,7 +106,7 @@ on:
 # match requires the underscore right after `ZEBRA`/`ZAKURA`.
 env:
   ZEBRAD_IMAGE_PINNED: "7.0.0"
-  ZAKURAD_IMAGE_PINNED: "1.7.0"
+  ZAKURAD_IMAGE_PINNED: "1.8.0"
   # The regtest NU7 activation height: above NU6.3's 8 and a multiple of 3, as ZIP 259 requires
   # of every NU7 activation height. Passed to each step that starts a regtest stack as
   # ZECD_REGTEST_NU7_HEIGHT, and part of the chain-snapshot cache key. Named without the `ZECD_`
