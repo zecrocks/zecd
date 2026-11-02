@@ -147,6 +147,23 @@ pub struct EnhanceTotals {
     /// Wall clock applying the fetched transactions to the wallet database, in milliseconds:
     /// trial decryption plus the writes, on the single writer, so nothing overlaps it.
     pub apply_ms: u64,
+    /// Wall clock parsing fetched raw transactions into `Transaction`s, in milliseconds. Kept
+    /// apart from `upstream_ms` because it is CPU on the actor's thread, not a round trip, and
+    /// it was being billed as one.
+    pub parse_ms: u64,
+    /// Of `requests_ms`, the wallet database read alone (`transaction_data_requests`), in
+    /// milliseconds; the rest is de-duplication in the daemon.
+    pub requests_db_ms: u64,
+    /// Wall clock after a pass's stores: filtering the pending set against what the drain
+    /// has already serviced, summarising the backlog and publishing status, in milliseconds.
+    /// A fixed cost per pass, charged however few requests the pass serviced.
+    pub pass_tail_ms: u64,
+    /// Wall clock in the actor loop's scan step between drain passes, in milliseconds. While a
+    /// drain runs the scan has nothing to do, but its range query still runs every iteration.
+    pub sync_step_ms: u64,
+    /// Wall clock in the rest of the loop iteration around a drain pass (rebroadcast check,
+    /// mempool stream upkeep), in milliseconds.
+    pub loop_other_ms: u64,
 }
 
 impl EnhanceTotals {
@@ -154,7 +171,7 @@ impl EnhanceTotals {
     /// before anything is serviced.
     pub fn per_request_ms(&self) -> f64 {
         if self.serviced > 0 {
-            (self.upstream_ms + self.apply_ms) as f64 / self.serviced as f64
+            (self.upstream_ms + self.parse_ms + self.apply_ms) as f64 / self.serviced as f64
         } else {
             0.0
         }

@@ -470,6 +470,10 @@ fn enhance_requests(
     Ok(out)
 }
 
+/// Nanoseconds spent in `Transaction::read` by the drain's fetch futures since the last pass
+/// accounted for them. A static because the futures cannot borrow the actor.
+static PARSE_NANOS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// How often to emit an enhancement-drain progress heartbeat (throttled by wall time, like the
 /// transparent pre-exposure heartbeat). The `pending_enhancements` count alone can sit flat for
 /// a long drain even while requests are being serviced continuously - e.g. before
@@ -2542,7 +2546,10 @@ impl WalletActor {
                         Err(mpsc::error::TryRecvError::Disconnected) => return,
                     }
                 }
-                match self.sync_step_caught().await {
+                let t_sync = Instant::now();
+                let stepped = self.sync_step_caught().await;
+                self.enhance_totals.sync_step_ms += t_sync.elapsed().as_millis() as u64;
+                match stepped {
                     Ok(worked) => {
                         // A successful pass ends any failure streak (see `note_sync_error`).
                         self.last_sync_error = None;
@@ -2561,7 +2568,10 @@ impl WalletActor {
                             // (Transparent receives are discovered by the block scan itself - see
                             // `sync_step` - and at 0-conf by the mempool path below, on every
                             // supported backend.)
+                            let t_other = Instant::now();
                             self.maybe_rebroadcast().await;
+                            self.enhance_totals.loop_other_ms +=
+                                t_other.elapsed().as_millis() as u64;
                             // Drain one bounded batch of the enhancement backlog. Keep `more_work`
                             // set while requests remain so the loop keeps draining (servicing queued
                             // commands and republishing the shrinking backlog between batches)
@@ -2571,7 +2581,10 @@ impl WalletActor {
                             // logged and treated as "no more work this pass" rather than taking the
                             // actor (and all wallet writes) down.
                             let more_enhance = self.enhance_step_caught().await;
+                            let t_other = Instant::now();
                             self.ensure_mempool_stream().await;
+                            self.enhance_totals.loop_other_ms +=
+                                t_other.elapsed().as_millis() as u64;
                             more_work = more_enhance;
                         }
                     }
@@ -3275,6 +3288,7 @@ impl WalletActor {
                 return false;
             }
         };
+        self.enhance_totals.requests_db_ms += t_requests.elapsed().as_millis() as u64;
         // Serviceable requests not yet attempted in this drain, deduplicated (see
         // `outstanding_requests` - without the dedup, upstream's duplicate spend-search rows are
         // each serviced, one redundant upstream query apiece). Inserting each into
@@ -3343,7 +3357,10 @@ impl WalletActor {
                 chain_tip,
             )
             .await;
-            self.enhance_totals.upstream_ms += t_upstream.elapsed().as_millis() as u64;
+            let parsed_ns = PARSE_NANOS.swap(0, std::sync::atomic::Ordering::Relaxed);
+            self.enhance_totals.parse_ms += parsed_ns / 1_000_000;
+            self.enhance_totals.upstream_ms +=
+                (t_upstream.elapsed().as_millis() as u64).saturating_sub(parsed_ns / 1_000_000);
 
             // Sort the results before writing anything: a transport failure means the
             // connection is gone and the rest of the pass waits for the next one, and that
@@ -3438,6 +3455,7 @@ impl WalletActor {
         // only a fresh read can see; publishing zero over them would flip readiness to synced
         // and `waitforsync` to done with work still queued, for a whole idle interval, since the
         // loop stops driving the drain on a `false` return. So that case reads the table again.
+        let t_tail = Instant::now();
         let remaining: Vec<&EnhanceRequest> = pending
             .iter()
             .filter(|r| !self.enhance_satisfied.contains(*r))
@@ -3448,6 +3466,7 @@ impl WalletActor {
             let backlog = self.summarize_backlog(remaining.into_iter());
             self.update_status_with_backlog(backlog);
         }
+        self.enhance_totals.pass_tail_ms += t_tail.elapsed().as_millis() as u64;
         // More to do only if the pass stopped short of the serviceable requests in hand.
         pending.len() > handled
     }
@@ -3485,10 +3504,15 @@ impl WalletActor {
                     let mined_height = raw.mined_height.map(BlockHeight::from_u32);
                     // An unmined tx is assumed created under the current tip's consensus
                     // branch, as `fetch_full_tx` assumes.
+                    let t_parse = Instant::now();
                     let tx = Transaction::read(
                         &raw.data[..],
                         BranchId::for_height(&network, mined_height.unwrap_or(chain_tip)),
                     )?;
+                    PARSE_NANOS.fetch_add(
+                        t_parse.elapsed().as_nanos() as u64,
+                        std::sync::atomic::Ordering::Relaxed,
+                    );
                     Ok(Some((tx, mined_height)))
                 }
             })
