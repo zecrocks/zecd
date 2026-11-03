@@ -1245,6 +1245,13 @@ struct WalletActor {
     /// cost per request against `enhance_pass_budget` (see [`next_pass_size`]), starting at
     /// `enhance_concurrency`.
     enhance_pass_size: usize,
+    /// The tip at which the scan step last found nothing to do, if it did. While the drain has
+    /// work and the tip is still this, the scan step is skipped: its nothing-to-scan path is a
+    /// scan-range query, and the scan queue only changes when the tip is refreshed - which the
+    /// loop does in its idle wait, never mid-drain - or a sync is forced, both of which clear it.
+    scan_idle_at_tip: Option<u32>,
+    /// Whether the last drain pass reported more work.
+    drain_has_work: bool,
     /// Cumulative enhancement-drain cost since this actor started, the drain's counterpart of
     /// `sync_totals`. See [`crate::wallet::EnhanceTotals`].
     enhance_totals: crate::wallet::EnhanceTotals,
@@ -1787,6 +1794,8 @@ async fn spawn_inner(
         enhance_concurrency: cfg.enhance_concurrency,
         enhance_pass_budget: cfg.enhance_pass_budget,
         enhance_pass_size: cfg.enhance_concurrency.max(1),
+        scan_idle_at_tip: None,
+        drain_has_work: false,
         enhance_totals: crate::wallet::EnhanceTotals::default(),
         sync_halted: false,
         force_sync: false,
@@ -2558,6 +2567,7 @@ impl WalletActor {
             // buys exactly one pass.
             if std::mem::take(&mut self.force_sync) {
                 more_work = true;
+                self.scan_idle_at_tip = None;
             }
             // A halted wallet serves commands and reads but never re-attempts the scan: the
             // failure that halted it cannot succeed on retry (see `sync_halted`). Clearing
@@ -2586,7 +2596,19 @@ impl WalletActor {
                     }
                 }
                 let t_sync = Instant::now();
-                let stepped = self.sync_step_caught().await;
+                let skip_scan = self.drain_has_work
+                    && self.scan_idle_at_tip.is_some()
+                    && self.scan_idle_at_tip == self.tip_height;
+                let stepped = if skip_scan {
+                    Ok(false)
+                } else {
+                    let stepped = self.sync_step_caught().await;
+                    self.scan_idle_at_tip = match stepped {
+                        Ok(false) => self.tip_height,
+                        _ => None,
+                    };
+                    stepped
+                };
                 self.enhance_totals.sync_step_ms += t_sync.elapsed().as_millis() as u64;
                 match stepped {
                     Ok(worked) => {
@@ -2625,6 +2647,7 @@ impl WalletActor {
                             self.enhance_totals.loop_other_ms +=
                                 t_other.elapsed().as_millis() as u64;
                             more_work = more_enhance;
+                            self.drain_has_work = more_enhance;
                         }
                     }
                     Err(e) => {
