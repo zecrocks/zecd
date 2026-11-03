@@ -472,6 +472,36 @@ fn enhance_requests(
     Ok(out)
 }
 
+/// The most requests one enhancement pass services whatever the time budget allows. Bounds the
+/// fetched transactions held before the apply and the size of the pass's single write
+/// transaction; past this the fixed per-pass cost is amortised beyond measurement anyway.
+const ENHANCE_PASS_MAX: usize = 1024;
+
+/// How many requests the next enhancement pass should service so that it fits `budget`, given
+/// that the last pass serviced `handled` requests in `elapsed`: the budget divided by the
+/// measured cost per request, no fewer than `floor` (the fetch concurrency, so a pass never
+/// shrinks below what one round of fetches covers) and no more than [`ENHANCE_PASS_MAX`].
+/// `None` when the last pass serviced nothing, which says nothing about cost. Pure, so the
+/// clamping is unit-testable without an actor.
+fn next_pass_size(
+    elapsed: Duration,
+    handled: usize,
+    budget: Duration,
+    floor: usize,
+) -> Option<usize> {
+    if handled == 0 {
+        return None;
+    }
+    let per_request = elapsed.as_secs_f64() / handled as f64;
+    let fits = if per_request > 0.0 {
+        (budget.as_secs_f64() / per_request).floor()
+    } else {
+        ENHANCE_PASS_MAX as f64
+    };
+    // f64 -> usize saturates, so an enormous quotient lands on the ceiling.
+    Some((fits as usize).clamp(floor.max(1), ENHANCE_PASS_MAX.max(floor)))
+}
+
 /// How often to emit an enhancement-drain progress heartbeat (throttled by wall time, like the
 /// transparent pre-exposure heartbeat). The `pending_enhancements` count alone can sit flat for
 /// a long drain even while requests are being serviced continuously - e.g. before
@@ -902,6 +932,9 @@ pub struct ActorConfig {
     /// Transaction fetches in flight at once during the enhancement drain (`[sync]
     /// enhance_concurrency`), which is also how many requests one drain pass services.
     pub enhance_concurrency: usize,
+    /// The longest one enhancement pass may run (`[sync] enhance_pass_budget_secs`); the
+    /// actor sizes each pass from the previous one's measured cost to stay within it.
+    pub enhance_pass_budget: Duration,
     /// Reconnect backoff base/max delays.
     pub reconnect_base: Duration,
     pub reconnect_max: Duration,
@@ -1206,6 +1239,12 @@ struct WalletActor {
     /// How many transaction fetches one enhancement pass keeps in flight, and services
     /// (`[sync] enhance_concurrency`).
     enhance_concurrency: usize,
+    /// The longest one enhancement pass may run (`[sync] enhance_pass_budget_secs`).
+    enhance_pass_budget: Duration,
+    /// How many requests the next enhancement pass services: derived from the previous pass's
+    /// cost per request against `enhance_pass_budget` (see [`next_pass_size`]), starting at
+    /// `enhance_concurrency`.
+    enhance_pass_size: usize,
     /// Cumulative enhancement-drain cost since this actor started, the drain's counterpart of
     /// `sync_totals`. See [`crate::wallet::EnhanceTotals`].
     enhance_totals: crate::wallet::EnhanceTotals,
@@ -1746,6 +1785,8 @@ async fn spawn_inner(
         prefetch: None,
         sync_totals: crate::wallet::SyncTotals::default(),
         enhance_concurrency: cfg.enhance_concurrency,
+        enhance_pass_budget: cfg.enhance_pass_budget,
+        enhance_pass_size: cfg.enhance_concurrency.max(1),
         enhance_totals: crate::wallet::EnhanceTotals::default(),
         sync_halted: false,
         force_sync: false,
@@ -3307,10 +3348,11 @@ impl WalletActor {
             self.maybe_log_enhance_progress(pending.len());
         }
 
-        // The pass: the first `enhance_concurrency` requests, split by what servicing them
-        // costs. A txid-shaped request is one transaction fetch and goes upstream together
-        // with the others; an address search keeps the sequential path.
-        let pass = &pending[..pending.len().min(self.enhance_concurrency.max(1))];
+        // The pass: as many requests as the previous pass's cost says fit the time budget
+        // (`enhance_pass_size`), split by what servicing them costs. A txid-shaped request is
+        // one transaction fetch and goes upstream together with the others; an address search
+        // keeps the sequential path.
+        let pass = &pending[..pending.len().min(self.enhance_pass_size.max(1))];
         let mut txid_reqs: Vec<TxidRequest<'_>> = Vec::new();
         let mut address_reqs: Vec<(&EnhanceRequest, &TransactionsInvolvingAddress)> = Vec::new();
         for req in pass {
@@ -3415,6 +3457,18 @@ impl WalletActor {
 
         self.enhance_totals.passes += 1;
         self.enhance_totals.serviced += handled as u64;
+        // Size the next pass from this one: the whole step so far (the request read and its
+        // de-duplication, the fetches, the parses and decrypts, the stores) is what an RPC
+        // queued behind it waited, and it is charged to the requests this pass serviced.
+        if let Some(n) = next_pass_size(
+            t_requests.elapsed(),
+            handled,
+            self.enhance_pass_budget,
+            self.enhance_concurrency.max(1),
+        ) {
+            self.enhance_pass_size = n;
+        }
+        self.enhance_totals.pass_size = self.enhance_pass_size as u64;
         if aborted {
             // The pass ended early, so what it read is no longer a complete picture of what
             // remains serviceable: republish from a fresh read.
@@ -10112,6 +10166,40 @@ mod tests {
     /// address inflates `pending_enhancements` quadratically - the "23,968 pending after one
     /// send, `/readyz` flaps" field report - and `enhance_step` services the same request
     /// repeatedly within one batch.
+    #[test]
+    fn next_pass_size_tracks_the_budget() {
+        use super::{next_pass_size, ENHANCE_PASS_MAX};
+        use std::time::Duration;
+        let budget = Duration::from_secs(5);
+        // Nothing serviced says nothing about cost.
+        assert_eq!(next_pass_size(Duration::from_secs(1), 0, budget, 16), None);
+        // 16 requests in 6 s (expensive stores): 5 s buys 13, the floor of 16 wins.
+        assert_eq!(
+            next_pass_size(Duration::from_secs(6), 16, budget, 16),
+            Some(16)
+        );
+        // 16 in 400 ms (25 ms each): 5 s buys 200.
+        assert_eq!(
+            next_pass_size(Duration::from_millis(400), 16, budget, 16),
+            Some(200)
+        );
+        // 256 in 1 s (4 ms each): 5 s buys 1,250, the ceiling of 1,024 wins.
+        assert_eq!(
+            next_pass_size(Duration::from_secs(1), 256, budget, 16),
+            Some(ENHANCE_PASS_MAX)
+        );
+        // A zero-length pass cannot divide; it lands on the ceiling.
+        assert_eq!(
+            next_pass_size(Duration::ZERO, 16, budget, 16),
+            Some(ENHANCE_PASS_MAX)
+        );
+        // A floor above the ceiling is honoured (an operator who set enhance_concurrency high).
+        assert_eq!(
+            next_pass_size(Duration::from_secs(1), 1, budget, 2048),
+            Some(2048)
+        );
+    }
+
     #[test]
     fn outstanding_requests_dedup_and_satisfied_filter() {
         use super::{outstanding_requests, EnhanceRequest};

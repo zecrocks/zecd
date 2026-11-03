@@ -368,6 +368,9 @@ mod tests {
                 batch_size: crate::sync::engine::DEFAULT_BATCH_SIZE,
                 writer_cache_mib: crate::wallet::open::DEFAULT_WRITER_CACHE_MIB,
                 enhance_concurrency: crate::config::DEFAULT_ENHANCE_CONCURRENCY,
+                enhance_pass_budget: std::time::Duration::from_secs(
+                    crate::config::DEFAULT_ENHANCE_PASS_BUDGET_SECS,
+                ),
             },
             spend: crate::config::SpendConfig::default(),
             pools: crate::config::PoolsConfig::default(),

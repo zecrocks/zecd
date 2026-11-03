@@ -458,6 +458,17 @@ rebroadcast_secs = 60
 # single writer, so this is also how many stores run before the actor next services a queued
 # command (a send, getnewaddress) - the same 16-store window as before at the default.
 # enhance_concurrency = 16
+#
+# enhance_pass_budget_secs (default 5) - the longest one enhancement pass may run, which is the
+# longest an actor-routed RPC (a send, getnewaddress, sendrawtransaction, walletpassphrase) waits
+# while a drain is in progress. The daemon sizes each pass from the one before it: this budget
+# divided by the measured cost per request, never fewer than enhance_concurrency, never more
+# than 1024. A pass has a fixed cost however few requests it services (the request-table read
+# and its de-duplication, the status publish, the loop iteration around it), so with cheap stores
+# a pass grows to amortise it, and with expensive ones it stays small. The fetches within a pass
+# still run enhance_concurrency at a time, so a public lightwalletd sees no more streams however
+# large the pass. /status reports the current size as enhance_totals.pass_size.
+# enhance_pass_budget_secs = 5
 
 [spend]
 # The wallet-wide confirmations policy (ZIP 315 defaults, like Zallet): how deep an output

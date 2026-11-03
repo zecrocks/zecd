@@ -167,6 +167,10 @@ pub struct EnhanceTotals {
     /// Wall clock in the rest of the loop iteration around a drain pass (rebroadcast check,
     /// mempool stream upkeep), in milliseconds.
     pub loop_other_ms: u64,
+    /// How many requests the next enhancement pass will service: derived each pass from the
+    /// last one's cost against `[sync] enhance_pass_budget_secs`, between `enhance_concurrency`
+    /// and a fixed ceiling. Small while stores are expensive, large once they are cheap.
+    pub pass_size: u64,
 }
 
 impl EnhanceTotals {

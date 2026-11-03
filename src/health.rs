@@ -228,6 +228,7 @@ fn snapshot(state: &AppState) -> Snapshot {
                     "pass_tail_ms": st.enhance_totals.pass_tail_ms,
                     "sync_step_ms": st.enhance_totals.sync_step_ms,
                     "loop_other_ms": st.enhance_totals.loop_other_ms,
+                    "pass_size": st.enhance_totals.pass_size,
                     "per_request_ms": st.enhance_totals.per_request_ms(),
                 },
                 "encrypted": st.encrypted,
