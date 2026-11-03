@@ -27,6 +27,8 @@ hyper = { version = "1", features = ["client", "http1"] }
 http-body-util = "0.1"
 bytes = "1"
 futures-util = "0.3"
+# The drain parses and trial-decrypts a pass's transactions on the global pool.
+rayon = "1"
 
 # Serialization. `arbitrary_precision` is REQUIRED: bitcoind emits amounts as JSON numbers
 # with 8 decimals and clients parse them as Decimal; without this they round-trip through f64.

@@ -393,7 +393,9 @@ fn sync_error_retry_deadline(now: Instant) -> Instant {
 
 /// One transaction as the enhancement drain fetches it: the parsed transaction and the height
 /// it was mined at (`None` while unmined), or `None` when the upstream does not know the txid.
-type FetchedTransaction = Option<(Transaction, Option<BlockHeight>)>;
+/// What the upstream returned for a txid: the raw transaction and, if mined, its height.
+/// Parsing happens later, on the thread pool, not in the fetch future.
+type FetchedTransaction = Option<(Vec<u8>, Option<BlockHeight>)>;
 
 /// A pending request that names one transaction - the two kinds the drain fetches
 /// concurrently. `enhance` is true for an `Enhancement` (decrypt and store the transaction)
@@ -469,10 +471,6 @@ fn enhance_requests(
     );
     Ok(out)
 }
-
-/// Nanoseconds spent in `Transaction::read` by the drain's fetch futures since the last pass
-/// accounted for them. A static because the futures cannot borrow the actor.
-static PARSE_NANOS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// How often to emit an enhancement-drain progress heartbeat (throttled by wall time, like the
 /// transparent pre-exposure heartbeat). The `pending_enhancements` count alone can sit flat for
@@ -3349,18 +3347,10 @@ impl WalletActor {
         if !txid_reqs.is_empty() {
             let txids: Vec<TxId> = txid_reqs.iter().map(|r| r.txid).collect();
             let t_upstream = Instant::now();
-            let fetched = Self::fetch_txs_concurrent(
-                Arc::clone(&self.hub),
-                self.network,
-                self.enhance_concurrency,
-                &txids,
-                chain_tip,
-            )
-            .await;
-            let parsed_ns = PARSE_NANOS.swap(0, std::sync::atomic::Ordering::Relaxed);
-            self.enhance_totals.parse_ms += parsed_ns / 1_000_000;
-            self.enhance_totals.upstream_ms +=
-                (t_upstream.elapsed().as_millis() as u64).saturating_sub(parsed_ns / 1_000_000);
+            let fetched =
+                Self::fetch_txs_concurrent(Arc::clone(&self.hub), self.enhance_concurrency, &txids)
+                    .await;
+            self.enhance_totals.upstream_ms += t_upstream.elapsed().as_millis() as u64;
 
             // Sort the results before writing anything: a transport failure means the
             // connection is gone and the rest of the pass waits for the next one, and that
@@ -3378,7 +3368,7 @@ impl WalletActor {
                 }
             }
             let t_apply = Instant::now();
-            let applied = self.apply_fetched_requests(&to_apply);
+            let applied = self.apply_fetched_requests(&to_apply, chain_tip);
             self.enhance_totals.apply_ms += t_apply.elapsed().as_millis() as u64;
             match applied {
                 Ok(()) => {
@@ -3483,10 +3473,8 @@ impl WalletActor {
     /// `&self` across these awaits could not be spawned.
     async fn fetch_txs_concurrent(
         hub: Arc<ChainHub>,
-        network: ZNetwork,
         concurrency: usize,
         txids: &[TxId],
-        chain_tip: BlockHeight,
     ) -> Vec<anyhow::Result<FetchedTransaction>> {
         use futures_util::stream::{self, StreamExt as _};
 
@@ -3502,18 +3490,7 @@ impl WalletActor {
                         return Ok(None);
                     };
                     let mined_height = raw.mined_height.map(BlockHeight::from_u32);
-                    // An unmined tx is assumed created under the current tip's consensus
-                    // branch, as `fetch_full_tx` assumes.
-                    let t_parse = Instant::now();
-                    let tx = Transaction::read(
-                        &raw.data[..],
-                        BranchId::for_height(&network, mined_height.unwrap_or(chain_tip)),
-                    )?;
-                    PARSE_NANOS.fetch_add(
-                        t_parse.elapsed().as_nanos() as u64,
-                        std::sync::atomic::Ordering::Relaxed,
-                    );
-                    Ok(Some((tx, mined_height)))
+                    Ok(Some((raw.data, mined_height)))
                 }
             })
             .buffered(concurrency.max(1))
@@ -3521,32 +3498,90 @@ impl WalletActor {
             .await
     }
 
-    /// Apply a pass's fetched transactions under one database transaction. Each store is the
-    /// same `decrypt_and_store_transaction` (or `set_transaction_status`) the per-request path
-    /// ran; only the commit is shared. All-or-nothing: on an error nothing is recorded and the
-    /// pass is retried whole. Runs under `block_in_place` - it is a database write of up to a
-    /// pass's worth of transactions, and it must not hold a runtime worker while it does that.
+    /// Apply a pass's fetched transactions: parse and trial-decrypt them on the thread pool,
+    /// then store them under one database transaction.
+    ///
+    /// Every transaction in a pass is independent of every other until it is written, and the
+    /// parse and the trial decryption are the CPU half of the drain - so they run on rayon,
+    /// not on this actor's thread, which is also the only thread that may write and therefore
+    /// serializes the whole drain behind whatever is left on it. Only the stores stay here.
+    /// All-or-nothing on the write: on an error nothing is recorded and the pass is retried
+    /// whole. Runs under `block_in_place` for the same reason as before.
     fn apply_fetched_requests(
         &mut self,
         fetched: &[(&TxidRequest<'_>, FetchedTransaction)],
+        chain_tip: BlockHeight,
     ) -> anyhow::Result<()> {
+        use rayon::prelude::*;
         if fetched.is_empty() {
             return Ok(());
         }
         let network = self.network;
         tokio::task::block_in_place(|| {
+            // What `decrypt_and_store_transaction` reads from the database per transaction,
+            // read once per pass: the viewing keys (and the UFVK parse behind them) and the
+            // chain height. An unmined-at-fetch transaction's height needs a lookup too, and
+            // that cannot happen on a pool thread.
+            let ufvks = self.db_data.get_unified_full_viewing_keys()?;
+            let chain_height = self.db_data.chain_height()?;
+            let mut heights: Vec<Option<BlockHeight>> = Vec::with_capacity(fetched.len());
+            for (req, found) in fetched {
+                heights.push(match found {
+                    Some((_, Some(h))) => Some(*h),
+                    Some((_, None)) if req.enhance => self.db_data.get_tx_height(req.txid)?,
+                    _ => None,
+                });
+            }
+
+            // Parse. Only an `Enhancement` needs the transaction; a `GetStatus` needs only
+            // the height the fetch already returned, so it is not parsed at all.
+            let t_parse = Instant::now();
+            let parsed: Vec<anyhow::Result<Option<Transaction>>> = fetched
+                .par_iter()
+                .map(|(req, found)| match found {
+                    Some((raw, mined)) if req.enhance => {
+                        // An unmined tx is assumed created under the current tip's consensus
+                        // branch, as `fetch_full_tx` assumes.
+                        let branch = BranchId::for_height(&network, mined.unwrap_or(chain_tip));
+                        Ok(Some(Transaction::read(&raw[..], branch)?))
+                    }
+                    _ => Ok(None),
+                })
+                .collect();
+            self.enhance_totals.parse_ms += t_parse.elapsed().as_millis() as u64;
+            let parsed: Vec<Option<Transaction>> =
+                parsed.into_iter().collect::<anyhow::Result<_>>()?;
+
+            // Trial-decrypt, borrowing the parsed transactions.
+            let t_decrypt = Instant::now();
+            let decrypted: Vec<_> = parsed
+                .par_iter()
+                .zip(heights.par_iter())
+                .map(|(tx, mined)| {
+                    tx.as_ref().map(|tx| {
+                        zcash_client_backend::decrypt_transaction(
+                            &network,
+                            *mined,
+                            chain_height,
+                            tx,
+                            &ufvks,
+                        )
+                    })
+                })
+                .collect();
+            self.enhance_totals.decrypt_ms += t_decrypt.elapsed().as_millis() as u64;
+
+            // The writes are all that is left, under one transaction for the pass.
             self.db_data.transactionally(|wdb| -> anyhow::Result<()> {
-                for (req, found) in fetched {
-                    match (req.enhance, found) {
-                        (true, Some((tx, mined))) => {
-                            decrypt_and_store_transaction(&network, wdb, tx, *mined)?;
-                        }
+                for ((req, found), decrypted) in fetched.iter().zip(decrypted) {
+                    match (req.enhance, found, decrypted) {
+                        (true, Some(_), Some(d_tx)) => wdb.store_decrypted_tx(d_tx)?,
                         // The upstream answered and does not know the transaction: retire
                         // the payload request. Status is a separate obligation now, so this
                         // no longer goes through `set_transaction_status`, which since rc7
                         // updates status only and would leave the fetch queued forever.
-                        (true, None) => wdb.notify_transaction_enhancement_not_found(req.txid)?,
-                        (false, found) => {
+                        (true, _, _) => wdb.notify_transaction_enhancement_not_found(req.txid)?,
+                        (false, found, _) => {
                             let status = match found {
                                 None => TransactionStatus::TxidNotRecognized,
                                 Some((_, Some(height))) => TransactionStatus::Mined(*height),

@@ -151,6 +151,9 @@ pub struct EnhanceTotals {
     /// apart from `upstream_ms` because it is CPU on the actor's thread, not a round trip, and
     /// it was being billed as one.
     pub parse_ms: u64,
+    /// Wall clock trial-decrypting a pass's transactions, in milliseconds. Parallel across the
+    /// pass, so this is elapsed time, not CPU time.
+    pub decrypt_ms: u64,
     /// Of `requests_ms`, the wallet database read alone (`transaction_data_requests`), in
     /// milliseconds; the rest is de-duplication in the daemon.
     pub requests_db_ms: u64,
@@ -171,7 +174,8 @@ impl EnhanceTotals {
     /// before anything is serviced.
     pub fn per_request_ms(&self) -> f64 {
         if self.serviced > 0 {
-            (self.upstream_ms + self.parse_ms + self.apply_ms) as f64 / self.serviced as f64
+            (self.upstream_ms + self.parse_ms + self.decrypt_ms + self.apply_ms) as f64
+                / self.serviced as f64
         } else {
             0.0
         }
