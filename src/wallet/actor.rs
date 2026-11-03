@@ -459,16 +459,30 @@ fn enhance_requests(
             out.push(EnhanceRequest::GetStatus(r.txid()));
         }
     }
+    let mut enhancements = 0usize;
     for work in db.transaction_enhancement_work()? {
         if let TransactionEnhancementWork::Public(r) = work {
             out.push(EnhanceRequest::Enhancement(r.txid()));
+            enhancements += 1;
         }
     }
-    out.extend(
-        db.transaction_data_requests()?
-            .into_iter()
-            .map(EnhanceRequest::from),
-    );
+    // The address searches derive from the spend-search queue: one row per still-unspent
+    // received transparent output, decoded into an address each, and on a wallet with
+    // thousands of such outputs that is thousands of rows on every pass. The drain services
+    // the txid-shaped requests first (`EnhanceRequest`'s order), so while any enhancement is
+    // outstanding the searches would be computed only to be sorted behind it and dropped at
+    // the pass boundary. They are read once the enhancement queue is empty, which is when
+    // they can be serviced. Keyed on enhancements only: each of those resolves (the
+    // transaction is stored, or the upstream does not know it and the row is retired),
+    // whereas a status obligation for the wallet's own unmined send persists until it is
+    // mined or expires, and must not hold back spend detection for that long.
+    if enhancements == 0 {
+        out.extend(
+            db.transaction_data_requests()?
+                .into_iter()
+                .map(EnhanceRequest::from),
+        );
+    }
     Ok(out)
 }
 
