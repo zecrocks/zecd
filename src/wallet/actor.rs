@@ -3986,11 +3986,15 @@ impl WalletActor {
         let derived = tokio::task::block_in_place(|| {
             self.db_data
                 .transactionally::<_, _, SqliteClientError>(|wdb| {
-                    for i in start..end {
-                        let div = DiversifierIndex::from(i);
-                        wdb.get_address_for_index(account_id, div, request)?;
-                    }
-                    Ok(())
+                    // One call for the chunk: the wallet crate reads the account, derives its
+                    // incoming viewing key and reads the chain tip once, instead of once per
+                    // index as `get_address_for_index` in a loop did.
+                    wdb.get_addresses_for_index_range(
+                        account_id,
+                        DiversifierIndex::from(start)..DiversifierIndex::from(end),
+                        request,
+                    )
+                    .map(|_| ())
                 })
         });
         if let Err(e) = derived {
