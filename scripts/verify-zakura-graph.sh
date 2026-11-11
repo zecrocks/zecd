@@ -43,6 +43,8 @@ FORBIDDEN = {
     "zcash_protocol", "zcash_address", "zcash_transparent", "zip321",
     # From the 3.0 family it forks note encryption too (`zakura-note-encryption`).
     "zcash_note_encryption",
+    # The 5.4 family's wallet layer forks the script crate (`zakura-zcash-script`).
+    "zcash_script",
     # zakura-core/wallet-libraries (the wallet layer).
     "zcash_client_backend", "zcash_client_sqlite", "pczt",
 }
