@@ -5,4 +5,5 @@
 ignore = [
     "RUSTSEC-2026-0374", # basic-toml unmaintained: build-time only, via age's i18n proc-macros
     "RUSTSEC-2026-0387", # crypto-bigint 0.5.5: age's P-256 tag recipients, which zecd never uses
+    "RUSTSEC-2026-0459", # SQLite WAL page-size disclosure: needs a crafted db + -wal pair in zecd's own datadir
 ]
