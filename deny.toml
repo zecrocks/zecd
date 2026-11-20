@@ -4,7 +4,7 @@ all-features = true
 [advisories]
 version = 2
 yanked = "deny"
-# Two exceptions, both reached only through `age`. An earlier one, RUSTSEC-2026-0173 (proc-macro-error2
+# Three exceptions, the first two reached only through `age`. An earlier one, RUSTSEC-2026-0173 (proc-macro-error2
 # unmaintained), went away when `age` 0.12 moved to i18n-embed-fl 0.10 - which
 # depends on the maintained proc-macro-error3 fork - and getset 0.1.7 (orchard's
 # build-time dependency) dropped it too.
@@ -22,6 +22,17 @@ ignore = [
     # passphrase, so no secret ever meets P-256 arithmetic. Drop this once age moves
     # to p256 0.14.
     { id = "RUSTSEC-2026-0387", reason = "crypto-bigint 0.5 timing leaks: reached only via age's P-256 recipients, which zecd never uses; no age release on a fixed version yet" },
+    # Bundled SQLite before 3.54.0 reads a `-wal` frame at the WAL header's page size
+    # without checking it against the database's, so a crafted database plus `-wal` pair
+    # makes queries return stale process memory (CVE-2026-119375). The only trigger is
+    # opening a file pair a less trusted party wrote, and zecd never does: every
+    # connection (`wallet/open.rs`, `wallet/read.rs`) opens a path it derives under its
+    # own datadir, and no RPC, CLI flag or config key names a database file. A party
+    # that can write the datadir can already replace the wallet database. The fix
+    # (libsqlite3-sys 0.39, rusqlite 0.41) cannot resolve yet: `links = "sqlite3"` allows
+    # one copy, and every zakura-client-sqlite release requires rusqlite ^0.37. Drop
+    # this with that bump.
+    { id = "RUSTSEC-2026-0459", reason = "SQLite WAL page-size disclosure: needs a crafted db + -wal pair, and zecd opens only files it creates in its own datadir; fix blocked on zakura-client-sqlite" },
 ]
 
 [licenses]

@@ -678,15 +678,20 @@ pub fn next_range_guess(
 /// contradicts the new chain, so any useful rewind must remove it - hence the strict
 /// `at_height - 2` bound, which also guarantees progress: each pass strictly shrinks the
 /// scanned chain instead of re-truncating to the same stale block forever. Without the
-/// retry a young wallet wedges: the deep rewind target can land below every checkpointed
-/// block (the birthday anchor has no `blocks` row), `truncate_to_height` errors with
-/// `RequestedRewindInvalid`, and the same scan range fails identically on every attempt -
-/// the bug upstream's `sync::run` still has (see the module docs).
+/// retry a young wallet wedged on the wallet crates before 0.1.0-rc9.4: the deep rewind
+/// target landed below every checkpointed block (the birthday anchor had no `blocks` row and
+/// was not a candidate), `truncate_to_height` errored with `RequestedRewindInvalid`, and the
+/// same scan range failed identically on every attempt - the bug upstream's `sync::run` still
+/// has (see the module docs). Since rc9.4 (zakura-core/wallet-libraries#301) checkpoint heights are
+/// candidates too, so a request at or below the anchor rewinds to the anchor and the wallet
+/// rescans from its birthday; a request *below* the anchor is still refused, and the retry
+/// still turns that refusal into the shallow rewind that removes only the stale blocks.
 ///
-/// The error's `safe_rewind_height` is deliberately ignored: upstream computes it as the
-/// minimum checkpoint height *without* requiring a scanned block there, so it may name the
-/// blocks-row-less birthday anchor (itself an invalid target), and any height below the
-/// already-failed `requested` fails a fortiori.
+/// The error's `safe_rewind_height` is only tried below what was just refused: before rc9.4
+/// it could name the blocks-row-less anchor (then an invalid target) or the refused height
+/// itself; since rc9.4 it names the anchor, which lies *above* a refused request, and the
+/// shallow candidate reaches a valid height first in every case (the stale block is scanned,
+/// so it is at or above the birthday, and `at_height - 2` is at or above the anchor).
 ///
 /// Lineage: mirrored in zkv's `internal/sync.rs` - port fixes both ways.
 ///
@@ -1502,31 +1507,45 @@ mod tests {
         wd: &std::path::Path,
         blocks: u32,
     ) -> (WriteDb, OrchardFrontier, OrchardFrontier) {
+        scanned_chain_from(wd, 0, blocks)
+    }
+
+    /// [`scanned_chain_a`] for a wallet born at `anchor` instead of genesis: the account's
+    /// chain state is the empty tree at `anchor` (no `blocks` row there, only the checkpoint
+    /// the birthday records), and chain A is `anchor + 1..=anchor + blocks`. Keep the whole
+    /// chain below the NU6.3 activation (8): these fixtures carry an Orchard frontier only.
+    fn scanned_chain_from(
+        wd: &std::path::Path,
+        anchor: u32,
+        blocks: u32,
+    ) -> (WriteDb, OrchardFrontier, OrchardFrontier) {
         let net = crate::network::regtest();
         let mut db_data = crate::wallet::open::init_dbs(net, wd).expect("init dbs");
 
-        let genesis = fake_hash(0xAA, 0);
+        let genesis = fake_hash(0xAA, anchor);
         let birthday = AccountBirthday::from_parts(
-            ChainState::empty(BlockHeight::from_u32(0), BlockHash(genesis)),
+            ChainState::empty(BlockHeight::from_u32(anchor), BlockHash(genesis)),
             None,
         );
         db_data
             .create_account("t", &SecretVec::new(vec![1u8; 64]), &birthday, None)
             .expect("create account");
         db_data
-            .update_chain_tip(BlockHeight::from_u32(blocks))
+            .update_chain_tip(BlockHeight::from_u32(anchor + blocks))
             .expect("set tip");
 
         let mut frontier = OrchardFrontier::empty();
         let mut frontier_at_1 = OrchardFrontier::empty();
         let mut prev = genesis;
-        for h in 1..=blocks {
+        for h in anchor + 1..=anchor + blocks {
             let from = chain_state(h - 1, prev, &frontier);
             let hash = fake_hash(0xA1, h);
             let cmx = cmx_bytes(0x0A, h);
+            // One commitment per block from the anchor on, so the block's final Orchard tree
+            // size is its distance from the anchor (the scanner checks it against the frontier).
             scan_blocks(
                 &net,
-                &cached_block(h, hash, prev, cmx, h),
+                &cached_block(h, hash, prev, cmx, h - anchor),
                 &mut db_data,
                 &from,
                 &range(h, h + 1),
@@ -1536,12 +1555,16 @@ mod tests {
             assert!(frontier.append(MerkleHashOrchard::from_cmx(
                 &ExtractedNoteCommitment::from_bytes(&cmx).unwrap()
             )));
-            if h == 1 {
+            if h == anchor + 1 {
                 frontier_at_1 = frontier.clone();
             }
             prev = hash;
         }
-        assert_eq!(max_scanned(&db_data), Some(blocks), "chain A fully scanned");
+        assert_eq!(
+            max_scanned(&db_data),
+            Some(anchor + blocks),
+            "chain A fully scanned"
+        );
         (db_data, frontier, frontier_at_1)
     }
 
@@ -1697,14 +1720,46 @@ mod tests {
         scanned_chain_a(wd, blocks).0
     }
 
-    /// A reorg within 10 blocks of the wallet's entire scanned history: the requested rewind
-    /// (`at_height - 10`, floored at 0) has no checkpoint at or below it, so a bare
-    /// `truncate_to_height` fails with `RequestedRewindInvalid` on every retry. The shallow
-    /// retry (truncate at `at_height - 2`) must rewind to the highest checkpointed block
-    /// *strictly below* the known-stale block at `at_height - 1` - here 4, not 5 - so the
-    /// conflicting block is removed and retries make progress.
+    /// A reorg within 10 blocks of a wallet whose birthday anchor sits above genesis (at 2,
+    /// below the NU6.3 activation these fixtures stay under): the requested rewind
+    /// (`at_height - 10`, floored at 0) lands *below* the anchor, where no checkpoint exists,
+    /// so a bare `truncate_to_height` is refused on every retry (the wallet crates name the
+    /// anchor as the safe height, which is above the request). The shallow retry (truncate at
+    /// `at_height - 2`) must rewind to the highest checkpointed block *strictly below* the
+    /// known-stale block at `at_height - 1` - here 6, not 7 - so the conflicting block is
+    /// removed and retries make progress.
     #[test]
     fn rewind_falls_back_to_shallow_checkpoint() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut db_data, _, _) = scanned_chain_from(dir.path(), 2, 5);
+
+        let rewound = perform_rewind(
+            &mut db_data,
+            BlockHeight::from_u32(8),
+            BlockHeight::from_u32(0),
+            BlockHeight::from_u32(0),
+        )
+        .expect("shallow fallback rewinds");
+        assert_eq!(
+            u32::from(rewound),
+            6,
+            "rewound below the stale block at at_height - 1"
+        );
+        assert_eq!(
+            max_scanned(&db_data),
+            Some(6),
+            "wallet truncated to the fallback target"
+        );
+    }
+
+    /// A reorg within the margin of a wallet's entire scanned history, with the anchor at
+    /// genesis: the requested rewind (`at_height - 10`, floored at 0) is the anchor itself.
+    /// Since the wallet crates' 0.1.0-rc9.4 that is a valid target (zakura-core/wallet-libraries#301),
+    /// so the first attempt succeeds and the wallet rescans from its birthday; before, every
+    /// attempt was refused and only the shallow retry made progress. Either way the stale
+    /// block is gone.
+    #[test]
+    fn rewind_to_the_birthday_anchor_is_accepted() {
         let dir = tempfile::tempdir().unwrap();
         let mut db_data = short_chain_wallet(dir.path(), 5);
 
@@ -1714,57 +1769,47 @@ mod tests {
             BlockHeight::from_u32(0),
             BlockHeight::from_u32(0),
         )
-        .expect("shallow fallback rewinds");
-        assert_eq!(
-            u32::from(rewound),
-            4,
-            "rewound below the stale block at at_height - 1"
-        );
+        .expect("the anchor is a valid rewind target");
+        assert_eq!(u32::from(rewound), 0, "rewound to the birthday anchor");
         assert_eq!(
             max_scanned(&db_data),
-            Some(4),
-            "wallet truncated to the fallback target"
+            None,
+            "every scanned block was truncated; the rescan starts from the birthday"
         );
     }
 
-    /// A reorg deeper than the wallet's rewindable history (only block 1 is scanned and the
-    /// conflict is right above it) has no valid fallback: the error must say so clearly
-    /// instead of surfacing a bare `RequestedRewindInvalid`.
+    /// A reorg right above the only scanned block (the shape that used to be unrecoverable:
+    /// nothing checkpointed below the conflict but the anchor, which was not a target): the
+    /// wallet now rewinds to the anchor. `UnrecoverableReorg` stays for the refusals the
+    /// per-pool tolerances can still raise - a truncation that would discard witness data no
+    /// rescan recreates - which no young wallet reaches by chain shape alone.
     #[test]
-    fn rewind_reports_unrecoverable_reorg() {
+    fn rewind_above_the_first_scanned_block_returns_to_the_anchor() {
         let dir = tempfile::tempdir().unwrap();
         let mut db_data = short_chain_wallet(dir.path(), 1);
 
-        let err = perform_rewind(
+        let rewound = perform_rewind(
             &mut db_data,
             BlockHeight::from_u32(2),
             BlockHeight::from_u32(0),
             BlockHeight::from_u32(0),
         )
-        .expect_err("nothing below the conflict to rewind to");
-        // Typed, not just worded: the actor halts this wallet's sync on exactly this type, and
-        // retries every other failure. A bare `anyhow!` here would be retried forever.
-        let unrecoverable = err
-            .downcast_ref::<UnrecoverableReorg>()
-            .expect("the terminal class must be recoverable by type, not by message text");
-        assert_eq!(u32::from(unrecoverable.at_height), 2);
-        assert!(
-            err.to_string().contains("unrecoverable reorg"),
-            "unexpected error: {err:#}"
-        );
-        assert_eq!(max_scanned(&db_data), Some(1), "wallet state untouched");
+        .expect("rewinds to the birthday anchor");
+        assert_eq!(u32::from(rewound), 0);
+        assert_eq!(max_scanned(&db_data), None, "the stale block is gone");
     }
 
-    /// The storage layer's `safe_rewind_height` is *not* a target to retry blindly: it can name
-    /// the very height that was just refused. Truncating a 1-block wallet to 0 does exactly that
-    /// (`RequestedRewindInvalid { safe_rewind_height: Some(0), requested_height: 0 }`), so a
-    /// candidate list that fed it back in would re-issue the identical failing call - the same
-    /// shape of infinite retry this whole change removes. Pin the upstream behaviour that makes
-    /// the guard necessary, so a bump that changes it shows up here.
+    /// Pin the storage layer's refusal shape that `perform_rewind`'s candidate order relies
+    /// on: a request *below* the birthday anchor is refused, and the `safe_rewind_height` it
+    /// names is the anchor, which lies above the request. The `< requested` filter therefore
+    /// leaves that height out, and the shallow retry (which is at or above the anchor whenever
+    /// the stale block is scanned) is what recovers. Before rc9.4 the same call could name the
+    /// refused height itself (`truncate_to_height(0)` refused with `Some(0)`), the other reason
+    /// the filter exists. A bump that changes either shape shows up here.
     #[test]
-    fn safe_rewind_height_can_name_the_refused_height() {
+    fn a_request_below_the_anchor_is_refused_with_the_anchor_as_safe_height() {
         let dir = tempfile::tempdir().unwrap();
-        let mut db_data = short_chain_wallet(dir.path(), 1);
+        let (mut db_data, _, _) = scanned_chain_from(dir.path(), 2, 1);
 
         match db_data.truncate_to_height(BlockHeight::from_u32(0)) {
             Err(SqliteClientError::RequestedRewindInvalid {
@@ -1774,13 +1819,23 @@ mod tests {
                 assert_eq!(u32::from(requested_height), 0);
                 assert_eq!(
                     safe_rewind_height.map(u32::from),
-                    Some(0),
-                    "upstream named a safe height other than the refused one; \
-                     `perform_rewind`'s `< requested` filter may now be over-cautious"
+                    Some(2),
+                    "upstream named a safe height other than the anchor; \
+                     `perform_rewind`'s candidate order may need revisiting"
                 );
             }
-            other => panic!("expected the truncation to 0 to be refused, got {other:?}"),
+            other => {
+                panic!("expected the truncation below the anchor to be refused, got {other:?}")
+            }
         }
+        // And the anchor itself is accepted, which is what makes the shallow retry sufficient.
+        assert_eq!(
+            db_data
+                .truncate_to_height(BlockHeight::from_u32(2))
+                .map(u32::from)
+                .expect("the anchor is a valid target"),
+            2
+        );
     }
 
     fn tip_range(start: u32, end: u32) -> ScanRange {

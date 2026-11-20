@@ -393,7 +393,9 @@ fn sync_error_retry_deadline(now: Instant) -> Instant {
 
 /// One transaction as the enhancement drain fetches it: the parsed transaction and the height
 /// it was mined at (`None` while unmined), or `None` when the upstream does not know the txid.
-type FetchedTransaction = Option<(Transaction, Option<BlockHeight>)>;
+/// What the upstream returned for a txid: the raw transaction and, if mined, its height.
+/// Parsing happens later, on the thread pool, not in the fetch future.
+type FetchedTransaction = Option<(Vec<u8>, Option<BlockHeight>)>;
 
 /// A pending request that names one transaction - the two kinds the drain fetches
 /// concurrently. `enhance` is true for an `Enhancement` (decrypt and store the transaction)
@@ -457,17 +459,61 @@ fn enhance_requests(
             out.push(EnhanceRequest::GetStatus(r.txid()));
         }
     }
+    let mut enhancements = 0usize;
     for work in db.transaction_enhancement_work()? {
         if let TransactionEnhancementWork::Public(r) = work {
             out.push(EnhanceRequest::Enhancement(r.txid()));
+            enhancements += 1;
         }
     }
-    out.extend(
-        db.transaction_data_requests()?
-            .into_iter()
-            .map(EnhanceRequest::from),
-    );
+    // The address searches derive from the spend-search queue: one row per still-unspent
+    // received transparent output, decoded into an address each, and on a wallet with
+    // thousands of such outputs that is thousands of rows on every pass. The drain services
+    // the txid-shaped requests first (`EnhanceRequest`'s order), so while any enhancement is
+    // outstanding the searches would be computed only to be sorted behind it and dropped at
+    // the pass boundary. They are read once the enhancement queue is empty, which is when
+    // they can be serviced. Keyed on enhancements only: each of those resolves (the
+    // transaction is stored, or the upstream does not know it and the row is retired),
+    // whereas a status obligation for the wallet's own unmined send persists until it is
+    // mined or expires, and must not hold back spend detection for that long.
+    if enhancements == 0 {
+        out.extend(
+            db.transaction_data_requests()?
+                .into_iter()
+                .map(EnhanceRequest::from),
+        );
+    }
     Ok(out)
+}
+
+/// The most requests one enhancement pass services whatever the time budget allows. Bounds the
+/// fetched transactions held before the apply and the size of the pass's single write
+/// transaction; past this the fixed per-pass cost is amortised beyond measurement anyway.
+const ENHANCE_PASS_MAX: usize = 1024;
+
+/// How many requests the next enhancement pass should service so that it fits `budget`, given
+/// that the last pass serviced `handled` requests in `elapsed`: the budget divided by the
+/// measured cost per request, no fewer than `floor` (the fetch concurrency, so a pass never
+/// shrinks below what one round of fetches covers) and no more than [`ENHANCE_PASS_MAX`].
+/// `None` when the last pass serviced nothing, which says nothing about cost. Pure, so the
+/// clamping is unit-testable without an actor.
+fn next_pass_size(
+    elapsed: Duration,
+    handled: usize,
+    budget: Duration,
+    floor: usize,
+) -> Option<usize> {
+    if handled == 0 {
+        return None;
+    }
+    let per_request = elapsed.as_secs_f64() / handled as f64;
+    let fits = if per_request > 0.0 {
+        (budget.as_secs_f64() / per_request).floor()
+    } else {
+        ENHANCE_PASS_MAX as f64
+    };
+    // f64 -> usize saturates, so an enormous quotient lands on the ceiling.
+    Some((fits as usize).clamp(floor.max(1), ENHANCE_PASS_MAX.max(floor)))
 }
 
 /// How often to emit an enhancement-drain progress heartbeat (throttled by wall time, like the
@@ -767,6 +813,26 @@ fn scan_progress_ratio(birthday: u32, fully_scanned: u32, chain_tip: u32) -> f64
     (f64::from(fully_scanned.saturating_sub(birthday)) / f64::from(total)).clamp(0.0, 1.0)
 }
 
+/// The status's `(fully_scanned, scan_progress, scanning)` from the database's fully-scanned
+/// height and the upstream's tip. The scanned height is reported whenever the database has
+/// one - before the first connect too, so `getblockcount` answers a restarted wallet's real
+/// height rather than 0 - while progress and `scanning` need the tip as well: with it unknown
+/// the wallet conservatively reads as still scanning, never caught up.
+fn scan_state(
+    birthday: u32,
+    fully_scanned: Option<u32>,
+    chain_tip: Option<u32>,
+) -> (Option<u32>, f64, bool) {
+    match (fully_scanned, chain_tip) {
+        (Some(scanned), Some(tip)) => (
+            Some(scanned),
+            scan_progress_ratio(birthday, scanned, tip),
+            scanned < tip,
+        ),
+        (scanned, _) => (scanned, 0.0, true),
+    }
+}
+
 /// At bootstrap, warn when the derived scan floor lands more than one note-commitment-tree
 /// shard (2^16 blocks) below the wallet birthday - the symptom of the scan queue flooring at
 /// an in-progress subtree boundary instead of the birthday (the failure `maybe_bootstrap_account`
@@ -880,6 +946,9 @@ pub struct ActorConfig {
     /// Transaction fetches in flight at once during the enhancement drain (`[sync]
     /// enhance_concurrency`), which is also how many requests one drain pass services.
     pub enhance_concurrency: usize,
+    /// The longest one enhancement pass may run (`[sync] enhance_pass_budget_secs`); the
+    /// actor sizes each pass from the previous one's measured cost to stay within it.
+    pub enhance_pass_budget: Duration,
     /// Reconnect backoff base/max delays.
     pub reconnect_base: Duration,
     pub reconnect_max: Duration,
@@ -1184,6 +1253,19 @@ struct WalletActor {
     /// How many transaction fetches one enhancement pass keeps in flight, and services
     /// (`[sync] enhance_concurrency`).
     enhance_concurrency: usize,
+    /// The longest one enhancement pass may run (`[sync] enhance_pass_budget_secs`).
+    enhance_pass_budget: Duration,
+    /// How many requests the next enhancement pass services: derived from the previous pass's
+    /// cost per request against `enhance_pass_budget` (see [`next_pass_size`]), starting at
+    /// `enhance_concurrency`.
+    enhance_pass_size: usize,
+    /// The tip at which the scan step last found nothing to do, if it did. While the drain has
+    /// work and the tip is still this, the scan step is skipped: its nothing-to-scan path is a
+    /// scan-range query, and the scan queue only changes when the tip is refreshed - which the
+    /// loop does in its idle wait, never mid-drain - or a sync is forced, both of which clear it.
+    scan_idle_at_tip: Option<u32>,
+    /// Whether the last drain pass reported more work.
+    drain_has_work: bool,
     /// Cumulative enhancement-drain cost since this actor started, the drain's counterpart of
     /// `sync_totals`. See [`crate::wallet::EnhanceTotals`].
     enhance_totals: crate::wallet::EnhanceTotals,
@@ -1614,11 +1696,25 @@ async fn spawn_inner(
             None => BTreeMap::new(),
         }
     };
+    // The scanned height is the database's from the first publish, not unknown until the
+    // actor connects: `getblockcount` and `getbestblockhash` read the status, and a restarted
+    // wallet answering 0 in that window reads as a wallet that lost its scan.
+    let (fully_scanned, _, _) = scan_state(
+        birthday,
+        db_data
+            .block_fully_scanned()
+            .ok()
+            .flatten()
+            .map(|meta| u32::from(meta.block_height())),
+        None,
+    );
     let (status_tx, status_rx) = watch::channel(SyncStatus {
         encrypted,
         watch_only,
         accounts: Arc::new(seeded_accounts),
         birthday: Some(birthday),
+        fully_scanned,
+        scanning: true,
         unlocked_until: encrypted.then_some(0),
         ..SyncStatus::default()
     });
@@ -1710,6 +1806,10 @@ async fn spawn_inner(
         prefetch: None,
         sync_totals: crate::wallet::SyncTotals::default(),
         enhance_concurrency: cfg.enhance_concurrency,
+        enhance_pass_budget: cfg.enhance_pass_budget,
+        enhance_pass_size: cfg.enhance_concurrency.max(1),
+        scan_idle_at_tip: None,
+        drain_has_work: false,
         enhance_totals: crate::wallet::EnhanceTotals::default(),
         sync_halted: false,
         force_sync: false,
@@ -2481,6 +2581,7 @@ impl WalletActor {
             // buys exactly one pass.
             if std::mem::take(&mut self.force_sync) {
                 more_work = true;
+                self.scan_idle_at_tip = None;
             }
             // A halted wallet serves commands and reads but never re-attempts the scan: the
             // failure that halted it cannot succeed on retry (see `sync_halted`). Clearing
@@ -2508,7 +2609,22 @@ impl WalletActor {
                         Err(mpsc::error::TryRecvError::Disconnected) => return,
                     }
                 }
-                match self.sync_step_caught().await {
+                let t_sync = Instant::now();
+                let skip_scan = self.drain_has_work
+                    && self.scan_idle_at_tip.is_some()
+                    && self.scan_idle_at_tip == self.tip_height;
+                let stepped = if skip_scan {
+                    Ok(false)
+                } else {
+                    let stepped = self.sync_step_caught().await;
+                    self.scan_idle_at_tip = match stepped {
+                        Ok(false) => self.tip_height,
+                        _ => None,
+                    };
+                    stepped
+                };
+                self.enhance_totals.sync_step_ms += t_sync.elapsed().as_millis() as u64;
+                match stepped {
                     Ok(worked) => {
                         // A successful pass ends any failure streak (see `note_sync_error`).
                         self.last_sync_error = None;
@@ -2527,7 +2643,10 @@ impl WalletActor {
                             // (Transparent receives are discovered by the block scan itself - see
                             // `sync_step` - and at 0-conf by the mempool path below, on every
                             // supported backend.)
+                            let t_other = Instant::now();
                             self.maybe_rebroadcast().await;
+                            self.enhance_totals.loop_other_ms +=
+                                t_other.elapsed().as_millis() as u64;
                             // Drain one bounded batch of the enhancement backlog. Keep `more_work`
                             // set while requests remain so the loop keeps draining (servicing queued
                             // commands and republishing the shrinking backlog between batches)
@@ -2537,8 +2656,12 @@ impl WalletActor {
                             // logged and treated as "no more work this pass" rather than taking the
                             // actor (and all wallet writes) down.
                             let more_enhance = self.enhance_step_caught().await;
+                            let t_other = Instant::now();
                             self.ensure_mempool_stream().await;
+                            self.enhance_totals.loop_other_ms +=
+                                t_other.elapsed().as_millis() as u64;
                             more_work = more_enhance;
+                            self.drain_has_work = more_enhance;
                         }
                     }
                     Err(e) => {
@@ -3241,6 +3364,7 @@ impl WalletActor {
                 return false;
             }
         };
+        self.enhance_totals.requests_db_ms += t_requests.elapsed().as_millis() as u64;
         // Serviceable requests not yet attempted in this drain, deduplicated (see
         // `outstanding_requests` - without the dedup, upstream's duplicate spend-search rows are
         // each serviced, one redundant upstream query apiece). Inserting each into
@@ -3261,10 +3385,11 @@ impl WalletActor {
             self.maybe_log_enhance_progress(pending.len());
         }
 
-        // The pass: the first `enhance_concurrency` requests, split by what servicing them
-        // costs. A txid-shaped request is one transaction fetch and goes upstream together
-        // with the others; an address search keeps the sequential path.
-        let pass = &pending[..pending.len().min(self.enhance_concurrency.max(1))];
+        // The pass: as many requests as the previous pass's cost says fit the time budget
+        // (`enhance_pass_size`), split by what servicing them costs. A txid-shaped request is
+        // one transaction fetch and goes upstream together with the others; an address search
+        // keeps the sequential path.
+        let pass = &pending[..pending.len().min(self.enhance_pass_size.max(1))];
         let mut txid_reqs: Vec<TxidRequest<'_>> = Vec::new();
         let mut address_reqs: Vec<(&EnhanceRequest, &TransactionsInvolvingAddress)> = Vec::new();
         for req in pass {
@@ -3301,14 +3426,9 @@ impl WalletActor {
         if !txid_reqs.is_empty() {
             let txids: Vec<TxId> = txid_reqs.iter().map(|r| r.txid).collect();
             let t_upstream = Instant::now();
-            let fetched = Self::fetch_txs_concurrent(
-                Arc::clone(&self.hub),
-                self.network,
-                self.enhance_concurrency,
-                &txids,
-                chain_tip,
-            )
-            .await;
+            let fetched =
+                Self::fetch_txs_concurrent(Arc::clone(&self.hub), self.enhance_concurrency, &txids)
+                    .await;
             self.enhance_totals.upstream_ms += t_upstream.elapsed().as_millis() as u64;
 
             // Sort the results before writing anything: a transport failure means the
@@ -3327,7 +3447,7 @@ impl WalletActor {
                 }
             }
             let t_apply = Instant::now();
-            let applied = self.apply_fetched_requests(&to_apply);
+            let applied = self.apply_fetched_requests(&to_apply, chain_tip);
             self.enhance_totals.apply_ms += t_apply.elapsed().as_millis() as u64;
             match applied {
                 Ok(()) => {
@@ -3374,6 +3494,18 @@ impl WalletActor {
 
         self.enhance_totals.passes += 1;
         self.enhance_totals.serviced += handled as u64;
+        // Size the next pass from this one: the whole step so far (the request read and its
+        // de-duplication, the fetches, the parses and decrypts, the stores) is what an RPC
+        // queued behind it waited, and it is charged to the requests this pass serviced.
+        if let Some(n) = next_pass_size(
+            t_requests.elapsed(),
+            handled,
+            self.enhance_pass_budget,
+            self.enhance_concurrency.max(1),
+        ) {
+            self.enhance_pass_size = n;
+        }
+        self.enhance_totals.pass_size = self.enhance_pass_size as u64;
         if aborted {
             // The pass ended early, so what it read is no longer a complete picture of what
             // remains serviceable: republish from a fresh read.
@@ -3404,6 +3536,7 @@ impl WalletActor {
         // only a fresh read can see; publishing zero over them would flip readiness to synced
         // and `waitforsync` to done with work still queued, for a whole idle interval, since the
         // loop stops driving the drain on a `false` return. So that case reads the table again.
+        let t_tail = Instant::now();
         let remaining: Vec<&EnhanceRequest> = pending
             .iter()
             .filter(|r| !self.enhance_satisfied.contains(*r))
@@ -3414,6 +3547,7 @@ impl WalletActor {
             let backlog = self.summarize_backlog(remaining.into_iter());
             self.update_status_with_backlog(backlog);
         }
+        self.enhance_totals.pass_tail_ms += t_tail.elapsed().as_millis() as u64;
         // More to do only if the pass stopped short of the serviceable requests in hand.
         pending.len() > handled
     }
@@ -3430,10 +3564,8 @@ impl WalletActor {
     /// `&self` across these awaits could not be spawned.
     async fn fetch_txs_concurrent(
         hub: Arc<ChainHub>,
-        network: ZNetwork,
         concurrency: usize,
         txids: &[TxId],
-        chain_tip: BlockHeight,
     ) -> Vec<anyhow::Result<FetchedTransaction>> {
         use futures_util::stream::{self, StreamExt as _};
 
@@ -3449,13 +3581,7 @@ impl WalletActor {
                         return Ok(None);
                     };
                     let mined_height = raw.mined_height.map(BlockHeight::from_u32);
-                    // An unmined tx is assumed created under the current tip's consensus
-                    // branch, as `fetch_full_tx` assumes.
-                    let tx = Transaction::read(
-                        &raw.data[..],
-                        BranchId::for_height(&network, mined_height.unwrap_or(chain_tip)),
-                    )?;
-                    Ok(Some((tx, mined_height)))
+                    Ok(Some((raw.data, mined_height)))
                 }
             })
             .buffered(concurrency.max(1))
@@ -3463,32 +3589,90 @@ impl WalletActor {
             .await
     }
 
-    /// Apply a pass's fetched transactions under one database transaction. Each store is the
-    /// same `decrypt_and_store_transaction` (or `set_transaction_status`) the per-request path
-    /// ran; only the commit is shared. All-or-nothing: on an error nothing is recorded and the
-    /// pass is retried whole. Runs under `block_in_place` - it is a database write of up to a
-    /// pass's worth of transactions, and it must not hold a runtime worker while it does that.
+    /// Apply a pass's fetched transactions: parse and trial-decrypt them on the thread pool,
+    /// then store them under one database transaction.
+    ///
+    /// Every transaction in a pass is independent of every other until it is written, and the
+    /// parse and the trial decryption are the CPU half of the drain - so they run on rayon,
+    /// not on this actor's thread, which is also the only thread that may write and therefore
+    /// serializes the whole drain behind whatever is left on it. Only the stores stay here.
+    /// All-or-nothing on the write: on an error nothing is recorded and the pass is retried
+    /// whole. Runs under `block_in_place` for the same reason as before.
     fn apply_fetched_requests(
         &mut self,
         fetched: &[(&TxidRequest<'_>, FetchedTransaction)],
+        chain_tip: BlockHeight,
     ) -> anyhow::Result<()> {
+        use rayon::prelude::*;
         if fetched.is_empty() {
             return Ok(());
         }
         let network = self.network;
         tokio::task::block_in_place(|| {
+            // What `decrypt_and_store_transaction` reads from the database per transaction,
+            // read once per pass: the viewing keys (and the UFVK parse behind them) and the
+            // chain height. An unmined-at-fetch transaction's height needs a lookup too, and
+            // that cannot happen on a pool thread.
+            let ufvks = self.db_data.get_unified_full_viewing_keys()?;
+            let chain_height = self.db_data.chain_height()?;
+            let mut heights: Vec<Option<BlockHeight>> = Vec::with_capacity(fetched.len());
+            for (req, found) in fetched {
+                heights.push(match found {
+                    Some((_, Some(h))) => Some(*h),
+                    Some((_, None)) if req.enhance => self.db_data.get_tx_height(req.txid)?,
+                    _ => None,
+                });
+            }
+
+            // Parse. Only an `Enhancement` needs the transaction; a `GetStatus` needs only
+            // the height the fetch already returned, so it is not parsed at all.
+            let t_parse = Instant::now();
+            let parsed: Vec<anyhow::Result<Option<Transaction>>> = fetched
+                .par_iter()
+                .map(|(req, found)| match found {
+                    Some((raw, mined)) if req.enhance => {
+                        // An unmined tx is assumed created under the current tip's consensus
+                        // branch, as `fetch_full_tx` assumes.
+                        let branch = BranchId::for_height(&network, mined.unwrap_or(chain_tip));
+                        Ok(Some(Transaction::read(&raw[..], branch)?))
+                    }
+                    _ => Ok(None),
+                })
+                .collect();
+            self.enhance_totals.parse_ms += t_parse.elapsed().as_millis() as u64;
+            let parsed: Vec<Option<Transaction>> =
+                parsed.into_iter().collect::<anyhow::Result<_>>()?;
+
+            // Trial-decrypt, borrowing the parsed transactions.
+            let t_decrypt = Instant::now();
+            let decrypted: Vec<_> = parsed
+                .par_iter()
+                .zip(heights.par_iter())
+                .map(|(tx, mined)| {
+                    tx.as_ref().map(|tx| {
+                        zcash_client_backend::decrypt_transaction(
+                            &network,
+                            *mined,
+                            chain_height,
+                            tx,
+                            &ufvks,
+                        )
+                    })
+                })
+                .collect();
+            self.enhance_totals.decrypt_ms += t_decrypt.elapsed().as_millis() as u64;
+
+            // The writes are all that is left, under one transaction for the pass.
             self.db_data.transactionally(|wdb| -> anyhow::Result<()> {
-                for (req, found) in fetched {
-                    match (req.enhance, found) {
-                        (true, Some((tx, mined))) => {
-                            decrypt_and_store_transaction(&network, wdb, tx, *mined)?;
-                        }
+                for ((req, found), decrypted) in fetched.iter().zip(decrypted) {
+                    match (req.enhance, found, decrypted) {
+                        (true, Some(_), Some(d_tx)) => wdb.store_decrypted_tx(d_tx)?,
                         // The upstream answered and does not know the transaction: retire
                         // the payload request. Status is a separate obligation now, so this
                         // no longer goes through `set_transaction_status`, which since rc7
                         // updates status only and would leave the fetch queued forever.
-                        (true, None) => wdb.notify_transaction_enhancement_not_found(req.txid)?,
-                        (false, found) => {
+                        (true, _, _) => wdb.notify_transaction_enhancement_not_found(req.txid)?,
+                        (false, found, _) => {
                             let status = match found {
                                 None => TransactionStatus::TxidNotRecognized,
                                 Some((_, Some(height))) => TransactionStatus::Mined(*height),
@@ -3893,11 +4077,15 @@ impl WalletActor {
         let derived = tokio::task::block_in_place(|| {
             self.db_data
                 .transactionally::<_, _, SqliteClientError>(|wdb| {
-                    for i in start..end {
-                        let div = DiversifierIndex::from(i);
-                        wdb.get_address_for_index(account_id, div, request)?;
-                    }
-                    Ok(())
+                    // One call for the chunk: the wallet crate reads the account, derives its
+                    // incoming viewing key and reads the chain tip once, instead of once per
+                    // index as `get_address_for_index` in a loop did.
+                    wdb.get_addresses_for_index_range(
+                        account_id,
+                        DiversifierIndex::from(start)..DiversifierIndex::from(end),
+                        request,
+                    )
+                    .map(|_| ())
                 })
         });
         if let Err(e) = derived {
@@ -4843,17 +5031,8 @@ impl WalletActor {
         // status RPCs (`getwalletinfo.scanning`, `initialblockdownload`, `getpeerinfo.syncing`)
         // reported the scan done hours early, and `pending_enhancements` was measured (one DB
         // read per status update) throughout the scan it was designed to skip.
-        let (fully_scanned, scan_progress, scanning) = match (fully_scanned_height, self.tip_height)
-        {
-            (Some(scanned), Some(tip)) => (
-                Some(scanned),
-                scan_progress_ratio(self.birthday, scanned, tip),
-                scanned < tip,
-            ),
-            // Either height still unknown (no tip yet, or nothing scanned): conservatively
-            // report still scanning rather than claiming a caught-up wallet.
-            _ => (None, 0.0, true),
-        };
+        let (fully_scanned, scan_progress, scanning) =
+            scan_state(self.birthday, fully_scanned_height, self.tip_height);
 
         // The enhancement backlog is the work that remains *after* the block scan reaches the tip
         // (memos, full transparent data - see `enhance_step`). While the block scan is still
@@ -9050,6 +9229,28 @@ mod tests {
         assert_eq!(scan_progress_ratio(1_000, 900, 1_100), 0.0);
     }
 
+    /// The scanned height is published as soon as the database has one, tip or no tip, so a
+    /// restarted wallet's `getblockcount` is its real height before the first connect; without
+    /// the tip it still reads as scanning, never as caught up.
+    #[test]
+    fn scan_state_reports_the_scanned_height_before_the_tip_is_known() {
+        use super::scan_state;
+        assert_eq!(
+            scan_state(1_000, Some(1_149), None),
+            (Some(1_149), 0.0, true)
+        );
+        assert_eq!(scan_state(1_000, None, None), (None, 0.0, true));
+        assert_eq!(scan_state(1_000, None, Some(1_149)), (None, 0.0, true));
+        assert_eq!(
+            scan_state(1_000, Some(1_149), Some(1_149)),
+            (Some(1_149), 1.0, false)
+        );
+        let (scanned, progress, scanning) = scan_state(1_000, Some(1_050), Some(1_100));
+        assert_eq!(scanned, Some(1_050));
+        assert!((progress - 0.5).abs() < 1e-9, "{progress}");
+        assert!(scanning);
+    }
+
     #[test]
     fn gap_slots_remaining_counts_down_and_saturates() {
         // First address in a fresh gap of 20: 19 slots remain after it.
@@ -10002,6 +10203,40 @@ mod tests {
     /// address inflates `pending_enhancements` quadratically - the "23,968 pending after one
     /// send, `/readyz` flaps" field report - and `enhance_step` services the same request
     /// repeatedly within one batch.
+    #[test]
+    fn next_pass_size_tracks_the_budget() {
+        use super::{next_pass_size, ENHANCE_PASS_MAX};
+        use std::time::Duration;
+        let budget = Duration::from_secs(5);
+        // Nothing serviced says nothing about cost.
+        assert_eq!(next_pass_size(Duration::from_secs(1), 0, budget, 16), None);
+        // 16 requests in 6 s (expensive stores): 5 s buys 13, the floor of 16 wins.
+        assert_eq!(
+            next_pass_size(Duration::from_secs(6), 16, budget, 16),
+            Some(16)
+        );
+        // 16 in 400 ms (25 ms each): 5 s buys 200.
+        assert_eq!(
+            next_pass_size(Duration::from_millis(400), 16, budget, 16),
+            Some(200)
+        );
+        // 256 in 1 s (4 ms each): 5 s buys 1,250, the ceiling of 1,024 wins.
+        assert_eq!(
+            next_pass_size(Duration::from_secs(1), 256, budget, 16),
+            Some(ENHANCE_PASS_MAX)
+        );
+        // A zero-length pass cannot divide; it lands on the ceiling.
+        assert_eq!(
+            next_pass_size(Duration::ZERO, 16, budget, 16),
+            Some(ENHANCE_PASS_MAX)
+        );
+        // A floor above the ceiling is honoured (an operator who set enhance_concurrency high).
+        assert_eq!(
+            next_pass_size(Duration::from_secs(1), 1, budget, 2048),
+            Some(2048)
+        );
+    }
+
     #[test]
     fn outstanding_requests_dedup_and_satisfied_filter() {
         use super::{outstanding_requests, EnhanceRequest};

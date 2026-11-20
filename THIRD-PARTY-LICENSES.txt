@@ -15,6 +15,7 @@ Apache License 2.0
 
 Used by:
   - self_cell 1.3.0
+  - zakura-zcash-script 0.0.1
 
                                  Apache License
                            Version 2.0, January 2004
@@ -440,7 +441,6 @@ Used by:
   - constant_time_eq 0.4.2
   - ryu 1.0.23
   - sync_wrapper 1.0.2
-  - zcash_script 0.6.0
 
 Apache License
 Version 2.0, January 2004
@@ -656,10 +656,8 @@ Creative Commons Zero v1.0 Universal
 ================================================================================
 
 Used by:
-  - bitcoin-io 0.1.101
-  - bitcoin_hashes 0.14.101
   - bounded-vec 0.9.0
-  - zakura-filters 0.0.1-rc0
+  - zakura-filters 0.0.1-rc1
 
 Creative Commons Legal Code
 
@@ -789,7 +787,6 @@ Creative Commons Zero v1.0 Universal
 ================================================================================
 
 Used by:
-  - hex-conservative 0.2.3
   - secp256k1-sys 0.14.1
   - secp256k1 0.33.1
 
@@ -1668,11 +1665,10 @@ MIT License
 ================================================================================
 
 Used by:
-  - daggy 0.8.1
+  - daggy 0.9.0
   - either 1.18.0
   - itertools 0.14.0
-  - petgraph 0.7.1
-  - serde_with 3.22.0
+  - petgraph 0.8.3
 
 Copyright (c) 2015
 
@@ -2040,7 +2036,6 @@ MIT License
 ================================================================================
 
 Used by:
-  - hashbrown 0.12.3
   - hashbrown 0.15.5
   - hashbrown 0.17.1
 
@@ -2273,7 +2268,6 @@ MIT License
 ================================================================================
 
 Used by:
-  - indexmap 1.9.3
   - indexmap 2.14.2
 
 Copyright (c) 2016--2017
@@ -3297,6 +3291,41 @@ MIT License
 ================================================================================
 
 Used by:
+  - getrandom 0.3.4
+
+Copyright (c) 2018-2025 The rust-random Project Developers
+Copyright (c) 2014 The Rust Project Developers
+
+Permission is hereby granted, free of charge, to any
+person obtaining a copy of this software and associated
+documentation files (the "Software"), to deal in the
+Software without restriction, including without
+limitation the rights to use, copy, modify, merge,
+publish, distribute, sublicense, and/or sell copies of
+the Software, and to permit persons to whom the Software
+is furnished to do so, subject to the following
+conditions:
+
+The above copyright notice and this permission notice
+shall be included in all copies or substantial portions
+of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF
+ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED
+TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A
+PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT
+SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY
+CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
+OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR
+IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+DEALINGS IN THE SOFTWARE.
+
+
+================================================================================
+MIT License
+================================================================================
+
+Used by:
   - rand_core 0.10.1
 
 Copyright (c) 2018-2026 The Rand Project Developers
@@ -4044,68 +4073,6 @@ Used by:
 
 Copyright (c) 2019-2026 The RustCrypto Project Developers
 Copyright (c) 2019 MobileCoin, LLC
-
-Permission is hereby granted, free of charge, to any
-person obtaining a copy of this software and associated
-documentation files (the "Software"), to deal in the
-Software without restriction, including without
-limitation the rights to use, copy, modify, merge,
-publish, distribute, sublicense, and/or sell copies of
-the Software, and to permit persons to whom the Software
-is furnished to do so, subject to the following
-conditions:
-
-The above copyright notice and this permission notice
-shall be included in all copies or substantial portions
-of the Software.
-
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF
-ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED
-TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A
-PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT
-SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY
-CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
-OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR
-IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
-DEALINGS IN THE SOFTWARE.
-
-
-================================================================================
-MIT License
-================================================================================
-
-Used by:
-  - document-features 0.2.12
-
-Copyright (c) 2020 Olivier Goffart <ogoffart@sixtyfps.io>
-
-Permission is hereby granted, free of charge, to any person obtaining a copy
-of this software and associated documentation files (the "Software"), to deal
-in the Software without restriction, including without limitation the rights
-to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-copies of the Software, and to permit persons to whom the Software is
-furnished to do so, subject to the following conditions:
-
-The above copyright notice and this permission notice shall be included in all
-copies or substantial portions of the Software.
-
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
-SOFTWARE.
-
-
-================================================================================
-MIT License
-================================================================================
-
-Used by:
-  - litrs 1.0.0
-
-Copyright (c) 2020 Project Developers
 
 Permission is hereby granted, free of charge, to any
 person obtaining a copy of this software and associated
@@ -5162,40 +5129,6 @@ MIT License
 ================================================================================
 
 Used by:
-  - rand_distr 0.6.0
-
-Copyright 2018 Developers of the Rand project
-
-Permission is hereby granted, free of charge, to any
-person obtaining a copy of this software and associated
-documentation files (the "Software"), to deal in the
-Software without restriction, including without
-limitation the rights to use, copy, modify, merge,
-publish, distribute, sublicense, and/or sell copies of
-the Software, and to permit persons to whom the Software
-is furnished to do so, subject to the following
-conditions:
-
-The above copyright notice and this permission notice
-shall be included in all copies or substantial portions
-of the Software.
-
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF
-ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED
-TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A
-PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT
-SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY
-CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
-OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR
-IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
-DEALINGS IN THE SOFTWARE.
-
-
-================================================================================
-MIT License
-================================================================================
-
-Used by:
   - rand 0.10.2
   - rand 0.8.8
   - rand_chacha 0.3.1
@@ -5321,36 +5254,6 @@ MIT License
 ================================================================================
 
 Used by:
-  - tap 1.0.1
-
-MIT License
-
-Copyright (c) 2017 Elliot Linder <darfink@gmail.com>
-
-Permission is hereby granted, free of charge, to any person obtaining a copy
-of this software and associated documentation files (the "Software"), to deal
-in the Software without restriction, including without limitation the rights
-to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-copies of the Software, and to permit persons to whom the Software is
-furnished to do so, subject to the following conditions:
-
-The above copyright notice and this permission notice shall be included in all
-copies or substantial portions of the Software.
-
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
-SOFTWARE.
-
-
-================================================================================
-MIT License
-================================================================================
-
-Used by:
   - static_assertions 1.1.0
 
 MIT License
@@ -5441,37 +5344,6 @@ MIT License
 ================================================================================
 
 Used by:
-  - bitvec 1.1.1
-  - wyz 0.5.1
-
-MIT License
-
-Copyright (c) 2018 myrrlyn (Alexander Payne)
-
-Permission is hereby granted, free of charge, to any person obtaining a copy
-of this software and associated documentation files (the "Software"), to deal
-in the Software without restriction, including without limitation the rights
-to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-copies of the Software, and to permit persons to whom the Software is
-furnished to do so, subject to the following conditions:
-
-The above copyright notice and this permission notice shall be included in all
-copies or substantial portions of the Software.
-
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
-SOFTWARE.
-
-
-================================================================================
-MIT License
-================================================================================
-
-Used by:
   - libmimalloc-sys 0.1.49
 
 MIT License
@@ -5502,7 +5374,7 @@ MIT License
 ================================================================================
 
 Used by:
-  - zakura-client-backend 0.1.0-rc9.3
+  - zakura-client-backend 0.1.0-rc9.8
 
 MIT License
 
@@ -5568,36 +5440,6 @@ Used by:
 MIT License
 
 Copyright (c) 2019 iqlusion
-
-Permission is hereby granted, free of charge, to any person obtaining a copy
-of this software and associated documentation files (the "Software"), to deal
-in the Software without restriction, including without limitation the rights
-to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-copies of the Software, and to permit persons to whom the Software is
-furnished to do so, subject to the following conditions:
-
-The above copyright notice and this permission notice shall be included in all
-copies or substantial portions of the Software.
-
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
-SOFTWARE.
-
-
-================================================================================
-MIT License
-================================================================================
-
-Used by:
-  - radium 0.7.0
-
-MIT License
-
-Copyright (c) 2019 kneecaw (Nika Layzell)
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal
@@ -5779,36 +5621,6 @@ MIT License
 ================================================================================
 
 Used by:
-  - funty 2.0.0
-
-MIT License
-
-Copyright (c) 2020 myrrlyn (Alexander Payne)
-
-Permission is hereby granted, free of charge, to any person obtaining a copy
-of this software and associated documentation files (the "Software"), to deal
-in the Software without restriction, including without limitation the rights
-to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-copies of the Software, and to permit persons to whom the Software is
-furnished to do so, subject to the following conditions:
-
-The above copyright notice and this permission notice shall be included in all
-copies or substantial portions of the Software.
-
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
-SOFTWARE.
-
-
-================================================================================
-MIT License
-================================================================================
-
-Used by:
   - maybe-rayon 0.1.1
 
 MIT License
@@ -5898,7 +5710,7 @@ MIT License
 ================================================================================
 
 Used by:
-  - zecd 0.9.0
+  - zecd 0.10.0-rc1
 
 MIT License
 
@@ -5937,12 +5749,12 @@ Used by:
   - intl_pluralrules 7.0.2
   - io_tee 0.1.1
   - libm 0.2.16
-  - schemerz-rusqlite 0.370.0
-  - schemerz 0.2.0
+  - schemerz-rusqlite 0.371.0
+  - schemerz 0.3.0
   - siphasher 1.0.3
   - tonic-prost 0.14.6
   - type-map 0.5.1
-  - zakura-orchard-legacy 4.0.0
+  - zakura-orchard-legacy 5.4.0
 
 MIT License
 
@@ -6123,7 +5935,6 @@ MIT License
 ================================================================================
 
 Used by:
-  - flume 0.11.1
   - rustc-hash 2.1.3
 
 Permission is hereby granted, free of charge, to any
@@ -6288,35 +6099,6 @@ The above copyright notice and this permission notice shall be included in all c
 
 THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 
-
-================================================================================
-MIT License
-================================================================================
-
-Used by:
-  - spin 0.9.9
-
-The MIT License (MIT)
-
-Copyright (c) 2014 Mathijs van de Nes
-
-Permission is hereby granted, free of charge, to any person obtaining a copy
-of this software and associated documentation files (the "Software"), to deal
-in the Software without restriction, including without limitation the rights
-to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-copies of the Software, and to permit persons to whom the Software is
-furnished to do so, subject to the following conditions:
-
-The above copyright notice and this permission notice shall be included in all
-copies or substantial portions of the Software.
-
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
-SOFTWARE.
 
 ================================================================================
 MIT License
@@ -6632,11 +6414,11 @@ MIT License
 ================================================================================
 
 Used by:
-  - zakura-client-sqlite 0.1.0-rc9.3
-  - zakura-equihash 4.0.0
-  - zakura-one-time-ivk 0.0.1-rc3
-  - zakura-pczt 0.1.0-rc9
-  - zakura-pir-protocol 0.0.1-rc2
+  - zakura-client-sqlite 0.1.0-rc9.8
+  - zakura-equihash 5.4.0
+  - zakura-one-time-ivk 0.0.1-rc5
+  - zakura-pczt 0.1.0-rc9.1
+  - zakura-pir-protocol 0.0.1-rc7
 
 The MIT License (MIT)
 
@@ -6666,8 +6448,8 @@ MIT License
 ================================================================================
 
 Used by:
-  - zakura-transparent 4.0.0
-  - zakura-zip321 4.0.0
+  - zakura-transparent 5.4.0
+  - zakura-zip321 5.4.0
 
 The MIT License (MIT)
 
@@ -6795,9 +6577,9 @@ MIT License
 ================================================================================
 
 Used by:
-  - zakura-address 4.0.0
-  - zakura-note-encryption 4.0.0
-  - zcash_encoding 0.4.0
+  - zakura-address 5.4.0
+  - zakura-note-encryption 5.4.0
+  - zcash_encoding 0.5.0
 
 The MIT License (MIT)
 
@@ -6857,7 +6639,7 @@ MIT License
 ================================================================================
 
 Used by:
-  - zakura-protocol 4.0.0
+  - zakura-protocol 5.4.0
 
 The MIT License (MIT)
 
@@ -6947,22 +6729,22 @@ MIT License
 ================================================================================
 
 Used by:
-  - zakura-bellman 4.0.0
-  - zakura-bls12-381 4.0.0
-  - zakura-halo2-gadgets 4.0.0
-  - zakura-halo2-poseidon 4.0.0
-  - zakura-halo2-proofs 4.0.0
-  - zakura-jubjub 4.0.0
-  - zakura-keys 4.0.0
-  - zakura-orchard 4.0.0
-  - zakura-pairing 4.0.0
-  - zakura-pasta-curves 4.0.0
-  - zakura-primitives 4.0.0
-  - zakura-proofs 4.0.0
-  - zakura-reddsa 4.0.0
-  - zakura-redjubjub 4.0.0
-  - zakura-sapling-crypto 4.0.0
-  - zakura-sinsemilla 4.0.0
+  - zakura-bellman 5.4.0
+  - zakura-bls12-381 5.4.0
+  - zakura-halo2-gadgets 5.4.0
+  - zakura-halo2-poseidon 5.4.0
+  - zakura-halo2-proofs 5.4.0
+  - zakura-jubjub 5.4.0
+  - zakura-keys 5.4.0
+  - zakura-orchard 5.4.0
+  - zakura-pairing 5.4.0
+  - zakura-pasta-curves 5.4.0
+  - zakura-primitives 5.4.0
+  - zakura-proofs 5.4.0
+  - zakura-reddsa 5.4.0
+  - zakura-redjubjub 5.4.0
+  - zakura-sapling-crypto 5.4.0
+  - zakura-sinsemilla 5.4.0
 
 The MIT License (MIT)
 
@@ -7272,34 +7054,3 @@ the following restrictions:
     misrepresented as being the original software.
 
 3. This notice may not be removed or altered from any source distribution.
-
-================================================================================
-zlib License
-================================================================================
-
-Used by:
-  - nanorand 0.7.0
-
-The zlib/libpng License
-=======================
-
-Copyright (c) 2021 lucy
-
-This software is provided 'as-is', without any express or implied warranty. In
-no event will the authors be held liable for any damages arising from the use of
-this software.
-
-Permission is granted to anyone to use this software for any purpose, including
-commercial applications, and to alter it and redistribute it freely, subject to
-the following restrictions:
-
-1.  The origin of this software must not be misrepresented; you must not claim
-    that you wrote the original software. If you use this software in a product,
-    an acknowledgment in the product documentation would be appreciated but is
-    not required.
-
-2.  Altered source versions must be plainly marked as such, and must not be
-    misrepresented as being the original software.
-
-3.  This notice may not be removed or altered from any source distribution.
-

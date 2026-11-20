@@ -649,6 +649,9 @@ mod tests {
             batch_size: crate::sync::engine::DEFAULT_BATCH_SIZE,
             writer_cache_mib: crate::wallet::open::DEFAULT_WRITER_CACHE_MIB,
             enhance_concurrency: crate::config::DEFAULT_ENHANCE_CONCURRENCY,
+            enhance_pass_budget: std::time::Duration::from_secs(
+                crate::config::DEFAULT_ENHANCE_PASS_BUDGET_SECS,
+            ),
             reconnect_base: std::time::Duration::from_secs(1),
             reconnect_max: std::time::Duration::from_secs(2),
             confirmations_policy: Default::default(),
@@ -790,6 +793,8 @@ pub struct ShardTemplate {
     pub writer_cache_mib: u32,
     /// Transaction fetches in flight per enhancement pass (`[sync] enhance_concurrency`).
     pub enhance_concurrency: usize,
+    /// The longest one enhancement pass may run (`[sync] enhance_pass_budget_secs`).
+    pub enhance_pass_budget: std::time::Duration,
     pub reconnect_base: std::time::Duration,
     pub reconnect_max: std::time::Duration,
     pub confirmations_policy: zcash_client_backend::data_api::wallet::ConfirmationsPolicy,
@@ -1104,6 +1109,7 @@ impl ShardTemplate {
             batch_size: self.batch_size,
             writer_cache_mib: self.writer_cache_mib,
             enhance_concurrency: self.enhance_concurrency,
+            enhance_pass_budget: self.enhance_pass_budget,
             reconnect_base: self.reconnect_base,
             reconnect_max: self.reconnect_max,
             age_identity: None,

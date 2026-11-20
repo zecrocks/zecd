@@ -40,7 +40,7 @@ on:
         required: false
         default: ""
       zakura-image:
-        description: "zakuracore/zakura image tag to test against (e.g. 1.7.0, latest)"
+        description: "zakuracore/zakura image tag to test against (e.g. 1.8.8, latest)"
         required: false
         default: ""
       stress:
@@ -94,9 +94,11 @@ on:
 # and a manual dispatch can name any tag. Bumping a node = changing its one value here (the harness
 # drives the node purely over JSON-RPC, so nothing else needs to move in lockstep).
 #
-# Both pins are the releases that schedule NU7 on mainnet (zebra 7.0.0, zakura 1.7.0), and the
-# regtest chain activates NU7 too (REGTEST_NU7_HEIGHT below), so every PR runs against the
-# consensus rules, config validation and RPC surface the network now requires.
+# Both pins follow NU7 on mainnet: zebra 7.0.0 is the release that scheduled it, and zakura 1.8.8
+# is the current release of the line that did (1.7.0; the harness drives either over JSON-RPC
+# alone). 1.8.8's default build leaves out Sprout verification (the `sprout` cargo feature),
+# which a regtest chain never needs: it has no JoinSplits. The regtest chain activates NU7 too (REGTEST_NU7_HEIGHT below), so every PR runs against
+# the consensus rules, config validation and RPC surface the network now requires.
 #
 # IMPORTANT: no workflow env var may start with `ZEBRA_` or `ZAKURA_` - zebrad/zakurad parse
 # such-prefixed environment variables as config overrides and exit with "unknown field" on ones
@@ -105,7 +107,7 @@ on:
 # match requires the underscore right after `ZEBRA`/`ZAKURA`.
 env:
   ZEBRAD_IMAGE_PINNED: "7.0.0"
-  ZAKURAD_IMAGE_PINNED: "1.7.0"
+  ZAKURAD_IMAGE_PINNED: "1.8.8"
   # The regtest NU7 activation height: above NU6.3's 8 and a multiple of 3, as ZIP 259 requires
   # of every NU7 activation height. Passed to each step that starts a regtest stack as
   # ZECD_REGTEST_NU7_HEIGHT, and part of the chain-snapshot cache key. Named without the `ZECD_`
@@ -146,8 +148,11 @@ env:
   # (`GetLightdInfo.lightwalletProtocolVersion`), which is what lets the harness stop asserting
   # the capability with `assume_transparent_in_compact_blocks` and run zecd's real probe. 0.6.0 is
   # functionally 0.5.5 rebuilt with Go 1.27.3 for the eMudhra intermediate-CA distrust
-  # (CVE-2026-111943); it needs Go >= 1.26.10 to build.
-  LIGHTWALLETD_VERSION: "v0.6.0"
+  # (CVE-2026-111943); it needs Go >= 1.26.10 to build. 0.6.1 adds the concurrency and
+  # block-range work limits, and ends a stream whose client stops reading for 60 s
+  # (`DEADLINE_EXCEEDED`); zecd's block reader drains every range into memory as it arrives, so
+  # the timeout never fires on a live sync.
+  LIGHTWALLETD_VERSION: "v0.6.1"
   # The harness --test targets for the standard (zecd) suite. Both node legs (zebra and zakura)
   # run this full list; only the zecd-lwd leg overrides it with its own subset (see the matrix
   # `include` below). Extended/stress tests skip in seconds unless their gate is set.
@@ -330,7 +335,7 @@ jobs:
           path: ${{ runner.temp }}/bin/lightwalletd-release
           key: lwd-release-bin-${{ runner.os }}-${{ env.LIGHTWALLETD_VERSION }}
 
-      # v0.6.0 requires Go >= 1.26.10 and its release is built with 1.27.3, which the runner image
+      # v0.6.x requires Go >= 1.26.10 and its release is built with 1.27.3, which the runner image
       # need not carry; pin the same toolchain upstream builds with.
       - name: Set up Go for the lightwalletd build
         if: steps.lwd-master-bin.outputs.cache-hit != 'true'

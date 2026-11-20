@@ -1081,6 +1081,9 @@ fn offline_actor_cfg(
         batch_size: crate::sync::engine::DEFAULT_BATCH_SIZE,
         writer_cache_mib: crate::wallet::open::DEFAULT_WRITER_CACHE_MIB,
         enhance_concurrency: crate::config::DEFAULT_ENHANCE_CONCURRENCY,
+        enhance_pass_budget: std::time::Duration::from_secs(
+            crate::config::DEFAULT_ENHANCE_PASS_BUDGET_SECS,
+        ),
         reconnect_base: Duration::from_secs(30),
         reconnect_max: Duration::from_secs(60),
         age_identity: None,

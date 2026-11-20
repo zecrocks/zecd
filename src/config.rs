@@ -9,6 +9,7 @@ use std::num::NonZeroU32;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::Context;
 #[cfg(feature = "cli")]
@@ -864,7 +865,7 @@ pub struct SyncConfig {
     /// database size buys nothing. Durability does not depend on it.
     pub writer_cache_mib: u32,
     /// How many transaction fetches the enhancement drain keeps in flight at once, which is
-    /// also how many requests one drain pass services. Default [`DEFAULT_ENHANCE_CONCURRENCY`]
+    /// also the floor of a drain pass's size. Default [`DEFAULT_ENHANCE_CONCURRENCY`]
     /// (16).
     ///
     /// The drain that follows the block scan is one upstream round trip per transaction, and
@@ -884,10 +885,27 @@ pub struct SyncConfig {
     /// waits. At the default it is the same 16-store window the sequential drain had; at 256
     /// on a wallet whose stores have grown to hundreds of milliseconds each it is a minute.
     pub enhance_concurrency: usize,
+    /// The longest one enhancement pass may run, which is the longest an actor-routed RPC (a
+    /// send, `getnewaddress`, `sendrawtransaction`, `walletpassphrase`) waits while a drain is
+    /// in progress. Default [`DEFAULT_ENHANCE_PASS_BUDGET_SECS`].
+    ///
+    /// The daemon sizes each pass from the one before it: budget divided by the measured cost
+    /// per request, no fewer than `enhance_concurrency`, no more than a fixed ceiling. A pass
+    /// has a fixed cost however few requests it services (the request-table read, its
+    /// de-duplication, the status publish, the loop iteration around it), so when the wallet's
+    /// stores are cheap a pass grows to amortise it; when they are expensive it stays small so
+    /// the RPC latency stays bounded. The fetches within a pass still run `enhance_concurrency`
+    /// at a time, so a public lightwalletd sees no more streams however large the pass.
+    pub enhance_pass_budget: Duration,
 }
 
 /// The default `[sync] enhance_concurrency`.
 pub const DEFAULT_ENHANCE_CONCURRENCY: usize = 16;
+
+/// The default `[sync] enhance_pass_budget_secs`: long enough that a pass of cheap stores
+/// amortises its fixed cost many times over, short enough that an RPC queued behind a pass of
+/// expensive ones is answered within a few seconds.
+pub const DEFAULT_ENHANCE_PASS_BUDGET_SECS: u64 = 5;
 
 /// `[spend]` - the wallet-wide confirmations policy (ZIP 315 defaults, like Zallet's
 /// `trusted_confirmations`/`untrusted_confirmations`): how deep an output must be before
@@ -1552,6 +1570,8 @@ struct SyncFile {
     writer_cache_mib: Option<u32>,
     /// See [`SyncConfig::enhance_concurrency`].
     enhance_concurrency: Option<usize>,
+    /// See [`SyncConfig::enhance_pass_budget`], in whole seconds.
+    enhance_pass_budget_secs: Option<u64>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -2330,6 +2350,7 @@ impl AppConfig {
             batch_size: None,
             writer_cache_mib: None,
             enhance_concurrency: None,
+            enhance_pass_budget_secs: None,
         });
         let sync = SyncConfig {
             // Clamp to >= 1s so a misconfigured `interval_secs = 0` can't make the actor busy-poll
@@ -2353,6 +2374,13 @@ impl AppConfig {
                 .enhance_concurrency
                 .unwrap_or(DEFAULT_ENHANCE_CONCURRENCY)
                 .max(1),
+            // Zero would make every pass the floor; one second is the smallest useful budget.
+            enhance_pass_budget: Duration::from_secs(
+                sync_file
+                    .enhance_pass_budget_secs
+                    .unwrap_or(DEFAULT_ENHANCE_PASS_BUDGET_SECS)
+                    .max(1),
+            ),
         };
 
         let spend_file = file.spend.unwrap_or_default();
