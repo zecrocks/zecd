@@ -5,6 +5,65 @@ All notable changes to zecd are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com), and this
 project adheres to [Semantic Versioning](https://semver.org).
 
+## [0.10.0-rc1] - 2026-11-20
+
+Faster cold sync and memo backfill for large wallets, on the Zakura Common 5.4 crates.
+
+**Read before deploying.**
+- The wallet database gains five migrations on first start, which 0.9.0 does not know: a data
+  directory opened once by this release does not open under 0.9.0 again. Copy the wallet
+  directory first if you might need to go back.
+- No consensus rule, address or key encoding changes, and an existing wallet opens as before.
+
+### Added
+- **`[sync] enhance_pass_budget_secs`** (default 5), the longest one memo-backfill pass may run,
+  and so the longest a send, `getnewaddress`, `sendrawtransaction` or `walletpassphrase` waits
+  behind one. Each pass is sized from the measured cost of the one before it, between
+  `enhance_concurrency` and 1,024 requests. Fetches still run `enhance_concurrency` at a time,
+  so a public lightwalletd sees no more streams.
+- **`enhance_totals` on `/status` splits a pass further**: `parse_ms`, `decrypt_ms`,
+  `requests_db_ms`, `pass_tail_ms`, `sync_step_ms`, `loop_other_ms` and the current `pass_size`.
+  `parse_ms` is carved out of `upstream_ms`, and `per_request_ms` now includes it.
+- **`docs/OPERATIONS.md` explains history for a transaction the wallet only partly funded**: why
+  `listtransactions` lists every output as a `send`, why `fee` is omitted, and how to account by
+  `gettransaction.amount`.
+
+### Changed
+- **Zakura Common 5.4.** The crypto and protocol crates move from 4.0 to 5.4, the wallet layer to
+  `zakura-client-backend`/`zakura-client-sqlite` 0.1.0-rc9.8 and `zakura-pczt` 0.1.0-rc9.1.
+  `zcash_script` is now a `zakura-*` fork as well, and `zcash_encoding` moves to 0.5.
+- **Pre-exposing a transparent window takes one wallet call per chunk.** With
+  `[pools] transparent_initial_scan = 100000` on a fresh testnet wallet it fell
+  from 144 s to 25 s. Chunking, progress logging and the resume cursor are unchanged.
+- **A reorg near a young wallet's birthday recovers on the first attempt.** A rewind to the
+  birthday anchor is now accepted, so a reorg right above the first scanned block rescans from
+  the birthday instead of ending in `unrecoverable reorg`.
+- **A scan skips accounts born after its range**, so a fleet shard with a late birthday no longer
+  trial-decrypts the blocks before it.
+- **A memo-backfill pass parses and trial-decrypts on the thread pool**, and only the stores run
+  on the wallet's writer. The scan step between passes is skipped while the tip is unchanged,
+  and the transparent address searches are read only once the backfill queue is empty.
+- **The regtest tier runs against Zakura 1.8.8 and lightwalletd v0.6.1.** The operator minimum
+  stays zakura 1.7.0.
+
+### Fixed
+- **Cold sync and memo backfill no longer slow down with a wallet's history**, the two known
+  issues of 0.9.0. The wallet crates add indexes for the lookups that storing a block, a
+  transparent output and a received note make, and the fee search for a stored transaction no
+  longer re-reads every earlier one. On a testnet wallet with 111,000 transactions to backfill,
+  the store fell from about 380 ms to 3.5-9 ms per transaction, measured with the fixes applied
+  ahead of the crate release. `fetch_memos = false` and `readiness = "scanned"` stay available
+  but are no longer needed as workarounds.
+- **A restarted wallet reports its scanned height from the first RPC.** `getblockcount` answered
+  0, and `getbestblockhash` had nothing, until the wallet reconnected to its node. The status is
+  now seeded from the wallet database; the wallet still reads as scanning until it has the tip.
+
+### Security
+- `RUSTSEC-2026-0459` (bundled SQLite, `libsqlite3-sys` 0.35) is accepted with a documented
+  exception: it needs a crafted database and `-wal` pair, and zecd opens only database files it
+  creates under its own datadir. The fix needs rusqlite 0.41, which the wallet crates do not
+  allow yet.
+
 ## [0.9.0] - 2026-10-27
 
 The 0.9.0 line, released as `0.9.0-rc1` through `0.9.0-rc5`. Everything below is relative to
@@ -1314,6 +1373,7 @@ Zcash, backed entirely by librustzcash and running as a light client.
 ### Security
 - Pre-release audit hardening; refuse to start on mainnet with the placeholder RPC password; enforce a 12-character passphrase minimum.
 
+[0.10.0-rc1]: https://github.com/zecrocks/zecd/compare/v0.9.0...v0.10.0-rc1
 [0.9.0]: https://github.com/zecrocks/zecd/compare/v0.8.2...v0.9.0
 [0.9.0-rc5]: https://github.com/zecrocks/zecd/compare/v0.9.0-rc4...v0.9.0-rc5
 [0.9.0-rc4]: https://github.com/zecrocks/zecd/compare/v0.9.0-rc3...v0.9.0-rc4
